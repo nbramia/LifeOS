@@ -1,0 +1,226 @@
+# Instructions for AI Coding Agents
+
+Critical instructions for AI agents (Claude, Cursor, Copilot, etc.) working on this codebase.
+
+---
+
+## Project Overview
+
+LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, messages) for semantic search and synthesis.
+
+**Key Concepts:**
+- **Two-tier data model**: SourceEntity (raw observations) → PersonEntity (canonical records)
+- **Hybrid search**: Vector (ChromaDB) + keyword (BM25/FTS5)
+- **Entity resolution**: Links emails/phones to canonical people
+
+**Tech Stack:**
+- FastAPI backend (port 8000)
+- ChromaDB vector store (port 8001)
+- Ollama for query routing
+- Claude API for synthesis
+
+**Documentation:**
+- [README.md](README.md) - Quick start and architecture
+- [docs/architecture/](docs/architecture/) - Technical details
+- [docs/getting-started/](docs/getting-started/) - Setup guides
+
+---
+
+# Development Workflow
+
+1. **Edit code**
+2. **Restart server**: `./scripts/server.sh restart`
+3. **Test manually** or run tests: `./scripts/test.sh`
+4. **Deploy**: `./scripts/deploy.sh "Your commit message"`
+
+Use the below guidelines when executing tasks or pursuing goals that have more than basic complexity. These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+These guidelines bias toward caution over speed. For trivial tasks (simple typo fixes, obvious one-liners), use judgment — not every change needs the full rigor.
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+---
+
+## Common Mistakes to Avoid
+
+1. **Running uvicorn directly** → Use `./scripts/server.sh start` 
+2. **Forgetting to restart server after code changes** → Use `./scripts/server.sh restart`
+3. **Committing without testing** → Use `./scripts/deploy.sh`
+4. **Starting server on localhost only** → Must use 0.0.0.0 for Tailscale
+5. **Overfitting to specific test cases** → All fixes must take into account the potential effects on the full system, never single-file patches to pass one query
+
+---
+
+## Key Files
+
+
+| File | Purpose |
+|------|---------|
+| `api/main.py` | FastAPI application entry point |
+| `config/settings.py` | Environment configuration |
+| `config/people_dictionary.json` | Known people and aliases (restart required after edits) |
+| `README.md` | Architecture documentation including hybrid search system |
+
+
+| Script | Purpose |
+|--------|---------|
+| `./scripts/server.sh` | Start/stop/restart server |
+| `./scripts/deploy.sh` | Test → restart → commit → push |
+| `./scripts/test.sh` | Run test suites |
+| `./scripts/service.sh` | launchd service management |
+
+## Dependency Management
+
+**Single source of truth**: `requirements.txt`
+**Virtual environment**: `~/.venvs/lifeos` (external due to macOS TCC)
+
+### Adding a new dependency
+
+1. Add to `requirements.txt`
+2. Install: `~/.venvs/lifeos/bin/pip install -r requirements.txt`
+3. Restart server: `./scripts/server.sh restart`
+
+### Why external venv?
+
+macOS TCC security scanning causes 30+ second delays when launchd loads
+agents from `~/Documents/`. The external venv at `~/.venvs/` is exempt.
+
+### Testing
+
+```bash
+./scripts/test.sh              # Unit tests (fast, ~30s)
+./scripts/test.sh smoke        # Unit + critical browser (used by deploy)
+./scripts/test.sh all          # Full test suite
+```
+
+## Server Management — CRITICAL
+
+**NEVER run uvicorn or start the server directly.** Always use the provided scripts:
+
+```bash
+./scripts/server.sh start    # Start server
+./scripts/server.sh stop     # Stop server
+./scripts/server.sh restart  # Restart after code changes
+./scripts/server.sh status   # Check if running
+```
+Always restart the server after modifying Python files
+The server does NOT auto-reload. Changes won't take effect until restart.
+
+### Why This Matters
+
+Running `uvicorn api.main:app` directly causes **ghost server processes**:
+
+1. The script binds to `0.0.0.0:8000` (all interfaces including Tailscale)
+2. Direct uvicorn often binds only to `127.0.0.1:8000` (localhost)
+3. This creates TWO servers on different interfaces
+4. User sees different behavior via localhost vs Tailscale/network
+5. Code changes appear to "not work" because the wrong server handles requests
+
+---
+
+## Common Tasks
+
+### Check Service Health
+
+```bash
+curl http://localhost:8000/health/full | jq
+```
+
+### Search for a Person
+
+```bash
+curl "http://localhost:8000/api/crm/people?q=Name" | jq '.people[0]'
+```
+
+### Run a Search Query
+
+```bash
+curl -X POST http://localhost:8000/api/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "search terms", "top_k": 10}' | jq
+```
+
+### Trigger Vault Reindex
+
+```bash
+curl -X POST http://localhost:8000/api/admin/reindex
+```
+
+### Run Manual Sync
+
+```bash
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --dry-run  # Preview
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --execute --force  # Execute
+```
+
+### Debug Sync Issues
+
+```bash
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
+tail -50 logs/lifeos-api-error.log
+```
+
+
+
+
+
+
+

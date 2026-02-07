@@ -1,0 +1,17 @@
+{
+  "family_last_names": ["smith", "jones"],
+  "family_exact_names": [
+    "uncle bob",
+    "aunt jane",
+    "grammy",
+    "grandpa"
+  ],
+  "tracked_relationships": [
+    {
+      "name": "Parent Relationship",
+      "person_ids": ["uuid-of-parent-1", "uuid-of-parent-2"],
+      "healthy_direction": "more"
+    }
+  ],
+  "default_selected_ids": ["uuid-1", "uuid-2", "uuid-3", "uuid-4"]
+}

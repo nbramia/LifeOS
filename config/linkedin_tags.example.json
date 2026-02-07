@@ -1,0 +1,6 @@
+{
+  "tag_overrides": {
+    "uuid-example-1": ["city:new-york", "state:ny", "industry:tech", "seniority:executive"],
+    "uuid-example-2": ["city:san-francisco", "state:ca", "industry:finance", "seniority:senior"]
+  }
+}

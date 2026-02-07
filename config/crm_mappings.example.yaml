@@ -1,0 +1,47 @@
+# CRM Domain and Company Mappings
+# Copy this file to crm_mappings.yaml and customize for your organization
+#
+# Maps email domains and company names to vault contexts for entity resolution
+
+domain_mappings:
+  # Current job
+  yourcompany.com:
+    company: "Your Company"
+    vault_contexts:
+      - "Work/YourCompany/"
+    category: work
+
+  # Previous jobs (archived)
+  previousjob.com:
+    company: "Previous Job"
+    vault_contexts:
+      - "Personal/zArchive/PreviousJob/"
+    category: work
+
+  # Personal domains (these are built-in defaults, but you can customize)
+  gmail.com:
+    vault_contexts:
+      - "Personal/"
+    category: personal
+
+  icloud.com:
+    vault_contexts:
+      - "Personal/"
+    category: personal
+
+
+company_normalization:
+  # Maps LinkedIn company names to email domains and vault contexts
+  # Useful when LinkedIn shows different company names than email domains
+
+  "Your Company":
+    domains:
+      - yourcompany.com
+    vault_contexts:
+      - "Work/YourCompany/"
+
+  "Previous Job Inc":
+    domains:
+      - previousjob.com
+    vault_contexts:
+      - "Personal/zArchive/PreviousJob/"

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS ChromaDB Server launchd configuration template.
+
+  NOTE: This launchd configuration does NOT work reliably with ChromaDB.
+  ChromaDB exits with code 78 when run via launchd for unknown reasons.
+
+  Instead, use the cron-based watchdog:
+  */5 * * * * __LIFEOS_PATH__/scripts/chromadb-watchdog.sh
+
+  Or manage ChromaDB manually with:
+  ./scripts/chromadb.sh start|stop|restart|status
+
+  To use this template (not recommended):
+  1. Copy this file to com.lifeos.chromadb.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Copy to ~/Library/LaunchAgents/
+  5. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.chromadb.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.chromadb</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.venvs/lifeos/bin/chroma</string>
+        <string>run</string>
+        <string>--host</string>
+        <string>localhost</string>
+        <string>--port</string>
+        <string>8001</string>
+        <string>--path</string>
+        <string>__LIFEOS_PATH__/data/chromadb</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/chromadb.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/chromadb-error.log</string>
+</dict>
+</plist>

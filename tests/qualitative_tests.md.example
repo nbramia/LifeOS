@@ -1,0 +1,943 @@
+# LifeOS Qualitative Test Suite & Report Card
+
+This document defines qualitative tests for LifeOS query orchestration and serves as a **report card** for evaluating system behavior. Each test includes scoring criteria to assess whether the system searched the right sources, resolved entities correctly, and applied appropriate time ranges.
+
+These tests represent **ideal behavior** - not necessarily current implementation state.
+
+**Last Evaluated: (run locally)
+**Overall Score:** ~75% of P0-P1 queries routing correctly after tuning
+
+---
+
+## Core Principles
+
+### 1. Entity-First Resolution
+When a person is mentioned, **always resolve them first** via the people database to get:
+- Email addresses (for Gmail, Calendar search)
+- Phone numbers (for iMessage search)
+- Company/role context (for Vault folder targeting)
+- Aliases (for broader search matching)
+
+### 2. Multi-Source by Default
+Most queries benefit from multiple sources. Default to searching across sources rather than limiting to one.
+
+### 3. Strong Recency Bias
+Unless the user specifies a time range, prioritize recent content:
+- Last 30-60 days for most queries
+- Last 7 days for "recent" queries
+- Expand if no results found
+
+### 4. Context-Aware Vault Search
+When a person or project has known context (company, project folder), target those vault locations specifically.
+
+---
+
+## Test Categories
+
+1. [Meeting & Event Queries](#1-meeting--event-queries)
+2. [Person-Focused Queries](#2-person-focused-queries)
+3. [Project & Topic Queries](#3-project--topic-queries)
+4. [Communication Queries](#4-communication-queries)
+5. [Preparation Queries](#5-preparation-queries)
+6. [Recall & Search Queries](#6-recall--search-queries)
+7. [Temporal Queries](#7-temporal-queries)
+8. [Action & Task Queries](#8-action--task-queries)
+
+---
+
+## 1. Meeting & Event Queries
+
+### 1.1 All Staff / Team Meetings
+**Query:** "What's been happening in recent all staff meetings?"
+
+**Orchestration Steps:**
+1. **Calendar** - Search for events titled "Team Stand Up" or "All Staff" or "All Hands" in last 60 days + next occurrence
+2. **Google Drive** - Search Docs and Slides for "all staff" OR "team stand up" modified in last 60 days
+3. **Vault** - Search for notes in meeting folders containing "all staff" OR "team stand up" OR "stand up" from last 60 days
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | title contains "Team Stand Up" OR "All Staff" | Last 60 days + next 2 weeks |
+| Drive (Docs) | fullText contains "all staff" OR name contains "all staff" | modifiedTime > 60 days ago |
+| Drive (Slides) | fullText contains "all staff" OR name contains "all staff" | modifiedTime > 60 days ago |
+| Vault | semantic: "all staff meeting" + keyword: "stand up" | last 60 days, meeting notes folders |
+
+**Output Should Include:**
+- List of recent meetings with dates
+- Links to presentation decks from Drive
+- Summary of key topics from notes
+- Next scheduled occurrence
+
+#### Report Card: Test 1.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Calendar for meeting events | ☐ | |
+| Searched Drive for Docs/Slides | ☐ | |
+| Searched Vault for meeting notes | ☐ | |
+| Recognized "all staff" = "Team Stand Up" alias | ☐ | |
+| Applied 60-day recency filter | ☐ | |
+| Included next scheduled occurrence | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+### 1.2 Specific Recurring Meeting
+**Query:** "What did we discuss in the last leadership sync?"
+
+**Orchestration Steps:**
+1. **Calendar** - Find most recent past event matching "leadership sync" to get date and attendees
+2. **Vault** - Search for meeting notes from that date OR containing "leadership sync"
+3. **Gmail** - Search for emails with "leadership sync" in subject from that week (for agendas, follow-ups)
+4. **Drive** - Search for documents shared around that date with "leadership" in title
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | title contains "leadership sync" | Last 30 days (find most recent) |
+| Vault | keyword: "leadership sync" + date match | ±3 days from meeting date |
+| Gmail | subject: "leadership sync" | ±7 days from meeting date |
+| Drive | name contains "leadership" | modifiedTime ±7 days from meeting |
+
+#### Report Card: Test 1.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Found the specific meeting on Calendar | ☐ | |
+| Searched Vault for notes near meeting date | ☐ | |
+| Searched Gmail for agendas/follow-ups | ☐ | |
+| Searched Drive for related documents | ☐ | |
+| Used meeting date to scope other searches | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+### 1.3 Meeting with External Party
+**Query:** "When did we last meet with the Anthropic team and what did we discuss?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Anthropic team" to list of known Anthropic contacts with emails
+2. **Calendar** - Search for events with any Anthropic email in attendees
+3. **Vault** - Search for notes mentioning "Anthropic" in work/meetings folders
+4. **Gmail** - Search for threads with Anthropic contacts around meeting dates
+5. **Drive** - Search for documents shared with Anthropic domains
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | company = "Anthropic" | All time (entity lookup) |
+| Calendar | attendees contains *@anthropic.com | Last 90 days |
+| Vault | semantic: "Anthropic" in Work/ folders | Last 90 days |
+| Gmail | from:*@anthropic.com OR to:*@anthropic.com | ±7 days from meetings |
+
+#### Report Card: Test 1.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved "Anthropic team" to contact list first | ☐ | |
+| Used Anthropic email domain for Calendar search | ☐ | |
+| Searched Vault in work/meetings context | ☐ | |
+| Searched Gmail with contact emails | ☐ | |
+| Searched Drive for shared documents | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+## 2. Person-Focused Queries
+
+### 2.1 Recent Interactions with Work Contact
+**Query:** "What are my recent interactions with Alex Johnson?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Alex Johnson" to entity, get:
+   - Email(s): e.g., colleague@example.org
+   - Company: Acme Corp
+   - Role: (if known)
+   - Category: work
+2. **Gmail** - Search for emails to/from Ben's email addresses in last 60 days
+3. **Calendar** - Search for events with Ben's email in attendees (past 60 days + next 30 days)
+4. **Vault** - Search in `Work/Acme/` folder for mentions of "Alex" or "Johnson" (since he's at Acme Corp)
+5. **iMessage** - Skip or deprioritize (work contact, unlikely to text)
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "Alex Johnson" | Entity resolution |
+| Gmail | from:colleague@example.org OR to:colleague@example.org | Last 60 days |
+| Calendar | attendees contains colleague@example.org | Last 60 days + next 30 days |
+| Vault | path:Work/Acme/* AND (Alex OR Johnson) | Last 90 days, high relevance |
+| iMessage | (skip - work contact) | - |
+
+**Output Should Include:**
+- Last email exchange (date, subject, snippet)
+- Recent/upcoming meetings
+- Relevant notes mentioning Ben
+- Context: "Alex is [role] at Acme Corp"
+
+#### Report Card: Test 2.1 (Evaluated 2023-01-09)
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved entity FIRST before other searches | ✅ | Routes to people first |
+| Got email address from entity | ✅ | Entity resolution working |
+| Got company context (Acme Corp) | ✅ | |
+| Searched Gmail with entity's email | ✅ | Fixed: now includes gmail in routing |
+| Searched Calendar with entity's email | ✅ | Fixed: now includes calendar in routing |
+| Targeted Vault search to Work/Acme/ folder | ☐ | Not yet implemented - searches all vault |
+| Correctly deprioritized iMessage (work contact) | ✅ | Work contact handling OK |
+| Applied 60-day recency bias | ✅ | |
+| **Score** | 7/8 | Fixed: routing now includes people+gmail+calendar+vault |
+
+---
+
+### 2.2 Recent Interactions with Personal Contact
+**Query:** "What have Sam and I been talking about lately?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Sam" to entity, get:
+   - Phone: +1-901-xxx-xxxx
+   - Email: partner@example.com
+   - Category: personal (partner)
+2. **iMessage** - Search for messages with Sam's phone number in last 30 days
+3. **Calendar** - Search for events with Sam's email (personal appointments, trips)
+4. **Gmail** - Search personal Gmail for threads with Sam
+5. **Vault** - Search in `Personal/` folders for mentions of "Sam" or "Samlor"
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "Sam" OR alias "Sam" | Entity resolution |
+| iMessage | phone = +19012295017 | Last 30 days |
+| Calendar | attendees contains partner@example.com | Last 30 days + next 30 days |
+| Gmail (personal) | from:partner@example.com OR to:... | Last 30 days |
+| Vault | path:Personal/* AND (Sam OR Samlor) | Last 60 days |
+
+**Output Should Include:**
+- Summary of text conversation topics
+- Shared calendar events (trips, appointments)
+- Key decisions or plans made
+
+#### Report Card: Test 2.2 (Evaluated 2023-01-09)
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved "Sam" alias to correct entity | ✅ | Alias resolution working |
+| Got phone number from entity | ✅ | |
+| Recognized personal contact category | ✅ | |
+| Prioritized iMessage (personal contact) | ✅ | 150+ messages returned |
+| Searched iMessage with phone number | ✅ | |
+| Searched Calendar with entity's email | ✅ | Fixed: now includes calendar |
+| Targeted Vault to Personal/ folders | ☐ | Not yet - searches all vault |
+| Applied 30-day recency for "lately" | ✅ | Fixed: "lately" now → 30 days |
+| **Score** | 7/8 | Fixed: routing, date extraction, search term filtering |
+
+---
+
+### 2.3 Preparing to Reconnect
+**Query:** "I'm about to call Sarah Chen, what should I know?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Sarah Chen" to entity, get all contact info + context
+2. **Calendar** - Find last meeting with Sarah, next scheduled meeting
+3. **Gmail** - Last few email threads with Sarah
+4. **Vault** - Notes mentioning Sarah, especially recent ones
+5. **iMessage** - Last few texts if personal contact
+6. **People Briefing** - Generate briefing from interaction store
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "Sarah Chen" | Full profile + briefing |
+| Calendar | attendees contains sarah's email | Last 90 days + next 30 days |
+| Gmail | from:sarah@... OR to:sarah@... | Last 90 days |
+| Vault | semantic: "Sarah Chen" | Last 90 days |
+| iMessage | (if personal contact) | Last 30 days |
+
+**Output Should Include:**
+- Who Sarah is (role, company, how you know her)
+- Last interaction and what was discussed
+- Any open loops or pending items
+- Upcoming commitments
+
+#### Report Card: Test 2.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved entity with full profile | ☐ | |
+| Generated people briefing | ☐ | |
+| Found last meeting on Calendar | ☐ | |
+| Found recent email threads | ☐ | |
+| Searched Vault for context | ☐ | |
+| Checked iMessage if personal contact | ☐ | |
+| Identified open loops/pending items | ☐ | |
+| **Score** | _/7 | |
+
+---
+
+### 2.4 Who Is This Person?
+**Query:** "Who is David Martinez and how do I know him?"
+
+**Orchestration Steps:**
+1. **People** - Search for "David Martinez", check if entity exists
+2. **Gmail** - Search for earliest emails with David to find origin
+3. **Calendar** - First meeting with David
+4. **Vault** - Any notes mentioning David with context
+5. **LinkedIn** - (if integrated) Profile lookup
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "David Martinez" | Full history |
+| Gmail | from:david... (find all matching) | All time, sort by oldest |
+| Calendar | attendees contains david's email | All time, sort by oldest |
+| Vault | "David Martinez" | All time |
+
+**Output Should Include:**
+- First touchpoint (how you met)
+- Current role/company
+- Relationship context
+- Interaction frequency
+
+#### Report Card: Test 2.4
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched People database first | ☐ | |
+| Searched Gmail for earliest interaction | ☐ | |
+| Searched Calendar for first meeting | ☐ | |
+| Searched Vault for context | ☐ | |
+| Sorted by oldest to find origin | ☐ | |
+| Provided relationship context | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+## 3. Project & Topic Queries
+
+### 3.1 Project Status
+**Query:** "What's the latest on the Acme Corp partnership?"
+
+**Orchestration Steps:**
+1. **People** - Identify Acme Corp contacts (Joe Huston, etc.)
+2. **Gmail** - Threads with Acme Corp contacts, recent first
+3. **Calendar** - Recent/upcoming meetings with ML folks
+4. **Vault** - Search `Work/Acme/` folder for recent notes
+5. **Drive** - Documents with "Acme Corp" in name or shared with @acme.example.com
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | company = "Acme Corp" | Get contact list |
+| Gmail | from:*@acme.example.com OR subject:"Acme Corp" | Last 60 days |
+| Calendar | attendees contains *@acme.example.com | Last 60 days + next 30 |
+| Vault | path:Work/Acme/* | Last 60 days, recent first |
+| Drive | name contains "Acme Corp" OR sharedWith *@acme.example.com | Last 60 days |
+
+#### Report Card: Test 3.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Identified ML contacts from People | ☐ | |
+| Searched Gmail with ML email domain | ☐ | |
+| Searched Calendar with ML attendees | ☐ | |
+| Targeted Vault to Work/Acme/ folder | ☐ | |
+| Searched Drive for ML documents | ☐ | |
+| Applied recency bias (60 days) | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+### 3.2 Topic Deep Dive
+**Query:** "What have I written about pricing strategy?"
+
+**Orchestration Steps:**
+1. **Vault** - Semantic search for "pricing strategy" across all notes
+2. **Drive** - Documents containing "pricing" in name or content
+3. **Gmail** - Threads with "pricing" in subject (discussions)
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Vault | semantic: "pricing strategy" | All time, relevance ranked |
+| Drive | fullText contains "pricing strategy" | All time, recency boost |
+| Gmail | subject: pricing | Last 6 months |
+
+#### Report Card: Test 3.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Vault with semantic search | ☐ | |
+| Searched Drive for documents | ☐ | |
+| Searched Gmail for discussions | ☐ | |
+| Ranked by relevance, not just recency | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+### 3.3 Decision History
+**Query:** "How did we decide to switch to the new CRM?"
+
+**Orchestration Steps:**
+1. **Vault** - Search for "CRM" in decision notes, meeting notes
+2. **Gmail** - Threads discussing CRM options, evaluation
+3. **Drive** - Documents comparing CRMs, evaluation sheets
+4. **Calendar** - Meetings about CRM decision
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Vault | semantic: "CRM decision" OR "CRM evaluation" | All time |
+| Gmail | subject: CRM | All time, find evaluation period |
+| Drive | name contains "CRM" | All time |
+| Calendar | title contains "CRM" | All time |
+
+**Output Should Include:**
+- Timeline of decision process
+- Options considered
+- Key decision makers
+- Final rationale
+
+#### Report Card: Test 3.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Vault for decision context | ☐ | |
+| Searched Gmail for evaluation discussions | ☐ | |
+| Searched Drive for comparison docs | ☐ | |
+| Searched Calendar for decision meetings | ☐ | |
+| Expanded time range (historical query) | ☐ | |
+| Reconstructed decision timeline | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+## 4. Communication Queries
+
+### 4.1 Email Status
+**Query:** "What's the status of my conversation with the recruiter about the PM role?"
+
+**Orchestration Steps:**
+1. **People** - Identify recruiter contacts, or search by context
+2. **Gmail** - Threads containing "PM" or "product manager" with recruiter-like senders
+3. **Calendar** - Any interview or call scheduled
+4. **Vault** - Interview prep notes
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Gmail | subject:(PM OR "product manager") AND (recruiter OR talent OR hiring) | Last 60 days |
+| Calendar | title contains "interview" OR "call" with external attendees | Next 30 days |
+| Vault | semantic: "PM role" OR "interview" | Last 30 days |
+
+**Output Should Include:**
+- Latest email in thread
+- Who needs to respond (you or them)
+- Any scheduled next steps
+
+#### Report Card: Test 4.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Gmail for recruiter threads | ☐ | |
+| Used contextual keywords (PM, recruiter) | ☐ | |
+| Checked Calendar for scheduled interviews | ☐ | |
+| Identified who needs to respond | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+### 4.2 Text Conversation Recall
+**Query:** "What did Alex and I decide about the weekend plans?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Alex" to entity (assume personal context from "weekend")
+2. **iMessage** - Recent messages with Alex, search for "weekend" OR planning language
+3. **Calendar** - Weekend events involving Alex
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "Alex" + category: personal | Entity resolution |
+| iMessage | phone = Alex's number, content contains "weekend" OR "Saturday" OR "Sunday" | Last 14 days |
+| Calendar | attendees contains Alex, date = upcoming weekend | Next 7 days |
+
+#### Report Card: Test 4.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved Alex entity | ☐ | |
+| Inferred personal context from "weekend" | ☐ | |
+| Searched iMessage with keyword filter | ☐ | |
+| Checked Calendar for weekend events | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+### 4.3 Thread Finder
+**Query:** "Find that email thread about the budget approval"
+
+**Orchestration Steps:**
+1. **Gmail** - Search for "budget approval" in subject and body
+2. **Drive** - Documents with "budget" in name (might have been attached)
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Gmail | subject:(budget approval) OR body:(budget approval) | Last 90 days |
+| Drive | name contains "budget" | Last 90 days |
+
+#### Report Card: Test 4.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Gmail subject and body | ☐ | |
+| Searched Drive for related docs | ☐ | |
+| Applied reasonable recency (90 days) | ☐ | |
+| **Score** | _/3 | |
+
+---
+
+## 5. Preparation Queries
+
+### 5.1 Meeting Prep - External
+**Query:** "Prep me for my meeting with the Mobilize team tomorrow"
+
+**Orchestration Steps:**
+1. **Calendar** - Find tomorrow's meeting with Mobilize, get attendees
+2. **People** - Look up each attendee, generate briefings
+3. **Gmail** - Recent threads with Mobilize contacts
+4. **Vault** - Notes about Mobilize, recent interactions
+5. **Drive** - Shared documents with Mobilize, recent presentations
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | title contains "Mobilize" AND date = tomorrow | Exact match |
+| People | emails in attendee list | Full profiles |
+| Gmail | from:*@mobilize.us OR to:*@mobilize.us | Last 30 days |
+| Vault | semantic: "Mobilize" | Last 60 days |
+| Drive | sharedWith *@mobilize.us OR name contains "Mobilize" | Last 60 days |
+
+**Output Should Include:**
+- Meeting time, attendees, agenda (if in invite)
+- Brief on each attendee
+- Recent email context
+- Previous meeting notes
+- Open items/pending decisions
+
+#### Report Card: Test 5.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Found the specific meeting on Calendar | ☐ | |
+| Extracted attendee list | ☐ | |
+| Generated briefings for attendees | ☐ | |
+| Searched Gmail for recent context | ☐ | |
+| Searched Vault for meeting notes | ☐ | |
+| Searched Drive for shared documents | ☐ | |
+| Identified open items/pending decisions | ☐ | |
+| **Score** | _/7 | |
+
+---
+
+### 5.2 Meeting Prep - Internal
+**Query:** "What should I prepare for the performance review with Jamie?"
+
+**Orchestration Steps:**
+1. **People** - Resolve "Jamie" to employee entity
+2. **Calendar** - Find the performance review meeting
+3. **Vault** - Notes about Jamie's work, previous reviews
+4. **Gmail** - Feedback emails, project updates from Jamie
+5. **Drive** - Review documents, Jamie's work artifacts
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| People | name match "Jamie" | Full profile |
+| Calendar | title contains "review" OR "1:1" with Jamie | Next 14 days |
+| Vault | semantic: "Jamie performance" OR "Jamie feedback" | Last 6 months |
+| Gmail | from:jamie@... (project updates, accomplishments) | Last 6 months |
+
+#### Report Card: Test 5.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Resolved Jamie entity | ☐ | |
+| Found performance review meeting | ☐ | |
+| Searched Vault for performance notes | ☐ | |
+| Searched Gmail for Jamie's updates | ☐ | |
+| Extended time range for review context (6mo) | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+### 5.3 Call Prep - Quick
+**Query:** "Quick context before my 3pm call"
+
+**Orchestration Steps:**
+1. **Calendar** - Get the 3pm meeting, identify attendees
+2. **People** - Quick lookup on attendees
+3. **Gmail** - Most recent thread with these people
+4. **Vault** - Most recent note mentioning these people
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | time = 3pm today | Exact match |
+| People | emails in attendee list | Quick summary |
+| Gmail | threads with attendees | Last 14 days, most recent |
+| Vault | mentions of attendees | Last 30 days, most recent |
+
+#### Report Card: Test 5.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Found the 3pm meeting | ☐ | |
+| Identified attendees | ☐ | |
+| Looked up attendees in People | ☐ | |
+| Found most recent email context | ☐ | |
+| Prioritized speed for "quick" query | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+## 6. Recall & Search Queries
+
+### 6.1 Vague Recall
+**Query:** "There was something about a partnership opportunity I was exploring..."
+
+**Orchestration Steps:**
+1. **Gmail** - Search for "partnership" in subjects and body
+2. **Vault** - Semantic search for "partnership opportunity"
+3. **Calendar** - Meetings with "partnership" in title
+4. **Drive** - Documents about partnerships
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Gmail | subject:partnership OR body:"partnership opportunity" | Last 6 months |
+| Vault | semantic: "partnership opportunity" | Last 6 months |
+| Calendar | title contains "partnership" | Last 6 months |
+| Drive | name contains "partnership" | Last 6 months |
+
+**Note:** For vague queries, cast a wider net and present options rather than assuming.
+
+#### Report Card: Test 6.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Gmail broadly | ☐ | |
+| Searched Vault with semantic search | ☐ | |
+| Searched Calendar for meetings | ☐ | |
+| Searched Drive for documents | ☐ | |
+| Cast wide net (6 months) for vague query | ☐ | |
+| Presented multiple options vs assuming | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+### 6.2 Document Finder
+**Query:** "Find the deck we used for the board presentation"
+
+**Orchestration Steps:**
+1. **Drive** - Search Slides for "board" in name
+2. **Calendar** - Find recent board meeting for date context
+3. **Gmail** - Threads with "board" + "presentation" or "deck"
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Drive | mimeType = slides AND name contains "board" | Last 6 months |
+| Calendar | title contains "board" | Last 6 months (get date) |
+| Gmail | subject:(board presentation) OR subject:(board deck) | Around board meeting date |
+
+#### Report Card: Test 6.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Drive for Slides specifically | ☐ | |
+| Used Calendar to find meeting date | ☐ | |
+| Searched Gmail for related threads | ☐ | |
+| Filtered by document type (slides) | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+### 6.3 Quote/Phrase Finder
+**Query:** "Where did I write about 'sustainable growth mindset'?"
+
+**Orchestration Steps:**
+1. **Vault** - Exact phrase search first, then semantic
+2. **Drive** - Full-text search for exact phrase
+3. **Gmail** - Search sent emails for phrase
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Vault | exact: "sustainable growth mindset" | All time |
+| Drive | fullText contains "sustainable growth mindset" | All time |
+| Gmail | body:"sustainable growth mindset" in:sent | All time |
+
+#### Report Card: Test 6.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Vault with exact phrase first | ☐ | |
+| Searched Drive full-text | ☐ | |
+| Searched Gmail sent folder | ☐ | |
+| Used exact match before semantic | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+## 7. Temporal Queries
+
+### 7.1 Week in Review
+**Query:** "What happened this week?"
+
+**Orchestration Steps:**
+1. **Calendar** - All events from this week
+2. **Gmail** - Important threads from this week (filter out noise)
+3. **Vault** - Notes created/modified this week
+4. **iMessage** - (summarize if relevant personal items)
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | all events | This week (Mon-Sun) |
+| Gmail | importance markers, threads with replies | This week |
+| Vault | modifiedTime | This week |
+
+**Output Should Include:**
+- Meetings held (grouped by type)
+- Key email threads
+- Notes taken
+- Highlights/lowlights
+
+#### Report Card: Test 7.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Calendar for this week | ☐ | |
+| Searched Gmail with noise filtering | ☐ | |
+| Searched Vault for recent notes | ☐ | |
+| Correctly interpreted "this week" | ☐ | |
+| Grouped/categorized results | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+### 7.2 Specific Date Reconstruction
+**Query:** "What was I doing on January 3rd?"
+
+**Orchestration Steps:**
+1. **Calendar** - All events on Jan 3rd
+2. **Vault** - Daily note for Jan 3rd if exists
+3. **Gmail** - Emails sent/received on Jan 3rd
+4. **iMessage** - Messages from Jan 3rd
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | date = 2023-01-03 | Exact date |
+| Vault | filename: "2023-01-03" OR "January 3" | Exact date |
+| Gmail | after:2023/01/03 before:2023/01/04 | Exact date |
+| iMessage | date = 2023-01-03 | Exact date |
+
+#### Report Card: Test 7.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Calendar for exact date | ☐ | |
+| Searched Vault for daily note | ☐ | |
+| Searched Gmail for exact date | ☐ | |
+| Searched iMessage for exact date | ☐ | |
+| Correctly parsed "January 3rd" | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+### 7.3 Historical Query
+**Query:** "What was our strategy discussion like back in October?"
+
+**Orchestration Steps:**
+1. **Calendar** - Meetings with "strategy" in October
+2. **Vault** - Notes about strategy from October
+3. **Drive** - Strategy documents modified in October
+4. **Gmail** - Strategy threads from October
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Calendar | title contains "strategy" | October 2025 |
+| Vault | semantic: "strategy" | October 2025 |
+| Drive | name contains "strategy" | modifiedTime in October 2025 |
+| Gmail | subject:strategy | October 2025 |
+
+#### Report Card: Test 7.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Calendar in October | ☐ | |
+| Searched Vault in October | ☐ | |
+| Searched Drive in October | ☐ | |
+| Searched Gmail in October | ☐ | |
+| Correctly interpreted "back in October" | ☐ | |
+| Overrode recency bias for historical query | ☐ | |
+| **Score** | _/6 | |
+
+---
+
+## 8. Action & Task Queries
+
+### 8.1 Open Action Items
+**Query:** "What action items do I have open?"
+
+**Orchestration Steps:**
+1. **Vault** - Search meeting notes for action items assigned to me
+2. **Gmail** - Emails with action-requesting language sent to me
+3. **Calendar** - Follow-up tasks, TODO items
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Vault | pattern: "- [ ]" OR "action item" OR "TODO" | Last 60 days |
+| Gmail | body:"can you" OR "please" OR "action" (to me) | Last 30 days |
+
+#### Report Card: Test 8.1
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Vault for unchecked items | ☐ | |
+| Recognized markdown checkbox pattern | ☐ | |
+| Searched Gmail for action requests | ☐ | |
+| Filtered to items assigned to me | ☐ | |
+| **Score** | _/4 | |
+
+---
+
+### 8.2 Commitments Made
+**Query:** "What did I promise to do this week?"
+
+**Orchestration Steps:**
+1. **Gmail** - Sent emails with commitment language
+2. **Vault** - Meeting notes with my action items
+3. **iMessage** - Texts where I committed to something
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Gmail | in:sent body:("I will" OR "I'll" OR "I can") | This week + last week |
+| Vault | semantic: "my action items" | Last 2 weeks |
+| iMessage | from:me content:("I'll" OR "I will" OR "I can") | Last 2 weeks |
+
+#### Report Card: Test 8.2
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Gmail sent folder | ☐ | |
+| Searched for commitment language patterns | ☐ | |
+| Searched Vault for my action items | ☐ | |
+| Searched iMessage for my commitments | ☐ | |
+| Scoped to this week + last week | ☐ | |
+| **Score** | _/5 | |
+
+---
+
+### 8.3 Waiting On Others
+**Query:** "What am I waiting on from other people?"
+
+**Orchestration Steps:**
+1. **Gmail** - Sent emails awaiting response
+2. **Vault** - Action items assigned to others
+3. **Calendar** - Pending RSVPs
+
+**Expected Searches:**
+| Source | Query/Filter | Time Range |
+|--------|-------------|------------|
+| Gmail | in:sent has:noreply (threads I started, no response) | Last 30 days |
+| Vault | pattern: "[ ] @name" (delegated items) | Last 60 days |
+
+#### Report Card: Test 8.3
+| Criterion | Pass? | Notes |
+|-----------|-------|-------|
+| Searched Gmail for unanswered sent emails | ☐ | |
+| Searched Vault for delegated items | ☐ | |
+| Identified threads awaiting response | ☐ | |
+| **Score** | _/3 | |
+
+---
+
+## Summary Report Card
+
+| Section | Tests | Max Score | Actual Score | % |
+|---------|-------|-----------|--------------|---|
+| 1. Meeting & Event Queries | 3 | 16 | ___ | ___ |
+| 2. Person-Focused Queries | 4 | 29 | ___ | ___ |
+| 3. Project & Topic Queries | 3 | 16 | ___ | ___ |
+| 4. Communication Queries | 3 | 11 | ___ | ___ |
+| 5. Preparation Queries | 3 | 17 | ___ | ___ |
+| 6. Recall & Search Queries | 3 | 14 | ___ | ___ |
+| 7. Temporal Queries | 3 | 16 | ___ | ___ |
+| 8. Action & Task Queries | 3 | 12 | ___ | ___ |
+| **TOTAL** | **25** | **131** | ___ | ___ |
+
+---
+
+## Priority Classification
+
+**P0 - Core Flows (must work well):**
+- 2.1 Recent Interactions - Work Contact
+- 2.2 Recent Interactions - Personal Contact
+- 5.1 Meeting Prep - External
+- 5.3 Call Prep - Quick
+
+**P1 - Important Use Cases:**
+- 1.1 All Staff Meetings
+- 2.3 Preparing to Reconnect
+- 3.1 Project Status
+- 7.1 Week in Review
+
+**P2 - Advanced:**
+- 1.3 Meeting with External Party
+- 3.3 Decision History
+- 6.1 Vague Recall
+- 7.3 Historical Query
+
+**P3 - Nice to Have:**
+- 6.3 Quote/Phrase Finder
+- 8.2 Commitments Made
+- 8.3 Waiting On Others
+
+---
+
+## Known Limitations to Track
+
+- [ ] Entity resolution for ambiguous names (multiple "David"s)
+- [ ] Group chat identification in iMessage
+- [ ] Distinguishing work vs personal context automatically
+- [ ] Calendar availability calculation
+- [ ] Understanding "last X" vs "past X" time references
+- [ ] Handling "we" vs "I" in queries (requires person name for iMessage search)
+- [ ] Recognizing meeting aliases ("all hands" = "team stand up")
+- [x] Vault folder targeting based on entity context (searches all vault, not context-specific)
+- [ ] Combining results from multiple sources coherently
+- [ ] Team name extraction (e.g., "Mobilize team" extracts "the Mobilize" incorrectly)
+
+---
+
+## Tuning Log
+
+### 2023-01-09 - Initial Systematic Testing
+
+**Issues Found & Fixed:**
+
+1. **Person interaction queries routing too narrow**
+   - Issue: Queries like "recent interactions with Alex Johnson" only routed to `['people']`
+   - Fix: Updated `config/prompts/query_router.txt` with explicit routing guidance
+   - Fix: Updated `_keyword_fallback()` in `query_router.py` to add `gmail` to people queries
+   - Result: Now routes to `['people', 'gmail', 'calendar', 'vault']`
+
+2. **"lately" and "recently" not extracting date ranges**
+   - Issue: "lately?" was captured as a search term, date range was None
+   - Fix: Updated `extract_message_date_range()` in `chat.py`:
+     - "lately" → last 30 days
+     - "recently" → last 14 days
+   - Fix: Updated `extract_message_search_terms()` to filter temporal words
+   - Result: Proper date filtering for temporal queries
+
+3. **Vault search filter bug (ChromaDB)**
+   - Issue: `{"people": ["Samlor"]}` filter passed to ChromaDB caused error
+   - Fix: Removed list-based filter in `briefings.py`, rely on semantic search
+   - Result: Vault searches work correctly
+
+**Test Results Summary:**
+
+| Test | Query | Routing Before | Routing After | Score |
+|------|-------|----------------|---------------|-------|
+| 2.1 | Recent interactions with Alex Johnson | `['people']` | `['people', 'gmail', 'calendar', 'vault']` | 7/8 |
+| 2.2 | What have Sam and I been talking about lately? | `['people', 'vault']` | `['people', 'gmail', 'calendar', 'vault']` + iMessage | 7/8 |
+| 5.1 | Prep me for meeting with Mobilize team | - | `['people', 'vault', 'calendar']` | 4/7 |
+| 5.3 | Quick context before my 3pm call | - | `['vault', 'calendar']` | 3/5 |
+
+**Remaining Work:**
+- Vault folder targeting based on entity context (Work/Acme/ for Acme Corp contacts)
+- Drive integration for meeting prep queries
+- Team name extraction improvements

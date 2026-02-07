@@ -1,0 +1,5267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>LifeOS</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --text-primary: #eaeaea;
+            --text-secondary: #a0a0a0;
+            --text-muted: #6a6a8a;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --user-bubble: #0f3460;
+            --assistant-bubble: #1a1a2e;
+            --border: #2a2a4e;
+            --success: #4caf50;
+            --warning: #ff9800;
+            --error: #f44336;
+            --sidebar-width: 280px;
+            --header-height: 56px;
+            --input-height: 72px;
+            --safe-top: env(safe-area-inset-top, 0px);
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --safe-left: env(safe-area-inset-left, 0px);
+            --safe-right: env(safe-area-inset-right, 0px);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            touch-action: manipulation;  /* Disable iOS double-tap delay globally */
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            padding-top: var(--safe-top);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: var(--sidebar-width);
+            height: 100%;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .new-chat-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            background: var(--accent);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 1.25rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .new-chat-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .conversations-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem;
+        }
+
+        .conversation-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+            min-height: 48px;
+        }
+
+        .conversation-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .conversation-item.active {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+        }
+
+        .conversation-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            flex-shrink: 0;
+        }
+
+        .conversation-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .conversation-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .conversation-date {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .conversation-delete {
+            opacity: 0;
+            width: 28px;
+            height: 28px;
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        .conversation-item:hover .conversation-delete {
+            opacity: 1;
+        }
+
+        .conversation-delete:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        /* Main content */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            height: 100%;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 1rem;
+            height: var(--header-height);
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 1rem;
+            padding: 0.375rem 0.5rem;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+
+        .header-brand:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .header-nav {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.375rem 0.75rem;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .nav-link.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        .menu-btn {
+            display: none;
+            width: 40px;
+            height: 40px;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1.25rem;
+            cursor: pointer;
+        }
+
+        .menu-btn:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .chat-title {
+            font-size: 1rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 300px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .cost-display {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            background: var(--bg-primary);
+            padding: 0.375rem 0.75rem;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+
+        .cost-display:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--border);
+        }
+
+        .cost-display .amount {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .status-dot.loading {
+            background: var(--warning);
+            animation: pulse 1s infinite;
+        }
+
+        .status-dot.error {
+            background: var(--error);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Messages area */
+        .messages-container {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .messages {
+            height: 100%;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            scroll-behavior: smooth;
+        }
+
+        .message {
+            max-width: min(85%, 700px);
+            padding: 1rem;
+            border-radius: 12px;
+            line-height: 1.6;
+            position: relative;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: var(--user-bubble);
+            border: 1px solid var(--border);
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: var(--assistant-bubble);
+            border: 1px solid var(--border);
+        }
+
+        .message-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message-content p {
+            margin-bottom: 0.5rem;
+        }
+
+        .message-content p:last-child {
+            margin-bottom: 0;
+        }
+
+        .message-content code {
+            background: var(--bg-tertiary);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.875em;
+        }
+
+        .attachment-indicator {
+            display: inline-block;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+        }
+
+        /* Routing sources display */
+        .routing-sources {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.375rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .routing-source {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-secondary);
+        }
+
+        .routing-source.vault { border-color: #4caf50; color: #4caf50; }
+        .routing-source.calendar { border-color: #2196f3; color: #2196f3; }
+        .routing-source.gmail { border-color: #f44336; color: #f44336; }
+        .routing-source.drive { border-color: #ff9800; color: #ff9800; }
+        .routing-source.attachment { border-color: #9c27b0; color: #9c27b0; }
+        .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
+
+        .message-actions {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            display: flex;
+            gap: 0.25rem;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .message:hover .message-actions {
+            opacity: 1;
+        }
+
+        .action-btn {
+            width: 28px;
+            height: 28px;
+            background: var(--bg-tertiary);
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            background: var(--accent);
+            color: white;
+        }
+
+        .action-btn.copied {
+            background: var(--success);
+            color: white;
+        }
+
+        .message-meta {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid var(--border);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .sources {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .source-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.375rem 0.625rem;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            color: var(--accent);
+            text-decoration: none;
+            transition: all 0.2s;
+            min-height: 32px;
+        }
+
+        .source-link:hover {
+            background: var(--border);
+            color: var(--accent-hover);
+        }
+
+        /* Collapsible sources */
+        .sources.collapsed .source-link:nth-child(n+4) {
+            display: none;
+        }
+
+        .sources-toggle {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.375rem 0.625rem;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            cursor: pointer;
+            transition: color 0.2s;
+            background: none;
+            border: none;
+            min-height: 32px;
+        }
+
+        .sources-toggle:hover {
+            color: var(--text-secondary);
+        }
+
+        .meta-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .save-btn {
+            padding: 0.375rem 0.75rem;
+            background: transparent;
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            color: var(--accent);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            min-height: 32px;
+        }
+
+        .save-btn:hover {
+            background: var(--accent);
+            color: white;
+        }
+
+        .save-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .save-btn.saved {
+            background: var(--success);
+            border-color: var(--success);
+            color: white;
+        }
+
+        .save-btn.hidden {
+            display: none;
+        }
+
+        .saved-link {
+            background: rgba(76, 175, 80, 0.15) !important;
+            border: 1px solid var(--success) !important;
+            color: var(--success) !important;
+        }
+
+        .saved-link:hover {
+            background: rgba(76, 175, 80, 0.25) !important;
+        }
+
+        /* Remember button */
+        .remember-btn {
+            padding: 0.375rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+        }
+
+        .remember-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+
+        .modal-overlay.visible {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            width: 100%;
+            max-width: 500px;
+            max-height: 90vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-header h3 {
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            width: 32px;
+            height: 32px;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+        }
+
+        .modal-close:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 1.25rem;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .modal-body p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+            line-height: 1.5;
+        }
+
+        .modal-body textarea {
+            width: 100%;
+            min-height: 120px;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-family: inherit;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        .modal-body textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .modal-body textarea::placeholder {
+            color: var(--text-muted);
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            padding: 1rem 1.25rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .modal-btn {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .modal-btn-cancel {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .modal-btn-cancel:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .modal-btn-save {
+            background: var(--accent);
+            border: none;
+            color: white;
+        }
+
+        .modal-btn-save:hover {
+            background: var(--accent-hover);
+        }
+
+        .modal-btn-save:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .modal-status {
+            padding: 0.75rem;
+            border-radius: 6px;
+            margin-top: 1rem;
+            font-size: 0.875rem;
+        }
+
+        .modal-status.success {
+            background: rgba(76, 175, 80, 0.1);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .modal-status.error {
+            background: rgba(244, 67, 54, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        /* Save to Vault modal styles */
+        .save-vault-modal {
+            max-width: 500px;
+        }
+
+        .save-vault-modal .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .save-vault-modal .form-group label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            margin-bottom: 0.375rem;
+        }
+
+        .save-vault-modal .form-group input[type="text"],
+        .save-vault-modal .form-group select,
+        .save-vault-modal .form-group textarea {
+            width: 100%;
+            padding: 0.625rem 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-family: inherit;
+        }
+
+        .save-vault-modal .form-group input[type="text"]:focus,
+        .save-vault-modal .form-group select:focus,
+        .save-vault-modal .form-group textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(111, 158, 211, 0.2);
+        }
+
+        .save-vault-modal .form-group input::placeholder,
+        .save-vault-modal .form-group textarea::placeholder {
+            color: var(--text-muted);
+        }
+
+        .save-vault-modal .form-group select {
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238a8a8a' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 0.75rem center;
+            padding-right: 2rem;
+        }
+
+        .save-vault-modal .toggle-group {
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .save-vault-modal .toggle-group:last-of-type {
+            border-bottom: none;
+            margin-bottom: 1rem;
+        }
+
+        .save-vault-modal .toggle-label {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            cursor: pointer;
+        }
+
+        .save-vault-modal .toggle-label input[type="checkbox"] {
+            margin-top: 0.125rem;
+            width: 1rem;
+            height: 1rem;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        .save-vault-modal .toggle-text {
+            font-weight: 500;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+        }
+
+        .save-vault-modal .toggle-hint {
+            display: block;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.125rem;
+        }
+
+        /* Usage modal specific styles */
+        .usage-modal {
+            max-width: 700px;
+        }
+
+        .usage-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .usage-stat-card {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+        .usage-stat-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .usage-stat-value {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .usage-stat-requests {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        .usage-stat-card.session-card {
+            border-color: var(--accent);
+            background: var(--bg-secondary);
+        }
+
+        .usage-chart-container {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid var(--border);
+            height: 300px;
+        }
+
+        @media (max-width: 768px) {
+            .usage-stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .usage-stat-card.session-card {
+                grid-column: span 2;
+            }
+
+            .usage-modal {
+                max-width: 100%;
+            }
+
+            .usage-stat-value {
+                font-size: 1rem;
+            }
+        }
+
+        /* Scroll to bottom */
+        .scroll-bottom {
+            position: absolute;
+            bottom: 1rem;
+            right: 1rem;
+            width: 40px;
+            height: 40px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            color: var(--text-primary);
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            transition: all 0.2s;
+            z-index: 10;
+        }
+
+        .scroll-bottom.visible {
+            display: flex;
+        }
+
+        .scroll-bottom:hover {
+            background: var(--bg-tertiary);
+            transform: scale(1.1);
+        }
+
+        /* Input area */
+        .input-area {
+            padding: 1rem;
+            padding-bottom: calc(1rem + var(--safe-bottom));
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .input-container {
+            display: flex;
+            align-items: flex-end;
+            gap: 0.75rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        .input-field {
+            display: block;  /* Fix baseline alignment gap */
+            width: 100%;
+            padding: 0.6875rem 1rem;  /* Adjusted to match 48px button height */
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-family: inherit;
+            resize: none;
+            min-height: 48px;
+            max-height: 200px;
+            line-height: 1.5;
+            transition: border-color 0.2s;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .input-field::placeholder {
+            color: var(--text-muted);
+        }
+
+        .send-btn {
+            width: 48px;
+            height: 48px;
+            background: var(--accent);
+            border: none;
+            border-radius: 12px;
+            color: white;
+            font-size: 1.25rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            background: var(--accent-hover);
+            transform: scale(1.05);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Attach button */
+        .attach-btn {
+            width: 48px;
+            height: 48px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-secondary);
+            font-size: 1.25rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .attach-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Hidden file input */
+        .file-input {
+            display: none;
+        }
+
+        /* Attachment preview area */
+        .attachments-preview {
+            display: none;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 0.75rem;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .attachments-preview.visible {
+            display: flex;
+        }
+
+        .attachment-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            max-width: 200px;
+        }
+
+        .attachment-thumb {
+            width: 40px;
+            height: 40px;
+            border-radius: 4px;
+            object-fit: cover;
+            background: var(--bg-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            flex-shrink: 0;
+        }
+
+        .attachment-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 4px;
+        }
+
+        .attachment-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .attachment-name {
+            font-size: 0.75rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: var(--text-primary);
+        }
+
+        .attachment-size {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+        }
+
+        .attachment-remove {
+            width: 20px;
+            height: 20px;
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .attachment-remove:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        /* Drag-over state for input area */
+        .input-area.drag-over {
+            background: rgba(233, 69, 96, 0.1);
+        }
+
+        .input-area.drag-over .input-field {
+            border-color: var(--accent);
+            border-style: dashed;
+        }
+
+        /* Attachment error toast */
+        .attachment-error {
+            position: fixed;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--error);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            z-index: 1000;
+            animation: fadeInOut 3s ease forwards;
+        }
+
+        @keyframes fadeInOut {
+            0% { opacity: 0; transform: translateX(-50%) translateY(10px); }
+            10% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            90% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            100% { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+        }
+
+        /* Typing indicator */
+        .typing {
+            display: flex;
+            gap: 4px;
+            padding: 0.5rem 0;
+        }
+
+        .typing span {
+            width: 8px;
+            height: 8px;
+            background: var(--text-secondary);
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing span:nth-child(2) { animation-delay: 0.2s; }
+        .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing {
+            0%, 100% { transform: translateY(0); opacity: 0.5; }
+            50% { transform: translateY(-4px); opacity: 1; }
+        }
+
+        /* Welcome message */
+        .welcome {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 2rem;
+            height: 100%;
+        }
+
+        .welcome-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .welcome h2 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+            color: var(--text-primary);
+        }
+
+        .welcome p {
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+            max-width: 400px;
+        }
+
+        .suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 0.75rem;
+            max-width: 500px;
+        }
+
+        .suggestion {
+            padding: 0.75rem 1.25rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            font-size: 0.875rem;
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+        }
+
+        .suggestion:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        /* Overlay for mobile sidebar */
+        .overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 99;
+        }
+
+        .overlay.visible {
+            display: block;
+        }
+
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                z-index: 100;
+                transform: translateX(-100%);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .menu-btn {
+                display: flex;
+            }
+
+            .chat-title {
+                max-width: 150px;
+            }
+
+            .cost-display {
+                padding: 0.375rem 0.5rem;
+                min-width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .cost-display .label,
+            .cost-display .amount {
+                display: none;
+            }
+
+            .cost-display::before {
+                content: '$';
+                font-weight: 600;
+                font-size: 0.875rem;
+            }
+
+            .header {
+                padding: 0 0.75rem;
+            }
+
+            .messages {
+                padding: 0.75rem;
+            }
+
+            .message {
+                max-width: 95%;
+                padding: 0.875rem;
+            }
+
+            .message-actions {
+                opacity: 1;
+                position: static;
+                margin-top: 0.5rem;
+            }
+
+            .input-area {
+                padding: 0.75rem;
+                padding-bottom: calc(0.75rem + var(--safe-bottom));
+            }
+
+            .input-container {
+                gap: 0.5rem;
+            }
+
+            .input-field {
+                padding: 0.75rem;
+                font-size: 16px; /* Prevent iOS zoom */
+            }
+
+            .welcome {
+                padding: 1.5rem;
+            }
+
+            .welcome h2 {
+                font-size: 1.25rem;
+            }
+
+            .suggestions {
+                gap: 0.5rem;
+            }
+
+            .suggestion {
+                padding: 0.625rem 1rem;
+                font-size: 0.8125rem;
+            }
+        }
+
+        /* Small mobile */
+        @media (max-width: 380px) {
+            .status-text {
+                display: none;
+            }
+
+            .chat-title {
+                max-width: 120px;
+                font-size: 0.875rem;
+            }
+        }
+
+        /* Empty state */
+        .empty-conversations {
+            padding: 2rem 1rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        /* Conversation search */
+        .conversation-search {
+            padding: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .conversation-search-input {
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+        }
+
+        .conversation-search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .conversation-search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        /* CRM Page Styles */
+        :root {
+            --crm-accent: #00bcd4;
+            --crm-sidebar-width: 320px;
+            --crm-right-panel-width: 360px;
+        }
+
+        .page {
+            display: none;
+            width: 100%;
+            height: 100%;
+        }
+
+        .page.active {
+            display: flex;
+        }
+
+        /* CRM Layout */
+        .crm-container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            background: var(--bg-primary);
+        }
+
+        .crm-sidebar {
+            width: var(--crm-sidebar-width);
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .crm-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .crm-header-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .crm-header h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .crm-stats-badge {
+            background: var(--crm-accent);
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .crm-search {
+            position: relative;
+        }
+
+        .crm-search-input {
+            width: 100%;
+            padding: 0.625rem 0.75rem 0.625rem 2rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-family: inherit;
+        }
+
+        .crm-search-input:focus {
+            outline: none;
+            border-color: var(--crm-accent);
+        }
+
+        .crm-search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .crm-search-icon {
+            position: absolute;
+            left: 0.625rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        .crm-filters {
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .crm-people-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .crm-main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-primary);
+            overflow: hidden;
+        }
+
+        .crm-detail-header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .crm-detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1.5rem;
+        }
+
+        .crm-right-panel {
+            width: var(--crm-right-panel-width);
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border);
+            display: none;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .crm-right-panel.visible {
+            display: flex;
+        }
+
+        .crm-panel-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .crm-panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        /* CRM Responsive */
+        @media (max-width: 1024px) {
+            .crm-right-panel {
+                position: absolute;
+                right: 0;
+                top: 0;
+                height: 100%;
+                z-index: 100;
+                box-shadow: -2px 0 8px rgba(0, 0, 0, 0.2);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .crm-sidebar {
+                position: absolute;
+                left: 0;
+                top: 0;
+                height: 100%;
+                z-index: 99;
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+                box-shadow: 2px 0 8px rgba(0, 0, 0, 0.2);
+            }
+
+            .crm-sidebar.visible {
+                transform: translateX(0);
+            }
+
+            .crm-main {
+                width: 100%;
+            }
+        }
+
+        /* CRM Empty State */
+        .crm-empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            color: var(--text-muted);
+            padding: 2rem;
+        }
+
+        .crm-empty-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .crm-empty-state h3 {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .crm-empty-state p {
+            font-size: 0.875rem;
+        }
+
+        /* CRM Timeline */
+        .crm-timeline {
+            margin-top: 1.5rem;
+        }
+
+        .crm-timeline-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .crm-timeline-header h3 {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            margin: 0;
+        }
+
+        .crm-timeline-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .crm-timeline-filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .crm-timeline-filter-btn {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 0.375rem 0.75rem;
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-timeline-filter-btn:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .crm-timeline-filter-btn.active {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        .crm-timeline-load-more {
+            width: 100%;
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+            background: var(--bg-secondary);
+            border: 1px dashed var(--border);
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-timeline-load-more:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-color: var(--crm-accent);
+        }
+
+        .crm-timeline-day {
+            margin-bottom: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .crm-timeline-date {
+            padding: 0.75rem 1rem;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .crm-timeline-date-count {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: normal;
+        }
+
+        .crm-timeline-groups {
+            padding: 0.5rem;
+        }
+
+        .crm-timeline-group {
+            border-radius: 6px;
+        }
+
+        .crm-timeline-group-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.625rem 0.75rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .crm-timeline-group-header:hover {
+            background: var(--bg-primary);
+        }
+
+        .crm-timeline-group-badge {
+            font-size: 1.25rem;
+            width: 2rem;
+            text-align: center;
+        }
+
+        .crm-timeline-group-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .crm-timeline-group-title {
+            font-size: 0.8125rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .crm-timeline-group-count {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            background: var(--bg-primary);
+            padding: 0.125rem 0.5rem;
+            border-radius: 999px;
+        }
+
+        .crm-timeline-group-preview {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 0.25rem;
+        }
+
+        .crm-timeline-group-expand {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+        }
+
+        .crm-timeline-group.expanded .crm-timeline-group-expand {
+            transform: rotate(180deg);
+        }
+
+        .crm-timeline-items {
+            display: none;
+            padding: 0.5rem 0.75rem 0.75rem 3rem;
+        }
+
+        .crm-timeline-group.expanded .crm-timeline-items {
+            display: block;
+        }
+
+        .crm-timeline-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+            padding: 0.5rem 0;
+            border-top: 1px solid var(--border);
+            font-size: 0.8125rem;
+        }
+
+        .crm-timeline-item:first-child {
+            border-top: none;
+        }
+
+        .crm-timeline-item-title {
+            color: var(--text-primary);
+            flex: 1;
+        }
+
+        .crm-timeline-item-title a {
+            color: var(--crm-accent);
+            text-decoration: none;
+        }
+
+        .crm-timeline-item-title a:hover {
+            text-decoration: underline;
+        }
+
+        .crm-timeline-item-snippet {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        .crm-timeline-loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        /* CRM Skeleton Loading States */
+        .crm-skeleton {
+            background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--bg-tertiary) 50%, var(--bg-secondary) 75%);
+            background-size: 200% 100%;
+            animation: crm-skeleton-loading 1.5s infinite;
+            border-radius: 4px;
+        }
+
+        @keyframes crm-skeleton-loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .crm-skeleton-text {
+            height: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .crm-skeleton-text.short {
+            width: 40%;
+        }
+
+        .crm-skeleton-text.medium {
+            width: 70%;
+        }
+
+        .crm-skeleton-stat {
+            height: 3.5rem;
+            border-radius: 8px;
+        }
+
+        .crm-skeleton-section {
+            margin-bottom: 1.5rem;
+        }
+
+        .crm-section-loading {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .crm-section-loading .spinner {
+            width: 1rem;
+            height: 1rem;
+            border: 2px solid var(--border);
+            border-top-color: var(--crm-accent);
+            border-radius: 50%;
+            animation: crm-spin 0.8s linear infinite;
+        }
+
+        @keyframes crm-spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .crm-section-loading.slow {
+            color: var(--warning, #f59e0b);
+        }
+
+        .crm-section-error {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            text-align: center;
+        }
+
+        .crm-section-error .error-icon {
+            font-size: 1.5rem;
+            opacity: 0.5;
+        }
+
+        .crm-retry-btn {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-retry-btn:hover {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        /* CRM Filter Controls */
+        .crm-filter-row {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .crm-sort-select {
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+            cursor: pointer;
+            flex: 1;
+            min-width: 120px;
+        }
+
+        .crm-sort-select:focus {
+            outline: none;
+            border-color: var(--crm-accent);
+        }
+
+        .crm-filter-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .crm-filter-toggle:hover {
+            border-color: var(--crm-accent);
+            color: var(--text-primary);
+        }
+
+        .crm-filter-toggle.active {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        .crm-filter-toggle input {
+            display: none;
+        }
+
+        /* CRM Person Card */
+        .crm-person-card {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .crm-person-card:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .crm-person-card.active {
+            background: var(--bg-tertiary);
+            border-left: 3px solid var(--crm-accent);
+        }
+
+        .crm-person-avatar {
+            width: 40px;
+            height: 40px;
+            background: var(--bg-primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            color: var(--crm-accent);
+            flex-shrink: 0;
+        }
+
+        .crm-person-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .crm-person-name {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .crm-person-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .crm-person-stats {
+            display: flex;
+            gap: 0.5rem;
+            font-size: 0.6875rem;
+            color: var(--text-muted);
+        }
+
+        .crm-person-stat {
+            display: flex;
+            align-items: center;
+            gap: 0.125rem;
+        }
+
+        /* Review Queue Button */
+        .crm-review-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-review-btn:hover {
+            border-color: var(--crm-accent);
+            color: var(--text-primary);
+        }
+
+        .crm-review-badge {
+            background: var(--warning);
+            color: white;
+            padding: 0.125rem 0.375rem;
+            border-radius: 10px;
+            font-size: 0.6875rem;
+            font-weight: 600;
+            min-width: 18px;
+            text-align: center;
+        }
+
+        .crm-review-badge.empty {
+            display: none;
+        }
+
+        /* Review Queue Modal */
+        .review-modal {
+            max-width: 550px;
+        }
+
+        .review-progress {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
+        }
+
+        .review-progress-bar {
+            flex: 1;
+            height: 4px;
+            background: var(--bg-primary);
+            border-radius: 2px;
+            margin: 0 1rem;
+            overflow: hidden;
+        }
+
+        .review-progress-fill {
+            height: 100%;
+            background: var(--crm-accent);
+            transition: width 0.3s ease;
+        }
+
+        .review-item {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .review-source-info {
+            margin-bottom: 1rem;
+        }
+
+        .review-source-label {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-source-name {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-source-details {
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+        }
+
+        .review-source-type {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 0.6875rem;
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+        }
+
+        .review-arrow {
+            text-align: center;
+            padding: 0.5rem 0;
+            color: var(--text-muted);
+            font-size: 1.25rem;
+        }
+
+        .review-match {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid var(--border);
+        }
+
+        .review-match-label {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-match-name {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--crm-accent);
+        }
+
+        .review-confidence {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .review-confidence-bar {
+            flex: 1;
+            height: 6px;
+            background: var(--bg-primary);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .review-confidence-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .review-confidence-fill.low {
+            background: var(--error);
+        }
+
+        .review-confidence-fill.medium {
+            background: var(--warning);
+        }
+
+        .review-confidence-fill.high {
+            background: var(--success);
+        }
+
+        .review-confidence-text {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            min-width: 40px;
+        }
+
+        .review-actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .review-btn {
+            flex: 1;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.375rem;
+        }
+
+        .review-btn-confirm {
+            background: var(--success);
+            border: none;
+            color: white;
+        }
+
+        .review-btn-confirm:hover {
+            filter: brightness(1.1);
+        }
+
+        .review-btn-reject {
+            background: transparent;
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        .review-btn-reject:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        .review-empty {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        .review-empty-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        /* CRM Loading State */
+        .crm-loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        /* CRM Tabs */
+        .crm-tabs {
+            display: flex;
+            gap: 0;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .crm-tab {
+            padding: 0.75rem 1.25rem;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-tab:hover {
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+        }
+
+        .crm-tab.active {
+            color: var(--crm-accent);
+            border-bottom-color: var(--crm-accent);
+        }
+
+        /* Network Graph Container */
+        .network-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .network-controls {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .network-control-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .network-control-label {
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+        }
+
+        .network-slider {
+            width: 120px;
+            height: 4px;
+            background: var(--bg-tertiary);
+            border-radius: 2px;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        .network-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--crm-accent);
+            cursor: pointer;
+        }
+
+        .network-slider::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--crm-accent);
+            cursor: pointer;
+            border: none;
+        }
+
+        .network-checkbox-group {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .network-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        .network-checkbox input {
+            width: 14px;
+            height: 14px;
+            accent-color: var(--crm-accent);
+        }
+
+        .network-reset-btn {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .network-reset-btn:hover {
+            border-color: var(--crm-accent);
+            background: var(--bg-primary);
+        }
+
+        .network-graph {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            background: var(--bg-primary);
+        }
+
+        .network-graph svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .network-node {
+            cursor: pointer;
+        }
+
+        .network-node:hover circle {
+            stroke: white;
+            stroke-width: 2px;
+        }
+
+        .network-node.selected circle {
+            stroke: var(--crm-accent);
+            stroke-width: 3px;
+        }
+
+        .network-node.degree-0 circle {
+            stroke: var(--crm-accent);
+            stroke-width: 3px;
+        }
+
+        .network-node.degree-2 circle {
+            opacity: 0.6;
+        }
+
+        .network-node-label {
+            font-size: 10px;
+            fill: var(--text-primary);
+            text-anchor: middle;
+            pointer-events: none;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+        }
+
+        .network-link {
+            stroke: var(--border);
+            stroke-opacity: 0.6;
+        }
+
+        .network-tooltip {
+            position: absolute;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.8125rem;
+            color: var(--text-primary);
+            pointer-events: none;
+            z-index: 100;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .network-empty {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            text-align: center;
+            padding: 2rem;
+        }
+
+        .network-empty-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <!-- Mobile overlay -->
+    <div class="overlay" id="overlay" onclick="closeSidebar()"></div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h1>LifeOS</h1>
+            <button class="new-chat-btn" onclick="newChat()" title="New chat">+</button>
+        </div>
+        <div class="conversation-search">
+            <input type="text" class="conversation-search-input" id="conversationSearch" placeholder="Search conversations..." oninput="filterConversations()">
+        </div>
+        <div class="conversations-list" id="conversationsList">
+            <div class="empty-conversations">No conversations yet</div>
+        </div>
+    </aside>
+
+    <!-- Chat Page -->
+    <div id="chatPage" class="page active">
+        <div class="main">
+        <header class="header">
+            <div class="header-left">
+                <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰</button>
+                <nav class="header-nav">
+                    <a href="/chat" class="nav-link active">💬 Chat</a>
+                    <a href="/crm" class="nav-link">👥 CRM</a>
+                </nav>
+            </div>
+            <div class="header-right">
+                <span class="chat-title" id="chatTitle">New conversation</span>
+                <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
+                    <span>💭</span> Remember
+                </button>
+                <div class="cost-display" id="costDisplay" onclick="openUsageModal()" title="Click to view usage stats">
+                    <span class="label">Session:</span> <span class="amount" id="sessionCost">$0.00</span>
+                </div>
+                <div class="status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span class="status-text" id="statusText">Ready</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="messages-container">
+            <main class="messages" id="messages">
+                <div class="welcome">
+                    <div class="welcome-icon">🧠</div>
+                    <h2>Welcome to LifeOS</h2>
+                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
+                    <div class="suggestions">
+                        <button class="suggestion" onclick="askQuestion('What\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
+                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
+                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
+                    </div>
+                </div>
+            </main>
+            <button class="scroll-bottom" id="scrollBottom" onclick="scrollToBottom()">↓</button>
+        </div>
+
+        <footer class="input-area" id="inputArea">
+            <!-- Attachment preview area -->
+            <div class="attachments-preview" id="attachmentsPreview"></div>
+
+            <div class="input-container">
+                <div class="input-wrapper">
+                    <textarea
+                        class="input-field"
+                        id="inputField"
+                        placeholder="Ask a question..."
+                        rows="1"
+                        autofocus
+                    ></textarea>
+                </div>
+                <input type="file" id="fileInput" class="file-input" multiple
+                       accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
+                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files">📎</button>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+            </div>
+        </footer>
+        </div>
+    </div>
+
+    <!-- CRM Page -->
+    <div id="crmPage" class="page">
+        <div class="crm-container">
+            <!-- Left Sidebar: Filters + People List -->
+            <div class="crm-sidebar" id="crmSidebar">
+                <div class="crm-header">
+                    <div class="crm-header-top">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <a href="#/" onclick="navigateToPage('chat'); return false;" style="color: var(--crm-accent); text-decoration: none; font-size: 1.25rem;" title="Back to chat">←</a>
+                            <h2>People</h2>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <button class="crm-review-btn" id="crmReviewBtn" onclick="openReviewQueueModal()" title="Review low-confidence matches">
+                                Review
+                                <span class="crm-review-badge" id="crmReviewBadge">0</span>
+                            </button>
+                            <span class="crm-stats-badge" id="crmStatsBadge">0</span>
+                        </div>
+                    </div>
+                    <div class="crm-search">
+                        <span class="crm-search-icon">🔍</span>
+                        <input
+                            type="text"
+                            class="crm-search-input"
+                            id="crmSearchInput"
+                            placeholder="Search people..."
+                            oninput="handleCrmSearch()"
+                        >
+                    </div>
+                </div>
+                <div class="crm-filters" id="crmFilters">
+                    <div class="crm-filter-row">
+                        <select class="crm-sort-select" id="crmSortSelect" onchange="handleCrmSortChange()">
+                            <option value="strength" selected>Strongest</option>
+                            <option value="interactions">Most Active</option>
+                            <option value="name">Name A-Z</option>
+                            <option value="last_seen">Recent</option>
+                        </select>
+                        <label class="crm-filter-toggle" id="crmShowAllToggle">
+                            <input type="checkbox" id="crmShowAllCheckbox" onchange="handleCrmShowAllChange()">
+                            <span>Show all</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="crm-people-list" id="crmPeopleList">
+                    <div class="crm-loading">Loading people...</div>
+                </div>
+            </div>
+
+            <!-- Center Panel: Person Detail or Dashboard -->
+            <div class="crm-main" id="crmMain">
+                <!-- Tabs -->
+                <div class="crm-tabs">
+                    <button class="crm-tab active" data-tab="people" onclick="switchCrmTab('people')">People</button>
+                    <button class="crm-tab" data-tab="network" onclick="switchCrmTab('network')">Network</button>
+                </div>
+
+                <!-- People Tab Content -->
+                <div class="crm-tab-content" id="crmPeopleTab" style="flex: 1; display: flex; flex-direction: column;">
+                    <div class="crm-empty-state">
+                        <div class="crm-empty-icon">👥</div>
+                        <h3>Welcome to People CRM</h3>
+                        <p>Select a person from the list to view their details</p>
+                    </div>
+                </div>
+
+                <!-- Network Tab Content -->
+                <div class="crm-tab-content network-container" id="crmNetworkTab" style="display: none;">
+                    <div class="network-controls">
+                        <div class="network-control-group">
+                            <span class="network-control-label">Min Strength:</span>
+                            <input type="range" class="network-slider" id="networkStrengthSlider"
+                                   min="0" max="100" value="0" oninput="updateNetworkFilters()">
+                            <span id="networkStrengthValue">0%</span>
+                        </div>
+                        <div class="network-control-group">
+                            <span class="network-control-label">Categories:</span>
+                            <div class="network-checkbox-group">
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatWork" checked onchange="updateNetworkFilters()">
+                                    Work
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatPersonal" checked onchange="updateNetworkFilters()">
+                                    Personal
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatFamily" checked onchange="updateNetworkFilters()">
+                                    Family
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatUnknown" checked onchange="updateNetworkFilters()">
+                                    Unknown
+                                </label>
+                            </div>
+                        </div>
+                        <button class="network-reset-btn" onclick="resetNetworkView()">Reset View</button>
+                    </div>
+                    <div class="network-graph" id="networkGraph">
+                        <!-- D3.js SVG will be inserted here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Contextual Panels (hidden by default) -->
+            <div class="crm-right-panel" id="crmRightPanel">
+                <div class="crm-panel-header">
+                    <h3>Context Panel</h3>
+                </div>
+                <div class="crm-panel-content" id="crmPanelContent">
+                    <!-- Contextual content will be added dynamically -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Remember Modal -->
+    <div class="modal-overlay" id="rememberModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Remember Something</h3>
+                <button class="modal-close" onclick="closeRememberModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Tell me something you want me to remember. Write naturally - I'll format it properly.</p>
+                <textarea
+                    id="memoryInput"
+                    placeholder="e.g., Remember that anytime I ask about Sarah you should also check the alternative spelling Sara..."
+                ></textarea>
+                <div id="memoryStatus"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeRememberModal()">Cancel</button>
+                <button class="modal-btn modal-btn-save" id="saveMemoryBtn" onclick="saveMemory()">Save Memory</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Save to Vault Modal -->
+    <div class="modal-overlay" id="saveVaultModal">
+        <div class="modal save-vault-modal">
+            <div class="modal-header">
+                <h3>Save to Vault</h3>
+                <button class="modal-close" onclick="closeSaveVaultModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Customize how this conversation is saved to your Obsidian vault.</p>
+
+                <!-- Title -->
+                <div class="form-group">
+                    <label for="vaultTitle">Title</label>
+                    <input type="text" id="vaultTitle" placeholder="Auto-generated from content">
+                </div>
+
+                <!-- Folder -->
+                <div class="form-group">
+                    <label for="vaultFolder">Folder</label>
+                    <select id="vaultFolder">
+                        <option value="">Auto-detect</option>
+                        <option value="LifeOS/Research">LifeOS/Research</option>
+                        <option value="LifeOS/Meetings">LifeOS/Meetings</option>
+                        <option value="LifeOS/Actions">LifeOS/Actions</option>
+                        <option value="LifeOS/People">LifeOS/People</option>
+                    </select>
+                </div>
+
+                <!-- Tags -->
+                <div class="form-group">
+                    <label for="vaultTags">Tags</label>
+                    <input type="text" id="vaultTags" placeholder="Comma-separated (e.g., python, tutorial)">
+                </div>
+
+                <!-- Toggles -->
+                <div class="form-group toggle-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="vaultFullConversation" checked>
+                        <span class="toggle-text">Full conversation</span>
+                        <span class="toggle-hint">Save entire thread vs. just last exchange</span>
+                    </label>
+                </div>
+
+                <div class="form-group toggle-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="vaultIncludeSources" checked>
+                        <span class="toggle-text">Include sources</span>
+                        <span class="toggle-hint">Include retrieved sources/references</span>
+                    </label>
+                </div>
+
+                <div class="form-group toggle-group">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="vaultIncludeRawQA">
+                        <span class="toggle-text">Include raw Q&A</span>
+                        <span class="toggle-hint">Append original conversation verbatim</span>
+                    </label>
+                </div>
+
+                <!-- Custom Guidance -->
+                <div class="form-group">
+                    <label for="vaultGuidance">Custom guidance</label>
+                    <textarea
+                        id="vaultGuidance"
+                        placeholder="e.g., Focus on the technical implementation details..."
+                        rows="3"
+                    ></textarea>
+                </div>
+
+                <div id="vaultStatus"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeSaveVaultModal()">Cancel</button>
+                <button class="modal-btn modal-btn-save" id="saveVaultBtn" onclick="submitSaveVault()">Save to Vault</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Review Queue Modal -->
+    <div class="modal-overlay" id="reviewQueueModal">
+        <div class="modal review-modal">
+            <div class="modal-header">
+                <h3>Review Queue</h3>
+                <button class="modal-close" onclick="closeReviewQueueModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="reviewQueueBody">
+                <div class="crm-loading">Loading review queue...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Usage Stats Modal -->
+    <div class="modal-overlay" id="usageModal">
+        <div class="modal usage-modal">
+            <div class="modal-header">
+                <h3>Usage Statistics</h3>
+                <button class="modal-close" onclick="closeUsageModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="usage-stats-grid">
+                    <div class="usage-stat-card session-card">
+                        <div class="usage-stat-label">This Session</div>
+                        <div class="usage-stat-value" id="usageSession">$0.00</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">24 Hours</div>
+                        <div class="usage-stat-value" id="usage24h">$0.00</div>
+                        <div class="usage-stat-requests" id="requests24h">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">7 Days</div>
+                        <div class="usage-stat-value" id="usage7d">$0.00</div>
+                        <div class="usage-stat-requests" id="requests7d">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">30 Days</div>
+                        <div class="usage-stat-value" id="usage30d">$0.00</div>
+                        <div class="usage-stat-requests" id="requests30d">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">All Time</div>
+                        <div class="usage-stat-value" id="usageAllTime">$0.00</div>
+                        <div class="usage-stat-requests" id="requestsAllTime">0 requests</div>
+                    </div>
+                </div>
+                <div class="usage-chart-container">
+                    <canvas id="usageChart"></canvas>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeUsageModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // DOM elements
+        const messagesEl = document.getElementById('messages');
+        const inputField = document.getElementById('inputField');
+        const sendBtn = document.getElementById('sendBtn');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const scrollBottomBtn = document.getElementById('scrollBottom');
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('overlay');
+        const conversationsList = document.getElementById('conversationsList');
+        const chatTitle = document.getElementById('chatTitle');
+        const sessionCostEl = document.getElementById('sessionCost');
+        const inputArea = document.getElementById('inputArea');
+        const attachmentsPreview = document.getElementById('attachmentsPreview');
+        const fileInput = document.getElementById('fileInput');
+
+        // State
+        let isLoading = false;
+        let currentConversationId = null;
+        let sessionCost = 0;
+        let attachments = []; // Array of {file, dataUrl, filename, mediaType, sizeBytes}
+        let allConversations = []; // Store all conversations for filtering
+
+        // Attachment configuration
+        const ALLOWED_TYPES = {
+            'image/png': 5 * 1024 * 1024,
+            'image/jpeg': 5 * 1024 * 1024,
+            'image/jpg': 5 * 1024 * 1024,
+            'image/gif': 5 * 1024 * 1024,
+            'image/webp': 5 * 1024 * 1024,
+            'application/pdf': 10 * 1024 * 1024,
+            'text/plain': 1 * 1024 * 1024,
+            'text/markdown': 1 * 1024 * 1024,
+            'text/csv': 1 * 1024 * 1024,
+            'application/json': 1 * 1024 * 1024,
+        };
+        const MAX_ATTACHMENTS = 5;
+        const MAX_TOTAL_SIZE = 20 * 1024 * 1024;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadConversations();
+            inputField.focus();
+            setupScrollListener();
+            setupAttachmentHandlers();
+        });
+
+        // Sidebar toggle
+        function toggleSidebar() {
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('visible');
+        }
+
+        function closeSidebar() {
+            sidebar.classList.remove('open');
+            overlay.classList.remove('visible');
+        }
+
+        function openSidebar() {
+            sidebar.classList.add('open');
+            overlay.classList.add('visible');
+        }
+
+        // Swipe gesture to open/close sidebar on mobile
+        (function setupSwipeGestures() {
+            let touchStartX = 0;
+            let touchStartY = 0;
+            let isSwiping = false;
+            const edgeThreshold = 30;  // px from left edge to trigger
+            const swipeThreshold = 50; // px movement to complete swipe
+
+            document.addEventListener('touchstart', (e) => {
+                touchStartX = e.touches[0].clientX;
+                touchStartY = e.touches[0].clientY;
+                // Only track swipes starting from left edge (when sidebar closed)
+                // or from sidebar area (when open)
+                isSwiping = touchStartX < edgeThreshold || sidebar.classList.contains('open');
+            }, { passive: true });
+
+            document.addEventListener('touchend', (e) => {
+                if (!isSwiping) return;
+
+                const touchEndX = e.changedTouches[0].clientX;
+                const touchEndY = e.changedTouches[0].clientY;
+                const deltaX = touchEndX - touchStartX;
+                const deltaY = Math.abs(touchEndY - touchStartY);
+
+                // Ignore if vertical movement is greater (scrolling)
+                if (deltaY > Math.abs(deltaX)) return;
+
+                if (!sidebar.classList.contains('open') && touchStartX < edgeThreshold && deltaX > swipeThreshold) {
+                    // Swipe right from left edge - open sidebar
+                    openSidebar();
+                } else if (sidebar.classList.contains('open') && deltaX < -swipeThreshold) {
+                    // Swipe left when sidebar open - close it
+                    closeSidebar();
+                }
+
+                isSwiping = false;
+            }, { passive: true });
+        })();
+
+        // Scroll handling
+        function setupScrollListener() {
+            messagesEl.addEventListener('scroll', () => {
+                const isNearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 100;
+                scrollBottomBtn.classList.toggle('visible', !isNearBottom);
+            });
+        }
+
+        function scrollToBottom() {
+            messagesEl.scrollTo({
+                top: messagesEl.scrollHeight,
+                behavior: 'smooth'
+            });
+        }
+
+        // Attachment handling
+        function setupAttachmentHandlers() {
+            // Drag and drop
+            inputArea.addEventListener('dragenter', handleDragEnter);
+            inputArea.addEventListener('dragover', handleDragOver);
+            inputArea.addEventListener('dragleave', handleDragLeave);
+            inputArea.addEventListener('drop', handleDrop);
+
+            // File input change
+            fileInput.addEventListener('change', handleFileSelect);
+
+            // Paste handler
+            document.addEventListener('paste', handlePaste);
+        }
+
+        function handleDragEnter(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            inputArea.classList.add('drag-over');
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            inputArea.classList.add('drag-over');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Only remove if leaving the input area entirely
+            if (!inputArea.contains(e.relatedTarget)) {
+                inputArea.classList.remove('drag-over');
+            }
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            inputArea.classList.remove('drag-over');
+
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                addFiles(Array.from(files));
+            }
+        }
+
+        function handleFileSelect(e) {
+            const files = e.target.files;
+            if (files.length > 0) {
+                addFiles(Array.from(files));
+            }
+            // Reset input so same file can be selected again
+            fileInput.value = '';
+        }
+
+        function handlePaste(e) {
+            // Only handle paste if input field or input area is focused
+            if (document.activeElement !== inputField && !inputArea.contains(document.activeElement)) {
+                return;
+            }
+
+            const items = e.clipboardData?.items;
+            if (!items) return;
+
+            const files = [];
+            for (const item of items) {
+                if (item.kind === 'file') {
+                    const file = item.getAsFile();
+                    if (file) {
+                        files.push(file);
+                    }
+                }
+            }
+
+            if (files.length > 0) {
+                e.preventDefault(); // Prevent default paste behavior for files
+                addFiles(files);
+            }
+            // If no files, allow normal text paste
+        }
+
+        function openFilePicker() {
+            fileInput.click();
+        }
+
+        async function addFiles(files) {
+            for (const file of files) {
+                await addFile(file);
+            }
+        }
+
+        async function addFile(file) {
+            // Validate file type
+            if (!ALLOWED_TYPES[file.type]) {
+                showAttachmentError(`Unsupported file type: ${file.type || 'unknown'}`);
+                return;
+            }
+
+            // Validate file size
+            const maxSize = ALLOWED_TYPES[file.type];
+            if (file.size > maxSize) {
+                const maxMB = (maxSize / (1024 * 1024)).toFixed(0);
+                showAttachmentError(`File too large. Max ${maxMB}MB for ${file.type}`);
+                return;
+            }
+
+            // Check attachment count
+            if (attachments.length >= MAX_ATTACHMENTS) {
+                showAttachmentError(`Maximum ${MAX_ATTACHMENTS} attachments allowed`);
+                return;
+            }
+
+            // Check total size
+            const currentTotal = attachments.reduce((sum, a) => sum + a.sizeBytes, 0);
+            if (currentTotal + file.size > MAX_TOTAL_SIZE) {
+                showAttachmentError('Total attachment size exceeds 20MB limit');
+                return;
+            }
+
+            // Read file as data URL
+            try {
+                const dataUrl = await readFileAsDataUrl(file);
+                const attachment = {
+                    id: Date.now() + Math.random(),
+                    file: file,
+                    dataUrl: dataUrl,
+                    filename: file.name,
+                    mediaType: file.type,
+                    sizeBytes: file.size
+                };
+                attachments.push(attachment);
+                renderAttachments();
+            } catch (err) {
+                console.error('Error reading file:', err);
+                showAttachmentError('Failed to read file');
+            }
+        }
+
+        function readFileAsDataUrl(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function removeAttachment(id) {
+            attachments = attachments.filter(a => a.id !== id);
+            renderAttachments();
+        }
+
+        function renderAttachments() {
+            if (attachments.length === 0) {
+                attachmentsPreview.classList.remove('visible');
+                attachmentsPreview.innerHTML = '';
+                return;
+            }
+
+            attachmentsPreview.classList.add('visible');
+            attachmentsPreview.innerHTML = attachments.map(att => {
+                const isImage = att.mediaType.startsWith('image/');
+                const icon = getFileIcon(att.mediaType);
+                const sizeStr = formatFileSize(att.sizeBytes);
+
+                return `
+                    <div class="attachment-item">
+                        <div class="attachment-thumb">
+                            ${isImage ? `<img src="${att.dataUrl}" alt="${escapeHtml(att.filename)}">` : icon}
+                        </div>
+                        <div class="attachment-info">
+                            <div class="attachment-name" title="${escapeHtml(att.filename)}">${escapeHtml(att.filename)}</div>
+                            <div class="attachment-size">${sizeStr}</div>
+                        </div>
+                        <button class="attachment-remove" onclick="removeAttachment(${att.id})" title="Remove">×</button>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function getFileIcon(mediaType) {
+            if (mediaType === 'application/pdf') return '📄';
+            if (mediaType.startsWith('text/')) return '📝';
+            if (mediaType === 'application/json') return '📋';
+            return '📎';
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        function showAttachmentError(message) {
+            const toast = document.createElement('div');
+            toast.className = 'attachment-error';
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        function clearAttachments() {
+            attachments = [];
+            renderAttachments();
+        }
+
+        function getAttachmentsForApi() {
+            return attachments.map(att => {
+                // Extract base64 data from data URL (remove "data:image/png;base64," prefix)
+                const base64Data = att.dataUrl.split(',')[1];
+                return {
+                    filename: att.filename,
+                    media_type: att.mediaType,
+                    data: base64Data
+                };
+            });
+        }
+
+        // Auto-resize textarea
+        inputField.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+        });
+
+        // Enter to send (Shift+Enter for newline)
+        inputField.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        // Status updates
+        function setStatus(status, text) {
+            statusDot.className = 'status-dot ' + status;
+            statusText.textContent = text;
+        }
+
+        // Conversations
+        async function loadConversations() {
+            try {
+                const response = await fetch('/api/conversations');
+                if (response.ok) {
+                    const data = await response.json();
+                    allConversations = data.conversations || [];
+                    filterConversations(); // Apply current search filter
+                }
+            } catch (e) {
+                console.log('Could not load conversations');
+            }
+        }
+
+        // Cache for conversation messages (for search)
+        const conversationMessagesCache = {};
+        let searchDebounceTimer = null;
+
+        function filterConversations() {
+            const searchInput = document.getElementById('conversationSearch');
+            const searchTerm = (searchInput?.value || '').toLowerCase().trim();
+
+            if (!searchTerm) {
+                renderConversations(allConversations);
+                return;
+            }
+
+            // Debounce the search to avoid too many API calls
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(() => filterConversationsAsync(searchTerm), 200);
+        }
+
+        async function filterConversationsAsync(searchTerm) {
+            // First, filter by title (immediate results)
+            const titleMatches = allConversations.filter(conv => {
+                const title = (conv.title || 'New conversation').toLowerCase();
+                return title.includes(searchTerm);
+            });
+
+            // Show title matches immediately
+            renderConversations(titleMatches, true);
+
+            // Then search in message content for remaining conversations
+            const nonTitleMatches = allConversations.filter(conv => {
+                const title = (conv.title || 'New conversation').toLowerCase();
+                return !title.includes(searchTerm);
+            });
+
+            // Fetch and search message content
+            const messageMatches = [];
+            for (const conv of nonTitleMatches) {
+                try {
+                    // Use cache if available
+                    if (!conversationMessagesCache[conv.id]) {
+                        const response = await fetch(`/api/conversations/${conv.id}`);
+                        if (response.ok) {
+                            const data = await response.json();
+                            conversationMessagesCache[conv.id] = data.messages || [];
+                        }
+                    }
+
+                    const messages = conversationMessagesCache[conv.id] || [];
+                    const hasMatch = messages.some(msg =>
+                        (msg.content || '').toLowerCase().includes(searchTerm)
+                    );
+                    if (hasMatch) {
+                        messageMatches.push(conv);
+                    }
+                } catch (e) {
+                    // Skip conversations we can't fetch
+                }
+            }
+
+            // Combine results: title matches first, then message matches
+            const allMatches = [...titleMatches, ...messageMatches];
+            renderConversations(allMatches);
+        }
+
+        function renderConversations(conversations, isPartial = false) {
+            if (conversations.length === 0 && !isPartial) {
+                const searchInput = document.getElementById('conversationSearch');
+                const isSearching = searchInput?.value?.trim();
+                const emptyText = isSearching ? 'No matching conversations' : 'No conversations yet';
+                conversationsList.innerHTML = `<div class="empty-conversations">${emptyText}</div>`;
+                return;
+            }
+
+            conversationsList.innerHTML = conversations.map(conv => `
+                <div class="conversation-item ${conv.id === currentConversationId ? 'active' : ''}"
+                     onclick="loadConversation('${conv.id}')">
+                    <div class="conversation-icon">💬</div>
+                    <div class="conversation-info">
+                        <div class="conversation-title" title="${escapeHtml(conv.title || 'New conversation')}">${escapeHtml(conv.title || 'New conversation')}</div>
+                        <div class="conversation-date">${formatDate(conv.updated_at)}</div>
+                    </div>
+                    <button class="conversation-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')" title="Delete">✕</button>
+                </div>
+            `).join('');
+        }
+
+        async function loadConversation(id) {
+            currentConversationId = id;
+            closeSidebar();
+
+            try {
+                const response = await fetch(`/api/conversations/${id}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    chatTitle.textContent = data.title || 'Conversation';
+
+                    // Clear and render messages
+                    messagesEl.innerHTML = '';
+                    if (data.messages && data.messages.length > 0) {
+                        data.messages.forEach(msg => {
+                            // Sources are stored directly on the message, not in metadata
+                            addMessage(msg.content, msg.role, msg.sources || []);
+                        });
+                    }
+
+                    loadConversations(); // Refresh list to show active
+                }
+            } catch (e) {
+                console.error('Error loading conversation:', e);
+            }
+        }
+
+        async function deleteConversation(id) {
+            if (!confirm('Delete this conversation?')) return;
+
+            try {
+                await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
+                if (id === currentConversationId) {
+                    newChat();
+                }
+                loadConversations();
+            } catch (e) {
+                console.error('Error deleting conversation:', e);
+            }
+        }
+
+        function newChat() {
+            currentConversationId = null;
+            chatTitle.textContent = 'New conversation';
+            messagesEl.innerHTML = `
+                <div class="welcome">
+                    <div class="welcome-icon">🧠</div>
+                    <h2>Welcome to LifeOS</h2>
+                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
+                    <div class="suggestions">
+                        <button class="suggestion" onclick="askQuestion('What\\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
+                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
+                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
+                    </div>
+                </div>
+            `;
+            loadConversations();
+            closeSidebar();
+            inputField.focus();
+        }
+
+        function askQuestion(question) {
+            inputField.value = question;
+            sendMessage();
+        }
+
+        function addMessage(content, type, sources = [], messageId = null) {
+            // Remove welcome message if exists
+            const welcome = messagesEl.querySelector('.welcome');
+            if (welcome) welcome.remove();
+
+            const msg = document.createElement('div');
+            msg.className = 'message ' + type;
+            if (messageId) msg.id = messageId;
+
+            let html = `
+                <div class="message-actions">
+                    <button class="action-btn" onclick="copyMessage(this)" title="Copy">📋</button>
+                </div>
+                <div class="message-content">${formatContent(content)}</div>
+            `;
+
+            if (type === 'assistant' && content) {
+                html += `<div class="message-meta">`;
+
+                if (sources.length > 0) {
+                    // Add collapsed class if more than 3 sources
+                    const collapsedClass = sources.length > 3 ? ' collapsed' : '';
+                    html += `<div class="sources${collapsedClass}">`;
+                    sources.forEach(src => {
+                        const fileName = src.file_name || src;
+                        const sourceType = src.source_type || 'vault';
+
+                        if (sourceType === 'calendar' && src.url) {
+                            // Calendar sources use Google Calendar URL
+                            html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
+                        } else {
+                            // Vault sources use Obsidian URL
+                            const obsidianPath = src.obsidian_path || fileName;
+                            const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
+                            html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
+                        }
+                    });
+                    // Add toggle button if more than 3 sources
+                    if (sources.length > 3) {
+                        const hiddenCount = sources.length - 3;
+                        html += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
+                    }
+                    html += `</div>`;
+                }
+
+                html += `
+                    <div class="meta-actions">
+                        <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
+                    </div>
+                </div>`;
+            }
+
+            msg.innerHTML = html;
+            messagesEl.appendChild(msg);
+            scrollToBottom();
+
+            return msg;
+        }
+
+        function updateMessage(messageId, content) {
+            const msg = document.getElementById(messageId);
+            if (msg) {
+                const contentEl = msg.querySelector('.message-content');
+                if (contentEl) {
+                    contentEl.innerHTML = formatContent(content);
+                }
+            }
+        }
+
+        function formatContent(content) {
+            return content
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/`(.*?)`/g, '<code>$1</code>')
+                .replace(/\n/g, '<br>');
+        }
+
+        function copyMessage(btn) {
+            const msg = btn.closest('.message');
+            const content = msg.querySelector('.message-content').textContent;
+            navigator.clipboard.writeText(content).then(() => {
+                btn.classList.add('copied');
+                btn.textContent = '✓';
+                setTimeout(() => {
+                    btn.classList.remove('copied');
+                    btn.textContent = '📋';
+                }, 2000);
+            });
+        }
+
+        function toggleSources(btn) {
+            const sourcesDiv = btn.closest('.sources');
+            const isCollapsed = sourcesDiv.classList.contains('collapsed');
+            const sourceLinks = sourcesDiv.querySelectorAll('.source-link');
+            const totalCount = sourceLinks.length;
+            const hiddenCount = totalCount - 3;
+
+            if (isCollapsed) {
+                // Expand
+                sourcesDiv.classList.remove('collapsed');
+                btn.textContent = 'Show less';
+            } else {
+                // Collapse
+                sourcesDiv.classList.add('collapsed');
+                btn.textContent = `Show ${hiddenCount} more...`;
+            }
+        }
+
+        async function sendMessage() {
+            const question = inputField.value.trim();
+            if (!question || isLoading) return;
+
+            isLoading = true;
+            setStatus('loading', 'Thinking...');
+            sendBtn.disabled = true;
+
+            // Capture attachments before clearing
+            const messageAttachments = [...attachments];
+            const attachmentCount = messageAttachments.length;
+
+            // Add user message with attachment indicator
+            let userMsgContent = question;
+            if (attachmentCount > 0) {
+                userMsgContent += `\n<span class="attachment-indicator">📎 ${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}</span>`;
+            }
+            addMessage(userMsgContent, 'user');
+            inputField.value = '';
+            inputField.style.height = 'auto';
+
+            // Clear attachments after capturing them
+            clearAttachments();
+
+            // Update title if new conversation
+            if (!currentConversationId) {
+                chatTitle.textContent = question.slice(0, 40) + (question.length > 40 ? '...' : '');
+            }
+
+            // Add placeholder for assistant response
+            const msgId = 'msg-' + Date.now();
+            const msg = addMessage('', 'assistant', [], msgId);
+
+            // Add typing indicator
+            const typingHtml = '<div class="typing"><span></span><span></span><span></span></div>';
+            msg.querySelector('.message-content').innerHTML = typingHtml;
+
+            try {
+                const body = { question };
+                if (currentConversationId) {
+                    body.conversation_id = currentConversationId;
+                }
+
+                // Include attachments if any
+                if (messageAttachments.length > 0) {
+                    body.attachments = messageAttachments.map(att => ({
+                        filename: att.filename,
+                        media_type: att.mediaType,
+                        data: att.dataUrl.split(',')[1]  // Extract base64 data
+                    }));
+                }
+
+                const response = await fetch('/api/ask/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+
+                if (!response.ok) {
+                    throw new Error('Request failed');
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullContent = '';
+                let sources = [];
+                let routingSources = [];  // Track which sources were used
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+
+                                if (data.type === 'routing') {
+                                    // Capture which sources are being used
+                                    routingSources = data.sources || [];
+                                    console.log('Routing to:', routingSources);
+                                } else if (data.type === 'content') {
+                                    fullContent += data.content;
+                                    updateMessage(msgId, fullContent);
+                                } else if (data.type === 'sources') {
+                                    sources = data.sources;
+                                } else if (data.type === 'conversation_id') {
+                                    currentConversationId = data.conversation_id;
+                                } else if (data.type === 'usage') {
+                                    sessionCost += data.cost_usd || 0;
+                                    sessionCostEl.textContent = '$' + sessionCost.toFixed(3);
+                                } else if (data.type === 'done') {
+                                    // Add sources and meta to message
+                                    const msgEl = document.getElementById(msgId);
+                                    if (msgEl) {
+                                        let metaHtml = '<div class="message-meta">';
+
+                                        // Show routing sources used
+                                        if (routingSources.length > 0) {
+                                            metaHtml += '<div class="routing-sources">';
+                                            const sourceIcons = {
+                                                vault: '📚',
+                                                calendar: '📅',
+                                                gmail: '✉️',
+                                                drive: '📁',
+                                                attachment: '📎',
+                                                people: '👤',
+                                                actions: '✅'
+                                            };
+                                            routingSources.forEach(src => {
+                                                const icon = sourceIcons[src] || '📄';
+                                                metaHtml += `<span class="routing-source ${src}">${icon} ${src}</span>`;
+                                            });
+                                            metaHtml += '</div>';
+                                        }
+
+                                        if (sources.length > 0) {
+                                            // Add collapsed class if more than 3 sources
+                                            const collapsedClass = sources.length > 3 ? ' collapsed' : '';
+                                            metaHtml += `<div class="sources${collapsedClass}">`;
+                                            sources.forEach(src => {
+                                                const fileName = src.file_name || src;
+                                                const sourceType = src.source_type || 'vault';
+
+                                                if (sourceType === 'calendar' && src.url) {
+                                                    // Calendar sources use Google Calendar URL
+                                                    metaHtml += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
+                                                } else {
+                                                    // Vault sources use Obsidian URL
+                                                    const obsidianPath = src.obsidian_path || fileName;
+                                                    const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
+                                                    metaHtml += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
+                                                }
+                                            });
+                                            // Add toggle button if more than 3 sources
+                                            if (sources.length > 3) {
+                                                const hiddenCount = sources.length - 3;
+                                                metaHtml += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
+                                            }
+                                            metaHtml += '</div>';
+                                        }
+
+                                        metaHtml += `
+                                            <div class="meta-actions">
+                                                <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
+                                            </div>
+                                        </div>`;
+
+                                        // Remove any existing meta
+                                        const existingMeta = msgEl.querySelector('.message-meta');
+                                        if (existingMeta) existingMeta.remove();
+
+                                        msgEl.insertAdjacentHTML('beforeend', metaHtml);
+                                    }
+
+                                    loadConversations();
+                                } else if (data.type === 'error') {
+                                    // Handle error from server
+                                    const errorMsg = data.message || 'An error occurred';
+                                    let userMessage = 'Sorry, something went wrong.';
+
+                                    // Provide helpful messages for common errors
+                                    if (errorMsg.toLowerCase().includes('api') ||
+                                        errorMsg.toLowerCase().includes('auth') ||
+                                        errorMsg.toLowerCase().includes('key') ||
+                                        errorMsg.toLowerCase().includes('token')) {
+                                        userMessage = 'API configuration error. Please check that your API key is set correctly.';
+                                    } else if (errorMsg.toLowerCase().includes('timeout')) {
+                                        userMessage = 'The request timed out. Please try again.';
+                                    } else if (errorMsg.toLowerCase().includes('rate')) {
+                                        userMessage = 'Rate limit exceeded. Please wait a moment and try again.';
+                                    }
+
+                                    console.error('Stream error:', errorMsg);
+                                    updateMessage(msgId, userMessage);
+                                    setStatus('error', 'Error');
+                                    return; // Stop processing
+                                }
+                            } catch (e) {
+                                // Skip malformed JSON
+                            }
+                        }
+                    }
+                }
+
+                setStatus('', 'Ready');
+
+            } catch (error) {
+                console.error('Error:', error);
+                updateMessage(msgId, 'Sorry, something went wrong. Please try again.');
+                setStatus('error', 'Error');
+            }
+
+            isLoading = false;
+            sendBtn.disabled = false;
+            inputField.focus();
+        }
+
+        // Save to Vault modal state
+        let saveVaultContext = {
+            button: null,
+            question: '',
+            answer: ''
+        };
+
+        function openSaveVaultModal(btn) {
+            const msg = btn.closest('.message');
+            const content = msg.querySelector('.message-content').textContent;
+
+            // Find corresponding user message
+            let userContent = '';
+            let prev = msg.previousElementSibling;
+            while (prev) {
+                if (prev.classList.contains('user')) {
+                    userContent = prev.querySelector('.message-content').textContent;
+                    break;
+                }
+                prev = prev.previousElementSibling;
+            }
+
+            // Store context for submission
+            saveVaultContext = {
+                button: btn,
+                question: userContent,
+                answer: content
+            };
+
+            // Reset form to defaults
+            document.getElementById('vaultTitle').value = '';
+            document.getElementById('vaultFolder').value = '';
+            document.getElementById('vaultTags').value = '';
+            document.getElementById('vaultFullConversation').checked = true;
+            document.getElementById('vaultIncludeSources').checked = true;
+            document.getElementById('vaultIncludeRawQA').checked = false;
+            document.getElementById('vaultGuidance').value = '';
+            document.getElementById('vaultStatus').innerHTML = '';
+            document.getElementById('saveVaultBtn').disabled = false;
+            document.getElementById('saveVaultBtn').textContent = 'Save to Vault';
+
+            // Show modal
+            document.getElementById('saveVaultModal').classList.add('visible');
+            document.getElementById('vaultTitle').focus();
+        }
+
+        function closeSaveVaultModal() {
+            document.getElementById('saveVaultModal').classList.remove('visible');
+            saveVaultContext = { button: null, question: '', answer: '' };
+        }
+
+        async function submitSaveVault() {
+            const statusEl = document.getElementById('vaultStatus');
+            const saveBtn = document.getElementById('saveVaultBtn');
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            statusEl.innerHTML = '';
+
+            // Gather form values
+            const title = document.getElementById('vaultTitle').value.trim() || null;
+            const folder = document.getElementById('vaultFolder').value || null;
+            const tagsInput = document.getElementById('vaultTags').value.trim();
+            const tags = tagsInput ? tagsInput.split(',').map(t => t.trim()).filter(t => t) : null;
+            const fullConversation = document.getElementById('vaultFullConversation').checked;
+            const includeSources = document.getElementById('vaultIncludeSources').checked;
+            const includeRawQA = document.getElementById('vaultIncludeRawQA').checked;
+            const guidance = document.getElementById('vaultGuidance').value.trim() || null;
+
+            // Build request body
+            const body = {
+                include_sources: includeSources,
+                include_raw_qa: includeRawQA,
+                full_conversation: fullConversation
+            };
+
+            // Use conversation_id if available and full conversation mode
+            if (fullConversation && currentConversationId) {
+                body.conversation_id = currentConversationId;
+            } else {
+                // Fallback to single Q&A
+                body.question = saveVaultContext.question;
+                body.answer = saveVaultContext.answer;
+            }
+
+            if (title) body.title = title;
+            if (folder) body.folder = folder;
+            if (tags) body.tags = tags;
+            if (guidance) body.guidance = guidance;
+
+            try {
+                const response = await fetch('/api/save-to-vault', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+
+                    // Show success in modal
+                    statusEl.innerHTML = `<div class="modal-status success">Saved successfully!</div>`;
+
+                    // Update the original button to show saved state
+                    if (saveVaultContext.button) {
+                        const metaActions = saveVaultContext.button.closest('.meta-actions');
+                        if (metaActions && data.obsidian_url) {
+                            const fileName = data.path.split('/').pop();
+                            metaActions.innerHTML = `
+                                <a href="${data.obsidian_url}" class="source-link saved-link" title="Open in Obsidian">
+                                    ✓ Saved: ${fileName}
+                                </a>
+                            `;
+                        }
+                    }
+
+                    // Close modal after brief delay
+                    setTimeout(() => {
+                        closeSaveVaultModal();
+                    }, 1000);
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    const errorMsg = errorData.detail || 'Failed to save note';
+                    throw new Error(errorMsg);
+                }
+            } catch (error) {
+                console.error('Save error:', error);
+                statusEl.innerHTML = `<div class="modal-status error">Error: ${error.message}</div>`;
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save to Vault';
+            }
+        }
+
+        // Remember modal functions
+        function openRememberModal() {
+            document.getElementById('rememberModal').classList.add('visible');
+            document.getElementById('memoryInput').focus();
+            document.getElementById('memoryStatus').innerHTML = '';
+        }
+
+        function closeRememberModal() {
+            document.getElementById('rememberModal').classList.remove('visible');
+            document.getElementById('memoryInput').value = '';
+            document.getElementById('memoryStatus').innerHTML = '';
+        }
+
+        async function saveMemory() {
+            const input = document.getElementById('memoryInput');
+            const statusEl = document.getElementById('memoryStatus');
+            const saveBtn = document.getElementById('saveMemoryBtn');
+
+            const content = input.value.trim();
+            if (!content) {
+                statusEl.innerHTML = '<div class="modal-status error">Please enter something to remember.</div>';
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            statusEl.innerHTML = '';
+
+            try {
+                const response = await fetch('/api/memories', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: content, synthesize: true })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    statusEl.innerHTML = `
+                        <div class="modal-status success">
+                            Memory saved! Category: ${data.category}
+                        </div>
+                    `;
+                    saveBtn.textContent = 'Saved!';
+                    // Close modal after 1.5 seconds
+                    setTimeout(() => {
+                        closeRememberModal();
+                        saveBtn.textContent = 'Save Memory';
+                        saveBtn.disabled = false;
+                    }, 1500);
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || 'Failed to save memory');
+                }
+            } catch (error) {
+                console.error('Memory save error:', error);
+                statusEl.innerHTML = `<div class="modal-status error">Error: ${escapeHtml(error.message)}</div>`;
+                saveBtn.textContent = 'Save Memory';
+                saveBtn.disabled = false;
+            }
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+            const modKey = isMac ? e.metaKey : e.ctrlKey;
+
+            // Check if any modal is open
+            const rememberModalOpen = document.getElementById('rememberModal').classList.contains('visible');
+            const usageModalOpen = document.getElementById('usageModal').classList.contains('visible');
+            const saveVaultModalOpen = document.getElementById('saveVaultModal').classList.contains('visible');
+            const anyModalOpen = rememberModalOpen || usageModalOpen || saveVaultModalOpen;
+
+            // Escape - close any open modal
+            if (e.key === 'Escape') {
+                if (rememberModalOpen) closeRememberModal();
+                if (usageModalOpen) closeUsageModal();
+                if (saveVaultModalOpen) closeSaveVaultModal();
+                return;
+            }
+
+            // Enter - save memory when Remember modal is open
+            if (e.key === 'Enter' && !e.shiftKey && rememberModalOpen) {
+                e.preventDefault();
+                saveMemory();
+                return;
+            }
+
+            // Enter - submit save vault when Save Vault modal is open (only if not in textarea)
+            if (e.key === 'Enter' && !e.shiftKey && saveVaultModalOpen) {
+                const activeElement = document.activeElement;
+                if (activeElement.tagName !== 'TEXTAREA') {
+                    e.preventDefault();
+                    submitSaveVault();
+                    return;
+                }
+            }
+
+            // Don't handle other shortcuts if a modal is open
+            if (anyModalOpen) return;
+
+            // Cmd/Ctrl+K - new conversation
+            if (modKey && e.key.toLowerCase() === 'k') {
+                e.preventDefault();
+                newChat();
+                return;
+            }
+
+            // Cmd/Ctrl+A - open attachment file picker (only when not in text input)
+            if (modKey && e.key.toLowerCase() === 'a') {
+                // Allow default select-all behavior in text inputs
+                const activeEl = document.activeElement;
+                const isTextInput = activeEl && (
+                    activeEl.tagName === 'INPUT' ||
+                    activeEl.tagName === 'TEXTAREA' ||
+                    activeEl.isContentEditable
+                );
+
+                if (!isTextInput) {
+                    e.preventDefault();
+                    openFilePicker();
+                }
+                return;
+            }
+        });
+
+        // Usage modal functions
+        let usageChart = null;
+
+        async function openUsageModal() {
+            document.getElementById('usageModal').classList.add('visible');
+            // Show current session cost in modal
+            document.getElementById('usageSession').textContent = '$' + sessionCost.toFixed(3);
+            await loadUsageStats();
+        }
+
+        function closeUsageModal() {
+            document.getElementById('usageModal').classList.remove('visible');
+            if (usageChart) {
+                usageChart.destroy();
+                usageChart = null;
+            }
+        }
+
+        async function loadUsageStats() {
+            try {
+                const response = await fetch('/api/admin/usage');
+                if (!response.ok) throw new Error('Failed to fetch usage stats');
+
+                const data = await response.json();
+
+                // Update stat cards
+                document.getElementById('usage24h').textContent = '$' + data.last_24h.total_cost.toFixed(2);
+                document.getElementById('requests24h').textContent = data.last_24h.request_count + ' requests';
+
+                document.getElementById('usage7d').textContent = '$' + data.last_7d.total_cost.toFixed(2);
+                document.getElementById('requests7d').textContent = data.last_7d.request_count + ' requests';
+
+                document.getElementById('usage30d').textContent = '$' + data.last_30d.total_cost.toFixed(2);
+                document.getElementById('requests30d').textContent = data.last_30d.request_count + ' requests';
+
+                document.getElementById('usageAllTime').textContent = '$' + data.all_time.total_cost.toFixed(2);
+                document.getElementById('requestsAllTime').textContent = data.all_time.request_count + ' requests';
+
+                // Render chart
+                renderUsageChart(data.daily_breakdown);
+            } catch (error) {
+                console.error('Error loading usage stats:', error);
+            }
+        }
+
+        function renderUsageChart(dailyData) {
+            const ctx = document.getElementById('usageChart').getContext('2d');
+
+            // Generate date range starting from Jan 1 of current year
+            const startDate = new Date(new Date().getFullYear(), 0, 1);
+            const today = new Date();
+            const labels = [];
+            const costMap = {};
+
+            // Create map of existing data
+            dailyData.forEach(d => {
+                costMap[d.date] = d.cost;
+            });
+
+            // Generate all dates from start to today
+            const currentDate = new Date(startDate);
+            while (currentDate <= today) {
+                const dateStr = currentDate.toISOString().split('T')[0];
+                labels.push(dateStr);
+                currentDate.setDate(currentDate.getDate() + 1);
+            }
+
+            // Get costs for each date (0 if no data)
+            const costs = labels.map(date => costMap[date] || 0);
+
+            // Format labels for display (M/D format)
+            const displayLabels = labels.map(date => {
+                const d = new Date(date + 'T00:00:00');
+                return (d.getMonth() + 1) + '/' + d.getDate();
+            });
+
+            // Destroy existing chart if any
+            if (usageChart) {
+                usageChart.destroy();
+            }
+
+            usageChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: displayLabels,
+                    datasets: [{
+                        label: 'Daily Cost ($)',
+                        data: costs,
+                        backgroundColor: 'rgba(233, 69, 96, 0.7)',
+                        borderColor: 'rgba(233, 69, 96, 1)',
+                        borderWidth: 1,
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return '$' + context.parsed.y.toFixed(3);
+                                },
+                                title: function(context) {
+                                    const idx = context[0].dataIndex;
+                                    return labels[idx];
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                color: 'rgba(42, 42, 78, 0.5)'
+                            },
+                            ticks: {
+                                color: '#a0a0a0',
+                                maxRotation: 45,
+                                minRotation: 45,
+                                autoSkip: true,
+                                maxTicksLimit: 15
+                            }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            grid: {
+                                color: 'rgba(42, 42, 78, 0.5)'
+                            },
+                            ticks: {
+                                color: '#a0a0a0',
+                                callback: function(value) {
+                                    return '$' + value.toFixed(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Utilities
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatDate(dateStr) {
+            if (!dateStr) return '';
+            const date = new Date(dateStr);
+            const now = new Date();
+            const diff = now - date;
+
+            // Under 1 minute: "Just now"
+            if (diff < 60000) return 'Just now';
+
+            // Under 1 hour: "5m ago", "23m ago"
+            if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+
+            // Check if date is today (same calendar day in local timezone)
+            const isToday = date.toDateString() === now.toDateString();
+
+            // Under 24 hours AND today: "2h ago", "11h ago"
+            if (diff < 86400000 && isToday) {
+                return Math.floor(diff / 3600000) + 'h ago';
+            }
+
+            // Check if date is yesterday
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            const isYesterday = date.toDateString() === yesterday.toDateString();
+
+            // Format time as "3:15 PM"
+            const timeStr = date.toLocaleTimeString('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            });
+
+            // Yesterday: "Yesterday 3:15 PM"
+            if (isYesterday) {
+                return 'Yesterday ' + timeStr;
+            }
+
+            // Format month and day as "Jan 8"
+            const monthDay = date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric'
+            });
+
+            // Check if same year
+            const isSameYear = date.getFullYear() === now.getFullYear();
+
+            // This year: "Jan 8" (short) or could include time for recent dates
+            if (isSameYear) {
+                // For dates within the last week, include time
+                if (diff < 604800000) {
+                    return monthDay + ', ' + timeStr;
+                }
+                // Older this-year dates: just "Jan 8"
+                return monthDay;
+            }
+
+            // Older (different year): "Jan 8, 2025"
+            return date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric'
+            });
+        }
+
+        // Page routing
+        function navigateToPage(page) {
+            // Hide all pages
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+
+            // Show the requested page
+            if (page === 'crm') {
+                document.getElementById('crmPage').classList.add('active');
+                window.location.hash = '/crm';
+                // Initialize CRM when navigating to it
+                if (typeof initCrm === 'function') {
+                    initCrm();
+                }
+            } else {
+                document.getElementById('chatPage').classList.add('active');
+                window.location.hash = '/';
+            }
+        }
+
+        function handleRouting() {
+            const hash = window.location.hash;
+
+            if (hash === '#/crm') {
+                navigateToPage('crm');
+            } else {
+                navigateToPage('chat');
+            }
+        }
+
+        // Handle hash changes
+        window.addEventListener('hashchange', handleRouting);
+
+        // Initialize
+        setStatus('', 'Ready');
+        handleRouting(); // Handle initial route
+
+        // ============================================
+        // CRM Tab Switching
+        // ============================================
+        function switchCrmTab(tab) {
+            // Update tab buttons
+            document.querySelectorAll('.crm-tab').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tab);
+            });
+
+            // Show/hide tab content
+            document.getElementById('crmPeopleTab').style.display = tab === 'people' ? 'flex' : 'none';
+            document.getElementById('crmNetworkTab').style.display = tab === 'network' ? 'flex' : 'none';
+
+            // Initialize network graph when switching to network tab
+            if (tab === 'network') {
+                if (!networkInitialized) {
+                    // Use setTimeout to ensure container is visible before getting dimensions
+                    setTimeout(() => initNetworkGraph(), 50);
+                } else {
+                    // Re-render with correct dimensions if already initialized
+                    setTimeout(() => {
+                        const container = document.getElementById('networkGraph');
+                        const rect = container.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && networkSvg) {
+                            networkSvg.attr('viewBox', [0, 0, rect.width, rect.height]);
+                            renderNetwork();
+                        }
+                    }, 50);
+                }
+            }
+        }
+
+        // ============================================
+        // D3.js Network Graph
+        // ============================================
+        let networkInitialized = false;
+        let networkSimulation = null;
+        let networkSvg = null;
+        let networkData = { nodes: [], edges: [] };
+        let selectedNetworkNode = null;
+        let networkCenterPersonId = null;  // Person ID to center the graph on
+
+        // Category colors
+        const categoryColors = {
+            work: '#3182ce',
+            personal: '#38a169',
+            family: '#d69e2e',
+            unknown: '#718096'
+        };
+
+        async function initNetworkGraph() {
+            const container = document.getElementById('networkGraph');
+            let rect = container.getBoundingClientRect();
+
+            // If container is hidden, use fallback dimensions (will be updated on render)
+            const width = rect.width || 800;
+            const height = rect.height || 600;
+
+            // Create SVG
+            networkSvg = d3.select('#networkGraph')
+                .append('svg')
+                .attr('width', '100%')
+                .attr('height', '100%')
+                .attr('viewBox', [0, 0, width, height]);
+
+            // Add zoom behavior
+            const zoom = d3.zoom()
+                .scaleExtent([0.1, 4])
+                .on('zoom', (event) => {
+                    networkSvg.select('g.network-content').attr('transform', event.transform);
+                });
+
+            networkSvg.call(zoom);
+
+            // Double-click to reset view
+            networkSvg.on('dblclick.zoom', () => {
+                networkSvg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+            });
+
+            // Create container group
+            networkSvg.append('g').attr('class', 'network-content');
+
+            // Create tooltip
+            const tooltip = d3.select('#networkGraph')
+                .append('div')
+                .attr('class', 'network-tooltip')
+                .style('display', 'none');
+
+            networkInitialized = true;
+
+            // Load initial data
+            await loadNetworkData();
+        }
+
+        async function loadNetworkData(centerOnPersonId = null) {
+            const container = document.getElementById('networkGraph');
+
+            // Update center person if provided
+            if (centerOnPersonId !== null) {
+                networkCenterPersonId = centerOnPersonId;
+            }
+
+            try {
+                // Build query params based on filters
+                const strengthSlider = document.getElementById('networkStrengthSlider');
+                const minStrength = strengthSlider ? parseInt(strengthSlider.value) / 100 : 0;
+
+                const params = new URLSearchParams();
+                if (minStrength > 0) params.append('min_strength', minStrength.toFixed(2));
+
+                // Add center_on and depth for second-degree connections
+                if (networkCenterPersonId) {
+                    params.append('center_on', networkCenterPersonId);
+                    params.append('depth', '2');  // Include second-degree connections
+                }
+
+                const response = await fetch(`/api/crm/network?${params.toString()}`);
+                if (!response.ok) throw new Error('Failed to load network data');
+
+                networkData = await response.json();
+
+                // Filter by selected categories
+                const categories = getSelectedCategories();
+                networkData.nodes = networkData.nodes.filter(n => categories.includes(n.category));
+
+                // Filter edges to only include nodes that exist
+                const nodeIds = new Set(networkData.nodes.map(n => n.id));
+                networkData.edges = networkData.edges.filter(e =>
+                    nodeIds.has(e.source) && nodeIds.has(e.target)
+                );
+
+                renderNetwork();
+            } catch (error) {
+                console.error('Error loading network data:', error);
+                container.innerHTML = `
+                    <div class="network-empty">
+                        <div class="network-empty-icon">⚠️</div>
+                        <p>Failed to load network data</p>
+                    </div>
+                `;
+            }
+        }
+
+        function getSelectedCategories() {
+            const categories = [];
+            if (document.getElementById('networkCatWork')?.checked) categories.push('work');
+            if (document.getElementById('networkCatPersonal')?.checked) categories.push('personal');
+            if (document.getElementById('networkCatFamily')?.checked) categories.push('family');
+            if (document.getElementById('networkCatUnknown')?.checked) categories.push('unknown');
+            return categories;
+        }
+
+        function renderNetwork() {
+            const container = document.getElementById('networkGraph');
+            const rect = container.getBoundingClientRect();
+            const width = rect.width;
+            const height = rect.height;
+
+            if (networkData.nodes.length === 0) {
+                const content = networkSvg.select('g.network-content');
+                content.selectAll('*').remove();
+                container.querySelector('.network-empty')?.remove();
+                container.insertAdjacentHTML('beforeend', `
+                    <div class="network-empty">
+                        <div class="network-empty-icon">🔗</div>
+                        <p>No connections found.<br>Try adjusting the filters or adding more relationships.</p>
+                    </div>
+                `);
+                return;
+            }
+
+            // Remove any empty state
+            container.querySelector('.network-empty')?.remove();
+
+            // Get the content group
+            const content = networkSvg.select('g.network-content');
+            content.selectAll('*').remove();
+
+            // Create copy of data for D3 (it will mutate it)
+            const nodes = networkData.nodes.map(d => ({...d}));
+            const links = networkData.edges.map(d => ({
+                source: d.source,
+                target: d.target,
+                weight: d.weight,
+                type: d.type
+            }));
+
+            // Stop any existing simulation
+            if (networkSimulation) {
+                networkSimulation.stop();
+            }
+
+            // Create force simulation
+            networkSimulation = d3.forceSimulation(nodes)
+                .force('link', d3.forceLink(links)
+                    .id(d => d.id)
+                    .distance(100))
+                .force('charge', d3.forceManyBody().strength(-200))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('collision', d3.forceCollide().radius(d => getNodeRadius(d) + 5));
+
+            // Create links
+            const link = content.append('g')
+                .attr('class', 'links')
+                .selectAll('line')
+                .data(links)
+                .join('line')
+                .attr('class', 'network-link')
+                .attr('stroke-width', d => Math.max(1, Math.min(5, d.weight / 5)))
+                .attr('stroke-opacity', d => Math.min(0.8, 0.2 + d.weight / 50));
+
+            // Create node groups
+            const node = content.append('g')
+                .attr('class', 'nodes')
+                .selectAll('g')
+                .data(nodes)
+                .join('g')
+                .attr('class', d => `network-node degree-${d.degree}`)
+                .call(d3.drag()
+                    .on('start', dragstarted)
+                    .on('drag', dragged)
+                    .on('end', dragended));
+
+            // Add circles to nodes
+            node.append('circle')
+                .attr('r', d => getNodeRadius(d))
+                .attr('fill', d => categoryColors[d.category] || categoryColors.unknown)
+                .attr('fill-opacity', d => d.degree === 2 ? 0.5 : 1);
+
+            // Add labels to high-strength nodes
+            node.filter(d => d.strength > 0.7)
+                .append('text')
+                .attr('class', 'network-node-label')
+                .attr('dy', d => getNodeRadius(d) + 12)
+                .text(d => d.name.split(' ')[0]); // First name only
+
+            // Add tooltips
+            const tooltip = d3.select('#networkGraph .network-tooltip');
+
+            node.on('mouseover', (event, d) => {
+                const degreeLabel = d.degree === 0 ? 'Center' : (d.degree === 1 ? '1st degree' : '2nd degree');
+                tooltip
+                    .style('display', 'block')
+                    .style('left', (event.offsetX + 10) + 'px')
+                    .style('top', (event.offsetY - 10) + 'px')
+                    .html(`
+                        <strong>${d.name}</strong><br>
+                        ${degreeLabel}<br>
+                        Category: ${d.category}<br>
+                        Strength: ${(d.strength * 100).toFixed(0)}%<br>
+                        Interactions: ${d.interaction_count}
+                    `);
+            })
+            .on('mouseout', () => {
+                tooltip.style('display', 'none');
+            })
+            .on('click', (event, d) => {
+                event.stopPropagation();
+                selectNetworkNode(d);
+            });
+
+            // Update positions on tick
+            networkSimulation.on('tick', () => {
+                link
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+
+                node.attr('transform', d => `translate(${d.x},${d.y})`);
+            });
+
+            // Drag functions
+            function dragstarted(event, d) {
+                if (!event.active) networkSimulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+
+            function dragended(event, d) {
+                if (!event.active) networkSimulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }
+        }
+
+        function getNodeRadius(node) {
+            const baseRadius = 5 + node.strength * 20;
+            // Center node (degree 0) is largest, first-degree normal, second-degree smaller
+            if (node.degree === 0) {
+                return baseRadius * 1.5;  // Center person is 50% larger
+            } else if (node.degree === 2) {
+                return baseRadius * 0.7;  // Second-degree is 30% smaller
+            }
+            return baseRadius;
+        }
+
+        function selectNetworkNode(node) {
+            selectedNetworkNode = node;
+
+            // Update visual selection
+            d3.selectAll('.network-node').classed('selected', d => d.id === node.id);
+
+            // Update the detail panel with this person's info
+            if (typeof selectCrmPerson === 'function') {
+                selectCrmPerson(node.id);
+            }
+
+            // Re-center the graph on this person to show their connections
+            loadNetworkData(node.id);
+        }
+
+        function updateNetworkFilters() {
+            // Update strength display
+            const slider = document.getElementById('networkStrengthSlider');
+            const valueDisplay = document.getElementById('networkStrengthValue');
+            if (slider && valueDisplay) {
+                valueDisplay.textContent = slider.value + '%';
+            }
+
+            // Reload data with new filters
+            if (networkInitialized) {
+                loadNetworkData();
+            }
+        }
+
+        function resetNetworkView() {
+            // Reset filters
+            document.getElementById('networkStrengthSlider').value = 0;
+            document.getElementById('networkStrengthValue').textContent = '0%';
+            document.getElementById('networkCatWork').checked = true;
+            document.getElementById('networkCatPersonal').checked = true;
+            document.getElementById('networkCatFamily').checked = true;
+            document.getElementById('networkCatUnknown').checked = true;
+
+            // Reset center person
+            networkCenterPersonId = null;
+            selectedNetworkNode = null;
+
+            // Reset zoom
+            if (networkSvg) {
+                networkSvg.transition().duration(500).call(
+                    d3.zoom().transform,
+                    d3.zoomIdentity
+                );
+            }
+
+            // Reload data without center
+            loadNetworkData();
+        }
+
+        // =====================
+        // CRM People List Functionality
+        // =====================
+
+        // CRM State
+        const crmState = {
+            initialized: false,
+            people: [],
+            selectedPersonId: null,
+            searchQuery: '',
+            timelineFilter: null, // null = all, or 'gmail', 'calendar', 'imessage', etc.
+            timelineDaysShown: 30, // Number of days currently shown
+            timelineData: null, // Cached timeline data for load more
+            sortBy: 'strength',
+            showAll: false,
+            reviewQueue: [],
+            reviewIndex: 0,
+            searchDebounce: null,
+        };
+
+        // Initialize CRM when page is shown
+        function initCrm() {
+            if (!crmState.initialized) {
+                crmState.initialized = true;
+                loadCrmPeople();
+                loadReviewQueueCount();
+            }
+        }
+
+        // Load people from API
+        async function loadCrmPeople() {
+            const peopleList = document.getElementById('crmPeopleList');
+            peopleList.innerHTML = '<div class="crm-loading">Loading people...</div>';
+
+            try {
+                const params = new URLSearchParams();
+                params.set('sort', crmState.sortBy);
+                params.set('limit', '200');
+
+                if (crmState.searchQuery) {
+                    params.set('q', crmState.searchQuery);
+                }
+
+                // By default, hide zero-interaction people unless showAll is enabled
+                if (!crmState.showAll) {
+                    params.set('has_interactions', 'true');
+                }
+
+                const response = await fetch(`/api/crm/people?${params.toString()}`);
+                if (!response.ok) throw new Error('Failed to load people');
+
+                const data = await response.json();
+                crmState.people = data.people || [];
+
+                renderCrmPeopleList();
+                document.getElementById('crmStatsBadge').textContent = data.total || crmState.people.length;
+            } catch (error) {
+                console.error('Error loading CRM people:', error);
+                peopleList.innerHTML = '<div class="crm-empty-state"><p>Failed to load people</p></div>';
+            }
+        }
+
+        // Render people list
+        function renderCrmPeopleList() {
+            const peopleList = document.getElementById('crmPeopleList');
+
+            if (crmState.people.length === 0) {
+                const emptyMessage = crmState.searchQuery
+                    ? 'No people match your search'
+                    : (crmState.showAll ? 'No people found' : 'No people with interactions found');
+                peopleList.innerHTML = `<div class="crm-empty-state"><p>${emptyMessage}</p></div>`;
+                return;
+            }
+
+            peopleList.innerHTML = crmState.people.map(person => {
+                const initials = getInitials(person.canonical_name || person.display_name || '?');
+                const isActive = person.id === crmState.selectedPersonId;
+
+                return `
+                    <div class="crm-person-card ${isActive ? 'active' : ''}" onclick="selectCrmPerson('${person.id}')">
+                        <div class="crm-person-avatar">${initials}</div>
+                        <div class="crm-person-info">
+                            <div class="crm-person-name">${escapeHtml(person.canonical_name || person.display_name)}</div>
+                            <div class="crm-person-meta">${escapeHtml(person.company || person.emails?.[0] || '')}</div>
+                            <div class="crm-person-stats">
+                                ${person.email_count ? `<span class="crm-person-stat" title="Emails">📧${person.email_count}</span>` : ''}
+                                ${person.meeting_count ? `<span class="crm-person-stat" title="Meetings">📅${person.meeting_count}</span>` : ''}
+                                ${person.message_count ? `<span class="crm-person-stat" title="Messages">💬${person.message_count}</span>` : ''}
+                                ${person.mention_count ? `<span class="crm-person-stat" title="Mentions">📝${person.mention_count}</span>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Get initials from name
+        function getInitials(name) {
+            return name
+                .split(' ')
+                .map(part => part.charAt(0).toUpperCase())
+                .slice(0, 2)
+                .join('');
+        }
+
+        // Handle search input
+        function handleCrmSearch() {
+            clearTimeout(crmState.searchDebounce);
+            crmState.searchDebounce = setTimeout(() => {
+                crmState.searchQuery = document.getElementById('crmSearchInput').value.trim();
+                loadCrmPeople();
+            }, 300);
+        }
+
+        // Handle sort change
+        function handleCrmSortChange() {
+            crmState.sortBy = document.getElementById('crmSortSelect').value;
+            loadCrmPeople();
+        }
+
+        // Handle show all toggle
+        function handleCrmShowAllChange() {
+            const checkbox = document.getElementById('crmShowAllCheckbox');
+            crmState.showAll = checkbox.checked;
+            document.getElementById('crmShowAllToggle').classList.toggle('active', crmState.showAll);
+            loadCrmPeople();
+        }
+
+        // Select a person with progressive loading
+        async function selectCrmPerson(personId) {
+            crmState.selectedPersonId = personId;
+            renderCrmPeopleList(); // Update active state
+
+            // 1. Immediately show header with name from list (instant feedback)
+            const personFromList = crmState.people.find(p => p.id === personId);
+            renderPersonHeaderWithSkeletons(personFromList || { id: personId });
+
+            // 2. Load full person data in background
+            try {
+                const response = await fetch(`/api/crm/people/${personId}`);
+                if (!response.ok) throw new Error('Failed to load person');
+
+                const person = await response.json();
+                renderCrmPersonDetail(person);
+            } catch (error) {
+                console.error('Error loading person:', error);
+                // Show error but keep the header visible
+                const contentArea = document.getElementById('crmDetailContent');
+                if (contentArea) {
+                    contentArea.innerHTML = `
+                        <div class="crm-section-error">
+                            <div class="error-icon">!</div>
+                            <div>Failed to load person details</div>
+                            <button class="crm-retry-btn" onclick="selectCrmPerson('${personId}')">Retry</button>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        // Render person header immediately with skeleton placeholders for content
+        function renderPersonHeaderWithSkeletons(person) {
+            const main = document.getElementById('crmMain');
+            const name = person.canonical_name || person.display_name || 'Loading...';
+            const initials = getInitials(name);
+            const company = person.company || '';
+            const position = person.position || '';
+
+            main.innerHTML = `
+                <div class="crm-detail-header">
+                    <div style="display: flex; align-items: center; gap: 1rem;">
+                        <div class="crm-person-avatar" style="width: 56px; height: 56px; font-size: 1.25rem;">${initials}</div>
+                        <div>
+                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(name)}</h2>
+                            <p style="color: var(--text-secondary); font-size: 0.875rem;">
+                                ${position ? escapeHtml(position) + ' at ' : ''}
+                                ${company ? escapeHtml(company) : ''}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                <div class="crm-detail-content" id="crmDetailContent">
+                    <!-- Skeleton stats grid -->
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                    </div>
+
+                    <!-- Skeleton contact info -->
+                    <div class="crm-skeleton-section">
+                        <div class="crm-skeleton crm-skeleton-text short"></div>
+                        <div class="crm-skeleton crm-skeleton-text medium"></div>
+                    </div>
+
+                    <!-- Timeline loading placeholder -->
+                    <div class="crm-timeline" id="personTimeline">
+                        <div class="crm-section-loading">
+                            <div class="spinner"></div>
+                            <span>Loading timeline...</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Render person detail view
+        function renderCrmPersonDetail(person) {
+            const main = document.getElementById('crmMain');
+            const initials = getInitials(person.canonical_name || person.display_name || '?');
+
+            main.innerHTML = `
+                <div class="crm-detail-header">
+                    <div style="display: flex; align-items: center; gap: 1rem;">
+                        <div class="crm-person-avatar" style="width: 56px; height: 56px; font-size: 1.25rem;">${initials}</div>
+                        <div>
+                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(person.canonical_name || person.display_name)}</h2>
+                            <p style="color: var(--text-secondary); font-size: 0.875rem;">
+                                ${person.position ? escapeHtml(person.position) + ' at ' : ''}
+                                ${person.company ? escapeHtml(person.company) : ''}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                <div class="crm-detail-content">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.email_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Emails</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.meeting_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Meetings</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.message_count ? person.message_count.toLocaleString() : 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Messages</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.mention_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Mentions</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${Math.round(person.relationship_strength * 100)}%</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Strength</div>
+                        </div>
+                    </div>
+
+                    ${person.emails?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Email</h3>
+                        ${person.emails.map(email => `<p style="font-size: 0.875rem; color: var(--text-primary);">${escapeHtml(email)}</p>`).join('')}
+                    </div>
+                    ` : ''}
+
+                    ${person.phone_numbers?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Phone</h3>
+                        ${person.phone_numbers.map(phone => `<p style="font-size: 0.875rem; color: var(--text-primary);">${escapeHtml(phone)}</p>`).join('')}
+                    </div>
+                    ` : ''}
+
+                    ${person.notes ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Notes</h3>
+                        <p style="font-size: 0.875rem; color: var(--text-primary); white-space: pre-wrap;">${escapeHtml(person.notes)}</p>
+                    </div>
+                    ` : ''}
+
+                    ${person.tags?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Tags</h3>
+                        <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                            ${person.tags.map(tag => `<span style="background: var(--bg-tertiary); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem;">${escapeHtml(tag)}</span>`).join('')}
+                        </div>
+                    </div>
+                    ` : ''}
+
+                    <div class="crm-timeline" id="personTimeline">
+                        <div class="crm-section-loading">
+                            <div class="spinner"></div>
+                            <span>Loading timeline...</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Load timeline after rendering (non-blocking)
+            loadPersonTimeline(person.id);
+        }
+
+        // Load and render aggregated timeline for a person with timeout handling
+        // Performance: days_back=90 for fast initial load (vs 365 before)
+        async function loadPersonTimeline(personId, sourceTypeFilter = null, daysBack = 90) {
+            const container = document.getElementById('personTimeline');
+            if (!container) return;
+
+            // Reset days shown when loading fresh
+            crmState.timelineDaysShown = 30;
+            crmState.timelineFilter = sourceTypeFilter;
+            crmState.timelineDaysBack = daysBack;
+
+            // Show initial loading state
+            container.innerHTML = `
+                <div class="crm-section-loading" id="timelineLoadingState">
+                    <div class="spinner"></div>
+                    <span>Loading timeline...</span>
+                </div>
+            `;
+
+            // Set up timeout handlers for slow loading feedback
+            let slowTimeout, failTimeout;
+            const loadingState = document.getElementById('timelineLoadingState');
+
+            slowTimeout = setTimeout(() => {
+                if (loadingState) {
+                    loadingState.classList.add('slow');
+                    loadingState.querySelector('span').textContent = 'Taking longer than expected...';
+                }
+            }, 10000); // 10 seconds
+
+            failTimeout = setTimeout(() => {
+                if (loadingState) {
+                    container.innerHTML = `
+                        <div class="crm-timeline-header">
+                            <h3>Timeline</h3>
+                        </div>
+                        <div class="crm-section-error">
+                            <div class="error-icon">!</div>
+                            <div>Timeline is taking too long to load</div>
+                            <button class="crm-retry-btn" onclick="loadPersonTimeline('${personId}', ${sourceTypeFilter ? `'${sourceTypeFilter}'` : 'null'}, ${daysBack})">Retry</button>
+                        </div>
+                    `;
+                }
+            }, 30000); // 30 seconds
+
+            try {
+                // Fetch 90 days with items (was 365, caused slow loads)
+                let url = `/api/crm/people/${personId}/timeline/aggregated?days_back=${daysBack}&include_items=true&max_items_per_group=10`;
+                if (sourceTypeFilter) {
+                    url += `&source_type=${sourceTypeFilter}`;
+                }
+                const response = await fetch(url);
+
+                // Clear timeouts on success
+                clearTimeout(slowTimeout);
+                clearTimeout(failTimeout);
+
+                if (!response.ok) throw new Error('Failed to load timeline');
+
+                const data = await response.json();
+                crmState.timelineData = data; // Store for "load more"
+                renderPersonTimeline(container, data);
+            } catch (error) {
+                // Clear timeouts on error
+                clearTimeout(slowTimeout);
+                clearTimeout(failTimeout);
+
+                console.error('Error loading timeline:', error);
+                container.innerHTML = `
+                    <div class="crm-timeline-header">
+                        <h3>Timeline</h3>
+                    </div>
+                    <div class="crm-section-error">
+                        <div class="error-icon">!</div>
+                        <div>Failed to load timeline</div>
+                        <button class="crm-retry-btn" onclick="loadPersonTimeline('${personId}', ${sourceTypeFilter ? `'${sourceTypeFilter}'` : 'null'}, ${daysBack})">Retry</button>
+                    </div>
+                `;
+            }
+        }
+
+        // Filter timeline by source type
+        function filterTimeline(sourceType) {
+            crmState.timelineFilter = sourceType;
+            if (crmState.selectedPersonId) {
+                loadPersonTimeline(crmState.selectedPersonId, sourceType);
+            }
+        }
+
+        // Load more timeline days
+        function loadMoreTimelineDays() {
+            crmState.timelineDaysShown += 30;
+            const container = document.getElementById('personTimeline');
+            if (container && crmState.timelineData) {
+                renderPersonTimeline(container, crmState.timelineData);
+            }
+        }
+
+        // Render aggregated timeline
+        function renderPersonTimeline(container, data) {
+            if (!data.days || data.days.length === 0) {
+                container.innerHTML = `
+                    <div class="crm-timeline-header">
+                        <h3>Timeline</h3>
+                    </div>
+                    <div class="crm-timeline-loading">No interactions found</div>
+                `;
+                return;
+            }
+
+            // Format source type for display
+            function formatSourceType(type) {
+                const names = {
+                    gmail: 'emails',
+                    calendar: 'meetings',
+                    vault: 'notes',
+                    granola: 'notes',
+                    imessage: 'messages',
+                    whatsapp: 'messages',
+                    contacts: 'contacts',
+                    phone: 'calls'
+                };
+                return names[type] || type;
+            }
+
+            // Build date range text
+            let dateRangeText = '';
+            if (data.date_range_start && data.date_range_end) {
+                dateRangeText = `${data.date_range_start} to ${data.date_range_end}`;
+            }
+
+            // Collect unique source types for filter buttons
+            const sourceTypes = new Set();
+            for (const day of data.days) {
+                for (const group of day.groups) {
+                    sourceTypes.add(group.source_type);
+                }
+            }
+
+            // Build filter buttons HTML
+            const activeFilter = crmState.timelineFilter;
+            let filterButtonsHtml = `
+                <button class="crm-timeline-filter-btn ${!activeFilter ? 'active' : ''}" onclick="filterTimeline(null)">All</button>
+            `;
+            const filterLabels = {
+                gmail: '📧 Email',
+                calendar: '📅 Calendar',
+                vault: '📝 Notes',
+                granola: '📝 Notes',
+                imessage: '💬 iMessage',
+                whatsapp: '💬 WhatsApp',
+                contacts: '📇 Contacts',
+                phone: '📞 Phone'
+            };
+            for (const type of sourceTypes) {
+                const label = filterLabels[type] || type;
+                filterButtonsHtml += `
+                    <button class="crm-timeline-filter-btn ${activeFilter === type ? 'active' : ''}" onclick="filterTimeline('${type}')">${label}</button>
+                `;
+            }
+
+            let html = `
+                <div class="crm-timeline-header">
+                    <h3>Timeline</h3>
+                    <span class="crm-timeline-meta">${data.total_interactions.toLocaleString()} interactions</span>
+                </div>
+                <div class="crm-timeline-filters">
+                    ${filterButtonsHtml}
+                </div>
+            `;
+
+            // Show days based on current limit
+            const daysToShow = data.days.slice(0, crmState.timelineDaysShown);
+
+            for (const day of daysToShow) {
+                html += `
+                    <div class="crm-timeline-day">
+                        <div class="crm-timeline-date">
+                            <span>${escapeHtml(day.date_display)}</span>
+                            <span class="crm-timeline-date-count">${day.total_count} interaction${day.total_count !== 1 ? 's' : ''}</span>
+                        </div>
+                        <div class="crm-timeline-groups">
+                `;
+
+                for (const group of day.groups) {
+                    const groupId = `timeline-group-${day.date}-${group.source_type}`;
+                    const hasItems = group.items && group.items.length > 0;
+
+                    html += `
+                        <div class="crm-timeline-group" id="${groupId}">
+                            <div class="crm-timeline-group-header" onclick="toggleTimelineGroup('${groupId}')">
+                                <div class="crm-timeline-group-badge">${group.source_badge}</div>
+                                <div class="crm-timeline-group-info">
+                                    <div class="crm-timeline-group-title">
+                                        <span>${group.count} ${formatSourceType(group.source_type)}</span>
+                                        <span class="crm-timeline-group-count">${group.count}</span>
+                                    </div>
+                                    ${group.preview ? `<div class="crm-timeline-group-preview">${escapeHtml(group.preview)}</div>` : ''}
+                                </div>
+                                ${hasItems ? '<div class="crm-timeline-group-expand">▼</div>' : ''}
+                            </div>
+                    `;
+
+                    if (hasItems) {
+                        html += `<div class="crm-timeline-items" id="${groupId}-items">`;
+                        for (const item of group.items) {
+                            html += `
+                                <div class="crm-timeline-item">
+                                    <div class="crm-timeline-item-title">
+                                        ${item.source_link ? `<a href="${escapeHtml(item.source_link)}" target="_blank">${escapeHtml(item.title)}</a>` : escapeHtml(item.title)}
+                                        ${item.snippet ? `<div class="crm-timeline-item-snippet">${escapeHtml(item.snippet)}</div>` : ''}
+                                    </div>
+                                </div>
+                            `;
+                        }
+                        html += '</div>';
+                    }
+                    html += '</div>'; // Close crm-timeline-group
+                }
+
+                html += `
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Show "Load More" button if there are more days
+            if (data.days.length > crmState.timelineDaysShown) {
+                const remainingDays = data.days.length - crmState.timelineDaysShown;
+                html += `
+                    <button class="crm-timeline-load-more" onclick="loadMoreTimelineDays()">
+                        Load ${Math.min(30, remainingDays)} more days (${remainingDays} remaining)
+                    </button>
+                `;
+            }
+
+            // Show "Load Full Year" button if we loaded less than 365 days
+            if (crmState.timelineDaysBack < 365) {
+                html += `
+                    <button class="crm-timeline-load-more" style="margin-top: 0.5rem; background: var(--bg-tertiary);" onclick="loadFullYearTimeline()">
+                        Load Full Year History
+                    </button>
+                `;
+            }
+
+            container.innerHTML = html;
+        }
+
+        // Load full year timeline (slower, but complete)
+        function loadFullYearTimeline() {
+            if (crmState.selectedPersonId) {
+                loadPersonTimeline(crmState.selectedPersonId, crmState.timelineFilter, 365);
+            }
+        }
+
+        // Toggle timeline group expansion
+        function toggleTimelineGroup(groupId) {
+            const group = document.getElementById(groupId);
+            if (group) {
+                group.classList.toggle('expanded');
+            }
+        }
+
+        // =====================
+        // Review Queue
+        // =====================
+
+        // Load review queue count for badge
+        async function loadReviewQueueCount() {
+            try {
+                const response = await fetch('/api/crm/review-queue?limit=1');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const badge = document.getElementById('crmReviewBadge');
+                const count = data.total_pending || 0;
+                badge.textContent = count;
+                badge.classList.toggle('empty', count === 0);
+            } catch (error) {
+                console.error('Error loading review queue count:', error);
+            }
+        }
+
+        // Open review queue modal
+        async function openReviewQueueModal() {
+            document.getElementById('reviewQueueModal').classList.add('visible');
+            await loadReviewQueue();
+        }
+
+        // Close review queue modal
+        function closeReviewQueueModal() {
+            document.getElementById('reviewQueueModal').classList.remove('visible');
+        }
+
+        // Load review queue
+        async function loadReviewQueue() {
+            const body = document.getElementById('reviewQueueBody');
+            body.innerHTML = '<div class="crm-loading">Loading review queue...</div>';
+
+            try {
+                const response = await fetch('/api/crm/review-queue?limit=50');
+                if (!response.ok) throw new Error('Failed to load review queue');
+
+                const data = await response.json();
+                crmState.reviewQueue = data.items || [];
+                crmState.reviewIndex = 0;
+
+                renderReviewQueueItem();
+            } catch (error) {
+                console.error('Error loading review queue:', error);
+                body.innerHTML = '<div class="review-empty"><p>Failed to load review queue</p></div>';
+            }
+        }
+
+        // Render current review queue item
+        function renderReviewQueueItem() {
+            const body = document.getElementById('reviewQueueBody');
+
+            if (crmState.reviewQueue.length === 0) {
+                body.innerHTML = `
+                    <div class="review-empty">
+                        <div class="review-empty-icon">✅</div>
+                        <p>No items to review</p>
+                        <p style="font-size: 0.75rem; margin-top: 0.5rem;">All matches have been confirmed or rejected.</p>
+                    </div>
+                `;
+                document.getElementById('crmReviewBadge').textContent = '0';
+                document.getElementById('crmReviewBadge').classList.add('empty');
+                return;
+            }
+
+            const item = crmState.reviewQueue[crmState.reviewIndex];
+            const total = crmState.reviewQueue.length;
+            const current = crmState.reviewIndex + 1;
+            const progress = (current / total) * 100;
+
+            // Determine confidence level for styling
+            let confidenceClass = 'low';
+            if (item.confidence >= 0.7) confidenceClass = 'high';
+            else if (item.confidence >= 0.5) confidenceClass = 'medium';
+
+            body.innerHTML = `
+                <div class="review-progress">
+                    <span>${current} of ${total}</span>
+                    <div class="review-progress-bar">
+                        <div class="review-progress-fill" style="width: ${progress}%"></div>
+                    </div>
+                    <span>${Math.round(progress)}%</span>
+                </div>
+
+                <div class="review-item">
+                    <div class="review-source-info">
+                        <div class="review-source-label">Source Entity</div>
+                        <div class="review-source-name">${escapeHtml(item.observed_name || 'Unknown')}</div>
+                        <div class="review-source-details">
+                            ${item.observed_email ? `<div>📧 ${escapeHtml(item.observed_email)}</div>` : ''}
+                            ${item.observed_phone ? `<div>📱 ${escapeHtml(item.observed_phone)}</div>` : ''}
+                        </div>
+                        <span class="review-source-type">${escapeHtml(item.source_type)}</span>
+                    </div>
+
+                    <div class="review-arrow">↓</div>
+
+                    <div class="review-match">
+                        <div class="review-match-label">Proposed Match</div>
+                        <div class="review-match-name">${escapeHtml(item.proposed_person_name)}</div>
+                        <div class="review-confidence">
+                            <span style="font-size: 0.75rem; color: var(--text-muted);">Confidence:</span>
+                            <div class="review-confidence-bar">
+                                <div class="review-confidence-fill ${confidenceClass}" style="width: ${item.confidence * 100}%"></div>
+                            </div>
+                            <span class="review-confidence-text">${Math.round(item.confidence * 100)}%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="review-actions">
+                    <button class="review-btn review-btn-reject" onclick="rejectReviewItem('${item.id}')">
+                        ✗ Reject
+                    </button>
+                    <button class="review-btn review-btn-confirm" onclick="confirmReviewItem('${item.id}')">
+                        ✓ Confirm
+                    </button>
+                </div>
+            `;
+        }
+
+        // Confirm review item
+        async function confirmReviewItem(entityId) {
+            try {
+                const response = await fetch(`/api/crm/review-queue/${entityId}/confirm`, {
+                    method: 'POST',
+                });
+                if (!response.ok) throw new Error('Failed to confirm');
+
+                advanceReviewQueue();
+            } catch (error) {
+                console.error('Error confirming review item:', error);
+                alert('Failed to confirm match');
+            }
+        }
+
+        // Reject review item
+        async function rejectReviewItem(entityId) {
+            try {
+                const response = await fetch(`/api/crm/review-queue/${entityId}/reject`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ create_new_person: false }),
+                });
+                if (!response.ok) throw new Error('Failed to reject');
+
+                advanceReviewQueue();
+            } catch (error) {
+                console.error('Error rejecting review item:', error);
+                alert('Failed to reject match');
+            }
+        }
+
+        // Advance to next review item
+        function advanceReviewQueue() {
+            // Remove current item from queue
+            crmState.reviewQueue.splice(crmState.reviewIndex, 1);
+
+            // Adjust index if needed
+            if (crmState.reviewIndex >= crmState.reviewQueue.length) {
+                crmState.reviewIndex = 0;
+            }
+
+            // Update badge
+            const badge = document.getElementById('crmReviewBadge');
+            badge.textContent = crmState.reviewQueue.length;
+            badge.classList.toggle('empty', crmState.reviewQueue.length === 0);
+
+            // Render next item
+            renderReviewQueueItem();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "strength_overrides": {
+    "uuid-of-partner": 100.0,
+    "uuid-of-close-family": 90.0
+  },
+  "circle_overrides": {
+    "uuid-of-partner": 0,
+    "uuid-of-close-family": 0
+  },
+  "partner_person_id": ""
+}
