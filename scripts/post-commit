@@ -1,0 +1,43 @@
+#!/bin/bash
+#
+# LifeOS Post-commit Hook
+#
+# Automatically restarts the server after each commit using server.sh
+# for consistent behavior with manual restarts.
+#
+# Installation:
+#   cp scripts/post-commit .git/hooks/post-commit
+#   chmod +x .git/hooks/post-commit
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If we're in .git/hooks, go up to project root
+if [[ "$SCRIPT_DIR" == *".git/hooks"* ]]; then
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+else
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+cd "$PROJECT_DIR"
+
+echo ""
+echo "========================================"
+echo "  Restarting LifeOS server..."
+echo "========================================"
+
+# Use server.sh for consistent restart behavior
+# This ensures ChromaDB check, proper binding, and correct timeouts
+if [ -x "./scripts/server.sh" ]; then
+    ./scripts/server.sh restart
+    if [ $? -eq 0 ]; then
+        echo "  Server restarted successfully"
+    else
+        echo "  Warning: Server restart may have issues"
+    fi
+else
+    echo "  Error: scripts/server.sh not found"
+    exit 1
+fi
+
+echo "========================================"

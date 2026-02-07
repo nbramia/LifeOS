@@ -1,0 +1,128 @@
+# =============================================================================
+# LifeOS .gitignore
+# =============================================================================
+# Organized by category. Files are consolidated into folders where possible.
+# Root-level patterns (*.db, credentials.json) are safety catch-alls.
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+uv.lock
+
+# =============================================================================
+# IDE & EDITOR
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# =============================================================================
+# DATA (all personal data lives in data/)
+# =============================================================================
+data/
+*.db
+*.sqlite
+
+# =============================================================================
+# LOGS (all logs live in logs/)
+# =============================================================================
+logs/
+*.log
+
+# =============================================================================
+# CREDENTIALS & SECRETS
+# =============================================================================
+# Primary location: config/
+config/credentials*.json
+config/token*.json
+
+# Safety catch-alls (in case files end up in wrong place)
+credentials.json
+credentials-*.json
+token.json
+token-*.json
+*.pem
+*.key
+
+# Environment files
+.env
+.env.local
+*.env
+
+# =============================================================================
+# PERSONAL CONFIGURATION (config/)
+# =============================================================================
+config/people_dictionary.json
+config/relationship_overrides.json
+config/family_members.json
+config/linkedin_tags.json
+config/linkedin_industry_mappings.json
+config/crm_mappings.yaml
+config/gsheet_sync.yaml
+config/gdoc_sync.yaml
+
+# Launchd plist files (use .plist.template to create)
+config/launchd/*.plist
+!config/launchd/*.plist.template
+
+# =============================================================================
+# INTERNAL DOCUMENTATION (personal notes for AI agents)
+# =============================================================================
+.internal/
+
+# =============================================================================
+# ARCHIVE FOLDERS (old scripts, tests, docs)
+# =============================================================================
+scripts/archive/
+tests/archive/
+docs/archive/
+docs/plans/archive/
+
+# =============================================================================
+# TESTING
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Test files with personal data
+tests/test_p91_*.py
+tests/qualitative_tests.md
+tests/qualitative_tests_v2.md
+tests/fixtures/production_test_data.py
+
+# =============================================================================
+# BUILD & DISTRIBUTION
+# =============================================================================
+dist/
+build/
+*.egg-info/
+
+# =============================================================================
+# OS & MISC
+# =============================================================================
+.DS_Store
+Thumbs.db
+venv.bak/
+vault/
+
+# External tools
+chromadb/
+.ralph/
+.playwright-mcp/
+
+# =============================================================================
+# DATE-PREFIXED DOCS (personal development notes)
+# =============================================================================
+docs/2026-*.md
+docs/plans/2026-*.md

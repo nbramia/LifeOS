@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS CRM Sync launchd configuration template.
+
+  To use:
+  1. Copy this file to com.lifeos.crm-sync.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Copy to ~/Library/LaunchAgents/
+  5. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.crm-sync.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.crm-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__LIFEOS_PATH__/.venv/bin/python</string>
+        <string>__LIFEOS_PATH__/scripts/run_all_syncs.py</string>
+        <string>--force</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__LIFEOS_PATH__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>__LIFEOS_PATH__</string>
+    </dict>
+
+    <!-- Run in Aqua session for better permissions (iMessage, Contacts access) -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <!-- Run daily at 3 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Also run on load (after reboot) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Log files -->
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/crm-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/crm-sync-error.log</string>
+
+    <!-- Don't restart on failure (will retry next day) -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

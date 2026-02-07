@@ -1,0 +1,104 @@
+# CRM System Settings
+
+# Entity Resolution Configuration
+entity_resolution:
+  # Fuzzy matching thresholds
+  name_similarity_weight: 0.4     # Weight for name similarity score (0-1)
+  context_boost_points: 30        # Points added when domain matches vault context
+  recency_boost_points: 10        # Points added for recently seen people
+  recency_threshold_days: 30      # Days to consider "recent"
+
+  # Disambiguation threshold
+  # If top two candidates score within this many points, create separate entities
+  disambiguation_threshold: 15
+
+  # Minimum score to consider a match
+  min_match_score: 40.0
+
+  # Cache settings
+  query_cache_ttl_seconds: 1800   # 30 minutes
+
+# Relationship Strength Configuration
+relationship_strength:
+  # Weights (must sum to 1.0)
+  recency_weight: 0.3
+  frequency_weight: 0.4
+  diversity_weight: 0.3
+
+  # Recency parameters
+  recency_window_days: 90         # Days after which recency score is 0
+
+  # Frequency parameters
+  frequency_target: 20            # Interactions in window for max frequency score
+
+# Relationship Discovery Configuration
+discovery:
+  window_days: 180                # Days to look back for relationship discovery
+  min_shared_events: 2            # Minimum shared calendar events to create relationship
+  min_shared_threads: 3           # Minimum shared email threads to create relationship
+  min_co_mentions: 2              # Minimum vault co-mentions to create relationship
+
+# Pending Link Configuration
+pending_links:
+  # Confidence threshold below which links require user confirmation
+  auto_link_confidence_threshold: 0.85
+
+  # Create pending link for new person entities (requires confirmation)
+  require_confirmation_for_new: true
+
+# Sync Configuration
+sync:
+  # How often to run background syncs (in minutes)
+  gmail_sync_interval: 30
+  calendar_sync_interval: 15
+  slack_sync_interval: 60
+  contacts_sync_interval: 1440    # Once per day
+
+  # Batch sizes for imports
+  gmail_batch_size: 100
+  calendar_batch_size: 50
+
+# Data Sources
+sources:
+  # Enable/disable individual sources
+  gmail:
+    enabled: true
+    accounts:
+      - personal
+      - work
+
+  calendar:
+    enabled: true
+    accounts:
+      - personal
+      - work
+
+  slack:
+    enabled: true
+    sync_dms: true
+    sync_channels: false  # Start with DMs only
+    sync_interval_minutes: 60
+
+  imessage:
+    enabled: true
+    # Requires Full Disk Access permission
+
+  contacts:
+    enabled: true
+    # Uses pyobjc-framework-Contacts
+
+  whatsapp:
+    enabled: false
+    # Requires manual export
+
+  signal:
+    enabled: false
+    # Requires manual export
+
+  linkedin:
+    enabled: true
+    # Uses CSV export from LinkedIn
+
+  vault:
+    enabled: true
+    # Uses Obsidian vault

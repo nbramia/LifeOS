@@ -1,0 +1,243 @@
+"""
+Tests for Google Drive Integration.
+P3.4 Acceptance Criteria:
+- Can search Drive by filename
+- Can search Drive by content
+- Can fetch and parse Google Doc content
+- Can fetch and parse Google Sheet content
+- Key docs indexable to ChromaDB
+- "Find the budget spreadsheet" returns correct file
+- Results include file name, link, last modified
+"""
+import pytest
+
+# All tests in this file use mocks (unit tests)
+pytestmark = pytest.mark.unit
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch, MagicMock
+
+from api.services.drive import (
+    DriveService,
+    DriveFile,
+    get_drive_link,
+)
+from api.services.google_auth import GoogleAccount
+
+
+class TestDriveFile:
+    """Test DriveFile dataclass."""
+
+    def test_creates_file_with_required_fields(self):
+        """Should create file with all required fields."""
+        file = DriveFile(
+            file_id="abc123",
+            name="Budget 2023.xlsx",
+            mime_type="application/vnd.google-apps.spreadsheet",
+            modified_time=datetime.now(timezone.utc),
+            source_account="personal"
+        )
+        assert file.file_id == "abc123"
+        assert file.name == "Budget 2023.xlsx"
+
+    def test_file_to_dict(self):
+        """Should convert file to dict."""
+        file = DriveFile(
+            file_id="abc123",
+            name="Budget 2023",
+            mime_type="application/vnd.google-apps.spreadsheet",
+            modified_time=datetime(2023, 1, 7, 10, 0, tzinfo=timezone.utc),
+            source_account="personal"
+        )
+        data = file.to_dict()
+        assert data["file_id"] == "abc123"
+        assert data["source"] == "google_drive"
+
+    def test_is_google_doc(self):
+        """Should detect Google Doc."""
+        doc = DriveFile(
+            file_id="1",
+            name="Doc",
+            mime_type="application/vnd.google-apps.document",
+            modified_time=datetime.now(timezone.utc),
+            source_account="personal"
+        )
+        assert doc.is_google_doc is True
+        assert doc.is_google_sheet is False
+
+    def test_is_google_sheet(self):
+        """Should detect Google Sheet."""
+        sheet = DriveFile(
+            file_id="1",
+            name="Sheet",
+            mime_type="application/vnd.google-apps.spreadsheet",
+            modified_time=datetime.now(timezone.utc),
+            source_account="personal"
+        )
+        assert sheet.is_google_sheet is True
+        assert sheet.is_google_doc is False
+
+
+class TestGetDriveLink:
+    """Test drive link generation."""
+
+    def test_generates_doc_link(self):
+        """Should generate Google Doc link."""
+        link = get_drive_link("abc123", "application/vnd.google-apps.document")
+        assert "docs.google.com" in link
+        assert "abc123" in link
+
+    def test_generates_sheet_link(self):
+        """Should generate Google Sheet link."""
+        link = get_drive_link("abc123", "application/vnd.google-apps.spreadsheet")
+        assert "docs.google.com/spreadsheets" in link
+        assert "abc123" in link
+
+    def test_generates_generic_link(self):
+        """Should generate generic Drive link for other types."""
+        link = get_drive_link("abc123", "application/pdf")
+        assert "drive.google.com" in link
+        assert "abc123" in link
+
+
+class TestDriveService:
+    """Test DriveService."""
+
+    @pytest.fixture
+    def mock_auth_service(self):
+        """Create mock auth service."""
+        mock = MagicMock()
+        mock_creds = MagicMock()
+        mock_creds.valid = True
+        mock.get_credentials.return_value = mock_creds
+        return mock
+
+    @pytest.fixture
+    def drive_service(self, mock_auth_service):
+        """Create Drive service with mock auth."""
+        with patch('api.services.drive.get_google_auth', return_value=mock_auth_service):
+            with patch('api.services.drive.build') as mock_build:
+                mock_service = MagicMock()
+                mock_build.return_value = mock_service
+                service = DriveService(account_type=GoogleAccount.PERSONAL)
+                service._service = mock_service
+                return service
+
+    def test_searches_by_filename(self, drive_service):
+        """Should search files by name."""
+        mock_files = {
+            "files": [
+                {
+                    "id": "file1",
+                    "name": "Budget 2023",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "modifiedTime": "2023-01-07T10:00:00.000Z",
+                }
+            ]
+        }
+        drive_service._service.files().list().execute.return_value = mock_files
+
+        files = drive_service.search(name="Budget")
+
+        assert len(files) >= 1
+        assert files[0].name == "Budget 2023"
+
+    def test_searches_by_content(self, drive_service):
+        """Should search by full text content."""
+        mock_files = {
+            "files": [
+                {
+                    "id": "doc1",
+                    "name": "Q1 Planning",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "modifiedTime": "2023-01-07T10:00:00.000Z",
+                }
+            ]
+        }
+        drive_service._service.files().list().execute.return_value = mock_files
+
+        files = drive_service.search(full_text="budget planning")
+
+        # Should use fullText query
+        call_args = drive_service._service.files().list.call_args
+        assert "fullText" in str(call_args)
+
+    def test_fetches_google_doc_content(self, drive_service):
+        """Should fetch and parse Google Doc content."""
+        mock_content = "This is the document content."
+        drive_service._service.files().export().execute.return_value = mock_content.encode()
+
+        content = drive_service.get_file_content("doc1", "application/vnd.google-apps.document")
+
+        assert content == mock_content
+
+    def test_fetches_google_sheet_as_csv(self, drive_service):
+        """Should fetch Google Sheet as CSV."""
+        mock_csv = "Column1,Column2\nValue1,Value2"
+        drive_service._service.files().export().execute.return_value = mock_csv.encode()
+
+        content = drive_service.get_file_content("sheet1", "application/vnd.google-apps.spreadsheet")
+
+        assert "Column1" in content
+        assert "Value1" in content
+
+    def test_returns_empty_list_for_no_results(self, drive_service):
+        """Should return empty list when no files found."""
+        drive_service._service.files().list().execute.return_value = {"files": []}
+
+        files = drive_service.search(name="nonexistent12345")
+
+        assert files == []
+
+    def test_results_include_required_fields(self, drive_service):
+        """Should include name, link, last modified."""
+        mock_files = {
+            "files": [
+                {
+                    "id": "file1",
+                    "name": "Test Doc",
+                    "mimeType": "application/vnd.google-apps.document",
+                    "modifiedTime": "2023-01-07T10:00:00.000Z",
+                    "webViewLink": "https://docs.google.com/document/d/file1",
+                }
+            ]
+        }
+        drive_service._service.files().list().execute.return_value = mock_files
+
+        files = drive_service.search(name="Test")
+
+        assert len(files) >= 1
+        file = files[0]
+        assert file.name is not None
+        assert file.modified_time is not None
+
+
+class TestDriveAPI:
+    """Test Drive API endpoint."""
+
+    @pytest.fixture
+    def mock_drive_service(self):
+        """Create mock Drive service."""
+        mock = MagicMock()
+        mock.search.return_value = [
+            DriveFile(
+                file_id="1",
+                name="Budget 2023",
+                mime_type="application/vnd.google-apps.spreadsheet",
+                modified_time=datetime(2023, 1, 7, tzinfo=timezone.utc),
+                source_account="personal",
+            )
+        ]
+        return mock
+
+    def test_search_endpoint_returns_results(self, mock_drive_service):
+        """Should return search results."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        with patch('api.routes.drive.get_drive_service', return_value=mock_drive_service):
+            client = TestClient(app)
+            response = client.get("/api/drive/search?q=budget")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert "files" in data

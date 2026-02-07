@@ -1,0 +1,18 @@
+{
+  "YourName": {
+    "canonical": "YourName",
+    "aliases": ["yourname", "me", "I"],
+    "category": "self",
+    "exclude": true
+  },
+  "FamilyMember": {
+    "canonical": "FamilyMember",
+    "aliases": ["familymember", "Family Member"],
+    "category": "family"
+  },
+  "Colleague": {
+    "canonical": "Colleague",
+    "aliases": ["colleague", "Colleague Name"],
+    "category": "work"
+  }
+}

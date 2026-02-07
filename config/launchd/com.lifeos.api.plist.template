@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LifeOS API Server launchd configuration template.
+
+  To use:
+  1. Copy this file to com.lifeos.api.plist
+  2. Replace __HOME__ with your home directory path
+  3. Replace __LIFEOS_PATH__ with your LifeOS project path
+  4. Replace __VAULT_PATH__ with your Obsidian vault path
+  5. Copy to ~/Library/LaunchAgents/
+  6. Run: launchctl load ~/Library/LaunchAgents/com.lifeos.api.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.api</string>
+
+    <!-- venv is located at ~/.venvs/lifeos to avoid macOS TCC security scanning delays -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.venvs/lifeos/bin/uvicorn</string>
+        <string>api.main:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8000</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__LIFEOS_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.venvs/lifeos/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>LIFEOS_VAULT_PATH</key>
+        <string>__VAULT_PATH__</string>
+        <!-- ANTHROPIC_API_KEY should be set in ~/.zshrc or launchctl setenv -->
+    </dict>
+
+    <!-- Auto-start on boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Auto-restart on crash (keep alive) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Restart throttle: wait 10 seconds before restart -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Log files -->
+    <key>StandardOutPath</key>
+    <string>__LIFEOS_PATH__/logs/lifeos-api.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LIFEOS_PATH__/logs/lifeos-api-error.log</string>
+</dict>
+</plist>

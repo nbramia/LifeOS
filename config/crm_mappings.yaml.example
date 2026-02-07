@@ -1,0 +1,54 @@
+# CRM Domain and Company Mappings
+# Maps email domains and company names to vault contexts and categories
+#
+# Configure your work domains here. Example entries are commented out below.
+# See LIFEOS_WORK_DOMAIN in .env for the primary work domain setting.
+
+domain_mappings:
+  # Example: Current job
+  # yourcompany.com:
+  #   company: "Your Company"
+  #   vault_contexts:
+  #     - "Work/YourCompany/"
+  #   category: work
+  #
+  # yourcompany.xyz:
+  #   company: "Your Company"
+  #   vault_contexts:
+  #     - "Work/YourCompany/"
+  #   category: work
+
+  # Example: Previous jobs (archived)
+  # oldcompany.com:
+  #   company: "Old Company"
+  #   vault_contexts:
+  #     - "Personal/zArchive/OldCompany/"
+  #   category: work
+
+  # Personal domains
+  gmail.com:
+    vault_contexts:
+      - "Personal/"
+    category: personal
+
+  icloud.com:
+    vault_contexts:
+      - "Personal/"
+    category: personal
+
+
+company_normalization:
+  # Maps LinkedIn company names to email domains and vault contexts
+  # Example:
+  # "Your Company":
+  #   domains:
+  #     - yourcompany.com
+  #     - yourcompany.xyz
+  #   vault_contexts:
+  #     - "Work/YourCompany/"
+  #
+  # "Old Company":
+  #   domains:
+  #     - oldcompany.com
+  #   vault_contexts:
+  #     - "Personal/zArchive/OldCompany/"

@@ -1,0 +1,40 @@
+# Google Sheets to Obsidian Sync Configuration
+#
+# This file defines which Google Sheets should be synced to your Obsidian vault.
+# Sync runs nightly at 3 AM Eastern as part of the regular sync.
+#
+# Copy this file to gsheet_sync.yaml and configure your sheets.
+
+sync_enabled: true
+
+sheets:
+  - sheet_id: "YOUR_GOOGLE_SHEET_ID"
+    name: "Daily Journal"
+    account: "personal"
+    range: "Form Responses 1"
+    timestamp_column: "Timestamp"
+
+    # Map column names to clean YAML keys for Dataview
+    # Note: Column names must match exactly (including ? marks)
+    field_mappings:
+      "Your Column Name": "field_key"
+      "Another Column": "another_key"
+
+    outputs:
+      # Individual journal notes with YAML frontmatter (best for Dataview)
+      journal_notes:
+        enabled: true
+        folder: "Personal/Journal"
+
+      # Rolling document: all entries in one file
+      rolling_document:
+        enabled: false
+        path: "Personal/Daily Journal Log.md"
+
+      # Append to existing daily notes
+      daily_notes:
+        enabled: false
+        path_pattern: "Work/Daily Notes/{date}.md"
+        section_header: "## Daily Journal"
+        insert_after: "## Meetings"
+        create_if_missing: false

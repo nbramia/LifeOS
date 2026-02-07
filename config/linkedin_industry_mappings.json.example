@@ -1,0 +1,6 @@
+{
+  "_comment": "Maps company names (lowercase) to industry categories. Used by scripts/enrich_linkedin_jobs.py. Copy to linkedin_industry_mappings.json and customize.",
+  "example company": "Tech",
+  "another company": "Finance",
+  "my nonprofit": "Non-profit"
+}

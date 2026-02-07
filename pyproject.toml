@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lifeos"
+version = "0.1.0"
+description = "Personal RAG system for Obsidian vault"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "LifeOS Contributors"}
+]
+
+# Runtime dependencies are managed via requirements.txt, not here.
+# This is intentional: the external venv at ~/.venvs/lifeos is required
+# for macOS launchd compatibility (avoids TCC scanning delays).
+# pyproject.toml only defines dev dependencies for pytest configuration.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.26.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["tests/archive", ".git", "__pycache__", ".venv"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v"
+markers = [
+    "unit: Fast unit tests with no external dependencies",
+    "slow: Tests that require ChromaDB, sentence-transformers, or heavy processing",
+    "integration: Tests that require running server or external APIs",
+    "browser: Browser-based UI tests using Playwright",
+    "requires_ollama: Tests that require Ollama to be running",
+    "requires_server: Tests that require the API server to be running",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["api*", "config*"]
