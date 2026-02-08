@@ -111,6 +111,8 @@ Available tools include:
 - `lifeos_search` - Raw search results
 - `lifeos_meeting_prep` - Meeting briefings
 - `lifeos_people_search` - CRM search
+- `lifeos_task_create` / `lifeos_task_list` - Task management
+- `lifeos_reminder_create` / `lifeos_reminder_list` - Reminders
 
 See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md) for full tool list.
 
@@ -137,6 +139,8 @@ Run this checklist to ensure everything is working:
 | Ollama | `curl localhost:11434/api/tags \| jq` | Lists models |
 | Search works | Search via UI | Returns results |
 | Index populated | `curl localhost:8000/api/search -d '{"query":"test"}'` | Non-empty results |
+| Tasks API | `curl localhost:8000/api/tasks` | `{"tasks":[],"total":0}` |
+| Reminders API | `curl localhost:8000/api/reminders` | `{"reminders":[...]}` |
 
 ---
 

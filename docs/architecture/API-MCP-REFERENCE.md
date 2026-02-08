@@ -15,8 +15,10 @@ Complete reference for LifeOS API endpoints and MCP tools.
 3. [Google Integration](#google-integration)
 4. [Messaging Endpoints](#messaging-endpoints)
 5. [CRM Endpoints](#crm-endpoints)
-6. [Admin Endpoints](#admin-endpoints)
-7. [MCP Tools](#mcp-tools)
+6. [Task Endpoints](#task-endpoints)
+7. [Reminders & Telegram Endpoints](#reminders--telegram-endpoints)
+8. [Admin Endpoints](#admin-endpoints)
+9. [MCP Tools](#mcp-tools)
 
 ---
 
@@ -699,6 +701,55 @@ Trigger Photos sync (matches faces to PersonEntity, creates interactions).
 
 ---
 
+## Task Endpoints
+
+Tasks can also be created, completed, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Task Management Guide](../guides/TASK-MANAGEMENT.md).
+
+### POST /api/tasks
+
+Create a task. Stored as an Obsidian Tasks-compatible markdown checkbox in the vault.
+
+**Request:**
+```json
+{
+  "description": "Call dentist",
+  "context": "Personal",
+  "priority": "high",
+  "due_date": "2025-02-10",
+  "tags": ["health"],
+  "reminder_id": "optional-linked-reminder-uuid"
+}
+```
+
+### GET /api/tasks
+
+List/filter tasks.
+
+**Query Parameters:**
+- `status` (string): Filter by status (todo, done, in_progress, cancelled, deferred, blocked, urgent)
+- `context` (string): Filter by context (Work, Personal, Finance, etc.)
+- `tag` (string): Filter by tag
+- `due_before` (string): YYYY-MM-DD, tasks due before this date
+- `query` (string): Fuzzy text search across task descriptions
+
+### GET /api/tasks/{id}
+
+Get a specific task.
+
+### PUT /api/tasks/{id}
+
+Update a task (description, status, context, priority, due_date, tags).
+
+### PUT /api/tasks/{id}/complete
+
+Mark a task as done (adds done date automatically).
+
+### DELETE /api/tasks/{id}
+
+Delete a task.
+
+---
+
 ## Reminders & Telegram Endpoints
 
 Reminders can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Reminders Guide](../guides/REMINDERS.md).
@@ -819,6 +870,11 @@ claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
 | `lifeos_photos_person` | GET /api/photos/person/{id} | Photos of a person |
 | `lifeos_photos_shared` | GET /api/photos/shared/{a}/{b} | Photos of two people together |
 | `lifeos_photos_stats` | GET /api/photos/stats | Photos library statistics |
+| `lifeos_task_create` | POST /api/tasks | Create a task |
+| `lifeos_task_list` | GET /api/tasks | List/filter tasks |
+| `lifeos_task_update` | PUT /api/tasks/{id} | Update a task |
+| `lifeos_task_complete` | PUT /api/tasks/{id}/complete | Mark task done |
+| `lifeos_task_delete` | DELETE /api/tasks/{id} | Delete a task |
 | `lifeos_reminder_create` | POST /api/reminders | Create scheduled reminder |
 | `lifeos_reminder_list` | GET /api/reminders | List all reminders |
 | `lifeos_reminder_delete` | DELETE /api/reminders/{id} | Delete a reminder |

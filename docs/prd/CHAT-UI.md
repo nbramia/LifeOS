@@ -5,7 +5,7 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 **Primary Use Cases:**
 - Natural language queries: "What did we discuss about the product launch?"
 - Stakeholder briefings: "Prep me for my meeting with Yoni"
-- Action item tracking: "What are my open action items?"
+- Task management: "Add a to-do to call the dentist"
 - Email drafting: "Draft an email to Kevin about the budget"
 
 **Related Documentation:**
@@ -80,7 +80,7 @@ The local LLM (Llama 3.2 3B via Ollama) routes queries to appropriate data sourc
 | `slack` | Slack DMs and channels | "What did John say in Slack about the project?" |
 | `people` | Stakeholder profiles | "Tell me about Alex before my meeting" |
 | `photos` | Apple Photos (face recognition) | "When was I last in a photo with Jonathan?" |
-| `actions` | Open tasks and commitments | "What are my open action items?" |
+| `tasks` | Task index (Obsidian Tasks) | "What are my open tasks?" |
 | `memories` | User-saved memories | "What did I want to remember about the project?" |
 
 **Router Prompt:** Configurable at `config/prompts/query_router.txt`

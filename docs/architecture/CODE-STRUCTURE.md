@@ -33,8 +33,10 @@ api/
 │   ├── imessage.py            # iMessage search
 │   ├── memories.py            # Memory store
 │   ├── people.py              # Simple people lookup
+│   ├── reminders.py           # Reminder CRUD endpoints
 │   ├── search.py              # Vector search
-│   └── slack.py               # Slack integration
+│   ├── slack.py               # Slack integration
+│   └── tasks.py               # Task CRUD endpoints
 ├── services/                  # Business logic and data access
 │   ├── __init__.py            # Public API exports
 │   ├── chat_helpers.py        # Query parsing, intent detection
@@ -54,7 +56,9 @@ api/
 | File | Lines | Endpoints | Purpose |
 |------|-------|-----------|---------|
 | crm.py | ~5,100 | 57 | Personal CRM API |
-| chat.py | ~1,200 | 1 | Streaming chat with RAG |
+| chat.py | ~1,400 | 1 | Streaming chat with RAG |
+| tasks.py | ~180 | 6 | Task CRUD API |
+| reminders.py | ~150 | 6 | Reminder CRUD API |
 | calendar.py | ~400 | 8 | Google Calendar |
 | gmail.py | ~350 | 6 | Gmail integration |
 | slack.py | ~500 | 10 | Slack integration |
@@ -85,9 +89,12 @@ api/
 - `whatsapp_import.py` - WhatsApp import
 - `signal_import.py` - Signal import
 
+**Task Management:**
+- `task_manager.py` - Task CRUD, markdown I/O, index persistence, fuzzy query
+
 **Telegram & Scheduling:**
 - `telegram.py` - Telegram bot (message sending, bot listener, internal chat client)
-- `reminder_store.py` - Reminder CRUD, persistence, and scheduler
+- `reminder_store.py` - Reminder CRUD, persistence, scheduler, and dashboard generation
 - `time_parser.py` - Natural language time parsing for reminders
 
 **Search & Retrieval:**
@@ -98,7 +105,7 @@ api/
 - `embeddings.py` - Embedding generation
 
 **Chat & Query Processing:**
-- `chat_helpers.py` - Query parsing, intent detection (compose, reminder create/edit/list/delete), date extraction
+- `chat_helpers.py` - Query parsing, unified intent classification (compose, task CRUD, reminder CRUD, task+reminder), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback).
 - `query_router.py` - LLM-based query routing with person name extraction
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)
 
