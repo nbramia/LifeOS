@@ -70,51 +70,6 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 
 ![LifeOS Architecture](docs/images/architecture-hero.png)
 
-### System Overview
-
-```mermaid
-flowchart LR
-    subgraph Sources["Data Sources"]
-        Gmail
-        Calendar
-        iMessage
-        Slack
-        WhatsApp
-        Vault["Obsidian Vault"]
-        Contacts["Apple Contacts"]
-        Photos["Apple Photos"]
-        LinkedIn
-        Phone["Phone Calls"]
-    end
-
-    subgraph Processing["Processing Layer"]
-        Sync["5-Phase Daily Sync"]
-        ER["Entity Resolution"]
-        Search["Hybrid Search"]
-        Router["Query Router"]
-    end
-
-    subgraph Storage["Storage Layer"]
-        ChromaDB["ChromaDB\n(vectors)"]
-        SQLite["SQLite\n(BM25 + CRM)"]
-        JSON["JSON Files\n(entities)"]
-    end
-
-    subgraph Outputs["User Interfaces"]
-        Chat["Chat UI"]
-        CRM["CRM UI"]
-        MCP["MCP Tools"]
-        Tasks["Task Manager"]
-    end
-
-    Sources --> Sync
-    Sync --> ER
-    ER --> Storage
-    Storage --> Search
-    Search --> Router
-    Router --> Outputs
-```
-
 ### How Data Flows
 
 Data moves through LifeOS in a clear pipeline from sources to user-facing features:
