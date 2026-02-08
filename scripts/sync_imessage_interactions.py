@@ -43,6 +43,28 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     Returns:
         Stats dict
     """
+    from api.services.imessage import get_imessage_store, join_imessages_to_entities
+
+    # STEP 1: Export new messages from Apple's Messages database
+    logger.info("Exporting new messages from Messages.app database...")
+    imessage_store = get_imessage_store()
+    try:
+        export_stats = imessage_store.export_from_source()
+        logger.info(f"Exported {export_stats['messages_exported']} new messages")
+    except Exception as e:
+        logger.error(f"Failed to export messages: {e}")
+        # Continue anyway - we can still sync existing messages
+
+    # STEP 2: Link exported messages to PersonEntity records
+    if export_stats.get('messages_exported', 0) > 0:
+        logger.info("Linking messages to people...")
+        try:
+            join_stats = join_imessages_to_entities()
+            logger.info(f"Linked {join_stats['messages_updated']} messages to people")
+        except Exception as e:
+            logger.error(f"Failed to link messages: {e}")
+
+    # STEP 3: Sync linked messages to interactions database
     imessage_db = get_imessage_db_path()
     interactions_db = get_interaction_db_path()
     person_store = get_person_entity_store()
