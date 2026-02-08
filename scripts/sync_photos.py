@@ -15,52 +15,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
 import logging
-import subprocess
-import time
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
-
-
-def trigger_photos_icloud_sync() -> bool:
-    """
-    Open Photos.app to trigger iCloud photo sync.
-
-    This ensures recent photos from iCloud are downloaded to the Mac
-    before we read the Photos database.
-
-    Returns:
-        True if Photos was opened successfully, False otherwise
-    """
-    try:
-        logger.info("Opening Photos.app to trigger iCloud sync...")
-
-        # Open Photos.app using AppleScript
-        result = subprocess.run(
-            ["osascript", "-e", 'tell application "Photos" to activate'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"Failed to open Photos.app: {result.stderr}")
-            return False
-
-        # Wait 30 seconds for Photos to start syncing
-        logger.info("Waiting 30 seconds for Photos to sync from iCloud...")
-        time.sleep(30)
-
-        logger.info("Photos.app opened and given time to sync")
-        return True
-
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout opening Photos.app")
-        return False
-    except Exception as e:
-        logger.warning(f"Error opening Photos.app: {e}")
-        return False
 
 
 def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
@@ -79,9 +37,9 @@ def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
             "errors": 0,
         }
 
-    # Trigger Photos.app to sync from iCloud (for non-dry-run)
-    if not dry_run:
-        trigger_photos_icloud_sync()
+    # Note: Photos.app is already open and syncing from iCloud
+    # The nightly sync opens Photos at the very beginning (3 AM) so it can
+    # sync in the background while other data sources are being processed
 
     if dry_run:
         logger.info("DRY RUN - would sync Photos data")
