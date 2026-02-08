@@ -68,8 +68,6 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 
 ## Architecture
 
-> **Note**: Diagrams render on GitHub desktop. Mobile app shows raw code ([known limitation](https://github.com/orgs/community/discussions/11595)).
-
 ![LifeOS Architecture](docs/images/architecture-hero.png)
 
 ### How Data Flows
