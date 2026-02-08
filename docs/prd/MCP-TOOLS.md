@@ -76,6 +76,18 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 | `lifeos_relationship_insights` | Get relationship patterns and observations |
 | `lifeos_communication_gaps` | Find neglected relationships |
 
+### Task Management Tools
+
+Tasks can also be managed via natural language chat. See [Task Management Guide](../guides/TASK-MANAGEMENT.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_task_create` | Create a task (stored as Obsidian Tasks markdown) |
+| `lifeos_task_list` | List/filter tasks by status, context, tag, due date, or fuzzy query |
+| `lifeos_task_update` | Update a task's description, status, context, priority, due date, or tags |
+| `lifeos_task_complete` | Mark a task as done |
+| `lifeos_task_delete` | Delete a task |
+
 ### Reminders & Telegram Tools
 
 Reminders can also be managed via natural language chat. See [Reminders Guide](../guides/REMINDERS.md).

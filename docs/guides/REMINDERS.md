@@ -98,9 +98,33 @@ Return the library book
 Reply to change the time or say "cancel that reminder" to remove it.
 ```
 
+## Task-Reminder Linking
+
+You can create a task and reminder together:
+
+```
+"add a task to call the dentist and remind me Friday at 3pm"
+```
+
+This creates both a task in your vault and a timed reminder, linked via `reminder_id`. See [Task Management Guide](TASK-MANAGEMENT.md) for details.
+
+## Obsidian Dashboard
+
+Reminders are tracked in an auto-generated dashboard:
+
+**Location:** `LifeOS/Reminders/Dashboard.md`
+
+The dashboard includes three sections:
+- **Recurring** — Active cron-based reminders with schedule and last triggered time
+- **Upcoming** — One-time reminders not yet triggered
+- **Past** — Completed or disabled reminders (last 20)
+
+The dashboard regenerates automatically whenever a reminder is created, updated, triggered, or deleted.
+
 ## Technical Details
 
 - Reminders are stored in `~/.lifeos/reminders.json`
 - The scheduler checks for due reminders every 60 seconds
 - Times are processed in Eastern time (America/New_York) by default
 - One-time reminders auto-disable after triggering
+- Dashboard auto-generated at `LifeOS/Reminders/Dashboard.md` in the vault

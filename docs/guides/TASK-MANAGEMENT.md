@@ -144,7 +144,7 @@ The dashboard includes:
 - Blocked tasks
 - Recently completed tasks
 
-The dashboard uses Obsidian Tasks plugin queries and updates automatically as tasks change.
+The dashboard uses Obsidian Tasks plugin queries and updates automatically as tasks change in Obsidian. It is created by TaskManager on initialization if it doesn't already exist.
 
 ## API Reference
 

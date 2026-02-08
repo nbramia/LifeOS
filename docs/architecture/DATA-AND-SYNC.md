@@ -169,6 +169,9 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | Interactions | `data/crm.db` | Interactions per person | People v2 sync, Slack sync |
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
 | iMessage | `data/imessage.db` | Message export cache | iMessage sync |
+| Task Index | `data/task_index.json` | Parsed task cache | Task CRUD, file watcher |
+| Reminders | `~/.lifeos/reminders.json` | Scheduled reminders | Reminder CRUD, scheduler |
+| Memories | `~/.lifeos/memories.json` | User-saved memories | Memory CRUD |
 
 ---
 
