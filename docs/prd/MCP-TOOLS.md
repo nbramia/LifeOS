@@ -77,6 +77,9 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 | `lifeos_communication_gaps` | Find neglected relationships |
 
 ### Reminders & Telegram Tools
+
+Reminders can also be managed via natural language chat. See [Reminders Guide](../guides/REMINDERS.md).
+
 | Tool | Description |
 |------|-------------|
 | `lifeos_reminder_create` | Create a scheduled reminder (cron or one-time) |

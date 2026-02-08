@@ -76,9 +76,16 @@ from api.services.chat_helpers import (
     extract_search_keywords,
     expand_followup_query,
     detect_compose_intent,
+    detect_reminder_intent,
     extract_date_context,
     extract_message_date_range,
     extract_message_search_terms,
+    ReminderIntentType,
+    classify_reminder_intent,
+    detect_reminder_edit_intent,
+    detect_reminder_list_intent,
+    detect_reminder_delete_intent,
+    extract_reminder_topic,
 )
 
 # ============================================================================
@@ -114,9 +121,16 @@ __all__ = [
     "extract_search_keywords",
     "expand_followup_query",
     "detect_compose_intent",
+    "detect_reminder_intent",
     "extract_date_context",
     "extract_message_date_range",
     "extract_message_search_terms",
+    "ReminderIntentType",
+    "classify_reminder_intent",
+    "detect_reminder_edit_intent",
+    "detect_reminder_list_intent",
+    "detect_reminder_delete_intent",
+    "extract_reminder_topic",
     # Shared utilities
     "make_aware",
     "get_crm_db_path",
