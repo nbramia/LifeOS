@@ -4,6 +4,7 @@ Chat helper functions for query processing and message formatting.
 Pure functions extracted from chat.py to reduce complexity and improve
 testability. These handle query parsing, date extraction, and message formatting.
 """
+import dataclasses
 import re
 from datetime import datetime, timedelta
 from enum import Enum
@@ -16,6 +17,22 @@ class ReminderIntentType(Enum):
     EDIT = "edit"
     LIST = "list"
     DELETE = "delete"
+
+
+class TaskIntentType(Enum):
+    """Types of task-related intents."""
+    CREATE = "create"
+    EDIT = "edit"
+    LIST = "list"
+    COMPLETE = "complete"
+    DELETE = "delete"
+
+
+@dataclasses.dataclass
+class ActionIntent:
+    """Unified intent classification result."""
+    category: str  # "compose", "task", "reminder", "ambiguous_task_reminder"
+    sub_type: Optional[str] = None  # CREATE/EDIT/LIST/COMPLETE/DELETE value string
 
 
 # Common words to filter out of search queries
@@ -591,6 +608,127 @@ def extract_reminder_topic(query: str) -> Optional[str]:
             # Filter out common words that aren't topics
             if topic not in {'that', 'this', 'it', 'the'}:
                 return topic
+
+    return None
+
+
+def classify_action_intent(query: str) -> Optional[ActionIntent]:
+    """
+    Classify action intent across all categories (compose, task, reminder).
+
+    Evaluates patterns simultaneously and returns the most specific match.
+
+    Args:
+        query: User query text
+
+    Returns:
+        ActionIntent with category and optional sub_type, or None if no match
+    """
+    query_lower = query.lower()
+
+    # 1. Check compose patterns first (very specific)
+    compose_patterns = [
+        "draft an email",
+        "draft email",
+        "draft a message",
+        "compose an email",
+        "compose email",
+        "write an email",
+        "write email",
+        "send an email",
+        "send email",
+        "email to ",
+        "write to ",
+        "draft to ",
+    ]
+
+    for pattern in compose_patterns:
+        if pattern in query_lower:
+            return ActionIntent("compose", None)
+
+    # 2. Check task-specific patterns
+    task_patterns = {
+        TaskIntentType.DELETE: [
+            "delete the task",
+            "remove the task",
+            "delete my task",
+            "remove the to-do",
+        ],
+        TaskIntentType.COMPLETE: [
+            r"mark .* as done",
+            "complete the task",
+            "finish the task",
+            "check off",
+            "done with the task",
+        ],
+        TaskIntentType.EDIT: [
+            "update the task",
+            "change the task",
+            "edit the task",
+            "modify the task",
+        ],
+        TaskIntentType.LIST: [
+            "list my tasks",
+            "show my tasks",
+            "what's on my to-do",
+            "my tasks",
+            "open tasks",
+            "pending tasks",
+            "show tasks",
+            "what tasks",
+        ],
+        TaskIntentType.CREATE: [
+            "add a to-do",
+            "add a todo",
+            "create a task",
+            "new task",
+            "add to my list",
+            "add to my to-do",
+            "add a task",
+        ],
+    }
+
+    # Check more specific task patterns first
+    for intent_type in [TaskIntentType.DELETE, TaskIntentType.COMPLETE,
+                        TaskIntentType.EDIT, TaskIntentType.LIST, TaskIntentType.CREATE]:
+        for pattern in task_patterns[intent_type]:
+            if re.search(pattern, query_lower):
+                return ActionIntent("task", intent_type.value)
+
+    # 3. Check reminder patterns
+    if detect_reminder_delete_intent(query):
+        return ActionIntent("reminder", ReminderIntentType.DELETE.value)
+    if detect_reminder_edit_intent(query):
+        return ActionIntent("reminder", ReminderIntentType.EDIT.value)
+    if detect_reminder_list_intent(query):
+        return ActionIntent("reminder", ReminderIntentType.LIST.value)
+    if detect_reminder_intent(query):
+        # 4. CRITICAL: Disambiguate "remind me to X" / "remember to X"
+        # Check for time references
+        time_indicators = [
+            r'\bat\b',
+            r'\bpm\b',
+            r'\bam\b',
+            r'\btomorrow\b',
+            r'\bevery\b',
+            r'\bdaily\b',
+            r'\bweekly\b',
+            r'\bnext\s+\w+day\b',
+            r'\btonight\b',
+            r'\bmorning\b',
+            r'\bevening\b',
+            r'\bnoon\b',
+            r'\bmidnight\b',
+            r"o'clock",
+            r'\bin\s+\d+\s+(minute|minutes|hour|hours|day|days)\b',
+        ]
+
+        has_time_reference = any(re.search(pattern, query_lower) for pattern in time_indicators)
+
+        if has_time_reference:
+            return ActionIntent("reminder", ReminderIntentType.CREATE.value)
+        else:
+            return ActionIntent("ambiguous_task_reminder", None)
 
     return None
 

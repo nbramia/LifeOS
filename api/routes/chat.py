@@ -39,6 +39,9 @@ from api.services.chat_helpers import (
     detect_reminder_list_intent,
     detect_reminder_delete_intent,
     extract_reminder_topic,
+    classify_action_intent,
+    TaskIntentType,
+    ActionIntent,
 )
 from api.services.time_parser import (
     get_smart_default_time,
@@ -446,6 +449,130 @@ def find_reminder_by_topic(
     return None
 
 
+# =============================================================================
+# Task Extraction & Matching Helpers
+# =============================================================================
+
+async def extract_task_params(query: str, conversation_history: list = None) -> Optional[dict]:
+    """
+    Use Claude to extract task parameters from a task creation request.
+
+    Returns dict with:
+        - description: Task description
+        - context: Work, Personal, Finance, Health, Inbox, etc.
+        - priority: high, medium, low, or ""
+        - due_date: YYYY-MM-DD or None
+        - tags: list of tag strings
+        - has_reminder: bool — whether to also create a linked reminder
+        - reminder_time: ISO datetime if has_reminder is true
+    Or None if extraction fails.
+    """
+    from zoneinfo import ZoneInfo
+
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(eastern)
+    current_datetime = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+
+    context = ""
+    if conversation_history:
+        recent_msgs = conversation_history[-4:]
+        context_parts = []
+        for msg in recent_msgs:
+            context_parts.append(f"{msg.role}: {msg.content[:300]}")
+        if context_parts:
+            context = "\n\nConversation context:\n" + "\n".join(context_parts)
+
+    extraction_prompt = f"""Extract task parameters from this request.{context}
+
+Current date/time: {current_datetime}
+
+User request: {query}
+
+Return a JSON object with these fields:
+- "description": Clear, concise task description (imperative form, e.g., "Call the dentist")
+- "context": Category — one of: "Work", "Personal", "Finance", "Health", "Inbox" (default "Inbox" if unclear)
+- "priority": "high", "medium", "low", or "" (empty if not specified)
+- "due_date": YYYY-MM-DD if a due date is mentioned/implied, null otherwise. Resolve relative dates (e.g., "by Friday" → actual date)
+- "tags": Array of lowercase tag strings inferred from content (e.g., ["tax", "schwab"] for "pull 1099 from Schwab")
+- "has_reminder": true if user also wants a timed reminder (e.g., "and remind me Friday"), false otherwise
+- "reminder_time": ISO datetime if has_reminder is true, null otherwise
+
+Return ONLY valid JSON, no other text. Example:
+{{"description": "Pull 1099 from Schwab", "context": "Finance", "priority": "medium", "due_date": "2026-02-15", "tags": ["tax", "schwab"], "has_reminder": false, "reminder_time": null}}"""
+
+    try:
+        synthesizer = get_synthesizer()
+        response_text = await synthesizer.get_response(
+            extraction_prompt,
+            max_tokens=512,
+            model_tier="haiku"
+        )
+
+        json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if json_match:
+            params = json.loads(json_match.group())
+            if params.get("description"):
+                return params
+    except Exception as e:
+        logger.error(f"Failed to extract task params: {e}")
+
+    return None
+
+
+def find_task_by_topic(
+    query: str,
+    tasks: list,
+) -> Optional[tuple]:
+    """
+    Find a task by topic using fuzzy matching on description.
+
+    Returns:
+        Tuple of (task, match_type) or None
+        match_type: "exact", "fuzzy", "ambiguous"
+    """
+    if not tasks:
+        return None
+
+    query_lower = query.lower()
+
+    # Extract topic from common patterns
+    topic = None
+    for pattern in [
+        r'(?:task|to-?do|item)\s+(?:about|for|to)\s+(.+?)(?:\s+as|\s*$)',
+        r'(?:mark|complete|finish|check off|delete|remove|update|change)\s+(?:the\s+)?(?:task|to-?do)?\s*(?:about|for|to)?\s*(.+?)(?:\s+as|\s*$)',
+        r'"([^"]+)"',  # Quoted text
+    ]:
+        m = re.search(pattern, query_lower)
+        if m:
+            topic = m.group(1).strip()
+            break
+
+    if not topic:
+        # Use the whole query minus common action words
+        topic = re.sub(
+            r'\b(mark|complete|finish|check|off|delete|remove|update|change|the|task|todo|to-do|about|done|as)\b',
+            '', query_lower
+        ).strip()
+
+    if not topic:
+        return None
+
+    matches = []
+    for task in tasks:
+        desc_lower = task.description.lower()
+        if topic in desc_lower:
+            matches.append((task, "exact"))
+        elif any(word in desc_lower for word in topic.split() if len(word) > 2):
+            matches.append((task, "fuzzy"))
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        return (matches, "ambiguous")
+
+    return None
+
+
 router = APIRouter(prefix="/api", tags=["chat"])
 
 # Attachment configuration
@@ -594,15 +721,19 @@ async def ask_stream(request: AskStreamRequest):
             if conversation_history and conversation_history[-1].role == "user" and conversation_history[-1].content == request.question:
                 conversation_history = conversation_history[:-1]
 
-            # Check for email compose intent - handle as action, not search
-            if detect_compose_intent(request.question):
+            # Unified intent classification — evaluates compose, task, and reminder
+            # patterns simultaneously and picks the most specific match.
+            action_intent = classify_action_intent(request.question)
+            _intent_handled = False
+
+            if action_intent and action_intent.category == "compose":
+                # ---- EMAIL COMPOSE (unchanged logic) ----
                 print("DETECTED COMPOSE INTENT - handling email draft")
                 yield f"data: {json.dumps({'type': 'routing', 'sources': ['gmail_draft'], 'reasoning': 'Email composition detected', 'latency_ms': 0})}\n\n"
 
                 draft_params = await extract_draft_params(request.question, conversation_history)
                 if draft_params:
                     try:
-                        # Determine account
                         account_str = draft_params.get("account", "personal").lower()
                         account_type = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
 
@@ -614,9 +745,7 @@ async def ask_stream(request: AskStreamRequest):
                         )
 
                         if draft:
-                            # Construct Gmail URL (same as API route)
                             gmail_url = f"https://mail.google.com/mail/u/0/#drafts?compose={draft.draft_id}"
-
                             response_text = f"I've created a draft email for you:\n\n"
                             response_text += f"**To:** {draft.to}\n"
                             response_text += f"**Subject:** {draft.subject}\n"
@@ -624,15 +753,10 @@ async def ask_stream(request: AskStreamRequest):
                             response_text += f"[Open draft in Gmail]({gmail_url})\n\n"
                             response_text += f"Review and send when ready."
 
-                            # Stream the response
                             for chunk in response_text:
                                 yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
                                 await asyncio.sleep(0.01)
-
-                            # Save assistant response
                             store.add_message(conversation_id, "assistant", response_text)
-
-                            # Send done signal
                             yield f"data: {json.dumps({'type': 'done'})}\n\n"
                             return
                         else:
@@ -649,17 +773,226 @@ async def ask_stream(request: AskStreamRequest):
                         yield f"data: {json.dumps({'type': 'done'})}\n\n"
                         return
                 else:
-                    # Couldn't extract params, fall through to normal flow
-                    # which will use Claude to ask for clarification
                     print("Could not extract draft params, falling through to normal flow")
 
-            # Check for any reminder-related intent (CREATE, EDIT, LIST, DELETE)
-            reminder_intent = classify_reminder_intent(request.question)
-            if reminder_intent:
-                print(f"DETECTED REMINDER INTENT: {reminder_intent.value}")
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['reminder'], 'reasoning': f'Reminder {reminder_intent.value} detected', 'latency_ms': 0})}\n\n"
+            elif action_intent and action_intent.category == "task":
+                # ---- TASK MANAGEMENT ----
+                print(f"DETECTED TASK INTENT: {action_intent.sub_type}")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['tasks'], 'reasoning': f'Task {action_intent.sub_type} detected', 'latency_ms': 0})}\n\n"
 
-                # Check if Telegram is configured (settings is imported at module level)
+                from api.services.task_manager import get_task_manager
+                task_manager = get_task_manager()
+
+                # Handle TASK LIST
+                if action_intent.sub_type == TaskIntentType.LIST.value:
+                    # Parse natural language filters from query
+                    q_lower = request.question.lower()
+                    status_filter = None
+                    context_filter = None
+                    for s in ["done", "completed", "in_progress", "in progress", "blocked", "urgent", "deferred", "cancelled"]:
+                        if s in q_lower:
+                            status_filter = s.replace(" ", "_")
+                            break
+                    if not status_filter and ("open" in q_lower or "pending" in q_lower or "to-do" in q_lower or "todo" in q_lower):
+                        status_filter = "todo"
+                    for ctx in ["work", "personal", "finance", "health"]:
+                        if ctx in q_lower:
+                            context_filter = ctx.title()
+                            break
+
+                    tasks = task_manager.list_tasks(status=status_filter, context=context_filter)
+                    if not status_filter:
+                        # Default: show non-done tasks
+                        tasks = [t for t in tasks if t.status not in ("done", "cancelled")]
+
+                    if not tasks:
+                        response_text = "You don't have any open tasks."
+                    else:
+                        from api.services.task_manager import STATUS_TO_SYMBOL
+                        response_text = f"You have {len(tasks)} task(s):\n\n"
+                        for t in tasks:
+                            sym = STATUS_TO_SYMBOL.get(t.status, " ")
+                            response_text += f"- [{sym}] **{t.description}**"
+                            if t.due_date:
+                                response_text += f" (due: {t.due_date})"
+                            if t.priority:
+                                response_text += f" [{t.priority}]"
+                            response_text += f"\n  _{t.context}_"
+                            if t.tags:
+                                response_text += f" | {' '.join('#' + tg for tg in t.tags)}"
+                            response_text += "\n"
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle TASK COMPLETE
+                elif action_intent.sub_type == TaskIntentType.COMPLETE.value:
+                    all_tasks = task_manager.list_tasks(status="todo") + task_manager.list_tasks(status="in_progress") + task_manager.list_tasks(status="urgent")
+                    match_result = find_task_by_topic(request.question, all_tasks)
+
+                    if match_result is None:
+                        response_text = "I couldn't find a task to complete. Try saying \"list my tasks\" to see them."
+                    elif match_result[1] == "ambiguous":
+                        matches = match_result[0]
+                        response_text = "I found multiple matching tasks. Which one?\n\n"
+                        for t, _ in matches:
+                            response_text += f"- {t.description}\n"
+                    else:
+                        task, _ = match_result
+                        task_manager.complete(task.id)
+                        response_text = f"Done! Marked **\"{task.description}\"** as complete."
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle TASK DELETE
+                elif action_intent.sub_type == TaskIntentType.DELETE.value:
+                    all_tasks = task_manager.list_tasks()
+                    match_result = find_task_by_topic(request.question, all_tasks)
+
+                    if match_result is None:
+                        response_text = "I couldn't find a task to delete. Try saying \"list my tasks\" to see them."
+                    elif match_result[1] == "ambiguous":
+                        matches = match_result[0]
+                        response_text = "I found multiple matching tasks. Which one?\n\n"
+                        for t, _ in matches:
+                            response_text += f"- {t.description}\n"
+                    else:
+                        task, _ = match_result
+                        task_manager.delete(task.id)
+                        response_text = f"I've deleted the task **\"{task.description}\"**."
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle TASK EDIT
+                elif action_intent.sub_type == TaskIntentType.EDIT.value:
+                    all_tasks = task_manager.list_tasks()
+                    match_result = find_task_by_topic(request.question, all_tasks)
+
+                    if match_result is None:
+                        response_text = "I couldn't find a task to update. Try saying \"list my tasks\" to see them."
+                    elif match_result[1] == "ambiguous":
+                        matches = match_result[0]
+                        response_text = "I found multiple matching tasks. Which one?\n\n"
+                        for t, _ in matches:
+                            response_text += f"- {t.description}\n"
+                    else:
+                        task, _ = match_result
+                        # Use Claude to extract what changed
+                        edit_params = await extract_task_params(request.question, conversation_history)
+                        if edit_params:
+                            updates = {}
+                            if edit_params.get("priority"):
+                                updates["priority"] = edit_params["priority"]
+                            if edit_params.get("due_date"):
+                                updates["due_date"] = edit_params["due_date"]
+                            if edit_params.get("context") and edit_params["context"] != "Inbox":
+                                updates["context"] = edit_params["context"]
+                            if edit_params.get("tags"):
+                                updates["tags"] = edit_params["tags"]
+                            if updates:
+                                task_manager.update(task.id, **updates)
+                                response_text = f"I've updated **\"{task.description}\"**."
+                            else:
+                                response_text = "I couldn't determine what to change. Please be more specific."
+                        else:
+                            response_text = "I couldn't understand the update. Please try again."
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle TASK CREATE
+                elif action_intent.sub_type == TaskIntentType.CREATE.value:
+                    task_params = await extract_task_params(request.question, conversation_history)
+                    if task_params:
+                        try:
+                            # Create the task
+                            task = task_manager.create(
+                                description=task_params["description"],
+                                context=task_params.get("context", "Inbox"),
+                                priority=task_params.get("priority", ""),
+                                due_date=task_params.get("due_date"),
+                                tags=task_params.get("tags", []),
+                            )
+
+                            # If user also wants a linked reminder
+                            reminder_id = None
+                            if task_params.get("has_reminder") and task_params.get("reminder_time"):
+                                try:
+                                    from api.services.reminder_store import get_reminder_store
+                                    r_store = get_reminder_store()
+                                    reminder = r_store.create(
+                                        name=task_params["description"],
+                                        schedule_type="once",
+                                        schedule_value=task_params["reminder_time"],
+                                        message_type="static",
+                                        message_content=task_params["description"],
+                                    )
+                                    task_manager.update(task.id, reminder_id=reminder.id)
+                                    reminder_id = reminder.id
+                                except Exception as e:
+                                    logger.warning(f"Failed to create linked reminder: {e}")
+
+                            response_text = f"I've added a task to your list:\n\n"
+                            response_text += f"**Task:** {task.description}\n"
+                            response_text += f"**Context:** {task.context}"
+                            if task.tags:
+                                response_text += f" | **Tags:** {' '.join('#' + t for t in task.tags)}"
+                            response_text += "\n"
+                            if task.due_date:
+                                response_text += f"**Due:** {task.due_date}\n"
+                            if task.priority:
+                                response_text += f"**Priority:** {task.priority}\n"
+                            response_text += f"**File:** {task.context}.md\n"
+                            if reminder_id:
+                                response_text += f"\nI've also set a reminder for this task."
+
+                            for chunk in response_text:
+                                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                await asyncio.sleep(0.005)
+                            store.add_message(conversation_id, "assistant", response_text)
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                        except Exception as e:
+                            error_msg = f"Error creating task: {str(e)}"
+                            logger.error(error_msg)
+                            yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+                            store.add_message(conversation_id, "assistant", error_msg)
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                    else:
+                        print("Could not extract task params, falling through to normal flow")
+
+            elif action_intent and action_intent.category == "reminder":
+                # ---- REMINDER MANAGEMENT (unchanged logic) ----
+                reminder_intent_type = None
+                for rit in ReminderIntentType:
+                    if rit.value == action_intent.sub_type:
+                        reminder_intent_type = rit
+                        break
+                if not reminder_intent_type:
+                    reminder_intent_type = ReminderIntentType.CREATE
+
+                print(f"DETECTED REMINDER INTENT: {reminder_intent_type.value}")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['reminder'], 'reasoning': f'Reminder {reminder_intent_type.value} detected', 'latency_ms': 0})}\n\n"
+
                 if not settings.telegram_enabled:
                     error_msg = "Telegram is not configured. To set up reminders, please configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in your .env file."
                     for chunk in error_msg:
@@ -673,12 +1006,10 @@ async def ask_stream(request: AskStreamRequest):
                 from api.services.conversation_context import extract_context_from_history
 
                 reminder_store = get_reminder_store()
-
-                # Get conversation context for reminder follow-ups
                 conv_context = extract_context_from_history(conversation_history) if conversation_history else None
 
                 # Handle LIST intent
-                if reminder_intent == ReminderIntentType.LIST:
+                if reminder_intent_type == ReminderIntentType.LIST:
                     all_reminders = reminder_store.list_all()
                     enabled_reminders = [r for r in all_reminders if r.enabled]
 
@@ -690,7 +1021,6 @@ async def ask_stream(request: AskStreamRequest):
                             if r.schedule_type == "cron":
                                 schedule_desc = f"recurring ({r.schedule_value})"
                             else:
-                                # Format one-time reminders nicely
                                 try:
                                     trigger_dt = datetime.fromisoformat(r.schedule_value)
                                     schedule_desc = format_time_for_display(trigger_dt)
@@ -708,13 +1038,11 @@ async def ask_stream(request: AskStreamRequest):
                     return
 
                 # Handle DELETE intent
-                if reminder_intent == ReminderIntentType.DELETE:
+                if reminder_intent_type == ReminderIntentType.DELETE:
                     topic = extract_reminder_topic(request.question)
                     all_reminders = reminder_store.list_all()
-
                     match_result = find_reminder_by_topic(
-                        topic,
-                        all_reminders,
+                        topic, all_reminders,
                         conv_context.last_reminder_id if conv_context else None,
                         conv_context.last_reminder_name if conv_context else None,
                     )
@@ -743,13 +1071,11 @@ async def ask_stream(request: AskStreamRequest):
                     return
 
                 # Handle EDIT intent
-                if reminder_intent == ReminderIntentType.EDIT:
+                if reminder_intent_type == ReminderIntentType.EDIT:
                     topic = extract_reminder_topic(request.question)
                     all_reminders = reminder_store.list_all()
-
                     match_result = find_reminder_by_topic(
-                        topic,
-                        all_reminders,
+                        topic, all_reminders,
                         conv_context.last_reminder_id if conv_context else None,
                         conv_context.last_reminder_name if conv_context else None,
                     )
@@ -768,7 +1094,6 @@ async def ask_stream(request: AskStreamRequest):
                     else:
                         reminder, match_type = match_result
                         edit_params = await extract_reminder_edit_params(request.question, reminder.name)
-
                         if edit_params:
                             reminder_store.update(
                                 reminder.id,
@@ -788,7 +1113,7 @@ async def ask_stream(request: AskStreamRequest):
                     return
 
                 # Handle CREATE intent
-                if reminder_intent == ReminderIntentType.CREATE:
+                if reminder_intent_type == ReminderIntentType.CREATE:
                     reminder_params = await extract_reminder_params(request.question, conversation_history)
                     if reminder_params:
                         try:
@@ -801,10 +1126,8 @@ async def ask_stream(request: AskStreamRequest):
                                 enabled=True,
                             )
 
-                            # Build response with clear time confirmation
                             display_time = reminder_params.get("display_time", "")
                             if not display_time and reminder.schedule_type == "cron":
-                                # Parse cron for human-readable description
                                 cron_parts = reminder.schedule_value.split()
                                 if len(cron_parts) >= 5:
                                     minute, hour = cron_parts[0], cron_parts[1]
@@ -825,12 +1148,10 @@ async def ask_stream(request: AskStreamRequest):
                             response_text += f"{reminder.message_content}\n\n"
                             response_text += f"Reply to change the time or say \"cancel that reminder\" to remove it."
 
-                            # Stream the response
                             for chunk in response_text:
                                 yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
                                 await asyncio.sleep(0.005)
 
-                            # Save assistant response with reminder context for follow-ups
                             routing_metadata = {
                                 "sources": ["reminder"],
                                 "reasoning": "Reminder created",
@@ -840,12 +1161,9 @@ async def ask_stream(request: AskStreamRequest):
                                 },
                             }
                             store.add_message(
-                                conversation_id,
-                                "assistant",
-                                response_text,
+                                conversation_id, "assistant", response_text,
                                 routing=routing_metadata,
                             )
-
                             yield f"data: {json.dumps({'type': 'done'})}\n\n"
                             return
                         except Exception as e:
@@ -856,8 +1174,19 @@ async def ask_stream(request: AskStreamRequest):
                             yield f"data: {json.dumps({'type': 'done'})}\n\n"
                             return
                     else:
-                        # Couldn't extract params, fall through to normal flow
                         print("Could not extract reminder params, falling through to normal flow")
+
+            elif action_intent and action_intent.category == "ambiguous_task_reminder":
+                # ---- AMBIGUOUS: could be task or reminder ----
+                print("DETECTED AMBIGUOUS TASK/REMINDER INTENT")
+                response_text = "Should I add this as a **to-do** in your task list, or set a **timed reminder** to ping you about it?"
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['clarification'], 'reasoning': 'Ambiguous task/reminder', 'latency_ms': 0})}\n\n"
+                for chunk in response_text:
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0.005)
+                store.add_message(conversation_id, "assistant", response_text)
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
 
             # Expand follow-up queries with conversation context
             # v3: Use enhanced conversation context for better follow-up handling

@@ -115,6 +115,8 @@ These guidelines bias toward caution over speed. For trivial tasks (simple typo 
 | File | Purpose |
 |------|---------|
 | `api/main.py` | FastAPI application entry point |
+| `api/services/task_manager.py` | Task management service (Obsidian Tasks integration) |
+| `api/routes/tasks.py` | Task CRUD API endpoints |
 | `config/settings.py` | Environment configuration |
 | `config/people_dictionary.json` | Known people and aliases (restart required after edits) |
 | `README.md` | Architecture documentation including hybrid search system |
@@ -216,6 +218,21 @@ curl -X POST http://localhost:8000/api/admin/reindex
 ```bash
 ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
 tail -50 logs/lifeos-api-error.log
+```
+
+### Manage Tasks
+
+```bash
+# Create a task
+curl -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Review Q4 report", "context": "Work", "tags": ["review"]}' | jq
+
+# List open tasks
+curl "http://localhost:8000/api/tasks?status=todo" | jq
+
+# Complete a task
+curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
 ```
 
 

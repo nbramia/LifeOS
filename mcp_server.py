@@ -317,6 +317,36 @@ Example morning briefing:
         "description": "Send an immediate message via Telegram. Use for ad-hoc notifications or testing. Requires Telegram to be configured.",
         "method": "POST"
     },
+    "/api/tasks:POST": {
+        "name": "lifeos_task_create",
+        "description": "Create a task in LifeOS. Tasks are stored as Obsidian-compatible markdown in LifeOS/Tasks/{Context}.md. Supports contexts (Work, Personal, Finance, etc.), priority (high/medium/low), due dates, and tags.",
+        "method": "POST",
+        "path": "/api/tasks"
+    },
+    "/api/tasks:GET": {
+        "name": "lifeos_task_list",
+        "description": "List and filter tasks. Supports filtering by status (todo/done/in_progress/cancelled/deferred/blocked/urgent), context, tag, due_before date, and fuzzy text query (e.g., query='taxes' finds '1099').",
+        "method": "GET",
+        "path": "/api/tasks"
+    },
+    "/api/tasks/{task_id}:PUT": {
+        "name": "lifeos_task_update",
+        "description": "Update a task's description, status, context, priority, due_date, or tags. Use lifeos_task_list first to find the task ID.",
+        "method": "PUT",
+        "path": "/api/tasks/{task_id}"
+    },
+    "/api/tasks/{task_id}/complete:PUT": {
+        "name": "lifeos_task_complete",
+        "description": "Mark a task as done. Shortcut for updating status to 'done'. Sets done_date automatically.",
+        "method": "PUT",
+        "path": "/api/tasks/{task_id}/complete"
+    },
+    "/api/tasks/{task_id}:DELETE": {
+        "name": "lifeos_task_delete",
+        "description": "Delete a task by ID. Removes it from the vault markdown file and index.",
+        "method": "DELETE",
+        "path": "/api/tasks/{task_id}"
+    },
 }
 
 
@@ -631,6 +661,55 @@ class LifeOSMCPServer:
                     "text": {"type": "string", "description": "Message text to send via Telegram"}
                 },
                 "required": ["text"]
+            },
+            "lifeos_task_create": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Task description"},
+                    "context": {"type": "string", "description": "Context/category (Work, Personal, Finance, etc.)", "default": "Inbox"},
+                    "priority": {"type": "string", "description": "Priority: high, medium, low"},
+                    "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
+                    "reminder_id": {"type": "string", "description": "Linked reminder ID"}
+                },
+                "required": ["description"]
+            },
+            "lifeos_task_list": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Filter by status (todo, done, in_progress, cancelled, deferred, blocked, urgent)"},
+                    "context": {"type": "string", "description": "Filter by context (Work, Personal, etc.)"},
+                    "tag": {"type": "string", "description": "Filter by tag"},
+                    "due_before": {"type": "string", "description": "Tasks due before date (YYYY-MM-DD)"},
+                    "query": {"type": "string", "description": "Fuzzy text search across task descriptions"}
+                }
+            },
+            "lifeos_task_update": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID from lifeos_task_list"},
+                    "description": {"type": "string", "description": "New task description"},
+                    "status": {"type": "string", "description": "New status (todo, done, in_progress, cancelled, deferred, blocked, urgent)"},
+                    "context": {"type": "string", "description": "New context"},
+                    "priority": {"type": "string", "description": "New priority (high, medium, low)"},
+                    "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags"}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_task_complete": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID to mark as done"}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_task_delete": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID to delete"}
+                },
+                "required": ["task_id"]
             }
         }
 
@@ -1105,6 +1184,36 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_telegram_send":
             return "Message sent to Telegram."
+
+        elif tool_name == "lifeos_task_create":
+            return f"Task created: **{data.get('description', '')}** (ID: {data.get('id', '')})\nContext: {data.get('context', 'Inbox')} | File: {data.get('source_file', '')}"
+
+        elif tool_name == "lifeos_task_list":
+            tasks = data.get("tasks", [])
+            if not tasks:
+                return "No tasks found."
+            text = f"Found {data.get('total', len(tasks))} tasks:\n\n"
+            for t in tasks:
+                symbol = {"todo": "[ ]", "done": "[x]", "in_progress": "[/]", "cancelled": "[-]", "deferred": "[>]", "blocked": "[?]", "urgent": "[!]"}.get(t.get("status", "todo"), "[ ]")
+                text += f"- {symbol} **{t.get('description', '')}**"
+                if t.get("due_date"):
+                    text += f" (due: {t['due_date']})"
+                if t.get("priority"):
+                    text += f" [{t['priority']}]"
+                text += f"\n  Context: {t.get('context', 'Inbox')}"
+                if t.get("tags"):
+                    text += f" | Tags: {', '.join('#' + tag for tag in t['tags'])}"
+                text += f" | ID: {t.get('id', '')}\n"
+            return text
+
+        elif tool_name == "lifeos_task_update":
+            return f"Task updated: **{data.get('description', '')}** (ID: {data.get('id', '')})\nStatus: {data.get('status', '')} | Context: {data.get('context', '')}"
+
+        elif tool_name == "lifeos_task_complete":
+            return f"Task completed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_task_delete":
+            return f"Task deleted (ID: {data.get('id', data.get('task_id', 'unknown'))})"
 
         # Default: return formatted JSON
         return json.dumps(data, indent=2)

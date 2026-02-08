@@ -274,6 +274,14 @@ class IndexerService:
             logger.error(f"Failed to read {file_path}: {e}")
             return
 
+        # Reindex task files for the task manager cache
+        if "LifeOS/Tasks/" in str(path):
+            try:
+                from api.services.task_manager import get_task_manager
+                get_task_manager().reindex_file(str(path))
+            except Exception as e:
+                logger.warning(f"Task reindex failed for {file_path}: {e}")
+
         # Extract frontmatter
         frontmatter, body = extract_frontmatter(content)
 
