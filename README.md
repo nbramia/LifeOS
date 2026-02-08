@@ -68,6 +68,8 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 
 ## Architecture
 
+> **Note**: Diagrams render on GitHub desktop. Mobile app shows raw code ([known limitation](https://github.com/orgs/community/discussions/11595)).
+
 ![LifeOS Architecture](docs/images/architecture-hero.png)
 
 ### How Data Flows
@@ -75,44 +77,38 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 Data moves through LifeOS in a clear pipeline from sources to user-facing features:
 
 ```mermaid
-flowchart TB
-    subgraph Collection["Phase 1: Data Collection"]
-        direction LR
-        G[Gmail] & C[Calendar] & I[iMessage] & S[Slack] & W[WhatsApp]
+flowchart LR
+    subgraph Sources["Data Sources"]
+        direction TB
+        G["Gmail\n(API: threads, attachments)"]
+        C["Calendar\n(API: events, attendees)"]
+        I["iMessage\n(chat.db: messages)"]
+        S["Slack\n(API: DMs, channels)"]
+        V["Vault\n(file watch: .md files)"]
     end
 
-    subgraph Entity["Phase 2-3: Entity Processing"]
+    subgraph Processing["Processing"]
         direction TB
         SE["SourceEntity\n(raw observations)"]
         PE["PersonEntity\n(canonical records)"]
-        SE -->|"email/phone match"| PE
-        SE -->|"fuzzy name match"| PE
+        SE --> PE
     end
 
-    subgraph Index["Phase 4: Indexing"]
-        direction LR
-        Vec["Vector Embeddings\n(ChromaDB)"]
-        BM["Keyword Index\n(BM25/FTS5)"]
-    end
-
-    subgraph Query["Query Pipeline"]
+    subgraph Storage["Storage"]
         direction TB
-        Q["User Query"]
-        R["Query Router\n(Ollama)"]
-        VS["Vector Search"]
-        KS["Keyword Search"]
-        RRF["RRF Fusion"]
-        Syn["Claude Synthesis"]
-
-        Q --> R
-        R --> VS & KS
-        VS & KS --> RRF
-        RRF --> Syn
+        Vec["ChromaDB\n(vectors)"]
+        BM["SQLite\n(FTS5/BM25)"]
     end
 
-    Collection --> Entity
-    Entity --> Index
-    Index --> Query
+    subgraph Query["Query"]
+        direction TB
+        R["Router\n(local Ollama)"]
+        Search["Hybrid Search"]
+        Syn["Synthesis\n(Anthropic API)"]
+        R --> Search --> Syn
+    end
+
+    Sources --> Processing --> Storage --> Query
 ```
 
 ### Two-Tier Entity Model
@@ -120,28 +116,27 @@ flowchart TB
 The CRM uses a two-tier model to handle data from multiple sources:
 
 ```mermaid
-flowchart TB
-    subgraph Sources["Raw Observations"]
-        GS["Gmail SourceEntity\njohn@company.com"]
-        CS["Calendar SourceEntity\nJohn Smith (attendee)"]
-        IS["iMessage SourceEntity\n+1-555-123-4567"]
-        SS["Slack SourceEntity\njohn.smith@company.com"]
-    end
-
-    subgraph Resolution["Entity Resolution Algorithm"]
+flowchart LR
+    subgraph Sources["Raw Observations (SourceEntity)"]
         direction TB
-        E1["1. Exact email match"]
-        E2["2. Exact phone match (E.164)"]
-        E3["3. Fuzzy name match\n(RapidFuzz token_set_ratio)"]
-        E1 --> E2 --> E3
+        GS["Gmail: john@company.com"]
+        CS["Calendar: John Smith"]
+        IS["iMessage: +1-555-123-4567"]
+        SS["Slack: john.smith@company.com"]
     end
 
-    subgraph Canonical["PersonEntity (Canonical)"]
-        PE["John Smith\nEmails: john@company.com\nPhones: +1-555-123-4567\nSources: gmail, calendar, imessage, slack"]
+    subgraph Resolution["Resolution Priority"]
+        direction TB
+        E1["1. Email match"]
+        E2["2. Phone match"]
+        E3["3. Name match"]
     end
 
-    Sources --> Resolution
-    Resolution --> Canonical
+    subgraph Canonical["Canonical (PersonEntity)"]
+        PE["John Smith\n• 2 emails\n• 1 phone\n• 4 sources linked"]
+    end
+
+    Sources --> Resolution --> Canonical
 ```
 
 **Why two tiers?**
@@ -157,15 +152,15 @@ Queries go through a hybrid search combining semantic and keyword matching:
 flowchart LR
     Q["Query"] --> NE["Name Expansion\n(nicknames → canonical)"]
 
-    NE --> VS["Vector Search\n(ChromaDB)"]
+    NE --> VS["Vector Search\n(local embedding model)"]
     NE --> KS["BM25 Search\n(SQLite FTS5)"]
 
-    VS --> RRF["RRF Fusion\nscore = Σ 1/(60 + rank)"]
+    VS --> RRF["RRF Fusion\nscore = Σ 1/(k + rank)"]
     KS --> RRF
 
-    RRF --> Boost["Boosting\n• Recency (0-50%)\n• Filename match (2x)"]
+    RRF --> Boost["Boosting\n• Recency\n• Filename match"]
 
-    Boost --> Results["Ranked Results"]
+    Boost --> Syn["Synthesis\n(Anthropic API)"]
 ```
 
 <details>
@@ -174,35 +169,33 @@ flowchart LR
 The unified daily sync runs in 5 phases with dependencies:
 
 ```mermaid
-flowchart TB
-    subgraph P1["Phase 1: Data Collection"]
-        direction LR
-        G1[Gmail] & C1[Calendar] & L1[LinkedIn] & Co[Contacts] & Ph[Phone] & WA[WhatsApp] & IM[iMessage] & Sl[Slack]
+flowchart LR
+    subgraph P1["1: Collection"]
+        direction TB
+        G1[Gmail]
+        C1[Calendar]
+        IM[iMessage]
+        Sl[Slack]
     end
 
-    subgraph P2["Phase 2: Entity Processing"]
-        direction LR
-        LinkSlack["Link Slack\n(by email)"]
-        LinkiMessage["Link iMessage\n(by phone)"]
-        SyncPhotos["Sync Photos\n(face recognition)"]
+    subgraph P2["2: Entity"]
+        direction TB
+        Link["Link sources\nto people"]
     end
 
-    subgraph P3["Phase 3: Relationship Building"]
-        direction LR
-        Discovery["Relationship\nDiscovery"]
-        Strengths["Calculate\nStrengths"]
+    subgraph P3["3: Relationships"]
+        direction TB
+        Rel["Discover &\ncalculate strength"]
     end
 
-    subgraph P4["Phase 4: Vector Indexing"]
-        direction LR
-        VaultReindex["Vault Reindex\n(ChromaDB + BM25)"]
-        CRMIndex["CRM Vectorstore"]
+    subgraph P4["4: Indexing"]
+        direction TB
+        Idx["ChromaDB +\nBM25 reindex"]
     end
 
-    subgraph P5["Phase 5: Content Sync"]
-        direction LR
-        GDocs["Google Docs"]
-        GSheets["Google Sheets"]
+    subgraph P5["5: Content"]
+        direction TB
+        Con["Google Docs\n& Sheets"]
     end
 
     P1 --> P2 --> P3 --> P4 --> P5
@@ -222,24 +215,19 @@ flowchart TB
 Different query types are handled by different pipelines:
 
 ```mermaid
-flowchart TB
-    Q["User Query"] --> Router["Query Router\n(Ollama LLM)"]
+flowchart LR
+    Q["User Query"] --> Router["Router\n(local Ollama)"]
 
-    Router -->|"General knowledge"| Direct["Claude Direct\n(no data fetch)"]
-    Router -->|"Current events"| Web["Web Search\n(Claude web_search)"]
-    Router -->|"Personal data"| Personal["Source Routing"]
-    Router -->|"Compound"| Compound["Multiple Actions"]
+    Router -->|"General"| Direct["Direct Answer\n(Anthropic API)"]
+    Router -->|"Web"| Web["Web Search\n(Anthropic API)"]
+    Router -->|"Personal"| Hybrid["Hybrid Search\n(local)"]
+    Router -->|"Compound"| Both["Web + Personal"]
 
-    Personal --> Sources["Route to sources:\nvault, email, calendar,\nimessage, slack, crm"]
-    Sources --> Hybrid["Hybrid Search"]
-    Hybrid --> Synthesis["Claude Synthesis"]
-
-    Compound --> Web
-    Compound --> Personal
-
+    Hybrid --> Syn["Synthesis\n(Anthropic API)"]
+    Both --> Syn
     Direct --> Response["Response"]
     Web --> Response
-    Synthesis --> Response
+    Syn --> Response
 ```
 
 **Query types:**
@@ -256,30 +244,30 @@ flowchart TB
 Services are categorized by criticality and fallback behavior:
 
 ```mermaid
-flowchart TB
-    subgraph Critical["Critical (No Fallback)"]
-        ChromaDB["ChromaDB"]
-        Embed["Embedding Model"]
-        Vault["Vault Filesystem"]
+flowchart LR
+    subgraph Local["Local (Critical)"]
+        direction TB
+        ChromaDB["ChromaDB\n:8001"]
+        Embed["Embedding\nModel"]
+        Vault["Vault\nFilesystem"]
     end
 
-    subgraph Degradable["Degradable (With Fallback)"]
-        Ollama["Ollama"] -->|"fallback"| Haiku["Haiku LLM"]
-        Haiku -->|"fallback"| Pattern["Pattern Matching"]
-
-        BM25["BM25 Index"] -->|"fallback"| VecOnly["Vector-Only Search"]
-
-        GCal["Google Calendar"] -->|"fallback"| Cached1["Cached Data"]
-        Gmail["Google Gmail"] -->|"fallback"| Cached2["Cached Data"]
+    subgraph Fallback["Local (With Fallback)"]
+        direction TB
+        Ollama["Ollama\n:11434"] -->|fallback| Haiku["Anthropic\nHaiku"]
+        BM25["BM25"] -->|fallback| VecOnly["Vector-only"]
     end
 
-    subgraph Info["Info Level"]
-        Telegram["Telegram"] -->|"fallback"| EmailOnly["Email-Only Alerts"]
+    subgraph External["External APIs"]
+        direction TB
+        GCal["Google\nCalendar"]
+        Gmail["Google\nGmail"]
+        Anthropic["Anthropic\nClaude"]
     end
 
-    style Critical fill:#ffcccc
-    style Degradable fill:#fff3cd
-    style Info fill:#d4edda
+    style Local fill:#ffcccc
+    style Fallback fill:#fff3cd
+    style External fill:#d4edda
 ```
 
 **Severity levels:**
