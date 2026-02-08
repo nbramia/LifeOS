@@ -113,36 +113,38 @@ flowchart LR
 
 ### Two-Tier Entity Model
 
-The CRM uses a two-tier model to handle data from multiple sources:
+Same person appears differently across sources. Entity resolution merges them:
 
 ```mermaid
 flowchart LR
-    subgraph Sources["Raw Observations (SourceEntity)"]
+    subgraph Tier1["Tier 1: SourceEntity (raw, immutable)"]
         direction TB
-        GS["Gmail: john@company.com"]
+        GS["Gmail: john@work.com"]
         CS["Calendar: John Smith"]
-        IS["iMessage: +1-555-123-4567"]
-        SS["Slack: john.smith@company.com"]
+        IS["iMessage: +1-555-1234"]
+        SS["Slack: @jsmith"]
     end
 
-    subgraph Resolution["Resolution Priority"]
+    subgraph Resolve["Resolution"]
         direction TB
-        E1["1. Email match"]
-        E2["2. Phone match"]
-        E3["3. Name match"]
+        Match["Match by:\nemail > phone > name"]
     end
 
-    subgraph Canonical["Canonical (PersonEntity)"]
-        PE["John Smith\n• 2 emails\n• 1 phone\n• 4 sources linked"]
+    subgraph Tier2["Tier 2: PersonEntity (canonical)"]
+        direction TB
+        PE["John Smith\nemails: john@work.com\nphone: +1-555-1234\nsources: 4"]
     end
 
-    Sources --> Resolution --> Canonical
+    GS --> Match
+    CS --> Match
+    IS --> Match
+    SS --> Match
+    Match --> PE
 ```
 
-**Why two tiers?**
-- **SourceEntity**: Preserves original data from each source (immutable audit trail)
-- **PersonEntity**: Single unified record per person with merged data from all sources
-- One person can have 50,000+ source entities across Gmail, Calendar, messages, etc.
+- **SourceEntity**: Raw observation from each source (immutable audit trail, ~125k records)
+- **PersonEntity**: Merged canonical record per person (~3.5k people)
+- Resolution priority: exact email match → exact phone → fuzzy name
 
 ### Search Pipeline
 
