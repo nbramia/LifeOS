@@ -295,7 +295,14 @@ Format:
 - Keep answers focused and brief
 - Use bullet points for lists
 - Include relevant quotes when helpful
-- End with sources list if multiple files referenced"""
+- End with sources list if multiple files referenced
+
+Actions you can take:
+- Create email drafts: Say "draft an email to..." and I'll create a Gmail draft
+- Create reminders: Say "remind me..." or "set a reminder..." and I'll schedule a Telegram notification
+- Search across calendar, email, drive, messages, and notes
+
+If asked to create a reminder or email, respond naturally - the system will handle the action."""
 
 
 def get_current_datetime_context() -> str:

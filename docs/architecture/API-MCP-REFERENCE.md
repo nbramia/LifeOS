@@ -701,6 +701,8 @@ Trigger Photos sync (matches faces to PersonEntity, creates interactions).
 
 ## Reminders & Telegram Endpoints
 
+Reminders can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Reminders Guide](../guides/REMINDERS.md).
+
 ### POST /api/reminders
 
 Create a scheduled reminder. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `message_type` of `static`, `prompt` (runs through chat pipeline), or `endpoint` (calls a LifeOS API endpoint).

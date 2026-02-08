@@ -88,6 +88,7 @@ api/
 **Telegram & Scheduling:**
 - `telegram.py` - Telegram bot (message sending, bot listener, internal chat client)
 - `reminder_store.py` - Reminder CRUD, persistence, and scheduler
+- `time_parser.py` - Natural language time parsing for reminders
 
 **Search & Retrieval:**
 - `vectorstore.py` - ChromaDB wrapper
@@ -97,8 +98,9 @@ api/
 - `embeddings.py` - Embedding generation
 
 **Chat & Query Processing:**
-- `chat_helpers.py` - Query parsing, intent detection, date extraction
+- `chat_helpers.py` - Query parsing, intent detection (compose, reminder create/edit/list/delete), date extraction
 - `query_router.py` - LLM-based query routing with person name extraction
+- `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)
 
 ---
 

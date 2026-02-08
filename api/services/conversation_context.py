@@ -39,12 +39,20 @@ class ConversationContext:
     # Topic context
     last_topics: list[str] = field(default_factory=list)
 
+    # Reminder context (for edit/delete follow-ups)
+    last_reminder_id: Optional[str] = None
+    last_reminder_name: Optional[str] = None
+
     # Timing
     last_query_time: Optional[datetime] = None
 
     def has_person_context(self) -> bool:
         """Check if we have person context for follow-up."""
         return bool(self.last_person_name or self.last_person_id)
+
+    def has_reminder_context(self) -> bool:
+        """Check if we have reminder context for follow-up."""
+        return bool(self.last_reminder_id or self.last_reminder_name)
 
     def is_stale(self, max_minutes: int = 30) -> bool:
         """Check if context is too old to be relevant."""
@@ -65,6 +73,8 @@ class ConversationContext:
             "last_sources": self.last_sources,
             "last_fetch_depth": self.last_fetch_depth,
             "last_topics": self.last_topics,
+            "last_reminder_id": self.last_reminder_id,
+            "last_reminder_name": self.last_reminder_name,
             "is_stale": self.is_stale(),
         }
 
@@ -112,6 +122,13 @@ def extract_context_from_history(
             # Get fetch depth
             if routing.get("fetch_depth"):
                 context.last_fetch_depth = routing["fetch_depth"]
+
+            # Check for reminder in routing (from reminder creation)
+            if not context.last_reminder_id and routing.get("created_reminder"):
+                reminder_info = routing["created_reminder"]
+                context.last_reminder_id = reminder_info.get("id")
+                context.last_reminder_name = reminder_info.get("name")
+                logger.debug(f"Found reminder context: {context.last_reminder_name}")
 
         # Extract person from content (as fallback)
         if not context.last_person_name and hasattr(msg, 'content') and msg.content:

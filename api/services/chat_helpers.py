@@ -6,7 +6,16 @@ testability. These handle query parsing, date extraction, and message formatting
 """
 import re
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Optional
+
+
+class ReminderIntentType(Enum):
+    """Types of reminder-related intents."""
+    CREATE = "create"
+    EDIT = "edit"
+    LIST = "list"
+    DELETE = "delete"
 
 
 # Common words to filter out of search queries
@@ -172,6 +181,41 @@ def detect_compose_intent(query: str) -> bool:
     ]
 
     return any(pattern in query_lower for pattern in compose_patterns)
+
+
+def detect_reminder_intent(query: str) -> bool:
+    """
+    Detect if the query is asking to create a reminder or scheduled notification.
+
+    Args:
+        query: User query text
+
+    Returns:
+        True if the query indicates reminder creation intent
+    """
+    query_lower = query.lower()
+
+    # Reminder intent patterns
+    reminder_patterns = [
+        "remind me",
+        "set a reminder",
+        "set up a reminder",
+        "create a reminder",
+        "schedule a reminder",
+        "send me a reminder",
+        "notify me",
+        "alert me",
+        "ping me",
+        "message me every",
+        "text me every",
+        "send me a message every",
+        "daily reminder",
+        "weekly reminder",
+        "reminder to",
+        "reminder that",
+    ]
+
+    return any(pattern in query_lower for pattern in reminder_patterns)
 
 
 def extract_date_context(query: str) -> Optional[str]:
@@ -385,6 +429,170 @@ def format_raw_qa_section(messages: list) -> str:
         parts.append(msg.content)
         parts.append("")
     return "\n".join(parts)
+
+
+def classify_reminder_intent(query: str) -> Optional[ReminderIntentType]:
+    """
+    Classify the type of reminder intent in a query.
+
+    Args:
+        query: User query text
+
+    Returns:
+        ReminderIntentType or None if not reminder-related
+    """
+    # Check each intent type in order of specificity
+    if detect_reminder_delete_intent(query):
+        return ReminderIntentType.DELETE
+    if detect_reminder_edit_intent(query):
+        return ReminderIntentType.EDIT
+    if detect_reminder_list_intent(query):
+        return ReminderIntentType.LIST
+    if detect_reminder_intent(query):
+        return ReminderIntentType.CREATE
+    return None
+
+
+def detect_reminder_edit_intent(query: str) -> bool:
+    """
+    Detect if the query is asking to edit/update an existing reminder.
+
+    Args:
+        query: User query text
+
+    Returns:
+        True if the query indicates reminder edit intent
+    """
+    query_lower = query.lower()
+
+    edit_patterns = [
+        "change it to",
+        "change that to",
+        "change the reminder",
+        "change my reminder",
+        "move it to",
+        "move that to",
+        "move the reminder",
+        "update the reminder",
+        "update my reminder",
+        "reschedule the reminder",
+        "reschedule my reminder",
+        "change the .* reminder",
+        "update the .* reminder",
+        "move the .* reminder",
+        "reschedule the .* reminder",
+        "make it ",  # "make it 7pm instead"
+        "change to ",
+    ]
+
+    for pattern in edit_patterns:
+        if re.search(pattern, query_lower):
+            return True
+
+    return False
+
+
+def detect_reminder_list_intent(query: str) -> bool:
+    """
+    Detect if the query is asking to list/show reminders.
+
+    Args:
+        query: User query text
+
+    Returns:
+        True if the query indicates reminder list intent
+    """
+    query_lower = query.lower()
+
+    list_patterns = [
+        "what are my reminders",
+        "what reminders",
+        "show my reminders",
+        "show reminders",
+        "list my reminders",
+        "list reminders",
+        "what reminders do i have",
+        "my reminders",
+        "all reminders",
+        "view reminders",
+        "see my reminders",
+        "see reminders",
+        "upcoming reminders",
+        "scheduled reminders",
+    ]
+
+    return any(pattern in query_lower for pattern in list_patterns)
+
+
+def detect_reminder_delete_intent(query: str) -> bool:
+    """
+    Detect if the query is asking to delete/cancel a reminder.
+
+    Args:
+        query: User query text
+
+    Returns:
+        True if the query indicates reminder delete intent
+    """
+    query_lower = query.lower()
+
+    delete_patterns = [
+        "cancel that reminder",
+        "cancel the reminder",
+        "cancel my reminder",
+        "delete that reminder",
+        "delete the reminder",
+        "delete my reminder",
+        "remove that reminder",
+        "remove the reminder",
+        "remove my reminder",
+        "cancel the .* reminder",
+        "delete the .* reminder",
+        "remove the .* reminder",
+        "delete reminder",
+        "cancel reminder",
+        "remove reminder",
+        "stop the reminder",
+        "stop that reminder",
+    ]
+
+    for pattern in delete_patterns:
+        if re.search(pattern, query_lower):
+            return True
+
+    return False
+
+
+def extract_reminder_topic(query: str) -> Optional[str]:
+    """
+    Extract the topic/name of a reminder from a query.
+
+    Used for matching existing reminders when editing/deleting.
+
+    Args:
+        query: User query like "change the library book reminder to 3pm"
+
+    Returns:
+        Topic string like "library book" or None
+    """
+    query_lower = query.lower()
+
+    # Patterns to extract topic
+    patterns = [
+        r"the\s+(.+?)\s+reminder",  # "the library book reminder"
+        r"my\s+(.+?)\s+reminder",   # "my library book reminder"
+        r"reminder\s+(?:about|for)\s+(.+?)(?:\s+to|\s*$)",  # "reminder about library book"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, query_lower)
+        if match:
+            topic = match.group(1).strip()
+            # Filter out common words that aren't topics
+            if topic not in {'that', 'this', 'it', 'the'}:
+                return topic
+
+    return None
 
 
 # Underscore-prefixed aliases for backward compatibility

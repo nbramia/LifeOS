@@ -27,11 +27,24 @@ from api.services.chat_helpers import (
     extract_search_keywords,
     expand_followup_query,
     detect_compose_intent,
+    detect_reminder_intent,
     extract_date_context,
     extract_message_date_range,
     extract_message_search_terms,
     format_messages_for_synthesis as _format_messages_for_synthesis,
     format_raw_qa_section as _format_raw_qa_section,
+    ReminderIntentType,
+    classify_reminder_intent,
+    detect_reminder_edit_intent,
+    detect_reminder_list_intent,
+    detect_reminder_delete_intent,
+    extract_reminder_topic,
+)
+from api.services.time_parser import (
+    get_smart_default_time,
+    parse_contextual_time,
+    format_time_for_display,
+    extract_time_from_query,
 )
 from config.settings import settings
 from api.services.google_auth import GoogleAccount
@@ -186,6 +199,249 @@ Return ONLY valid JSON, no other text. Example:
                 return params
     except Exception as e:
         logger.error(f"Failed to extract draft params: {e}")
+
+    return None
+
+
+async def extract_reminder_params(query: str, conversation_history: list = None) -> Optional[dict]:
+    """
+    Use Claude to extract reminder parameters from a reminder creation request.
+
+    Uses smart time defaults when no specific time is mentioned:
+    - "remind me to X" without time -> tomorrow 9am
+    - "remind me later today" -> 5pm or 8pm depending on current time
+    - "remind me tonight" -> 8pm today
+
+    Returns dict with:
+        - name: Human-readable reminder name
+        - schedule_type: 'once' or 'cron'
+        - schedule_value: ISO datetime or cron expression
+        - message_type: 'static' (default)
+        - message_content: The reminder message
+        - display_time: Human-readable time for confirmation
+    Or None if extraction fails.
+    """
+    from zoneinfo import ZoneInfo
+
+    # Get current time for context
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(eastern)
+    current_datetime = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+
+    # Try to parse time from query using smart time parser first
+    time_expr = extract_time_from_query(query)
+    parsed_time = None
+    if time_expr:
+        parsed_time = parse_contextual_time(time_expr, now)
+
+    # If no time expression found or couldn't parse, use smart default
+    if parsed_time is None:
+        # Check if query has any time indicators at all
+        has_time_indicator = any(word in query.lower() for word in [
+            'at', 'pm', 'am', 'tomorrow', 'today', 'tonight', 'morning',
+            'afternoon', 'evening', 'next', 'in ', 'daily', 'weekly',
+            'every', 'hour', 'minute'
+        ])
+        if not has_time_indicator:
+            # No time mentioned - use smart default (tomorrow 9am)
+            parsed_time = get_smart_default_time(now)
+
+    # Build context from conversation if available
+    context = ""
+    if conversation_history:
+        recent_msgs = conversation_history[-4:]  # Last 2 exchanges
+        context_parts = []
+        for msg in recent_msgs:
+            context_parts.append(f"{msg.role}: {msg.content[:300]}")
+        if context_parts:
+            context = "\n\nConversation context:\n" + "\n".join(context_parts)
+
+    # Include parsed time hint for Claude
+    time_hint = ""
+    if parsed_time:
+        time_hint = f"\n\nNote: Based on the query, the intended time appears to be: {parsed_time.isoformat()}"
+
+    extraction_prompt = f"""Extract reminder parameters from this request.{context}
+
+Current date/time: {current_datetime}{time_hint}
+
+User request: {query}
+
+Return a JSON object with these fields:
+- "name": Short descriptive name for the reminder (e.g., "Library Book Reminder")
+- "schedule_type": "once" for one-time, "cron" for recurring
+- "schedule_value": For "once" use ISO datetime (e.g., "2026-02-07T18:00:00-05:00"). For "cron" use cron expression (e.g., "0 18 * * *" for daily at 6pm)
+- "message_content": The reminder message to send (include any URLs mentioned)
+- "timezone": The timezone mentioned or implied (default to "America/New_York" for ET/Eastern)
+
+IMPORTANT:
+- If no specific time is mentioned, use the time hint provided above
+- If the time hint shows tomorrow at 9am, use that as the schedule_value
+- Daily at 6pm ET = "0 18 * * *"
+- Every weekday at 9am = "0 9 * * 1-5"
+- Convert times to 24-hour format for cron. 6pm = 18, 9am = 9, etc.
+
+Return ONLY valid JSON, no other text. Example:
+{{"name": "Library Book Reminder", "schedule_type": "once", "schedule_value": "2026-02-09T09:00:00-05:00", "message_content": "Return the library book", "timezone": "America/New_York"}}"""
+
+    try:
+        synthesizer = get_synthesizer()
+        response_text = await synthesizer.get_response(
+            extraction_prompt,
+            max_tokens=512,
+            model_tier="haiku"  # Fast, cheap for structured extraction
+        )
+
+        # Find JSON in response
+        json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if json_match:
+            params = json.loads(json_match.group())
+            # Validate required fields
+            if params.get("schedule_type") and params.get("schedule_value"):
+                # Default message_type to static
+                params["message_type"] = "static"
+
+                # Add human-readable display time
+                if params["schedule_type"] == "once":
+                    try:
+                        trigger_dt = datetime.fromisoformat(params["schedule_value"])
+                        params["display_time"] = format_time_for_display(trigger_dt, now)
+                    except (ValueError, TypeError):
+                        params["display_time"] = params["schedule_value"]
+
+                return params
+    except Exception as e:
+        logger.error(f"Failed to extract reminder params: {e}")
+
+    return None
+
+
+async def extract_reminder_edit_params(query: str, reminder_name: str) -> Optional[dict]:
+    """
+    Extract new schedule parameters for editing an existing reminder.
+
+    Args:
+        query: User query like "change it to 7pm" or "move to tomorrow"
+        reminder_name: Name of the reminder being edited
+
+    Returns:
+        dict with schedule_type, schedule_value, display_time or None
+    """
+    from zoneinfo import ZoneInfo
+
+    eastern = ZoneInfo("America/New_York")
+    now = datetime.now(eastern)
+
+    # Try to parse time from query
+    time_expr = extract_time_from_query(query)
+    parsed_time = None
+    if time_expr:
+        parsed_time = parse_contextual_time(time_expr, now)
+
+    if parsed_time:
+        return {
+            "schedule_type": "once",
+            "schedule_value": parsed_time.isoformat(),
+            "display_time": format_time_for_display(parsed_time, now),
+        }
+
+    # If simple parsing failed, use Claude for complex expressions
+    extraction_prompt = f"""Extract the new time from this reminder edit request.
+
+Current date/time: {now.strftime("%A, %B %d, %Y at %I:%M %p")} ET
+Reminder being edited: {reminder_name}
+User request: {query}
+
+Return ONLY a JSON object with:
+- "schedule_type": "once" for one-time
+- "schedule_value": ISO datetime (e.g., "2026-02-08T19:00:00-05:00")
+
+Example: {{"schedule_type": "once", "schedule_value": "2026-02-08T19:00:00-05:00"}}"""
+
+    try:
+        synthesizer = get_synthesizer()
+        response_text = await synthesizer.get_response(
+            extraction_prompt,
+            max_tokens=256,
+            model_tier="haiku"
+        )
+
+        json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if json_match:
+            params = json.loads(json_match.group())
+            if params.get("schedule_value"):
+                try:
+                    trigger_dt = datetime.fromisoformat(params["schedule_value"])
+                    params["display_time"] = format_time_for_display(trigger_dt, now)
+                except (ValueError, TypeError):
+                    params["display_time"] = params["schedule_value"]
+                return params
+    except Exception as e:
+        logger.error(f"Failed to extract edit params: {e}")
+
+    return None
+
+
+def find_reminder_by_topic(
+    topic: Optional[str],
+    reminders: list,
+    context_reminder_id: Optional[str] = None,
+    context_reminder_name: Optional[str] = None,
+) -> Optional[tuple]:
+    """
+    Find a reminder by topic/name using fuzzy matching.
+
+    Resolution order:
+    1. If topic provided, search all reminders for fuzzy match
+    2. If no topic, use context (last created reminder in conversation)
+    3. Return None if no match
+
+    Args:
+        topic: Topic extracted from query (e.g., "library book")
+        reminders: List of Reminder objects to search
+        context_reminder_id: Last reminder ID from conversation context
+        context_reminder_name: Last reminder name from conversation context
+
+    Returns:
+        Tuple of (reminder, match_type) or None
+        match_type: "exact", "fuzzy", "context", "ambiguous"
+    """
+    if not reminders:
+        return None
+
+    # If topic provided, search by name/content
+    if topic:
+        topic_lower = topic.lower()
+        matches = []
+
+        for reminder in reminders:
+            name_lower = reminder.name.lower()
+            content_lower = (reminder.message_content or "").lower()
+
+            # Exact match in name
+            if topic_lower == name_lower or topic_lower in name_lower:
+                matches.append((reminder, "exact"))
+            # Fuzzy match - topic words appear in name or content
+            elif any(word in name_lower or word in content_lower
+                     for word in topic_lower.split()):
+                matches.append((reminder, "fuzzy"))
+
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            # Multiple matches - return first with "ambiguous" flag
+            return (matches, "ambiguous")
+
+    # Fall back to conversation context
+    if context_reminder_id:
+        for reminder in reminders:
+            if reminder.id == context_reminder_id:
+                return (reminder, "context")
+
+    if context_reminder_name:
+        for reminder in reminders:
+            if reminder.name.lower() == context_reminder_name.lower():
+                return (reminder, "context")
 
     return None
 
@@ -396,6 +652,212 @@ async def ask_stream(request: AskStreamRequest):
                     # Couldn't extract params, fall through to normal flow
                     # which will use Claude to ask for clarification
                     print("Could not extract draft params, falling through to normal flow")
+
+            # Check for any reminder-related intent (CREATE, EDIT, LIST, DELETE)
+            reminder_intent = classify_reminder_intent(request.question)
+            if reminder_intent:
+                print(f"DETECTED REMINDER INTENT: {reminder_intent.value}")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['reminder'], 'reasoning': f'Reminder {reminder_intent.value} detected', 'latency_ms': 0})}\n\n"
+
+                # Check if Telegram is configured (settings is imported at module level)
+                if not settings.telegram_enabled:
+                    error_msg = "Telegram is not configured. To set up reminders, please configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in your .env file."
+                    for chunk in error_msg:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", error_msg)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                from api.services.reminder_store import get_reminder_store
+                from api.services.conversation_context import extract_context_from_history
+
+                reminder_store = get_reminder_store()
+
+                # Get conversation context for reminder follow-ups
+                conv_context = extract_context_from_history(conversation_history) if conversation_history else None
+
+                # Handle LIST intent
+                if reminder_intent == ReminderIntentType.LIST:
+                    all_reminders = reminder_store.list_all()
+                    enabled_reminders = [r for r in all_reminders if r.enabled]
+
+                    if not enabled_reminders:
+                        response_text = "You don't have any active reminders."
+                    else:
+                        response_text = f"You have {len(enabled_reminders)} active reminder(s):\n\n"
+                        for r in enabled_reminders:
+                            if r.schedule_type == "cron":
+                                schedule_desc = f"recurring ({r.schedule_value})"
+                            else:
+                                # Format one-time reminders nicely
+                                try:
+                                    trigger_dt = datetime.fromisoformat(r.schedule_value)
+                                    schedule_desc = format_time_for_display(trigger_dt)
+                                except (ValueError, TypeError):
+                                    schedule_desc = r.schedule_value
+                            response_text += f"- **{r.name}**: {schedule_desc}\n"
+                            if r.message_content:
+                                response_text += f"  _{r.message_content[:50]}{'...' if len(r.message_content) > 50 else ''}_\n"
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle DELETE intent
+                if reminder_intent == ReminderIntentType.DELETE:
+                    topic = extract_reminder_topic(request.question)
+                    all_reminders = reminder_store.list_all()
+
+                    match_result = find_reminder_by_topic(
+                        topic,
+                        all_reminders,
+                        conv_context.last_reminder_id if conv_context else None,
+                        conv_context.last_reminder_name if conv_context else None,
+                    )
+
+                    if match_result is None:
+                        response_text = "I couldn't find a reminder to delete. "
+                        if topic:
+                            response_text += f"No reminder matching \"{topic}\" was found."
+                        else:
+                            response_text += "Please specify which reminder to delete, or say \"list my reminders\" to see them."
+                    elif match_result[1] == "ambiguous":
+                        matches = match_result[0]
+                        response_text = f"I found multiple reminders matching \"{topic}\". Which one?\n\n"
+                        for r in matches:
+                            response_text += f"- {r[0].name}\n"
+                    else:
+                        reminder, match_type = match_result
+                        reminder_store.delete(reminder.id)
+                        response_text = f"I've deleted the reminder **\"{reminder.name}\"**."
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle EDIT intent
+                if reminder_intent == ReminderIntentType.EDIT:
+                    topic = extract_reminder_topic(request.question)
+                    all_reminders = reminder_store.list_all()
+
+                    match_result = find_reminder_by_topic(
+                        topic,
+                        all_reminders,
+                        conv_context.last_reminder_id if conv_context else None,
+                        conv_context.last_reminder_name if conv_context else None,
+                    )
+
+                    if match_result is None:
+                        response_text = "I couldn't find a reminder to edit. "
+                        if topic:
+                            response_text += f"No reminder matching \"{topic}\" was found."
+                        else:
+                            response_text += "Please specify which reminder to change, or say \"list my reminders\" to see them."
+                    elif match_result[1] == "ambiguous":
+                        matches = match_result[0]
+                        response_text = f"I found multiple reminders matching \"{topic}\". Which one?\n\n"
+                        for r in matches:
+                            response_text += f"- {r[0].name}\n"
+                    else:
+                        reminder, match_type = match_result
+                        edit_params = await extract_reminder_edit_params(request.question, reminder.name)
+
+                        if edit_params:
+                            reminder_store.update(
+                                reminder.id,
+                                schedule_type=edit_params.get("schedule_type", reminder.schedule_type),
+                                schedule_value=edit_params["schedule_value"],
+                            )
+                            display_time = edit_params.get("display_time", edit_params["schedule_value"])
+                            response_text = f"I've updated **\"{reminder.name}\"** to {display_time}."
+                        else:
+                            response_text = f"I couldn't understand the new time. Please try again with something like \"change it to 7pm\" or \"move it to tomorrow\"."
+
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Handle CREATE intent
+                if reminder_intent == ReminderIntentType.CREATE:
+                    reminder_params = await extract_reminder_params(request.question, conversation_history)
+                    if reminder_params:
+                        try:
+                            reminder = reminder_store.create(
+                                name=reminder_params.get("name", "Reminder"),
+                                schedule_type=reminder_params["schedule_type"],
+                                schedule_value=reminder_params["schedule_value"],
+                                message_type=reminder_params.get("message_type", "static"),
+                                message_content=reminder_params.get("message_content", ""),
+                                enabled=True,
+                            )
+
+                            # Build response with clear time confirmation
+                            display_time = reminder_params.get("display_time", "")
+                            if not display_time and reminder.schedule_type == "cron":
+                                # Parse cron for human-readable description
+                                cron_parts = reminder.schedule_value.split()
+                                if len(cron_parts) >= 5:
+                                    minute, hour = cron_parts[0], cron_parts[1]
+                                    hour_int = int(hour)
+                                    am_pm = "AM" if hour_int < 12 else "PM"
+                                    hour_12 = hour_int % 12 or 12
+                                    time_str = f"{hour_12}:{minute.zfill(2)} {am_pm}"
+                                    day_of_week = cron_parts[4]
+                                    if day_of_week == "*":
+                                        display_time = f"daily at {time_str}"
+                                    elif day_of_week == "1-5":
+                                        display_time = f"weekdays at {time_str}"
+                                    else:
+                                        display_time = f"at {time_str}"
+
+                            response_text = f"Done! I've set a reminder for **{display_time}**.\n\n"
+                            response_text += f"**{reminder.name}**\n"
+                            response_text += f"{reminder.message_content}\n\n"
+                            response_text += f"Reply to change the time or say \"cancel that reminder\" to remove it."
+
+                            # Stream the response
+                            for chunk in response_text:
+                                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                await asyncio.sleep(0.005)
+
+                            # Save assistant response with reminder context for follow-ups
+                            routing_metadata = {
+                                "sources": ["reminder"],
+                                "reasoning": "Reminder created",
+                                "created_reminder": {
+                                    "id": reminder.id,
+                                    "name": reminder.name,
+                                },
+                            }
+                            store.add_message(
+                                conversation_id,
+                                "assistant",
+                                response_text,
+                                routing=routing_metadata,
+                            )
+
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                        except Exception as e:
+                            error_msg = f"Error creating reminder: {str(e)}"
+                            logger.error(error_msg)
+                            yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+                            store.add_message(conversation_id, "assistant", error_msg)
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                    else:
+                        # Couldn't extract params, fall through to normal flow
+                        print("Could not extract reminder params, falling through to normal flow")
 
             # Expand follow-up queries with conversation context
             # v3: Use enhanced conversation context for better follow-up handling
