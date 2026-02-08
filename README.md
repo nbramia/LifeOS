@@ -1,18 +1,23 @@
 # LifeOS
 
-Self-hosted AI assistant that indexes your digital life for semantic search and synthesis.
+**Your personal knowledge graph, built from the digital exhaust of your life.**
+
+LifeOS is a self-hosted AI assistant that connects to your email, calendar, messages, notes, and contacts—then makes all of it searchable and queryable through natural language. Ask "What did Sarah and I discuss about the project last month?" and get an answer synthesized from Gmail threads, calendar meetings, Slack DMs, and your Obsidian notes.
+
+The system solves a fundamental problem: the same person appears differently across every platform. Your colleague is `john.smith@company.com` in Gmail, `John Smith` in Calendar invites, `+1-555-1234` in iMessage, and `@jsmith` on Slack. LifeOS automatically resolves these fragments into unified person records, building a personal CRM that tracks your relationships across all channels.
+
+Everything runs locally on your Mac. Your data never leaves your machine—only query synthesis calls the Claude API. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
 
 ---
 
-## Features
+## What You Can Do
 
-- **Semantic + keyword hybrid search** across Obsidian notes, emails, messages
-- **Personal CRM** with entity resolution across all data sources
-- **Task management** with Obsidian Tasks integration and natural language creation
-- **Meeting prep briefings** with relevant context and history
-- **People intelligence** - relationship tracking and network visualization
-- **MCP server** for Claude Code integration
-- **Local-first** - all data stays on your machine
+- **Ask questions about your life**: "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?"
+- **Search across everything**: Hybrid semantic + keyword search across notes, emails, messages, calendar
+- **Track relationships**: See interaction history, communication patterns, relationship strength with anyone
+- **Manage tasks naturally**: "Remind me to follow up with John next Tuesday" creates an Obsidian task
+- **Prepare for meetings**: Get briefings with attendee history, past discussions, and relevant notes
+- **Use from Claude Code**: MCP tools let AI assistants query your personal knowledge
 
 ---
 
@@ -70,79 +75,21 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 
 ![LifeOS Architecture](docs/images/architecture-hero.png)
 
-### How Data Flows
+### Entity Resolution
 
-Data moves through LifeOS in a clear pipeline from sources to user-facing features:
+The same person appears differently across every data source. Entity resolution automatically links these fragments:
 
-```mermaid
-flowchart LR
-    subgraph Sources["Data Sources"]
-        direction TB
-        G["Gmail\n(API: threads, attachments)"]
-        C["Calendar\n(API: events, attendees)"]
-        I["iMessage\n(chat.db: messages)"]
-        S["Slack\n(API: DMs, channels)"]
-        V["Vault\n(file watch: .md files)"]
-    end
-
-    subgraph Processing["Processing"]
-        direction TB
-        SE["SourceEntity\n(raw observations)"]
-        PE["PersonEntity\n(canonical records)"]
-        SE --> PE
-    end
-
-    subgraph Storage["Storage"]
-        direction TB
-        Vec["ChromaDB\n(vectors)"]
-        BM["SQLite\n(FTS5/BM25)"]
-    end
-
-    subgraph Query["Query"]
-        direction TB
-        R["Router\n(local Ollama)"]
-        Search["Hybrid Search"]
-        Syn["Synthesis\n(Anthropic API)"]
-        R --> Search --> Syn
-    end
-
-    Sources --> Processing --> Storage --> Query
+```
+ Gmail: john@acme.com        ┐
+ Calendar: "John Smith"      │      ┌─ John Smith ──────────────┐
+ iMessage: +1-555-0123       ├──────│  john@acme.com            │
+ Slack: @jsmith              │      │  +1-555-0123              │
+ LinkedIn: John Smith, Acme  ┘      │  847 interactions         │
+                                    │  Last: yesterday          │
+ = 5 "strangers"                    └─ 1 unified person ────────┘
 ```
 
-### Two-Tier Entity Model
-
-Same person appears differently across sources. Entity resolution merges them:
-
-```mermaid
-flowchart LR
-    subgraph Tier1["Tier 1: SourceEntity (raw, immutable)"]
-        direction TB
-        GS["Gmail: john@work.com"]
-        CS["Calendar: John Smith"]
-        IS["iMessage: +1-555-1234"]
-        SS["Slack: @jsmith"]
-    end
-
-    subgraph Resolve["Resolution"]
-        direction TB
-        Match["Match by:\nemail > phone > name"]
-    end
-
-    subgraph Tier2["Tier 2: PersonEntity (canonical)"]
-        direction TB
-        PE["John Smith\nemails: john@work.com\nphone: +1-555-1234\nsources: 4"]
-    end
-
-    GS --> Match
-    CS --> Match
-    IS --> Match
-    SS --> Match
-    Match --> PE
-```
-
-- **SourceEntity**: Raw observation from each source (immutable audit trail, ~125k records)
-- **PersonEntity**: Merged canonical record per person (~3.5k people)
-- Resolution priority: exact email match → exact phone → fuzzy name
+Resolution matches by: **email** (exact) → **phone** (normalized) → **name** (fuzzy). Raw observations are preserved as immutable SourceEntity records (~125k), while merged PersonEntity records (~3.5k) power the CRM.
 
 ### Search Pipeline
 
