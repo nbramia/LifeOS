@@ -2,9 +2,13 @@
 
 **Your personal knowledge graph, built from the digital exhaust of your life.**
 
-LifeOS is a self-hosted AI assistant that connects to your email, calendar, messages, notes, and contacts—then makes all of it searchable and queryable through natural language. Ask "What did Sarah and I discuss about the project last month?" and get an answer synthesized from Gmail threads, calendar meetings, Slack DMs, and your Obsidian notes.
+LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **searchable and queryable through natural language.** 
+- Ask questions of your unified data through Telegram or a dedicated chat UI 
+- Visualize and explore your relationships with each person in your life through a CRM UI
+- Manage tasks, reminders and alerts (pushed to you through email and Telegram) in natural language
+- Or enable Claude Code to interface with the full range of MCP tools directly
 
-The system solves a fundamental problem: the same person appears differently across every platform. Your colleague is `john.smith@company.com` in Gmail, `John Smith` in Calendar invites, `+1-555-1234` in iMessage, and `@jsmith` on Slack. LifeOS automatically resolves these fragments into unified person records, building a personal CRM that tracks your relationships across all channels.
+The people we are closest to appear across multiple channels. Your colleague is `katie.smith@company.com` in Gmail and calendar invites, `Kate Smith` in email bodies and your personal notes, `+1-901-555-1234` in iMessage and WhatsApp, and `@ksmith` on Slack - and iPhoto has tied her face to her contact in your phone. LifeOS automatically resolves these fragments into unified person records, surfacing this unified information and making it immediately accessible.
 
 Everything runs locally on your Mac. Your data never leaves your machine—only query synthesis calls the Claude API. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
 
@@ -12,10 +16,11 @@ Everything runs locally on your Mac. Your data never leaves your machine—only 
 
 ## What You Can Do
 
-- **Ask questions about your life**: "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?"
-- **Search across everything**: Hybrid semantic + keyword search across notes, emails, messages, calendar
-- **Track relationships**: See interaction history, communication patterns, relationship strength with anyone
-- **Manage tasks naturally**: "Remind me to follow up with John next Tuesday" creates an Obsidian task
+- **Ask questions about your life**: "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
+- **Search across everything**: Ask "What were the key recommendations Sarah made on the Acme project last month?" and get an answer synthesized from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
+- **Track relationships**: Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
+- **Surface old facts and ideas**: Ask "What should I get Jane for her birthday" and it'll pull context from calendar events, email threads, and text messages up to 10 years old
+- **Manage tasks naturally**: "Remind me to follow up with John next Tuesday" creates an Obsidian task or a push reminder
 - **Prepare for meetings**: Get briefings with attendee history, past discussions, and relevant notes
 - **Use from Claude Code**: MCP tools let AI assistants query your personal knowledge
 
@@ -75,40 +80,80 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 
 ![LifeOS Architecture](docs/images/architecture-hero.png)
 
-### Entity Resolution
-
-The same person appears differently across every data source. Entity resolution automatically links these fragments:
-
-```
- Gmail: john@acme.com        ┐
- Calendar: "John Smith"      │      ┌─ John Smith ──────────────┐
- iMessage: +1-555-0123       ├──────│  john@acme.com            │
- Slack: @jsmith              │      │  +1-555-0123              │
- LinkedIn: John Smith, Acme  ┘      │  847 interactions         │
-                                    │  Last: yesterday          │
- = 5 "strangers"                    └─ 1 unified person ────────┘
-```
-
-Resolution matches by: **email** (exact) → **phone** (normalized) → **name** (fuzzy). Raw observations are preserved as immutable SourceEntity records (~125k), while merged PersonEntity records (~3.5k) power the CRM.
-
 ### Search Pipeline
 
-Queries go through a hybrid search combining semantic and keyword matching:
+Different query types are handled by different pipelines:
 
 ```mermaid
 flowchart LR
-    Q["Query"] --> NE["Name Expansion\n(nicknames → canonical)"]
+    Q["User Query"] --> Router["Router\n(local Ollama)"]
 
-    NE --> VS["Vector Search\n(local embedding model)"]
-    NE --> KS["BM25 Search\n(SQLite FTS5)"]
+    Router -->|"General"| Direct["Direct Answer\n(Anthropic API)"]
+    Router -->|"Web"| Web["Web Search\n(Anthropic API)"]
+    Router -->|"Personal"| Hybrid["Hybrid Search\n(local)"]
+    Router -->|"Compound"| Both["Web + Personal"]
 
-    VS --> RRF["RRF Fusion\nscore = Σ 1/(k + rank)"]
-    KS --> RRF
-
-    RRF --> Boost["Boosting\n• Recency\n• Filename match"]
-
-    Boost --> Syn["Synthesis\n(Anthropic API)"]
+    Hybrid --> Syn["Synthesis\n(Anthropic API)"]
+    Both --> Syn
+    Direct --> Response["Response"]
+    Web --> Response
+    Syn --> Response
 ```
+
+**Query types:**
+- **General knowledge**: "What's the capital of France?" → Claude answers directly
+- **Web search**: "What's the weather in NYC?" → Uses web_search tool
+- **Personal data**: "What did I discuss with John last week?" → Searches your data
+- **Compound**: "Look up the trash schedule and remind me the night before" → Multiple actions
+
+### CRM UI
+
+Translates 10 years of interaction history with thousands of contacts into insights and visualizations.
+
+<details>
+<summary><strong>Pages aggregating contact details and interaction history for each person you know.</strong></summary>
+
+![Person page](docs/images/person.png)
+
+</details>
+
+<details>
+<summary><strong>Visualize how your communication patterns have evolved over the last 10 years.</strong></summary>
+
+![Dashboard page](docs/images/dashboard.png)
+
+</details>
+
+<details>
+<summary><strong>Dive deeper on relationships with your family and partner.</strong></summary>
+
+![Dashboard page](docs/images/family.png)
+
+</details>
+
+<details>
+<summary><strong>Visualize and explore relationships in a dynamic social graph.</strong></summary>
+
+![Close graph page](docs/images/close_graph.png)
+
+![Far graph page](docs/images/far_graph.png)
+
+</details>
+
+---
+
+## Data Sources
+
+| Source | Method | Data |
+|--------|--------|------|
+| Obsidian | File watcher | Notes, mentions |
+| Gmail | Google API | Emails, threads |
+| Calendar | Google API | Events, attendees |
+| iMessage | macOS chat.db | Messages |
+| Slack | Slack API | DMs, users |
+| Contacts | Apple CSV | Names, emails, phones |
+| Photos | Photos.sqlite | Face recognition |
+| LinkedIn | CSV import | Connections |
 
 <details>
 <summary><strong>Sync Phases (Daily 3AM)</strong></summary>
@@ -148,40 +193,11 @@ flowchart LR
     P1 --> P2 --> P3 --> P4 --> P5
 ```
 
-**Why phases matter:**
+**Why:**
 1. Data Collection must complete before Entity Processing can link records
 2. Entity Processing must complete before Relationship Building has linked entities
 3. Relationship Building must complete before Vector Indexing has fresh CRM data
 4. Content Sync runs last (indexed on next cycle)
-
-</details>
-
-<details>
-<summary><strong>Query Routing</strong></summary>
-
-Different query types are handled by different pipelines:
-
-```mermaid
-flowchart LR
-    Q["User Query"] --> Router["Router\n(local Ollama)"]
-
-    Router -->|"General"| Direct["Direct Answer\n(Anthropic API)"]
-    Router -->|"Web"| Web["Web Search\n(Anthropic API)"]
-    Router -->|"Personal"| Hybrid["Hybrid Search\n(local)"]
-    Router -->|"Compound"| Both["Web + Personal"]
-
-    Hybrid --> Syn["Synthesis\n(Anthropic API)"]
-    Both --> Syn
-    Direct --> Response["Response"]
-    Web --> Response
-    Syn --> Response
-```
-
-**Query types:**
-- **General knowledge**: "What's the capital of France?" → Claude answers directly
-- **Web search**: "What's the weather in NYC?" → Uses web_search tool
-- **Personal data**: "What did I discuss with John last week?" → Searches your data
-- **Compound**: "Look up the trash schedule and remind me the night before" → Multiple actions
 
 </details>
 
@@ -223,21 +239,6 @@ flowchart LR
 - **INFO**: Log only (Telegram retry, config defaults used)
 
 </details>
-
----
-
-## Data Sources
-
-| Source | Method | Data |
-|--------|--------|------|
-| Obsidian | File watcher | Notes, mentions |
-| Gmail | Google API | Emails, threads |
-| Calendar | Google API | Events, attendees |
-| iMessage | macOS chat.db | Messages |
-| Slack | Slack API | DMs, users |
-| Contacts | Apple CSV | Names, emails, phones |
-| Photos | Photos.sqlite | Face recognition |
-| LinkedIn | CSV import | Connections |
 
 ---
 
