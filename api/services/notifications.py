@@ -125,12 +125,15 @@ def send_alert(
         email_sent = False
 
     # Also send via Telegram if configured
+    telegram_sent = False
     try:
         from api.services.telegram import send_message
         telegram_text = f"*{full_subject}*\n\n{body[:4000]}"
-        send_message(telegram_text)
+        telegram_sent = send_message(telegram_text)
+        if not telegram_sent:
+            logger.warning("Telegram alert not sent (disabled or failed)")
     except Exception as e:
-        logger.debug(f"Telegram alert skipped: {e}")
+        logger.warning(f"Telegram alert failed: {e}")
 
     return email_sent
 

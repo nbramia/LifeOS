@@ -244,6 +244,22 @@ curl "http://localhost:8000/api/tasks?status=todo" | jq
 curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
 ```
 
+### Web Search & Compound Queries
+
+The chat supports three query categories:
+
+1. **General knowledge** - Claude answers directly (no data fetch):
+   - "What's the capital of France?"
+   - "How do I sort a list in Python?"
+
+2. **Web search** - External info via Claude's web_search tool:
+   - "What's the weather in NYC?"
+   - "When does trash get picked up in 22043?"
+
+3. **Compound queries** - Info gathering + action:
+   - "Look up the trash schedule and remind me the night before"
+   - "How do I reset AirPods? Add a task to do this later."
+
 ---
 
 ## Observability & Alerting
@@ -284,6 +300,8 @@ Set in `.env`:
 
 When a service fails and a fallback is used, this is recorded as a "degradation event".
 These are collected and reported in the nightly health check if there are 5+ in 24 hours.
+
+**Note:** Services are tracked on-use, not by polling. Status updates when a service is actually called.
 
 
 

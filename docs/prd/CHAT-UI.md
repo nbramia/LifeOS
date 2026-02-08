@@ -82,6 +82,7 @@ The local LLM (Llama 3.2 3B via Ollama) routes queries to appropriate data sourc
 | `photos` | Apple Photos (face recognition) | "When was I last in a photo with Jonathan?" |
 | `tasks` | Task index (Obsidian Tasks) | "What are my open tasks?" |
 | `memories` | User-saved memories | "What did I want to remember about the project?" |
+| `web` | External info via web search | "What's the weather?" / "Trash pickup schedule?" |
 
 **Router Prompt:** Configurable at `config/prompts/query_router.txt`
 
