@@ -723,7 +723,7 @@ async def ask_stream(request: AskStreamRequest):
 
             # Unified intent classification — evaluates compose, task, and reminder
             # patterns simultaneously and picks the most specific match.
-            action_intent = classify_action_intent(request.question)
+            action_intent = await classify_action_intent(request.question, conversation_history)
             _intent_handled = False
 
             if action_intent and action_intent.category == "compose":
@@ -1176,10 +1176,117 @@ async def ask_stream(request: AskStreamRequest):
                     else:
                         print("Could not extract reminder params, falling through to normal flow")
 
+            elif action_intent and action_intent.category == "task_and_reminder":
+                # ---- BOTH: create task AND linked reminder ----
+                print("DETECTED TASK_AND_REMINDER INTENT — creating both")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['tasks', 'reminder'], 'reasoning': 'Task and reminder creation', 'latency_ms': 0})}\n\n"
+
+                from api.services.task_manager import get_task_manager
+                task_manager = get_task_manager()
+
+                # Extract the underlying request from conversation context
+                # The user may have said "Both" as a follow-up, so check history
+                original_query = request.question
+                if conversation_history and len(request.question.split()) <= 3:
+                    # Short follow-up like "Both" — find the original request
+                    for msg in reversed(conversation_history):
+                        if msg.role == "user" and len(msg.content.split()) > 3:
+                            original_query = msg.content
+                            break
+
+                task_params = await extract_task_params(original_query, conversation_history)
+                if task_params:
+                    try:
+                        task = task_manager.create(
+                            description=task_params["description"],
+                            context=task_params.get("context", "Inbox"),
+                            priority=task_params.get("priority", ""),
+                            due_date=task_params.get("due_date"),
+                            tags=task_params.get("tags", []),
+                        )
+
+                        # Create linked reminder
+                        reminder_id = None
+                        try:
+                            from api.services.reminder_store import get_reminder_store
+                            r_store = get_reminder_store()
+
+                            reminder_time = task_params.get("reminder_time")
+                            if not reminder_time:
+                                # No time extracted — extract reminder params from original query
+                                r_params = await extract_reminder_params(original_query, conversation_history)
+                                if r_params:
+                                    reminder = r_store.create(
+                                        name=task_params["description"],
+                                        schedule_type=r_params["schedule_type"],
+                                        schedule_value=r_params["schedule_value"],
+                                        message_type=r_params.get("message_type", "static"),
+                                        message_content=task_params["description"],
+                                    )
+                                    reminder_id = reminder.id
+                                else:
+                                    # Default: remind tomorrow at 9am
+                                    from zoneinfo import ZoneInfo
+                                    eastern = ZoneInfo("America/New_York")
+                                    tomorrow = (datetime.now(eastern) + timedelta(days=1)).replace(
+                                        hour=9, minute=0, second=0, microsecond=0
+                                    )
+                                    reminder = r_store.create(
+                                        name=task_params["description"],
+                                        schedule_type="once",
+                                        schedule_value=tomorrow.isoformat(),
+                                        message_type="static",
+                                        message_content=task_params["description"],
+                                    )
+                                    reminder_id = reminder.id
+                            else:
+                                reminder = r_store.create(
+                                    name=task_params["description"],
+                                    schedule_type="once",
+                                    schedule_value=reminder_time,
+                                    message_type="static",
+                                    message_content=task_params["description"],
+                                )
+                                reminder_id = reminder.id
+
+                            if reminder_id:
+                                task_manager.update(task.id, reminder_id=reminder_id)
+                        except Exception as e:
+                            logger.warning(f"Failed to create linked reminder: {e}")
+
+                        response_text = f"Done! I've created both:\n\n"
+                        response_text += f"**Task:** {task.description}\n"
+                        response_text += f"**Context:** {task.context}"
+                        if task.tags:
+                            response_text += f" | {' '.join('#' + t for t in task.tags)}"
+                        response_text += "\n"
+                        if task.due_date:
+                            response_text += f"**Due:** {task.due_date}\n"
+                        if reminder_id:
+                            response_text += f"\n**Reminder** set to ping you about it."
+                        else:
+                            response_text += f"\nI added the task but couldn't create the reminder."
+
+                        for chunk in response_text:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+                        store.add_message(conversation_id, "assistant", response_text)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                    except Exception as e:
+                        error_msg = f"Error creating task and reminder: {str(e)}"
+                        logger.error(error_msg)
+                        yield f"data: {json.dumps({'type': 'content', 'content': error_msg})}\n\n"
+                        store.add_message(conversation_id, "assistant", error_msg)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                else:
+                    print("Could not extract task params for task_and_reminder, falling through")
+
             elif action_intent and action_intent.category == "ambiguous_task_reminder":
                 # ---- AMBIGUOUS: could be task or reminder ----
                 print("DETECTED AMBIGUOUS TASK/REMINDER INTENT")
-                response_text = "Should I add this as a **to-do** in your task list, or set a **timed reminder** to ping you about it?"
+                response_text = "Should I add this as a **to-do** in your task list, or set a **timed reminder** to ping you about it, or both?"
                 yield f"data: {json.dumps({'type': 'routing', 'sources': ['clarification'], 'reasoning': 'Ambiguous task/reminder', 'latency_ms': 0})}\n\n"
                 for chunk in response_text:
                     yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"

@@ -5,10 +5,14 @@ Pure functions extracted from chat.py to reduce complexity and improve
 testability. These handle query parsing, date extraction, and message formatting.
 """
 import dataclasses
+import json
+import logging
 import re
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ReminderIntentType(Enum):
@@ -612,90 +616,163 @@ def extract_reminder_topic(query: str) -> Optional[str]:
     return None
 
 
-def classify_action_intent(query: str) -> Optional[ActionIntent]:
-    """
-    Classify action intent across all categories (compose, task, reminder).
+_INTENT_CLASSIFICATION_PROMPT = """Classify the user's intent. Return ONLY a JSON object.
 
-    Evaluates patterns simultaneously and returns the most specific match.
+Possible intents:
+- compose: drafting/sending an email
+- task_create: adding a to-do or task
+- task_list: listing/showing tasks
+- task_complete: marking a task as done
+- task_edit: changing a task's details
+- task_delete: removing a task
+- reminder_create: setting a timed reminder/notification
+- reminder_list: listing reminders
+- reminder_edit: changing a reminder
+- reminder_delete: removing a reminder
+- task_and_reminder: user wants BOTH a task and a reminder (e.g., "both", "do both", "task and reminder")
+- none: question, search, or anything that isn't an action above
+
+Key distinction: A "task" is a to-do item on a list. A "reminder" is a timed notification that pings the user. If the user mentions a specific time/date for a notification, it's a reminder. If they want to track something to do, it's a task. If ambiguous, prefer task_create.
+
+{context}
+
+User message: {query}
+
+Return JSON: {{"intent": "<intent>", "confidence": <0.0-1.0>}}"""
+
+
+async def classify_action_intent(query: str, conversation_history: list = None) -> Optional[ActionIntent]:
+    """
+    Classify action intent using LLM (Ollama first, Haiku fallback).
+
+    Uses conversation history to understand follow-ups like "Both" or "the second one".
 
     Args:
         query: User query text
+        conversation_history: Recent conversation messages for context
 
     Returns:
         ActionIntent with category and optional sub_type, or None if no match
     """
-    query_lower = query.lower()
+    # Build conversation context for follow-up understanding
+    context = ""
+    if conversation_history:
+        recent = conversation_history[-4:]
+        parts = []
+        for msg in recent:
+            role = getattr(msg, "role", "user")
+            content = getattr(msg, "content", str(msg))[:300]
+            parts.append(f"{role}: {content}")
+        if parts:
+            context = "Recent conversation:\n" + "\n".join(parts)
 
-    # 1. Check compose patterns first (very specific)
-    compose_patterns = [
-        "draft an email",
-        "draft email",
-        "draft a message",
-        "compose an email",
-        "compose email",
-        "write an email",
-        "write email",
-        "send an email",
-        "send email",
-        "email to ",
-        "write to ",
-        "draft to ",
-    ]
+    prompt = _INTENT_CLASSIFICATION_PROMPT.format(query=query, context=context)
 
-    for pattern in compose_patterns:
-        if pattern in query_lower:
+    # Try Ollama (local, fast, free)
+    intent_str = await _classify_via_ollama(prompt)
+    if intent_str:
+        result = _parse_intent_response(intent_str)
+        if result:
+            return result
+
+    # Fallback: Haiku (remote, cheap, reliable)
+    intent_str = await _classify_via_haiku(prompt)
+    if intent_str:
+        result = _parse_intent_response(intent_str)
+        if result:
+            return result
+
+    # Last resort: pattern matching when both LLMs are down
+    logger.warning("Both Ollama and Haiku unavailable for intent classification, using pattern fallback")
+    return _classify_action_intent_patterns(query)
+
+
+async def _classify_via_ollama(prompt: str) -> Optional[str]:
+    """Try classifying intent via local Ollama (fast, free)."""
+    try:
+        from api.services.ollama_client import OllamaClient
+        client = OllamaClient()
+        if not client.is_available():
+            return None
+        response = await client.generate(prompt)
+        return response
+    except Exception as e:
+        logger.debug(f"Ollama intent classification failed: {e}")
+        return None
+
+
+async def _classify_via_haiku(prompt: str) -> Optional[str]:
+    """Fallback: classify intent via Claude Haiku."""
+    try:
+        from api.services.synthesizer import get_synthesizer
+        synthesizer = get_synthesizer()
+        response = await synthesizer.get_response(prompt, max_tokens=64, model_tier="haiku")
+        return response
+    except Exception as e:
+        logger.debug(f"Haiku intent classification failed: {e}")
+        return None
+
+
+def _parse_intent_response(response: str) -> Optional[ActionIntent]:
+    """Parse the LLM's JSON response into an ActionIntent."""
+    try:
+        json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+        if not json_match:
+            return None
+        data = json.loads(json_match.group())
+        intent = data.get("intent", "none")
+        confidence = data.get("confidence", 0.5)
+
+        if confidence < 0.3 or intent == "none":
+            return None
+
+        # Map LLM intent string to ActionIntent
+        mapping = {
+            "compose": ("compose", None),
+            "task_create": ("task", TaskIntentType.CREATE.value),
+            "task_list": ("task", TaskIntentType.LIST.value),
+            "task_complete": ("task", TaskIntentType.COMPLETE.value),
+            "task_edit": ("task", TaskIntentType.EDIT.value),
+            "task_delete": ("task", TaskIntentType.DELETE.value),
+            "reminder_create": ("reminder", ReminderIntentType.CREATE.value),
+            "reminder_list": ("reminder", ReminderIntentType.LIST.value),
+            "reminder_edit": ("reminder", ReminderIntentType.EDIT.value),
+            "reminder_delete": ("reminder", ReminderIntentType.DELETE.value),
+            "task_and_reminder": ("task_and_reminder", None),
+        }
+
+        if intent in mapping:
+            category, sub_type = mapping[intent]
+            return ActionIntent(category, sub_type)
+
+        return None
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.debug(f"Failed to parse intent response: {e}")
+        return None
+
+
+def _classify_action_intent_patterns(query: str) -> Optional[ActionIntent]:
+    """Pattern-based fallback when LLMs are unavailable."""
+    q = query.lower()
+
+    # Compose
+    for p in ["draft an email", "draft email", "compose email", "write an email", "send an email", "email to "]:
+        if p in q:
             return ActionIntent("compose", None)
 
-    # 2. Check task-specific patterns
-    task_patterns = {
-        TaskIntentType.DELETE: [
-            "delete the task",
-            "remove the task",
-            "delete my task",
-            "remove the to-do",
-        ],
-        TaskIntentType.COMPLETE: [
-            r"mark .* as done",
-            "complete the task",
-            "finish the task",
-            "check off",
-            "done with the task",
-        ],
-        TaskIntentType.EDIT: [
-            "update the task",
-            "change the task",
-            "edit the task",
-            "modify the task",
-        ],
-        TaskIntentType.LIST: [
-            "list my tasks",
-            "show my tasks",
-            "what's on my to-do",
-            "my tasks",
-            "open tasks",
-            "pending tasks",
-            "show tasks",
-            "what tasks",
-        ],
-        TaskIntentType.CREATE: [
-            "add a to-do",
-            "add a todo",
-            "create a task",
-            "new task",
-            "add to my list",
-            "add to my to-do",
-            "add a task",
-        ],
-    }
+    # Task
+    if any(p in q for p in ["delete the task", "remove the task", "remove the to-do"]):
+        return ActionIntent("task", TaskIntentType.DELETE.value)
+    if re.search(r"mark .* as done", q) or any(p in q for p in ["complete the task", "check off"]):
+        return ActionIntent("task", TaskIntentType.COMPLETE.value)
+    if any(p in q for p in ["update the task", "change the task", "edit the task"]):
+        return ActionIntent("task", TaskIntentType.EDIT.value)
+    if any(p in q for p in ["list my tasks", "show my tasks", "my tasks", "open tasks", "show tasks"]):
+        return ActionIntent("task", TaskIntentType.LIST.value)
+    if any(p in q for p in ["add a to-do", "add a todo", "create a task", "new task", "add a task"]):
+        return ActionIntent("task", TaskIntentType.CREATE.value)
 
-    # Check more specific task patterns first
-    for intent_type in [TaskIntentType.DELETE, TaskIntentType.COMPLETE,
-                        TaskIntentType.EDIT, TaskIntentType.LIST, TaskIntentType.CREATE]:
-        for pattern in task_patterns[intent_type]:
-            if re.search(pattern, query_lower):
-                return ActionIntent("task", intent_type.value)
-
-    # 3. Check reminder patterns
+    # Reminder
     if detect_reminder_delete_intent(query):
         return ActionIntent("reminder", ReminderIntentType.DELETE.value)
     if detect_reminder_edit_intent(query):
@@ -703,32 +780,7 @@ def classify_action_intent(query: str) -> Optional[ActionIntent]:
     if detect_reminder_list_intent(query):
         return ActionIntent("reminder", ReminderIntentType.LIST.value)
     if detect_reminder_intent(query):
-        # 4. CRITICAL: Disambiguate "remind me to X" / "remember to X"
-        # Check for time references
-        time_indicators = [
-            r'\bat\b',
-            r'\bpm\b',
-            r'\bam\b',
-            r'\btomorrow\b',
-            r'\bevery\b',
-            r'\bdaily\b',
-            r'\bweekly\b',
-            r'\bnext\s+\w+day\b',
-            r'\btonight\b',
-            r'\bmorning\b',
-            r'\bevening\b',
-            r'\bnoon\b',
-            r'\bmidnight\b',
-            r"o'clock",
-            r'\bin\s+\d+\s+(minute|minutes|hour|hours|day|days)\b',
-        ]
-
-        has_time_reference = any(re.search(pattern, query_lower) for pattern in time_indicators)
-
-        if has_time_reference:
-            return ActionIntent("reminder", ReminderIntentType.CREATE.value)
-        else:
-            return ActionIntent("ambiguous_task_reminder", None)
+        return ActionIntent("reminder", ReminderIntentType.CREATE.value)
 
     return None
 
