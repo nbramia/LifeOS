@@ -63,11 +63,11 @@ class TestBriefingsService:
         return search
 
     @pytest.fixture
-    def mock_action_registry(self):
-        """Create mock action registry."""
-        registry = MagicMock()
-        registry.get_actions_involving_person.return_value = []
-        return registry
+    def mock_task_manager(self):
+        """Create mock task manager."""
+        manager = MagicMock()
+        manager.list_tasks.return_value = []
+        return manager
 
     @pytest.fixture
     def mock_entity_resolver(self):
@@ -85,11 +85,11 @@ class TestBriefingsService:
         return store
 
     @pytest.fixture
-    def service(self, mock_hybrid_search, mock_action_registry, mock_entity_resolver, mock_interaction_store):
+    def service(self, mock_hybrid_search, mock_task_manager, mock_entity_resolver, mock_interaction_store):
         """Create briefings service with mocks."""
         return BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=mock_entity_resolver,
             interaction_store=mock_interaction_store,
         )
@@ -143,15 +143,14 @@ class TestBriefingsService:
         assert len(context.related_notes) == 1
         assert "Q1 Planning.md" in context.sources
 
-    def test_gather_context_gets_action_items(self, service, mock_action_registry):
+    def test_gather_context_gets_action_items(self, service, mock_task_manager):
         """Should get action items for person."""
-        mock_action = MagicMock()
-        mock_action.task = "Review budget proposal"
-        mock_action.owner = "Alex"
-        mock_action.completed = False
-        mock_action.due_date = None
-        mock_action.source_file = "Budget.md"
-        mock_action_registry.get_actions_involving_person.return_value = [mock_action]
+        mock_task = MagicMock()
+        mock_task.description = "Review budget proposal"
+        mock_task.status = "todo"
+        mock_task.due_date = None
+        mock_task.source_file = "Budget.md"
+        mock_task_manager.list_tasks.return_value = [mock_task]
 
         context = service.gather_context("alex")
 

@@ -153,12 +153,12 @@ class TestBriefingsServiceV2Integration:
         mock_hybrid_search.search.return_value = []
 
         # Mock action registry
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=resolver,
             interaction_store=populated_interaction_store,
         )
@@ -184,12 +184,12 @@ class TestBriefingsServiceV2Integration:
         mock_hybrid_search = MagicMock()
         mock_hybrid_search.search.return_value = []
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=resolver,
         )
 
@@ -210,12 +210,12 @@ class TestBriefingsServiceV2Integration:
         mock_hybrid_search = MagicMock()
         mock_hybrid_search.search.return_value = []
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=resolver,
         )
 
@@ -249,12 +249,12 @@ class TestBriefingsServiceGenerateBriefing:
         mock_hybrid_search = MagicMock()
         mock_hybrid_search.search.return_value = []
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=resolver,
             interaction_store=populated_interaction_store,
         )
@@ -282,12 +282,12 @@ class TestBriefingsServiceGenerateBriefing:
         mock_hybrid_search = MagicMock()
         mock_hybrid_search.search.return_value = []
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=resolver,
         )
 
@@ -325,12 +325,12 @@ class TestVaultSearchImprovement:
             }
         ]
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
         )
 
         # Person NOT in PEOPLE_DICTIONARY

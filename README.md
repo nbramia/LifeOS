@@ -8,6 +8,7 @@ Self-hosted AI assistant that indexes your digital life for semantic search and 
 
 - **Semantic + keyword hybrid search** across Obsidian notes, emails, messages
 - **Personal CRM** with entity resolution across all data sources
+- **Task management** with Obsidian Tasks integration and natural language creation
 - **Meeting prep briefings** with relevant context and history
 - **People intelligence** - relationship tracking and network visualization
 - **MCP server** for Claude Code integration
@@ -21,7 +22,9 @@ Self-hosted AI assistant that indexes your digital life for semantic search and 
 |-----------------|--------|-----------|
 | [Installation](docs/getting-started/INSTALLATION.md) | [Google OAuth](docs/guides/GOOGLE-OAUTH.md) | [API Reference](docs/architecture/API-MCP-REFERENCE.md) |
 | [Configuration](docs/getting-started/CONFIGURATION.md) | [Slack Integration](docs/guides/SLACK-INTEGRATION.md) | [Scripts](docs/reference/SCRIPTS.md) |
-| [First Run](docs/getting-started/FIRST-RUN.md) | [Launchd Setup](docs/guides/LAUNCHD-SETUP.md) | [Troubleshooting](docs/reference/TROUBLESHOOTING.md) |
+| [First Run](docs/getting-started/FIRST-RUN.md) | [Task Management](docs/guides/TASK-MANAGEMENT.md) | [Troubleshooting](docs/reference/TROUBLESHOOTING.md) |
+|  | [Reminders](docs/guides/REMINDERS.md) | |
+|  | [Launchd Setup](docs/guides/LAUNCHD-SETUP.md) | |
 
 ---
 
@@ -87,7 +90,7 @@ See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed inst
 │                         │                                   │
 │  ┌──────────────────────▼──────────────────────┐           │
 │  │             FastAPI Server                   │           │
-│  │         + MCP Tools for Claude              │           │
+│  │   + MCP Tools + Task Management + CRM       │           │
 │  └─────────────────────────────────────────────┘           │
 └─────────────────────────────────────────────────────────────┘
 ```

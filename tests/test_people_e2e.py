@@ -55,12 +55,12 @@ class TestBriefingIntegration:
         mock_hybrid_search = MagicMock()
         mock_hybrid_search.search.return_value = []
 
-        mock_action_registry = MagicMock()
-        mock_action_registry.get_actions_involving_person.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
 
         service = BriefingsService(
             hybrid_search=mock_hybrid_search,
-            action_registry=mock_action_registry,
+            task_manager=mock_task_manager,
             entity_resolver=mock_resolver,
             interaction_store=mock_interaction_store,
         )

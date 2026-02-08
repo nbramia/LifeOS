@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from api.services.people import resolve_person_name, PEOPLE_DICTIONARY
 from api.services.hybrid_search import HybridSearch
-from api.services.actions import ActionRegistry, get_action_registry
+from api.services.task_manager import TaskManager, get_task_manager
 from api.services.synthesizer import get_synthesizer
 from api.services.entity_resolver import EntityResolver, get_entity_resolver
 from api.services.interaction_store import InteractionStore, get_interaction_store
@@ -151,14 +151,14 @@ class BriefingsService:
     def __init__(
         self,
         hybrid_search: Optional[HybridSearch] = None,
-        action_registry: Optional[ActionRegistry] = None,
+        task_manager: Optional[TaskManager] = None,
         entity_resolver: Optional[EntityResolver] = None,
         interaction_store: Optional[InteractionStore] = None,
         imessage_store: Optional["IMessageStore"] = None,
     ):
         """Initialize briefings service."""
         self._hybrid_search = hybrid_search
-        self._action_registry = action_registry
+        self._task_manager = task_manager
         self._entity_resolver = entity_resolver
         self._interaction_store = interaction_store
         self._imessage_store = imessage_store
@@ -171,11 +171,11 @@ class BriefingsService:
         return self._hybrid_search
 
     @property
-    def action_registry(self) -> ActionRegistry:
-        """Lazy-load action registry."""
-        if self._action_registry is None:
-            self._action_registry = get_action_registry()
-        return self._action_registry
+    def task_manager(self) -> TaskManager:
+        """Lazy-load task manager."""
+        if self._task_manager is None:
+            self._task_manager = get_task_manager()
+        return self._task_manager
 
     @property
     def entity_resolver(self) -> EntityResolver:
@@ -318,14 +318,14 @@ class BriefingsService:
 
         # Get action items involving person
         try:
-            actions = self.action_registry.get_actions_involving_person(resolved)
-            for action in actions[:10]:  # Limit to 10
+            tasks = self.task_manager.list_tasks(query=resolved, status="todo")
+            for t in tasks[:10]:
                 context.action_items.append({
-                    "task": action.task,
-                    "owner": action.owner,
-                    "completed": action.completed,
-                    "due_date": action.due_date.isoformat() if action.due_date else None,
-                    "source_file": action.source_file,
+                    "task": t.description,
+                    "owner": None,
+                    "completed": t.status == "done",
+                    "due_date": t.due_date,
+                    "source_file": t.source_file,
                 })
         except Exception as e:
             logger.warning(f"Could not get action items: {e}")
