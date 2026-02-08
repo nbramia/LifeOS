@@ -947,6 +947,9 @@ class InteractionStore:
             return backup_path
         except Exception as e:
             logger.error(f"Failed to create backup: {e}")
+            # Record backup failure for nightly alert
+            from api.services.notifications import record_failure
+            record_failure("backup_storage", f"Interactions backup failed: {e}", severity="warning")
             return None
 
     def get_statistics(self) -> dict:

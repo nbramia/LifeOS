@@ -46,12 +46,21 @@ class EmbeddingService:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
-            # Load model with cache directory and trust_remote_code for Qwen models
-            self._model = SentenceTransformer(
-                self.model_name,
-                cache_folder=self.cache_dir,
-                trust_remote_code=True,  # Required for gte-Qwen2 models
-            )
+            try:
+                # Load model with cache directory and trust_remote_code for Qwen models
+                self._model = SentenceTransformer(
+                    self.model_name,
+                    cache_folder=self.cache_dir,
+                    trust_remote_code=True,  # Required for gte-Qwen2 models
+                )
+                # Mark embedding model as healthy
+                from api.services.service_health import mark_service_healthy
+                mark_service_healthy("embedding_model")
+            except Exception as e:
+                # Mark embedding model as failed (critical)
+                from api.services.service_health import mark_service_failed, Severity
+                mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
+                raise
         return self._model
 
     def embed_text(self, text: str) -> list[float]:

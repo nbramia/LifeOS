@@ -183,8 +183,17 @@ Running `uvicorn api.main:app` directly causes **ghost server processes**:
 ### Check Service Health
 
 ```bash
+# API endpoint health (tests all endpoints)
 curl http://localhost:8000/health/full | jq
+
+# External service status (ChromaDB, Ollama, etc.)
+curl http://localhost:8000/health/services | jq
 ```
+
+The `/health/services` endpoint shows:
+- Per-service status (healthy/degraded/unavailable)
+- Degradation events (fallback usage) from last 24h
+- Critical issues requiring immediate attention
 
 ### Search for a Person
 
@@ -234,6 +243,47 @@ curl "http://localhost:8000/api/tasks?status=todo" | jq
 # Complete a task
 curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
 ```
+
+---
+
+## Observability & Alerting
+
+### How Alerts Work
+
+| Severity | When Sent | Examples |
+|----------|-----------|----------|
+| **CRITICAL** | Immediately (rate-limited) | ChromaDB down, embedding model failed, vault inaccessible |
+| **WARNING** | Batched nightly (7 AM ET) | Ollama unavailable, backup failed, >5 degradation events |
+| **INFO** | Log only | Telegram retry, config defaults used |
+
+**Rate limiting for CRITICAL alerts:**
+- Only sent on state transition (healthy → failed), not repeated failures
+- 5-minute cooldown between alerts for the same service (handles flapping)
+
+### Alert Configuration
+
+Set in `.env`:
+- `LIFEOS_ALERT_EMAIL` - Email address for alerts
+- `telegram_bot_token` + `telegram_chat_id` - Telegram backup channel
+
+### Tracked Services
+
+| Service | Severity | Fallback |
+|---------|----------|----------|
+| `chromadb` | CRITICAL | None (core functionality) |
+| `embedding_model` | CRITICAL | None (core functionality) |
+| `vault_filesystem` | CRITICAL | None (core functionality) |
+| `ollama` | WARNING | Haiku LLM → pattern matching |
+| `bm25_index` | WARNING | Vector-only search |
+| `google_calendar` | WARNING | Cached data |
+| `google_gmail` | WARNING | Cached data |
+| `backup_storage` | WARNING | Skips backup |
+| `telegram` | INFO | Email-only alerts |
+
+### Degradation Tracking
+
+When a service fails and a fallback is used, this is recorded as a "degradation event".
+These are collected and reported in the nightly health check if there are 5+ in 24 hours.
 
 
 

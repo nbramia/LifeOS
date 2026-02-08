@@ -28,13 +28,14 @@ _failure_lock = threading.Lock()
 _FAILURE_RETENTION_HOURS = 24
 
 
-def record_failure(source: str, error: str) -> None:
+def record_failure(source: str, error: str, severity: str = "warning") -> None:
     """
     Record a processor failure for inclusion in the nightly batch email.
 
     Args:
         source: Name of the failing processor (e.g., "Granola processor", "Omi processor")
         error: Error message
+        severity: "critical" for immediate alert, "warning" for nightly batch (default)
     """
     with _failure_lock:
         now = datetime.now(timezone.utc)
@@ -43,6 +44,13 @@ def record_failure(source: str, error: str) -> None:
         # Clean up old failures
         cutoff = now - timedelta(hours=_FAILURE_RETENTION_HOURS)
         _failure_log[:] = [(ts, src, err) for ts, src, err in _failure_log if ts > cutoff]
+
+    # Send immediate alert for critical failures
+    if severity == "critical":
+        send_alert(
+            subject=f"CRITICAL: {source}",
+            body=f"A critical failure occurred.\n\nSource: {source}\nError: {error}",
+        )
 
 
 def get_recent_failures(hours: int = 24) -> list[tuple[datetime, str, str]]:

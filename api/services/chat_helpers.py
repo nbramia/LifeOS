@@ -680,10 +680,16 @@ async def classify_action_intent(query: str, conversation_history: list = None) 
     if intent_str:
         result = _parse_intent_response(intent_str)
         if result:
+            # Track degradation: Ollama failed, using Haiku
+            from api.services.service_health import record_degradation
+            record_degradation("ollama", "intent_classification", "haiku_llm", "Ollama unavailable or failed")
             return result
 
     # Last resort: pattern matching when both LLMs are down
     logger.warning("Both Ollama and Haiku unavailable for intent classification, using pattern fallback")
+    # Track degradation: both LLMs failed, using pattern matching
+    from api.services.service_health import record_degradation
+    record_degradation("ollama", "intent_classification", "pattern_matching", "Both Ollama and Haiku unavailable")
     return _classify_action_intent_patterns(query)
 
 
