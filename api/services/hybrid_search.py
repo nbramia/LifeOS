@@ -418,6 +418,10 @@ class HybridSearch:
         # If no BM25 results, return vector results directly
         if not bm25_doc_ids:
             logger.debug("No BM25 results, using vector-only search")
+            # Track degradation if BM25 index was expected but unavailable
+            if bm25_index is None:
+                from api.services.service_health import record_degradation
+                record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 index unavailable")
             return vector_results[:top_k]
 
         # Apply RRF fusion

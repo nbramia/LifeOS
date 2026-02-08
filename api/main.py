@@ -120,6 +120,33 @@ def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[i
         except Exception as e:
             logger.error(f"Failed to check sync health: {e}")
 
+        # Collect service degradation events (fallback usage)
+        try:
+            from api.services.service_health import get_service_health
+            registry = get_service_health()
+            events = registry.get_degradation_events(hours=24)
+
+            # Report if there were frequent degradations (>5 in 24h)
+            if len(events) >= 5:
+                # Group by service for summary
+                by_service = {}
+                for event in events:
+                    by_service[event.service] = by_service.get(event.service, 0) + 1
+
+                for service, count in by_service.items():
+                    failures.append((f"{service} (degraded)", f"{count} fallback events in 24h"))
+
+            # Also report critical issues
+            for service, error in registry.get_critical_issues():
+                failures.append((f"{service} (CRITICAL)", error[:100]))
+
+            # Clear events after including in report
+            if events:
+                registry.clear_degradation_events()
+                logger.info(f"Collected {len(events)} degradation events from last 24h")
+        except Exception as e:
+            logger.error(f"Failed to collect service health: {e}")
+
         # Send notification if any failures occurred
         if failures:
             logger.warning(f"Health check: {len(failures)} issue(s), sending alert...")
@@ -519,6 +546,23 @@ async def full_health_check():
         results["summary"] = f"All {len(results['checks'])} services healthy"
 
     return results
+
+
+@app.get("/health/services")
+async def service_health_check():
+    """
+    Get real-time status of all external services.
+
+    Returns:
+    - overall_status: healthy/degraded/critical
+    - services: per-service status with last check time
+    - degradation_events: recent fallback usage (last 24h)
+    - critical_issues: services requiring immediate attention
+
+    Use this to monitor service availability and degradation patterns.
+    """
+    from api.services.service_health import get_service_health
+    return get_service_health().get_summary()
 
 
 @app.get("/")

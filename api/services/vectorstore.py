@@ -39,17 +39,27 @@ class VectorStore:
         self.server_url = server_url or settings.chroma_url
 
         # Connect to ChromaDB server via HTTP
-        self._client = chromadb.HttpClient(
-            host=self._parse_host(self.server_url),
-            port=self._parse_port(self.server_url),
-            settings=Settings(anonymized_telemetry=False)
-        )
+        try:
+            self._client = chromadb.HttpClient(
+                host=self._parse_host(self.server_url),
+                port=self._parse_port(self.server_url),
+                settings=Settings(anonymized_telemetry=False)
+            )
 
-        # Get or create collection
-        self._collection = self._client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
+            # Get or create collection
+            self._collection = self._client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+
+            # Mark ChromaDB as healthy on successful connection
+            from api.services.service_health import mark_service_healthy
+            mark_service_healthy("chromadb")
+        except Exception as e:
+            # Mark ChromaDB as failed
+            from api.services.service_health import mark_service_failed, Severity
+            mark_service_failed("chromadb", str(e), Severity.CRITICAL)
+            raise
 
         # Get embedding service (lazy import)
         from api.services.embeddings import get_embedding_service

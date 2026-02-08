@@ -235,6 +235,9 @@ class OllamaClient:
         try:
             response = httpx.get(f"{self.host}/api/tags", timeout=2.0)
             if response.status_code != 200:
+                # Track Ollama as unavailable (but not critical - has fallbacks)
+                from api.services.service_health import mark_service_failed, Severity
+                mark_service_failed("ollama", f"HTTP {response.status_code}", Severity.WARNING)
                 return False
 
             data = response.json()
@@ -246,15 +249,24 @@ class OllamaClient:
             # Handle model name variations (e.g., "llama3.2:3b" vs "llama3.2:3b-instruct")
             for name in model_names:
                 if self.model in name or name.startswith(self.model.split(":")[0]):
+                    # Mark Ollama as healthy
+                    from api.services.service_health import mark_service_healthy
+                    mark_service_healthy("ollama")
                     return True
 
             # If specific model not found, still return True if server is up
             # (model can be pulled on first use)
             logger.warning(f"Model {self.model} not found in Ollama. Available: {model_names}")
+            if len(models) > 0:
+                from api.services.service_health import mark_service_healthy
+                mark_service_healthy("ollama")
             return len(models) > 0
 
         except Exception as e:
             logger.debug(f"Ollama availability check failed: {e}")
+            # Track Ollama as unavailable
+            from api.services.service_health import mark_service_failed, Severity
+            mark_service_failed("ollama", str(e), Severity.WARNING)
             return False
 
     async def is_available_async(self) -> bool:
