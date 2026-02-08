@@ -96,6 +96,12 @@ class DegradationEvent:
 # Minimum time between critical alerts for the same service (prevents spam)
 CRITICAL_ALERT_COOLDOWN_MINUTES = 5
 
+# Grace period after startup before alerting (handles restarts)
+STARTUP_GRACE_PERIOD_SECONDS = 30
+
+# Minimum consecutive failures before alerting (handles transient issues)
+MIN_CONSECUTIVE_FAILURES_FOR_ALERT = 3
+
 
 class ServiceHealthRegistry:
     """
@@ -131,6 +137,7 @@ class ServiceHealthRegistry:
         self._alert_cooldowns: dict[str, datetime] = {}  # service -> last alert time
         self._state_lock = threading.Lock()
         self._event_lock = threading.Lock()
+        self._startup_time = datetime.now(timezone.utc)  # Track when registry was created
 
         # Initialize states for known services
         for service in SERVICE_CONFIG:
@@ -177,7 +184,8 @@ class ServiceHealthRegistry:
         for CRITICAL severity (rate-limited to prevent spam).
 
         Alert conditions:
-        - Only on state transition (healthy/unknown → failed)
+        - Not within startup grace period (handles restarts)
+        - Minimum consecutive failures reached (handles transient issues)
         - Respects cooldown period (5 min) to handle flapping services
         """
         should_alert = False
@@ -188,9 +196,6 @@ class ServiceHealthRegistry:
                 self._states[service] = ServiceState()
 
             state = self._states[service]
-
-            # Check if this is a state transition (healthy/unknown → failed)
-            was_healthy = state.status in (ServiceStatus.HEALTHY, ServiceStatus.UNKNOWN)
 
             state.status = ServiceStatus.UNAVAILABLE
             state.last_check = now
@@ -203,19 +208,27 @@ class ServiceHealthRegistry:
             if severity is None:
                 severity = SERVICE_CONFIG.get(service, (Severity.WARNING, ""))[0]
 
-            # Log the failure
-            if was_healthy or state.consecutive_failures == 1:
+            # Log the failure (only first time or first consecutive)
+            if state.consecutive_failures == 1:
                 logger.warning(f"Service failed: {service} - {error[:100]}")
 
-            # Determine if we should send an alert (rate limiting)
-            if severity == Severity.CRITICAL and was_healthy:
-                # Check cooldown
-                last_alert = self._alert_cooldowns.get(service)
-                cooldown = timedelta(minutes=CRITICAL_ALERT_COOLDOWN_MINUTES)
+            # Determine if we should send an alert
+            if severity == Severity.CRITICAL:
+                # Check startup grace period (don't alert during restarts)
+                time_since_startup = (now - self._startup_time).total_seconds()
+                if time_since_startup < STARTUP_GRACE_PERIOD_SECONDS:
+                    logger.info(f"Suppressing alert for {service} - within startup grace period")
+                # Check minimum consecutive failures (handles transient issues)
+                elif state.consecutive_failures < MIN_CONSECUTIVE_FAILURES_FOR_ALERT:
+                    logger.info(f"Suppressing alert for {service} - only {state.consecutive_failures} consecutive failures")
+                else:
+                    # Check cooldown
+                    last_alert = self._alert_cooldowns.get(service)
+                    cooldown = timedelta(minutes=CRITICAL_ALERT_COOLDOWN_MINUTES)
 
-                if last_alert is None or (now - last_alert) > cooldown:
-                    should_alert = True
-                    self._alert_cooldowns[service] = now
+                    if last_alert is None or (now - last_alert) > cooldown:
+                        should_alert = True
+                        self._alert_cooldowns[service] = now
 
         # Send alert outside lock
         if should_alert:

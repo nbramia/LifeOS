@@ -22,7 +22,7 @@ from api.services.model_selector import classify_query_complexity
 logger = logging.getLogger(__name__)
 
 # Valid data sources
-VALID_SOURCES = {"vault", "calendar", "gmail", "drive", "people", "actions", "slack", "photos"}
+VALID_SOURCES = {"vault", "calendar", "gmail", "drive", "people", "actions", "slack", "photos", "web"}
 
 # Minimum relationship strength to be considered "strong" for disambiguation
 DISAMBIGUATION_STRENGTH_THRESHOLD = 0.3
@@ -81,6 +81,8 @@ class RoutingResult:
     fetch_depth: str = "normal"  # "shallow", "normal", "deep"
     min_results_threshold: int = 3  # Minimum chunks needed
     relationship_context: Optional[dict] = None  # CRM signals
+    # v4: Compound query support
+    action_after: Optional[str] = None  # "task_create", "reminder_create", "compose"
 
 
 class QueryRouter:
@@ -467,6 +469,11 @@ class QueryRouter:
                 if extracted_name:
                     logger.info(f"LLM extracted person name: {extracted_name}")
 
+            # Extract action_after for compound queries
+            action_after = data.get("action_after")
+            if action_after:
+                logger.info(f"LLM detected action_after: {action_after}")
+
             result = RoutingResult(
                 sources=valid_sources,
                 reasoning=reasoning,
@@ -475,6 +482,8 @@ class QueryRouter:
             )
             if extracted_name:
                 result.extracted_person_name = extracted_name
+            if action_after:
+                result.action_after = action_after
             return result
 
         except (json.JSONDecodeError, KeyError) as e:
@@ -522,6 +531,58 @@ class QueryRouter:
         query_lower = query.lower()
         sources = set()
         reasons = []
+        action_after = None
+
+        # General knowledge patterns - Claude answers directly (empty sources)
+        general_knowledge_patterns = [
+            r"what is the capital of",
+            r"what'?s the capital of",
+            r"explain\b.*\bhow",
+            r"how do(?:es)? .+ work",
+            r"write (?:a |me )?(?:poem|haiku|story|song|limerick)",
+            r"how (?:do i|to|can i) .+ in (?:python|javascript|java|c\+\+|rust|go|typescript)",
+            r"what(?:'s| is) \d+.*(?:plus|minus|times|divided|percent|\+|\-|\*|\/|%)",
+            r"^define\b",
+            r"^what does .+ mean",
+            r"^who (?:was|is) .+ (?:in history|historically)",
+        ]
+        is_general_knowledge = any(
+            re.search(pattern, query_lower) for pattern in general_knowledge_patterns
+        )
+
+        # Web search keywords - current/local info needs web
+        web_keywords = [
+            "weather", "news", "price", "stock", "current",
+            "hours", "near me", "zip code", "trash pickup",
+            "recycling", "bus schedule", "train schedule",
+            "what time does", "is .+ open", "store hours",
+        ]
+        is_web_query = any(kw in query_lower for kw in web_keywords[:6]) or any(
+            re.search(kw, query_lower) for kw in web_keywords[6:]
+        )
+
+        # Compound query patterns - action after info gathering
+        if re.search(r"(?:and|then)?\s*(?:remind|set a reminder)", query_lower):
+            action_after = "reminder_create"
+        elif re.search(r"(?:and|then)?\s*(?:add|create).*(?:task|to-?do)", query_lower):
+            action_after = "task_create"
+        elif re.search(r"(?:and|then)?\s*(?:draft|compose|write).*(?:email|message)", query_lower):
+            action_after = "compose"
+
+        # If it's a general knowledge query with no personal data indicators, return empty sources
+        if is_general_knowledge and not is_web_query:
+            return RoutingResult(
+                sources=[],
+                reasoning="General knowledge - Claude answers directly",
+                confidence=0.8,
+                latency_ms=0,
+                action_after=action_after,
+            )
+
+        # If it needs web search
+        if is_web_query:
+            sources.add("web")
+            reasons.append("web search keywords")
 
         # Calendar keywords
         calendar_keywords = [
@@ -616,5 +677,6 @@ class QueryRouter:
             sources=list(sources),
             reasoning=f"Keyword fallback: {', '.join(reasons)}",
             confidence=0.7,
-            latency_ms=0  # Will be set by caller
+            latency_ms=0,
+            action_after=action_after,
         )

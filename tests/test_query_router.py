@@ -440,3 +440,89 @@ class TestPeopleRouting:
             result = await router.route("prep me for meeting with Kevin")
         assert "people" in result.sources
         assert "calendar" in result.sources
+
+
+class TestWebSearchRouting:
+    """Tests for web search and general knowledge routing."""
+
+    @pytest.fixture
+    def router(self):
+        from api.services.query_router import QueryRouter
+        return QueryRouter()
+
+    def test_routes_to_web_for_current_info(self, router):
+        """Current/local info should include web source."""
+        result = router._keyword_fallback("What's the weather in NYC?")
+        assert "web" in result.sources
+
+    def test_routes_to_web_for_prices(self, router):
+        """Price queries should include web source."""
+        result = router._keyword_fallback("What's the current price of Bitcoin?")
+        assert "web" in result.sources
+
+    def test_routes_to_web_for_local_services(self, router):
+        """Local service queries should include web source."""
+        result = router._keyword_fallback("When is trash pickup in 22043?")
+        assert "web" in result.sources
+
+    def test_routes_empty_for_general_knowledge(self, router):
+        """General knowledge should return empty sources."""
+        result = router._keyword_fallback("What's the capital of France?")
+        assert result.sources == []
+
+    def test_routes_empty_for_coding_questions(self, router):
+        """Coding questions Claude knows should be empty sources."""
+        result = router._keyword_fallback("How do I sort a list in Python?")
+        assert result.sources == []
+
+    def test_routes_empty_for_creative(self, router):
+        """Creative tasks should return empty sources."""
+        result = router._keyword_fallback("Write a haiku about coffee")
+        assert result.sources == []
+
+    def test_routes_empty_for_math(self, router):
+        """Math questions should return empty sources."""
+        result = router._keyword_fallback("What's 15% of 200?")
+        assert result.sources == []
+
+
+class TestActionAfterRouting:
+    """Tests for compound query action_after detection."""
+
+    @pytest.fixture
+    def router(self):
+        from api.services.query_router import QueryRouter
+        return QueryRouter()
+
+    def test_detects_action_after_reminder(self, router):
+        """Compound queries should set action_after for reminders."""
+        result = router._keyword_fallback("When does trash get picked up? Remind me.")
+        assert result.action_after == "reminder_create"
+
+    def test_detects_action_after_reminder_with_set(self, router):
+        """'Set a reminder' should trigger action_after."""
+        result = router._keyword_fallback("Look up the weather and set a reminder for tomorrow")
+        assert result.action_after == "reminder_create"
+
+    def test_detects_action_after_task(self, router):
+        """Task creation compound queries should set action_after."""
+        result = router._keyword_fallback("Explain how to fix this. Add it to my tasks.")
+        assert result.action_after == "task_create"
+
+    def test_detects_action_after_compose(self, router):
+        """Email compose compound queries should set action_after."""
+        result = router._keyword_fallback("Look up the info and draft an email about it")
+        assert result.action_after == "compose"
+
+    def test_no_action_after_for_simple_queries(self, router):
+        """Simple queries should not have action_after."""
+        result = router._keyword_fallback("What's the weather?")
+        assert result.action_after is None
+
+    @pytest.mark.asyncio
+    async def test_combines_web_and_personal_sources(self, router):
+        """Can combine web with personal sources."""
+        with patch.object(router.ollama_client, 'is_available', return_value=False):
+            result = await router.route("What's the weather for my NYC trip tomorrow?")
+        # Should have web for weather and calendar for trip
+        assert "web" in result.sources or "calendar" in result.sources

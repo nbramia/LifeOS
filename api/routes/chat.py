@@ -153,6 +153,105 @@ async def _fetch_vault(query: str, top_k: int, date_filter: str | None = None) -
         return []
 
 
+async def _fetch_web(query: str) -> str:
+    """Fetch web search results and format for context."""
+    try:
+        from api.services.web_search import search_web_with_synthesis
+        synthesized, results = await search_web_with_synthesis(query)
+        return synthesized
+    except Exception as e:
+        logger.warning(f"Web search error: {e}")
+        return ""
+
+
+async def _execute_action_after(
+    action_type: str,
+    query: str,
+    synthesis_result: str,
+    conversation_history: list,
+    conversation_id: str,
+) -> Optional[str]:
+    """
+    Execute an action after synthesis completes.
+
+    Uses the synthesis result as context for parameter extraction.
+
+    Args:
+        action_type: Type of action ("task_create", "reminder_create", "compose")
+        query: Original user query
+        synthesis_result: The synthesized answer to use as context
+        conversation_history: Conversation history for context
+        conversation_id: Current conversation ID
+
+    Returns:
+        Confirmation message or None if failed.
+    """
+    # Combine original query + synthesis for better param extraction
+    combined_context = f"Based on this information:\n{synthesis_result}\n\nOriginal request: {query}"
+
+    if action_type == "reminder_create":
+        try:
+            if not settings.telegram_enabled:
+                return None
+
+            params = await extract_reminder_params(combined_context, conversation_history)
+            if params:
+                from api.services.reminder_store import get_reminder_store
+                reminder_store = get_reminder_store()
+                reminder = reminder_store.create(
+                    name=params.get("name", "Reminder"),
+                    schedule_type=params["schedule_type"],
+                    schedule_value=params["schedule_value"],
+                    message_type=params.get("message_type", "static"),
+                    message_content=params.get("message_content", ""),
+                    enabled=True,
+                )
+                display_time = params.get("display_time", params["schedule_value"])
+                return f"---\nI've also set a reminder for **{display_time}**: {reminder.name}"
+        except Exception as e:
+            logger.error(f"Failed to create reminder after synthesis: {e}")
+            return None
+
+    elif action_type == "task_create":
+        try:
+            params = await extract_task_params(combined_context, conversation_history)
+            if params:
+                from api.services.task_manager import get_task_manager
+                task_manager = get_task_manager()
+                task = task_manager.create(
+                    description=params["description"],
+                    context=params.get("context", "Inbox"),
+                    priority=params.get("priority", ""),
+                    due_date=params.get("due_date"),
+                    tags=params.get("tags", []),
+                )
+                return f"---\nI've added a task: **{task.description}** ({task.context})"
+        except Exception as e:
+            logger.error(f"Failed to create task after synthesis: {e}")
+            return None
+
+    elif action_type == "compose":
+        try:
+            params = await extract_draft_params(combined_context, conversation_history)
+            if params and params.get("to"):
+                account_str = params.get("account", "personal").lower()
+                account_type = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+                gmail = GmailService(account_type)
+                draft = gmail.create_draft(
+                    to=params["to"],
+                    subject=params.get("subject", ""),
+                    body=params.get("body", ""),
+                )
+                if draft:
+                    gmail_url = f"https://mail.google.com/mail/u/0/#drafts?compose={draft.draft_id}"
+                    return f"---\nI've created a draft email to {params['to']}. [Open in Gmail]({gmail_url})"
+        except Exception as e:
+            logger.error(f"Failed to create draft after synthesis: {e}")
+            return None
+
+    return None
+
+
 async def extract_draft_params(query: str, conversation_history: list = None) -> Optional[dict]:
     """
     Use Claude to extract email draft parameters from a compose request.
@@ -1398,6 +1497,60 @@ async def ask_stream(request: AskStreamRequest):
             # Send routing info first (with attachment source if applicable)
             yield f"data: {json.dumps({'type': 'routing', 'sources': effective_sources, 'reasoning': routing_result.reasoning, 'latency_ms': routing_result.latency_ms})}\n\n"
 
+            # Handle empty sources (general knowledge) - Claude answers directly
+            if not routing_result.sources:
+                print("GENERAL KNOWLEDGE QUERY - Claude answers directly")
+                synthesizer = get_synthesizer()
+                full_response = ""
+
+                # Simple prompt for general knowledge
+                prompt = f"Answer this question directly: {request.question}"
+                if conversation_history:
+                    # Include conversation context
+                    context_parts = []
+                    for msg in conversation_history[-6:]:
+                        context_parts.append(f"{msg.role}: {msg.content[:500]}")
+                    if context_parts:
+                        prompt = f"Conversation context:\n{'\\n'.join(context_parts)}\n\nUser: {request.question}\n\nAssistant:"
+
+                async for chunk in synthesizer.stream_response(prompt, max_tokens=2048):
+                    if isinstance(chunk, dict) and chunk.get("type") == "usage":
+                        usage_store = get_usage_store()
+                        usage_store.record_usage(
+                            model=chunk.get("model", "sonnet"),
+                            input_tokens=chunk.get("input_tokens", 0),
+                            output_tokens=chunk.get("output_tokens", 0),
+                            cost_usd=chunk.get("cost_usd", 0.0),
+                            conversation_id=conversation_id
+                        )
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    else:
+                        full_response += chunk
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0)
+
+                # Handle action_after if present
+                if routing_result.action_after:
+                    action_response = await _execute_action_after(
+                        routing_result.action_after,
+                        request.question,
+                        full_response,
+                        conversation_history,
+                        conversation_id,
+                    )
+                    if action_response:
+                        full_response += f"\n\n{action_response}"
+                        for chunk in action_response:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+
+                store.add_message(
+                    conversation_id, "assistant", full_response,
+                    routing={"sources": [], "reasoning": routing_result.reasoning}
+                )
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
             # Get relevant data based on routing
             chunks = []
             extra_context = []  # For calendar/drive/gmail results
@@ -1733,6 +1886,19 @@ async def ask_stream(request: AskStreamRequest):
                 else:
                     print("  No Slack messages found")
 
+            # Handle web search queries
+            if "web" in routing_result.sources:
+                print("FETCHING WEB SEARCH RESULTS...")
+                web_answer = await _fetch_web(request.question)
+                if web_answer:
+                    extra_context.append({
+                        "source": "web",
+                        "content": f"## Web Search Results\n\n{web_answer}"
+                    })
+                    print(f"  Web search returned {len(web_answer)} chars")
+                else:
+                    print("  No web search results")
+
             # Handle vault queries (always include as fallback)
             if "vault" in routing_result.sources or not routing_result.sources or not extra_context:
                 # v3: Use adaptive chunk limit based on fetch_depth
@@ -1992,6 +2158,12 @@ async def ask_stream(request: AskStreamRequest):
                         'file_name': f"📷 Photos ({photo_count} photos)",
                         'source_type': 'photos',
                     })
+                # Add Web source
+                elif ctx.get("source") == "web":
+                    sources.insert(0, {
+                        'file_name': "🌐 Web Search",
+                        'source_type': 'web',
+                    })
 
             # Send sources to client
             if request.include_sources:
@@ -2165,6 +2337,23 @@ Please continue your response, incorporating this additional information. Do NOT
                             yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
                         await asyncio.sleep(0)
 
+            # Handle action_after if present (compound queries)
+            if routing_result.action_after:
+                print(f"EXECUTING ACTION_AFTER: {routing_result.action_after}")
+                action_response = await _execute_action_after(
+                    routing_result.action_after,
+                    request.question,
+                    full_response,
+                    conversation_history,
+                    conversation_id,
+                )
+                if action_response:
+                    full_response += f"\n\n{action_response}"
+                    for chunk in action_response:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    print(f"  Action completed: {action_response[:50]}...")
+
             # Save assistant response with enhanced routing metadata
             routing_metadata = {
                 "sources": effective_sources,
@@ -2175,6 +2364,8 @@ Please continue your response, incorporating this additional information. Do NOT
                 routing_metadata["skipped_sources"] = skipped_sources
             if routing_result.extracted_person_name:
                 routing_metadata["person"] = routing_result.extracted_person_name
+            if routing_result.action_after:
+                routing_metadata["action_after"] = routing_result.action_after
 
             store.add_message(
                 conversation_id,
