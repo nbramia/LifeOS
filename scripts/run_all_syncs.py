@@ -497,6 +497,21 @@ def run_all_syncs(
     logger.info(f"Starting sync run for {len(sources)} sources...")
     logger.info(f"Log file: {log_file}")
 
+    # Trigger Photos.app to open and start iCloud sync in background
+    # This runs at the beginning so Photos can sync throughout the entire process
+    if not dry_run:
+        try:
+            logger.info("Opening Photos.app to trigger iCloud sync in background...")
+            subprocess.run(
+                ["osascript", "-e", 'tell application "Photos" to activate'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            logger.info("Photos.app opened - will sync in background during data collection")
+        except Exception as e:
+            logger.warning(f"Could not open Photos.app: {e}")
+
     # Create interactions backup before any syncs
     # (person entities backup happens automatically on save)
     if not dry_run:
