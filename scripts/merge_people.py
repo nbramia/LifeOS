@@ -287,19 +287,35 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     interactions_db = get_interaction_db_path()
     int_conn = sqlite3.connect(interactions_db)
 
-    cursor = int_conn.execute(
-        "SELECT COUNT(*) FROM interactions WHERE person_id = ?",
-        (canonical_secondary_id,)
-    )
-    count = cursor.fetchone()[0]
-    stats['interactions_updated'] = count
-    logger.info(f"   {count} interactions to update")
+    # Update interactions for both the canonical secondary ID AND the original secondary_id
+    # (in case they differ due to previous merges)
+    ids_to_migrate = [canonical_secondary_id]
+    if secondary_id != canonical_secondary_id:
+        ids_to_migrate.append(secondary_id)
 
-    if not dry_run and count > 0:
-        int_conn.execute(
-            "UPDATE interactions SET person_id = ? WHERE person_id = ?",
-            (canonical_primary_id, canonical_secondary_id)
+    total_count = 0
+    for old_id in ids_to_migrate:
+        cursor = int_conn.execute(
+            "SELECT COUNT(*) FROM interactions WHERE person_id = ?",
+            (old_id,)
         )
+        count = cursor.fetchone()[0]
+        if count > 0:
+            logger.info(f"   {count} interactions to update for {old_id}")
+            if not dry_run:
+                int_conn.execute(
+                    "UPDATE interactions SET person_id = ? WHERE person_id = ?",
+                    (canonical_primary_id, old_id)
+                )
+            total_count += count
+
+    stats['interactions_updated'] = total_count
+    if total_count > 0:
+        logger.info(f"   Total: {total_count} interactions updated")
+    else:
+        logger.info(f"   No interactions to update")
+
+    if not dry_run:
         int_conn.commit()
     int_conn.close()
 
