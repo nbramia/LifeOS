@@ -449,3 +449,231 @@ class TestClarificationFlow:
         orch = ClaudeOrchestrator()
         orch._active_session = ClaudeSession(status="awaiting_clarification")
         assert orch.is_busy() is True
+
+
+class TestMaxTurnsAndCostCap:
+    """Test --max-turns CLI flag and cost cap enforcement."""
+
+    @patch("api.services.claude_orchestrator.subprocess.Popen")
+    def test_max_turns_in_cli_args(self, mock_popen):
+        from api.services.claude_orchestrator import ClaudeOrchestrator
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter([])
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = ""
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.poll.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        orch = ClaudeOrchestrator()
+        orch.run_task("test task", "/tmp")
+
+        cmd = mock_popen.call_args[0][0]
+        assert "--max-turns" in cmd
+        idx = cmd.index("--max-turns")
+        assert cmd[idx + 1].isdigit()
+
+    def test_cost_cap_cancels_session(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test")
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        # Mock a process that's still running
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        orch._process = mock_proc
+
+        # Send a result event with cost exceeding cap
+        event = {
+            "type": "result",
+            "session_id": "sess-expensive",
+            "total_cost_usd": 5.00,
+            "result": "Still going...",
+        }
+        orch._handle_event(event, session)
+
+        # Session should be cleaned up
+        assert orch._active_session is None
+        assert len(notifications) == 1
+        assert "cost cap" in notifications[0].lower()
+        mock_proc.terminate.assert_called_once()
+
+    def test_cost_under_cap_continues(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test")
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        event = {
+            "type": "result",
+            "session_id": "sess-cheap",
+            "total_cost_usd": 0.50,
+            "result": "All done!",
+        }
+        orch._handle_event(event, session)
+
+        assert len(notifications) == 1
+        assert "All done!" in notifications[0]
+
+
+class TestToolCallTracking:
+    """Test tool_use event tracking for heartbeat context."""
+
+    def test_tool_use_updates_last_activity(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test")
+        orch._notification_callback = lambda msg: None
+
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/home/user/api/main.py"},
+                    }
+                ]
+            }
+        }
+        orch._handle_event(event, session)
+        assert session.last_activity == "reading main.py"
+
+    def test_bash_tool_truncates_command(self):
+        from api.services.claude_orchestrator import _summarize_tool_call
+
+        result = _summarize_tool_call("Bash", {"command": "pytest tests/test_search.py -v --tb=short"})
+        assert "pytest" in result
+        assert len(result) < 80
+
+    def test_unknown_tool_shows_name(self):
+        from api.services.claude_orchestrator import _summarize_tool_call
+
+        result = _summarize_tool_call("WebSearch", {"query": "test"})
+        assert "WebSearch" in result
+
+    def test_heartbeat_includes_activity(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test", last_activity="editing main.py")
+        session.started_at = session.started_at - 600  # 10 min ago
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        orch._on_heartbeat(session)
+
+        assert len(notifications) == 1
+        assert "editing main.py" in notifications[0]
+        assert "10m" in notifications[0]
+
+    def test_heartbeat_without_activity(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test")
+        session.started_at = session.started_at - 300
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        orch._on_heartbeat(session)
+
+        assert len(notifications) == 1
+        assert "Still working" in notifications[0]
+        # Should not have a dangling " —" when no activity
+        assert " — " not in notifications[0]
+
+    def test_heartbeat_includes_cost(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test", cost_usd=0.75)
+        session.started_at = session.started_at - 300
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        orch._on_heartbeat(session)
+
+        assert "$0.75" in notifications[0]
+
+
+class TestClarificationNoCollision:
+    """Test that 'no' is passed through as an answer, not treated as cancellation."""
+
+    @pytest.mark.asyncio
+    async def test_no_passes_through_as_answer(self):
+        from api.services.telegram import TelegramBotListener
+        from api.services.claude_orchestrator import ClaudeSession
+
+        listener = TelegramBotListener()
+
+        with patch("api.services.claude_orchestrator.get_orchestrator") as mock_get, \
+             patch("api.services.telegram.send_message_async") as mock_send:
+            mock_orch = MagicMock()
+            session = ClaudeSession(
+                status="awaiting_clarification",
+                pending_clarification="Should I also update the tests?",
+                session_id="sess-123",
+            )
+            mock_orch.respond_to_clarification.return_value = session
+            mock_orch.get_active_session.return_value = session
+            mock_get.return_value = mock_orch
+
+            await listener._handle_agent_clarification("no", "chat123")
+
+            # Should pass "no" through, not cancel
+            mock_orch.respond_to_clarification.assert_called_once_with("no")
+            mock_orch.cancel.assert_not_called()
+            mock_send.assert_called_once()
+            assert "Resuming" in mock_send.call_args[0][0]
+
+
+class TestDirectoryResolverNewKeywords:
+    """Test expanded LifeOS keywords in directory resolver."""
+
+    def test_readme_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("update the readme") == _LIFEOS_DIR
+
+    def test_fix_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("fix the failing test") == _LIFEOS_DIR
+
+    def test_deploy_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("fix the deploy script") == _LIFEOS_DIR
+
+    def test_api_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("the api returns 500") == _LIFEOS_DIR
+
+    def test_search_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("search is broken") == _LIFEOS_DIR
+
+    def test_config_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("update the config") == _LIFEOS_DIR
+
+    def test_backup_resolves_to_lifeos(self):
+        from api.services.directory_resolver import resolve_working_directory, _LIFEOS_DIR
+        assert resolve_working_directory("set up database backup") == _LIFEOS_DIR
+
+    def test_unrelated_still_defaults_to_home(self):
+        from api.services.directory_resolver import resolve_working_directory, _HOME
+        assert resolve_working_directory("clean up my desktop") == _HOME
+
+    def test_existing_vault_keywords_still_work(self):
+        from api.services.directory_resolver import resolve_working_directory, _VAULT_DIR
+        assert resolve_working_directory("add to the backlog") == _VAULT_DIR

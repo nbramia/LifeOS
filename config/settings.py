@@ -225,6 +225,16 @@ class Settings(BaseSettings):
         alias="LIFEOS_CLAUDE_TIMEOUT",
         description="Safety-net timeout for Claude Code sessions (seconds). Heartbeats keep user informed; this is a backstop."
     )
+    claude_max_turns: int = Field(
+        default=50,
+        alias="LIFEOS_CLAUDE_MAX_TURNS",
+        description="Max agentic turns per Claude Code session. Prevents runaway retry loops."
+    )
+    claude_max_cost_usd: float = Field(
+        default=2.0,
+        alias="LIFEOS_CLAUDE_MAX_COST",
+        description="Max cost in USD per Claude Code session. Session cancelled if exceeded."
+    )
 
     @property
     def telegram_enabled(self) -> bool:
