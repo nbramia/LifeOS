@@ -132,9 +132,16 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 
 ### System Prompt
 
-Claude Code receives a system prompt instructing it to use `[NOTIFY]` for user-facing messages. Only `[NOTIFY]` lines are relayed — all other output (tool calls, file reads, intermediate steps) stays in the subprocess.
+Claude Code receives a system prompt instructing it to:
+- Use `[NOTIFY]` for user-facing messages
+- Be **persistent and resourceful** — try alternative approaches before giving up, debug errors independently, and only ask the user for help after exhausting options
+- Always include a completion summary
 
-This keeps Telegram messages clean and concise. Claude is instructed to always include a completion summary as a `[NOTIFY]` so you know the task finished.
+Only `[NOTIFY]` lines are relayed — all other output (tool calls, file reads, intermediate steps) stays in the subprocess.
+
+### Heartbeat Updates
+
+Every 5 minutes, if the session is still running, you'll receive an automatic progress ping ("Still working... (5m elapsed)") via Telegram. This happens regardless of whether Claude has sent any `[NOTIFY]` messages, so you always know the session is alive.
 
 ---
 

@@ -168,6 +168,8 @@ The system prompt instructs Claude to use `[NOTIFY]` for:
 
 Everything else stays in the subprocess output (logged but not relayed).
 
+**Heartbeat**: A 5-minute repeating timer sends "Still working... (Xm elapsed)" to Telegram if the session is active. This runs independently of Claude's `[NOTIFY]` output, ensuring the user always knows the session is alive.
+
 ---
 
 ## Session Lifecycle
