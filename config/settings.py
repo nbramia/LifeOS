@@ -221,9 +221,9 @@ class Settings(BaseSettings):
         description="Path to claude CLI binary"
     )
     claude_timeout_seconds: int = Field(
-        default=600,
+        default=3600,
         alias="LIFEOS_CLAUDE_TIMEOUT",
-        description="Max runtime for Claude Code sessions (seconds)"
+        description="Safety-net timeout for Claude Code sessions (seconds). Heartbeats keep user informed; this is a backstop."
     )
 
     @property

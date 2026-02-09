@@ -82,7 +82,7 @@ When both are set, Telegram is enabled as a conversational client (full chat pip
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LIFEOS_CLAUDE_BINARY` | Path to Claude CLI binary | `/Users/nathanramia/.local/bin/claude` |
-| `LIFEOS_CLAUDE_TIMEOUT` | Max session runtime (seconds) | `600` |
+| `LIFEOS_CLAUDE_TIMEOUT` | Safety-net timeout (seconds) | `3600` |
 
 Requires Claude Code installed and authenticated on the Mac Mini. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.
 

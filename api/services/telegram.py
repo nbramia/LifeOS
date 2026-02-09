@@ -319,6 +319,11 @@ class TelegramBotListener:
             await self._handle_agent_approval(text, chat_id)
             return
 
+        # Check for clarification response (any non-command text)
+        if self._check_agent_clarification():
+            await self._handle_agent_clarification(text, chat_id)
+            return
+
         # Send through chat pipeline
         try:
             conv_id = self._conversations.get(chat_id)
@@ -409,6 +414,8 @@ class TelegramBotListener:
     _PLAN_MODE_KEYWORDS = [
         "refactor", "implement", "redesign", "migrate",
         "integrate", "build a", "set up a",
+        "rewrite", "overhaul", "replace", "restructure",
+        "add a new", "create a new", "remove all", "delete all",
     ]
 
     def _check_agent_approval(self, text: str) -> bool:
@@ -440,6 +447,31 @@ class TelegramBotListener:
                 await send_message_async("Plan rejected. Session closed.", chat_id=chat_id)
             else:
                 await send_message_async("No plan pending approval.", chat_id=chat_id)
+
+    def _check_agent_clarification(self) -> bool:
+        """Check if a session is waiting for a clarification response."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        session = orch.get_active_session()
+        return session is not None and session.status == "awaiting_clarification"
+
+    async def _handle_agent_clarification(self, text: str, chat_id: str):
+        """Forward the user's response to a pending clarification question."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+
+        # Check for cancel intent
+        normalized = text.strip().lower().rstrip(".")
+        if normalized in self._REJECTION_KEYWORDS:
+            orch.cancel()
+            await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
+            return
+
+        session = orch.respond_to_clarification(text)
+        if session:
+            await send_message_async("Got it. Resuming...", chat_id=chat_id)
+        else:
+            await send_message_async("No session waiting for clarification.", chat_id=chat_id)
 
     def _should_use_plan_mode(self, task: str) -> bool:
         """Conservative heuristic: plan mode only for complex-sounding tasks."""

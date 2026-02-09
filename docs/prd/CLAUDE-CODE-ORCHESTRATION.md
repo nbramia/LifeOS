@@ -83,8 +83,7 @@ The subprocess runs on the **Mac Mini** (where the LifeOS server runs). The Clau
 
 - Complex multi-session development work (use Claude Code directly via terminal)
 - Tasks requiring interactive input or visual review
-- Tasks that need multiple rounds of human feedback mid-execution
-- Long-running processes (10-minute timeout by default)
+- Long-running processes (1-hour safety timeout by default; heartbeats provide progress)
 
 ### Assumptions
 
@@ -166,6 +165,8 @@ The system prompt instructs Claude to use `[NOTIFY]` for:
 - Completion summaries (always — so the user knows it finished)
 - Errors that block progress and need user input
 
+Claude can also use `[CLARIFY]` to ask the user a question. When detected, the session pauses (`awaiting_clarification`) and the question is relayed to Telegram. The user's reply resumes the session via `--resume`. This enables back-and-forth on vague tasks without the user needing to re-run the command.
+
 Everything else stays in the subprocess output (logged but not relayed).
 
 **Heartbeat**: A 5-minute repeating timer sends "Still working... (Xm elapsed)" to Telegram if the session is active. This runs independently of Claude's `[NOTIFY]` output, ensuring the user always knows the session is alive.
@@ -177,13 +178,15 @@ Everything else stays in the subprocess output (logged but not relayed).
 ```
 run_task() → status: "running"
   ├─ [NOTIFY] messages → Telegram
+  ├─ [CLARIFY] question → status: "awaiting_clarification"
+  │    └─ user reply → status: "running" → resume subprocess
   ├─ result event (non-plan) → status: "completed" → Telegram
   └─ result event (plan mode) → status: "awaiting_approval"
        ├─ "approve" → status: "implementing" → resume subprocess
        │    └─ result event → status: "completed" → Telegram
        └─ "reject" → status: "completed"
 
-Timeout (10 min) → status: "failed" → Telegram
+Timeout (1 hr safety net) → status: "failed" → Telegram
 Cancel (/code_cancel) → SIGTERM → status: "failed" → Telegram
 Server shutdown → cancel active session
 ```

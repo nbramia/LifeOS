@@ -304,9 +304,14 @@ class TestTelegramIntegration:
         assert listener._should_use_plan_mode("refactor the auth module") is True
         assert listener._should_use_plan_mode("implement a new search feature") is True
         assert listener._should_use_plan_mode("build a backup system") is True
+        assert listener._should_use_plan_mode("rewrite the auth module") is True
+        assert listener._should_use_plan_mode("overhaul the sync pipeline") is True
+        assert listener._should_use_plan_mode("add a new health check endpoint") is True
+        assert listener._should_use_plan_mode("remove all unused imports") is True
         assert listener._should_use_plan_mode("create a file called test.txt") is False
         assert listener._should_use_plan_mode("edit the backlog") is False
         assert listener._should_use_plan_mode("write a cron job") is False
+        assert listener._should_use_plan_mode("add weather alerts to the backlog") is False
 
     def test_check_agent_approval_no_session(self):
         from api.services.telegram import TelegramBotListener
@@ -335,3 +340,112 @@ class TestTelegramIntegration:
             assert listener._check_agent_approval("no") is True
             # Long messages should NOT be intercepted
             assert listener._check_agent_approval("I think we should approve but also change X") is False
+
+    def test_check_agent_clarification(self):
+        from api.services.telegram import TelegramBotListener
+        from api.services.claude_orchestrator import ClaudeSession
+        listener = TelegramBotListener()
+
+        with patch("api.services.claude_orchestrator.get_orchestrator") as mock_get:
+            mock_orch = MagicMock()
+            # No session → False
+            mock_orch.get_active_session.return_value = None
+            mock_get.return_value = mock_orch
+            assert listener._check_agent_clarification() is False
+
+            # Awaiting clarification → True
+            mock_orch.get_active_session.return_value = ClaudeSession(
+                status="awaiting_clarification",
+                pending_clarification="Which section?",
+            )
+            assert listener._check_agent_clarification() is True
+
+            # Running → False
+            mock_orch.get_active_session.return_value = ClaudeSession(status="running")
+            assert listener._check_agent_clarification() is False
+
+
+class TestClarificationFlow:
+    """Test the [CLARIFY] extraction and session pause/resume."""
+
+    def test_clarify_regex(self):
+        from api.services.claude_orchestrator import _CLARIFY_RE
+        match = _CLARIFY_RE.search("[CLARIFY] Which backlog section?")
+        assert match
+        assert match.group(1) == "Which backlog section?"
+
+    def test_clarify_regex_no_match(self):
+        from api.services.claude_orchestrator import _CLARIFY_RE
+        assert _CLARIFY_RE.search("[NOTIFY] Done.") is None
+        assert _CLARIFY_RE.search("regular text") is None
+
+    def test_clarify_event_sets_pending(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test")
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "[CLARIFY] Work or Personal backlog?"},
+                ]
+            }
+        }
+        orch._handle_event(event, session)
+
+        assert session.pending_clarification == "Work or Personal backlog?"
+        assert len(notifications) == 1
+        assert "Work or Personal" in notifications[0]
+
+    def test_result_after_clarify_awaits_response(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(task="test", pending_clarification="Which one?")
+        session.session_id = "sess-123"
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        event = {"type": "result", "session_id": "sess-123", "total_cost_usd": 0.001, "result": ""}
+        orch._handle_event(event, session)
+
+        assert session.status == "awaiting_clarification"
+        # Should NOT send a completion notification
+        assert len(notifications) == 0
+
+    def test_respond_to_clarification_resumes(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        orch = ClaudeOrchestrator()
+        session = ClaudeSession(
+            task="test",
+            status="awaiting_clarification",
+            pending_clarification="Which one?",
+            session_id="sess-123",
+        )
+        orch._active_session = session
+
+        with patch.object(orch, "_spawn") as mock_spawn:
+            result = orch.respond_to_clarification("The work backlog")
+            assert result is session
+            assert session.status == "running"
+            assert session.pending_clarification == ""
+            mock_spawn.assert_called_once_with(
+                "The work backlog",
+                session,
+                resume_session_id="sess-123",
+            )
+
+    def test_respond_when_not_awaiting(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        orch = ClaudeOrchestrator()
+        orch._active_session = ClaudeSession(status="running")
+        assert orch.respond_to_clarification("answer") is None
+
+    def test_is_busy_when_awaiting_clarification(self):
+        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        orch = ClaudeOrchestrator()
+        orch._active_session = ClaudeSession(status="awaiting_clarification")
+        assert orch.is_busy() is True
