@@ -67,12 +67,24 @@ We talked about Q1 targets.
 
     @pytest.fixture
     def indexer(self, temp_vault, temp_db):
-        """Create indexer instance."""
+        """Create indexer instance with mock stores to avoid production DB writes."""
         from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
+        # Create mock stores to prevent writes to production database
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None  # Don't create entities
 
         indexer = IndexerService(
             vault_path=str(temp_vault),
-            db_path=str(temp_db)
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
         )
         yield indexer
         indexer.stop()
@@ -174,14 +186,27 @@ No frontmatter here, just content.
 
     def test_recovers_from_restart_no_duplicates(self, indexer, temp_vault, temp_db):
         """Re-indexing should not create duplicates."""
+        from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
         # First index
         indexer.index_all()
         count1 = indexer.vector_store.get_document_count()
 
+        # Create mock stores to prevent production DB writes
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None
+
         # Create new indexer (simulating restart)
         indexer2 = IndexerService(
             vault_path=str(temp_vault),
-            db_path=str(temp_db)
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
         )
 
         # Re-index
@@ -212,10 +237,23 @@ class TestFileWatcher:
 
     @pytest.fixture
     def indexer(self, temp_vault, temp_db):
-        """Create indexer with file watching."""
+        """Create indexer with file watching and mock stores."""
+        from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
+        # Create mock stores to prevent production DB writes
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None
+
         indexer = IndexerService(
             vault_path=str(temp_vault),
-            db_path=str(temp_db)
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
         )
         yield indexer
         indexer.stop()

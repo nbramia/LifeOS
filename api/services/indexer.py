@@ -110,7 +110,10 @@ class IndexerService:
     def __init__(
         self,
         vault_path: str,
-        db_path: str = "./data/chromadb"
+        db_path: str = "./data/chromadb",
+        interaction_store=None,
+        source_entity_store=None,
+        entity_resolver=None,
     ):
         """
         Initialize indexer.
@@ -118,9 +121,17 @@ class IndexerService:
         Args:
             vault_path: Path to Obsidian vault
             db_path: Path to ChromaDB database
+            interaction_store: Optional InteractionStore (uses singleton if None)
+            source_entity_store: Optional SourceEntityStore (uses singleton if None)
+            entity_resolver: Optional EntityResolver (uses singleton if None)
         """
         self.vault_path = Path(vault_path)
         self.db_path = Path(db_path)
+
+        # Store injected dependencies (or None to use singletons)
+        self._interaction_store = interaction_store
+        self._source_entity_store = source_entity_store
+        self._entity_resolver = entity_resolver
 
         # Initialize vector store
         self.vector_store = VectorStore()
@@ -591,9 +602,10 @@ class IndexerService:
         if not HAS_V2_PEOPLE:
             return affected_person_ids
 
-        resolver = get_entity_resolver()
-        interaction_store = get_interaction_store()
-        source_entity_store = get_source_entity_store()
+        # Use injected stores if available, otherwise fall back to singletons
+        resolver = self._entity_resolver or get_entity_resolver()
+        interaction_store = self._interaction_store or get_interaction_store()
+        source_entity_store = self._source_entity_store or get_source_entity_store()
         file_path_str = str(path.resolve())
         note_title = path.stem  # filename without .md
 
