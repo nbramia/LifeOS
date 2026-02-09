@@ -1,28 +1,36 @@
 # LifeOS
 
-**Your personal knowledge graph, built from the digital exhaust of your life.**
+**Your personal operating system, built from the digital exhaust of your life.**
 
-LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **searchable and queryable through natural language.** 
-- Ask questions of your unified data through Telegram or a dedicated chat UI 
-- Visualize and explore your relationships with each person in your life through a CRM UI
-- Manage tasks, reminders and alerts (pushed to you through email and Telegram) in natural language
-- Or enable Claude Code to interface with the full range of MCP tools directly
+LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **available and actionable through natural language.** 
 
-The people we are closest to appear across multiple channels. Your colleague is `katie.smith@company.com` in Gmail and calendar invites, `Kate Smith` in email bodies and your personal notes, `+1-901-555-1234` in iMessage and WhatsApp, and `@ksmith` on Slack - and iPhoto has tied her face to her contact in your phone. LifeOS automatically resolves these fragments into unified person records, surfacing this unified information and making it immediately accessible.
+LifeOS is also able to take action in response to requests you send through Telegram: not just creating tasks and reminders, but reading/editing files on your computer and autonomously managing Claude Code to accomplish discrete tasks.
 
-Everything runs locally on your Mac. Your data never leaves your machine—only query synthesis calls the Claude API. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
+Everything runs locally on your Mac. Your data never leaves your machine — the Claude API is only used for discrete queries. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
 
 ---
 
 ## What You Can Do
 
-- **Ask questions about your life**: "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
-- **Search across everything**: Ask "What were the key recommendations Sarah made on the Acme project last month?" and get an answer synthesized from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
-- **Track relationships**: Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
-- **Surface old facts and ideas**: Ask "What should I get Jane for her birthday" and it'll pull context from calendar events, email threads, and text messages up to 10 years old
-- **Manage tasks naturally**: "Remind me to follow up with John next Tuesday" creates an Obsidian task or a push reminder
-- **Prepare for meetings**: Get briefings with attendee history, past discussions, and relevant notes
-- **Use from Claude Code**: MCP tools let AI assistants query your personal knowledge
+**Ask questions about your life – search across all the channels you use**: 
+- Interface with it conversationally through Telegram, or a dedicated chat UI, or by using Claude Code to leverage the MCP tools directly
+- "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
+- "What were the key recommendations Sarah made on the Acme project last month?" will synthesize and answer from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
+- "What should I get Jane for her birthday" will pull context from up to 10 years of data to generate ideas tailored to her
+
+**Manage and complete tasks** 
+- "Remind me to follow up with John next Tuesday" creates a reminder (pushed to you through Telegram)
+- "Tomorrow at 3pm, check that the sync completed as expected and shoot me a note to confirm it did" schedules a task and a push notification
+- "Next Wednesday I need to pull down my 1099 from Schwab" creates a task in your task management system
+- "I just saw an error in the sync, can you investigate and get it fixed?" will spin up and manage Claude Code to get things working again
+- "Add an idea to that backlog markdown file in the X project folder - I want the system to be able to do Y" will find and directly edit the right file
+
+**Track relationships**: 
+- Visualize and explore your relationships with each person in your life through a CRM UI
+- Track and analyze your relationships with those closest to you, like family and a designated partner
+- Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
+
+You can also interface with it for general queries in the same way you'd interact with any AI model, and it'll intelligently route the query to Opus, Google, your personal data, etc.
 
 ---
 
@@ -110,35 +118,24 @@ flowchart LR
 
 Translates 10 years of interaction history with thousands of contacts into insights and visualizations.
 
-<details>
-<summary><strong>Pages aggregating contact details and interaction history for each person you know.</strong></summary>
+<strong>Pages aggregating contact details and interaction history for each person you know.</strong>
 
 ![Person page](docs/images/person.png)
 
-</details>
-
-<details>
-<summary><strong>Visualize how your communication patterns have evolved over the last 10 years.</strong></summary>
+<strong>Visualize how your communication patterns have evolved over the last 10 years.</strong>
 
 ![Dashboard page](docs/images/dashboard.png)
 
-</details>
-
-<details>
-<summary><strong>Dive deeper on relationships with your family and partner.</strong></summary>
+<strong>Dive deeper on relationships with your family and partner.</strong>
 
 ![Dashboard page](docs/images/family.png)
 
-</details>
-
-<details>
-<summary><strong>Visualize and explore relationships in a dynamic social graph.</strong></summary>
+<strong>Visualize and explore relationships in a dynamic social graph.</strong>
 
 ![Close graph page](docs/images/close_graph.png)
 
 ![Far graph page](docs/images/far_graph.png)
 
-</details>
 
 ---
 

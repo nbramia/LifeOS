@@ -529,12 +529,16 @@ def run_all_syncs(
             continue
 
         # Check if recently synced (unless forced)
+        # FDA sources (phone, imessage) are synced via run_fda_syncs.py at 2:50 AM
+        # before this script runs at 3:00 AM, so they should show as recently synced
         if not force and not dry_run:
             health = get_sync_health(source)
             if health.hours_since_sync is not None and health.hours_since_sync < 1:
-                logger.info(f"Skipping {source}: synced {health.hours_since_sync:.1f}h ago")
-                results[source] = {"skipped": True, "reason": "recently_synced"}
-                continue
+                if health.last_status == SyncStatus.SUCCESS:
+                    reason = "recently synced via FDA" if source in ("phone", "imessage") else "recently synced"
+                    logger.info(f"Skipping {source}: {reason} ({health.hours_since_sync*60:.0f}m ago)")
+                    results[source] = {"skipped": True, "reason": "recently_synced"}
+                    continue
 
         success, stats = run_sync(source, dry_run=dry_run)
         results[source] = {"success": success, **stats}

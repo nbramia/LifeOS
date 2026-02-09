@@ -229,6 +229,27 @@ curl -X POST http://localhost:8000/api/admin/reindex
 tail -50 logs/lifeos-api-error.log
 ```
 
+### FDA Sync (Phone/iMessage)
+
+Phone calls, FaceTime, and iMessage require **Full Disk Access** to read CallHistoryDB
+and chat.db. The launchd service doesn't have FDA, but Terminal.app does.
+
+**How it works:**
+- `run_sync_with_fda.sh` runs via cron at **2:50 AM** (10 min before main sync)
+- Opens Terminal.app which has FDA permission
+- Runs `run_fda_syncs.py` to sync phone + iMessage with health tracking
+- Main sync at 3:00 AM detects these were recently synced and skips them
+
+**Cron entry:**
+```
+50 2 * * * /Users/nathanramia/Documents/Code/LifeOS/scripts/run_sync_with_fda.sh
+```
+
+**Manual run (from Terminal.app):**
+```bash
+.venv/bin/python scripts/run_fda_syncs.py
+```
+
 ### Manage Tasks
 
 ```bash
