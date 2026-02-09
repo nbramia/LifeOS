@@ -93,7 +93,9 @@ api/
 - `task_manager.py` - Task CRUD, markdown I/O, index persistence, fuzzy query
 
 **Telegram & Scheduling:**
-- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client)
+- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands)
+- `claude_orchestrator.py` - Claude Code subprocess lifecycle, stream parsing, [NOTIFY] relay
+- `directory_resolver.py` - Maps task keywords to working directories for Claude Code
 - `reminder_store.py` - Reminder CRUD, persistence, scheduler, and dashboard generation
 - `time_parser.py` - Natural language time parsing for reminders
 
