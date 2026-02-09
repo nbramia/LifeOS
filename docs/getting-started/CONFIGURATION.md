@@ -75,7 +75,16 @@ Environment variables and configuration files for LifeOS.
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | `123456:ABC-DEF...` |
 | `TELEGRAM_CHAT_ID` | Your chat ID (from `/getUpdates`) | `7145472553` |
 
-When both are set, Telegram is enabled as a conversational client (full chat pipeline), scheduled reminder delivery channel, and alert destination. See [Reminders Guide](../guides/REMINDERS.md) for natural language reminder usage.
+When both are set, Telegram is enabled as a conversational client (full chat pipeline), scheduled reminder delivery channel, and alert destination. See [Reminders Guide](../guides/REMINDERS.md) for natural language reminder usage and [Claude Code Orchestration](../guides/CLAUDE-CODE-ORCHESTRATION.md) for running code tasks via `/code`.
+
+### Claude Code Orchestration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LIFEOS_CLAUDE_BINARY` | Path to Claude CLI binary | `/Users/nathanramia/.local/bin/claude` |
+| `LIFEOS_CLAUDE_TIMEOUT` | Max session runtime (seconds) | `600` |
+
+Requires Claude Code installed and authenticated on the Mac Mini. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.
 
 ### Notifications
 

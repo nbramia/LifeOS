@@ -214,6 +214,18 @@ class Settings(BaseSettings):
         description="Directory for database backups (use fast storage like NVMe)"
     )
 
+    # Claude Code orchestration
+    claude_binary: str = Field(
+        default="/Users/nathanramia/.local/bin/claude",
+        alias="LIFEOS_CLAUDE_BINARY",
+        description="Path to claude CLI binary"
+    )
+    claude_timeout_seconds: int = Field(
+        default=600,
+        alias="LIFEOS_CLAUDE_TIMEOUT",
+        description="Max runtime for Claude Code sessions (seconds)"
+    )
+
     @property
     def telegram_enabled(self) -> bool:
         """Check if Telegram bot is configured."""

@@ -257,6 +257,16 @@ async def lifespan(app: FastAPI):
         _telegram_listener.stop()
         logger.info("Telegram bot listener stopped")
 
+    # Cancel any active Claude Code session
+    try:
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        if orch.is_busy():
+            orch.cancel()
+            logger.info("Cancelled active Claude Code session during shutdown")
+    except Exception:
+        pass
+
     if _reminder_scheduler:
         _reminder_scheduler.stop()
         logger.info("Reminder scheduler stopped")

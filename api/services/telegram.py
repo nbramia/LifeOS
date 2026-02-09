@@ -314,6 +314,11 @@ class TelegramBotListener:
             await self._handle_command(text, chat_id)
             return
 
+        # Check for agent approval/rejection (short keywords only)
+        if self._check_agent_approval(text):
+            await self._handle_agent_approval(text, chat_id)
+            return
+
         # Send through chat pipeline
         try:
             conv_id = self._conversations.get(chat_id)
@@ -362,6 +367,19 @@ class TelegramBotListener:
                     chat_id=chat_id,
                 )
 
+        elif command == "/code":
+            task = text[len("/code"):].strip()
+            if not task:
+                await send_message_async("Usage: /code <task description>", chat_id=chat_id)
+            else:
+                await self._handle_code_command(task, chat_id)
+
+        elif command in ("/code_status", "/codestatus"):
+            await self._handle_code_status(chat_id)
+
+        elif command in ("/code_cancel", "/codecancel"):
+            await self._handle_code_cancel(chat_id)
+
         elif command == "/help":
             help_text = (
                 "*LifeOS Telegram Bot*\n\n"
@@ -369,6 +387,9 @@ class TelegramBotListener:
                 "*Commands:*\n"
                 "/new - Start a new conversation\n"
                 "/status - Check LifeOS server health\n"
+                "/code <task> - Run a task with Claude Code\n"
+                "/code\\_status - Check active Claude Code session\n"
+                "/code\\_cancel - Cancel active Claude Code session\n"
                 "/help - Show this message"
             )
             await send_message_async(help_text, chat_id=chat_id)
@@ -378,6 +399,117 @@ class TelegramBotListener:
                 f"Unknown command: {command}. Try /help",
                 chat_id=chat_id,
             )
+
+    # ------------------------------------------------------------------
+    # Claude Code orchestration
+    # ------------------------------------------------------------------
+
+    _APPROVAL_KEYWORDS = {"approve", "approved", "yes", "go", "proceed", "ok"}
+    _REJECTION_KEYWORDS = {"reject", "rejected", "no", "cancel", "stop"}
+    _PLAN_MODE_KEYWORDS = [
+        "refactor", "implement", "redesign", "migrate",
+        "integrate", "build a", "set up a",
+    ]
+
+    def _check_agent_approval(self, text: str) -> bool:
+        """Check if text is a short approval/rejection for a pending plan."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        session = orch.get_active_session()
+        if not session or session.status != "awaiting_approval":
+            return False
+        # Only intercept short messages (likely approval keywords)
+        normalized = text.strip().lower().rstrip(".")
+        return normalized in self._APPROVAL_KEYWORDS | self._REJECTION_KEYWORDS
+
+    async def _handle_agent_approval(self, text: str, chat_id: str):
+        """Approve or reject a pending Claude Code plan."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        normalized = text.strip().lower().rstrip(".")
+
+        if normalized in self._APPROVAL_KEYWORDS:
+            session = orch.approve_plan()
+            if session:
+                await send_message_async("Plan approved. Implementing...", chat_id=chat_id)
+            else:
+                await send_message_async("No plan pending approval.", chat_id=chat_id)
+        else:
+            session = orch.reject_plan()
+            if session:
+                await send_message_async("Plan rejected. Session closed.", chat_id=chat_id)
+            else:
+                await send_message_async("No plan pending approval.", chat_id=chat_id)
+
+    def _should_use_plan_mode(self, task: str) -> bool:
+        """Conservative heuristic: plan mode only for complex-sounding tasks."""
+        task_lower = task.lower()
+        return any(kw in task_lower for kw in self._PLAN_MODE_KEYWORDS)
+
+    async def _handle_code_command(self, task: str, chat_id: str):
+        """Spawn a Claude Code session for the given task."""
+        from api.services.claude_orchestrator import get_orchestrator
+        from api.services.directory_resolver import resolve_working_directory
+
+        orch = get_orchestrator()
+        if orch.is_busy():
+            session = orch.get_active_session()
+            await send_message_async(
+                f"Claude Code is busy: {session.task[:100]}\nUse /code_cancel to cancel.",
+                chat_id=chat_id,
+            )
+            return
+
+        working_dir = resolve_working_directory(task)
+        plan_mode = self._should_use_plan_mode(task)
+
+        mode_label = " (plan mode)" if plan_mode else ""
+        await send_message_async(
+            f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
+            chat_id=chat_id,
+        )
+
+        def notify(msg: str):
+            send_message(msg, chat_id=chat_id)
+
+        try:
+            orch.run_task(task, working_dir, plan_mode=plan_mode, notification_callback=notify)
+        except RuntimeError as e:
+            await send_message_async(f"Error: {e}", chat_id=chat_id)
+
+    async def _handle_code_status(self, chat_id: str):
+        """Report on the active Claude Code session."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        session = orch.get_active_session()
+
+        if not session:
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+
+        elapsed = int(time.time() - session.started_at)
+        minutes, seconds = divmod(elapsed, 60)
+        status_text = (
+            f"*Claude Code Session*\n"
+            f"Task: {session.task[:200]}\n"
+            f"Directory: `{session.working_dir}`\n"
+            f"Status: {session.status}\n"
+            f"Duration: {minutes}m {seconds}s\n"
+            f"Cost: ${session.cost_usd:.4f}"
+        )
+        await send_message_async(status_text, chat_id=chat_id)
+
+    async def _handle_code_cancel(self, chat_id: str):
+        """Cancel the active Claude Code session."""
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+
+        if not orch.is_busy():
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+
+        orch.cancel()
+        await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
 
 
 # ---------------------------------------------------------------------------
