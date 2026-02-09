@@ -75,7 +75,20 @@ Environment variables and configuration files for LifeOS.
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | `123456:ABC-DEF...` |
 | `TELEGRAM_CHAT_ID` | Your chat ID (from `/getUpdates`) | `7145472553` |
 
-When both are set, Telegram is enabled as a conversational client (full chat pipeline), scheduled reminder delivery channel, and alert destination. See [Reminders Guide](../guides/REMINDERS.md) for natural language reminder usage and [Claude Code Orchestration](../guides/CLAUDE-CODE-ORCHESTRATION.md) for running code tasks via `/code`.
+When both are set, Telegram is enabled as a conversational client (full chat pipeline), scheduled reminder delivery channel, and alert destination.
+
+**Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `/new` | Start a new conversation (clears context) |
+| `/status` | Check LifeOS server health |
+| `/code <task>` | Run a task with Claude Code |
+| `/code_status` | Check active Claude Code session |
+| `/code_cancel` | Cancel active Claude Code session |
+| `/help` | Show available commands |
+
+**Natural language:** Send any message to query LifeOS, create tasks/reminders, or draft emails. See [Reminders Guide](../guides/REMINDERS.md) and [Task Management](../guides/TASK-MANAGEMENT.md) for examples. See [Claude Code Orchestration](../guides/CLAUDE-CODE-ORCHESTRATION.md) for `/code` details.
 
 ### Claude Code Orchestration
 
