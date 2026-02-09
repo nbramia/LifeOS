@@ -334,6 +334,29 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
         'errors': 0,
     }
 
+    # STEP 1: Sync new messages from WhatsApp via wacli
+    logger.info("Syncing new messages from WhatsApp...")
+    try:
+        result = subprocess.run(
+            ["wacli", "sync", "--once"],
+            capture_output=True,
+            text=True,
+            timeout=180,  # 3 minute timeout
+        )
+        if result.returncode == 0:
+            logger.info("wacli sync completed")
+        else:
+            logger.warning(f"wacli sync failed: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logger.warning("wacli sync timed out after 3 minutes")
+    except FileNotFoundError:
+        logger.error("wacli not found. Install with: brew install steipete/tap/wacli")
+        stats['error'] = "wacli not installed"
+        return stats
+    except Exception as e:
+        logger.warning(f"wacli sync error: {e}")
+
+    # STEP 2: Read messages from wacli database
     # Track affected person_ids for stats refresh
     affected_person_ids: set[str] = set()
 
@@ -369,7 +392,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     existing_ids = {row[0] for row in int_cursor.fetchall()}
     logger.info(f"Found {len(existing_ids)} existing WhatsApp interactions")
 
-    # Fetch messages from wacli (excluding messages from self)
+    # Fetch all messages (both sent and received)
     wacli_cursor.execute("""
         SELECT
             m.msg_id,
@@ -383,13 +406,12 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
             m.display_text,
             m.media_type
         FROM messages m
-        WHERE m.from_me = 0
         ORDER BY m.ts DESC
     """)
 
     messages = wacli_cursor.fetchall()
     stats['messages_read'] = len(messages)
-    logger.info(f"Found {len(messages)} incoming WhatsApp messages")
+    logger.info(f"Found {len(messages)} WhatsApp messages")
 
     batch_size = 500
     batch = []
@@ -409,6 +431,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
             chat_jid = msg['chat_jid']
             chat_name = msg['chat_name']
             timestamp = msg['ts']
+            from_me = msg['from_me']
             text = msg['display_text'] or msg['text'] or ''
             is_group = is_group_jid(chat_jid)
 
@@ -419,20 +442,36 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
                     stats['skipped_large_group'] += 1
                     continue
 
-            # Skip linked device IDs (not real phone numbers)
-            if sender_jid and '@lid' in sender_jid:
-                stats['skipped_lid'] += 1
-                continue
+            # Determine the phone/person for this interaction
+            # For incoming messages (from_me=0): use sender_jid
+            # For outgoing messages (from_me=1): use chat_jid (the recipient)
+            if from_me:
+                # Outgoing message - skip if group (no single recipient)
+                if is_group:
+                    stats['interactions_skipped'] += 1
+                    continue
+                # For DMs, the chat_jid is the recipient
+                target_jid = chat_jid
+                target_name = chat_name or sender_name
+            else:
+                # Incoming message - use sender
+                target_jid = sender_jid
+                target_name = sender_name
 
-            # Extract phone from sender JID
-            phone = extract_phone_from_jid(sender_jid)
+                # Skip linked device IDs for incoming messages
+                if target_jid and '@lid' in target_jid:
+                    stats['skipped_lid'] += 1
+                    continue
+
+            # Extract phone from target JID
+            phone = extract_phone_from_jid(target_jid)
             if not phone:
                 stats['interactions_skipped'] += 1
                 continue
 
             # Resolve to PersonEntity
             result = resolver.resolve(
-                name=sender_name if sender_name else None,
+                name=target_name if target_name else None,
                 phone=phone,
                 create_if_missing=True,  # Create new person if not found (matches contact sync)
             )
@@ -457,7 +496,8 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
 
             # Create interaction record
             interaction_id = str(uuid.uuid4())
-            title = f"WhatsApp {'group' if is_group else 'DM'}: {chat_name or sender_name or phone}"
+            direction = "→" if from_me else "←"
+            title = f"WhatsApp {direction} {target_name or phone}"
             snippet = text[:500] if text else ""
 
             batch.append((
