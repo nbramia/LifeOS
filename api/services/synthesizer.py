@@ -297,10 +297,12 @@ Format:
 - Include relevant quotes when helpful
 - End with sources list if multiple files referenced
 
-Actions you can take:
+Actions you can take directly:
 - Create email drafts: Say "draft an email to..." and I'll create a Gmail draft
 - Create reminders: Say "remind me..." or "set a reminder..." and I'll schedule a Telegram notification
 - Search across calendar, email, drive, messages, and notes
+
+Note: Tasks requiring file operations, terminal commands, code changes, or browser access are automatically routed to Claude Code. If the user asks for something you can't do (edit files, run scripts, browse websites, etc.) and it wasn't auto-routed, mention they can use /code directly.
 
 If asked to create a reminder or email, respond naturally - the system will handle the action."""
 

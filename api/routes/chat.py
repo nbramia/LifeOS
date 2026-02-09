@@ -1394,6 +1394,15 @@ async def ask_stream(request: AskStreamRequest):
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
+            elif action_intent and action_intent.category == "code":
+                # ---- CODE: requires Claude Code (terminal/filesystem/browser) ----
+                print("DETECTED CODE INTENT - delegating to Claude Code")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n"
+                # Signal to caller (e.g., Telegram) that this needs Claude Code
+                yield f"data: {json.dumps({'type': 'code_intent', 'task': request.question})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
             # Expand follow-up queries with conversation context
             # v3: Use enhanced conversation context for better follow-up handling
             from api.services.conversation_context import (

@@ -630,9 +630,12 @@ Possible intents:
 - reminder_edit: changing a reminder
 - reminder_delete: removing a reminder
 - task_and_reminder: user wants BOTH a task and a reminder (e.g., "both", "do both", "task and reminder")
+- code: user wants an ACTION that requires terminal commands, file operations, code changes, browser automation, or system tasks. Examples: create/edit/delete files, run scripts, install software, change settings, fix bugs, update code, browse websites, check system status. This is for DOING things, not asking questions about code.
 - none: question, search, or anything that isn't an action above
 
-Key distinction: A "task" is a to-do item on a list. A "reminder" is a timed notification that pings the user. If the user mentions a specific time/date for a notification, it's a reminder. If they want to track something to do, it's a task. If ambiguous, prefer task_create.
+Key distinctions:
+- A "task" is a to-do item on a list. A "reminder" is a timed notification that pings the user.
+- "code" is for actions requiring filesystem/terminal/browser access - NOT for questions about code or programming help. "How do I write a for loop?" is none. "Create a Python script that does X" is code. "Fix the bug in my server" is code. "What does this function do?" is none.
 
 {context}
 
@@ -745,6 +748,7 @@ def _parse_intent_response(response: str) -> Optional[ActionIntent]:
             "reminder_edit": ("reminder", ReminderIntentType.EDIT.value),
             "reminder_delete": ("reminder", ReminderIntentType.DELETE.value),
             "task_and_reminder": ("task_and_reminder", None),
+            "code": ("code", None),
         }
 
         if intent in mapping:
