@@ -124,11 +124,15 @@ class TestR2EntityResolution:
             if person.display_name and person.display_name != person.canonical_name:
                 names_to_find.append(person.display_name)
             names_to_find.extend(person.aliases)
-            # Also search for first name (entity resolution often links based on first name)
+            # Also search for first name and last name (entity resolution links on either)
             if person.canonical_name and ' ' in person.canonical_name:
-                first_name = person.canonical_name.split()[0]
+                parts = person.canonical_name.split()
+                first_name = parts[0]
+                last_name = parts[-1]
                 if first_name not in names_to_find:
                     names_to_find.append(first_name)
+                if last_name not in names_to_find and last_name != first_name:
+                    names_to_find.append(last_name)
 
             # Read file content
             try:

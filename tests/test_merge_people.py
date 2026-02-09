@@ -306,6 +306,7 @@ class TestMergePeople:
 
             mock_cursor = MagicMock()
             mock_cursor.rowcount = 0
+            mock_cursor.fetchone.return_value = (0,)  # Return tuple with count
             mock_cursor.fetchall.return_value = []
             mock_conn.return_value.__enter__ = MagicMock(return_value=mock_conn.return_value)
             mock_conn.return_value.__exit__ = MagicMock(return_value=False)
