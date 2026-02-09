@@ -23,10 +23,17 @@ You are being orchestrated by LifeOS on behalf of the user (Nathan).
 The user sent this task via Telegram and cannot see your full output.
 Only messages prefixed with [NOTIFY] will be relayed to the user.
 
+IMPORTANT - Be persistent and resourceful:
+- If your first approach doesn't work, try alternative approaches before giving up.
+- Debug errors yourself — read logs, check file contents, inspect state.
+- If a tool fails, understand why and adapt. Don't just report the failure.
+- The user cannot easily intervene, so exhaust your options before asking for help.
+- Only use [NOTIFY] to ask the user for input if you are truly stuck after multiple attempts.
+
 Use [NOTIFY] for:
-- Plan summaries or key decision points
+- Progress updates on significant milestones (e.g., "Found the file, making edits...")
 - Completion summaries (always include one when done)
-- Errors that block progress and need user input
+- Errors that block progress AFTER you've tried to resolve them yourself
 
 Do NOT use [NOTIFY] for routine tool calls or intermediate steps.
 Keep [NOTIFY] messages concise (1-3 sentences).
@@ -43,6 +50,8 @@ The user will review and approve the plan before you proceed.
 
 _NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.+)")
 
+HEARTBEAT_INTERVAL = 300  # 5 minutes
+
 
 @dataclass
 class ClaudeSession:
@@ -56,6 +65,7 @@ class ClaudeSession:
     completed_at: Optional[float] = None
     cost_usd: float = 0.0
     plan_mode: bool = False
+    last_notify_at: float = field(default_factory=time.time)
 
 
 class ClaudeOrchestrator:
@@ -66,6 +76,7 @@ class ClaudeOrchestrator:
         self._active_session: Optional[ClaudeSession] = None
         self._process: Optional[subprocess.Popen] = None
         self._watchdog: Optional[threading.Timer] = None
+        self._heartbeat: Optional[threading.Timer] = None
         self._notification_callback: Optional[Callable[[str], None]] = None
 
     def is_busy(self) -> bool:
@@ -201,6 +212,9 @@ class ClaudeOrchestrator:
         self._watchdog.daemon = True
         self._watchdog.start()
 
+        # Start heartbeat timer
+        self._start_heartbeat(session)
+
     def _stream_reader(self, proc: subprocess.Popen, session: ClaudeSession):
         """Read and parse stream-json output from the Claude subprocess."""
         try:
@@ -260,6 +274,7 @@ class ClaudeOrchestrator:
                         notify_text = match.group(1).strip()
                         if notify_text and self._notification_callback:
                             self._notification_callback(notify_text)
+                            session.last_notify_at = time.time()
                         # For plan mode, accumulate plan text
                         if session.plan_mode and session.status == "running":
                             session.plan_text += notify_text + "\n"
@@ -302,11 +317,43 @@ class ClaudeOrchestrator:
                 f"Claude Code session timed out after {settings.claude_timeout_seconds // 60} minutes."
             )
 
+    def _start_heartbeat(self, session: ClaudeSession):
+        """Start a repeating heartbeat that pings Telegram if no [NOTIFY] recently."""
+        if self._heartbeat:
+            self._heartbeat.cancel()
+        self._heartbeat = threading.Timer(
+            HEARTBEAT_INTERVAL,
+            self._on_heartbeat,
+            args=(session,),
+        )
+        self._heartbeat.daemon = True
+        self._heartbeat.start()
+
+    def _on_heartbeat(self, session: ClaudeSession):
+        """Send a progress update if no [NOTIFY] was sent in the last interval."""
+        if session.status not in ("running", "implementing"):
+            return
+
+        elapsed = int(time.time() - session.started_at)
+        minutes = elapsed // 60
+
+        if self._notification_callback:
+            self._notification_callback(
+                f"Still working... ({minutes}m elapsed)"
+            )
+            session.last_notify_at = time.time()
+
+        # Schedule next heartbeat
+        self._start_heartbeat(session)
+
     def _cleanup(self, final_status: str):
         """Mark session complete and release lock."""
         if self._watchdog:
             self._watchdog.cancel()
             self._watchdog = None
+        if self._heartbeat:
+            self._heartbeat.cancel()
+            self._heartbeat = None
         session = self._active_session
         if session and session.status not in ("completed", "failed", "awaiting_approval"):
             session.status = final_status
