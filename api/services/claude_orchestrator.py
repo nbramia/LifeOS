@@ -23,17 +23,54 @@ You are being orchestrated by LifeOS on behalf of the user (Nathan).
 The user sent this task via Telegram and cannot see your full output.
 Only messages prefixed with [NOTIFY] will be relayed to the user.
 
-IMPORTANT - Be persistent and resourceful:
-- If your first approach doesn't work, try alternative approaches before giving up.
+CREATIVE TASK INTERPRETATION:
+The user is messaging from their phone — requests will be brief and informal.
+Think about what they actually want, not just the literal words.
+- "add X to the backlog" → find the backlog file, understand its format, add a properly formatted entry
+- "fix the sync" → investigate what's broken, understand the root cause, fix it
+- "write a cron job for X" → create the script AND install the cron entry
+- "update the readme" → read the current readme, understand the project, make meaningful updates
+Explore the working directory structure and conventions before making changes.
+When in doubt, do more rather than less — the user can't easily follow up from their phone.
+
+SCOPE — keep changes proportional to the ask:
+- Be creative in HOW you solve the task, but don't expand WHAT the task is.
+- A small ask ("add X to the backlog") should be a small change. Don't refactor the backlog format.
+- A bug fix should fix the bug, not redesign the surrounding system.
+- If you discover the task is bigger than expected (would touch 4+ files or require
+  significant refactoring), STOP. Send a [NOTIFY] explaining what you found and what
+  you'd recommend, then make ONLY the minimal safe change. The user can follow up
+  with a larger task if they want the full change.
+- Never delete files, drop data, or reorganize project structure unless explicitly asked.
+- If you notice adjacent issues, mention them in your completion [NOTIFY] — don't fix them.
+
+CLARIFICATION — ask instead of guessing:
+- If the task is vague or ambiguous, DO NOT guess. Ask the user.
+- Use [CLARIFY] to ask a question. Your session will pause and the user's answer
+  will be relayed back to you. After sending [CLARIFY], STOP and do not continue working.
+- Keep questions short and specific. Offer options when possible.
+- Example: [CLARIFY] The backlog has two sections (Work and Personal). Which one should I add this to?
+- Example: [CLARIFY] I found 3 sync-related errors in the logs. Which one are you seeing? (1) OAuth token expired (2) ChromaDB timeout (3) Slack rate limit
+
+PERSISTENCE:
+- If your first approach doesn't work, try alternatives before giving up.
 - Debug errors yourself — read logs, check file contents, inspect state.
-- If a tool fails, understand why and adapt. Don't just report the failure.
 - The user cannot easily intervene, so exhaust your options before asking for help.
 - Only use [NOTIFY] to ask the user for input if you are truly stuck after multiple attempts.
 
-Use [NOTIFY] for:
-- Progress updates on significant milestones (e.g., "Found the file, making edits...")
-- Completion summaries (always include one when done)
-- Errors that block progress AFTER you've tried to resolve them yourself
+ENVIRONMENT:
+- This is a Mac Mini running macOS
+- Obsidian vault: ~/Notes 2025 (markdown notes with YAML frontmatter)
+- LifeOS project: ~/Documents/Code/LifeOS (has CLAUDE.md with project conventions)
+- Other projects: ~/Documents/Code/
+- Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
+- Git, cron, and standard macOS tools are available
+
+NOTIFICATIONS — use [NOTIFY] for:
+- Completion summaries (ALWAYS include one when done)
+- Progress updates on significant milestones
+- Errors that block progress after you've tried to resolve them
+- Plans before large changes (see SCOPE above)
 
 Do NOT use [NOTIFY] for routine tool calls or intermediate steps.
 Keep [NOTIFY] messages concise (1-3 sentences).
@@ -49,6 +86,7 @@ The user will review and approve the plan before you proceed.
 """
 
 _NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.+)")
+_CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.+)")
 
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 
@@ -59,13 +97,14 @@ class ClaudeSession:
     session_id: Optional[str] = None  # Claude's session ID from init event
     task: str = ""
     working_dir: str = ""
-    status: str = "running"  # running | awaiting_approval | implementing | completed | failed
+    status: str = "running"  # running | awaiting_approval | awaiting_clarification | implementing | completed | failed
     plan_text: str = ""
     started_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     cost_usd: float = 0.0
     plan_mode: bool = False
     last_notify_at: float = field(default_factory=time.time)
+    pending_clarification: str = ""  # Last [CLARIFY] question text
 
 
 class ClaudeOrchestrator:
@@ -81,7 +120,7 @@ class ClaudeOrchestrator:
 
     def is_busy(self) -> bool:
         return self._active_session is not None and self._active_session.status in (
-            "running", "awaiting_approval", "implementing",
+            "running", "awaiting_approval", "awaiting_clarification", "implementing",
         )
 
     def get_active_session(self) -> Optional[ClaudeSession]:
@@ -142,6 +181,25 @@ class ClaudeOrchestrator:
             session.completed_at = time.time()
             self._active_session = None
             return session
+
+    def respond_to_clarification(self, answer: str) -> Optional[ClaudeSession]:
+        """Resume a session that asked a [CLARIFY] question with the user's answer."""
+        with self._lock:
+            session = self._active_session
+            if not session or session.status != "awaiting_clarification":
+                return None
+            if not session.session_id:
+                logger.error("No session_id to resume for clarification")
+                return None
+            session.status = "running"
+            session.pending_clarification = ""
+
+        self._spawn(
+            answer,
+            session,
+            resume_session_id=session.session_id,
+        )
+        return session
 
     def cancel(self):
         """Cancel the active session."""
@@ -247,8 +305,8 @@ class ClaudeOrchestrator:
                     if self._notification_callback:
                         self._notification_callback("Claude Code session completed.")
                     self._cleanup("completed")
-            elif session.status == "awaiting_approval":
-                pass  # Stay in awaiting_approval
+            elif session.status in ("awaiting_approval", "awaiting_clarification"):
+                pass  # Stay in waiting state — user will respond
 
         except Exception as e:
             logger.error(f"Stream reader error: {e}")
@@ -265,11 +323,18 @@ class ClaudeOrchestrator:
             logger.info(f"Claude session started: {session.session_id}")
 
         elif etype == "assistant":
-            # Extract [NOTIFY] lines from message content
+            # Extract [NOTIFY] and [CLARIFY] lines from message content
             content_blocks = event.get("message", {}).get("content", [])
             for block in content_blocks:
                 if block.get("type") == "text":
                     text = block.get("text", "")
+                    for match in _CLARIFY_RE.finditer(text):
+                        clarify_text = match.group(1).strip()
+                        if clarify_text:
+                            session.pending_clarification = clarify_text
+                            if self._notification_callback:
+                                self._notification_callback(clarify_text)
+                                session.last_notify_at = time.time()
                     for match in _NOTIFY_RE.finditer(text):
                         notify_text = match.group(1).strip()
                         if notify_text and self._notification_callback:
@@ -285,7 +350,10 @@ class ClaudeOrchestrator:
 
             result_text = event.get("result", "")
 
-            if session.plan_mode and session.status == "running":
+            if session.pending_clarification:
+                # Claude asked a question — wait for user's answer
+                session.status = "awaiting_clarification"
+            elif session.plan_mode and session.status == "running":
                 # Plan phase complete — await approval
                 session.status = "awaiting_approval"
                 if self._notification_callback:
@@ -355,7 +423,7 @@ class ClaudeOrchestrator:
             self._heartbeat.cancel()
             self._heartbeat = None
         session = self._active_session
-        if session and session.status not in ("completed", "failed", "awaiting_approval"):
+        if session and session.status not in ("completed", "failed", "awaiting_approval", "awaiting_clarification"):
             session.status = final_status
             session.completed_at = time.time()
         if final_status in ("completed", "failed"):

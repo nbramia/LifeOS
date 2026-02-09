@@ -49,7 +49,7 @@ Two optional environment variables in `.env`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LIFEOS_CLAUDE_BINARY` | `/Users/nathanramia/.local/bin/claude` | Path to the Claude CLI binary |
-| `LIFEOS_CLAUDE_TIMEOUT` | `600` (10 minutes) | Max runtime per session in seconds |
+| `LIFEOS_CLAUDE_TIMEOUT` | `3600` (1 hour) | Safety-net timeout per session in seconds. Heartbeats keep you informed; this is a backstop. |
 
 These rarely need changing. The binary path matches the standard Claude Code installation location.
 
@@ -92,7 +92,7 @@ The orchestrator picks the working directory based on keywords in your task:
 
 ### Plan Mode
 
-For complex tasks, Claude will present a plan before implementing. This triggers automatically for tasks containing words like "refactor", "implement", "build a", "set up a", "migrate", or "integrate".
+For complex tasks, Claude will present a plan before implementing. This triggers automatically for tasks containing words like "refactor", "implement", "rewrite", "overhaul", "build a", "set up a", "add a new", "create a new", "remove all", "delete all", "migrate", "replace", "restructure", or "integrate".
 
 **Flow:**
 1. You send: `/code implement a new health check endpoint`
@@ -104,6 +104,20 @@ For complex tasks, Claude will present a plan before implementing. This triggers
 To reject: reply `reject` (or `no`, `cancel`, `stop`).
 
 While a plan is pending, you can still send normal messages to LifeOS chat — only short approval/rejection keywords are intercepted.
+
+### Clarification Questions
+
+If a task is vague or ambiguous, Claude will ask you a clarifying question instead of guessing. The question is relayed via Telegram, and the session pauses until you respond.
+
+**Flow:**
+1. You send: `/code add this to the backlog`
+2. Claude asks: "The backlog has two sections (Work and Personal). Which one?"
+3. You reply: `Work`
+4. Claude resumes with your answer and completes the task
+
+To cancel instead of answering: reply `cancel` (or `no`, `stop`).
+
+While a clarification is pending, all non-command messages are routed as responses. Use `/code_cancel` if you want to chat normally instead.
 
 ### Monitoring and Control
 
@@ -133,9 +147,10 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 ### System Prompt
 
 Claude Code receives a system prompt instructing it to:
-- Use `[NOTIFY]` for user-facing messages
-- Be **persistent and resourceful** — try alternative approaches before giving up, debug errors independently, and only ask the user for help after exhausting options
-- Always include a completion summary
+- **Interpret tasks creatively** — think about what you actually want, not just the literal words. Requests from Telegram are brief and informal; Claude will explore the directory, understand conventions, and do the full job (e.g., "write a cron job" means create the script AND install the cron entry)
+- **Be persistent and resourceful** — try alternative approaches before giving up, debug errors independently, and only ask the user for help after exhausting options
+- **Know the environment** — vault location, project directories, available tools (git, cron, Python venv)
+- Always include a completion summary via `[NOTIFY]`
 
 Only `[NOTIFY]` lines are relayed — all other output (tool calls, file reads, intermediate steps) stays in the subprocess.
 
@@ -193,7 +208,7 @@ If Claude is working in the wrong directory, make your task description more exp
 
 ## Limitations
 
-- **10-minute timeout** — adjustable via `LIFEOS_CLAUDE_TIMEOUT` but tasks should be concise
+- **1-hour safety timeout** — adjustable via `LIFEOS_CLAUDE_TIMEOUT`; heartbeats keep you informed, this is a backstop
 - **One session at a time** — serial execution only; cancel before starting a new one
 - **No interactive input** — Claude runs with `--dangerously-skip-permissions` (no approval prompts)
 - **No streaming to Telegram** — you get `[NOTIFY]` checkpoints, not real-time output
