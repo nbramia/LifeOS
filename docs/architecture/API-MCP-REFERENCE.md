@@ -860,7 +860,7 @@ claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
 | `lifeos_drive_search` | GET /api/drive/search | Search Drive |
 | `lifeos_imessage_search` | GET /api/imessage/search | Search messages |
 | `lifeos_slack_search` | POST /api/slack/search | Search Slack |
-| `lifeos_people_search` | GET /api/crm/people | Search people |
+| `lifeos_people_search` | GET /api/people/search | Search people |
 | `lifeos_person_profile` | GET /api/crm/people/{id} | Full CRM profile |
 | `lifeos_person_facts` | GET /api/crm/people/{id}/facts | Extracted facts |
 | `lifeos_person_timeline` | GET /api/crm/people/{id}/timeline | Interaction history |
