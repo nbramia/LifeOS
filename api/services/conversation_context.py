@@ -43,6 +43,11 @@ class ConversationContext:
     last_reminder_id: Optional[str] = None
     last_reminder_name: Optional[str] = None
 
+    # Pending selection context (for numeric responses to "which one?" prompts)
+    pending_selection_type: Optional[str] = None  # "reminder", "task"
+    pending_selection_action: Optional[str] = None  # "edit", "delete"
+    pending_selection_items: list[str] = field(default_factory=list)  # IDs in display order
+
     # Timing
     last_query_time: Optional[datetime] = None
 
@@ -53,6 +58,10 @@ class ConversationContext:
     def has_reminder_context(self) -> bool:
         """Check if we have reminder context for follow-up."""
         return bool(self.last_reminder_id or self.last_reminder_name)
+
+    def has_pending_selection(self) -> bool:
+        """Check if we're waiting for user to select from a numbered list."""
+        return bool(self.pending_selection_type and self.pending_selection_items)
 
     def is_stale(self, max_minutes: int = 30) -> bool:
         """Check if context is too old to be relevant."""
@@ -75,6 +84,9 @@ class ConversationContext:
             "last_topics": self.last_topics,
             "last_reminder_id": self.last_reminder_id,
             "last_reminder_name": self.last_reminder_name,
+            "pending_selection_type": self.pending_selection_type,
+            "pending_selection_action": self.pending_selection_action,
+            "pending_selection_items": self.pending_selection_items,
             "is_stale": self.is_stale(),
         }
 
@@ -129,6 +141,14 @@ def extract_context_from_history(
                 context.last_reminder_id = reminder_info.get("id")
                 context.last_reminder_name = reminder_info.get("name")
                 logger.debug(f"Found reminder context: {context.last_reminder_name}")
+
+            # Check for pending selection (from disambiguation prompts)
+            if not context.has_pending_selection() and routing.get("pending_selection"):
+                pending = routing["pending_selection"]
+                context.pending_selection_type = pending.get("type")
+                context.pending_selection_action = pending.get("action")
+                context.pending_selection_items = pending.get("items", [])
+                logger.debug(f"Found pending selection: {context.pending_selection_type} ({len(context.pending_selection_items)} items)")
 
         # Extract person from content (as fallback)
         if not context.last_person_name and hasattr(msg, 'content') and msg.content:

@@ -205,6 +205,7 @@ async def _execute_action_after(
                     message_type=params.get("message_type", "static"),
                     message_content=params.get("message_content", ""),
                     enabled=True,
+                    timezone=params.get("timezone", "America/New_York"),
                 )
                 display_time = params.get("display_time", params["schedule_value"])
                 return f"---\nI've also set a reminder for **{display_time}**: {reminder.name}"
@@ -549,6 +550,138 @@ def find_reminder_by_topic(
 
 
 # =============================================================================
+# LLM-Based Reminder Disambiguation (Fix #2)
+# =============================================================================
+
+def format_reminders_for_context(reminders: list) -> str:
+    """
+    Format reminders as a numbered list for LLM context injection.
+
+    This allows the LLM to see ALL reminders and reason about which one
+    the user is referring to, rather than relying on fuzzy string matching.
+    """
+    if not reminders:
+        return "No active reminders."
+
+    from api.services.reminder_store import _format_cron_human
+    from api.services.time_parser import format_time_for_display
+
+    lines = ["Current reminders:"]
+    for i, r in enumerate(reminders, 1):
+        if r.schedule_type == "cron":
+            schedule = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
+        else:
+            try:
+                trigger_dt = datetime.fromisoformat(r.schedule_value)
+                schedule = format_time_for_display(trigger_dt)
+            except (ValueError, TypeError):
+                schedule = r.schedule_value
+
+        status = "enabled" if r.enabled else "disabled"
+        lines.append(f"{i}. \"{r.name}\" - {schedule} ({status})")
+
+    return "\n".join(lines)
+
+
+async def identify_reminder_with_llm(
+    query: str,
+    reminders: list,
+    conversation_history: list = None,
+) -> Optional[dict]:
+    """
+    Use LLM to identify which reminder the user is referring to.
+
+    This provides better disambiguation than fuzzy string matching by:
+    1. Showing the LLM the full list of reminders
+    2. Letting it reason about context ("that one", "the daily one", etc.)
+    3. Using conversation history for pronouns and references
+
+    Returns dict with:
+        - reminder_index: 1-based index into reminders list (or None if ambiguous)
+        - confidence: 0.0-1.0
+        - reason: Brief explanation
+    """
+    if not reminders:
+        return None
+
+    reminder_context = format_reminders_for_context(reminders)
+
+    # Build conversation context if available
+    conv_context = ""
+    if conversation_history:
+        recent_msgs = conversation_history[-4:]  # Last 2 exchanges
+        context_parts = []
+        for msg in recent_msgs:
+            role = "User" if msg.role == "user" else "Assistant"
+            context_parts.append(f"{role}: {msg.content[:200]}")
+        if context_parts:
+            conv_context = "\n\nRecent conversation:\n" + "\n".join(context_parts)
+
+    prompt = f"""Given the user's request and the list of current reminders, identify which reminder they are referring to.
+
+{reminder_context}{conv_context}
+
+User request: "{query}"
+
+Instructions:
+- If the user mentions a specific name, number, or clear description, identify that reminder
+- If the user says "that one", "it", "the reminder", use conversation context to infer
+- If the user says "the first one", "number 2", etc., use the numbered list
+- If truly ambiguous (multiple equally likely matches), return null for reminder_index
+
+Return ONLY valid JSON:
+{{"reminder_index": <1-based number or null>, "confidence": <0.0-1.0>, "reason": "<brief explanation>"}}"""
+
+    try:
+        synthesizer = get_synthesizer()
+        response_text = await synthesizer.get_response(
+            prompt,
+            max_tokens=128,
+            model_tier="haiku"  # Fast, cheap for identification
+        )
+
+        json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            return result
+    except Exception as e:
+        logger.error(f"Failed to identify reminder with LLM: {e}")
+
+    return None
+
+
+def format_reminder_selection_prompt(reminders: list, action: str) -> tuple[str, list[str]]:
+    """
+    Format a numbered list of reminders for user selection.
+
+    Returns:
+        - response_text: The message to show the user
+        - reminder_ids: List of reminder IDs in display order
+    """
+    from api.services.reminder_store import _format_cron_human
+    from api.services.time_parser import format_time_for_display
+
+    lines = [f"Which reminder would you like to {action}?\n"]
+    reminder_ids = []
+
+    for i, r in enumerate(reminders, 1):
+        if r.schedule_type == "cron":
+            schedule = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
+        else:
+            try:
+                trigger_dt = datetime.fromisoformat(r.schedule_value)
+                schedule = format_time_for_display(trigger_dt)
+            except (ValueError, TypeError):
+                schedule = r.schedule_value
+
+        lines.append(f"{i}. **{r.name}** - {schedule}")
+        reminder_ids.append(r.id)
+
+    lines.append("\nReply with the number.")
+    return "\n".join(lines), reminder_ids
+
+
+# =============================================================================
 # Task Extraction & Matching Helpers
 # =============================================================================
 
@@ -820,6 +953,70 @@ async def ask_stream(request: AskStreamRequest):
             if conversation_history and conversation_history[-1].role == "user" and conversation_history[-1].content == request.question:
                 conversation_history = conversation_history[:-1]
 
+            # Check for pending numeric selection (Fix #3: handle "1", "2" responses)
+            from api.services.conversation_context import extract_context_from_history
+            conv_context = extract_context_from_history(conversation_history) if conversation_history else None
+
+            if conv_context and conv_context.has_pending_selection() and request.question.strip().isdigit():
+                idx = int(request.question.strip()) - 1  # Convert to 0-based
+                if 0 <= idx < len(conv_context.pending_selection_items):
+                    item_id = conv_context.pending_selection_items[idx]
+                    action = conv_context.pending_selection_action
+                    selection_type = conv_context.pending_selection_type
+
+                    if selection_type == "reminder":
+                        from api.services.reminder_store import get_reminder_store
+                        reminder_store = get_reminder_store()
+                        reminder = reminder_store.get(item_id)
+
+                        if reminder:
+                            if action == "delete":
+                                reminder_store.delete(item_id)
+                                response_text = f"I've deleted the reminder **\"{reminder.name}\"**."
+                            elif action == "edit":
+                                edit_params = await extract_reminder_edit_params(request.question, reminder.name)
+                                if edit_params:
+                                    reminder_store.update(
+                                        item_id,
+                                        schedule_type=edit_params.get("schedule_type", reminder.schedule_type),
+                                        schedule_value=edit_params["schedule_value"],
+                                    )
+                                    display_time = edit_params.get("display_time", edit_params["schedule_value"])
+                                    response_text = f"I've updated **\"{reminder.name}\"** to {display_time}."
+                                else:
+                                    # User selected the reminder but we need the new time
+                                    response_text = f"Got it, you want to change **\"{reminder.name}\"**. What time should I set it to?"
+                                    # Store selected reminder for next turn
+                                    routing_metadata = {
+                                        "sources": ["reminder"],
+                                        "reasoning": "Awaiting new time for edit",
+                                        "created_reminder": {"id": reminder.id, "name": reminder.name},
+                                    }
+                                    for chunk in response_text:
+                                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                        await asyncio.sleep(0.005)
+                                    store.add_message(conversation_id, "assistant", response_text, routing=routing_metadata)
+                                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                                    return
+                            else:
+                                response_text = f"Selected reminder: **\"{reminder.name}\"**"
+
+                            for chunk in response_text:
+                                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                await asyncio.sleep(0.005)
+                            store.add_message(conversation_id, "assistant", response_text)
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                else:
+                    # Invalid number
+                    response_text = f"Please enter a number between 1 and {len(conv_context.pending_selection_items)}."
+                    for chunk in response_text:
+                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.005)
+                    store.add_message(conversation_id, "assistant", response_text)
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
             # Unified intent classification — evaluates compose, task, and reminder
             # patterns simultaneously and picks the most specific match.
             action_intent = await classify_action_intent(request.question, conversation_history)
@@ -1043,6 +1240,7 @@ async def ask_stream(request: AskStreamRequest):
                                         schedule_value=task_params["reminder_time"],
                                         message_type="static",
                                         message_content=task_params["description"],
+                                        timezone="America/New_York",
                                     )
                                     task_manager.update(task.id, reminder_id=reminder.id)
                                     reminder_id = reminder.id
@@ -1109,6 +1307,7 @@ async def ask_stream(request: AskStreamRequest):
 
                 # Handle LIST intent
                 if reminder_intent_type == ReminderIntentType.LIST:
+                    from api.services.reminder_store import _format_cron_human
                     all_reminders = reminder_store.list_all()
                     enabled_reminders = [r for r in all_reminders if r.enabled]
 
@@ -1118,7 +1317,7 @@ async def ask_stream(request: AskStreamRequest):
                         response_text = f"You have {len(enabled_reminders)} active reminder(s):\n\n"
                         for r in enabled_reminders:
                             if r.schedule_type == "cron":
-                                schedule_desc = f"recurring ({r.schedule_value})"
+                                schedule_desc = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
                             else:
                                 try:
                                     trigger_dt = datetime.fromisoformat(r.schedule_value)
@@ -1136,31 +1335,54 @@ async def ask_stream(request: AskStreamRequest):
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
-                # Handle DELETE intent
+                # Handle DELETE intent (Fix #2: LLM-based disambiguation)
                 if reminder_intent_type == ReminderIntentType.DELETE:
-                    topic = extract_reminder_topic(request.question)
                     all_reminders = reminder_store.list_all()
-                    match_result = find_reminder_by_topic(
-                        topic, all_reminders,
-                        conv_context.last_reminder_id if conv_context else None,
-                        conv_context.last_reminder_name if conv_context else None,
+                    enabled_reminders = [r for r in all_reminders if r.enabled]
+
+                    if not enabled_reminders:
+                        response_text = "You don't have any active reminders to delete."
+                        for chunk in response_text:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+                        store.add_message(conversation_id, "assistant", response_text)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+
+                    # Use LLM to identify which reminder
+                    llm_result = await identify_reminder_with_llm(
+                        request.question,
+                        enabled_reminders,
+                        conversation_history
                     )
 
-                    if match_result is None:
-                        response_text = "I couldn't find a reminder to delete. "
-                        if topic:
-                            response_text += f"No reminder matching \"{topic}\" was found."
+                    if llm_result and llm_result.get("reminder_index") and llm_result.get("confidence", 0) >= 0.7:
+                        # High confidence match
+                        idx = llm_result["reminder_index"] - 1  # Convert to 0-based
+                        if 0 <= idx < len(enabled_reminders):
+                            reminder = enabled_reminders[idx]
+                            reminder_store.delete(reminder.id)
+                            response_text = f"I've deleted the reminder **\"{reminder.name}\"**."
                         else:
-                            response_text += "Please specify which reminder to delete, or say \"list my reminders\" to see them."
-                    elif match_result[1] == "ambiguous":
-                        matches = match_result[0]
-                        response_text = f"I found multiple reminders matching \"{topic}\". Which one?\n\n"
-                        for r in matches:
-                            response_text += f"- {r[0].name}\n"
+                            response_text = "I couldn't identify which reminder to delete."
                     else:
-                        reminder, match_type = match_result
-                        reminder_store.delete(reminder.id)
-                        response_text = f"I've deleted the reminder **\"{reminder.name}\"**."
+                        # Ambiguous - show numbered list and store pending selection
+                        response_text, reminder_ids = format_reminder_selection_prompt(enabled_reminders, "delete")
+                        routing_metadata = {
+                            "sources": ["reminder"],
+                            "reasoning": "Awaiting reminder selection for delete",
+                            "pending_selection": {
+                                "type": "reminder",
+                                "action": "delete",
+                                "items": reminder_ids,
+                            },
+                        }
+                        for chunk in response_text:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+                        store.add_message(conversation_id, "assistant", response_text, routing=routing_metadata)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
 
                     for chunk in response_text:
                         yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
@@ -1169,29 +1391,36 @@ async def ask_stream(request: AskStreamRequest):
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
-                # Handle EDIT intent
+                # Handle EDIT intent (Fix #2: LLM-based disambiguation)
                 if reminder_intent_type == ReminderIntentType.EDIT:
-                    topic = extract_reminder_topic(request.question)
                     all_reminders = reminder_store.list_all()
-                    match_result = find_reminder_by_topic(
-                        topic, all_reminders,
-                        conv_context.last_reminder_id if conv_context else None,
-                        conv_context.last_reminder_name if conv_context else None,
+                    enabled_reminders = [r for r in all_reminders if r.enabled]
+
+                    if not enabled_reminders:
+                        response_text = "You don't have any active reminders to edit."
+                        for chunk in response_text:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+                        store.add_message(conversation_id, "assistant", response_text)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+
+                    # Use LLM to identify which reminder
+                    llm_result = await identify_reminder_with_llm(
+                        request.question,
+                        enabled_reminders,
+                        conversation_history
                     )
 
-                    if match_result is None:
-                        response_text = "I couldn't find a reminder to edit. "
-                        if topic:
-                            response_text += f"No reminder matching \"{topic}\" was found."
-                        else:
-                            response_text += "Please specify which reminder to change, or say \"list my reminders\" to see them."
-                    elif match_result[1] == "ambiguous":
-                        matches = match_result[0]
-                        response_text = f"I found multiple reminders matching \"{topic}\". Which one?\n\n"
-                        for r in matches:
-                            response_text += f"- {r[0].name}\n"
-                    else:
-                        reminder, match_type = match_result
+                    reminder = None
+                    if llm_result and llm_result.get("reminder_index") and llm_result.get("confidence", 0) >= 0.7:
+                        # High confidence match
+                        idx = llm_result["reminder_index"] - 1  # Convert to 0-based
+                        if 0 <= idx < len(enabled_reminders):
+                            reminder = enabled_reminders[idx]
+
+                    if reminder:
+                        # Found the reminder - now extract the new time
                         edit_params = await extract_reminder_edit_params(request.question, reminder.name)
                         if edit_params:
                             reminder_store.update(
@@ -1202,7 +1431,37 @@ async def ask_stream(request: AskStreamRequest):
                             display_time = edit_params.get("display_time", edit_params["schedule_value"])
                             response_text = f"I've updated **\"{reminder.name}\"** to {display_time}."
                         else:
-                            response_text = f"I couldn't understand the new time. Please try again with something like \"change it to 7pm\" or \"move it to tomorrow\"."
+                            # Selected reminder but need new time
+                            response_text = f"What time should I change **\"{reminder.name}\"** to?"
+                            routing_metadata = {
+                                "sources": ["reminder"],
+                                "reasoning": "Awaiting new time for edit",
+                                "created_reminder": {"id": reminder.id, "name": reminder.name},
+                            }
+                            for chunk in response_text:
+                                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                await asyncio.sleep(0.005)
+                            store.add_message(conversation_id, "assistant", response_text, routing=routing_metadata)
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                    else:
+                        # Ambiguous - show numbered list and store pending selection
+                        response_text, reminder_ids = format_reminder_selection_prompt(enabled_reminders, "edit")
+                        routing_metadata = {
+                            "sources": ["reminder"],
+                            "reasoning": "Awaiting reminder selection for edit",
+                            "pending_selection": {
+                                "type": "reminder",
+                                "action": "edit",
+                                "items": reminder_ids,
+                            },
+                        }
+                        for chunk in response_text:
+                            yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                            await asyncio.sleep(0.005)
+                        store.add_message(conversation_id, "assistant", response_text, routing=routing_metadata)
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
 
                     for chunk in response_text:
                         yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
@@ -1223,6 +1482,7 @@ async def ask_stream(request: AskStreamRequest):
                                 message_type=reminder_params.get("message_type", "static"),
                                 message_content=reminder_params.get("message_content", ""),
                                 enabled=True,
+                                timezone=reminder_params.get("timezone", "America/New_York"),
                             )
 
                             display_time = reminder_params.get("display_time", "")
@@ -1321,6 +1581,7 @@ async def ask_stream(request: AskStreamRequest):
                                         schedule_value=r_params["schedule_value"],
                                         message_type=r_params.get("message_type", "static"),
                                         message_content=task_params["description"],
+                                        timezone=r_params.get("timezone", "America/New_York"),
                                     )
                                     reminder_id = reminder.id
                                 else:
@@ -1336,6 +1597,7 @@ async def ask_stream(request: AskStreamRequest):
                                         schedule_value=tomorrow.isoformat(),
                                         message_type="static",
                                         message_content=task_params["description"],
+                                        timezone="America/New_York",
                                     )
                                     reminder_id = reminder.id
                             else:
@@ -1345,6 +1607,7 @@ async def ask_stream(request: AskStreamRequest):
                                     schedule_value=reminder_time,
                                     message_type="static",
                                     message_content=task_params["description"],
+                                    timezone="America/New_York",
                                 )
                                 reminder_id = reminder.id
 
@@ -1520,7 +1783,8 @@ async def ask_stream(request: AskStreamRequest):
                     for msg in conversation_history[-6:]:
                         context_parts.append(f"{msg.role}: {msg.content[:500]}")
                     if context_parts:
-                        prompt = f"Conversation context:\n{'\\n'.join(context_parts)}\n\nUser: {request.question}\n\nAssistant:"
+                        context_str = "\n".join(context_parts)
+                        prompt = f"Conversation context:\n{context_str}\n\nUser: {request.question}\n\nAssistant:"
 
                 async for chunk in synthesizer.stream_response(prompt, max_tokens=2048):
                     if isinstance(chunk, dict) and chunk.get("type") == "usage":
