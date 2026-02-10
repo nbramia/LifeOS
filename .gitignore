@@ -127,3 +127,6 @@ chromadb/
 docs/2026-*.md
 docs/plans/2026-*.md
 scripts/clear-caches.sh
+
+# Personal planning docs
+docs/plans/LifeOS Backlog.md
