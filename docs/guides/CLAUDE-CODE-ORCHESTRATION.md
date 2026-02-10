@@ -115,7 +115,7 @@ If a task is vague or ambiguous, Claude will ask you a clarifying question inste
 3. You reply: `Work`
 4. Claude resumes with your answer and completes the task
 
-To cancel instead of answering: reply `cancel` (or `no`, `stop`).
+**Important:** "no" is treated as an answer to yes/no questions, not a cancellation. Use `/code_cancel` to cancel instead.
 
 While a clarification is pending, all non-command messages are routed as responses. Use `/code_cancel` if you want to chat normally instead.
 
