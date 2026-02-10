@@ -28,6 +28,7 @@ class CreateReminderRequest(BaseModel):
     message_content: str = Field(default="", description="Static text or natural language prompt")
     endpoint_config: Optional[dict] = Field(default=None, description="For endpoint type: {endpoint, method, params}")
     enabled: bool = Field(default=True)
+    timezone: str = Field(default="America/New_York", description="Timezone for interpreting schedule times (e.g., 'America/New_York')")
 
 
 class UpdateReminderRequest(BaseModel):
@@ -38,6 +39,7 @@ class UpdateReminderRequest(BaseModel):
     message_content: Optional[str] = None
     endpoint_config: Optional[dict] = None
     enabled: Optional[bool] = None
+    timezone: Optional[str] = None
 
 
 class ReminderResponse(BaseModel):
@@ -52,6 +54,7 @@ class ReminderResponse(BaseModel):
     created_at: str
     last_triggered_at: Optional[str]
     next_trigger_at: Optional[str]
+    timezone: str
 
     @classmethod
     def from_reminder(cls, r: Reminder) -> "ReminderResponse":
@@ -67,6 +70,7 @@ class ReminderResponse(BaseModel):
             created_at=r.created_at or "",
             last_triggered_at=r.last_triggered_at,
             next_trigger_at=r.next_trigger_at,
+            timezone=r.timezone or "America/New_York",
         )
 
 
@@ -100,6 +104,7 @@ async def create_reminder(request: CreateReminderRequest):
         message_content=request.message_content,
         endpoint_config=request.endpoint_config,
         enabled=request.enabled,
+        timezone=request.timezone,
     )
     return ReminderResponse.from_reminder(reminder)
 

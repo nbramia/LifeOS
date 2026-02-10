@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from croniter import croniter
+from zoneinfo import ZoneInfo
 
 from config.settings import settings
 
@@ -42,6 +43,7 @@ class Reminder:
     created_at: str = ""
     last_triggered_at: Optional[str] = None
     next_trigger_at: Optional[str] = None
+    timezone: str = "America/New_York"  # Default to Eastern for cron interpretation
 
     def to_dict(self) -> dict:
         return {
@@ -56,38 +58,61 @@ class Reminder:
             "created_at": self.created_at,
             "last_triggered_at": self.last_triggered_at,
             "next_trigger_at": self.next_trigger_at,
+            "timezone": self.timezone,
         }
 
 
 def compute_next_trigger(reminder: Reminder) -> Optional[str]:
-    """Compute the next trigger time for a reminder."""
-    now = datetime.now(timezone.utc)
+    """
+    Compute the next trigger time for a reminder.
+
+    For cron expressions, times are interpreted in the reminder's timezone
+    (defaults to America/New_York) and then converted to UTC for storage.
+    This ensures "daily at 6pm" means 6pm Eastern, not 6pm UTC.
+    """
+    now_utc = datetime.now(timezone.utc)
 
     if reminder.schedule_type == "once":
         try:
             trigger_time = datetime.fromisoformat(reminder.schedule_value)
             if trigger_time.tzinfo is None:
-                trigger_time = trigger_time.replace(tzinfo=timezone.utc)
-            if trigger_time > now:
-                return trigger_time.isoformat()
+                # Assume the reminder's timezone if not specified
+                tz = ZoneInfo(reminder.timezone or "America/New_York")
+                trigger_time = trigger_time.replace(tzinfo=tz)
+            # Convert to UTC for comparison and storage
+            trigger_time_utc = trigger_time.astimezone(timezone.utc)
+            if trigger_time_utc > now_utc:
+                return trigger_time_utc.isoformat()
             return None  # Past one-time reminder
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid datetime for reminder {reminder.id}: {e}")
             return None
 
     elif reminder.schedule_type == "cron":
         try:
-            cron = croniter(reminder.schedule_value, now)
-            next_time = cron.get_next(datetime)
-            return next_time.isoformat()
-        except (ValueError, KeyError):
-            logger.error(f"Invalid cron expression for reminder {reminder.id}: {reminder.schedule_value}")
+            # Interpret cron expression in the reminder's timezone
+            tz = ZoneInfo(reminder.timezone or "America/New_York")
+            now_local = datetime.now(tz)
+
+            cron = croniter(reminder.schedule_value, now_local)
+            next_time_local = cron.get_next(datetime)
+
+            # Ensure the result has timezone info
+            if next_time_local.tzinfo is None:
+                next_time_local = next_time_local.replace(tzinfo=tz)
+
+            # Convert to UTC for storage
+            next_time_utc = next_time_local.astimezone(timezone.utc)
+            return next_time_utc.isoformat()
+        except (ValueError, KeyError) as e:
+            logger.error(f"Invalid cron expression for reminder {reminder.id}: {reminder.schedule_value} - {e}")
             return None
 
     return None
 
 
-def _format_cron_human(cron_expr: str) -> str:
-    """Convert a cron expression to a human-readable string."""
+def _format_cron_human(cron_expr: str, tz_name: str = "America/New_York") -> str:
+    """Convert a cron expression to a human-readable string with timezone."""
     parts = cron_expr.split()
     if len(parts) < 5:
         return cron_expr
@@ -105,7 +130,10 @@ def _format_cron_human(cron_expr: str) -> str:
                "0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed",
                "4": "Thu", "5": "Fri", "6": "Sat"}
     day_str = dow_map.get(dow, dow)
-    return f"{day_str} at {time_str}"
+
+    # Add timezone abbreviation
+    tz_abbrev = "ET" if "New_York" in tz_name else tz_name.split("/")[-1]
+    return f"{day_str} at {time_str} {tz_abbrev}"
 
 
 def _format_dt_short(iso_str: str) -> str:
@@ -194,7 +222,7 @@ class ReminderStore:
                 lines.append("| Name | Schedule | Last Triggered |")
                 lines.append("|------|----------|----------------|")
                 for r in active_recurring:
-                    sched = _format_cron_human(r.schedule_value)
+                    sched = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
                     last = _format_dt_short(r.last_triggered_at) if r.last_triggered_at else "—"
                     lines.append(f"| {r.name} | {sched} | {last} |")
             else:
