@@ -44,7 +44,7 @@ class TestResolveWorkingDirectory:
 
     def test_code_keywords(self):
         code_dir = os.path.join(HOME, "Documents", "Code")
-        assert self._resolve("write a script to backup") == code_dir
+        assert self._resolve("write a script to automate") == code_dir
         assert self._resolve("create a cron job") == code_dir
 
     def test_code_word_boundary(self):
@@ -90,5 +90,5 @@ class TestResolveWorkingDirectory:
             ("anotherapp", f"{HOME}/Documents/Code/AnotherApp"),
         ]
 
-        result = mod.resolve_working_directory("update the myproject readme")
+        result = mod.resolve_working_directory("update the myproject docs")
         assert result == f"{HOME}/Documents/Code/MyProject"

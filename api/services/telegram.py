@@ -460,13 +460,8 @@ class TelegramBotListener:
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
 
-        # Check for cancel intent
-        normalized = text.strip().lower().rstrip(".")
-        if normalized in self._REJECTION_KEYWORDS:
-            orch.cancel()
-            await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
-            return
-
+        # Pass all responses through as answers — "no" is a valid answer to
+        # yes/no clarification questions. Use /code_cancel to cancel instead.
         session = orch.respond_to_clarification(text)
         if session:
             await send_message_async("Got it. Resuming...", chat_id=chat_id)

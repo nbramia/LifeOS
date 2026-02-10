@@ -6,6 +6,7 @@ and supports plan-then-implement workflows via session resume.
 """
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -56,7 +57,9 @@ PERSISTENCE:
 - If your first approach doesn't work, try alternatives before giving up.
 - Debug errors yourself — read logs, check file contents, inspect state.
 - The user cannot easily intervene, so exhaust your options before asking for help.
-- Only use [NOTIFY] to ask the user for input if you are truly stuck after multiple attempts.
+- IMPORTANT: If you have tried 3 or more distinct approaches and none worked, STOP.
+  Send a [NOTIFY] summarizing: (1) what you tried, (2) what failed, (3) your best guess
+  at the root cause. Let the user decide next steps rather than looping indefinitely.
 
 ENVIRONMENT:
 - This is a Mac Mini running macOS
@@ -91,6 +94,28 @@ _CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.+)")
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 
 
+def _summarize_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Create a brief human-readable summary of a tool call for heartbeat context."""
+    if tool_name in ("Read", "read"):
+        path = tool_input.get("file_path", "")
+        return f"reading {os.path.basename(path)}" if path else "reading a file"
+    if tool_name in ("Edit", "edit"):
+        path = tool_input.get("file_path", "")
+        return f"editing {os.path.basename(path)}" if path else "editing a file"
+    if tool_name in ("Write", "write"):
+        path = tool_input.get("file_path", "")
+        return f"writing {os.path.basename(path)}" if path else "writing a file"
+    if tool_name in ("Bash", "bash"):
+        cmd = tool_input.get("command", "")
+        # Show first 40 chars of command
+        return f"running `{cmd[:40]}`" if cmd else "running a command"
+    if tool_name in ("Grep", "grep"):
+        return f"searching for '{tool_input.get('pattern', '')}'"
+    if tool_name in ("Glob", "glob"):
+        return f"finding files matching '{tool_input.get('pattern', '')}'"
+    return f"using {tool_name}"
+
+
 @dataclass
 class ClaudeSession:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -105,6 +130,7 @@ class ClaudeSession:
     plan_mode: bool = False
     last_notify_at: float = field(default_factory=time.time)
     pending_clarification: str = ""  # Last [CLARIFY] question text
+    last_activity: str = ""  # Brief description of last tool/action for heartbeat context
 
 
 class ClaudeOrchestrator:
@@ -226,6 +252,7 @@ class ClaudeOrchestrator:
             "--output-format", "stream-json",
             "--verbose",
             "--model", "opus",
+            "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
             "--chrome",
             "--append-system-prompt", _SYSTEM_PROMPT,
@@ -343,10 +370,27 @@ class ClaudeOrchestrator:
                         # For plan mode, accumulate plan text
                         if session.plan_mode and session.status == "running":
                             session.plan_text += notify_text + "\n"
+                elif block.get("type") == "tool_use":
+                    tool_name = block.get("name", "")
+                    tool_input = block.get("input", {})
+                    session.last_activity = _summarize_tool_call(tool_name, tool_input)
 
         elif etype == "result":
             session.session_id = event.get("session_id", session.session_id)
             session.cost_usd = event.get("total_cost_usd", 0.0)
+
+            # Cost cap check
+            if session.cost_usd > settings.claude_max_cost_usd:
+                logger.warning(f"Claude session exceeded cost cap: ${session.cost_usd:.2f} > ${settings.claude_max_cost_usd:.2f}")
+                proc = self._process
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                self._cleanup("failed")
+                if self._notification_callback:
+                    self._notification_callback(
+                        f"Session stopped — cost cap exceeded (${session.cost_usd:.2f}/{settings.claude_max_cost_usd:.2f}). Use /code to retry."
+                    )
+                return
 
             result_text = event.get("result", "")
 
@@ -406,8 +450,10 @@ class ClaudeOrchestrator:
         minutes = elapsed // 60
 
         if self._notification_callback:
+            activity = f" — {session.last_activity}" if session.last_activity else ""
+            cost = f" | ${session.cost_usd:.2f}" if session.cost_usd > 0 else ""
             self._notification_callback(
-                f"Still working... ({minutes}m elapsed)"
+                f"Still working{activity} ({minutes}m elapsed{cost})"
             )
             session.last_notify_at = time.time()
 

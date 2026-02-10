@@ -10,7 +10,12 @@ _VAULT_PHRASES = ["meeting notes", "daily note"]
 _VAULT_WORDS = ["note", "notes", "vault", "obsidian", "journal", "backlog"]
 
 _LIFEOS_PHRASES = ["life os", "api endpoint", "telegram bot"]
-_LIFEOS_WORDS = ["lifeos", "server", "sync", "chromadb"]
+_LIFEOS_WORDS = [
+    "lifeos", "server", "sync", "chromadb",
+    "readme", "test", "tests", "deploy", "endpoint", "route",
+    "bug", "fix", "config", "backup", "database", "db",
+    "api", "search", "health", "telegram",
+]
 
 _CODE_WORDS = ["script", "code", "function", "cron"]
 
