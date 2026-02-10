@@ -160,7 +160,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     POSTs to the local /api/ask/stream endpoint and collects SSE events.
 
     Returns:
-        {"answer": str, "conversation_id": str}
+        {"answer": str, "conversation_id": str, "code_intent": bool, "task": str|None}
     """
     port = settings.port
     body: dict = {"question": question}
@@ -169,6 +169,8 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
 
     full_text = ""
     conv_id = conversation_id
+    code_intent = False
+    task = None
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
@@ -187,13 +189,16 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                     full_text += event.get("content", "")
                 elif event.get("type") == "conversation_id":
                     conv_id = event.get("conversation_id", conv_id)
+                elif event.get("type") == "code_intent":
+                    code_intent = True
+                    task = event.get("task", question)
                 elif event.get("type") == "error":
                     error_msg = event.get("message", "Unknown error")
                     logger.error(f"Chat pipeline error: {error_msg}")
                     if not full_text:
                         full_text = f"Error: {error_msg}"
 
-    return {"answer": full_text, "conversation_id": conv_id}
+    return {"answer": full_text, "conversation_id": conv_id, "code_intent": code_intent, "task": task}
 
 
 # ---------------------------------------------------------------------------
@@ -324,11 +329,18 @@ class TelegramBotListener:
             await self._handle_agent_clarification(text, chat_id)
             return
 
-        # Send through chat pipeline
+        # Send through chat pipeline (intent classification happens there)
         try:
             conv_id = self._conversations.get(chat_id)
             result = await chat_via_api(text, conversation_id=conv_id)
             self._conversations[chat_id] = result["conversation_id"]
+
+            # Check if the chat pipeline detected a "code" intent
+            if result.get("code_intent"):
+                task = result.get("task", text)
+                logger.info(f"Code intent detected, invoking Claude Code: {task[:50]}...")
+                await self._handle_code_command(task, chat_id)
+                return
 
             answer = result["answer"]
             if not answer:
