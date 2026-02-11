@@ -200,3 +200,39 @@ def pytest_runtest_teardown(item, nextitem):
     each test to keep memory usage bounded.
     """
     gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def reset_singletons_after_test():
+    """
+    Reset lightweight singletons after each test to prevent pollution.
+
+    Singletons that persist across tests can cause:
+    - Stale data from previous tests
+    - Mock objects leaking between tests
+    - Settings changes not taking effect
+
+    This resets fast singletons only (no model reloads).
+    """
+    yield
+    try:
+        from tests.reset_singletons import reset_lightweight_singletons
+        reset_lightweight_singletons()
+    except ImportError:
+        pass  # Skip if module not available (shouldn't happen)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def reset_ml_singletons_at_session_end():
+    """
+    Reset ML singletons at end of test session.
+
+    This ensures the embedding model and other ML resources are
+    properly cleaned up when all tests complete.
+    """
+    yield
+    try:
+        from tests.reset_singletons import reset_ml_singletons
+        reset_ml_singletons()
+    except ImportError:
+        pass

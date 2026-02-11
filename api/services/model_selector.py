@@ -240,3 +240,13 @@ def get_model_selector() -> ModelSelector:
     if _model_selector is None:
         _model_selector = ModelSelector()
     return _model_selector
+
+
+def reset_model_selector() -> None:
+    """
+    Reset the model selector singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _model_selector
+    _model_selector = None

@@ -450,3 +450,13 @@ def get_store() -> ConversationStore:
     if _store_instance is None:
         _store_instance = ConversationStore()
     return _store_instance
+
+
+def reset_conversation_store() -> None:
+    """
+    Reset the conversation store singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _store_instance
+    _store_instance = None

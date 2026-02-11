@@ -538,3 +538,13 @@ def get_hybrid_search() -> HybridSearch:
     if _hybrid_search_instance is None:
         _hybrid_search_instance = HybridSearch()
     return _hybrid_search_instance
+
+
+def reset_hybrid_search() -> None:
+    """
+    Reset the hybrid search singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _hybrid_search_instance
+    _hybrid_search_instance = None

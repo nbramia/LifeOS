@@ -26,8 +26,8 @@ class TestEmbeddingService:
 
         assert embedding is not None
         assert len(embedding) > 0
-        # MiniLM produces 384-dimensional embeddings
-        assert len(embedding) == 384
+        # Embedding dimension depends on configured model
+        assert len(embedding) == embedding_service.embedding_dimension
 
     def test_generates_batch_embeddings(self, embedding_service):
         """Should generate embeddings for multiple texts."""
@@ -40,7 +40,7 @@ class TestEmbeddingService:
 
         assert len(embeddings) == 3
         for emb in embeddings:
-            assert len(emb) == 384
+            assert len(emb) == embedding_service.embedding_dimension
 
     def test_similar_texts_have_similar_embeddings(self, embedding_service):
         """Semantically similar texts should have higher cosine similarity."""
@@ -68,7 +68,7 @@ class TestEmbeddingService:
         """Should handle empty text gracefully."""
         embedding = embedding_service.embed_text("")
         assert embedding is not None
-        assert len(embedding) == 384
+        assert len(embedding) == embedding_service.embedding_dimension
 
     def test_handles_long_text(self, embedding_service):
         """Should handle long text (model truncates if needed)."""
@@ -76,7 +76,7 @@ class TestEmbeddingService:
         embedding = embedding_service.embed_text(long_text)
 
         assert embedding is not None
-        assert len(embedding) == 384
+        assert len(embedding) == embedding_service.embedding_dimension
 
     def test_consistent_embeddings(self, embedding_service):
         """Same text should produce same embedding."""

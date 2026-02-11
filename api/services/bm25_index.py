@@ -266,3 +266,13 @@ def get_bm25_index() -> BM25Index:
     if _bm25_instance is None:
         _bm25_instance = BM25Index()
     return _bm25_instance
+
+
+def reset_bm25_index() -> None:
+    """
+    Reset the BM25 index singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _bm25_instance
+    _bm25_instance = None
