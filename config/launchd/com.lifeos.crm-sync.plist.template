@@ -17,7 +17,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__LIFEOS_PATH__/.venv/bin/python</string>
+        <string>__HOME__/.venvs/lifeos/bin/python</string>
         <string>__LIFEOS_PATH__/scripts/run_all_syncs.py</string>
         <string>--force</string>
     </array>
@@ -30,7 +30,7 @@
         <key>HOME</key>
         <string>__HOME__</string>
         <key>PATH</key>
-        <string>__LIFEOS_PATH__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.venvs/lifeos/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONPATH</key>
         <string>__LIFEOS_PATH__</string>
     </dict>
