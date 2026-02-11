@@ -192,6 +192,9 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                 elif event.get("type") == "code_intent":
                     code_intent = True
                     task = event.get("task", question)
+                elif event.get("type") == "status":
+                    # Agent loop status (e.g. "Searching calendar...") — log only
+                    logger.debug(f"Agent status: {event.get('message', '')}")
                 elif event.get("type") == "error":
                     error_msg = event.get("message", "Unknown error")
                     logger.error(f"Chat pipeline error: {error_msg}")
