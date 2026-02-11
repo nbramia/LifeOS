@@ -62,7 +62,18 @@ ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh
 
 ## Usage
 
-### Basic Tasks
+### Automatic Detection
+
+You don't always need `/code`. If you send a natural language message that requires terminal, filesystem, or browser access, the chat pipeline's intent classifier detects it and automatically routes to Claude Code. For example:
+
+```
+"create a backup script for the data directory"
+"fix the bug in the sync pipeline"
+```
+
+These are handled identically to `/code <task>` — the Telegram handler spawns a Claude Code session with the same plan mode, clarification, and notification flow.
+
+### Explicit `/code` Command
 
 Send `/code` followed by your task description:
 
@@ -142,7 +153,9 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 
 5. **Timeout**: A watchdog timer kills the subprocess after 10 minutes (configurable). You'll get a timeout notification in Telegram.
 
-6. **Server shutdown**: Active sessions are gracefully terminated during server restart.
+6. **MCP tools**: Claude Code sessions have access to LifeOS data via MCP tools (`lifeos_ask`, `lifeos_search`, `lifeos_calendar_*`, etc.). This lets Claude reference personal data while performing code tasks. See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md#mcp-tools) for the full tool list.
+
+7. **Server shutdown**: Active sessions are gracefully terminated during server restart.
 
 ### System Prompt
 

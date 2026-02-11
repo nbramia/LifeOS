@@ -53,7 +53,7 @@ curl -X POST http://localhost:8000/api/tasks \
 
 ### Via MCP Tools
 
-Use the `create_task` MCP tool in Claude Code or other MCP clients.
+Use `lifeos_task_create` in Claude Code (registered via MCP server).
 
 ## Managing Tasks
 

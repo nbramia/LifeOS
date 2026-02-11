@@ -30,9 +30,23 @@ _PRICING = {
     "opus":   {"input": 15.00, "output": 75.00},
 }
 
+# Consolidated tools that use sub-action status messages
+_CONSOLIDATED_TOOLS = {"manage_tasks", "manage_reminders", "person_info"}
 
-def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate cost in USD for a given model and token counts."""
+
+def _calc_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int = 0,
+    cache_creation: int = 0,
+) -> float:
+    """Calculate cost in USD accounting for prompt caching.
+
+    - Cache reads cost 0.1x the input price.
+    - Cache creation costs 1.25x the input price.
+    - Remaining input tokens are charged at the normal rate.
+    """
     tier = "sonnet"
     model_lower = model.lower()
     if "haiku" in model_lower:
@@ -40,7 +54,13 @@ def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     elif "opus" in model_lower:
         tier = "opus"
     pricing = _PRICING[tier]
-    return (input_tokens / 1_000_000) * pricing["input"] + (output_tokens / 1_000_000) * pricing["output"]
+    non_cached = input_tokens - cache_read - cache_creation
+    return (
+        (non_cached / 1_000_000) * pricing["input"]
+        + (cache_read / 1_000_000) * pricing["input"] * 0.1
+        + (cache_creation / 1_000_000) * pricing["input"] * 1.25
+        + (output_tokens / 1_000_000) * pricing["output"]
+    )
 
 
 @dataclass
@@ -50,6 +70,8 @@ class AgentResult:
     tool_calls_log: list[dict] = field(default_factory=list)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
 
@@ -123,12 +145,19 @@ async def run_agent_loop(
 
             final_msg = stream.get_final_message()
 
-        # Track usage
+        # Track usage (including cache tokens)
         if final_msg and final_msg.usage:
             usage = final_msg.usage
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
             result.total_input_tokens += usage.input_tokens
             result.total_output_tokens += usage.output_tokens
-            result.total_cost_usd += _calc_cost(model, usage.input_tokens, usage.output_tokens)
+            result.total_cache_read_tokens += cache_read
+            result.total_cache_creation_tokens += cache_creation
+            result.total_cost_usd += _calc_cost(
+                model, usage.input_tokens, usage.output_tokens,
+                cache_read=cache_read, cache_creation=cache_creation,
+            )
 
         result.full_text += text_this_round
 
@@ -172,9 +201,13 @@ async def run_agent_loop(
                 "is_error": is_error,
             }
 
-        # Emit status for each tool
+        # Emit status for each tool (with sub-action lookup for consolidated tools)
         for block in tool_use_blocks:
             status_msg = TOOL_STATUS_MESSAGES.get(block.name, f"Running {block.name}...")
+            if block.name in _CONSOLIDATED_TOOLS:
+                action = block.input.get("action", "")
+                sub_key = f"{block.name}.{action}"
+                status_msg = TOOL_STATUS_MESSAGES.get(sub_key, status_msg)
             yield {"type": "status", "message": status_msg}
 
         tool_results = await asyncio.gather(*[_exec_one(b) for b in tool_use_blocks])

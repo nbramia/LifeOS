@@ -36,7 +36,7 @@ Complete reference for LifeOS API endpoints and MCP tools.
 
 ### POST /api/ask/stream
 
-Streaming chat with RAG. Returns SSE stream with routing, sources, content, and done events.
+Streaming chat with an agentic pipeline. Claude autonomously decides which tools to call, iterating when initial results are insufficient. Returns an SSE stream.
 
 **Request:**
 ```json
@@ -47,7 +47,40 @@ Streaming chat with RAG. Returns SSE stream with routing, sources, content, and 
 }
 ```
 
-**Response:** Server-Sent Events stream
+**Response:** Server-Sent Events stream with event types:
+
+| Event | Fields | Description |
+|-------|--------|-------------|
+| `routing` | `sources`, `reasoning`, `latency_ms` | Which pipeline path was selected |
+| `status` | `message` | Tool execution status (e.g. "Searching notes...") |
+| `content` | `content` | Streamed response text chunk |
+| `sources` | `sources` | Data sources used (vault, calendar, gmail, etc.) |
+| `code_intent` | `task` | Query requires Claude Code (terminal/filesystem) |
+| `usage` | `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` | Token usage and cost |
+| `done` | — | Stream complete |
+
+**Pipeline routing (in order of priority):**
+1. **Direct actions** — compose email, create/list/complete tasks, create/list reminders, task+reminder combos. Handled inline without the agentic loop.
+2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
+3. **Agentic loop** — everything else. Claude gets 11 tools and up to 5 rounds to fetch data and synthesize an answer.
+
+**Agentic loop tools (11):**
+
+| Tool | Description |
+|------|-------------|
+| `search_vault` | Obsidian notes, journals, meeting transcripts |
+| `search_calendar` | Google Calendar (personal + work) |
+| `search_email` | Gmail (personal + work) |
+| `search_drive` | Google Drive files |
+| `search_slack` | Slack messages |
+| `search_web` | Web search (weather, news, public info) |
+| `get_message_history` | iMessage/WhatsApp (requires entity_id) |
+| `person_info` | Lookup or briefing (action: lookup/briefing) |
+| `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
+| `manage_reminders` | Create or list reminders (action: create/list) |
+| `create_email_draft` | Gmail draft |
+
+**Prompt caching:** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 
 ### POST /api/search
 
