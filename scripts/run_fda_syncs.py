@@ -65,12 +65,9 @@ def run_fda_sync(source: str, script_path: str) -> tuple[bool, dict]:
     logger.info(f"Started sync for {source} (run_id={run_id})")
 
     try:
-        # Use local .venv (Terminal has FDA, launchd doesn't)
-        venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python"
-        if not venv_python.exists():
-            venv_python = sys.executable
-
-        cmd = [str(venv_python), str(full_path), "--execute"]
+        # Use the same Python that's running this script
+        # This ensures child scripts use the correct venv (e.g., ~/.venvs/lifeos)
+        cmd = [sys.executable, str(full_path), "--execute"]
 
         result = subprocess.run(
             cmd,
