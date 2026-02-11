@@ -255,6 +255,27 @@ def _init_schema(conn: sqlite3.Connection):
     """)
     conn.commit()
 
+    # Migration: add categorized stats columns if missing
+    cursor = conn.execute("PRAGMA table_info(sync_runs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    migrations = []
+    if "people_created" not in columns:
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN people_created INTEGER DEFAULT 0")
+    if "people_updated" not in columns:
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN people_updated INTEGER DEFAULT 0")
+    if "interactions_created" not in columns:
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN interactions_created INTEGER DEFAULT 0")
+    if "source_entities_created" not in columns:
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN source_entities_created INTEGER DEFAULT 0")
+    if "trigger_source" not in columns:
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN trigger_source TEXT DEFAULT 'unknown'")
+
+    for sql in migrations:
+        conn.execute(sql)
+    if migrations:
+        conn.commit()
+        logger.info(f"Migrated sync_runs table: added {len(migrations)} columns")
+
 
 def record_sync_start(source: str) -> int:
     """
@@ -286,6 +307,10 @@ def record_sync_complete(
     records_updated: int = 0,
     errors: int = 0,
     error_message: Optional[str] = None,
+    people_created: int = 0,
+    people_updated: int = 0,
+    interactions_created: int = 0,
+    source_entities_created: int = 0,
 ):
     """Record completion of a sync operation."""
     conn = get_sync_health_db()
@@ -310,7 +335,11 @@ def record_sync_complete(
             records_updated = ?,
             errors = ?,
             error_message = ?,
-            duration_seconds = ?
+            duration_seconds = ?,
+            people_created = ?,
+            people_updated = ?,
+            interactions_created = ?,
+            source_entities_created = ?
         WHERE id = ?
         """,
         (
@@ -322,6 +351,10 @@ def record_sync_complete(
             errors,
             error_message,
             duration,
+            people_created,
+            people_updated,
+            interactions_created,
+            source_entities_created,
             run_id,
         )
     )

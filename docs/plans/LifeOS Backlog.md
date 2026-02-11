@@ -13,5 +13,14 @@ Deferred features and enhancements to revisit
 - [ ] **Emotion wheel visualization** - Shade emotions felt most often, or animate a gif lighting up emotions logged each day in the daily journal.
 - [ ] **LinkedIn enrichment for inner circles** - Use Playwright or Claude in Chrome to document employment and educational history for contacts in circles 0-3 who have a LinkedIn URL.
 
-Tag types professional, personal, romantic, political, tech, mentor, mentee, as well as the cities they live in and states they live in
+When people are categorized as unknown in photos, they still create source entities with the name of unknown. If we can group these together by similar face and then propose the ones that come up most often for naming, this could be a source of translating new people to their face. I could present myself with a quque for review after having some agent do grouping.
+
+downgrade importance of work interactions a bit more
+
+
+
+
+
+
+
 

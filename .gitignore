@@ -130,3 +130,9 @@ scripts/clear-caches.sh
 
 # Personal planning docs
 docs/plans/LifeOS Backlog.md
+
+# Claude Code local settings
+.claude/
+
+# Duplicate of CLAUDE.md
+AGENTS.md
