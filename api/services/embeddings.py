@@ -1,8 +1,8 @@
 """
 Embedding service using sentence-transformers.
 
-Uses gte-Qwen2-1.5B-instruct for high-quality local embedding generation.
-Model files are cached on NVMe external storage to save internal disk space.
+Uses model configured via settings.embedding_model for local embedding generation.
+Model files are cached at settings.embedding_cache_dir to save internal disk space.
 
 NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
@@ -116,3 +116,14 @@ def get_embedding_service(model_name: str = None) -> EmbeddingService:
     if _embedding_service is None:
         _embedding_service = EmbeddingService(model_name)
     return _embedding_service
+
+
+def reset_embedding_service() -> None:
+    """
+    Reset the embedding service singleton.
+
+    For testing only - allows tests to start with fresh state.
+    WARNING: This causes model to reload on next use (~2s).
+    """
+    global _embedding_service
+    _embedding_service = None

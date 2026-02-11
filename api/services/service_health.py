@@ -433,3 +433,15 @@ def mark_service_failed(
 ) -> None:
     """Mark a service as failed (convenience wrapper)."""
     get_service_health().mark_failed(service, error, severity)
+
+
+def reset_service_health() -> None:
+    """
+    Reset the service health registry singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _registry
+    # Also reset the class-level singleton
+    ServiceHealthRegistry._instance = None
+    _registry = None

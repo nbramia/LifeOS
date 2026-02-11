@@ -234,12 +234,14 @@ class TestAPIOpenAPISync:
 
         paths = openapi_spec.get("paths", {})
 
-        for path, config in module.CURATED_ENDPOINTS.items():
+        for path_key, config in module.CURATED_ENDPOINTS.items():
+            # Use explicit path if provided, otherwise strip :METHOD suffix
+            actual_path = config.get("path", path_key.split(":")[0])
             # Handle path parameters
-            base_path = path.split("{")[0].rstrip("/")
+            base_path = actual_path.split("{")[0].rstrip("/")
             matching_paths = [p for p in paths if p.startswith(base_path)]
 
-            assert len(matching_paths) > 0, f"Curated endpoint {path} not found in OpenAPI spec"
+            assert len(matching_paths) > 0, f"Curated endpoint {actual_path} not found in OpenAPI spec"
 
     def test_request_schemas_match(self, openapi_spec):
         """Tool input schemas should match OpenAPI request schemas."""
