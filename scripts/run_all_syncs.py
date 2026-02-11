@@ -6,15 +6,17 @@ This script should be run daily via launchd or cron. It:
 1. Syncs all configured data sources
 2. Records sync status and errors in sync_health.db
 3. Logs all output for debugging
-4. Exits with non-zero status if any critical sync fails
+4. Sends Telegram notification with sync summary
+5. Exits with non-zero status if any critical sync fails
 
 Usage:
-    python scripts/run_all_syncs.py [--source SOURCE] [--dry-run] [--force]
+    python scripts/run_all_syncs.py [--source SOURCE] [--dry-run] [--force] [--trigger TYPE]
 
 Options:
     --source SOURCE   Run only this specific source
     --dry-run         Don't actually sync, just report what would run
     --force           Run even if sync was run recently
+    --trigger TYPE    How sync was triggered: scheduled (default), manual, startup
 """
 # Load environment variables from .env FIRST, before any other imports
 # This is critical for launchd/cron which don't have access to shell environment
@@ -70,30 +72,123 @@ def log_error_to_markdown(source: str, error_msg: str, error_type: str = "error"
     _write_to_markdown_log(entry)
 
 
-def log_sync_summary_to_markdown(result: dict):
+def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
     """
     Log a sync run summary to the markdown file.
 
-    Only logs if there were failures, to avoid noise from successful runs.
+    Always logs to provide visibility into sync history.
     """
-    if result["failed"] == 0:
-        return  # Don't log successful runs
-
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    failed_list = ", ".join(result["failed_sources"]) if result["failed_sources"] else "none"
+    status = "FAILED" if result["failed"] > 0 else "SUCCESS"
 
-    entry = f"""
-## {timestamp} - SYNC RUN SUMMARY
+    # Format duration
+    duration_secs = result.get("duration_seconds", 0)
+    if duration_secs:
+        mins, secs = divmod(int(duration_secs), 60)
+        duration_str = f"{mins}m {secs}s"
+    else:
+        duration_str = "N/A"
 
-- **Total sources:** {result["sources_run"]}
-- **Succeeded:** {result["succeeded"]}
-- **Failed:** {result["failed"]}
-- **Failed sources:** {failed_list}
+    lines = [
+        f"## {timestamp} - SYNC SUMMARY ({trigger})",
+        "",
+        f"**Status:** {result['succeeded']}/{result['sources_run']} succeeded, {result['failed']} failed",
+        f"**Duration:** {duration_str}",
+    ]
 
----
-"""
+    # Failed sources
+    if result["failed"] > 0:
+        lines.append("")
+        lines.append("**Failed:**")
+        for src in result.get("failed_sources", []):
+            error = result.get("results", {}).get(src, {}).get("error", "unknown error")
+            # Truncate error for readability
+            error_short = error[:80] + "..." if len(error) > 80 else error
+            lines.append(f"- {src}: {error_short}")
 
+    # New records summary
+    people_created = result.get("people_created", 0)
+    interactions_created = result.get("interactions_created", 0)
+
+    if people_created > 0 or interactions_created > 0:
+        lines.append("")
+        lines.append("**New Records:**")
+        if people_created > 0:
+            people_by_src = result.get("people_by_source", {})
+            src_details = ", ".join(f"{s}: {c}" for s, c in people_by_src.items() if c > 0)
+            lines.append(f"- People: {people_created}" + (f" ({src_details})" if src_details else ""))
+        if interactions_created > 0:
+            interactions_by_src = result.get("interactions_by_source", {})
+            src_details = ", ".join(f"{s}: {c}" for s, c in interactions_by_src.items() if c > 0)
+            lines.append(f"- Interactions: {interactions_created}" + (f" ({src_details})" if src_details else ""))
+
+    lines.append("")
+    lines.append("---")
+
+    entry = "\n" + "\n".join(lines) + "\n"
     _write_to_markdown_log(entry)
+
+
+def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
+    """
+    Send formatted sync summary to Telegram after sync completes.
+
+    Sends for all sync runs (manual and scheduled) with categorized stats.
+    """
+    from api.services.telegram import send_message
+
+    # Format duration
+    duration_secs = result.get("duration_seconds", 0)
+    if duration_secs:
+        mins, secs = divmod(int(duration_secs), 60)
+        duration_str = f"{mins}m {secs}s"
+    else:
+        duration_str = "N/A"
+
+    # Build message
+    status_emoji = "✅" if result["failed"] == 0 else "⚠️"
+    lines = [
+        f"{status_emoji} *LifeOS Sync Complete*",
+        f"Trigger: {trigger}",
+        f"Status: {result['succeeded']}/{result['sources_run']} succeeded",
+        f"Duration: {duration_str}",
+    ]
+
+    # Failed sources
+    if result["failed"] > 0:
+        lines.append("")
+        lines.append(f"*Failed ({result['failed']}):*")
+        for src in result.get("failed_sources", []):
+            lines.append(f"  • {src}")
+
+    # New records summary
+    people_created = result.get("people_created", 0)
+    interactions_created = result.get("interactions_created", 0)
+
+    if people_created > 0 or interactions_created > 0:
+        lines.append("")
+        if people_created > 0:
+            people_by_src = result.get("people_by_source", {})
+            lines.append(f"*New People:* {people_created}")
+            for src, count in people_by_src.items():
+                if count > 0:
+                    lines.append(f"  • {src}: {count}")
+
+        if interactions_created > 0:
+            interactions_by_src = result.get("interactions_by_source", {})
+            lines.append(f"*New Interactions:* {interactions_created}")
+            for src, count in interactions_by_src.items():
+                if count > 0:
+                    lines.append(f"  • {src}: {count}")
+
+    try:
+        success = send_message("\n".join(lines))
+        if success:
+            logger.info("Sync summary sent to Telegram")
+        else:
+            logger.warning("Failed to send sync summary to Telegram")
+    except Exception as e:
+        logger.warning(f"Error sending sync summary to Telegram: {e}")
 
 
 def _write_to_markdown_log(entry: str):
@@ -163,9 +258,12 @@ SYNC_ORDER = [
     "calendar",                 # Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
     "contacts",                 # Apple Contacts CSV
-    "phone",                    # Phone call history
+    # NOTE: phone and imessage are NOT in this list - they require Full Disk Access
+    # which launchd doesn't have. They run via cron at 2:50 AM through Terminal.app:
+    #   - scripts/run_sync_with_fda.sh (cron entry, opens Terminal)
+    #   - scripts/run_fda_syncs.py (actual sync runner with health tracking)
+    # Cron schedule: 50 2 * * * /path/to/run_sync_with_fda.sh
     "whatsapp",                 # WhatsApp contacts + messages
-    "imessage",                 # iMessage/SMS
     "slack",                    # Slack users + DM messages
 
     # === Phase 2: Entity Processing ===
@@ -181,6 +279,7 @@ SYNC_ORDER = [
     # its own affected PersonEntity stats via refresh_person_stats()
     "relationship_discovery",   # Discover relationships, populate edge weights
     "strengths",                # Calculate relationship strength scores
+    "push_birthdays",           # Push LifeOS birthdays to Apple Contacts
 
     # === Phase 4: Vector Store Indexing ===
     # Index content with fresh people data available for entity resolution
@@ -300,12 +399,9 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     try:
         logger.info(f"Starting sync for {source}...")
 
-        # Build command
-        venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python"
-        if not venv_python.exists():
-            venv_python = sys.executable
-
-        cmd = [str(venv_python), str(full_path)] + args
+        # Build command - use the same Python that's running this script
+        # This ensures child scripts use the correct venv (e.g., ~/.venvs/lifeos)
+        cmd = [sys.executable, str(full_path)] + args
 
         # Get per-source timeout (default 60 minutes)
         timeout_seconds = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT)
@@ -338,6 +434,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 records_updated=stats.get("updated", 0),
                 errors=1,
                 error_message=error_msg[:500],
+                people_created=stats.get("people_created", 0),
+                people_updated=stats.get("people_updated", 0),
+                interactions_created=stats.get("interactions_created", 0),
+                source_entities_created=stats.get("source_entities_created", 0),
             )
 
             record_sync_error(
@@ -361,6 +461,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             records_created=stats.get("created", 0),
             records_updated=stats.get("updated", 0),
             errors=stats.get("errors", 0),
+            people_created=stats.get("people_created", 0),
+            people_updated=stats.get("people_updated", 0),
+            interactions_created=stats.get("interactions_created", 0),
+            source_entities_created=stats.get("source_entities_created", 0),
         )
 
         return True, stats
@@ -394,6 +498,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             records_updated=stats.get("updated", 0),
             errors=1,
             error_message=error_msg,
+            people_created=stats.get("people_created", 0),
+            people_updated=stats.get("people_updated", 0),
+            interactions_created=stats.get("interactions_created", 0),
+            source_entities_created=stats.get("source_entities_created", 0),
         )
 
         # Include partial output in markdown log for visibility
@@ -433,31 +541,64 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
 
 def _parse_sync_output(output: str) -> dict:
     """Parse sync script output for statistics."""
+    import re
+
     stats = {
         "processed": 0,
         "created": 0,
         "updated": 0,
         "errors": 0,
+        # Categorized stats
+        "people_created": 0,
+        "people_updated": 0,
+        "interactions_created": 0,
+        "source_entities_created": 0,
     }
 
-    # Common patterns in sync outputs
-    import re
-
-    patterns = [
+    # Generic patterns (for backwards compatibility)
+    generic_patterns = [
         (r"(\d+)\s*(?:records?|items?|entities?)\s*(?:read|processed|found)", "processed"),
-        (r"(?:created|new)\s*[:\s]*(\d+)", "created"),
-        (r"(?:updated)\s*[:\s]*(\d+)", "updated"),
         (r"(?:errors?)\s*[:\s]*(\d+)", "errors"),
-        (r"source.entities.created\s*[:\s]*(\d+)", "created"),
-        (r"source.entities.updated\s*[:\s]*(\d+)", "updated"),
-        (r"interactions.created\s*[:\s]*(\d+)", "created"),
-        (r"persons?.created\s*[:\s]*(\d+)", "created"),
     ]
 
-    for pattern, key in patterns:
+    # Categorized patterns - people
+    people_patterns = [
+        (r"persons?[_\s]?created\s*[:\s]*(\d+)", "people_created"),
+        (r"people[_\s]?created\s*[:\s]*(\d+)", "people_created"),
+        (r"new\s+(?:people|persons?)\s*[:\s]*(\d+)", "people_created"),
+        (r"created\s+(\d+)\s+(?:people|persons?)", "people_created"),
+        (r"persons?[_\s]?updated\s*[:\s]*(\d+)", "people_updated"),
+        (r"persons?[_\s]?linked\s*[:\s]*(\d+)", "people_updated"),
+        (r"linked\s+(\d+)\s+(?:people|persons?)", "people_updated"),
+    ]
+
+    # Categorized patterns - interactions
+    interaction_patterns = [
+        (r"interactions?[_\s]?created\s*[:\s]*(\d+)", "interactions_created"),
+        (r"inserted\s*[:\s]*(\d+)", "interactions_created"),
+        (r"new\s+interactions?\s*[:\s]*(\d+)", "interactions_created"),
+        (r"created\s+(\d+)\s+interactions?", "interactions_created"),
+    ]
+
+    # Categorized patterns - source entities
+    source_entity_patterns = [
+        (r"source[_\s]?entities?[_\s]?created\s*[:\s]*(\d+)", "source_entities_created"),
+        (r"new\s+source[_\s]?entities?\s*[:\s]*(\d+)", "source_entities_created"),
+    ]
+
+    all_patterns = generic_patterns + people_patterns + interaction_patterns + source_entity_patterns
+
+    for pattern, key in all_patterns:
         match = re.search(pattern, output, re.IGNORECASE)
         if match:
             stats[key] = max(stats[key], int(match.group(1)))
+
+    # Aggregate into generic created/updated for backwards compatibility
+    stats["created"] = max(
+        stats["created"],
+        stats["people_created"] + stats["interactions_created"] + stats["source_entities_created"]
+    )
+    stats["updated"] = max(stats["updated"], stats["people_updated"])
 
     return stats
 
@@ -477,9 +618,16 @@ def run_all_syncs(
     sources: list[str] = None,
     dry_run: bool = False,
     force: bool = False,
+    trigger: str = "scheduled",
 ) -> dict:
     """
     Run all syncs in order.
+
+    Args:
+        sources: List of sources to sync (default: all in SYNC_ORDER)
+        dry_run: If True, don't actually run syncs
+        force: If True, run even if recently synced
+        trigger: How sync was triggered: scheduled, manual, or startup
 
     Returns:
         Summary dict with results
@@ -487,6 +635,7 @@ def run_all_syncs(
     sources = sources or SYNC_ORDER
     results = {}
     failed = []
+    start_time = datetime.now()
 
     # Check for disabled work integrations
     disabled_sources = get_disabled_work_sources()
@@ -494,6 +643,7 @@ def run_all_syncs(
         logger.info(f"Work integration sources disabled: {', '.join(sorted(disabled_sources))}")
         logger.info("Enable via LIFEOS_SYNC_SLACK=true, etc. in .env")
 
+    logger.info(f"Sync triggered: {trigger}")
     logger.info(f"Starting sync run for {len(sources)} sources...")
     logger.info(f"Log file: {log_file}")
 
@@ -529,14 +679,11 @@ def run_all_syncs(
             continue
 
         # Check if recently synced (unless forced)
-        # FDA sources (phone, imessage) are synced via run_fda_syncs.py at 2:50 AM
-        # before this script runs at 3:00 AM, so they should show as recently synced
         if not force and not dry_run:
             health = get_sync_health(source)
             if health.hours_since_sync is not None and health.hours_since_sync < 1:
                 if health.last_status == SyncStatus.SUCCESS:
-                    reason = "recently synced via FDA" if source in ("phone", "imessage") else "recently synced"
-                    logger.info(f"Skipping {source}: {reason} ({health.hours_since_sync*60:.0f}m ago)")
+                    logger.info(f"Skipping {source}: recently synced ({health.hours_since_sync*60:.0f}m ago)")
                     results[source] = {"skipped": True, "reason": "recently_synced"}
                     continue
 
@@ -560,6 +707,36 @@ def run_all_syncs(
     is_healthy, health_msg = check_sync_health()
     logger.info(f"Overall health: {health_msg}")
 
+    # Calculate duration
+    end_time = datetime.now()
+    duration_seconds = (end_time - start_time).total_seconds()
+
+    # Aggregate categorized stats across all sources
+    people_created = 0
+    people_updated = 0
+    interactions_created = 0
+    source_entities_created = 0
+    people_by_source = {}
+    interactions_by_source = {}
+
+    for source, stats in results.items():
+        if stats.get("skipped") or stats.get("dry_run"):
+            continue
+        pc = stats.get("people_created", 0)
+        pu = stats.get("people_updated", 0)
+        ic = stats.get("interactions_created", 0)
+        sec = stats.get("source_entities_created", 0)
+
+        people_created += pc
+        people_updated += pu
+        interactions_created += ic
+        source_entities_created += sec
+
+        if pc > 0:
+            people_by_source[source] = pc
+        if ic > 0:
+            interactions_by_source[source] = ic
+
     result = {
         "sources_run": len(sources),
         "succeeded": len(sources) - len(failed),
@@ -568,10 +745,23 @@ def run_all_syncs(
         "results": results,
         "is_healthy": is_healthy,
         "health_message": health_msg,
+        "duration_seconds": duration_seconds,
+        "trigger": trigger,
+        # Categorized stats
+        "people_created": people_created,
+        "people_updated": people_updated,
+        "interactions_created": interactions_created,
+        "source_entities_created": source_entities_created,
+        "people_by_source": people_by_source,
+        "interactions_by_source": interactions_by_source,
     }
 
-    # Log summary to markdown file if there were failures
-    log_sync_summary_to_markdown(result)
+    # Log summary to markdown (always, not just on failure)
+    log_sync_summary_to_markdown(result, trigger=trigger)
+
+    # Send Telegram notification (skip for dry run)
+    if not dry_run:
+        send_sync_summary_telegram(result, trigger=trigger)
 
     return result
 
@@ -583,6 +773,8 @@ def main():
     parser.add_argument("--execute", action="store_true", help="Actually run syncs (required for non-dry-run)")
     parser.add_argument("--force", action="store_true", help="Run even if recently synced")
     parser.add_argument("--status", action="store_true", help="Just show sync status")
+    parser.add_argument("--trigger", choices=["scheduled", "manual", "startup"], default="scheduled",
+                        help="How sync was triggered (default: scheduled)")
     args = parser.parse_args()
 
     if args.status:
@@ -603,7 +795,7 @@ def main():
     if not args.execute and not args.dry_run:
         logger.info("Note: Running in dry-run mode. Use --execute to actually run syncs.")
 
-    result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force)
+    result = run_all_syncs(sources=sources, dry_run=dry_run, force=args.force, trigger=args.trigger)
 
     # Exit with error if any sync failed
     if result["failed"] > 0:

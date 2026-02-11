@@ -17,6 +17,6 @@ LIFEOS_DIR="/Users/nathanramia/Documents/Code/LifeOS"
 osascript <<EOF
 tell application "Terminal"
     activate
-    do script "cd ${LIFEOS_DIR} && .venv/bin/python scripts/run_fda_syncs.py && sleep 2 && exit"
+    do script "cd ${LIFEOS_DIR} && ~/.venvs/lifeos/bin/python scripts/run_fda_syncs.py && sleep 2 && exit"
 end tell
 EOF

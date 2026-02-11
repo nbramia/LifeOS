@@ -17,8 +17,10 @@ Run categories:
 - pytest                      # All tests
 - pytest -n auto              # Parallel execution (requires pytest-xdist)
 """
-import pytest
+import gc
 import os
+
+import pytest
 
 
 def pytest_configure(config):
@@ -187,3 +189,14 @@ def production_test_data():
         }
     except ImportError:
         return None
+
+
+def pytest_runtest_teardown(item, nextitem):
+    """
+    Force garbage collection after each test to reduce memory pressure.
+
+    With 1600+ tests, accumulated objects (DB connections, mock objects,
+    ChromaDB clients) can push memory to 100%. This hook cleans up after
+    each test to keep memory usage bounded.
+    """
+    gc.collect()
