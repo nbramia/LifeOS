@@ -1750,6 +1750,7 @@ async def ask_stream(request: AskStreamRequest):
             sources = []
             _source_type_map = {
                 "search_vault": "vault",
+                "read_vault_file": "vault",
                 "search_calendar": "calendar",
                 "search_email": "gmail",
                 "search_drive": "drive",

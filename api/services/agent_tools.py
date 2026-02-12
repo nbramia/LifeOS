@@ -295,6 +295,24 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "read_vault_file",
+        "description": (
+            "Read the full content of a specific file from the Obsidian vault by name. "
+            "Use after search_vault finds a relevant file but only returns partial chunks. "
+            "Supports fuzzy matching — just provide the filename (e.g. 'Taylor.md' or 'Taylor')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "File name to read (e.g. 'Taylor.md', '2026-01-12'). Fuzzy matched.",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
+    {
         "name": "create_email_draft",
         "description": "Create a Gmail draft email.",
         "input_schema": {
@@ -337,12 +355,40 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
     Returns a string suitable for a tool_result content block.
     On error, returns a string prefixed with "Error: " (caller sets is_error).
+
+    Sync handlers are run in a thread pool so they don't block the event loop
+    and can execute truly in parallel via asyncio.gather.
     """
     try:
         handler = _TOOL_HANDLERS.get(name)
         if not handler:
             return f"Error: Unknown tool '{name}'"
         result = handler(tool_input)
+        if asyncio.iscoroutine(result):
+            result = await result
+        elif not isinstance(result, str):
+            # Handler returned a coroutine wrapper (from consolidated dispatchers)
+            result = await result if asyncio.iscoroutine(result) else result
+        return result
+    except Exception as e:
+        logger.error(f"Tool '{name}' failed: {e}", exc_info=True)
+        return f"Error: {e}"
+
+
+# Sync handlers to wrap in to_thread for parallel execution
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders"}
+
+
+async def execute_tool_parallel(name: str, tool_input: dict) -> str:
+    """Like execute_tool but runs sync handlers in a thread to avoid blocking the event loop."""
+    try:
+        handler = _TOOL_HANDLERS.get(name)
+        if not handler:
+            return f"Error: Unknown tool '{name}'"
+        if name in _SYNC_HANDLERS:
+            result = await asyncio.to_thread(handler, tool_input)
+        else:
+            result = handler(tool_input)
         if asyncio.iscoroutine(result):
             result = await result
         return result
@@ -547,8 +593,8 @@ def _lookup_person(inp: dict) -> str:
 
     if entity.emails:
         parts.append(f"Emails: {', '.join(entity.emails)}")
-    if entity.phones:
-        parts.append(f"Phones: {', '.join(entity.phones)}")
+    if entity.phone_numbers:
+        parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
 
     # Relationship summary
     rel = get_relationship_summary(entity.id)
@@ -690,8 +736,52 @@ async def _tool_create_email_draft(inp: dict) -> str:
 
 
 # Handler dispatch table
+def _tool_read_vault_file(inp: dict) -> str:
+    from pathlib import Path
+    from config.settings import settings
+    vault = Path(settings.vault_path)
+    target = inp["filename"].strip()
+    # Add .md extension if missing
+    if not target.endswith(".md"):
+        target_md = target + ".md"
+    else:
+        target_md = target
+        target = target[:-3]  # name without extension
+
+    # Try exact match first, then case-insensitive, then substring
+    candidates = list(vault.rglob("*.md"))
+    match = None
+    for f in candidates:
+        if f.name == target_md:
+            match = f
+            break
+    if not match:
+        target_lower = target_md.lower()
+        for f in candidates:
+            if f.name.lower() == target_lower:
+                match = f
+                break
+    if not match:
+        target_lower = target.lower()
+        for f in candidates:
+            if target_lower in f.stem.lower():
+                match = f
+                break
+    if not match:
+        return f"File '{inp['filename']}' not found in vault."
+    try:
+        content = match.read_text(encoding="utf-8")
+        # Truncate if very long (keep first 6000 chars)
+        if len(content) > 6000:
+            content = content[:6000] + f"\n\n... (truncated, {len(content)} chars total)"
+        return f"File: {match.relative_to(vault)}\n\n{content}"
+    except Exception as e:
+        return f"Error reading {match.name}: {e}"
+
+
 _TOOL_HANDLERS = {
     "search_vault": _tool_search_vault,
+    "read_vault_file": _tool_read_vault_file,
     "search_calendar": _tool_search_calendar,
     "search_email": _tool_search_email,
     "search_drive": _tool_search_drive,
@@ -707,6 +797,7 @@ _TOOL_HANDLERS = {
 # Status messages for UI feedback when tools execute
 TOOL_STATUS_MESSAGES = {
     "search_vault": "Searching notes...",
+    "read_vault_file": "Reading vault file...",
     "search_calendar": "Checking calendar...",
     "search_email": "Searching email...",
     "search_drive": "Searching Drive...",
