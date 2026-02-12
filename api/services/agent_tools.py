@@ -156,14 +156,14 @@ TOOL_DEFINITIONS = [
         "name": "get_message_history",
         "description": (
             "Get iMessage/WhatsApp conversation history with a specific person. "
-            "Requires entity_id from lookup_person. Can filter by date range or search term."
+            "Requires entity_id from person_info. Can filter by date range or search term."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "entity_id": {
                     "type": "string",
-                    "description": "Person entity ID (from lookup_person).",
+                    "description": "Person entity ID (from person_info).",
                 },
                 "search_term": {
                     "type": "string",
@@ -185,56 +185,52 @@ TOOL_DEFINITIONS = [
             "required": ["entity_id"],
         },
     },
-    # -- People --
+    # -- People (consolidated) --
     {
-        "name": "lookup_person",
+        "name": "person_info",
         "description": (
-            "Look up a person by name. Returns their entity_id, relationship summary, "
-            "and known facts. ALWAYS call this before any person-specific query to get "
-            "entity_id and context."
+            "Look up a person or generate a comprehensive briefing. "
+            "Always start with 'lookup' for person queries; use 'briefing' for meeting prep or deep dives."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {
+                "action": {
                     "type": "string",
-                    "description": "Person's name to look up.",
+                    "enum": ["lookup", "briefing"],
+                    "description": "'lookup' to get entity_id/context, 'briefing' for comprehensive profile.",
                 },
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "generate_briefing",
-        "description": (
-            "Generate a comprehensive briefing about a person. Includes interaction history, "
-            "notes, action items. Use for 'tell me about X' or meeting prep."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "person_name": {
+                "name": {
                     "type": "string",
                     "description": "Person's name.",
                 },
                 "email": {
                     "type": "string",
-                    "description": "Person's email (optional, improves accuracy).",
+                    "description": "Person's email (optional, improves briefing accuracy).",
                 },
             },
-            "required": ["person_name"],
+            "required": ["action", "name"],
         },
     },
-    # -- Actions --
+    # -- Actions (consolidated) --
     {
-        "name": "create_task",
-        "description": "Create a to-do task in the Obsidian vault.",
+        "name": "manage_tasks",
+        "description": "Manage Obsidian tasks: create, list, or complete.",
         "input_schema": {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "list", "complete"],
+                    "description": "Action to perform.",
+                },
                 "description": {
                     "type": "string",
-                    "description": "Task description.",
+                    "description": "Task description (for create).",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID (for complete).",
                 },
                 "context": {
                     "type": "string",
@@ -254,80 +250,48 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "string"},
                     "description": "Tags for the task. Optional.",
                 },
-            },
-            "required": ["description"],
-        },
-    },
-    {
-        "name": "list_tasks",
-        "description": "List tasks from the Obsidian vault. Can filter by status, context, or search.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
                 "status": {
                     "type": "string",
-                    "description": "Filter by status: 'todo', 'done', 'in_progress', etc.",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Filter by context (e.g. 'Work').",
+                    "description": "Filter by status (for list): 'todo', 'done', 'in_progress', etc.",
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search within task descriptions.",
+                    "description": "Search within task descriptions (for list).",
                 },
             },
-            "required": [],
+            "required": ["action"],
         },
     },
     {
-        "name": "complete_task",
-        "description": "Mark a task as done.",
+        "name": "manage_reminders",
+        "description": "Manage timed reminders: create or list.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "task_id": {
+                "action": {
                     "type": "string",
-                    "description": "ID of the task to complete.",
+                    "enum": ["create", "list"],
+                    "description": "Action to perform.",
                 },
-            },
-            "required": ["task_id"],
-        },
-    },
-    {
-        "name": "create_reminder",
-        "description": "Create a timed reminder that sends a Telegram notification.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Short reminder name/title.",
+                    "description": "Short reminder name/title (for create).",
                 },
                 "schedule_type": {
                     "type": "string",
-                    "description": "'once' for one-time, 'cron' for recurring.",
                     "enum": ["once", "cron"],
+                    "description": "'once' for one-time, 'cron' for recurring (for create).",
                 },
                 "schedule_value": {
                     "type": "string",
-                    "description": "ISO datetime for 'once' (e.g. '2025-03-15T18:00:00'), or cron expression for 'cron'.",
+                    "description": "ISO datetime for 'once', or cron expression for 'cron' (for create).",
                 },
                 "message_content": {
                     "type": "string",
-                    "description": "The reminder message to send.",
+                    "description": "The reminder message to send (for create).",
                 },
             },
-            "required": ["name", "schedule_type", "schedule_value", "message_content"],
-        },
-    },
-    {
-        "name": "list_reminders",
-        "description": "List all active reminders.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
+            "required": ["action"],
         },
     },
     {
@@ -358,6 +322,9 @@ TOOL_DEFINITIONS = [
         },
     },
 ]
+
+# Cache breakpoint on last tool — everything up to here gets cached
+TOOL_DEFINITIONS[-1]["cache_control"] = {"type": "ephemeral"}
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +530,9 @@ def _tool_get_message_history(inp: dict) -> str:
     return f"{result['count']} messages{date_info}:\n\n{result['formatted']}"
 
 
-def _tool_lookup_person(inp: dict) -> str:
+# -- People helpers --
+
+def _lookup_person(inp: dict) -> str:
     from api.services.entity_resolver import get_entity_resolver
     from api.services.relationship_summary import get_relationship_summary, format_relationship_context
     from api.services.person_facts import get_person_fact_store
@@ -596,16 +565,27 @@ def _tool_lookup_person(inp: dict) -> str:
     return "\n\n".join(parts)
 
 
-async def _tool_generate_briefing(inp: dict) -> str:
+async def _briefing_person(inp: dict) -> str:
     from api.services.briefings import get_briefings_service
     svc = get_briefings_service()
-    result = await svc.generate_briefing(inp["person_name"], email=inp.get("email"))
+    result = await svc.generate_briefing(inp["name"], email=inp.get("email"))
     if result.get("status") == "success":
         return result.get("briefing", "Briefing generated but empty.")
     return f"Briefing failed: {result.get('message', 'unknown error')}"
 
 
-def _tool_create_task(inp: dict) -> str:
+def _tool_person_info(inp: dict):
+    action = inp["action"]
+    if action == "lookup":
+        return _lookup_person(inp)
+    elif action == "briefing":
+        return _briefing_person(inp)
+    return f"Error: Unknown person_info action '{action}'"
+
+
+# -- Task helpers --
+
+def _task_create(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
     task = tm.create(
@@ -619,7 +599,7 @@ def _tool_create_task(inp: dict) -> str:
     return f"Task created: \"{task.description}\" (id: {task.id}, context: {task.context}{due})"
 
 
-def _tool_list_tasks(inp: dict) -> str:
+def _task_list(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
     tasks = tm.list_tasks(
@@ -637,7 +617,7 @@ def _tool_list_tasks(inp: dict) -> str:
     return "\n".join(lines)
 
 
-def _tool_complete_task(inp: dict) -> str:
+def _task_complete(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
     task = tm.complete(inp["task_id"])
@@ -646,7 +626,20 @@ def _tool_complete_task(inp: dict) -> str:
     return f"Task completed: \"{task.description}\""
 
 
-def _tool_create_reminder(inp: dict) -> str:
+def _tool_manage_tasks(inp: dict):
+    action = inp["action"]
+    if action == "create":
+        return _task_create(inp)
+    elif action == "list":
+        return _task_list(inp)
+    elif action == "complete":
+        return _task_complete(inp)
+    return f"Error: Unknown manage_tasks action '{action}'"
+
+
+# -- Reminder helpers --
+
+def _reminder_create(inp: dict) -> str:
     from api.services.reminder_store import get_reminder_store
     store = get_reminder_store()
     reminder = store.create(
@@ -659,7 +652,7 @@ def _tool_create_reminder(inp: dict) -> str:
     return f"Reminder created: \"{reminder.name}\" (id: {reminder.id}, next: {reminder.next_trigger_at})"
 
 
-def _tool_list_reminders(inp: dict) -> str:
+def _reminder_list(inp: dict) -> str:
     from api.services.reminder_store import get_reminder_store
     store = get_reminder_store()
     reminders = store.list_all()
@@ -670,6 +663,15 @@ def _tool_list_reminders(inp: dict) -> str:
         status = "enabled" if r.enabled else "disabled"
         lines.append(f"- \"{r.name}\" ({r.schedule_type}: {r.schedule_value}) [{status}] [id:{r.id}]")
     return "\n".join(lines)
+
+
+def _tool_manage_reminders(inp: dict):
+    action = inp["action"]
+    if action == "create":
+        return _reminder_create(inp)
+    elif action == "list":
+        return _reminder_list(inp)
+    return f"Error: Unknown manage_reminders action '{action}'"
 
 
 async def _tool_create_email_draft(inp: dict) -> str:
@@ -696,13 +698,9 @@ _TOOL_HANDLERS = {
     "search_slack": _tool_search_slack,
     "search_web": _tool_search_web,
     "get_message_history": _tool_get_message_history,
-    "lookup_person": _tool_lookup_person,
-    "generate_briefing": _tool_generate_briefing,
-    "create_task": _tool_create_task,
-    "list_tasks": _tool_list_tasks,
-    "complete_task": _tool_complete_task,
-    "create_reminder": _tool_create_reminder,
-    "list_reminders": _tool_list_reminders,
+    "person_info": _tool_person_info,
+    "manage_tasks": _tool_manage_tasks,
+    "manage_reminders": _tool_manage_reminders,
     "create_email_draft": _tool_create_email_draft,
 }
 
@@ -715,12 +713,15 @@ TOOL_STATUS_MESSAGES = {
     "search_slack": "Searching Slack...",
     "search_web": "Searching the web...",
     "get_message_history": "Loading messages...",
-    "lookup_person": "Looking up person...",
-    "generate_briefing": "Generating briefing...",
-    "create_task": "Creating task...",
-    "list_tasks": "Loading tasks...",
-    "complete_task": "Completing task...",
-    "create_reminder": "Setting reminder...",
-    "list_reminders": "Loading reminders...",
+    "person_info": "Looking up person...",
+    "person_info.lookup": "Looking up person...",
+    "person_info.briefing": "Generating briefing...",
+    "manage_tasks": "Managing tasks...",
+    "manage_tasks.create": "Creating task...",
+    "manage_tasks.list": "Loading tasks...",
+    "manage_tasks.complete": "Completing task...",
+    "manage_reminders": "Managing reminders...",
+    "manage_reminders.create": "Setting reminder...",
+    "manage_reminders.list": "Loading reminders...",
     "create_email_draft": "Drafting email...",
 }

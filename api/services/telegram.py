@@ -317,10 +317,11 @@ class TelegramBotListener:
 
         logger.info(f"Telegram message: {text[:100]}")
 
-        # Handle commands
+        # Handle known commands (unrecognized /commands fall through to chat)
         if text.startswith("/"):
-            await self._handle_command(text, chat_id)
-            return
+            handled = await self._handle_command(text, chat_id)
+            if handled:
+                return
 
         # Check for agent approval/rejection (short keywords only)
         if self._check_agent_approval(text):
@@ -357,8 +358,8 @@ class TelegramBotListener:
                 chat_id=chat_id,
             )
 
-    async def _handle_command(self, text: str, chat_id: str):
-        """Handle bot commands."""
+    async def _handle_command(self, text: str, chat_id: str) -> bool:
+        """Handle known bot commands. Returns True if handled, False to fall through to chat."""
         command = text.split()[0].lower()
 
         if command == "/new":
@@ -415,10 +416,10 @@ class TelegramBotListener:
             await send_message_async(help_text, chat_id=chat_id)
 
         else:
-            await send_message_async(
-                f"Unknown command: {command}. Try /help",
-                chat_id=chat_id,
-            )
+            # Unknown command — fall through to chat pipeline
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Claude Code orchestration

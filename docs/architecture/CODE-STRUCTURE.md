@@ -21,7 +21,7 @@ api/
 │   ├── ask.py                 # Chat endpoints
 │   ├── briefings.py           # People briefings
 │   ├── calendar.py            # Calendar integration
-│   ├── chat.py                # Streaming chat with RAG
+│   ├── chat.py                # Streaming chat with agentic pipeline
 │   ├── conversations.py       # Conversation history
 │   ├── crm.py                 # CRM endpoints (~5,100 LOC)
 │   ├── crm_models/            # CRM Pydantic models and helpers
@@ -56,7 +56,7 @@ api/
 | File | Lines | Endpoints | Purpose |
 |------|-------|-----------|---------|
 | crm.py | ~5,100 | 57 | Personal CRM API |
-| chat.py | ~1,400 | 1 | Streaming chat with RAG |
+| chat.py | ~1,800 | 1 | Streaming chat with agentic pipeline |
 | tasks.py | ~180 | 6 | Task CRUD API |
 | reminders.py | ~150 | 6 | Reminder CRUD API |
 | calendar.py | ~400 | 8 | Google Calendar |
@@ -107,8 +107,11 @@ api/
 - `embeddings.py` - Embedding generation
 
 **Chat & Query Processing:**
-- `chat_helpers.py` - Query parsing, unified intent classification (compose, task CRUD, reminder CRUD, task+reminder), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback).
-- `query_router.py` - LLM-based query routing with person name extraction
+- `chat_helpers.py` - Query parsing, unified intent classification (compose, task CRUD, reminder CRUD, task+reminder, code), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback).
+- `agent_loop.py` - Agentic chat loop: multi-turn conversation where Claude autonomously calls tools. Async generator yielding streamed text, tool status, and final result with cost tracking. Supports prompt caching.
+- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 11 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes prompt cache breakpoint on tool definitions.
+- `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block for Anthropic prompt caching.
+- `query_router.py` - LLM-based query routing with person name extraction (used by non-agentic paths)
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)
 
 ---

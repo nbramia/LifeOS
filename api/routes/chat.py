@@ -1756,8 +1756,7 @@ async def ask_stream(request: AskStreamRequest):
                 "search_slack": "slack",
                 "search_web": "web",
                 "get_message_history": "imessage",
-                "lookup_person": "people",
-                "generate_briefing": "people",
+                "person_info": "people",
             }
             for tc in agent_result.tool_calls_log:
                 source_type = _source_type_map.get(tc["tool"])
