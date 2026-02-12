@@ -362,7 +362,7 @@ class TelegramBotListener:
         """Handle known bot commands. Returns True if handled, False to fall through to chat."""
         command = text.split()[0].lower()
 
-        if command == "/new":
+        if command in ("/new", "/clear"):
             self._conversations.pop(chat_id, None)
             await send_message_async("Started a new conversation.", chat_id=chat_id)
 
@@ -406,7 +406,7 @@ class TelegramBotListener:
                 "*LifeOS Telegram Bot*\n\n"
                 "Send any message to query LifeOS (calendar, emails, vault, etc.)\n\n"
                 "*Commands:*\n"
-                "/new - Start a new conversation\n"
+                "/new or /clear - Start a new conversation\n"
                 "/status - Check LifeOS server health\n"
                 "/code <task> - Run a task with Claude Code\n"
                 "/code\\_status - Check active Claude Code session\n"
