@@ -17,8 +17,9 @@ Complete reference for LifeOS API endpoints and MCP tools.
 5. [CRM Endpoints](#crm-endpoints)
 6. [Task Endpoints](#task-endpoints)
 7. [Reminders & Telegram Endpoints](#reminders--telegram-endpoints)
-8. [Admin Endpoints](#admin-endpoints)
-9. [MCP Tools](#mcp-tools)
+8. [Monarch Money Endpoints](#monarch-money-endpoints)
+9. [Admin Endpoints](#admin-endpoints)
+10. [MCP Tools](#mcp-tools)
 
 ---
 
@@ -64,7 +65,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
 3. **Agentic loop** — everything else. Claude gets 11 tools and up to 5 rounds to fetch data and synthesize an answer.
 
-**Agentic loop tools (12):**
+**Agentic loop tools (13):**
 
 | Tool | Description |
 |------|-------------|
@@ -77,6 +78,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `search_web` | Web search (weather, news, public info) |
 | `get_message_history` | iMessage/WhatsApp (requires entity_id) |
 | `person_info` | Lookup or briefing (action: lookup/briefing) |
+| `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
 | `manage_reminders` | Create or list reminders (action: create/list) |
 | `create_email_draft` | Gmail draft |
@@ -818,6 +820,51 @@ Send an ad-hoc message via Telegram.
 
 ---
 
+## Monarch Money Endpoints
+
+Live financial data from Monarch Money. Monthly summaries are also synced to the vault.
+
+### GET /api/monarch/accounts
+
+List all financial accounts with current balances.
+
+**Response:** Array of `{name, type, subtype, balance, institution, last_updated}`
+
+### GET /api/monarch/transactions
+
+Search recent transactions.
+
+**Query Parameters:**
+- `start_date` (string): YYYY-MM-DD (default: 30 days ago)
+- `end_date` (string): YYYY-MM-DD (default: today)
+- `category` (string): Filter by category name
+- `search` (string): Search merchant names
+- `limit` (int): Max results (default: 500)
+
+**Response:** Array of `{date, merchant, category, amount, account, notes, pending}`
+
+### GET /api/monarch/cashflow
+
+Cashflow summary for a date range.
+
+**Query Parameters:**
+- `start_date` (string): YYYY-MM-DD (default: 1st of current month)
+- `end_date` (string): YYYY-MM-DD (default: today)
+
+**Response:** `{summary: {total_income, total_expenses, savings, savings_rate}, categories: [{category, amount}]}`
+
+### GET /api/monarch/budgets
+
+Budget status (budgeted vs actual).
+
+**Query Parameters:**
+- `start_date` (string): YYYY-MM-DD (default: 1st of current month)
+- `end_date` (string): YYYY-MM-DD (default: today)
+
+**Response:** Array of `{category, budgeted, actual, remaining}`
+
+---
+
 ## Admin Endpoints
 
 ### GET /api/admin/health
@@ -904,6 +951,10 @@ claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
 | `lifeos_photos_person` | GET /api/photos/person/{id} | Photos of a person |
 | `lifeos_photos_shared` | GET /api/photos/shared/{a}/{b} | Photos of two people together |
 | `lifeos_photos_stats` | GET /api/photos/stats | Photos library statistics |
+| `lifeos_monarch_accounts` | GET /api/monarch/accounts | Financial account balances |
+| `lifeos_monarch_transactions` | GET /api/monarch/transactions | Search transactions |
+| `lifeos_monarch_cashflow` | GET /api/monarch/cashflow | Income/expense summary |
+| `lifeos_monarch_budgets` | GET /api/monarch/budgets | Budget vs actual |
 | `lifeos_task_create` | POST /api/tasks | Create a task |
 | `lifeos_task_list` | GET /api/tasks | List/filter tasks |
 | `lifeos_task_update` | PUT /api/tasks/{id} | Update a task |

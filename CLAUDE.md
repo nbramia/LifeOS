@@ -250,6 +250,37 @@ and chat.db. The launchd service doesn't have FDA, but Terminal.app does.
 .venv/bin/python scripts/run_fda_syncs.py
 ```
 
+### Monarch Money (Financial Data)
+
+Monarch Money provides live financial data (accounts, transactions, budgets) via API.
+Auth uses a cached session token at `data/monarch_session.pickle`.
+
+**Monthly sync**: Runs on the 1st of each month via `run_all_syncs.py` (phase 5).
+Writes `Personal/Finance/Monarch/YYYY-MM.md` to the vault. Use `--force` to run any day.
+
+**Live queries**: 4 API endpoints at `/api/monarch/*` auto-exposed as MCP tools.
+Also available to the chat agent via the `search_finances` tool.
+
+**Re-authenticate when token expires** (login fails with 401/525):
+```bash
+~/.venvs/lifeos/bin/python -c "
+import asyncio
+from monarchmoney import MonarchMoney
+mm = MonarchMoney()
+asyncio.run(mm.interactive_login())
+mm.save_session('data/monarch_session.pickle')
+print('Session saved!')
+"
+```
+Monarch requires MFA — a code will be sent via email/SMS. Sessions last months.
+
+**Env vars** (in `.env`):
+- `MONARCH_EMAIL` — Monarch account email
+- `MONARCH_PASSWORD` — Monarch account password
+
+**Package**: `monarchmoneycommunity>=1.3.0` (community fork with correct `api.monarch.com` domain).
+Import path is still `from monarchmoney import MonarchMoney`.
+
 ### Manage Tasks
 
 ```bash

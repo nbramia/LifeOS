@@ -46,5 +46,8 @@ rapidfuzz>=3.6.0  # Fast fuzzy string matching for entity resolution
 python-multipart
 psutil
 
+# Financial Data
+monarchmoneycommunity>=1.3.0  # Community fork with api.monarch.com domain fix
+
 # macOS Integrations (optional)
 pyobjc-framework-Contacts>=10.0; sys_platform == "darwin"  # Apple Contacts integration

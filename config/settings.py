@@ -207,6 +207,18 @@ class Settings(BaseSettings):
         description="Telegram chat ID for receiving messages"
     )
 
+    # Monarch Money
+    monarch_email: str = Field(
+        default="",
+        alias="MONARCH_EMAIL",
+        description="Monarch Money account email"
+    )
+    monarch_password: str = Field(
+        default="",
+        alias="MONARCH_PASSWORD",
+        description="Monarch Money account password"
+    )
+
     # Backup directory
     backup_path: str = Field(
         default="./data/backups",
