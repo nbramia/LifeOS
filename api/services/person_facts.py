@@ -7,6 +7,7 @@ Facts are stored in SQLite and can be displayed in the CRM UI.
 Pipeline Architecture (v3):
 - Stage 1: Extract candidate facts using Claude (natural sentence values, no keys)
 - Stage 2: Batched validation + dedup using single Ollama call (quality, attribution, dedup)
+- Stage 3: Semantic dedup via second Ollama call (catches remaining duplicates)
 
 Key design decisions:
 - No LLM-generated keys: content-hash keys auto-generated for DB dedup
@@ -19,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 import sqlite3
 import uuid
@@ -141,6 +143,7 @@ class PersonFactStore:
         """Create the person_facts table if it doesn't exist."""
         conn = sqlite3.connect(self.db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS person_facts (
                     id TEXT PRIMARY KEY,
@@ -573,14 +576,14 @@ class PersonFactExtractor:
         # Enrich with conversation context (for message-based sources)
         enriched_interactions = self._enrich_with_context(sampled_interactions)
 
-        # Fetch existing facts so Claude can avoid re-extracting known topics
+        # Fetch existing facts for dedup comparison
         existing_facts = self.fact_store.get_for_person(person_id)
         existing_non_summary = [f for f in existing_facts if f.category != "summary"]
 
-        # Extract facts with Claude
+        # Extract facts with Claude (no knowledge of existing facts — dedup handles it)
         extracted_facts = self._extract_facts_claude(
             person_id, person_name, enriched_interactions, interaction_lookup,
-            use_model, existing_facts=existing_non_summary,
+            use_model,
         )
         logger.info(f"Extracted {len(extracted_facts)} facts for {person_name}")
 
@@ -590,9 +593,11 @@ class PersonFactExtractor:
                 extracted_facts, existing_non_summary, person_name
             )
 
-        # Programmatic word-overlap dedup as safety net (catches what Ollama misses)
+        # Semantic dedup via Ollama as safety net (catches what main validation misses)
         if extracted_facts:
-            extracted_facts = self._word_overlap_dedup(extracted_facts, existing_non_summary)
+            extracted_facts = await self._semantic_dedup_ollama(
+                extracted_facts, existing_non_summary, person_name
+            )
 
         # Generate relationship summaries for people with sufficient interactions
         if len(interactions) >= 10:
@@ -604,17 +609,7 @@ class PersonFactExtractor:
             except Exception as e:
                 logger.error(f"Failed to generate summaries for {person_name}: {e}")
 
-        # Delete old non-confirmed, non-summary facts before saving new ones.
-        # This clears legacy cruft (old key formats, terse values) on re-extraction.
-        for old_fact in existing_non_summary:
-            if not old_fact.confirmed_by_user:
-                self.fact_store.delete(old_fact.id)
-        if existing_non_summary:
-            confirmed_kept = sum(1 for f in existing_non_summary if f.confirmed_by_user)
-            deleted = len(existing_non_summary) - confirmed_kept
-            logger.info(f"Cleared {deleted} old facts ({confirmed_kept} confirmed kept)")
-
-        # Save new facts
+        # Save new facts (upsert alongside existing — dedup pipeline prevents duplicates)
         saved_facts = []
         seen_keys = set()
         for fact in extracted_facts:
@@ -680,16 +675,12 @@ class PersonFactExtractor:
 
         extracted_facts = self._extract_facts_claude(
             person_id, person_name, enriched_interactions, interaction_lookup,
-            use_model, existing_facts=existing_non_summary,
+            use_model,
         )
 
         # Fallback validation (no Ollama in sync path)
         if extracted_facts:
             extracted_facts = self._fallback_validate(extracted_facts, existing_non_summary)
-
-        # Programmatic word-overlap dedup
-        if extracted_facts:
-            extracted_facts = self._word_overlap_dedup(extracted_facts, existing_non_summary)
 
         if len(interactions) >= 10:
             try:
@@ -822,7 +813,6 @@ class PersonFactExtractor:
         interactions: list[dict],
         interaction_lookup: dict,
         model: str,
-        existing_facts: Optional[list[PersonFact]] = None,
     ) -> list[PersonFact]:
         """
         Extract facts using Claude with calibrated confidence.
@@ -836,7 +826,6 @@ class PersonFactExtractor:
             interactions: Interactions to extract facts from
             interaction_lookup: Dict mapping interaction IDs to full records
             model: Claude model to use
-            existing_facts: Already-stored facts to avoid re-extracting
 
         Returns:
             List of PersonFact objects with calibrated confidence scores
@@ -849,7 +838,7 @@ class PersonFactExtractor:
             logger.info(f"Batch {batch_idx + 1}/{len(batches)}: {len(batch)} interactions")
             interaction_text = self._format_interactions(batch, person_name)
             prompt = self._build_extraction_prompt(
-                person_name, interaction_text, existing_facts=existing_facts
+                person_name, interaction_text
             )
 
             try:
@@ -1002,7 +991,13 @@ class PersonFactExtractor:
 
         result = []
         for name in ["recent", "mid", "old"]:
-            result.extend(buckets[name][:allocations[name]])
+            bucket = buckets[name]
+            alloc = allocations[name]
+            if len(bucket) > alloc:
+                # Random sample so re-extraction covers different interactions
+                result.extend(random.sample(bucket, alloc))
+            else:
+                result.extend(bucket)
 
         return result
 
@@ -1281,113 +1276,104 @@ Return ONLY valid JSON."""
         logger.info(f"Fallback validation: {len(validated)}/{len(new_facts)} kept")
         return validated
 
-    # Expanded stopwords: common verbs, adverbs, prepositions — so content words
-    # focus on actual topic nouns (names, places, activities, objects).
-    _STOPWORDS = {
-        # articles/pronouns/prepositions
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "has", "have", "had", "do", "does", "did", "at", "in", "on", "to",
-        "for", "of", "with", "and", "or", "but", "not", "that", "this",
-        "it", "its", "by", "from", "as", "into", "about", "who", "their",
-        "they", "them", "she", "he", "her", "his", "we", "our", "my", "me",
-        "you", "your", "i", "up", "out", "so", "if", "no", "yes", "also",
-        "very", "just", "more", "most", "some", "any", "all", "each", "every",
-        "both", "few", "many", "much", "own", "other", "than", "then", "when",
-        "where", "how", "what", "which", "there", "here", "after", "before",
-        # common verbs/adverbs (not meaningful for topic matching)
-        "goes", "went", "going", "get", "gets", "got", "getting",
-        "works", "working", "worked", "uses", "using", "used",
-        "likes", "liked", "enjoys", "enjoyed", "loves", "loved",
-        "interested", "participates", "attends", "attended", "attending",
-        "lives", "lived", "living", "plays", "played", "playing",
-        "signed", "recently", "regularly", "currently", "often", "sometimes",
-        "always", "never", "really", "quite", "pretty", "especially",
-        "named", "called", "known",
-    }
-
-    @classmethod
-    def _get_content_words(cls, text: str) -> set[str]:
-        """Extract meaningful content words from text (lowercase, no stopwords)."""
-        words = set(re.sub(r'[^\w\s]', '', text.lower()).split())
-        return words - cls._STOPWORDS
-
-    def _word_overlap_dedup(
-        self, candidates: list[PersonFact], existing_facts: list[PersonFact]
+    async def _semantic_dedup_ollama(
+        self,
+        candidates: list[PersonFact],
+        existing_facts: list[PersonFact],
+        person_name: str,
     ) -> list[PersonFact]:
         """
-        Remove candidates whose content words heavily overlap with existing facts.
+        Use Ollama to identify and remove semantically duplicate candidates.
 
-        Uses Jaccard-like word overlap within the same category. A candidate is
-        dropped if its content words overlap >= 60% with any existing fact in the
-        same category. Among candidates themselves, keeps the longest (most detailed).
+        Sends a focused dedup-only prompt to the local LLM asking it to compare
+        each candidate against existing facts and other candidates. This catches
+        semantic duplicates that the main validation pass may have missed.
+
+        Falls back to keeping all candidates if Ollama is unavailable.
         """
-        # Build existing word sets by category
-        existing_by_cat: dict[str, list[tuple[set[str], PersonFact]]] = {}
-        for fact in existing_facts:
-            words = self._get_content_words(fact.value)
-            if fact.category not in existing_by_cat:
-                existing_by_cat[fact.category] = []
-            existing_by_cat[fact.category].append((words, fact))
+        from api.services.ollama_client import OllamaClient
 
-        # First pass: remove candidates that duplicate existing facts
-        survivors = []
-        for candidate in candidates:
-            cand_words = self._get_content_words(candidate.value)
-            if not cand_words:
-                survivors.append(candidate)
-                continue
+        client = OllamaClient()
 
-            is_dup = False
-            for existing_words, existing_fact in existing_by_cat.get(candidate.category, []):
-                if not existing_words:
-                    continue
-                overlap = len(cand_words & existing_words)
-                smaller = min(len(cand_words), len(existing_words))
-                if smaller > 0 and overlap / smaller >= 0.6:
+        if not await client.is_available_async():
+            logger.warning("Ollama unavailable for semantic dedup — skipping")
+            return candidates
+
+        # Build fact lists for the prompt
+        existing_lines = []
+        for i, fact in enumerate(existing_facts):
+            existing_lines.append(f"[E{i}] {fact.category}: {fact.value}")
+
+        candidate_lines = []
+        for i, fact in enumerate(candidates):
+            candidate_lines.append(f"[C{i}] {fact.category}: {fact.value}")
+
+        existing_block = "\n".join(existing_lines) if existing_lines else "(none)"
+        candidate_block = "\n".join(candidate_lines)
+
+        prompt = f"""Check these candidate facts about {person_name} for semantic duplicates.
+
+EXISTING FACTS (already stored):
+{existing_block}
+
+CANDIDATE FACTS (to check):
+{candidate_block}
+
+For each candidate, decide: is it semantically similar to an existing fact or another candidate?
+
+Two facts are DUPLICATES if they are about the SAME topic, even if worded differently. Examples:
+- "Goes backpacking" and "Interested in backpacking trips" → DUPLICATES (both about backpacking)
+- "Has a daughter named Emma" and "Daughter Emma plays soccer" → DUPLICATES (both about daughter Emma)
+- "Works at Google" and "Software engineer at Google" → DUPLICATES (both about working at Google)
+- "Uses email regularly" and "Has an email address" → DUPLICATES (both about email)
+
+Return JSON listing ONLY the candidates to REMOVE (duplicates). For each, say what it duplicates:
+
+{{
+  "remove": [
+    {{"candidate": 1, "reason": "Same topic as E2 (backpacking)"}},
+    {{"candidate": 3, "reason": "Same topic as C0 (daughter Emma)"}}
+  ]
+}}
+
+If no duplicates, return: {{"remove": []}}
+
+Compare every candidate against ALL existing facts and ALL other candidates. Be aggressive — it is much worse to keep duplicates than to remove a borderline case.
+
+Return ONLY valid JSON."""
+
+        try:
+            result = await client.generate_json(
+                prompt=prompt,
+                max_tokens=1024,
+                timeout=15,
+            )
+
+            remove_indices = set()
+            for entry in result.get("remove", []):
+                idx = entry.get("candidate")
+                if idx is not None and 0 <= idx < len(candidates):
+                    remove_indices.add(idx)
                     logger.debug(
-                        f"Word-overlap dedup: '{candidate.value[:50]}' "
-                        f"overlaps with existing '{existing_fact.value[:50]}'"
+                        f"Semantic dedup: removing C{idx} '{candidates[idx].value[:50]}' — "
+                        f"{entry.get('reason', 'duplicate')}"
                     )
-                    is_dup = True
-                    break
-            if not is_dup:
-                survivors.append(candidate)
 
-        # Second pass: dedup candidates against each other (keep longest)
-        # Sort longest first so the most detailed version wins
-        survivors.sort(key=lambda f: len(f.value), reverse=True)
-        final = []
-        final_word_sets: list[tuple[set[str], PersonFact]] = []
+            if remove_indices:
+                kept = [c for i, c in enumerate(candidates) if i not in remove_indices]
+                logger.info(
+                    f"Semantic dedup: removed {len(remove_indices)}, kept {len(kept)}"
+                )
+                return kept
 
-        for candidate in survivors:
-            cand_words = self._get_content_words(candidate.value)
-            is_dup = False
-            for kept_words, kept_fact in final_word_sets:
-                if candidate.category != kept_fact.category:
-                    continue
-                if not cand_words or not kept_words:
-                    continue
-                overlap = len(cand_words & kept_words)
-                smaller = min(len(cand_words), len(kept_words))
-                if smaller > 0 and overlap / smaller >= 0.6:
-                    logger.debug(
-                        f"Word-overlap dedup (intra): '{candidate.value[:50]}' "
-                        f"overlaps with kept '{kept_fact.value[:50]}'"
-                    )
-                    is_dup = True
-                    break
-            if not is_dup:
-                final.append(candidate)
-                final_word_sets.append((cand_words, candidate))
+            return candidates
 
-        removed = len(candidates) - len(final)
-        if removed:
-            logger.info(f"Word-overlap dedup: removed {removed}, kept {len(final)}")
-        return final
+        except Exception as e:
+            logger.error(f"Ollama semantic dedup failed: {e}")
+            return candidates
 
     def _build_extraction_prompt(
         self, person_name: str, interaction_text: str,
-        existing_facts: Optional[list[PersonFact]] = None,
     ) -> str:
         """Build the strict LLM prompt for fact extraction."""
         # Uses LIFEOS_USER_NAME from settings (see config/settings.py)
@@ -1395,21 +1381,8 @@ Return ONLY valid JSON."""
         user_upper = user.upper()
         person_upper = person_name.upper()
 
-        # Build existing facts block to avoid re-extraction
-        existing_block = ""
-        if existing_facts:
-            lines = []
-            for f in existing_facts:
-                lines.append(f"- [{f.category}] {f.value}")
-            existing_block = f"""
-ALREADY KNOWN FACTS (do NOT re-extract these or variations of them):
-{chr(10).join(lines)}
-
-Focus on finding NEW facts not covered above. If an interaction confirms an existing fact, skip it.
-"""
-
         return f"""Analyze these interactions and extract ONLY facts about {person_name} (the contact person).
-{existing_block}
+
 CONTEXT: These messages are between {user} (the user) and {person_name}.
 
 CRITICAL - MESSAGE SENDER LABELS:

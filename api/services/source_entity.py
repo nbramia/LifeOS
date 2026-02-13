@@ -190,6 +190,7 @@ class SourceEntityStore:
         """Create database tables if they don't exist."""
         conn = sqlite3.connect(self.db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS source_entities (
                     id TEXT PRIMARY KEY,

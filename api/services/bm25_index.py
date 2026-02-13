@@ -54,6 +54,7 @@ class BM25Index:
         """Create FTS5 table if it doesn't exist."""
         conn = sqlite3.connect(self.db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             # Create FTS5 virtual table for full-text search
             # Using porter tokenizer for stemming
             conn.execute("""
