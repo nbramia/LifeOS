@@ -109,7 +109,7 @@ api/
 **Chat & Query Processing:**
 - `chat_helpers.py` - Query parsing, unified intent classification (compose, task CRUD, reminder CRUD, task+reminder, code), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback).
 - `agent_loop.py` - Agentic chat loop: multi-turn conversation where Claude autonomously calls tools. Async generator yielding streamed text, tool status, and final result with cost tracking. Supports prompt caching.
-- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 11 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes prompt cache breakpoint on tool definitions.
+- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 12 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads. Prompt cache breakpoint on tool definitions.
 - `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block for Anthropic prompt caching.
 - `query_router.py` - LLM-based query routing with person name extraction (used by non-agentic paths)
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)

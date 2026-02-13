@@ -172,7 +172,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     code_intent = False
     task = None
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
             f"http://localhost:{port}/api/ask/stream",
@@ -198,8 +198,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                 elif event.get("type") == "error":
                     error_msg = event.get("message", "Unknown error")
                     logger.error(f"Chat pipeline error: {error_msg}")
-                    if not full_text:
-                        full_text = f"Error: {error_msg}"
+                    full_text += f"\n\nError: {error_msg}" if full_text else f"Error: {error_msg}"
 
     return {"answer": full_text, "conversation_id": conv_id, "code_intent": code_intent, "task": task}
 

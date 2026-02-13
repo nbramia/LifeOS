@@ -64,11 +64,12 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
 3. **Agentic loop** — everything else. Claude gets 11 tools and up to 5 rounds to fetch data and synthesize an answer.
 
-**Agentic loop tools (11):**
+**Agentic loop tools (12):**
 
 | Tool | Description |
 |------|-------------|
 | `search_vault` | Obsidian notes, journals, meeting transcripts |
+| `read_vault_file` | Read full vault file by name (fuzzy matched) |
 | `search_calendar` | Google Calendar (personal + work) |
 | `search_email` | Gmail (personal + work) |
 | `search_drive` | Google Drive files |
