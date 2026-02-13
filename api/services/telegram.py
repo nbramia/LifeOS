@@ -246,6 +246,69 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     return {"answer": full_text, "conversation_id": conv_id, "code_intent": code_intent, "task": task}
 
 
+async def chat_via_api_with_log(question: str) -> dict:
+    """Run a question through the chat pipeline and capture execution metadata.
+
+    Like chat_via_api() but also returns tool_statuses, token usage, and cost
+    for reminder execution logging.
+
+    Returns:
+        {"answer": str, "conversation_id": str, "tool_statuses": list[str],
+         "cost_usd": float, "model": str, "input_tokens": int, "output_tokens": int}
+    """
+    port = settings.port
+    body: dict = {"question": question}
+
+    full_text = ""
+    conv_id = None
+    tool_statuses: list[str] = []
+    cost_usd = 0.0
+    model = ""
+    input_tokens = 0
+    output_tokens = 0
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            f"http://localhost:{port}/api/ask/stream",
+            json=body,
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type", "")
+                if etype == "content":
+                    full_text += event.get("content", "")
+                elif etype == "self_correction":
+                    full_text = ""
+                elif etype == "conversation_id":
+                    conv_id = event.get("conversation_id", conv_id)
+                elif etype == "status":
+                    tool_statuses.append(event.get("message", ""))
+                elif etype == "usage":
+                    cost_usd = event.get("cost_usd", 0)
+                    model = event.get("model", "")
+                    input_tokens = event.get("input_tokens", 0)
+                    output_tokens = event.get("output_tokens", 0)
+                elif etype == "error":
+                    error_msg = event.get("message", "Unknown error")
+                    full_text += f"\n\nError: {error_msg}" if full_text else f"Error: {error_msg}"
+
+    return {
+        "answer": full_text,
+        "conversation_id": conv_id,
+        "tool_statuses": tool_statuses,
+        "cost_usd": cost_usd,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Bot listener (long-polling)
 # ---------------------------------------------------------------------------

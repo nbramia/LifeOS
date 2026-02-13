@@ -98,10 +98,10 @@ api/
 - `job_queue.py` - SQLite-backed job queue with worker thread (reindex, sync)
 
 **Telegram & Scheduling:**
-- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands)
+- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands, `chat_via_api_with_log` for execution metadata capture)
 - `claude_orchestrator.py` - Claude Code subprocess lifecycle, stream parsing, [NOTIFY] relay
 - `directory_resolver.py` - Maps task keywords to working directories for Claude Code
-- `reminder_store.py` - Reminder CRUD, persistence, scheduler, and dashboard generation
+- `reminder_store.py` - Reminder CRUD, persistence, scheduler (with retry, execution logging, suppression), and dashboard generation
 - `time_parser.py` - Natural language time parsing for reminders
 
 **Search & Retrieval:**

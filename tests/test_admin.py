@@ -34,19 +34,23 @@ class TestAdminEndpoints:
         assert "vault_path" in data
 
     def test_reindex_endpoint_exists(self, client):
-        """Reindex endpoint should exist."""
-        with patch('api.routes.admin._do_reindex'):
+        """Reindex endpoint should exist and enqueue a job."""
+        with patch('api.routes.admin.get_job_queue') as mock_jq:
+            mock_jq.return_value.list_jobs.return_value = []
+            mock_jq.return_value.enqueue.return_value = "job-123"
             response = client.post("/api/admin/reindex")
             assert response.status_code == 200
 
     def test_reindex_returns_started(self, client):
-        """Reindex should return started status."""
-        with patch('api.routes.admin._do_reindex'):
+        """Reindex should return started status with job_id."""
+        with patch('api.routes.admin.get_job_queue') as mock_jq:
+            mock_jq.return_value.list_jobs.return_value = []
+            mock_jq.return_value.enqueue.return_value = "job-456"
             response = client.post("/api/admin/reindex")
             data = response.json()
 
-            assert "status" in data
-            assert data["status"] in ["started", "already_running"]
+            assert data["status"] == "started"
+            assert data["job_id"] == "job-456"
 
     def test_reindex_sync_endpoint_exists(self, client):
         """Sync reindex endpoint should exist."""
