@@ -4,20 +4,22 @@ Person Facts Service for LifeOS CRM.
 Extracts and stores interesting facts about contacts using a multi-stage LLM pipeline.
 Facts are stored in SQLite and can be displayed in the CRM UI.
 
-Pipeline Architecture (v2):
-- Stage 1: Filter interactions using local Ollama (fast, cheap)
-- Stage 2: Extract candidate facts using Claude (accurate, expensive)
-- Stage 3: Validate facts and assign confidence using Ollama (local)
+Pipeline Architecture (v3):
+- Stage 1: Extract candidate facts using Claude (natural sentence values, no keys)
+- Stage 2: Batched validation + dedup using single Ollama call (quality, attribution, dedup)
 
-Key improvements over v1:
-- Focus on MEMORABLE facts (pet names, hobbies) not obvious ones (job titles)
-- Calibrated confidence based on evidence strength, not LLM self-assessment
-- Message context windows for better extraction from conversations
-- Significant cost reduction via local Ollama for filtering/validation
+Key design decisions:
+- No LLM-generated keys: content-hash keys auto-generated for DB dedup
+- Values are natural sentences displayed directly (no key-value stitching)
+- Single batched Ollama call replaces N per-fact calls (faster, cheaper)
+- Semantic dedup: Ollama compares candidates against existing facts
+- Fallback: rule-based validation when Ollama unavailable
 """
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -521,6 +523,12 @@ class PersonFactExtractor:
             self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         return self._client
 
+    def _generate_fact_key(self, category: str, value: str) -> str:
+        """Generate a deterministic dedup key from category + normalized value."""
+        normalized = re.sub(r'[^\w\s]', '', value.lower())
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return hashlib.sha256(f"{category}:{normalized}".encode()).hexdigest()[:12]
+
     async def extract_facts_async(
         self,
         person_id: str,
@@ -571,9 +579,15 @@ class PersonFactExtractor:
         )
         logger.info(f"Extracted {len(extracted_facts)} facts for {person_name}")
 
-        # Validate facts with Ollama (local, free)
+        # Fetch existing facts for dedup comparison
+        existing_facts = self.fact_store.get_for_person(person_id)
+        existing_non_summary = [f for f in existing_facts if f.category != "summary"]
+
+        # Combined validation + dedup (single batched Ollama call)
         if extracted_facts:
-            extracted_facts = await self._validate_facts_ollama(extracted_facts, person_name)
+            extracted_facts = await self._validate_and_dedup_ollama(
+                extracted_facts, existing_non_summary, person_name
+            )
 
         # Generate relationship summaries for people with sufficient interactions
         if len(interactions) >= 10:
@@ -648,6 +662,12 @@ class PersonFactExtractor:
         extracted_facts = self._extract_facts_claude(
             person_id, person_name, enriched_interactions, interaction_lookup, use_model
         )
+
+        # Fallback validation (no Ollama in sync path)
+        if extracted_facts:
+            existing_facts = self.fact_store.get_for_person(person_id)
+            existing_non_summary = [f for f in existing_facts if f.category != "summary"]
+            extracted_facts = self._fallback_validate(extracted_facts, existing_non_summary)
 
         if len(interactions) >= 10:
             try:
@@ -1009,86 +1029,199 @@ class PersonFactExtractor:
 
         return "\n\n".join(lines)
 
-    async def _validate_facts_ollama(
-        self, facts: list[PersonFact], person_name: str
+    async def _validate_and_dedup_ollama(
+        self,
+        new_facts: list[PersonFact],
+        existing_facts: list[PersonFact],
+        person_name: str,
     ) -> list[PersonFact]:
         """
-        Validate extracted facts using local Ollama.
+        Validate and deduplicate facts in a single batched Ollama call.
 
-        For each fact with a quote, asks Ollama:
-        1. Does the quote support this fact?
-        2. Is this about the target person, not the user?
-        3. Evidence strength (1-5)
-
-        Facts failing support or attribution are rejected.
-        Evidence strength is mapped to calibrated confidence.
-        Falls back gracefully if Ollama is unavailable.
+        Sends all candidates + existing facts to Ollama, which returns
+        keep/reject/update decisions for each candidate. Falls back to
+        rule-based validation if Ollama is unavailable.
         """
         from api.services.ollama_client import OllamaClient
 
         client = OllamaClient()
 
         if not await client.is_available_async():
-            logger.warning("Ollama unavailable for fact validation — passing through with capped confidence")
-            for fact in facts:
-                fact.confidence = min(fact.confidence, 0.7)
-            return facts
+            logger.warning("Ollama unavailable — using fallback validation")
+            return self._fallback_validate(new_facts, existing_facts)
 
-        validated = []
-        for fact in facts:
-            if not fact.source_quote:
-                # No quote to validate — keep but cap confidence
-                fact.confidence = min(fact.confidence, 0.6)
-                validated.append(fact)
-                continue
+        # Build existing facts list for the prompt
+        existing_lines = []
+        for i, fact in enumerate(existing_facts):
+            confirmed = " [USER-CONFIRMED]" if fact.confirmed_by_user else ""
+            existing_lines.append(f"[E{i}] {fact.category}: {fact.value}{confirmed}")
 
-            prompt = f"""Validate this extracted fact about {person_name}.
+        # Build candidate facts list
+        candidate_lines = []
+        for i, fact in enumerate(new_facts):
+            quote_part = f' (quote: "{fact.source_quote}")' if fact.source_quote else ""
+            candidate_lines.append(f"[C{i}] {fact.category}: {fact.value}{quote_part}")
 
-Fact: {fact.key} = {fact.value}
-Quote: "{fact.source_quote}"
+        existing_block = "\n".join(existing_lines) if existing_lines else "(none)"
+        candidate_block = "\n".join(candidate_lines)
 
-Answer these questions as JSON:
+        prompt = f"""Validate candidate facts about {person_name} and check for duplicates against existing facts.
+
+EXISTING FACTS (already stored):
+{existing_block}
+
+CANDIDATE FACTS (to validate):
+{candidate_block}
+
+For each candidate [C0], [C1], etc., return a JSON array with one decision per candidate:
+
 {{
-  "supported": true/false,  // Does the quote support this fact?
-  "correct_person": true/false,  // Is this about {person_name} (not the user or a third party)?
-  "evidence_strength": 1-5  // How strong is the evidence? (1=weak inference, 5=explicit statement)
+  "decisions": [
+    {{
+      "candidate": 0,
+      "action": "keep",
+      "evidence_strength": 4,
+      "reason": "New unique fact with strong evidence"
+    }},
+    {{
+      "candidate": 1,
+      "action": "reject",
+      "reason": "Universal fact — everyone has a mother"
+    }},
+    {{
+      "candidate": 2,
+      "action": "update",
+      "updates_existing": 0,
+      "evidence_strength": 4,
+      "reason": "More detailed version of E0"
+    }}
+  ]
 }}
+
+RULES:
+- "keep": New, unique, specific fact. Assign evidence_strength 1-5.
+- "reject": Universal/obvious, wrong person, unsupported by quote, too vague, or fewer than 5 words.
+- "update": Same core fact as an existing one but with more/better detail. Specify which existing fact it updates via "updates_existing" index. If the existing fact is marked [USER-CONFIRMED], use "keep" instead (don't overwrite confirmed facts).
+- evidence_strength: 1=weak inference, 2=implied, 3=stated once, 4=clearly stated, 5=explicitly confirmed multiple times.
 
 Return ONLY valid JSON."""
 
-            try:
-                result = await client.generate_json(
-                    prompt=prompt,
-                    max_tokens=256,
-                    timeout=10
-                )
+        try:
+            result = await client.generate_json(
+                prompt=prompt,
+                max_tokens=2048,
+                timeout=30,
+            )
 
-                supported = result.get("supported", True)
-                correct_person = result.get("correct_person", True)
-                evidence_strength = int(result.get("evidence_strength", 3))
+            decisions = result.get("decisions", [])
+            # Index decisions by candidate number
+            decision_map = {}
+            for d in decisions:
+                idx = d.get("candidate")
+                if idx is not None:
+                    decision_map[idx] = d
 
-                if not supported:
-                    logger.debug(f"Fact rejected (unsupported): {fact.key}={fact.value}")
+            validated = []
+            kept = 0
+            rejected = 0
+
+            confidence_map = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
+
+            for i, fact in enumerate(new_facts):
+                decision = decision_map.get(i)
+
+                if not decision:
+                    # Not mentioned in response → reject (safe default)
+                    rejected += 1
                     continue
 
-                if not correct_person:
-                    logger.debug(f"Fact rejected (wrong person): {fact.key}={fact.value}")
-                    continue
-
-                # Map evidence strength to calibrated confidence
-                confidence_map = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
+                action = decision.get("action", "reject")
+                evidence_strength = int(decision.get("evidence_strength", 3))
                 fact.confidence = confidence_map.get(
                     max(1, min(5, evidence_strength)), 0.7
                 )
-                validated.append(fact)
 
-            except Exception as e:
-                logger.debug(f"Ollama validation failed for {fact.key}: {e}")
-                # On per-fact failure, keep the fact with capped confidence
-                fact.confidence = min(fact.confidence, 0.7)
-                validated.append(fact)
+                if action == "keep":
+                    kept += 1
+                    validated.append(fact)
 
-        logger.info(f"Validation: {len(validated)}/{len(facts)} facts passed")
+                elif action == "update":
+                    updates_idx = decision.get("updates_existing")
+                    if updates_idx is not None and 0 <= updates_idx < len(existing_facts):
+                        existing = existing_facts[updates_idx]
+                        if existing.confirmed_by_user:
+                            # Don't overwrite confirmed facts — keep as new instead
+                            kept += 1
+                            validated.append(fact)
+                        else:
+                            # Use existing fact's key so upsert overwrites it
+                            fact.key = existing.key
+                            kept += 1
+                            validated.append(fact)
+                    else:
+                        # Invalid update target — keep as new
+                        kept += 1
+                        validated.append(fact)
+
+                else:  # reject
+                    rejected += 1
+
+            logger.info(f"Validation+dedup: {kept} kept, {rejected} rejected/deduped")
+            return validated
+
+        except Exception as e:
+            logger.error(f"Ollama batch validation failed: {e}")
+            return self._fallback_validate(new_facts, existing_facts)
+
+    def _fallback_validate(
+        self, new_facts: list[PersonFact], existing_facts: list[PersonFact]
+    ) -> list[PersonFact]:
+        """Rule-based validation when Ollama is unavailable."""
+        # Build set of normalized existing values for dedup
+        existing_normalized = set()
+        for fact in existing_facts:
+            normalized = re.sub(r'[^\w\s]', '', fact.value.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            existing_normalized.add(f"{fact.category}:{normalized}")
+
+        # Universal patterns to reject
+        universal_pattern = re.compile(
+            r'^has (a )?(mother|father|parents|family|siblings?|brother|sister)$',
+            re.IGNORECASE,
+        )
+
+        validated = []
+        for fact in new_facts:
+            value = fact.value.strip()
+
+            # Reject short values
+            if len(value.split()) < 4:
+                logger.debug(f"Fallback rejected (too short): {value}")
+                continue
+
+            # Reject boolean values
+            if value.lower() in ("true", "false", "yes", "no"):
+                logger.debug(f"Fallback rejected (boolean): {value}")
+                continue
+
+            # Reject universal patterns
+            if universal_pattern.match(value):
+                logger.debug(f"Fallback rejected (universal): {value}")
+                continue
+
+            # Skip exact normalized-value matches against existing facts
+            normalized = re.sub(r'[^\w\s]', '', value.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            norm_key = f"{fact.category}:{normalized}"
+            if norm_key in existing_normalized:
+                logger.debug(f"Fallback rejected (duplicate): {value}")
+                continue
+
+            # Cap confidence
+            fact.confidence = min(fact.confidence, 0.7)
+            validated.append(fact)
+
+        logger.info(f"Fallback validation: {len(validated)}/{len(new_facts)} kept")
         return validated
 
     def _build_extraction_prompt(self, person_name: str, interaction_text: str) -> str:
@@ -1130,22 +1263,24 @@ Return ONLY valid JSON with this structure (no markdown, no explanation):
   "facts": [
     {{
       "category": "family",
-      "key": "spouse_sarah",
-      "value": "Married to Sarah",
+      "value": "Married to Sarah, they went hiking together",
       "quote": "my wife Sarah and I went hiking",
-      "source_id": "abc123",
-      "confidence": 0.95
+      "source_id": "abc123"
     }}
   ]
 }}
 
-VALUE FORMAT — write as a natural sentence:
-- The "value" field is displayed directly to the user. Write it as a short, readable sentence.
+VALUE QUALITY RULES:
+- The "value" field is displayed directly to the user. It MUST be a complete sentence or phrase.
+- MUST be at least 5 words long.
+- MUST contain at least one specific detail (a name, place, date, or quantifiable detail).
+- NEVER use boolean values ("true", "false", "yes", "no").
+- NEVER use bare names ("Emma") or fragments ("monthly onsites").
 - GOOD: "Has a daughter named Emma who plays soccer"
-- GOOD: "Allergic to shellfish"
+- GOOD: "Allergic to shellfish and carries an EpiPen"
 - GOOD: "Grew up in Portland, Oregon"
-- BAD: "Emma" (too terse — displayed as "daughter_emma: Emma" which reads weird)
-- BAD: "true" (never use boolean values — write what the fact actually is)
+- BAD: "Emma" (bare name — not a sentence)
+- BAD: "true" (boolean — write what the fact actually is)
 - BAD: "monthly West Coast onsites" (fragment — write "Travels to the West Coast monthly for onsites")
 
 NEVER EXTRACT these (obvious/universal — not useful):
@@ -1168,43 +1303,28 @@ Tier 3 (only if nothing better available):
 - Job title, company, generic interests
 - If you have 10+ Tier 1/2 facts, skip Tier 3 entirely
 
-Categories and example keys:
-- family: spouse_sarah, daughter_emma, son_jake, sister_jane, dog_max, cat_luna
-- preferences: hates_cilantro, morning_person, prefers_texting
-- background: hometown, alma_mater, nationality, languages, health_condition
-- interests: hobby_pottery, hobby_running, sport_tennis, favorite_team_lakers
-- dates: birthday, anniversary, started_current_job
-- work: current_role, company, expertise
-- topics: frequent_discussion_topics, concerns, goals, current_focus
-- travel: visited_japan, planned_trip_italy, favorite_destination
-
-KEY NAMING RULES (for deduplication):
-- Use specific names in keys: "daughter_emma" not "daughter", "dog_max" not "pet"
-- Hobbies: "hobby_pottery", "hobby_running" (not generic "hobby")
-- Format: lowercase_snake_case, descriptive enough to be unique
+Categories: family, preferences, background, interests, dates, work, topics, travel
 
 EXTRACTION RULES:
 - Only include facts with clear textual evidence about {person_name} specifically
 - The "quote" field MUST show this fact belongs to {person_name}
 - The "source_id" field should match the ID shown in the interaction (e.g., "ID:abc123")
-- Use lowercase snake_case for keys
 - Reject vague facts without specific names or details
 - Reject any fact about the user or third parties mentioned in conversation
 
 GOOD examples:
 - [{person_name.upper()} SENT]: "I'm taking my daughter Emma to soccer practice"
-- {{"category": "family", "key": "daughter_emma", "value": "Has a daughter named Emma who plays soccer", "quote": "I'm taking my daughter Emma to soccer practice", "confidence": 0.95}}
+- {{"category": "family", "value": "Has a daughter named Emma who plays soccer", "quote": "I'm taking my daughter Emma to soccer practice", "source_id": "abc123"}}
 
 - [{person_name.upper()} SENT]: "I can't eat shellfish, I'm allergic"
-- {{"category": "preferences", "key": "allergy_shellfish", "value": "Allergic to shellfish", "quote": "I can't eat shellfish, I'm allergic", "confidence": 0.9}}
+- {{"category": "preferences", "value": "Allergic to shellfish", "quote": "I can't eat shellfish, I'm allergic", "source_id": "abc456"}}
 
 BAD examples (DO NOT do this):
-- {{"key": "has_mother", "value": "true"}} <- USELESS. Everyone has a mother. Only extract if you know the name.
-- {{"key": "daughter", "value": "Emma"}} <- Terse. Write "Has a daughter named Emma" instead.
-- {{"key": "work_pattern", "value": "monthly West Coast onsites"}} <- Fragment. Write "Travels to the West Coast monthly for onsites" instead.
-- [{user_upper} SENT]: "I'm in Minnesota" — {{"key": "location", "value": "Minnesota"}} <- WRONG! The user said this, not {person_name}!
-- [{user_upper} SENT]: "I need to pick up my daughter" — {{"key": "child", "value": "..."}} <- WRONG! This is the user's child!
-- "Sarah got a new job in Boston" — {{"key": "employer", "value": "Boston company"}} <- WRONG! This is about Sarah, not {person_name}!
+- {{"value": "true"}} <- USELESS boolean. Write what the fact actually is.
+- {{"value": "Emma"}} <- Terse. Write "Has a daughter named Emma" instead.
+- {{"value": "monthly West Coast onsites"}} <- Fragment. Write "Travels to the West Coast monthly for onsites" instead.
+- [{user_upper} SENT]: "I'm in Minnesota" — {{"value": "Lives in Minnesota"}} <- WRONG! The user said this, not {person_name}!
+- [{user_upper} SENT]: "I need to pick up my daughter" — {{"value": "Has a daughter"}} <- WRONG! This is the user's child!
 
 Interactions:
 {interaction_text}"""
@@ -1235,11 +1355,9 @@ Interactions:
 
             for fact_data in data["facts"]:
                 category = fact_data.get("category", "").lower()
-                key = fact_data.get("key", "")
                 value = fact_data.get("value", "")
                 quote = fact_data.get("quote", "")
                 source_id = fact_data.get("source_id", "")
-                confidence = float(fact_data.get("confidence", 0.5))
 
                 # Validate category
                 if category not in FACT_CATEGORIES:
@@ -1247,16 +1365,14 @@ Interactions:
                     continue
 
                 # Validate required fields
-                if not key or not value:
+                if not value:
                     continue
 
-                # Require quote for high-confidence facts
-                if confidence >= 0.8 and not quote:
-                    logger.warning(f"Rejecting high-confidence fact without quote: {key}")
-                    confidence = 0.6  # Downgrade confidence
+                # Auto-generate key from category + value
+                key = self._generate_fact_key(category, value)
 
-                # Clamp confidence
-                confidence = max(0.0, min(1.0, confidence))
+                # Placeholder confidence — real confidence assigned by Ollama validation
+                confidence = 0.7
 
                 # Find source interaction for link
                 source_link = None

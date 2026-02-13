@@ -579,16 +579,14 @@ class TestPersonFactExtractor:
         assert "Thanks for the great meeting" in result
 
     def test_parse_extraction_response_valid_json(self, extractor):
-        """Valid JSON response is parsed correctly."""
+        """Valid JSON response is parsed correctly with auto-generated key."""
         response = json.dumps({
             "facts": [
                 {
                     "category": "family",
-                    "key": "spouse_name",
-                    "value": "Sarah",
-                    "quote": "my wife Sarah",
+                    "value": "Married to Sarah who loves hiking",
+                    "quote": "my wife Sarah and I went hiking",
                     "source_id": "int-123",
-                    "confidence": 0.95,
                 }
             ]
         })
@@ -600,9 +598,10 @@ class TestPersonFactExtractor:
 
         assert len(facts) == 1
         assert facts[0].category == "family"
-        assert facts[0].key == "spouse_name"
-        assert facts[0].value == "Sarah"
-        assert facts[0].source_quote == "my wife Sarah"
+        assert len(facts[0].key) == 12  # Auto-generated hash key
+        assert facts[0].value == "Married to Sarah who loves hiking"
+        assert facts[0].source_quote == "my wife Sarah and I went hiking"
+        assert facts[0].confidence == 0.7  # Placeholder confidence
 
     def test_parse_extraction_response_markdown_json(self, extractor):
         """JSON in markdown code block is extracted."""
@@ -612,11 +611,9 @@ class TestPersonFactExtractor:
   "facts": [
     {
       "category": "work",
-      "key": "company",
-      "value": "Acme Inc",
+      "value": "Works at Acme Inc as an engineer",
       "quote": "I work at Acme Inc",
-      "source_id": "int-456",
-      "confidence": 0.9
+      "source_id": "int-456"
     }
   ]
 }
@@ -625,7 +622,8 @@ class TestPersonFactExtractor:
         facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
-        assert facts[0].value == "Acme Inc"
+        assert facts[0].value == "Works at Acme Inc as an engineer"
+        assert len(facts[0].key) == 12  # Auto-generated hash key
 
     def test_parse_extraction_response_invalid_category_skipped(self, extractor):
         """Facts with invalid categories are skipped."""
@@ -645,44 +643,28 @@ class TestPersonFactExtractor:
         """Facts missing required fields are skipped."""
         response = json.dumps({
             "facts": [
-                {"category": "work", "key": "", "value": "test", "confidence": 0.9},  # Empty key
-                {"category": "work", "key": "test", "value": "", "confidence": 0.9},  # Empty value
-                {"category": "work", "key": "valid", "value": "valid", "confidence": 0.9},
+                {"category": "work", "value": "", "quote": "q"},  # Empty value
+                {"category": "work", "value": "Works as a senior engineer at Google", "quote": "q"},  # Valid
             ]
         })
 
         facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
-        assert facts[0].key == "valid"
+        assert facts[0].value == "Works as a senior engineer at Google"
 
-    def test_parse_extraction_response_downgrades_no_quote(self, extractor):
-        """High-confidence facts without quotes get downgraded."""
+    def test_parse_extraction_response_ignores_llm_confidence(self, extractor):
+        """LLM-provided confidence is ignored; placeholder 0.7 is used."""
         response = json.dumps({
             "facts": [
-                {"category": "work", "key": "role", "value": "CEO", "confidence": 0.95}
-                # No quote field
+                {"category": "work", "value": "Works as a CEO at Acme Corp", "confidence": 0.95, "quote": "q"},
             ]
         })
 
         facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
-        assert facts[0].confidence == 0.6  # Downgraded from 0.95
-
-    def test_parse_extraction_response_clamps_confidence(self, extractor):
-        """Confidence values are clamped to 0.0-1.0."""
-        response = json.dumps({
-            "facts": [
-                {"category": "work", "key": "a", "value": "test", "confidence": 1.5, "quote": "q"},
-                {"category": "work", "key": "b", "value": "test", "confidence": -0.5, "quote": "q"},
-            ]
-        })
-
-        facts = extractor._parse_extraction_response(response, "person-id", {})
-
-        assert facts[0].confidence == 1.0
-        assert facts[1].confidence == 0.0
+        assert facts[0].confidence == 0.7  # Placeholder, not 0.95
 
     def test_parse_extraction_response_invalid_json(self, extractor):
         """Invalid JSON returns empty list."""
@@ -713,8 +695,8 @@ class TestPersonFactExtractor:
         assert "December email" in result
 
 
-class TestOllamaValidation:
-    """Tests for Ollama post-extraction validation."""
+class TestValidateAndDedup:
+    """Tests for batched Ollama validation + deduplication."""
 
     @pytest.fixture
     def mock_store(self):
@@ -726,76 +708,164 @@ class TestOllamaValidation:
     def extractor(self, mock_store):
         return PersonFactExtractor(fact_store=mock_store)
 
-    def _make_fact(self, key="test_key", value="test_value", quote="test quote", confidence=0.9):
+    def _make_fact(self, value="Has a daughter named Emma", category="family",
+                   quote="my daughter Emma", confidence=0.7, confirmed=False):
         return PersonFact(
             person_id="person-1",
-            category="family",
-            key=key,
+            category=category,
+            key=PersonFactExtractor(fact_store=MagicMock())._generate_fact_key(category, value),
             value=value,
             confidence=confidence,
             source_quote=quote,
+            confirmed_by_user=confirmed,
         )
 
     @pytest.mark.asyncio
-    async def test_fact_rejected_when_unsupported(self, extractor):
-        """Fact rejected when Ollama says supported: false."""
-        fact = self._make_fact()
-        mock_result = {"supported": False, "correct_person": True, "evidence_strength": 3}
+    async def test_rejects_universal_facts(self, extractor):
+        """Ollama rejects universal/obvious facts."""
+        fact = self._make_fact(value="Has a mother")
+        mock_result = {"decisions": [
+            {"candidate": 0, "action": "reject", "reason": "Universal fact"}
+        ]}
 
         with patch("api.services.ollama_client.OllamaClient") as MockClient:
             instance = MockClient.return_value
             instance.is_available_async = AsyncMock(return_value=True)
             instance.generate_json = AsyncMock(return_value=mock_result)
 
-            result = await extractor._validate_facts_ollama([fact], "John")
+            result = await extractor._validate_and_dedup_ollama([fact], [], "John")
 
         assert len(result) == 0
 
     @pytest.mark.asyncio
-    async def test_fact_rejected_when_wrong_person(self, extractor):
-        """Fact rejected when Ollama says correct_person: false."""
-        fact = self._make_fact()
-        mock_result = {"supported": True, "correct_person": False, "evidence_strength": 3}
+    async def test_deduplicates_against_existing(self, extractor):
+        """Ollama returns update for semantically duplicate fact."""
+        existing = self._make_fact(value="Has a daughter named Emma")
+        existing.key = "existing_key_abc"
+        candidate = self._make_fact(value="Daughter Emma plays piano after school")
+
+        mock_result = {"decisions": [
+            {"candidate": 0, "action": "update", "updates_existing": 0,
+             "evidence_strength": 4, "reason": "More detailed version"}
+        ]}
 
         with patch("api.services.ollama_client.OllamaClient") as MockClient:
             instance = MockClient.return_value
             instance.is_available_async = AsyncMock(return_value=True)
             instance.generate_json = AsyncMock(return_value=mock_result)
 
-            result = await extractor._validate_facts_ollama([fact], "John")
-
-        assert len(result) == 0
-
-    @pytest.mark.asyncio
-    async def test_confidence_remapped_from_evidence_strength(self, extractor):
-        """Confidence is remapped based on evidence_strength."""
-        fact = self._make_fact(confidence=0.95)
-        mock_result = {"supported": True, "correct_person": True, "evidence_strength": 4}
-
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
-
-            result = await extractor._validate_facts_ollama([fact], "John")
+            result = await extractor._validate_and_dedup_ollama([candidate], [existing], "John")
 
         assert len(result) == 1
-        assert result[0].confidence == 0.8  # evidence_strength 4 → 0.8
+        assert result[0].key == "existing_key_abc"  # Takes existing key for upsert overwrite
+        assert result[0].confidence == 0.8  # evidence_strength 4
 
     @pytest.mark.asyncio
-    async def test_graceful_degradation_ollama_unavailable(self, extractor):
-        """All facts pass through with capped confidence when Ollama unavailable."""
-        facts = [self._make_fact(confidence=0.95), self._make_fact(key="k2", confidence=0.8)]
+    async def test_keeps_new_facts(self, extractor):
+        """Ollama keeps new unique facts with evidence_strength."""
+        fact = self._make_fact(value="Allergic to shellfish and avoids seafood")
+        mock_result = {"decisions": [
+            {"candidate": 0, "action": "keep", "evidence_strength": 5,
+             "reason": "New unique fact"}
+        ]}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_and_dedup_ollama([fact], [], "John")
+
+        assert len(result) == 1
+        assert result[0].confidence == 0.9  # evidence_strength 5
+
+    @pytest.mark.asyncio
+    async def test_respects_confirmed_facts(self, extractor):
+        """Update action is converted to keep for confirmed existing facts."""
+        existing = self._make_fact(value="Has a daughter named Emma", confirmed=True)
+        candidate = self._make_fact(value="Daughter Emma plays piano after school")
+
+        mock_result = {"decisions": [
+            {"candidate": 0, "action": "update", "updates_existing": 0,
+             "evidence_strength": 4, "reason": "More detail"}
+        ]}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_and_dedup_ollama([candidate], [existing], "John")
+
+        assert len(result) == 1
+        # Key should NOT be the existing key (kept as new fact instead)
+        assert result[0].key != "existing_key_abc"
+
+    @pytest.mark.asyncio
+    async def test_fallback_rejects_short_values(self, extractor):
+        """Fallback validation rejects values with fewer than 4 words."""
+        short = self._make_fact(value="Has dog")
+        long = self._make_fact(value="Has a golden retriever named Max")
+
+        result = extractor._fallback_validate([short, long], [])
+
+        assert len(result) == 1
+        assert result[0].value == "Has a golden retriever named Max"
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_ollama_unavailable(self, extractor):
+        """Falls back to rule-based validation when Ollama is down."""
+        facts = [
+            self._make_fact(value="Has a daughter named Emma who plays soccer"),
+            self._make_fact(value="true", category="preferences"),
+        ]
 
         with patch("api.services.ollama_client.OllamaClient") as MockClient:
             instance = MockClient.return_value
             instance.is_available_async = AsyncMock(return_value=False)
 
-            result = await extractor._validate_facts_ollama(facts, "John")
+            result = await extractor._validate_and_dedup_ollama(facts, [], "John")
 
-        assert len(result) == 2
-        assert result[0].confidence == 0.7  # Capped from 0.95
-        assert result[1].confidence == 0.7  # Capped from 0.8
+        # "true" should be rejected, the other kept with capped confidence
+        assert len(result) == 1
+        assert result[0].confidence <= 0.7
+
+
+class TestGenerateFactKey:
+    """Tests for the _generate_fact_key helper."""
+
+    @pytest.fixture
+    def extractor(self):
+        return PersonFactExtractor(fact_store=MagicMock())
+
+    def test_deterministic(self, extractor):
+        """Same input produces same key."""
+        key1 = extractor._generate_fact_key("family", "Has a daughter named Emma")
+        key2 = extractor._generate_fact_key("family", "Has a daughter named Emma")
+        assert key1 == key2
+
+    def test_case_insensitive(self, extractor):
+        """Different case produces same key."""
+        key1 = extractor._generate_fact_key("family", "Has A Daughter Named Emma")
+        key2 = extractor._generate_fact_key("family", "has a daughter named emma")
+        assert key1 == key2
+
+    def test_punctuation_insensitive(self, extractor):
+        """Punctuation differences produce same key."""
+        key1 = extractor._generate_fact_key("family", "Has a daughter, Emma!")
+        key2 = extractor._generate_fact_key("family", "Has a daughter Emma")
+        assert key1 == key2
+
+    def test_different_values_different_keys(self, extractor):
+        """Different values produce different keys."""
+        key1 = extractor._generate_fact_key("family", "Has a daughter named Emma")
+        key2 = extractor._generate_fact_key("family", "Has a son named Jake")
+        assert key1 != key2
+
+    def test_key_length(self, extractor):
+        """Key is always 12 characters."""
+        key = extractor._generate_fact_key("work", "Works at Google as an engineer")
+        assert len(key) == 12
 
 
 class TestFactCategories:
