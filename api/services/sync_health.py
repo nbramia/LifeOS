@@ -165,6 +165,14 @@ SYNC_SOURCES = {
         "phase": 5,
     },
 
+    # === Phase 5b: Financial Data ===
+    "monarch_money": {
+        "description": "Monarch Money financial data (monthly summary to vault)",
+        "script": "scripts/sync_monarch_money.py",
+        "frequency": "monthly",
+        "phase": 5,
+    },
+
     # === Phase 6: Post-Sync Cleanup ===
     "entity_cleanup": {
         "description": "Post-sync cleanup (non-human detection, duplicate queue)",

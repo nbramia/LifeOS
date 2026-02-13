@@ -317,6 +317,26 @@ Example morning briefing:
         "description": "Send an immediate message via Telegram. Use for ad-hoc notifications or testing. Requires Telegram to be configured.",
         "method": "POST"
     },
+    "/api/monarch/accounts": {
+        "name": "lifeos_monarch_accounts",
+        "description": "List all financial accounts with current balances from Monarch Money. Returns account name, type (checking, savings, credit card, investment), balance, and institution.",
+        "method": "GET"
+    },
+    "/api/monarch/transactions": {
+        "name": "lifeos_monarch_transactions",
+        "description": "Search recent financial transactions from Monarch Money. Filter by date range, category, or merchant name. Returns date, merchant, category, amount, and account. Defaults to last 30 days.",
+        "method": "GET"
+    },
+    "/api/monarch/cashflow": {
+        "name": "lifeos_monarch_cashflow",
+        "description": "Get cashflow summary from Monarch Money for a date range. Returns total income, expenses, savings rate, and spending breakdown by category. Defaults to current month.",
+        "method": "GET"
+    },
+    "/api/monarch/budgets": {
+        "name": "lifeos_monarch_budgets",
+        "description": "Get current budget status from Monarch Money. Returns each budget with budgeted amount, actual spending, and remaining balance. Defaults to current month.",
+        "method": "GET"
+    },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
         "description": "Create a task in LifeOS. Tasks are stored as Obsidian-compatible markdown in LifeOS/Tasks/{Context}.md. Supports contexts (Work, Personal, Finance, etc.), priority (high/medium/low), due dates, and tags.",
@@ -346,6 +366,24 @@ Example morning briefing:
         "description": "Delete a task by ID. Removes it from the vault markdown file and index.",
         "method": "DELETE",
         "path": "/api/tasks/{task_id}"
+    },
+    "/api/calendar/events:POST": {
+        "name": "lifeos_calendar_create",
+        "description": "Create a Google Calendar event. Provide title, start_time (ISO datetime), end_time (ISO datetime). Optional: attendees (email list), description, location, account (personal/work). No invite emails are sent — user reviews and sends from Google Calendar. [CLARIFY] before creating events with attendees.",
+        "method": "POST",
+        "path": "/api/calendar/events"
+    },
+    "/api/calendar/events/{event_id}:PUT": {
+        "name": "lifeos_calendar_update",
+        "description": "Update an existing calendar event. Requires event_id from lifeos_calendar_search. Only provided fields are changed. Optional: title, start_time, end_time, attendees, description, location, account. No invite emails are sent. [CLARIFY] before updating events.",
+        "method": "PUT",
+        "path": "/api/calendar/events/{event_id}"
+    },
+    "/api/calendar/events/{event_id}:DELETE": {
+        "name": "lifeos_calendar_delete",
+        "description": "Delete a calendar event. Requires event_id from lifeos_calendar_search. Optional: account (personal/work). No cancellation emails are sent. [CLARIFY] before deleting events.",
+        "method": "DELETE",
+        "path": "/api/calendar/events/{event_id}"
     },
 }
 
@@ -662,6 +700,34 @@ class LifeOSMCPServer:
                 },
                 "required": ["text"]
             },
+            "lifeos_monarch_accounts": {
+                "type": "object",
+                "properties": {}
+            },
+            "lifeos_monarch_transactions": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "Start date (YYYY-MM-DD), defaults to 30 days ago"},
+                    "end_date": {"type": "string", "description": "End date (YYYY-MM-DD), defaults to today"},
+                    "category": {"type": "string", "description": "Filter by category name"},
+                    "search": {"type": "string", "description": "Search by merchant name"},
+                    "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100}
+                }
+            },
+            "lifeos_monarch_cashflow": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "Start date (YYYY-MM-DD), defaults to first of current month"},
+                    "end_date": {"type": "string", "description": "End date (YYYY-MM-DD), defaults to today"}
+                }
+            },
+            "lifeos_monarch_budgets": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "description": "Start date (YYYY-MM-DD), defaults to first of current month"},
+                    "end_date": {"type": "string", "description": "End date (YYYY-MM-DD), defaults to today"}
+                }
+            },
             "lifeos_task_create": {
                 "type": "object",
                 "properties": {
@@ -710,6 +776,41 @@ class LifeOSMCPServer:
                     "task_id": {"type": "string", "description": "Task ID to delete"}
                 },
                 "required": ["task_id"]
+            },
+            "lifeos_calendar_create": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Event title"},
+                    "start_time": {"type": "string", "description": "Start time (ISO datetime, e.g. 2026-02-14T14:00:00-05:00)"},
+                    "end_time": {"type": "string", "description": "End time (ISO datetime)"},
+                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "Attendee email addresses"},
+                    "description": {"type": "string", "description": "Event description"},
+                    "location": {"type": "string", "description": "Event location"},
+                    "account": {"type": "string", "description": "Account: personal or work", "default": "personal"}
+                },
+                "required": ["title", "start_time", "end_time"]
+            },
+            "lifeos_calendar_update": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Event ID from lifeos_calendar_search"},
+                    "title": {"type": "string", "description": "New title"},
+                    "start_time": {"type": "string", "description": "New start time (ISO datetime)"},
+                    "end_time": {"type": "string", "description": "New end time (ISO datetime)"},
+                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "New attendee emails (replaces existing)"},
+                    "description": {"type": "string", "description": "New description"},
+                    "location": {"type": "string", "description": "New location"},
+                    "account": {"type": "string", "description": "Account: personal or work", "default": "personal"}
+                },
+                "required": ["event_id"]
+            },
+            "lifeos_calendar_delete": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Event ID from lifeos_calendar_search"},
+                    "account": {"type": "string", "description": "Account: personal or work", "default": "personal"}
+                },
+                "required": ["event_id"]
             }
         }
 
@@ -763,7 +864,9 @@ class LifeOSMCPServer:
             if method == "GET":
                 resp = self.client.get(url, params=arguments)
             elif method == "DELETE":
-                resp = self.client.delete(url)
+                resp = self.client.delete(url, params=arguments)
+            elif method == "PUT":
+                resp = self.client.put(url, json=arguments)
             else:  # POST
                 resp = self.client.post(url, json=arguments)
 
@@ -824,6 +927,28 @@ class LifeOSMCPServer:
                 if attendees := e.get('attendees'):
                     text += f"  With: {', '.join(attendees[:3])}\n"
             return text
+
+        elif tool_name == "lifeos_calendar_create":
+            title = data.get("title", "Untitled")
+            start = data.get("start_time", "")
+            end = data.get("end_time", "")
+            text = f"Event created: **{title}**\nWhen: {start} – {end}"
+            if attendees := data.get("attendees"):
+                text += f"\nAttendees: {', '.join(attendees)}"
+            text += f"\nAccount: {data.get('source_account', 'personal')}"
+            return text
+
+        elif tool_name == "lifeos_calendar_update":
+            title = data.get("title", "Untitled")
+            start = data.get("start_time", "")
+            end = data.get("end_time", "")
+            text = f"Event updated: **{title}**\nWhen: {start} – {end}"
+            if attendees := data.get("attendees"):
+                text += f"\nAttendees: {', '.join(attendees)}"
+            return text
+
+        elif tool_name == "lifeos_calendar_delete":
+            return f"Event deleted (ID: {data.get('event_id', 'unknown')})"
 
         elif tool_name == "lifeos_gmail_search":
             emails = data.get("emails", data.get("messages", []))
@@ -1155,6 +1280,63 @@ class LifeOSMCPServer:
                     if i.get("source_title"):
                         text += f"  _Source: {i['source_title']}_\n"
                 text += "\n"
+            return text
+
+        elif tool_name == "lifeos_monarch_accounts":
+            accounts = data.get("accounts", [])
+            if not accounts:
+                return "No accounts found."
+            text = f"Found {len(accounts)} accounts:\n\n"
+            text += "| Account | Type | Balance | Institution |\n"
+            text += "|---------|------|---------|-------------|\n"
+            for a in accounts:
+                bal = a.get("balance", 0)
+                text += f"| {a.get('name', '')} | {a.get('type', '')} | ${bal:,.2f} | {a.get('institution', '')} |\n"
+            return text
+
+        elif tool_name == "lifeos_monarch_transactions":
+            txns = data.get("transactions", [])
+            if not txns:
+                return "No transactions found."
+            text = f"Found {len(txns)} transactions ({data.get('start_date', '')} to {data.get('end_date', '')}):\n\n"
+            text += "| Date | Merchant | Category | Amount |\n"
+            text += "|------|----------|----------|--------|\n"
+            for t in txns[:50]:
+                amount = t.get("amount", 0)
+                sign = "" if amount >= 0 else "-"
+                text += f"| {t.get('date', '')} | {t.get('merchant', '')} | {t.get('category', '')} | {sign}${abs(amount):,.2f} |\n"
+            if len(txns) > 50:
+                text += f"\n_... and {len(txns) - 50} more transactions_\n"
+            return text
+
+        elif tool_name == "lifeos_monarch_cashflow":
+            income = data.get("total_income", 0)
+            expenses = data.get("total_expenses", 0)
+            savings = income - expenses
+            rate = data.get("savings_rate", 0)
+            text = f"**Cashflow Summary** ({data.get('start_date', '')} to {data.get('end_date', '')})\n\n"
+            text += f"- **Income**: ${income:,.2f}\n"
+            text += f"- **Expenses**: ${expenses:,.2f}\n"
+            text += f"- **Net Savings**: ${savings:,.2f}\n"
+            text += f"- **Savings Rate**: {rate * 100:.1f}%\n"
+            categories = data.get("categories", [])
+            if categories:
+                text += "\n**Spending by Category:**\n"
+                text += "| Category | Amount |\n"
+                text += "|----------|--------|\n"
+                for c in categories[:15]:
+                    text += f"| {c.get('category', '')} | ${c.get('amount', 0):,.2f} |\n"
+            return text
+
+        elif tool_name == "lifeos_monarch_budgets":
+            budgets = data.get("budgets", [])
+            if not budgets:
+                return "No budgets found."
+            text = f"Found {len(budgets)} budgets ({data.get('start_date', '')} to {data.get('end_date', '')}):\n\n"
+            text += "| Budget | Budgeted | Actual | Remaining |\n"
+            text += "|--------|----------|--------|----------|\n"
+            for b in budgets:
+                text += f"| {b.get('category', '')} | ${b.get('budgeted', 0):,.2f} | ${b.get('actual', 0):,.2f} | ${b.get('remaining', 0):,.2f} |\n"
             return text
 
         elif tool_name == "lifeos_reminder_create":

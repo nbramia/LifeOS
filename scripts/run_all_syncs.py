@@ -290,6 +290,7 @@ SYNC_ORDER = [
     # Pull external content into vault (will be indexed on next run)
     "google_docs",              # Sync Google Docs to vault as markdown
     "google_sheets",            # Sync Google Sheets to vault as markdown
+    "monarch_money",            # Monthly financial summary (runs on 1st only)
 
     # === Phase 6: Post-Sync Cleanup ===
     # Clean up entity data quality issues after all other syncs
@@ -327,6 +328,7 @@ SYNC_SCRIPTS = {
     # Phase 5: Content Sync
     "google_docs": ("scripts/sync_google_docs.py", ["--execute"]),
     "google_sheets": ("scripts/sync_google_sheets.py", ["--execute"]),
+    "monarch_money": ("scripts/sync_monarch_money.py", ["--execute"]),
 
     # Phase 6: Post-Sync Cleanup
     "entity_cleanup": ("scripts/sync_entity_cleanup.py", ["--execute"]),
@@ -677,6 +679,14 @@ def run_all_syncs(
             logger.info(f"Skipping {source}: work integration disabled")
             results[source] = {"skipped": True, "reason": "work_integration_disabled"}
             continue
+
+        # Skip monthly sources unless it's the 1st of the month (or forced)
+        source_info = SYNC_SOURCES.get(source, {})
+        if source_info.get("frequency") == "monthly" and not force and not dry_run:
+            if datetime.now().day != 1:
+                logger.info(f"Skipping {source}: monthly sync, not the 1st (use --force to override)")
+                results[source] = {"skipped": True, "reason": "monthly_not_due"}
+                continue
 
         # Check if recently synced (unless forced)
         if not force and not dry_run:

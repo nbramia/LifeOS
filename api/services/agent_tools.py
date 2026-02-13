@@ -319,6 +319,42 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "search_finances",
+        "description": (
+            "Query live financial data from Monarch Money. "
+            "Actions: 'accounts' (current balances), 'transactions' (recent spending, filterable), "
+            "'cashflow' (income/expenses/savings summary), 'budgets' (budget vs actual by category). "
+            "For historical monthly summaries, use search_vault with 'finance' or 'spending'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["accounts", "transactions", "cashflow", "budgets"],
+                    "description": "What financial data to retrieve.",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date (YYYY-MM-DD). Transactions default to 30 days ago, cashflow/budgets to 1st of current month.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date (YYYY-MM-DD). Defaults to today.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Filter transactions by category name (e.g. 'Groceries', 'Dining').",
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Search transactions by merchant name.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "create_email_draft",
         "description": "Create a Gmail draft email.",
         "input_schema": {
@@ -343,6 +379,85 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["to", "subject", "body"],
+        },
+    },
+    {
+        "name": "create_calendar_event",
+        "description": (
+            "Create a Google Calendar event. IMPORTANT: Before calling this tool, "
+            "present the event details to the user and wait for confirmation. "
+            "No invite emails are sent — the user can send invites from Google Calendar after reviewing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Event title."},
+                "start_time": {"type": "string", "description": "ISO datetime (e.g. 2026-02-14T14:00:00-05:00)."},
+                "end_time": {"type": "string", "description": "ISO datetime."},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses of attendees.",
+                },
+                "description": {"type": "string", "description": "Event description."},
+                "location": {"type": "string", "description": "Event location."},
+                "account": {
+                    "type": "string",
+                    "enum": ["personal", "work"],
+                    "description": "'personal' or 'work'. Default: 'personal'.",
+                },
+            },
+            "required": ["title", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "update_calendar_event",
+        "description": (
+            "Update an existing Google Calendar event. Requires event_id from search_calendar. "
+            "Only provided fields are changed. IMPORTANT: Confirm changes with the user before calling. "
+            "No invite emails are sent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Event ID from search_calendar."},
+                "title": {"type": "string", "description": "New title."},
+                "start_time": {"type": "string", "description": "New start ISO datetime."},
+                "end_time": {"type": "string", "description": "New end ISO datetime."},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "New attendee emails (replaces existing list).",
+                },
+                "description": {"type": "string", "description": "New description."},
+                "location": {"type": "string", "description": "New location."},
+                "account": {
+                    "type": "string",
+                    "enum": ["personal", "work"],
+                    "description": "'personal' or 'work'. Default: 'personal'.",
+                },
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "delete_calendar_event",
+        "description": (
+            "Delete a Google Calendar event. Requires event_id from search_calendar. "
+            "IMPORTANT: Confirm deletion with the user before calling. "
+            "No cancellation emails are sent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Event ID from search_calendar."},
+                "account": {
+                    "type": "string",
+                    "enum": ["personal", "work"],
+                    "description": "'personal' or 'work'. Default: 'personal'.",
+                },
+            },
+            "required": ["event_id"],
         },
     },
 ]
@@ -382,7 +497,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "create_calendar_event", "update_calendar_event", "delete_calendar_event"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -741,6 +856,61 @@ async def _tool_create_email_draft(inp: dict) -> str:
     return "Error: Failed to create email draft."
 
 
+def _tool_create_calendar_event(inp: dict) -> str:
+    from api.services.calendar import CalendarService
+    account_str = inp.get("account", "personal")
+    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    cal = CalendarService(account)
+    event = cal.create_event(
+        title=inp["title"],
+        start_time=inp["start_time"],
+        end_time=inp["end_time"],
+        attendees=inp.get("attendees"),
+        description=inp.get("description"),
+        location=inp.get("location"),
+    )
+    parts = [f"Event created: \"{event.title}\""]
+    parts.append(f"When: {event.start_time.strftime('%Y-%m-%d %H:%M')} – {event.end_time.strftime('%H:%M')}")
+    if event.attendees:
+        parts.append(f"Attendees: {', '.join(event.attendees)}")
+    if event.html_link:
+        parts.append(f"Link: {event.html_link}")
+    parts.append(f"Account: {account_str}")
+    return "\n".join(parts)
+
+
+def _tool_update_calendar_event(inp: dict) -> str:
+    from api.services.calendar import CalendarService
+    account_str = inp.get("account", "personal")
+    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    cal = CalendarService(account)
+    event = cal.update_event(
+        event_id=inp["event_id"],
+        title=inp.get("title"),
+        start_time=inp.get("start_time"),
+        end_time=inp.get("end_time"),
+        attendees=inp.get("attendees"),
+        description=inp.get("description"),
+        location=inp.get("location"),
+    )
+    parts = [f"Event updated: \"{event.title}\""]
+    parts.append(f"When: {event.start_time.strftime('%Y-%m-%d %H:%M')} – {event.end_time.strftime('%H:%M')}")
+    if event.attendees:
+        parts.append(f"Attendees: {', '.join(event.attendees)}")
+    if event.html_link:
+        parts.append(f"Link: {event.html_link}")
+    return "\n".join(parts)
+
+
+def _tool_delete_calendar_event(inp: dict) -> str:
+    from api.services.calendar import CalendarService
+    account_str = inp.get("account", "personal")
+    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    cal = CalendarService(account)
+    cal.delete_event(event_id=inp["event_id"])
+    return f"Event deleted (id: {inp['event_id']}, account: {account_str})"
+
+
 # Handler dispatch table
 def _tool_read_vault_file(inp: dict) -> str:
     from pathlib import Path
@@ -785,6 +955,77 @@ def _tool_read_vault_file(inp: dict) -> str:
         return f"Error reading {match.name}: {e}"
 
 
+async def _tool_search_finances(inp: dict) -> str:
+    from api.services.monarch import get_monarch_client
+
+    action = inp["action"]
+    client = get_monarch_client()
+
+    if action == "accounts":
+        accounts = await client.get_accounts()
+        if not accounts:
+            return "No accounts found."
+        lines = ["| Account | Type | Balance | Institution |", "|---------|------|---------|-------------|"]
+        for a in sorted(accounts, key=lambda x: x["balance"], reverse=True):
+            lines.append(f"| {a['name']} | {a['type']} | ${a['balance']:,.2f} | {a['institution']} |")
+        return "\n".join(lines)
+
+    elif action == "transactions":
+        start = inp.get("start_date")
+        end = inp.get("end_date")
+        if not start:
+            start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        txns = await client.get_transactions(
+            start_date=start, end_date=end,
+            search=inp.get("search", ""), category=inp.get("category"),
+        )
+        if not txns:
+            return "No transactions found."
+        lines = [f"{len(txns)} transactions:"]
+        for t in sorted(txns, key=lambda x: x["date"], reverse=True)[:50]:
+            sign = "" if t["amount"] >= 0 else "-"
+            lines.append(f"- {t['date']} | {t['merchant']} | {t['category']} | {sign}${abs(t['amount']):,.2f}")
+        if len(txns) > 50:
+            lines.append(f"... and {len(txns) - 50} more")
+        return "\n".join(lines)
+
+    elif action == "cashflow":
+        start = inp.get("start_date")
+        end = inp.get("end_date")
+        if not start:
+            now = datetime.now()
+            start = now.replace(day=1).strftime("%Y-%m-%d")
+        cf = await client.get_cashflow_summary(start_date=start, end_date=end)
+        cats = await client.get_cashflow_by_category(start_date=start, end_date=end)
+        lines = [
+            f"**Income**: ${cf['total_income']:,.2f}",
+            f"**Expenses**: ${cf['total_expenses']:,.2f}",
+            f"**Net Savings**: ${cf['total_income'] - cf['total_expenses']:,.2f}",
+            f"**Savings Rate**: {cf['savings_rate'] * 100:.1f}%" if cf['savings_rate'] <= 1 else f"**Savings Rate**: {cf['savings_rate']:.1f}%",
+        ]
+        if cats:
+            lines.append("\nTop categories:")
+            for c in cats[:10]:
+                lines.append(f"- {c['category']}: ${c['amount']:,.2f}")
+        return "\n".join(lines)
+
+    elif action == "budgets":
+        start = inp.get("start_date")
+        end = inp.get("end_date")
+        if not start:
+            now = datetime.now()
+            start = now.replace(day=1).strftime("%Y-%m-%d")
+        budgets = await client.get_budgets(start_date=start, end_date=end)
+        if not budgets:
+            return "No budgets found."
+        lines = ["| Category | Budgeted | Actual | Remaining |", "|----------|----------|--------|-----------|"]
+        for b in budgets:
+            lines.append(f"| {b['category']} | ${b['budgeted']:,.2f} | ${b['actual']:,.2f} | ${b['remaining']:,.2f} |")
+        return "\n".join(lines)
+
+    return f"Error: Unknown search_finances action '{action}'"
+
+
 _TOOL_HANDLERS = {
     "search_vault": _tool_search_vault,
     "read_vault_file": _tool_read_vault_file,
@@ -797,7 +1038,11 @@ _TOOL_HANDLERS = {
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
     "manage_reminders": _tool_manage_reminders,
+    "search_finances": _tool_search_finances,
     "create_email_draft": _tool_create_email_draft,
+    "create_calendar_event": _tool_create_calendar_event,
+    "update_calendar_event": _tool_update_calendar_event,
+    "delete_calendar_event": _tool_delete_calendar_event,
 }
 
 # Status messages for UI feedback when tools execute
@@ -820,5 +1065,13 @@ TOOL_STATUS_MESSAGES = {
     "manage_reminders": "Managing reminders...",
     "manage_reminders.create": "Setting reminder...",
     "manage_reminders.list": "Loading reminders...",
+    "search_finances": "Checking finances...",
+    "search_finances.accounts": "Loading account balances...",
+    "search_finances.transactions": "Searching transactions...",
+    "search_finances.cashflow": "Loading cashflow summary...",
+    "search_finances.budgets": "Checking budgets...",
     "create_email_draft": "Drafting email...",
+    "create_calendar_event": "Creating calendar event...",
+    "update_calendar_event": "Updating calendar event...",
+    "delete_calendar_event": "Deleting calendar event...",
 }
