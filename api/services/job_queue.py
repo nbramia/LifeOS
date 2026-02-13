@@ -1,0 +1,365 @@
+"""
+SQLite-backed job queue for LifeOS.
+
+Provides background job processing so long-running operations (reindex,
+sync) don't block the API. Jobs run one at a time in a background thread
+with status tracking, retry logic, and progress reporting.
+
+Usage:
+    queue = get_job_queue()
+    job_id = queue.enqueue("reindex_vault", params={"force": True})
+    status = queue.get_job(job_id)
+"""
+import json
+import logging
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+# Default DB path: data/jobs.db relative to project root
+_DEFAULT_DB_PATH = str(Path(__file__).parent.parent.parent / "data" / "jobs.db")
+
+# Job status constants
+PENDING = "pending"
+RUNNING = "running"
+COMPLETED = "completed"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+# Registry of job type -> handler function
+_JOB_HANDLERS: dict[str, Callable] = {}
+
+
+def register_job_handler(job_type: str, handler: Callable):
+    """Register a handler function for a job type."""
+    _JOB_HANDLERS[job_type] = handler
+
+
+@dataclass
+class Job:
+    id: str
+    type: str
+    status: str
+    params: dict
+    result: dict | None
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+    attempts: int
+    max_attempts: int
+    priority: int
+    error: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "status": self.status,
+            "params": self.params,
+            "result": self.result,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
+            "priority": self.priority,
+            "error": self.error,
+        }
+
+
+class JobQueue:
+    """SQLite-backed job queue with background worker."""
+
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path or _DEFAULT_DB_PATH
+        self._stop_event = threading.Event()
+        self._worker_thread: threading.Thread | None = None
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    params TEXT NOT NULL DEFAULT '{}',
+                    result TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    priority INTEGER NOT NULL DEFAULT 10,
+                    error TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_status
+                ON jobs (status, priority, created_at)
+            """)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def enqueue(
+        self,
+        job_type: str,
+        params: dict | None = None,
+        max_attempts: int = 3,
+        priority: int = 10,
+    ) -> str:
+        """Add a job to the queue. Returns the job ID."""
+        job_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO jobs (id, type, status, params, created_at, max_attempts, priority)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, job_type, PENDING, json.dumps(params or {}), now, max_attempts, priority),
+            )
+        logger.info(f"Job enqueued: {job_id} ({job_type})")
+        return job_id
+
+    def get_job(self, job_id: str) -> Job | None:
+        """Get a job by ID."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return None
+        return self._row_to_job(row)
+
+    def list_jobs(
+        self,
+        status: str | None = None,
+        job_type: str | None = None,
+        limit: int = 50,
+    ) -> list[Job]:
+        """List jobs with optional filtering."""
+        query = "SELECT * FROM jobs WHERE 1=1"
+        params: list[Any] = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if job_type:
+            query += " AND type = ?"
+            params.append(job_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a pending job. Returns True if cancelled."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status = ? WHERE id = ? AND status = ?",
+                (CANCELLED, job_id, PENDING),
+            )
+        return cur.rowcount > 0
+
+    def _claim_next(self) -> Job | None:
+        """Claim the next pending job (atomic). Returns None if queue is empty."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT * FROM jobs
+                   WHERE status = ?
+                   ORDER BY priority ASC, created_at ASC
+                   LIMIT 1""",
+                (PENDING,),
+            ).fetchone()
+            if not row:
+                return None
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?",
+                (RUNNING, now, row["id"]),
+            )
+        return self._row_to_job(row)
+
+    def _mark_completed(self, job_id: str, result: dict | None = None):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, completed_at = ?, result = ? WHERE id = ?",
+                (COMPLETED, now, json.dumps(result or {}), job_id),
+            )
+
+    def _mark_failed(self, job_id: str, error: str, attempts: int, max_attempts: int):
+        now = datetime.now(timezone.utc).isoformat()
+        # If retries remain, set back to pending; otherwise mark failed
+        new_status = PENDING if attempts < max_attempts else FAILED
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, completed_at = ?, error = ? WHERE id = ?",
+                (new_status, now if new_status == FAILED else None, error, job_id),
+            )
+        if new_status == PENDING:
+            logger.info(f"Job {job_id} will retry (attempt {attempts}/{max_attempts})")
+
+    def _row_to_job(self, row: sqlite3.Row) -> Job:
+        return Job(
+            id=row["id"],
+            type=row["type"],
+            status=row["status"],
+            params=json.loads(row["params"]),
+            result=json.loads(row["result"]) if row["result"] else None,
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            attempts=row["attempts"],
+            max_attempts=row["max_attempts"],
+            priority=row["priority"],
+            error=row["error"],
+        )
+
+    # ---- Worker ----
+
+    def start_worker(self):
+        """Start the background worker thread."""
+        if self._worker_thread and self._worker_thread.is_alive():
+            logger.warning("Worker already running")
+            return
+        self._stop_event.clear()
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+            name="JobQueueWorker",
+        )
+        self._worker_thread.start()
+        logger.info("Job queue worker started")
+
+    def stop_worker(self, timeout: float = 10.0):
+        """Stop the background worker."""
+        self._stop_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=timeout)
+        logger.info("Job queue worker stopped")
+
+    def _worker_loop(self):
+        """Poll for jobs and execute them one at a time."""
+        logger.info("Job queue worker loop started")
+        while not self._stop_event.is_set():
+            try:
+                job = self._claim_next()
+                if job:
+                    self._execute_job(job)
+                else:
+                    # No jobs — sleep 2 seconds before polling again
+                    self._stop_event.wait(timeout=2.0)
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}", exc_info=True)
+                self._stop_event.wait(timeout=5.0)
+
+    def _execute_job(self, job: Job):
+        """Execute a single job."""
+        handler = _JOB_HANDLERS.get(job.type)
+        if not handler:
+            self._mark_failed(job.id, f"No handler for job type: {job.type}", job.attempts + 1, job.max_attempts)
+            return
+
+        logger.info(f"Executing job {job.id} ({job.type}), attempt {job.attempts + 1}/{job.max_attempts}")
+        try:
+            result = handler(job.params)
+            self._mark_completed(job.id, result)
+            logger.info(f"Job {job.id} completed")
+        except Exception as e:
+            logger.error(f"Job {job.id} failed: {e}", exc_info=True)
+            self._mark_failed(job.id, str(e), job.attempts + 1, job.max_attempts)
+
+    def cleanup_old_jobs(self, days: int = 30):
+        """Delete completed/failed jobs older than N days."""
+        cutoff = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """DELETE FROM jobs
+                   WHERE status IN (?, ?, ?)
+                   AND created_at < datetime(?, '-' || ? || ' days')""",
+                (COMPLETED, FAILED, CANCELLED, cutoff, days),
+            )
+        if cur.rowcount:
+            logger.info(f"Cleaned up {cur.rowcount} old jobs")
+
+
+# ---- Job Handlers ----
+
+def _handle_reindex_vault(params: dict) -> dict:
+    """Reindex the vault (runs in worker thread)."""
+    from api.services.indexer import IndexerService
+    from config.settings import settings
+    indexer = IndexerService(vault_path=settings.vault_path)
+    count = indexer.index_all()
+    return {"files_indexed": count}
+
+
+def _handle_sync_source(params: dict) -> dict:
+    """Run a sync for a specific source via subprocess."""
+    import subprocess
+    source = params.get("source", "")
+    if not source:
+        raise ValueError("Missing 'source' parameter")
+
+    # Map source names to sync scripts
+    script_map = {
+        "gmail": "scripts/sync_gmail.py",
+        "calendar": "scripts/sync_calendar.py",
+        "linkedin": "scripts/sync_linkedin.py",
+        "contacts": "scripts/sync_contacts.py",
+        "whatsapp": "scripts/sync_whatsapp.py",
+        "slack": "scripts/sync_slack.py",
+        "vault": "scripts/sync_vault.py",
+    }
+
+    script = script_map.get(source)
+    if not script:
+        raise ValueError(f"Unknown sync source: {source}")
+
+    project_root = Path(__file__).parent.parent.parent
+    script_path = project_root / script
+
+    if not script_path.exists():
+        raise FileNotFoundError(f"Sync script not found: {script}")
+
+    python = Path("~/.venvs/lifeos/bin/python").expanduser()
+    result = subprocess.run(
+        [str(python), str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=3600,  # 1 hour max
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Sync failed (exit {result.returncode}): {result.stderr[:500]}")
+
+    return {"source": source, "stdout": result.stdout[-500:]}
+
+
+# Register built-in handlers
+register_job_handler("reindex_vault", _handle_reindex_vault)
+register_job_handler("sync_source", _handle_sync_source)
+
+
+# ---- Singleton ----
+
+_instance: JobQueue | None = None
+_lock = threading.Lock()
+
+
+def get_job_queue(db_path: str | None = None) -> JobQueue:
+    """Get the singleton JobQueue instance."""
+    global _instance
+    if _instance is None:
+        with _lock:
+            if _instance is None:
+                _instance = JobQueue(db_path=db_path)
+    return _instance

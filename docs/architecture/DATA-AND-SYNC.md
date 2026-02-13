@@ -150,7 +150,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 │  • Immutable - preserves original data                                          │
 │                                                                                  │
 │  TIER 2: PERSON ENTITIES (Canonical Records)                                    │
-│  • Stored in JSON (data/people_entities.json)                                   │
+│  • Stored in SQLite (data/crm.db: person_entities + lookup tables)              │
 │  • One unified record per person                                                │
 │  • Merged data from all sources                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -164,7 +164,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | ChromaDB (Slack) | `lifeos_slack` collection | Slack message vectors | Nightly Slack sync |
 | BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex, File watcher |
 | Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, Granola, Omi, GDoc Sync |
-| PersonEntity | `data/people_entities.json` | Resolved identities | People v2 sync, iMessage sync |
+| PersonEntity | `data/crm.db` (person_entities table) | Resolved identities | People v2 sync, iMessage sync |
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
 | Interactions | `data/crm.db` | Interactions per person | People v2 sync, Slack sync |
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
@@ -172,6 +172,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | Task Index | `data/task_index.json` | Parsed task cache | Task CRUD, file watcher |
 | Reminders | `~/.lifeos/reminders.json` | Scheduled reminders | Reminder CRUD, scheduler |
 | Memories | `~/.lifeos/memories.json` | User-saved memories | Memory CRUD |
+| Job Queue | `data/jobs.db` | Background job tracking | Job queue worker |
 
 ---
 

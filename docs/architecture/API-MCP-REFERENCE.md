@@ -18,8 +18,9 @@ Complete reference for LifeOS API endpoints and MCP tools.
 6. [Task Endpoints](#task-endpoints)
 7. [Reminders & Telegram Endpoints](#reminders--telegram-endpoints)
 8. [Monarch Money Endpoints](#monarch-money-endpoints)
-9. [Admin Endpoints](#admin-endpoints)
-10. [MCP Tools](#mcp-tools)
+9. [Job Queue Endpoints](#job-queue-endpoints)
+10. [Admin Endpoints](#admin-endpoints)
+11. [MCP Tools](#mcp-tools)
 
 ---
 
@@ -61,11 +62,11 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `done` | — | Stream complete |
 
 **Pipeline routing (in order of priority):**
-1. **Direct actions** — compose email, create/list/complete tasks, create/list reminders, task+reminder combos. Handled inline without the agentic loop.
+1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else. Claude gets 11 tools and up to 5 rounds to fetch data and synthesize an answer.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 15 tools and up to 5 rounds to fetch data and synthesize an answer.
 
-**Agentic loop tools (13):**
+**Agentic loop tools (15):**
 
 | Tool | Description |
 |------|-------------|
@@ -82,6 +83,8 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
 | `manage_reminders` | Create or list reminders (action: create/list) |
 | `create_email_draft` | Gmail draft |
+| `save_memory` | Save a memory for future reference |
+| `search_memories` | Search previously saved memories |
 
 **Prompt caching:** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 
@@ -865,6 +868,27 @@ Budget status (budgeted vs actual).
 
 ---
 
+## Job Queue Endpoints
+
+### GET /api/jobs
+
+List recent jobs with optional filtering.
+
+**Query Parameters:**
+- `status` (string): Filter by status (pending, running, completed, failed, cancelled)
+- `type` (string): Filter by job type (e.g., reindex_vault, sync_source)
+- `limit` (int): Max results (default: 50)
+
+### GET /api/jobs/{job_id}
+
+Get a specific job's status, result, and retry information.
+
+### POST /api/jobs/{job_id}/cancel
+
+Cancel a pending job. Only pending jobs can be cancelled.
+
+---
+
 ## Admin Endpoints
 
 ### GET /api/admin/health
@@ -877,11 +901,20 @@ Full health check including all services.
 
 ### POST /api/admin/reindex
 
-Trigger vault reindex (background).
+Enqueue a vault reindex job. Returns immediately with a job ID. Use `GET /api/jobs/{job_id}` to check progress. Prevents duplicates (won't enqueue if already pending/running).
+
+**Response:**
+```json
+{
+  "status": "started",
+  "message": "Reindex enqueued. Check /api/jobs/{job_id} for progress.",
+  "job_id": "abc123"
+}
+```
 
 ### POST /api/admin/reindex/sync
 
-Trigger vault reindex (blocking).
+Trigger vault reindex (blocking). Use for initial setup only.
 
 ### GET /api/admin/calendar/status
 
@@ -967,6 +1000,15 @@ claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
 | `lifeos_memories_create` | POST /api/memories | Save memory |
 | `lifeos_memories_search` | GET /api/memories/search | Search memories |
 | `lifeos_conversations_list` | GET /api/conversations | List chats |
-| `lifeos_health` | GET /health/full | Health check |
+| `lifeos_person_update` | PATCH /api/crm/people/{id} | Update person profile |
+| `lifeos_person_fact_update` | PUT /api/crm/people/{id}/facts/{fid} | Update a fact |
+| `lifeos_person_fact_confirm` | POST /api/crm/people/{id}/facts/{fid}/confirm | Confirm a fact |
+| `lifeos_person_fact_delete` | DELETE /api/crm/people/{id}/facts/{fid} | Delete a fact |
+| `lifeos_reminder_update` | PUT /api/reminders/{id} | Update a reminder |
+| `lifeos_sync_trigger` | POST /api/admin/sync | Trigger data sync |
+| `lifeos_calendar_create` | POST /api/calendar/events | Create calendar event |
+| `lifeos_calendar_update` | PUT /api/calendar/events/{id} | Update calendar event |
+| `lifeos_calendar_delete` | DELETE /api/calendar/events/{id} | Delete calendar event |
+| `lifeos_health` | GET /health/services | Service health check |
 
 See [MCP Tools PRD](../prd/MCP-TOOLS.md) for detailed tool specifications.

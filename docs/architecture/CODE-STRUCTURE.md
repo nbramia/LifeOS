@@ -17,7 +17,8 @@ api/
 ├── main.py                    # FastAPI application entry point
 ├── routes/                    # API route handlers
 │   ├── __init__.py            # Router exports
-│   ├── admin.py               # Admin endpoints
+│   ├── admin.py               # Admin endpoints (reindex via job queue)
+│   ├── jobs.py                # Job queue status API
 │   ├── ask.py                 # Chat endpoints
 │   ├── briefings.py           # People briefings
 │   ├── calendar.py            # Calendar integration
@@ -63,6 +64,7 @@ api/
 | gmail.py | ~350 | 6 | Gmail integration |
 | slack.py | ~500 | 10 | Slack integration |
 | admin.py | ~300 | 15 | Admin/maintenance |
+| jobs.py | ~70 | 3 | Job queue status |
 
 ### Services (api/services/)
 
@@ -92,6 +94,9 @@ api/
 **Task Management:**
 - `task_manager.py` - Task CRUD, markdown I/O, index persistence, fuzzy query
 
+**Background Jobs:**
+- `job_queue.py` - SQLite-backed job queue with worker thread (reindex, sync)
+
 **Telegram & Scheduling:**
 - `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands)
 - `claude_orchestrator.py` - Claude Code subprocess lifecycle, stream parsing, [NOTIFY] relay
@@ -107,9 +112,9 @@ api/
 - `embeddings.py` - Embedding generation
 
 **Chat & Query Processing:**
-- `chat_helpers.py` - Query parsing, unified intent classification (compose, task CRUD, reminder CRUD, task+reminder, code), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback).
+- `chat_helpers.py` - Query parsing, intent classification (ambiguous task/reminder, code), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback). Compose/task/reminder intents now flow through the agentic loop.
 - `agent_loop.py` - Agentic chat loop: multi-turn conversation where Claude autonomously calls tools. Async generator yielding streamed text, tool status, and final result with cost tracking. Supports prompt caching.
-- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 12 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads. Prompt cache breakpoint on tool definitions.
+- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 15 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads, `save_memory` and `search_memories` for agent memory. Prompt cache breakpoint on tool definitions.
 - `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block for Anthropic prompt caching.
 - `query_router.py` - LLM-based query routing with person name extraction (used by non-agentic paths)
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)

@@ -99,12 +99,29 @@ Reminders can also be managed via natural language chat. See [Reminders Guide](.
 | `lifeos_reminder_delete` | Delete a reminder |
 | `lifeos_telegram_send` | Send an ad-hoc Telegram message |
 
+### CRM Write Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_person_update` | Update person profile (notes, tags, category, birthday) |
+| `lifeos_person_fact_update` | Update an extracted fact |
+| `lifeos_person_fact_confirm` | Confirm a fact as accurate |
+| `lifeos_person_fact_delete` | Delete an incorrect fact |
+
+### Calendar Write Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_calendar_create` | Create a Google Calendar event |
+| `lifeos_calendar_update` | Update a calendar event |
+| `lifeos_calendar_delete` | Delete a calendar event |
+
 ### Memory & Admin Tools
 | Tool | Description |
 |------|-------------|
 | `lifeos_memories_create` | Save a memory |
 | `lifeos_memories_search` | Search saved memories |
 | `lifeos_conversations_list` | List chat conversations |
+| `lifeos_reminder_update` | Update an existing reminder |
+| `lifeos_sync_trigger` | Trigger data sync for a source |
 | `lifeos_health` | Check service health |
 
 ---

@@ -34,7 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, tasks, monarch
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, tasks, monarch, jobs
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ _people_v2_sync_thread = None
 _people_v2_stop_event = threading.Event()
 _telegram_listener = None
 _reminder_scheduler = None
+_job_queue = None
 
 
 def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[int, int]] = None, timezone: str = "America/New_York"):
@@ -168,7 +169,7 @@ def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[i
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _granola_processor, _omi_processor, _calendar_indexer, _people_v2_sync_thread, _telegram_listener, _reminder_scheduler
+    global _granola_processor, _omi_processor, _calendar_indexer, _people_v2_sync_thread, _telegram_listener, _reminder_scheduler, _job_queue
 
     # Startup: Initialize and start Granola processor
     try:
@@ -233,6 +234,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start reminder scheduler: {e}")
 
+    # Startup: Start job queue worker
+    try:
+        from api.services.job_queue import get_job_queue
+        _job_queue = get_job_queue()
+        _job_queue.start_worker()
+        logger.info("Job queue worker started")
+    except Exception as e:
+        logger.error(f"Failed to start job queue worker: {e}")
+
     yield  # Application runs here
 
     # Shutdown: Stop services
@@ -271,6 +281,10 @@ async def lifespan(app: FastAPI):
         _reminder_scheduler.stop()
         logger.info("Reminder scheduler stopped")
 
+    if _job_queue:
+        _job_queue.stop_worker()
+        logger.info("Job queue worker stopped")
+
 
 app = FastAPI(
     title="LifeOS",
@@ -307,6 +321,7 @@ app.include_router(photos.router)
 app.include_router(reminders.router)
 app.include_router(tasks.router)
 app.include_router(monarch.router)
+app.include_router(jobs.router)
 
 # Serve static files
 web_dir = Path(__file__).parent.parent / "web"
