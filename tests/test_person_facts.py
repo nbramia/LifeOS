@@ -855,8 +855,8 @@ class TestValidateAndDedup:
         assert result[0].value == fact_a.value  # The more detailed one survives
 
 
-class TestWordOverlapDedup:
-    """Tests for programmatic word-overlap deduplication."""
+class TestSemanticDedupOllama:
+    """Tests for Ollama-based semantic deduplication."""
 
     @pytest.fixture
     def extractor(self):
@@ -869,41 +869,93 @@ class TestWordOverlapDedup:
             value=value, confidence=0.7,
         )
 
-    def test_removes_candidate_overlapping_existing(self, extractor):
-        """Candidate overlapping with existing fact in same category is removed."""
+    @pytest.mark.asyncio
+    async def test_removes_duplicate_of_existing(self, extractor):
+        """Ollama identifies candidate as duplicate of existing fact."""
         existing = [self._make_fact("Goes backpacking regularly")]
         candidates = [self._make_fact("Participates in backpacking trips")]
 
-        result = extractor._word_overlap_dedup(candidates, existing)
+        mock_result = {"remove": [
+            {"candidate": 0, "reason": "Same topic as E0 (backpacking)"}
+        ]}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._semantic_dedup_ollama(candidates, existing, "John")
+
         assert len(result) == 0
 
-    def test_keeps_candidate_different_topic(self, extractor):
-        """Candidate with different topic is kept."""
+    @pytest.mark.asyncio
+    async def test_keeps_different_topic(self, extractor):
+        """Ollama keeps candidates with different topics."""
         existing = [self._make_fact("Goes backpacking regularly")]
         candidates = [self._make_fact("Plays piano every weekend")]
 
-        result = extractor._word_overlap_dedup(candidates, existing)
+        mock_result = {"remove": []}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._semantic_dedup_ollama(candidates, existing, "John")
+
         assert len(result) == 1
 
-    def test_dedup_candidates_against_each_other(self, extractor):
-        """Among overlapping candidates, keeps the longest."""
+    @pytest.mark.asyncio
+    async def test_dedup_candidates_against_each_other(self, extractor):
+        """Ollama removes duplicate candidates within the batch."""
         candidates = [
-            self._make_fact("backpacking"),
-            self._make_fact("Goes backpacking"),
             self._make_fact("Interested in backpacking and signed up for a trip"),
+            self._make_fact("Goes backpacking regularly"),
         ]
-        result = extractor._word_overlap_dedup(candidates, [])
+
+        mock_result = {"remove": [
+            {"candidate": 1, "reason": "Same topic as C0 (backpacking)"}
+        ]}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._semantic_dedup_ollama(candidates, [], "John")
 
         assert len(result) == 1
-        assert "signed up" in result[0].value  # Longest survives
+        assert "signed up" in result[0].value
 
-    def test_different_categories_not_deduped(self, extractor):
-        """Facts in different categories are not deduped against each other."""
-        existing = [self._make_fact("Works at Google as an engineer", category="work")]
-        candidates = [self._make_fact("Met someone who works at Google", category="background")]
+    @pytest.mark.asyncio
+    async def test_skips_when_ollama_unavailable(self, extractor):
+        """All candidates kept when Ollama is unavailable."""
+        candidates = [
+            self._make_fact("Goes backpacking"),
+            self._make_fact("Participates in backpacking trips"),
+        ]
 
-        result = extractor._word_overlap_dedup(candidates, existing)
-        assert len(result) == 1  # Different category, kept
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=False)
+
+            result = await extractor._semantic_dedup_ollama(candidates, [], "John")
+
+        assert len(result) == 2  # All kept, no dedup
+
+    @pytest.mark.asyncio
+    async def test_handles_ollama_error_gracefully(self, extractor):
+        """All candidates kept when Ollama call fails."""
+        candidates = [self._make_fact("Goes backpacking")]
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(side_effect=Exception("Connection failed"))
+
+            result = await extractor._semantic_dedup_ollama(candidates, [], "John")
+
+        assert len(result) == 1  # Kept despite error
 
 
 class TestGenerateFactKey:
