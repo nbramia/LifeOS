@@ -17,12 +17,11 @@ from api.services.entity_resolver import (
 
 # Module-level fixtures available to all test classes
 @pytest.fixture
-def temp_store():
+def temp_store(tmp_path):
     """Create a temporary entity store for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        store = PersonEntityStore(f.name)
-        yield store
-        Path(f.name).unlink(missing_ok=True)
+    db_path = str(tmp_path / "test_entity_resolver.db")
+    store = PersonEntityStore(db_path)
+    yield store
 
 
 @pytest.fixture

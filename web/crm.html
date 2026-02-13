@@ -16784,7 +16784,7 @@
         // Render a single fact as a bullet point
         function renderFactItem(fact) {
             const unconfirmedClass = fact.confirmed_by_user ? '' : 'unconfirmed';
-            const factSentence = formatFactAsSentence(fact.key, fact.value);
+            const factSentence = fact.value;
             const confidencePercent = Math.round(fact.confidence * 100);
 
             // Confidence level - High/Mid/Low
@@ -16830,59 +16830,6 @@
             if (sourceLink.includes('calendar.google.com')) return String.fromCodePoint(0x1F4C5);
             if (sourceLink.startsWith('obsidian://')) return String.fromCodePoint(0x1F4DD);
             return String.fromCodePoint(0x1F517);
-        }
-
-        // Format a fact key/value pair as a natural sentence
-        function formatFactAsSentence(key, value) {
-            const keyLower = key.toLowerCase().replace(/_/g, ' ');
-
-            // Common patterns for natural phrasing
-            const patterns = {
-                'spouse': `Spouse is ${value}`,
-                'spouse name': `Spouse is ${value}`,
-                'partner': `Partner is ${value}`,
-                'kids': `Has kids: ${value}`,
-                'children': `Has children: ${value}`,
-                'birthday': `Birthday is ${value}`,
-                'birth date': `Birthday is ${value}`,
-                'company': `Works at ${value}`,
-                'employer': `Works at ${value}`,
-                'job title': `Works as ${value}`,
-                'role': `Role is ${value}`,
-                'title': `Title is ${value}`,
-                'hometown': `From ${value}`,
-                'location': `Located in ${value}`,
-                'city': `Lives in ${value}`,
-                'email': `Email is ${value}`,
-                'phone': `Phone is ${value}`,
-                'alma mater': `Studied at ${value}`,
-                'school': `Studied at ${value}`,
-                'university': `Attended ${value}`,
-                'hobby': `Enjoys ${value}`,
-                'hobbies': `Enjoys ${value}`,
-                'interest': `Interested in ${value}`,
-                'interests': `Interested in ${value}`,
-                'favorite': `Favorite: ${value}`,
-                'pet': `Has a pet: ${value}`,
-                'pets': `Has pets: ${value}`,
-                'anniversary': `Anniversary is ${value}`,
-                // Summary category patterns
-                'relationship trajectory': value,
-                'key themes': `Key themes: ${value}`,
-                'major events': `Major events: ${value}`,
-                'communication style': `Communication style: ${value}`,
-            };
-
-            // Check for exact or partial matches
-            for (const [pattern, template] of Object.entries(patterns)) {
-                if (keyLower === pattern || keyLower.includes(pattern)) {
-                    return template;
-                }
-            }
-
-            // Default: capitalize key and use "is" connector
-            const capitalizedKey = keyLower.charAt(0).toUpperCase() + keyLower.slice(1);
-            return `${capitalizedKey} is ${value}`;
         }
 
         // Format source attribution text
