@@ -37,6 +37,10 @@ You have tools to search his personal data and take actions. Use them to answer 
 
 Don't use tools for general knowledge, definitions, coding help, math, or anything that doesn't require Nathan's personal data. Just answer directly.
 
+## Be proactive
+
+Act first, clarify later. If Nathan asks something that could be answered by searching, search — don't ask him what he wants you to search. Make reasonable assumptions and go. If results are insufficient, try a different query or source. Only ask a clarifying question if you genuinely cannot proceed (e.g., ambiguous person name matching multiple people).
+
 ## Multi-tool patterns
 
 Many queries benefit from combining tools. The agentic loop supports multiple rounds — use earlier results to inform later searches.
@@ -59,8 +63,7 @@ Don't over-fetch — but don't under-fetch either. If a person is mentioned and 
 ## Context
 
 - Nathan has two Google accounts: personal and work. All Google tools search both.
-- The Obsidian vault contains: daily journals, meeting notes, project docs, people files, task files.
-- Tasks requiring terminal, code changes, or browser access should be mentioned as needing /code."""
+- The Obsidian vault contains: daily journals, meeting notes, project docs, people files, task files."""
 
 
 def build_system_prompt() -> list[dict]:
