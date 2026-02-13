@@ -855,6 +855,57 @@ class TestValidateAndDedup:
         assert result[0].value == fact_a.value  # The more detailed one survives
 
 
+class TestWordOverlapDedup:
+    """Tests for programmatic word-overlap deduplication."""
+
+    @pytest.fixture
+    def extractor(self):
+        return PersonFactExtractor(fact_store=MagicMock())
+
+    def _make_fact(self, value, category="interests"):
+        return PersonFact(
+            person_id="person-1", category=category,
+            key=PersonFactExtractor(fact_store=MagicMock())._generate_fact_key(category, value),
+            value=value, confidence=0.7,
+        )
+
+    def test_removes_candidate_overlapping_existing(self, extractor):
+        """Candidate overlapping with existing fact in same category is removed."""
+        existing = [self._make_fact("Goes backpacking regularly")]
+        candidates = [self._make_fact("Participates in backpacking trips")]
+
+        result = extractor._word_overlap_dedup(candidates, existing)
+        assert len(result) == 0
+
+    def test_keeps_candidate_different_topic(self, extractor):
+        """Candidate with different topic is kept."""
+        existing = [self._make_fact("Goes backpacking regularly")]
+        candidates = [self._make_fact("Plays piano every weekend")]
+
+        result = extractor._word_overlap_dedup(candidates, existing)
+        assert len(result) == 1
+
+    def test_dedup_candidates_against_each_other(self, extractor):
+        """Among overlapping candidates, keeps the longest."""
+        candidates = [
+            self._make_fact("backpacking"),
+            self._make_fact("Goes backpacking"),
+            self._make_fact("Interested in backpacking and signed up for a trip"),
+        ]
+        result = extractor._word_overlap_dedup(candidates, [])
+
+        assert len(result) == 1
+        assert "signed up" in result[0].value  # Longest survives
+
+    def test_different_categories_not_deduped(self, extractor):
+        """Facts in different categories are not deduped against each other."""
+        existing = [self._make_fact("Works at Google as an engineer", category="work")]
+        candidates = [self._make_fact("Met someone who works at Google", category="background")]
+
+        result = extractor._word_overlap_dedup(candidates, existing)
+        assert len(result) == 1  # Different category, kept
+
+
 class TestGenerateFactKey:
     """Tests for the _generate_fact_key helper."""
 
