@@ -111,10 +111,20 @@ Search tools:
 - lifeos_calendar_upcoming: Get upcoming events for the next N days.
 - lifeos_drive_search: Search Google Drive files by name or content.
 
+Finance tools (Monarch Money — live data):
+- lifeos_monarch_accounts: List all financial accounts with current balances. Returns account name, type (checking, savings, credit card, investment), balance, and institution.
+- lifeos_monarch_transactions: Search recent transactions. Filter by start_date, end_date, category, or merchant name (search param). Returns date, merchant, category, amount, account. Defaults to last 30 days.
+- lifeos_monarch_cashflow: Cashflow summary for a date range. Returns total income, expenses, savings rate, and spending breakdown by category. Defaults to current month.
+- lifeos_monarch_budgets: Current budget status. Returns each budget category with budgeted amount, actual spending, and remaining balance. Defaults to current month.
+Note: Monthly financial summaries are also synced to the vault at Personal/Finance/Monarch/YYYY-MM.md — searchable via lifeos_search.
+
 Action tools:
 - lifeos_task_create/list/update/complete/delete: Manage Obsidian tasks.
 - lifeos_reminder_create/list/delete: Manage scheduled Telegram reminders.
 - lifeos_gmail_draft: Create a draft email in Gmail (not sent, user reviews first).
+- lifeos_calendar_create: Create a Google Calendar event. No invite emails sent. [CLARIFY] with user before creating.
+- lifeos_calendar_update: Update an existing calendar event (title, time, attendees, etc.). Requires event_id from lifeos_calendar_search. [CLARIFY] before updating.
+- lifeos_calendar_delete: Delete a calendar event. Requires event_id from lifeos_calendar_search. [CLARIFY] before deleting.
 - lifeos_telegram_send: Send an immediate message via Telegram.
 - lifeos_meeting_prep: Get intelligent meeting preparation context for a date.
 - lifeos_memories_create/search: Save and retrieve persistent memories.
@@ -181,6 +191,7 @@ class ClaudeSession:
     last_notify_at: float = field(default_factory=time.time)
     pending_clarification: str = ""  # Last [CLARIFY] question text
     last_activity: str = ""  # Brief description of last tool/action for heartbeat context
+    notifications_sent: int = 0  # Count of [NOTIFY] messages relayed during this session
 
 
 FOLLOWUP_WINDOW = 300  # 5 minutes to send follow-ups to completed sessions
@@ -464,6 +475,7 @@ class ClaudeOrchestrator:
                         if notify_text and self._notification_callback:
                             self._notification_callback(notify_text)
                             session.last_notify_at = time.time()
+                            session.notifications_sent += 1
                         # For plan mode, accumulate plan text
                         if session.plan_mode and session.status == "running":
                             session.plan_text += notify_text + "\n"
@@ -502,12 +514,11 @@ class ClaudeOrchestrator:
                         "Reply 'approve' to proceed or 'reject' to cancel."
                     )
             else:
-                # Task complete
-                if self._notification_callback:
-                    if result_text:
-                        self._notification_callback(result_text[:3000])
-                    else:
-                        self._notification_callback("Claude Code session completed.")
+                # Task complete — only send a fallback if no [NOTIFY] was
+                # already relayed.  Never send raw result_text: it contains
+                # reasoning/thinking plus duplicate [NOTIFY] content.
+                if self._notification_callback and not session.notifications_sent:
+                    self._notification_callback("Claude Code session completed.")
                 self._cleanup("completed")
 
     def _on_timeout(self, session: ClaudeSession):

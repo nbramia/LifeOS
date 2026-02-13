@@ -133,8 +133,9 @@ class TestHandleEvent:
 
         assert session.session_id == "sess-final"
         assert session.cost_usd == 0.0042
+        # No [NOTIFY] was sent during session, so fallback message is used
         assert len(notifications) == 1
-        assert "All done!" in notifications[0]
+        assert "completed" in notifications[0].lower()
 
     def test_result_event_empty_result_still_notifies(self):
         from api.services.claude_orchestrator import ClaudeSession
@@ -521,8 +522,9 @@ class TestMaxTurnsAndCostCap:
         }
         orch._handle_event(event, session)
 
+        # No [NOTIFY] was sent during session, so fallback message is used
         assert len(notifications) == 1
-        assert "All done!" in notifications[0]
+        assert "completed" in notifications[0].lower()
 
 
 class TestToolCallTracking:
