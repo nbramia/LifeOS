@@ -830,6 +830,30 @@ class TestValidateAndDedup:
         assert len(result) == 1
         assert result[0].confidence <= 0.7
 
+    @pytest.mark.asyncio
+    async def test_merges_duplicate_candidates(self, extractor):
+        """Ollama merges duplicate candidates within the same batch."""
+        fact_a = self._make_fact(value="Interested in backpacking and signed up for a trip")
+        fact_b = self._make_fact(value="Goes backpacking regularly")
+
+        mock_result = {"decisions": [
+            {"candidate": 0, "action": "keep", "evidence_strength": 4,
+             "reason": "Most detailed backpacking fact"},
+            {"candidate": 1, "action": "merge", "merge_into_candidate": 0,
+             "reason": "Same topic as C0 — backpacking"},
+        ]}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_and_dedup_ollama([fact_a, fact_b], [], "John")
+
+        assert len(result) == 1
+        assert "backpacking" in result[0].value.lower()
+        assert result[0].value == fact_a.value  # The more detailed one survives
+
 
 class TestGenerateFactKey:
     """Tests for the _generate_fact_key helper."""

@@ -1065,7 +1065,7 @@ class PersonFactExtractor:
         existing_block = "\n".join(existing_lines) if existing_lines else "(none)"
         candidate_block = "\n".join(candidate_lines)
 
-        prompt = f"""Validate candidate facts about {person_name} and check for duplicates against existing facts.
+        prompt = f"""Validate candidate facts about {person_name}. Check for duplicates against BOTH existing facts AND other candidates.
 
 EXISTING FACTS (already stored):
 {existing_block}
@@ -1094,14 +1094,31 @@ For each candidate [C0], [C1], etc., return a JSON array with one decision per c
       "updates_existing": 0,
       "evidence_strength": 4,
       "reason": "More detailed version of E0"
+    }},
+    {{
+      "candidate": 3,
+      "action": "merge",
+      "merge_into_candidate": 0,
+      "reason": "Same topic as C0 — backpacking"
     }}
   ]
 }}
 
-RULES:
+ACTIONS:
 - "keep": New, unique, specific fact. Assign evidence_strength 1-5.
 - "reject": Universal/obvious, wrong person, unsupported by quote, too vague, or fewer than 5 words.
-- "update": Same core fact as an existing one but with more/better detail. Specify which existing fact it updates via "updates_existing" index. If the existing fact is marked [USER-CONFIRMED], use "keep" instead (don't overwrite confirmed facts).
+- "update": Same core topic as an EXISTING fact but with more/better detail. Specify "updates_existing" index. If the existing fact is marked [USER-CONFIRMED], use "keep" instead (don't overwrite confirmed facts).
+- "merge": Same core topic as another CANDIDATE in this batch. Keep the most detailed version, merge the rest into it via "merge_into_candidate" index. Only the target candidate survives.
+
+CRITICAL — DEDUPLICATION:
+Two facts are duplicates if they describe the SAME core topic about this person, even if worded differently. Examples of duplicates:
+- "Goes backpacking" and "Interested in backpacking and signed up for a trip" → SAME TOPIC (backpacking)
+- "Has a daughter named Emma" and "Daughter Emma plays soccer" → SAME TOPIC (daughter Emma)
+- "Works at Google" and "Software engineer at Google" → SAME TOPIC (works at Google)
+When in doubt, merge/update. It is much worse to keep duplicates than to accidentally merge two slightly different facts.
+
+Check EVERY candidate against ALL existing facts AND all other candidates for overlap. Be aggressive about dedup.
+
 - evidence_strength: 1=weak inference, 2=implied, 3=stated once, 4=clearly stated, 5=explicitly confirmed multiple times.
 
 Return ONLY valid JSON."""
@@ -1121,13 +1138,25 @@ Return ONLY valid JSON."""
                 if idx is not None:
                     decision_map[idx] = d
 
+            # First pass: identify which candidates are merged away
+            merged_away = set()
+            for d in decisions:
+                if d.get("action") == "merge":
+                    merged_away.add(d.get("candidate"))
+
             validated = []
             kept = 0
             rejected = 0
+            merged = 0
 
             confidence_map = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
 
             for i, fact in enumerate(new_facts):
+                # Skip candidates that were merged into another candidate
+                if i in merged_away:
+                    merged += 1
+                    continue
+
                 decision = decision_map.get(i)
 
                 if not decision:
@@ -1163,10 +1192,12 @@ Return ONLY valid JSON."""
                         kept += 1
                         validated.append(fact)
 
-                else:  # reject
+                else:  # reject or unrecognized
                     rejected += 1
 
-            logger.info(f"Validation+dedup: {kept} kept, {rejected} rejected/deduped")
+            logger.info(
+                f"Validation+dedup: {kept} kept, {rejected} rejected, {merged} merged"
+            )
             return validated
 
         except Exception as e:
@@ -1271,17 +1302,18 @@ Return ONLY valid JSON with this structure (no markdown, no explanation):
 }}
 
 VALUE QUALITY RULES:
-- The "value" field is displayed directly to the user. It MUST be a complete sentence or phrase.
-- MUST be at least 5 words long.
+- The "value" field is displayed directly to the user. Write it as a readable phrase or sentence.
 - MUST contain at least one specific detail (a name, place, date, or quantifiable detail).
 - NEVER use boolean values ("true", "false", "yes", "no").
 - NEVER use bare names ("Emma") or fragments ("monthly onsites").
 - GOOD: "Has a daughter named Emma who plays soccer"
-- GOOD: "Allergic to shellfish and carries an EpiPen"
+- GOOD: "Allergic to shellfish"
 - GOOD: "Grew up in Portland, Oregon"
 - BAD: "Emma" (bare name — not a sentence)
 - BAD: "true" (boolean — write what the fact actually is)
 - BAD: "monthly West Coast onsites" (fragment — write "Travels to the West Coast monthly for onsites")
+
+EXTRACT GENEROUSLY — aim for 10-20 facts per person. It's better to extract too many (the validation step will filter) than to miss interesting details. Extract every specific, personal detail you can find.
 
 NEVER EXTRACT these (obvious/universal — not useful):
 - Having parents, siblings, or family in general (unless you know NAMES or specifics)
