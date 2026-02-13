@@ -262,6 +262,12 @@ class ClaudeOrchestrator:
 
         logger.info(f"Spawning Claude Code in {session.working_dir}: {session.task[:80]}")
 
+        # Strip Claude Code env vars so the child process doesn't think
+        # it's inside an existing session (happens when server was started
+        # from a Claude Code terminal).
+        clean_env = {k: v for k, v in os.environ.items()
+                     if not k.startswith("CLAUDE")}
+
         try:
             self._process = subprocess.Popen(
                 cmd,
@@ -269,6 +275,7 @@ class ClaudeOrchestrator:
                 stderr=subprocess.PIPE,
                 cwd=session.working_dir,
                 text=True,
+                env=clean_env,
             )
         except FileNotFoundError:
             logger.error(f"Claude binary not found at {settings.claude_binary}")
