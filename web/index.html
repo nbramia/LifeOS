@@ -3552,6 +3552,9 @@
                                     // Capture which sources are being used
                                     routingSources = data.sources || [];
                                     console.log('Routing to:', routingSources);
+                                } else if (data.type === 'self_correction') {
+                                    fullContent = '';
+                                    updateMessage(msgId, '');
                                 } else if (data.type === 'content') {
                                     fullContent += data.content;
                                     updateMessage(msgId, fullContent);

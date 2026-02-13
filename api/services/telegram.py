@@ -228,6 +228,8 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                     continue
                 if event.get("type") == "content":
                     full_text += event.get("content", "")
+                elif event.get("type") == "self_correction":
+                    full_text = ""
                 elif event.get("type") == "conversation_id":
                     conv_id = event.get("conversation_id", conv_id)
                 elif event.get("type") == "code_intent":

@@ -1726,6 +1726,8 @@ async def ask_stream(request: AskStreamRequest):
                     yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"
                 elif event["type"] == "status":
                     yield f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n"
+                elif event["type"] == "self_correction":
+                    yield f"data: {json.dumps({'type': 'self_correction'})}\n\n"
                 elif event["type"] == "result":
                     agent_result = event["result"]
 

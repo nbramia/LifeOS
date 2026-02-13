@@ -141,8 +141,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_web",
         "description": (
-            "Search the web for current information (weather, news, prices, public facts). "
-            "Only use for information that wouldn't be in Nathan's personal data."
+            "Search the web for current or real-time information — weather, news, prices, "
+            "rankings, benchmarks, reviews, technical specs, documentation, or any public facts "
+            "that may have changed. Use whenever the answer requires up-to-date information. "
+            "You have full web access through this tool."
         ),
         "input_schema": {
             "type": "object",
