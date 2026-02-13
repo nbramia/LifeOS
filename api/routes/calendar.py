@@ -20,6 +20,28 @@ from api.services.meeting_prep import get_meeting_prep, MeetingPrep, RelatedNote
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
 
 
+class CreateEventRequest(BaseModel):
+    """Request to create a calendar event."""
+    title: str
+    start_time: str  # ISO datetime
+    end_time: str    # ISO datetime
+    attendees: list[str] = []
+    description: Optional[str] = None
+    location: Optional[str] = None
+    account: str = "personal"
+
+
+class UpdateEventRequest(BaseModel):
+    """Request to update a calendar event."""
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    attendees: Optional[list[str]] = None
+    description: Optional[str] = None
+    location: Optional[str] = None
+    account: str = "personal"
+
+
 class EventResponse(BaseModel):
     """Response model for a calendar event."""
     event_id: str
@@ -215,6 +237,83 @@ async def get_event(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch event: {e}")
+
+
+@router.post("/events", response_model=EventResponse)
+async def create_event(request: CreateEventRequest):
+    """
+    **Create a Google Calendar event.**
+
+    Creates an event on the specified account. Invite emails are
+    automatically sent to attendees.
+    """
+    try:
+        account_type = GoogleAccount.PERSONAL if request.account == "personal" else GoogleAccount.WORK
+        service = get_calendar_service(account_type)
+        event = service.create_event(
+            title=request.title,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            attendees=request.attendees or None,
+            description=request.description,
+            location=request.location,
+        )
+        return _event_to_response(event)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create event: {e}")
+
+
+@router.put("/events/{event_id}", response_model=EventResponse)
+async def update_event(
+    event_id: str,
+    request: UpdateEventRequest,
+):
+    """
+    **Update an existing calendar event.**
+
+    Only provided fields are updated; others remain unchanged.
+    Update emails are sent to attendees.
+    """
+    try:
+        account_type = GoogleAccount.PERSONAL if request.account == "personal" else GoogleAccount.WORK
+        service = get_calendar_service(account_type)
+        event = service.update_event(
+            event_id=event_id,
+            title=request.title,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            attendees=request.attendees,
+            description=request.description,
+            location=request.location,
+        )
+        return _event_to_response(event)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update event: {e}")
+
+
+@router.delete("/events/{event_id}")
+async def delete_event(
+    event_id: str,
+    account: str = Query(default="personal", description="Account: personal or work"),
+):
+    """
+    **Delete a calendar event.**
+
+    Cancellation emails are sent to attendees.
+    """
+    try:
+        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        service = get_calendar_service(account_type)
+        service.delete_event(event_id=event_id)
+        return {"deleted": True, "event_id": event_id}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete event: {e}")
 
 
 @router.get("/meeting-prep", response_model=MeetingPrepListResponse)

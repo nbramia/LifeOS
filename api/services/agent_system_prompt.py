@@ -62,7 +62,7 @@ Live financial data from Monarch Money. Use 'accounts' for current balances, 'tr
 Create a Gmail draft email.
 
 **create_calendar_event:**
-Creates a Google Calendar event on personal or work account. No invite emails are sent — the user reviews and sends invites from Google Calendar. ALWAYS present the event details and ask the user to confirm before calling this tool.
+Creates a Google Calendar event on personal or work account. Invite emails are automatically sent to attendees. ALWAYS present the event details and ask the user to confirm before calling this tool.
 
 **update_calendar_event:**
 Updates an existing calendar event (title, time, attendees, etc.). Requires event_id from search_calendar. ALWAYS confirm changes with the user first.
