@@ -102,7 +102,22 @@ ROUTING GUIDANCE based on active_channels:
 - No active channels → Check profile for notes (dormant contact)""",
         "method": "GET"
     },
-    "/health/full": {
+    "/api/crm/people/{entity_id}:PATCH": {
+        "name": "lifeos_person_update",
+        "description": """Update a person's profile in the CRM. Can set notes, tags, category, or birthday. Requires entity_id from lifeos_people_search. Only provided fields are changed.
+
+PARAMETERS:
+- entity_id (required): Person entity ID from lifeos_people_search
+- notes: Free-text notes (replaces existing)
+- tags: Classification tags (replaces existing)
+- category: work, personal, family, or other
+- birthday: MM-DD format (month-day only), empty string to clear
+
+FOLLOW-UP TOOLS: Use lifeos_person_profile(entity_id) to verify the update.""",
+        "method": "PATCH",
+        "path": "/api/crm/people/{entity_id}"
+    },
+    "/health/services": {
         "name": "lifeos_health",
         "description": "Check if all LifeOS services are healthy. Use for debugging connection issues.",
         "method": "GET"
@@ -132,6 +147,24 @@ Each fact includes: key, value, confidence (0-1), confirmed status, source_quote
 
 WORKFLOW: lifeos_people_search → get entity_id → lifeos_person_facts""",
         "method": "GET"
+    },
+    "/api/crm/people/{entity_id}/facts/{fact_id}:PUT": {
+        "name": "lifeos_person_fact_update",
+        "description": "Update an extracted fact about a person. Use lifeos_person_facts first to get fact IDs. FOLLOW-UP TOOLS: Use lifeos_person_facts to verify the update.",
+        "method": "PUT",
+        "path": "/api/crm/people/{entity_id}/facts/{fact_id}"
+    },
+    "/api/crm/people/{entity_id}/facts/{fact_id}/confirm:POST": {
+        "name": "lifeos_person_fact_confirm",
+        "description": "Confirm an extracted fact as accurate. Confirmed facts are weighted higher in person profiles. Use lifeos_person_facts to find fact IDs.",
+        "method": "POST",
+        "path": "/api/crm/people/{entity_id}/facts/{fact_id}/confirm"
+    },
+    "/api/crm/people/{entity_id}/facts/{fact_id}:DELETE": {
+        "name": "lifeos_person_fact_delete",
+        "description": "Delete an incorrect or outdated fact about a person. Use lifeos_person_facts to find fact IDs.",
+        "method": "DELETE",
+        "path": "/api/crm/people/{entity_id}/facts/{fact_id}"
     },
     "/api/crm/people/{person_id}": {
         "name": "lifeos_person_profile",
@@ -306,6 +339,24 @@ Example morning briefing:
         "method": "GET",
         "path": "/api/reminders"
     },
+    "/api/reminders/{reminder_id}:PUT": {
+        "name": "lifeos_reminder_update",
+        "description": """Update an existing reminder's schedule, message, or other properties. Use lifeos_reminder_list to find reminder IDs. Only provided fields are changed.
+
+PARAMETERS:
+- reminder_id (required): Reminder ID from lifeos_reminder_list
+- name: Display name
+- schedule_type: 'once' or 'cron'
+- schedule_value: ISO datetime for 'once', cron expression for 'cron'
+- message_type: 'static', 'prompt', or 'endpoint'
+- message_content: The message text or prompt
+- timezone: IANA timezone (e.g., 'America/New_York')
+- enabled: Whether the reminder is active
+
+FOLLOW-UP TOOLS: Use lifeos_reminder_list to verify the update.""",
+        "method": "PUT",
+        "path": "/api/reminders/{reminder_id}"
+    },
     "/api/reminders/{reminder_id}:DELETE": {
         "name": "lifeos_reminder_delete",
         "description": "Delete a scheduled reminder by ID. Use lifeos_reminder_list first to find the ID.",
@@ -316,6 +367,18 @@ Example morning briefing:
         "name": "lifeos_telegram_send",
         "description": "Send an immediate message via Telegram. Use for ad-hoc notifications or testing. Requires Telegram to be configured.",
         "method": "POST"
+    },
+    "/api/admin/sync:POST": {
+        "name": "lifeos_sync_trigger",
+        "description": """Trigger a data sync for a specific source. Returns immediately — sync runs in background.
+
+PARAMETERS:
+- source (required): vault, calendar, contacts, slack, photos, gmail, imessage, whatsapp, phone, facetime, or linkedin
+
+FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
+        "method": "POST",
+        "path": "/api/admin/sync",
+        "custom_handler": True
     },
     "/api/monarch/accounts": {
         "name": "lifeos_monarch_accounts",
@@ -423,7 +486,15 @@ class LifeOSMCPServer:
             # Find matching path in OpenAPI spec (handle path parameters)
             spec_path = self._find_spec_path(actual_path, paths)
             if not spec_path:
-                logger.debug(f"Path {actual_path} not found in OpenAPI spec")
+                if config.get("custom_handler"):
+                    # Custom handler tools use fallback schemas
+                    self.tools.append({
+                        "name": config["name"],
+                        "description": config["description"],
+                        "inputSchema": self._get_fallback_schema(config["name"])
+                    })
+                else:
+                    logger.debug(f"Path {actual_path} not found in OpenAPI spec")
                 continue
 
             method = config["method"].lower()
@@ -480,8 +551,8 @@ class LifeOSMCPServer:
                 }
                 required.append(param_name)
 
-        # Handle request body (POST requests)
-        if method == "post":
+        # Handle request body (POST/PUT/PATCH requests)
+        if method in ("post", "put", "patch"):
             request_body = endpoint_spec.get("requestBody", {})
             content = request_body.get("content", {})
             json_content = content.get("application/json", {})
@@ -511,10 +582,13 @@ class LifeOSMCPServer:
             schema["required"] = required
         return schema
 
-    def _build_tools_fallback(self):
-        """Build tools from curated list without OpenAPI spec."""
-        # Fallback schemas for when OpenAPI is unavailable
-        fallback_schemas = {
+    def _get_fallback_schema(self, tool_name: str) -> dict:
+        """Get fallback input schema for a tool by name."""
+        return self._fallback_schemas().get(tool_name, {"type": "object", "properties": {}})
+
+    def _fallback_schemas(self) -> dict:
+        """Return fallback schemas for all tools."""
+        return {
             "lifeos_ask": {
                 "type": "object",
                 "properties": {
@@ -586,6 +660,17 @@ class LifeOSMCPServer:
                     "q": {"type": "string", "description": "Name or email to search"}
                 },
                 "required": ["q"]
+            },
+            "lifeos_person_update": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "description": "Person entity ID from lifeos_people_search"},
+                    "notes": {"type": "string", "description": "Free-text notes (replaces existing)"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Classification tags (replaces existing)"},
+                    "category": {"type": "string", "description": "Category: work, personal, family, or other"},
+                    "birthday": {"type": "string", "description": "Birthday in MM-DD format, empty string to clear"}
+                },
+                "required": ["entity_id"]
             },
             "lifeos_health": {
                 "type": "object",
@@ -686,12 +771,59 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {}
             },
+            "lifeos_reminder_update": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": {"type": "string", "description": "Reminder ID from lifeos_reminder_list"},
+                    "name": {"type": "string", "description": "Display name"},
+                    "schedule_type": {"type": "string", "description": "'once' or 'cron'"},
+                    "schedule_value": {"type": "string", "description": "ISO datetime or cron expression"},
+                    "message_type": {"type": "string", "description": "'static', 'prompt', or 'endpoint'"},
+                    "message_content": {"type": "string", "description": "Message text or prompt"},
+                    "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
+                    "enabled": {"type": "boolean", "description": "Whether the reminder is active"}
+                },
+                "required": ["reminder_id"]
+            },
             "lifeos_reminder_delete": {
                 "type": "object",
                 "properties": {
                     "reminder_id": {"type": "string", "description": "ID of the reminder to delete (from lifeos_reminder_list)"}
                 },
                 "required": ["reminder_id"]
+            },
+            "lifeos_sync_trigger": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Sync source: vault, calendar, contacts, slack, photos, gmail, imessage, whatsapp, phone, facetime, linkedin"}
+                },
+                "required": ["source"]
+            },
+            "lifeos_person_fact_update": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "description": "Person entity ID from lifeos_people_search"},
+                    "fact_id": {"type": "string", "description": "Fact ID from lifeos_person_facts"},
+                    "value": {"type": "string", "description": "Updated fact value"},
+                    "category": {"type": "string", "description": "Fact category (family, work, interests, dates, etc.)"}
+                },
+                "required": ["entity_id", "fact_id"]
+            },
+            "lifeos_person_fact_confirm": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "description": "Person entity ID from lifeos_people_search"},
+                    "fact_id": {"type": "string", "description": "Fact ID from lifeos_person_facts"}
+                },
+                "required": ["entity_id", "fact_id"]
+            },
+            "lifeos_person_fact_delete": {
+                "type": "object",
+                "properties": {
+                    "entity_id": {"type": "string", "description": "Person entity ID from lifeos_people_search"},
+                    "fact_id": {"type": "string", "description": "Fact ID from lifeos_person_facts"}
+                },
+                "required": ["entity_id", "fact_id"]
             },
             "lifeos_telegram_send": {
                 "type": "object",
@@ -814,6 +946,9 @@ class LifeOSMCPServer:
             }
         }
 
+    def _build_tools_fallback(self):
+        """Build tools from curated list without OpenAPI spec."""
+        fallback_schemas = self._fallback_schemas()
         for config in CURATED_ENDPOINTS.values():
             tool = {
                 "name": config["name"],
@@ -834,8 +969,46 @@ class LifeOSMCPServer:
             logger.warning(f"Failed to fetch email body for {message_id}: {e}")
             return None
 
+    def _handle_sync_trigger(self, arguments: dict) -> dict:
+        """Route sync trigger to the correct endpoint based on source param."""
+        source = arguments.get("source", "").lower().strip()
+        if not source:
+            return {"error": "Missing required parameter: source"}
+
+        route_map = {
+            "vault": "/api/admin/reindex",
+            "calendar": "/api/admin/calendar/sync",
+            "contacts": "/api/crm/contacts/sync",
+            "slack": "/api/crm/slack/sync",
+            "photos": "/api/photos/sync",
+        }
+
+        valid_sources = list(route_map.keys()) + [
+            "gmail", "imessage", "whatsapp", "phone", "facetime", "linkedin"
+        ]
+
+        if source in route_map:
+            url = f"{API_BASE}{route_map[source]}"
+        elif source in valid_sources:
+            url = f"{API_BASE}/api/crm/sources/{source}/sync"
+        else:
+            return {"error": f"Invalid source: '{source}'. Valid sources: {', '.join(valid_sources)}"}
+
+        try:
+            resp = self.client.post(url)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API error {e.response.status_code}: {e.response.text[:200]}"}
+        except httpx.RequestError as e:
+            return {"error": f"Request failed: {e}"}
+
     def _call_api(self, tool_name: str, arguments: dict) -> dict:
         """Call the LifeOS API based on tool name and arguments."""
+        # Custom handlers for tools that don't map 1:1 to endpoints
+        if tool_name == "lifeos_sync_trigger":
+            return self._handle_sync_trigger(arguments)
+
         # Find the endpoint config
         endpoint_config = None
         endpoint_path = None
@@ -865,8 +1038,8 @@ class LifeOSMCPServer:
                 resp = self.client.get(url, params=arguments)
             elif method == "DELETE":
                 resp = self.client.delete(url, params=arguments)
-            elif method == "PUT":
-                resp = self.client.put(url, json=arguments)
+            elif method in ("PUT", "PATCH"):
+                resp = self.client.request(method, url, json=arguments)
             else:  # POST
                 resp = self.client.post(url, json=arguments)
 
@@ -1033,8 +1206,30 @@ class LifeOSMCPServer:
             return text
 
         elif tool_name == "lifeos_health":
-            status = data.get("status", "unknown")
-            return f"LifeOS API status: {status}"
+            overall = data.get("overall_status", data.get("status", "unknown"))
+            text = f"LifeOS Status: {overall}\n\nServices:\n"
+            services = data.get("services", {})
+            for svc_name, svc_info in services.items():
+                if isinstance(svc_info, dict):
+                    svc_status = svc_info.get("status", "unknown")
+                    text += f"  {svc_name}: {svc_status}"
+                    if svc_info.get("using_fallback"):
+                        text += f" (fallback: {svc_info.get('fallback_name', 'yes')})"
+                    if svc_info.get("last_error"):
+                        text += f" - {svc_info['last_error']}"
+                    text += "\n"
+                else:
+                    text += f"  {svc_name}: {svc_info}\n"
+            deg_count = data.get("degradation_count_24h", 0)
+            text += f"\nDegradation Events (24h): {deg_count}"
+            critical = data.get("critical_issues", [])
+            if critical:
+                text += "\nCritical Issues:"
+                for issue in critical:
+                    text += f"\n  - {issue.get('service', 'unknown')}: {issue.get('error', '')}"
+            else:
+                text += "\nCritical Issues: none"
+            return text
 
         elif tool_name == "lifeos_imessage_search":
             messages = data.get("messages", [])
@@ -1361,8 +1556,36 @@ class LifeOSMCPServer:
                 text += f"  ID: {r.get('id', '')}\n\n"
             return text
 
+        elif tool_name == "lifeos_reminder_update":
+            name = data.get("name", "")
+            next_trigger = data.get("next_trigger_at", "not scheduled")
+            return f"Reminder updated: **{name}** (ID: {data.get('id', '')})\nNext trigger: {next_trigger}"
+
         elif tool_name == "lifeos_reminder_delete":
             return f"Reminder deleted: {data.get('id', 'unknown')}"
+
+        elif tool_name == "lifeos_sync_trigger":
+            return f"Sync triggered: {data.get('message', data.get('status', 'started'))}"
+
+        elif tool_name == "lifeos_person_update":
+            name = data.get("display_name", data.get("canonical_name", "Unknown"))
+            text = f"Person updated: **{name}** (ID: {data.get('entity_id', '')})"
+            if data.get("notes"):
+                text += f"\nNotes: {data['notes'][:100]}"
+            if data.get("tags"):
+                text += f"\nTags: {', '.join(data['tags'])}"
+            if data.get("category"):
+                text += f"\nCategory: {data['category']}"
+            return text
+
+        elif tool_name == "lifeos_person_fact_update":
+            return f"Fact updated (ID: {data.get('id', data.get('fact_id', 'unknown'))})"
+
+        elif tool_name == "lifeos_person_fact_confirm":
+            return f"Fact confirmed (ID: {data.get('id', data.get('fact_id', 'unknown'))})"
+
+        elif tool_name == "lifeos_person_fact_delete":
+            return f"Fact deleted (ID: {data.get('id', data.get('fact_id', 'unknown'))})"
 
         elif tool_name == "lifeos_telegram_send":
             return "Message sent to Telegram."
