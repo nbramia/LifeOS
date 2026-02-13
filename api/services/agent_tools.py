@@ -461,6 +461,42 @@ TOOL_DEFINITIONS = [
             "required": ["event_id"],
         },
     },
+    {
+        "name": "save_memory",
+        "description": (
+            "Save a persistent memory for future reference. Use when the user says "
+            "'remember that...', 'don't forget...', 'note that...', or asks you to "
+            "remember something across conversations. Memories persist across all sessions "
+            "and are automatically surfaced when relevant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The memory to save (natural language).",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "search_memories",
+        "description": (
+            "Search saved memories by keyword. Use to recall previously saved information, "
+            "check if a memory already exists, or find specific remembered facts/preferences."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for memories.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 # Cache breakpoint on last tool — everything up to here gets cached
@@ -498,7 +534,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "create_calendar_event", "update_calendar_event", "delete_calendar_event"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -912,6 +948,29 @@ def _tool_delete_calendar_event(inp: dict) -> str:
     return f"Event deleted (id: {inp['event_id']}, account: {account_str})"
 
 
+async def _tool_save_memory(inp: dict) -> str:
+    from api.services.memory_store import get_memory_store
+    from api.routes.memories import synthesize_memory
+
+    content = await synthesize_memory(inp["content"])
+    store = get_memory_store()
+    memory = store.create_memory(content)
+    return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
+
+
+def _tool_search_memories(inp: dict) -> str:
+    from api.services.memory_store import get_memory_store
+
+    store = get_memory_store()
+    memories = store.search_memories(inp["query"], limit=10)
+    if not memories:
+        return "No matching memories found."
+    lines = []
+    for m in memories:
+        lines.append(f"- [{m.category}] {m.content}")
+    return "\n".join(lines)
+
+
 # Handler dispatch table
 def _tool_read_vault_file(inp: dict) -> str:
     from pathlib import Path
@@ -1044,6 +1103,8 @@ _TOOL_HANDLERS = {
     "create_calendar_event": _tool_create_calendar_event,
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
+    "save_memory": _tool_save_memory,
+    "search_memories": _tool_search_memories,
 }
 
 # Status messages for UI feedback when tools execute
@@ -1075,4 +1136,6 @@ TOOL_STATUS_MESSAGES = {
     "create_calendar_event": "Creating calendar event...",
     "update_calendar_event": "Updating calendar event...",
     "delete_calendar_event": "Deleting calendar event...",
+    "save_memory": "Saving memory...",
+    "search_memories": "Searching memories...",
 }

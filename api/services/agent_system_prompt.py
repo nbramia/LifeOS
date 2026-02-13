@@ -70,6 +70,12 @@ Updates an existing calendar event (title, time, attendees, etc.). Requires even
 **delete_calendar_event:**
 Deletes a calendar event. Requires event_id from search_calendar. ALWAYS confirm with the user first.
 
+**save_memory:**
+Saves a persistent memory that will be surfaced in future conversations. Use when the user says "remember that...", "don't forget...", or asks you to remember something. Memories are automatically retrieved when relevant to future queries.
+
+**search_memories:**
+Searches saved memories by keyword. Use to recall previously saved information or check if a memory already exists.
+
 ## When NOT to use tools
 
 Don't use tools for general knowledge, definitions, coding help, math, or anything that doesn't require Nathan's personal data or current/live information. Just answer directly.
