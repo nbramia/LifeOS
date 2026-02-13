@@ -12,6 +12,7 @@ Event types yielded:
 """
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
 
@@ -32,6 +33,34 @@ _PRICING = {
 
 # Consolidated tools that use sub-action status messages
 _CONSOLIDATED_TOOLS = {"manage_tasks", "manage_reminders", "person_info"}
+
+# Patterns that indicate the model is giving up without trying tools
+_GIVE_UP_PATTERNS = re.compile(
+    r"(?i)("
+    r"can'?t access|cannot access|unable to access"
+    r"|can'?t browse|cannot browse|unable to browse"
+    r"|don'?t have access to|do not have access to"
+    r"|can'?t search the (web|internet)|cannot search the (web|internet)"
+    r"|knowledge cutoff|training data"
+    r"|can'?t provide real-?time|cannot provide real-?time"
+    r"|can'?t look up|cannot look up|unable to look up"
+    r"|don'?t have the ability|do not have the ability"
+    r"|can'?t fetch|cannot fetch|unable to fetch"
+    r"|as of my last|as of my knowledge"
+    r"|I don'?t have (?:access to )?(?:live|current|real-?time|up-to-date)"
+    r")"
+)
+
+SELF_CORRECTION_NUDGE = (
+    "Stop — you DO have a search_web tool. Use it now to answer the question "
+    "with current information. Do not apologize or explain limitations, just "
+    "call search_web and answer."
+)
+
+
+def _looks_like_giving_up(text: str) -> bool:
+    """Return True if the response text contains give-up phrases."""
+    return bool(_GIVE_UP_PATTERNS.search(text))
 
 
 def _calc_cost(
@@ -193,8 +222,20 @@ async def run_agent_loop(
         tool_names = [b.name for b in tool_use_blocks]
         print(f"[agent] Round {round_num} done: stop={final_msg.stop_reason}, tools={tool_names}, text={len(text_this_round)}ch")
 
-        # If no tool calls, we're done
+        # If no tool calls, we're done — unless the model is giving up without trying
         if final_msg.stop_reason != "tool_use" or not tool_use_blocks:
+            if (
+                round_num == 1
+                and not result.tool_calls_log
+                and text_this_round.strip()
+                and _looks_like_giving_up(text_this_round)
+            ):
+                print("[agent] Self-correction triggered: model gave up without using tools")
+                yield {"type": "self_correction"}
+                result.full_text = ""
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": SELF_CORRECTION_NUDGE})
+                continue
             break
 
         # Append the assistant message with tool use blocks
