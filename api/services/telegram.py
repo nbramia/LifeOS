@@ -332,6 +332,10 @@ class TelegramBotListener:
             await self._handle_agent_clarification(text, chat_id)
             return
 
+        # Check for follow-up to a recently completed Claude Code session
+        if await self._check_code_followup(text, chat_id):
+            return
+
         # Send through chat pipeline (intent classification happens there)
         try:
             conv_id = self._conversations.get(chat_id)
@@ -482,6 +486,32 @@ class TelegramBotListener:
             await send_message_async("Got it. Resuming...", chat_id=chat_id)
         else:
             await send_message_async("No session waiting for clarification.", chat_id=chat_id)
+
+    async def _check_code_followup(self, text: str, chat_id: str) -> bool:
+        """Check if this message is a follow-up to a recently completed Claude Code session.
+
+        Routes follow-ups to Claude Code via session resume so the context is preserved.
+        Returns True if the message was handled as a follow-up.
+        """
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+
+        # Don't intercept if Claude Code is already busy
+        if orch.is_busy():
+            return False
+
+        session = orch.get_recent_completed_session()
+        if not session:
+            return False
+
+        def notify(msg: str):
+            send_message(msg, chat_id=chat_id)
+
+        resumed = orch.followup(text, notification_callback=notify)
+        if resumed:
+            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
+            return True
+        return False
 
     def _should_use_plan_mode(self, task: str) -> bool:
         """Conservative heuristic: plan mode only for complex-sounding tasks."""

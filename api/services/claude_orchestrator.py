@@ -57,6 +57,9 @@ PERSISTENCE:
 - If your first approach doesn't work, try alternatives before giving up.
 - Debug errors yourself — read logs, check file contents, inspect state.
 - The user cannot easily intervene, so exhaust your options before asking for help.
+- NEVER respond saying you don't have context or can't find information without first
+  searching for it. If asked about a person, search the vault and LifeOS API. If asked
+  about a project, explore the filesystem. Always try before saying you can't.
 - IMPORTANT: If you have tried 3 or more distinct approaches and none worked, STOP.
   Send a [NOTIFY] summarizing: (1) what you tried, (2) what failed, (3) your best guess
   at the root cause. Let the user decide next steps rather than looping indefinitely.
@@ -68,6 +71,13 @@ ENVIRONMENT:
 - Other projects: ~/Documents/Code/
 - Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
 - Git, cron, and standard macOS tools are available
+
+LIFEOS DATA ACCESS:
+You have LifeOS MCP tools available (lifeos_people_search, lifeos_person_profile,
+lifeos_person_timeline, lifeos_person_facts, lifeos_search, lifeos_gmail_search,
+lifeos_imessage_search, lifeos_calendar_search, etc.). Use these to look up personal
+data — people, meetings, emails, notes, messages. Always search before saying you
+don't have information. The data is there — find it.
 
 NOTIFICATIONS — use [NOTIFY] for:
 - Completion summaries (ALWAYS include one when done)
@@ -133,12 +143,16 @@ class ClaudeSession:
     last_activity: str = ""  # Brief description of last tool/action for heartbeat context
 
 
+FOLLOWUP_WINDOW = 300  # 5 minutes to send follow-ups to completed sessions
+
+
 class ClaudeOrchestrator:
     """Manages a single Claude Code subprocess at a time."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._active_session: Optional[ClaudeSession] = None
+        self._last_completed: Optional[ClaudeSession] = None
         self._process: Optional[subprocess.Popen] = None
         self._watchdog: Optional[threading.Timer] = None
         self._heartbeat: Optional[threading.Timer] = None
@@ -225,6 +239,38 @@ class ClaudeOrchestrator:
             session,
             resume_session_id=session.session_id,
         )
+        return session
+
+    def get_recent_completed_session(self) -> Optional[ClaudeSession]:
+        """Return the last completed session if it finished within FOLLOWUP_WINDOW."""
+        session = self._last_completed
+        if not session or not session.completed_at:
+            return None
+        if time.time() - session.completed_at > FOLLOWUP_WINDOW:
+            return None
+        return session
+
+    def followup(
+        self,
+        message: str,
+        notification_callback: Optional[Callable[[str], None]] = None,
+    ) -> Optional[ClaudeSession]:
+        """Resume a recently completed session with a follow-up message."""
+        with self._lock:
+            if self.is_busy():
+                return None
+            session = self.get_recent_completed_session()
+            if not session or not session.session_id:
+                return None
+
+            # Reactivate the session
+            session.status = "running"
+            session.completed_at = None
+            self._active_session = session
+            self._last_completed = None
+            self._notification_callback = notification_callback
+
+        self._spawn(message, session, resume_session_id=session.session_id)
         return session
 
     def cancel(self):
@@ -480,6 +526,9 @@ class ClaudeOrchestrator:
             session.status = final_status
             session.completed_at = time.time()
         if final_status in ("completed", "failed"):
+            # Keep completed sessions for follow-up resumption
+            if final_status == "completed" and session and session.session_id:
+                self._last_completed = session
             self._active_session = None
         self._process = None
 
