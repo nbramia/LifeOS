@@ -571,6 +571,10 @@ class PersonFactExtractor:
         )
         logger.info(f"Extracted {len(extracted_facts)} facts for {person_name}")
 
+        # Validate facts with Ollama (local, free)
+        if extracted_facts:
+            extracted_facts = await self._validate_facts_ollama(extracted_facts, person_name)
+
         # Generate relationship summaries for people with sufficient interactions
         if len(interactions) >= 10:
             try:
@@ -666,6 +670,9 @@ class PersonFactExtractor:
 
         return saved_facts
 
+    # Source types that benefit from conversation context
+    MESSAGE_SOURCES = {"imessage", "whatsapp", "slack"}
+
     def _enrich_with_context(self, interactions: list) -> list:
         """
         Enrich message-based interactions with conversation context.
@@ -673,13 +680,98 @@ class PersonFactExtractor:
         For iMessage, WhatsApp, and Slack interactions, fetches surrounding
         messages to provide better context for fact extraction.
 
-        NOTE: Disabled for speed - context enrichment requires N database queries
-        where N = number of message-based interactions, which is too slow for
-        people with many iMessage/WhatsApp/Slack interactions.
+        Groups nearby messages into threads (same source_type, within 1 hour)
+        and fetches context once per thread to minimize DB queries.
         """
-        # Skip context enrichment for now - too slow
-        # TODO: Batch context queries for better performance
-        return interactions
+        try:
+            from api.services.interaction_store import get_interaction_store
+            store = get_interaction_store()
+        except Exception as e:
+            logger.warning(f"Could not load interaction store for context enrichment: {e}")
+            return interactions
+
+        # Separate message-based and non-message interactions
+        message_interactions = [
+            i for i in interactions
+            if i.get("source_type") in self.MESSAGE_SOURCES and i.get("id")
+        ]
+
+        if not message_interactions:
+            return interactions
+
+        # Group into threads: same source_type, within 1 hour of each other
+        threads = self._group_into_threads(message_interactions)
+        logger.info(f"Grouped {len(message_interactions)} messages into {len(threads)} threads for context")
+
+        # Fetch context once per thread (using the first message in each thread)
+        context_cache = {}  # interaction_id -> context_text
+        for thread in threads:
+            representative_id = thread[0].get("id")
+            try:
+                context_interactions = store.get_conversation_context(
+                    representative_id, window=3
+                )
+                if len(context_interactions) > 1:
+                    # Build context text from surrounding messages
+                    context_lines = []
+                    for ctx in context_interactions:
+                        title = ctx.title or ""
+                        context_lines.append(f"  [{ctx.source_type}] {title}")
+                    context_text = "\n".join(context_lines)
+
+                    # Apply context to all messages in this thread
+                    for msg in thread:
+                        context_cache[msg.get("id")] = context_text
+            except Exception as e:
+                logger.debug(f"Context fetch failed for {representative_id}: {e}")
+
+        if context_cache:
+            logger.info(f"Enriched {len(context_cache)} messages with conversation context")
+
+        # Attach context to interactions
+        enriched = []
+        for interaction in interactions:
+            iid = interaction.get("id")
+            if iid and iid in context_cache:
+                interaction = dict(interaction)  # Don't mutate original
+                interaction["thread_context"] = context_cache[iid]
+            enriched.append(interaction)
+
+        return enriched
+
+    def _group_into_threads(self, messages: list) -> list[list]:
+        """Group messages into conversation threads by source proximity."""
+        if not messages:
+            return []
+
+        # Sort by source_type then timestamp
+        sorted_msgs = sorted(
+            messages,
+            key=lambda x: (x.get("source_type", ""), x.get("timestamp", ""))
+        )
+
+        threads = []
+        current_thread = [sorted_msgs[0]]
+
+        for msg in sorted_msgs[1:]:
+            prev = current_thread[-1]
+            # Same thread if same source_type and within 1 hour
+            if msg.get("source_type") == prev.get("source_type"):
+                try:
+                    prev_ts = datetime.fromisoformat(prev.get("timestamp", ""))
+                    msg_ts = datetime.fromisoformat(msg.get("timestamp", ""))
+                    if abs((msg_ts - prev_ts).total_seconds()) <= 3600:
+                        current_thread.append(msg)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # Start new thread
+            threads.append(current_thread)
+            current_thread = [msg]
+
+        threads.append(current_thread)
+        return threads
 
     def _extract_facts_claude(
         self,
@@ -732,103 +824,6 @@ class PersonFactExtractor:
 
         return all_facts
 
-    def _build_extraction_prompt(self, person_name: str, interaction_text: str) -> str:
-        """Build the extraction prompt focused on memorable facts with confidence."""
-        return f"""Extract MEMORABLE personal details about {person_name} from these interactions.
-
-YOU ARE A RECALL ASSISTANT, not a biography builder. Extract facts that help remember
-personal details about {person_name} - things you couldn't find on LinkedIn or in a quick search.
-
-PRIORITIZE (high value for recall):
-- Pet names ("my dog Max", "our cat Luna")
-- Hobby specifics ("I've been learning pottery", "training for a triathlon")
-- Family member names ("my sister Emma", "my son Jake")
-- Personal preferences ("I can't stand cilantro", "I'm a morning person")
-- Personal anecdotes ("We went to Costa Rica last year")
-- Health/medical mentions ("I have my infusion next week", "my allergies")
-- Interests and passions ("I'm obsessed with Formula 1")
-
-SKIP (low value, findable elsewhere):
-- Current job title (LinkedIn has this)
-- Company name (LinkedIn has this)
-- Generic professional info
-- Meeting logistics
-- Routine scheduling details
-
-CRITICAL - ENTITY ATTRIBUTION:
-These are conversations BETWEEN the user and {person_name}.
-- If the user says "my daughter" → This is the user's family, NOT {person_name}'s. DO NOT extract.
-- If {person_name} says "my daughter Emma" → This IS {person_name}'s daughter. EXTRACT IT.
-- If they discuss a third person "Sarah got a new job" → About Sarah, not {person_name}. DO NOT extract.
-
-CONFIDENCE SCORING (based on evidence strength):
-- 0.9: Direct quote where {person_name} states the fact explicitly ("My dog's name is Max")
-- 0.8: Clear statement in context, minor interpretation needed
-- 0.7: Reasonably certain but some ambiguity in context
-- 0.6: Likely true based on context but not explicitly stated
-- 0.5: Inference from indirect evidence
-
-Return ONLY valid JSON (no markdown, no explanation):
-{{
-  "facts": [
-    {{
-      "category": "family",
-      "key": "dog_name",
-      "value": "Max",
-      "confidence": 0.9,
-      "quote": "I need to take Max to the vet tomorrow",
-      "source_id": "abc123"
-    }}
-  ]
-}}
-
-Categories: family, preferences, background, interests, dates, work, topics, travel
-
-Interactions:
-{interaction_text}"""
-
-    def _parse_extraction_response(
-        self,
-        response_text: str,
-        person_id: str,
-        interaction_lookup: dict
-    ) -> list[PersonFact]:
-        """Parse Claude response into PersonFact objects."""
-        try:
-            # Handle markdown code blocks
-            if "```json" in response_text:
-                json_start = response_text.find("```json") + 7
-                json_end = response_text.find("```", json_start)
-                response_text = response_text[json_start:json_end].strip()
-            elif "```" in response_text:
-                json_start = response_text.find("```") + 3
-                json_end = response_text.find("```", json_start)
-                response_text = response_text[json_start:json_end].strip()
-
-            data = json.loads(response_text)
-            facts_data = data.get("facts", [])
-
-            facts = []
-            for f in facts_data:
-                source_id = f.get("source_id")
-                fact = PersonFact(
-                    person_id=person_id,
-                    category=f.get("category", ""),
-                    key=f.get("key", ""),
-                    value=str(f.get("value", "")),
-                    confidence=f.get("confidence", 0.7),
-                    source_interaction_id=source_id,
-                    source_quote=f.get("quote"),
-                    source_link=interaction_lookup.get(source_id, {}).get("source_link"),
-                )
-                facts.append(fact)
-
-            return facts
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse extraction JSON: {e}")
-            return []
-
     def _sample_interactions(self, interactions: list) -> list:
         """
         Intelligently sample interactions with dynamic budget distribution.
@@ -874,7 +869,7 @@ Interactions:
         for source_type, source_interactions in by_source.items():
             is_priority = source_type in self.PRIORITY_SOURCES
             allocation = int(budget_per_share * (self.PRIORITY_BONUS if is_priority else 1.0))
-            sampled.extend(source_interactions[:allocation])
+            sampled.extend(self._sample_with_temporal_diversity(source_interactions, allocation))
 
         # Final cap and sort by timestamp
         if len(sampled) > self.MAX_INTERACTIONS_PER_BATCH:
@@ -890,6 +885,80 @@ Interactions:
         logger.info(f"Sampled {len(sampled)} from {len(interactions)} ({', '.join(breakdown)})")
 
         return sampled
+
+    def _sample_with_temporal_diversity(self, interactions: list, budget: int) -> list:
+        """
+        Sample interactions with temporal diversity across time buckets.
+
+        Distributes budget across time periods to avoid missing old facts:
+        - 50% from the most recent year
+        - 30% from 1-3 years ago
+        - 20% from 3+ years ago
+
+        Unused budget from empty buckets is redistributed to non-empty ones.
+        Interactions must already be sorted most-recent-first.
+        """
+        if len(interactions) <= budget:
+            return interactions
+
+        now = datetime.now(timezone.utc)
+
+        # Bucket interactions by age
+        recent = []      # < 1 year
+        mid = []         # 1-3 years
+        old = []         # 3+ years
+
+        for interaction in interactions:
+            ts = interaction.get("timestamp", "")
+            if not ts:
+                recent.append(interaction)
+                continue
+            try:
+                dt = datetime.fromisoformat(ts) if isinstance(ts, str) else ts
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                age_days = (now - dt).days
+                if age_days < 365:
+                    recent.append(interaction)
+                elif age_days < 365 * 3:
+                    mid.append(interaction)
+                else:
+                    old.append(interaction)
+            except (ValueError, TypeError):
+                recent.append(interaction)
+
+        # Initial allocations
+        allocations = {
+            "recent": int(budget * 0.5),
+            "mid": int(budget * 0.3),
+            "old": budget - int(budget * 0.5) - int(budget * 0.3),  # remainder
+        }
+        buckets = {"recent": recent, "mid": mid, "old": old}
+
+        # Redistribute unused budget
+        unused = 0
+        for name in ["recent", "mid", "old"]:
+            available = len(buckets[name])
+            if available < allocations[name]:
+                unused += allocations[name] - available
+                allocations[name] = available
+
+        # Distribute unused to buckets that have more items
+        if unused > 0:
+            for name in ["recent", "mid", "old"]:
+                can_add = len(buckets[name]) - allocations[name]
+                if can_add > 0:
+                    give = min(can_add, unused)
+                    allocations[name] += give
+                    unused -= give
+                    if unused == 0:
+                        break
+
+        result = []
+        for name in ["recent", "mid", "old"]:
+            result.extend(buckets[name][:allocations[name]])
+
+        return result
 
     def _create_batches(self, interactions: list, batch_size: int) -> list[list]:
         """Split interactions into batches for processing."""
@@ -929,11 +998,98 @@ Interactions:
 
             if snippet and not sender_prefix:
                 # Only add snippet if we didn't already include the full message
-                line += f"\n    Content: {snippet[:500]}"
+                line += f"\n    Content: {snippet[:800]}"
+
+            # Include thread context if available
+            thread_context = interaction.get("thread_context")
+            if thread_context:
+                line += f"\n    Thread context:\n{thread_context}"
 
             lines.append(line)
 
         return "\n\n".join(lines)
+
+    async def _validate_facts_ollama(
+        self, facts: list[PersonFact], person_name: str
+    ) -> list[PersonFact]:
+        """
+        Validate extracted facts using local Ollama.
+
+        For each fact with a quote, asks Ollama:
+        1. Does the quote support this fact?
+        2. Is this about the target person, not the user?
+        3. Evidence strength (1-5)
+
+        Facts failing support or attribution are rejected.
+        Evidence strength is mapped to calibrated confidence.
+        Falls back gracefully if Ollama is unavailable.
+        """
+        from api.services.ollama_client import OllamaClient
+
+        client = OllamaClient()
+
+        if not await client.is_available_async():
+            logger.warning("Ollama unavailable for fact validation — passing through with capped confidence")
+            for fact in facts:
+                fact.confidence = min(fact.confidence, 0.7)
+            return facts
+
+        validated = []
+        for fact in facts:
+            if not fact.source_quote:
+                # No quote to validate — keep but cap confidence
+                fact.confidence = min(fact.confidence, 0.6)
+                validated.append(fact)
+                continue
+
+            prompt = f"""Validate this extracted fact about {person_name}.
+
+Fact: {fact.key} = {fact.value}
+Quote: "{fact.source_quote}"
+
+Answer these questions as JSON:
+{{
+  "supported": true/false,  // Does the quote support this fact?
+  "correct_person": true/false,  // Is this about {person_name} (not the user or a third party)?
+  "evidence_strength": 1-5  // How strong is the evidence? (1=weak inference, 5=explicit statement)
+}}
+
+Return ONLY valid JSON."""
+
+            try:
+                result = await client.generate_json(
+                    prompt=prompt,
+                    max_tokens=256,
+                    timeout=10
+                )
+
+                supported = result.get("supported", True)
+                correct_person = result.get("correct_person", True)
+                evidence_strength = int(result.get("evidence_strength", 3))
+
+                if not supported:
+                    logger.debug(f"Fact rejected (unsupported): {fact.key}={fact.value}")
+                    continue
+
+                if not correct_person:
+                    logger.debug(f"Fact rejected (wrong person): {fact.key}={fact.value}")
+                    continue
+
+                # Map evidence strength to calibrated confidence
+                confidence_map = {1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9}
+                fact.confidence = confidence_map.get(
+                    max(1, min(5, evidence_strength)), 0.7
+                )
+                validated.append(fact)
+
+            except Exception as e:
+                logger.debug(f"Ollama validation failed for {fact.key}: {e}")
+                # On per-fact failure, keep the fact with capped confidence
+                fact.confidence = min(fact.confidence, 0.7)
+                validated.append(fact)
+
+        logger.info(f"Validation: {len(validated)}/{len(facts)} facts passed")
+        return validated
 
     def _build_extraction_prompt(self, person_name: str, interaction_text: str) -> str:
         """Build the strict LLM prompt for fact extraction."""
@@ -974,8 +1130,8 @@ Return ONLY valid JSON with this structure (no markdown, no explanation):
   "facts": [
     {{
       "category": "family",
-      "key": "spouse_name",
-      "value": "Sarah",
+      "key": "spouse_sarah",
+      "value": "Married to Sarah",
       "quote": "my wife Sarah and I went hiking",
       "source_id": "abc123",
       "confidence": 0.95
@@ -983,44 +1139,78 @@ Return ONLY valid JSON with this structure (no markdown, no explanation):
   ]
 }}
 
+VALUE FORMAT — write as a natural sentence:
+- The "value" field is displayed directly to the user. Write it as a short, readable sentence.
+- GOOD: "Has a daughter named Emma who plays soccer"
+- GOOD: "Allergic to shellfish"
+- GOOD: "Grew up in Portland, Oregon"
+- BAD: "Emma" (too terse — displayed as "daughter_emma: Emma" which reads weird)
+- BAD: "true" (never use boolean values — write what the fact actually is)
+- BAD: "monthly West Coast onsites" (fragment — write "Travels to the West Coast monthly for onsites")
+
+NEVER EXTRACT these (obvious/universal — not useful):
+- Having parents, siblings, or family in general (unless you know NAMES or specifics)
+- Having a job (unless you know the specific role/company)
+- Living somewhere (unless you know WHERE)
+- Liking food/music/travel in general (unless you know WHAT specifically)
+- Any fact that would be true of most people (e.g., "has a mother", "eats food", "uses a phone")
+
+VALUE TIERS — extract in priority order:
+Tier 1 (extract first — high recall value):
+- Pet names, children's names and details
+- Specific hobbies, health mentions, strong preferences
+
+Tier 2 (useful context):
+- Hometown, spouse name, birthday, school/alma_mater
+- Siblings by name, parents by name, anniversary dates
+
+Tier 3 (only if nothing better available):
+- Job title, company, generic interests
+- If you have 10+ Tier 1/2 facts, skip Tier 3 entirely
+
 Categories and example keys:
-- family: spouse_name, children_count, child_names, parent_names, sibling_names, pet_name
-- preferences: food_preference, communication_style, meeting_preference, schedule_preference
-- background: hometown, alma_mater, previous_companies, nationality, languages, medication
-- interests: hobby, sport, music_taste, book_genre, favorite_team, creative_pursuits
-- dates: birthday, anniversary, started_job, important_dates
-- work: current_role, company, expertise, projects, team_size, reports_to
+- family: spouse_sarah, daughter_emma, son_jake, sister_jane, dog_max, cat_luna
+- preferences: hates_cilantro, morning_person, prefers_texting
+- background: hometown, alma_mater, nationality, languages, health_condition
+- interests: hobby_pottery, hobby_running, sport_tennis, favorite_team_lakers
+- dates: birthday, anniversary, started_current_job
+- work: current_role, company, expertise
 - topics: frequent_discussion_topics, concerns, goals, current_focus
-- travel: visited_countries, planned_trips, favorite_destination, travel_style
+- travel: visited_japan, planned_trip_italy, favorite_destination
+
+KEY NAMING RULES (for deduplication):
+- Use specific names in keys: "daughter_emma" not "daughter", "dog_max" not "pet"
+- Hobbies: "hobby_pottery", "hobby_running" (not generic "hobby")
+- Format: lowercase_snake_case, descriptive enough to be unique
 
 EXTRACTION RULES:
 - Only include facts with clear textual evidence about {person_name} specifically
 - The "quote" field MUST show this fact belongs to {person_name}
 - The "source_id" field should match the ID shown in the interaction (e.g., "ID:abc123")
-- Values should be specific (not "sister" but "sister named Jane")
 - Use lowercase snake_case for keys
 - Reject vague facts without specific names or details
 - Reject any fact about the user or third parties mentioned in conversation
 
-Example of GOOD extraction (from [{person_name.upper()} SENT] messages):
+GOOD examples:
 - [{person_name.upper()} SENT]: "I'm taking my daughter Emma to soccer practice"
-- Fact: {{"category": "family", "key": "daughter_name", "value": "Emma", "quote": "I'm taking my daughter Emma", "confidence": 0.95}}
+- {{"category": "family", "key": "daughter_emma", "value": "Has a daughter named Emma who plays soccer", "quote": "I'm taking my daughter Emma to soccer practice", "confidence": 0.95}}
 
-Example of BAD extraction (DO NOT do this):
-- [{user_upper} SENT]: "I'm in Minnesota" <- The user said this, not {person_name}!
-- BAD: {{"category": "travel", "key": "location", "value": "Minnesota"}} <- WRONG! This is about the user!
+- [{person_name.upper()} SENT]: "I can't eat shellfish, I'm allergic"
+- {{"category": "preferences", "key": "allergy_shellfish", "value": "Allergic to shellfish", "quote": "I can't eat shellfish, I'm allergic", "confidence": 0.9}}
 
-- [{user_upper} SENT]: "I need to pick up my daughter" <- The user said this about their own family
-- BAD: {{"category": "family", "key": "child_name", "value": "..."}} <- WRONG! This is the user's child, not {person_name}'s!
-
-- They discuss "Sarah got a new job in Boston"
-- BAD: {{"category": "work", "key": "employer", "value": "Boston company"}} <- WRONG! This is about Sarah, not {person_name}!
+BAD examples (DO NOT do this):
+- {{"key": "has_mother", "value": "true"}} <- USELESS. Everyone has a mother. Only extract if you know the name.
+- {{"key": "daughter", "value": "Emma"}} <- Terse. Write "Has a daughter named Emma" instead.
+- {{"key": "work_pattern", "value": "monthly West Coast onsites"}} <- Fragment. Write "Travels to the West Coast monthly for onsites" instead.
+- [{user_upper} SENT]: "I'm in Minnesota" — {{"key": "location", "value": "Minnesota"}} <- WRONG! The user said this, not {person_name}!
+- [{user_upper} SENT]: "I need to pick up my daughter" — {{"key": "child", "value": "..."}} <- WRONG! This is the user's child!
+- "Sarah got a new job in Boston" — {{"key": "employer", "value": "Boston company"}} <- WRONG! This is about Sarah, not {person_name}!
 
 Interactions:
 {interaction_text}"""
 
-    def _parse_facts_response(
-        self, response_text: str, person_id: str, interactions: list, interaction_lookup: dict
+    def _parse_extraction_response(
+        self, response_text: str, person_id: str, interaction_lookup: dict
     ) -> list[PersonFact]:
         """Parse the LLM response into PersonFact objects with source attribution."""
         facts = []
@@ -1084,10 +1274,11 @@ Interactions:
                                 source_interaction_id = int_id
                                 break
 
-                # If no source found, use first interaction as fallback
-                if not source_interaction_id and interactions:
-                    source_interaction_id = interactions[0].get("id")
-                    source_link = interactions[0].get("source_link")
+                # If no source found, use first interaction from lookup as fallback
+                if not source_interaction_id and interaction_lookup:
+                    fallback_id = next(iter(interaction_lookup))
+                    source_interaction_id = fallback_id
+                    source_link = interaction_lookup[fallback_id].get("source_link")
 
                 fact = PersonFact(
                     person_id=person_id,

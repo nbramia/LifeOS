@@ -26,7 +26,8 @@ TOOL_DEFINITIONS = [
         "name": "search_vault",
         "description": (
             "Search Nathan's Obsidian vault (notes, meeting transcripts, journals, project docs). "
-            "Use for past events, decisions, project details, or anything written down."
+            "Returns relevance-ranked text chunks with file names. "
+            "Good for written records, decisions, project details. Returns chunks, not full files."
         ),
         "input_schema": {
             "type": "object",
@@ -47,7 +48,8 @@ TOOL_DEFINITIONS = [
         "name": "search_calendar",
         "description": (
             "Search Google Calendar events across personal and work accounts. "
-            "Returns upcoming events or events matching a query/date range."
+            "Returns event titles, dates, times, attendees, and locations. "
+            "Shows when Nathan met with someone or has upcoming meetings."
         ),
         "input_schema": {
             "type": "object",
@@ -72,7 +74,8 @@ TOOL_DEFINITIONS = [
         "name": "search_email",
         "description": (
             "Search Gmail across personal and work accounts. "
-            "Can filter by sender, recipient, keywords, or date range."
+            "Returns sender, recipient, subject, date, and body preview. "
+            "Use from_email/to_email for targeted searches (get email from person_info first)."
         ),
         "input_schema": {
             "type": "object",
@@ -155,7 +158,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_message_history",
         "description": (
-            "Get iMessage/WhatsApp conversation history with a specific person. "
+            "Get iMessage and WhatsApp chat logs with a specific person. "
+            "Returns actual message content with timestamps — shows what was said and when. "
             "Requires entity_id from person_info. Can filter by date range or search term."
         ),
         "input_schema": {
@@ -190,7 +194,9 @@ TOOL_DEFINITIONS = [
         "name": "person_info",
         "description": (
             "Look up a person or generate a comprehensive briefing. "
-            "Always start with 'lookup' for person queries; use 'briefing' for meeting prep or deep dives."
+            "Use 'lookup' for any query mentioning a person — returns entity_id, emails, phones, "
+            "relationship strength, days since last contact, interaction counts per channel (90 days), "
+            "and known facts. Use 'briefing' for meeting prep or deep dives."
         ),
         "input_schema": {
             "type": "object",

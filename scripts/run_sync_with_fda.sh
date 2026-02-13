@@ -14,6 +14,10 @@
 
 LIFEOS_DIR="/Users/nathanramia/Documents/Code/LifeOS"
 
+# Wake NVMe before running Python (Homebrew/venv live on the NVMe)
+ls /opt/homebrew/bin > /dev/null 2>&1
+sleep 2
+
 osascript <<EOF
 tell application "Terminal"
     activate

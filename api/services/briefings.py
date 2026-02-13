@@ -420,7 +420,7 @@ class BriefingsService:
             facts_by_cat = {}
             for fact in context.person_facts:
                 cat = fact["category"]
-                facts_by_cat.setdefault(cat, []).append(f"- {fact['key']}: {fact['value']}")
+                facts_by_cat.setdefault(cat, []).append(f"- {fact['value']}")
             person_facts_text = "\n".join(
                 f"**{cat.title()}:**\n" + "\n".join(items)
                 for cat, items in facts_by_cat.items()

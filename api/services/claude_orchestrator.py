@@ -15,7 +15,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import httpx
+
 from config.settings import settings
+
+TELEGRAM_API = "https://api.telegram.org"
 
 logger = logging.getLogger(__name__)
 
@@ -65,19 +69,55 @@ PERSISTENCE:
   at the root cause. Let the user decide next steps rather than looping indefinitely.
 
 ENVIRONMENT:
-- This is a Mac Mini running macOS
-- Obsidian vault: ~/Notes 2025 (markdown notes with YAML frontmatter)
+- Mac Mini running macOS
+- You have full filesystem access — you can read, write, search, and edit any file
+- You have a browser (Chrome) for web tasks
+- Git, cron, and standard macOS tools are available
+- Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
+
+KEY LOCATIONS:
+- Obsidian vault: ~/Notes 2025/ — Nathan's personal knowledge base. Markdown files with YAML frontmatter.
+  - People/Name.md — files about specific people (contact info, notes, facts)
+  - Daily logs — date-named files (e.g. 2026-01-12.md) with journal entries, meeting notes
+  - Meeting notes, project docs, task files
+  You can read these files directly with Read/Glob/Grep. Use this when you know the filename
+  or want full file content. Use the LifeOS MCP search tools when you need to search across
+  many files or need structured data like entity_ids and relationship scores.
 - LifeOS project: ~/Documents/Code/LifeOS (has CLAUDE.md with project conventions)
 - Other projects: ~/Documents/Code/
-- Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
-- Git, cron, and standard macOS tools are available
 
 LIFEOS DATA ACCESS:
-You have LifeOS MCP tools available (lifeos_people_search, lifeos_person_profile,
-lifeos_person_timeline, lifeos_person_facts, lifeos_search, lifeos_gmail_search,
-lifeos_imessage_search, lifeos_calendar_search, etc.). Use these to look up personal
-data — people, meetings, emails, notes, messages. Always search before saying you
-don't have information. The data is there — find it.
+You have LifeOS MCP tools for searching Nathan's personal data. Always use these
+before saying you don't have information. The data is there — find it.
+
+People tools (always start with lifeos_people_search to get entity_id):
+- lifeos_people_search: Find a person by name or email. Returns entity_id needed by all other people tools.
+- lifeos_person_profile: Full CRM profile — emails, phones, company, relationship strength, tags, notes. Use for contact details.
+- lifeos_person_timeline: Chronological interaction history — emails, messages, meetings in time order. Use for "catch me up on X" or "what's been happening with Y."
+- lifeos_person_facts: Extracted facts organized by category (family, interests, work, dates). Use for personal details like birthdays, hobbies, family members.
+- lifeos_person_connections: People connected through shared meetings, emails, Slack. Use for "who does X work with?"
+- lifeos_relationship_insights: Relationship patterns and observations from notes. Use for understanding dynamics.
+- lifeos_communication_gaps: Find people you haven't contacted recently. Requires comma-separated entity_ids.
+- lifeos_photos_person: Photos containing a specific person from Apple Photos.
+- lifeos_photos_shared: Photos where two people appear together.
+
+Search tools:
+- lifeos_search: Raw vault search — returns document chunks with relevance scores. Use when you need specific documents.
+- lifeos_ask: RAG search with Claude synthesis — returns a natural language answer. Use for open-ended questions about notes.
+- lifeos_gmail_search: Search Gmail across personal and work accounts. Returns email metadata and body.
+- lifeos_imessage_search: Search iMessage/SMS history. Filter by entity_id, phone, date range, or text.
+- lifeos_slack_search: Semantic search across Slack DMs and channels.
+- lifeos_calendar_search: Search past and future calendar events by keyword.
+- lifeos_calendar_upcoming: Get upcoming events for the next N days.
+- lifeos_drive_search: Search Google Drive files by name or content.
+
+Action tools:
+- lifeos_task_create/list/update/complete/delete: Manage Obsidian tasks.
+- lifeos_reminder_create/list/delete: Manage scheduled Telegram reminders.
+- lifeos_gmail_draft: Create a draft email in Gmail (not sent, user reviews first).
+- lifeos_telegram_send: Send an immediate message via Telegram.
+- lifeos_meeting_prep: Get intelligent meeting preparation context for a date.
+- lifeos_memories_create/search: Save and retrieve persistent memories.
 
 NOTIFICATIONS — use [NOTIFY] for:
 - Completion summaries (ALWAYS include one when done)
@@ -156,6 +196,7 @@ class ClaudeOrchestrator:
         self._process: Optional[subprocess.Popen] = None
         self._watchdog: Optional[threading.Timer] = None
         self._heartbeat: Optional[threading.Timer] = None
+        self._typing_stop: Optional[threading.Event] = None
         self._notification_callback: Optional[Callable[[str], None]] = None
 
     def is_busy(self) -> bool:
@@ -353,6 +394,9 @@ class ClaudeOrchestrator:
         # Start heartbeat timer
         self._start_heartbeat(session)
 
+        # Start typing indicator
+        self._start_typing()
+
     def _stream_reader(self, proc: subprocess.Popen, session: ClaudeSession):
         """Read and parse stream-json output from the Claude subprocess."""
         try:
@@ -513,6 +557,28 @@ class ClaudeOrchestrator:
         # Schedule next heartbeat
         self._start_heartbeat(session)
 
+    def _start_typing(self):
+        """Send Telegram typing indicator every 4 seconds while session is active."""
+        if self._typing_stop:
+            self._typing_stop.set()
+        self._typing_stop = threading.Event()
+        stop = self._typing_stop
+
+        def _typing_loop():
+            chat_id = settings.telegram_chat_id
+            while not stop.wait(4):
+                try:
+                    httpx.post(
+                        f"{TELEGRAM_API}/bot{settings.telegram_bot_token}/sendChatAction",
+                        json={"chat_id": chat_id, "action": "typing"},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_typing_loop, daemon=True, name="TypingIndicator")
+        t.start()
+
     def _cleanup(self, final_status: str):
         """Mark session complete and release lock."""
         if self._watchdog:
@@ -521,6 +587,9 @@ class ClaudeOrchestrator:
         if self._heartbeat:
             self._heartbeat.cancel()
             self._heartbeat = None
+        if self._typing_stop:
+            self._typing_stop.set()
+            self._typing_stop = None
         session = self._active_session
         if session and session.status not in ("completed", "failed", "awaiting_approval", "awaiting_clarification"):
             session.status = final_status

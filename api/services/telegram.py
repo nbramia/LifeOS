@@ -69,6 +69,47 @@ def _clean_markdown_for_telegram(text: str) -> str:
     return text.strip()
 
 
+async def send_typing_indicator(chat_id: str = None):
+    """Send 'typing...' chat action. Lasts ~5 seconds in the Telegram UI."""
+    chat_id = chat_id or settings.telegram_chat_id
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                _telegram_url("sendChatAction"),
+                json={"chat_id": chat_id, "action": "typing"},
+            )
+    except Exception:
+        pass  # Non-critical, don't log
+
+
+class TypingIndicator:
+    """Context manager that sends typing indicators every 4 seconds."""
+
+    def __init__(self, chat_id: str):
+        self.chat_id = chat_id
+        self._task: Optional[asyncio.Task] = None
+
+    async def _loop(self):
+        try:
+            while True:
+                await send_typing_indicator(self.chat_id)
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            pass
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+
 def send_message(text: str, chat_id: str = None) -> bool:
     """
     Send a message via Telegram (synchronous).
@@ -338,9 +379,10 @@ class TelegramBotListener:
 
         # Send through chat pipeline (intent classification happens there)
         try:
-            conv_id = self._conversations.get(chat_id)
-            result = await chat_via_api(text, conversation_id=conv_id)
-            self._conversations[chat_id] = result["conversation_id"]
+            async with TypingIndicator(chat_id):
+                conv_id = self._conversations.get(chat_id)
+                result = await chat_via_api(text, conversation_id=conv_id)
+                self._conversations[chat_id] = result["conversation_id"]
 
             # Check if the chat pipeline detected a "code" intent
             if result.get("code_intent"):

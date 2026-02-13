@@ -12,7 +12,7 @@ import json
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 from api.services.person_facts import (
     PersonFact,
@@ -508,6 +508,48 @@ class TestPersonFactExtractor:
         calendar_ids = [i["id"] for i in result if i["source_type"] == "calendar"]
         assert len(calendar_ids) == 10
 
+    def test_sample_interactions_temporal_diversity(self, extractor):
+        """Temporal diversity ensures older interactions appear in samples."""
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        interactions = []
+
+        # 300 recent (last 6 months)
+        for i in range(300):
+            interactions.append({
+                "id": f"recent-{i}",
+                "timestamp": (now - timedelta(days=i)).isoformat(),
+                "source_type": "gmail",
+            })
+        # 100 from 2 years ago
+        for i in range(100):
+            interactions.append({
+                "id": f"mid-{i}",
+                "timestamp": (now - timedelta(days=730 + i)).isoformat(),
+                "source_type": "gmail",
+            })
+        # 100 from 4 years ago
+        for i in range(100):
+            interactions.append({
+                "id": f"old-{i}",
+                "timestamp": (now - timedelta(days=1460 + i)).isoformat(),
+                "source_type": "gmail",
+            })
+
+        result = extractor._sample_interactions(interactions)
+
+        # Should have sampled within budget
+        assert len(result) <= extractor.MAX_INTERACTIONS_PER_BATCH
+
+        # Older interactions must appear
+        result_ids = {i["id"] for i in result}
+        old_count = sum(1 for rid in result_ids if rid.startswith("old-"))
+        mid_count = sum(1 for rid in result_ids if rid.startswith("mid-"))
+
+        assert old_count > 0, "No old interactions (3+ years) were sampled"
+        assert mid_count > 0, "No mid interactions (1-3 years) were sampled"
+
     def test_create_batches(self, extractor):
         """Interactions are split into batches."""
         interactions = list(range(250))
@@ -536,7 +578,7 @@ class TestPersonFactExtractor:
         assert "Meeting follow-up" in result
         assert "Thanks for the great meeting" in result
 
-    def test_parse_facts_response_valid_json(self, extractor):
+    def test_parse_extraction_response_valid_json(self, extractor):
         """Valid JSON response is parsed correctly."""
         response = json.dumps({
             "facts": [
@@ -554,7 +596,7 @@ class TestPersonFactExtractor:
         interactions = [{"id": "int-123", "source_link": "obsidian://test"}]
         lookup = {"int-123": interactions[0]}
 
-        facts = extractor._parse_facts_response(response, "person-id", interactions, lookup)
+        facts = extractor._parse_extraction_response(response, "person-id", lookup)
 
         assert len(facts) == 1
         assert facts[0].category == "family"
@@ -562,7 +604,7 @@ class TestPersonFactExtractor:
         assert facts[0].value == "Sarah"
         assert facts[0].source_quote == "my wife Sarah"
 
-    def test_parse_facts_response_markdown_json(self, extractor):
+    def test_parse_extraction_response_markdown_json(self, extractor):
         """JSON in markdown code block is extracted."""
         response = '''Here are the facts:
 ```json
@@ -580,12 +622,12 @@ class TestPersonFactExtractor:
 }
 ```
 '''
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
         assert facts[0].value == "Acme Inc"
 
-    def test_parse_facts_response_invalid_category_skipped(self, extractor):
+    def test_parse_extraction_response_invalid_category_skipped(self, extractor):
         """Facts with invalid categories are skipped."""
         response = json.dumps({
             "facts": [
@@ -594,12 +636,12 @@ class TestPersonFactExtractor:
             ]
         })
 
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
         assert facts[0].category == "work"
 
-    def test_parse_facts_response_missing_fields_skipped(self, extractor):
+    def test_parse_extraction_response_missing_fields_skipped(self, extractor):
         """Facts missing required fields are skipped."""
         response = json.dumps({
             "facts": [
@@ -609,12 +651,12 @@ class TestPersonFactExtractor:
             ]
         })
 
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
         assert facts[0].key == "valid"
 
-    def test_parse_facts_response_downgrades_no_quote(self, extractor):
+    def test_parse_extraction_response_downgrades_no_quote(self, extractor):
         """High-confidence facts without quotes get downgraded."""
         response = json.dumps({
             "facts": [
@@ -623,12 +665,12 @@ class TestPersonFactExtractor:
             ]
         })
 
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert len(facts) == 1
         assert facts[0].confidence == 0.6  # Downgraded from 0.95
 
-    def test_parse_facts_response_clamps_confidence(self, extractor):
+    def test_parse_extraction_response_clamps_confidence(self, extractor):
         """Confidence values are clamped to 0.0-1.0."""
         response = json.dumps({
             "facts": [
@@ -637,16 +679,16 @@ class TestPersonFactExtractor:
             ]
         })
 
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert facts[0].confidence == 1.0
         assert facts[1].confidence == 0.0
 
-    def test_parse_facts_response_invalid_json(self, extractor):
+    def test_parse_extraction_response_invalid_json(self, extractor):
         """Invalid JSON returns empty list."""
         response = "This is not valid JSON {{"
 
-        facts = extractor._parse_facts_response(response, "person-id", [], {})
+        facts = extractor._parse_extraction_response(response, "person-id", {})
 
         assert facts == []
 
@@ -669,6 +711,91 @@ class TestPersonFactExtractor:
         assert "2024-12" in result
         assert "January email" in result
         assert "December email" in result
+
+
+class TestOllamaValidation:
+    """Tests for Ollama post-extraction validation."""
+
+    @pytest.fixture
+    def mock_store(self):
+        store = MagicMock()
+        store.upsert.side_effect = lambda f: f
+        return store
+
+    @pytest.fixture
+    def extractor(self, mock_store):
+        return PersonFactExtractor(fact_store=mock_store)
+
+    def _make_fact(self, key="test_key", value="test_value", quote="test quote", confidence=0.9):
+        return PersonFact(
+            person_id="person-1",
+            category="family",
+            key=key,
+            value=value,
+            confidence=confidence,
+            source_quote=quote,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fact_rejected_when_unsupported(self, extractor):
+        """Fact rejected when Ollama says supported: false."""
+        fact = self._make_fact()
+        mock_result = {"supported": False, "correct_person": True, "evidence_strength": 3}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_facts_ollama([fact], "John")
+
+        assert len(result) == 0
+
+    @pytest.mark.asyncio
+    async def test_fact_rejected_when_wrong_person(self, extractor):
+        """Fact rejected when Ollama says correct_person: false."""
+        fact = self._make_fact()
+        mock_result = {"supported": True, "correct_person": False, "evidence_strength": 3}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_facts_ollama([fact], "John")
+
+        assert len(result) == 0
+
+    @pytest.mark.asyncio
+    async def test_confidence_remapped_from_evidence_strength(self, extractor):
+        """Confidence is remapped based on evidence_strength."""
+        fact = self._make_fact(confidence=0.95)
+        mock_result = {"supported": True, "correct_person": True, "evidence_strength": 4}
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=True)
+            instance.generate_json = AsyncMock(return_value=mock_result)
+
+            result = await extractor._validate_facts_ollama([fact], "John")
+
+        assert len(result) == 1
+        assert result[0].confidence == 0.8  # evidence_strength 4 → 0.8
+
+    @pytest.mark.asyncio
+    async def test_graceful_degradation_ollama_unavailable(self, extractor):
+        """All facts pass through with capped confidence when Ollama unavailable."""
+        facts = [self._make_fact(confidence=0.95), self._make_fact(key="k2", confidence=0.8)]
+
+        with patch("api.services.ollama_client.OllamaClient") as MockClient:
+            instance = MockClient.return_value
+            instance.is_available_async = AsyncMock(return_value=False)
+
+            result = await extractor._validate_facts_ollama(facts, "John")
+
+        assert len(result) == 2
+        assert result[0].confidence == 0.7  # Capped from 0.95
+        assert result[1].confidence == 0.7  # Capped from 0.8
 
 
 class TestFactCategories:
