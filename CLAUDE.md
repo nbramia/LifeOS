@@ -128,6 +128,8 @@ These guidelines bias toward caution over speed. For trivial tasks (simple typo 
 | `./scripts/deploy.sh` | Test → restart → commit → push |
 | `./scripts/test.sh` | Run test suites |
 | `./scripts/service.sh` | launchd service management |
+| `/Applications/LifeOS.app/Contents/MacOS/LifeOS` | FDA wrapper for cron jobs (see macOS Permissions section) |
+| `./scripts/run_sync_wrapper.sh` | NVMe wake + Python pre-flight for nightly sync (used by launchd) |
 
 ## Dependency Management
 
@@ -229,25 +231,43 @@ curl -X POST http://localhost:8000/api/admin/reindex
 tail -50 logs/lifeos-api-error.log
 ```
 
+### macOS Permissions & the LifeOS.app Wrapper
+
+`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**
+granted in macOS Privacy settings. Cron and launchd cannot access `~/Documents/` without
+FDA, so all cron jobs route through this wrapper.
+
+**Commands:**
+- `LifeOS server` — Start API server (used by launchd, default)
+- `LifeOS fda-sync` — FDA sync (phone/iMessage via Terminal.app)
+- `LifeOS watchdog` — ChromaDB health check and auto-restart
+- `LifeOS exec <cmd>` — Run arbitrary command with FDA permissions
+
+**Binary location:** `/Applications/LifeOS.app/Contents/MacOS/LifeOS`
+
+If adding new cron jobs or scripts that need to access `~/Documents/`, route them
+through `LifeOS exec` rather than calling scripts directly.
+
 ### FDA Sync (Phone/iMessage)
 
 Phone calls, FaceTime, and iMessage require **Full Disk Access** to read CallHistoryDB
-and chat.db. The launchd service doesn't have FDA, but Terminal.app does.
+and chat.db. Terminal.app has FDA; the sync opens a Terminal window to run.
 
 **How it works:**
-- `run_sync_with_fda.sh` runs via cron at **2:50 AM** (10 min before main sync)
-- Opens Terminal.app which has FDA permission
+- Cron runs `LifeOS fda-sync` at **2:50 AM** (10 min before main sync)
+- Wakes NVMe (Homebrew lives there), then opens Terminal.app with FDA
 - Runs `run_fda_syncs.py` to sync phone + iMessage with health tracking
 - Main sync at 3:00 AM detects these were recently synced and skips them
 
-**Cron entry:**
+**Cron entries** (both route through LifeOS.app for FDA):
 ```
-50 2 * * * /Users/nathanramia/Documents/Code/LifeOS/scripts/run_sync_with_fda.sh
+*/5 * * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS watchdog
+50 2 * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS fda-sync
 ```
 
 **Manual run (from Terminal.app):**
 ```bash
-.venv/bin/python scripts/run_fda_syncs.py
+~/.venvs/lifeos/bin/python scripts/run_fda_syncs.py
 ```
 
 ### Monarch Money (Financial Data)
