@@ -384,9 +384,8 @@ TOOL_DEFINITIONS = [
     {
         "name": "create_calendar_event",
         "description": (
-            "Create a Google Calendar event. IMPORTANT: Before calling this tool, "
-            "present the event details to the user and wait for confirmation. "
-            "No invite emails are sent — the user can send invites from Google Calendar after reviewing."
+            "Create a Google Calendar event. Invite emails are automatically sent to attendees. "
+            "IMPORTANT: Before calling this tool, present the event details to the user and wait for confirmation."
         ),
         "input_schema": {
             "type": "object",
@@ -414,8 +413,8 @@ TOOL_DEFINITIONS = [
         "name": "update_calendar_event",
         "description": (
             "Update an existing Google Calendar event. Requires event_id from search_calendar. "
-            "Only provided fields are changed. IMPORTANT: Confirm changes with the user before calling. "
-            "No invite emails are sent."
+            "Only provided fields are changed. Update emails are sent to attendees. "
+            "IMPORTANT: Confirm changes with the user before calling."
         ),
         "input_schema": {
             "type": "object",
@@ -444,8 +443,8 @@ TOOL_DEFINITIONS = [
         "name": "delete_calendar_event",
         "description": (
             "Delete a Google Calendar event. Requires event_id from search_calendar. "
-            "IMPORTANT: Confirm deletion with the user before calling. "
-            "No cancellation emails are sent."
+            "Cancellation emails are sent to attendees. "
+            "IMPORTANT: Confirm deletion with the user before calling."
         ),
         "input_schema": {
             "type": "object",

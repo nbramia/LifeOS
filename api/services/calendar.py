@@ -296,6 +296,134 @@ class CalendarService:
             logger.error(f"Failed to fetch calendar events: {e}")
             return []
 
+    def create_event(
+        self,
+        title: str,
+        start_time: str,
+        end_time: str,
+        attendees: list[str] | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        calendar_id: str = "primary",
+    ) -> CalendarEvent:
+        """
+        Create a new calendar event.
+
+        Args:
+            title: Event title
+            start_time: ISO datetime string
+            end_time: ISO datetime string
+            attendees: List of email addresses
+            description: Event description
+            location: Event location
+            calendar_id: Calendar to create in
+
+        Returns:
+            Created CalendarEvent
+        """
+        body: dict = {
+            "summary": title,
+            "start": {"dateTime": start_time},
+            "end": {"dateTime": end_time},
+        }
+        if attendees:
+            body["attendees"] = [{"email": e} for e in attendees]
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+
+        result = self.service.events().insert(
+            calendarId=calendar_id,
+            body=body,
+            sendUpdates="all",
+        ).execute()
+
+        event = self._parse_event(result)
+        if not event:
+            raise RuntimeError("Failed to parse created event")
+        return event
+
+    def update_event(
+        self,
+        event_id: str,
+        title: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        attendees: list[str] | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        calendar_id: str = "primary",
+    ) -> CalendarEvent:
+        """
+        Update an existing calendar event.
+
+        Fetches the current event, merges changes, and updates.
+
+        Args:
+            event_id: ID of the event to update
+            title: New title (None = keep existing)
+            start_time: New start ISO datetime (None = keep existing)
+            end_time: New end ISO datetime (None = keep existing)
+            attendees: New attendee list (None = keep existing)
+            description: New description (None = keep existing)
+            location: New location (None = keep existing)
+            calendar_id: Calendar containing the event
+
+        Returns:
+            Updated CalendarEvent
+        """
+        existing = self.service.events().get(
+            calendarId=calendar_id, eventId=event_id
+        ).execute()
+
+        if title is not None:
+            existing["summary"] = title
+        if start_time is not None:
+            existing["start"] = {"dateTime": start_time}
+        if end_time is not None:
+            existing["end"] = {"dateTime": end_time}
+        if attendees is not None:
+            existing["attendees"] = [{"email": e} for e in attendees]
+        if description is not None:
+            existing["description"] = description
+        if location is not None:
+            existing["location"] = location
+
+        result = self.service.events().update(
+            calendarId=calendar_id,
+            eventId=event_id,
+            body=existing,
+            sendUpdates="all",
+        ).execute()
+
+        event = self._parse_event(result)
+        if not event:
+            raise RuntimeError("Failed to parse updated event")
+        return event
+
+    def delete_event(
+        self,
+        event_id: str,
+        calendar_id: str = "primary",
+    ) -> bool:
+        """
+        Delete a calendar event.
+
+        Args:
+            event_id: ID of the event to delete
+            calendar_id: Calendar containing the event
+
+        Returns:
+            True on success
+        """
+        self.service.events().delete(
+            calendarId=calendar_id,
+            eventId=event_id,
+            sendUpdates="all",
+        ).execute()
+        return True
+
     def _parse_event(self, item: dict) -> Optional[CalendarEvent]:
         """
         Parse a raw API event into CalendarEvent.

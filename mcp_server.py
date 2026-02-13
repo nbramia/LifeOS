@@ -369,19 +369,19 @@ Example morning briefing:
     },
     "/api/calendar/events:POST": {
         "name": "lifeos_calendar_create",
-        "description": "Create a Google Calendar event. Provide title, start_time (ISO datetime), end_time (ISO datetime). Optional: attendees (email list), description, location, account (personal/work). No invite emails are sent — user reviews and sends from Google Calendar. [CLARIFY] before creating events with attendees.",
+        "description": "Create a Google Calendar event. Provide title, start_time (ISO datetime), end_time (ISO datetime). Optional: attendees (email list), description, location, account (personal/work). Invite emails are automatically sent to attendees. [CLARIFY] before creating events with attendees.",
         "method": "POST",
         "path": "/api/calendar/events"
     },
     "/api/calendar/events/{event_id}:PUT": {
         "name": "lifeos_calendar_update",
-        "description": "Update an existing calendar event. Requires event_id from lifeos_calendar_search. Only provided fields are changed. Optional: title, start_time, end_time, attendees, description, location, account. No invite emails are sent. [CLARIFY] before updating events.",
+        "description": "Update an existing calendar event. Requires event_id from lifeos_calendar_search. Only provided fields are changed. Optional: title, start_time, end_time, attendees, description, location, account. Update emails are sent to attendees. [CLARIFY] before updating events.",
         "method": "PUT",
         "path": "/api/calendar/events/{event_id}"
     },
     "/api/calendar/events/{event_id}:DELETE": {
         "name": "lifeos_calendar_delete",
-        "description": "Delete a calendar event. Requires event_id from lifeos_calendar_search. Optional: account (personal/work). No cancellation emails are sent. [CLARIFY] before deleting events.",
+        "description": "Delete a calendar event. Requires event_id from lifeos_calendar_search. Optional: account (personal/work). Cancellation emails are sent to attendees. [CLARIFY] before deleting events.",
         "method": "DELETE",
         "path": "/api/calendar/events/{event_id}"
     },

@@ -122,7 +122,7 @@ Action tools:
 - lifeos_task_create/list/update/complete/delete: Manage Obsidian tasks.
 - lifeos_reminder_create/list/delete: Manage scheduled Telegram reminders.
 - lifeos_gmail_draft: Create a draft email in Gmail (not sent, user reviews first).
-- lifeos_calendar_create: Create a Google Calendar event. No invite emails sent. [CLARIFY] with user before creating.
+- lifeos_calendar_create: Create a Google Calendar event. Invite emails sent to attendees. [CLARIFY] with user before creating.
 - lifeos_calendar_update: Update an existing calendar event (title, time, attendees, etc.). Requires event_id from lifeos_calendar_search. [CLARIFY] before updating.
 - lifeos_calendar_delete: Delete a calendar event. Requires event_id from lifeos_calendar_search. [CLARIFY] before deleting.
 - lifeos_telegram_send: Send an immediate message via Telegram.
