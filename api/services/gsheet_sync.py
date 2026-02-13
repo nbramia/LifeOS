@@ -121,6 +121,7 @@ class GSheetSyncService:
     def _init_db(self):
         """Initialize SQLite database for tracking synced rows."""
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS synced_rows (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

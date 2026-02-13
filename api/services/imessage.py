@@ -172,6 +172,7 @@ class IMessageStore:
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
 
         with sqlite3.connect(self.storage_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS messages (
                     rowid INTEGER PRIMARY KEY,

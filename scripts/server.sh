@@ -123,9 +123,33 @@ wait_for_healthy() {
     done
 }
 
+# Rotate server.log if it exceeds 10 MB (keeps 5 rotations)
+rotate_log() {
+    local max_size=$((10 * 1024 * 1024))  # 10 MB
+    local max_rotations=5
+
+    if [ -f "$LOG_FILE" ]; then
+        local size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo "0")
+        if [ "$size" -ge "$max_size" ]; then
+            log_info "Rotating server.log ($(($size / 1048576))MB)..."
+            # Shift existing rotations
+            for i in $(seq $((max_rotations - 1)) -1 1); do
+                [ -f "$LOG_FILE.$i" ] && mv "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+            done
+            mv "$LOG_FILE" "$LOG_FILE.1"
+            touch "$LOG_FILE"
+            # Remove oldest if over limit
+            [ -f "$LOG_FILE.$((max_rotations + 1))" ] && rm "$LOG_FILE.$((max_rotations + 1))"
+        fi
+    fi
+}
+
 # Start the server
 start_server() {
     log_info "Starting LifeOS server..."
+
+    # Rotate logs before starting
+    rotate_log
 
     # Check ChromaDB is running (required dependency)
     if ! chromadb_healthy; then
