@@ -17,9 +17,10 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/.venvs/lifeos/bin/python</string>
-        <string>__LIFEOS_PATH__/scripts/run_all_syncs.py</string>
-        <string>--force</string>
+        <string>/bin/bash</string>
+        <string>__LIFEOS_PATH__/scripts/run_sync_wrapper.sh</string>
+        <string>--execute</string>
+        <string>--trigger=scheduled</string>
     </array>
 
     <key>WorkingDirectory</key>
