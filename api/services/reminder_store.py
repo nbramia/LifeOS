@@ -47,7 +47,7 @@ class Reminder:
     created_at: str = ""
     last_triggered_at: Optional[str] = None
     next_trigger_at: Optional[str] = None
-    timezone: str = "America/New_York"  # Default to Eastern for cron interpretation
+    timezone: str = ""  # Resolved from settings.timezone when empty
 
     def to_dict(self) -> dict:
         return {
@@ -81,7 +81,7 @@ def compute_next_trigger(reminder: Reminder) -> Optional[str]:
             trigger_time = datetime.fromisoformat(reminder.schedule_value)
             if trigger_time.tzinfo is None:
                 # Assume the reminder's timezone if not specified
-                tz = ZoneInfo(reminder.timezone or "America/New_York")
+                tz = ZoneInfo(reminder.timezone or settings.timezone)
                 trigger_time = trigger_time.replace(tzinfo=tz)
             # Convert to UTC for comparison and storage
             trigger_time_utc = trigger_time.astimezone(timezone.utc)
@@ -95,7 +95,7 @@ def compute_next_trigger(reminder: Reminder) -> Optional[str]:
     elif reminder.schedule_type == "cron":
         try:
             # Interpret cron expression in the reminder's timezone
-            tz = ZoneInfo(reminder.timezone or "America/New_York")
+            tz = ZoneInfo(reminder.timezone or settings.timezone)
             now_local = datetime.now(tz)
 
             cron = croniter(reminder.schedule_value, now_local)
@@ -115,8 +115,9 @@ def compute_next_trigger(reminder: Reminder) -> Optional[str]:
     return None
 
 
-def _format_cron_human(cron_expr: str, tz_name: str = "America/New_York") -> str:
+def _format_cron_human(cron_expr: str, tz_name: str = "") -> str:
     """Convert a cron expression to a human-readable string with timezone."""
+    tz_name = tz_name or settings.timezone
     parts = cron_expr.split()
     if len(parts) < 5:
         return cron_expr
@@ -160,8 +161,9 @@ def _format_cron_human(cron_expr: str, tz_name: str = "America/New_York") -> str
     return f"{day_str} at {time_str} {tz_abbrev}"
 
 
-def _format_dt_short(iso_str: str, tz_name: str = "America/New_York") -> str:
+def _format_dt_short(iso_str: str, tz_name: str = "") -> str:
     """Format an ISO datetime string to a short display in local timezone."""
+    tz_name = tz_name or settings.timezone
     try:
         dt = datetime.fromisoformat(iso_str)
         tz = ZoneInfo(tz_name)
@@ -251,7 +253,7 @@ class ReminderStore:
                 lines.append("| Name | Schedule | Next Fire | Last Triggered | Type |")
                 lines.append("|------|----------|-----------|----------------|------|")
                 for r in active_recurring:
-                    tz = r.timezone or "America/New_York"
+                    tz = r.timezone or settings.timezone
                     sched = _format_cron_human(r.schedule_value, tz)
                     nxt = _format_dt_short(r.next_trigger_at, tz) if r.next_trigger_at else "—"
                     last = _format_dt_short(r.last_triggered_at, tz) if r.last_triggered_at else "—"
@@ -267,7 +269,7 @@ class ReminderStore:
                 lines.append("| Name | Scheduled For | Created | Type |")
                 lines.append("|------|---------------|---------|------|")
                 for r in upcoming_once:
-                    tz = r.timezone or "America/New_York"
+                    tz = r.timezone or settings.timezone
                     trigger = _format_dt_short(r.next_trigger_at, tz) if r.next_trigger_at else "—"
                     created = _format_dt_short(r.created_at, tz) if r.created_at else "—"
                     lines.append(f"| {r.name} | {trigger} | {created} | {r.message_type} |")

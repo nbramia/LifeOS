@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from api.services.calendar import CalendarService, CalendarEvent
 from api.services.google_auth import GoogleAccount
 from api.services.vectorstore import VectorStore, get_vector_store
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +308,7 @@ class CalendarIndexer:
     def start_time_scheduler(
         self,
         schedule_times: list[tuple[int, int]] = [(8, 0), (12, 0), (15, 0)],
-        timezone: str = "America/New_York",
+        timezone: str = "",
         skip_initial_sync: bool = True
     ):
         """
@@ -316,9 +317,10 @@ class CalendarIndexer:
         Args:
             schedule_times: List of (hour, minute) tuples in 24-hour format
                            Default: 8:00 AM, 12:00 PM, 3:00 PM
-            timezone: IANA timezone string (default: America/New_York for Eastern)
+            timezone: IANA timezone string (defaults to settings.timezone)
             skip_initial_sync: Skip initial sync on startup (default: True to avoid blocking)
         """
+        timezone = timezone or settings.timezone
         if self._scheduler_thread and self._scheduler_thread.is_alive():
             logger.warning("Scheduler already running")
             return

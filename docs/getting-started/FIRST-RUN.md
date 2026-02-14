@@ -90,6 +90,23 @@ uv run python scripts/run_all_syncs.py --execute --force
 
 **Note**: First sync may take 30+ minutes depending on data volume.
 
+### After First Sync: Set Your Person ID
+
+After sync completes, find your person ID and add it to `.env`:
+
+```bash
+curl "http://localhost:8000/api/crm/people?q=YourName" | jq '.people[0].id'
+```
+
+Add the result to `.env`:
+```bash
+LIFEOS_MY_PERSON_ID=<the-uuid-from-above>
+```
+
+Then restart: `./scripts/server.sh restart`
+
+This enables relationship tracking, communication gap analysis, and other CRM features that need to know which person is "you."
+
 ---
 
 ## Step 5: MCP Integration (Optional)

@@ -293,7 +293,8 @@ class TestDirectoryResolution:
     def test_default_directory(self):
         """Test default working directory when no project mentioned."""
         # Default should be the LifeOS project
-        default_dir = "/Users/nathanramia/Documents/Code/LifeOS"
+        from pathlib import Path
+        default_dir = str(Path(__file__).resolve().parent.parent.parent)
         assert "LifeOS" in default_dir
 
     def test_project_keyword_detection(self):

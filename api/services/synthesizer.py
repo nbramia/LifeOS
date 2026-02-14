@@ -309,7 +309,7 @@ If asked to create a reminder or email, respond naturally - the system will hand
 
 def get_current_datetime_context() -> str:
     """Get the current date and time formatted for the prompt."""
-    tz = ZoneInfo("America/New_York")
+    tz = ZoneInfo(settings.timezone)
     now = datetime.now(tz)
     return now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
 

@@ -113,7 +113,18 @@ See [Configuration Guide](CONFIGURATION.md) for all options.
 
 ---
 
-## Step 6: Start Server
+## Step 6: Run Preflight Check
+
+```bash
+# Validate all prerequisites before starting
+./scripts/server.sh preflight
+```
+
+Fix any failures before proceeding. Warnings are non-blocking.
+
+---
+
+## Step 7: Start Server
 
 ```bash
 # Start the server (ALWAYS use this script, never run uvicorn directly)
@@ -127,7 +138,7 @@ Web UI available at: http://localhost:8000
 
 ---
 
-## Step 7: Verify Installation
+## Step 8: Verify Installation
 
 Run the verification checklist:
 
@@ -153,8 +164,9 @@ All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLES
 
 1. **Configure integrations**: See [Configuration](CONFIGURATION.md)
 2. **Set up Google OAuth**: See [Google OAuth Guide](../guides/GOOGLE-OAUTH.md)
-3. **Configure launchd services**: See [Launchd Setup](../guides/LAUNCHD-SETUP.md)
-4. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
+3. **Set up FDA wrapper** (for iMessage/Phone sync): `./scripts/create-lifeos-app.sh`
+4. **Configure launchd services**: See [Launchd Setup](../guides/LAUNCHD-SETUP.md)
+5. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
 
 ---
 

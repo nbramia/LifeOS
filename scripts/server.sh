@@ -2,14 +2,15 @@
 # LifeOS Server Management Script
 # Designed for reliable server management from Claude or command line
 #
-# Usage: ./scripts/server.sh [start|stop|restart|status|wait]
+# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight]
 #
 # Commands:
-#   start   - Kill any existing processes, start server, wait for health check
-#   stop    - Stop the server
-#   restart - Stop and start the server
-#   status  - Check if server is running and healthy
-#   wait    - Wait for server to be healthy (use after manual start)
+#   start     - Kill any existing processes, start server, wait for health check
+#   stop      - Stop the server
+#   restart   - Stop and start the server
+#   status    - Check if server is running and healthy
+#   wait      - Wait for server to be healthy (use after manual start)
+#   preflight - Check prerequisites before first start
 #
 # Expected startup time: 30-60 seconds (loading sentence-transformers model)
 
@@ -251,17 +252,21 @@ case "${1:-status}" in
     wait)
         wait_for_healthy ${2:-$STARTUP_TIMEOUT}
         ;;
+    preflight)
+        exec "$SCRIPT_DIR/preflight.sh"
+        ;;
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|preflight}"
         echo ""
         echo "Commands:"
-        echo "  start   - Start server (kills existing, waits for healthy)"
-        echo "  stop    - Stop the server"
-        echo "  restart - Restart the server"
-        echo "  status  - Show server status"
-        echo "  wait    - Wait for server to become healthy"
+        echo "  start     - Start server (kills existing, waits for healthy)"
+        echo "  stop      - Stop the server"
+        echo "  restart   - Restart the server"
+        echo "  status    - Show server status"
+        echo "  wait      - Wait for server to become healthy"
+        echo "  preflight - Check prerequisites before first start"
         echo ""
         echo "Expected startup time: 30-60 seconds (ML model loading)"
         exit 1

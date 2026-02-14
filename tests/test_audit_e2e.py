@@ -11,11 +11,14 @@ and what actually works in practice.
 import asyncio
 import json
 import time
+from pathlib import Path
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, AsyncMock, MagicMock
 
 pytestmark = pytest.mark.unit
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +745,14 @@ class TestMCPWriteTools:
         # Load mcp_server module manually since it's not in the api package
         spec = importlib.util.spec_from_file_location(
             "mcp_server",
-            "/Users/nathanramia/Documents/Code/LifeOS/mcp_server.py"
+            f"{_PROJECT_ROOT}/mcp_server.py"
         )
         mcp_mod = importlib.util.module_from_spec(spec)
 
         # The module tries to connect to the API on import; we just need CURATED_ENDPOINTS
         # Read it from source instead
         import ast
-        with open("/Users/nathanramia/Documents/Code/LifeOS/mcp_server.py") as f:
+        with open(f"{_PROJECT_ROOT}/mcp_server.py") as f:
             source = f.read()
 
         # Check for the claimed tool names in the source
@@ -767,7 +770,7 @@ class TestMCPWriteTools:
 
     def test_call_api_handles_put_patch_delete(self):
         """_call_api should handle PUT, PATCH, and DELETE methods."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/mcp_server.py") as f:
+        with open(f"{_PROJECT_ROOT}/mcp_server.py") as f:
             source = f.read()
 
         # Verify the method dispatch handles all HTTP methods
@@ -784,7 +787,7 @@ class TestAgentReminderMessageType:
 
     def test_reminder_create_uses_valid_message_type(self):
         """agent_tools._reminder_create must use 'static', not 'telegram'."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/services/agent_tools.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/services/agent_tools.py") as f:
             source = f.read()
 
         # Find the _reminder_create function
@@ -800,7 +803,7 @@ class TestEndpointReminderFixed:
 
     def test_httpx_imported_in_reminder_store(self):
         """reminder_store.py must import httpx for _call_endpoint."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/services/reminder_store.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
             source = f.read()
 
         import_lines = [line for line in source.split("\n") if line.startswith("import ") or line.startswith("from ")]
@@ -846,13 +849,13 @@ class TestSchedulerCrashRecovery:
             scheduler = ReminderScheduler(store)
             # Check that the thread would be created as daemon
             # (we can't start it without Telegram, but we can verify the code)
-            with open("/Users/nathanramia/Documents/Code/LifeOS/api/services/reminder_store.py") as f:
+            with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
                 source = f.read()
             assert "daemon=True" in source
 
     def test_scheduler_logs_crash(self):
         """Scheduler crash should be logged (even if not alerted)."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/services/reminder_store.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
             source = f.read()
         assert "scheduler crashed" in source.lower() or "Reminder scheduler crashed" in source
 
@@ -866,14 +869,14 @@ class TestChatPipelineUnification:
 
     def test_no_legacy_compose_handler(self):
         """chat.py should not have a compose handler."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/routes/chat.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/routes/chat.py") as f:
             source = f.read()
         assert "def handle_compose" not in source
         assert "async def handle_compose" not in source
 
     def test_no_legacy_task_handler(self):
         """chat.py should not have dedicated task/reminder handlers."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/routes/chat.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/routes/chat.py") as f:
             source = f.read()
         assert "def handle_task_intent" not in source
         assert "def handle_reminder_intent" not in source
@@ -881,13 +884,13 @@ class TestChatPipelineUnification:
 
     def test_ambiguous_handler_still_exists(self):
         """The ambiguous_task_reminder handler should still exist."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/routes/chat.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/routes/chat.py") as f:
             source = f.read()
         assert "ambiguous_task_reminder" in source
 
     def test_code_handler_still_exists(self):
         """The code intent handler should still exist."""
-        with open("/Users/nathanramia/Documents/Code/LifeOS/api/routes/chat.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/routes/chat.py") as f:
             source = f.read()
         assert "code_intent" in source
 

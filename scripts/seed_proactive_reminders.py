@@ -15,6 +15,7 @@ Delete any reminder via the API to disable it.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.reminder_store import get_reminder_store
+
+_TZ = os.environ.get("LIFEOS_TIMEZONE", "America/New_York")
 
 # ---------------------------------------------------------------------------
 # Prompt definitions
@@ -111,7 +114,7 @@ REMINDERS = [
         "message_type": "prompt",
         "message_content": MEETING_PREP_PROMPT,
         "enabled": True,
-        "timezone": "America/New_York",
+        "timezone": _TZ,
     },
     {
         "name": "Morning Briefing",
@@ -120,7 +123,7 @@ REMINDERS = [
         "message_type": "prompt",
         "message_content": MORNING_BRIEFING_PROMPT,
         "enabled": True,
-        "timezone": "America/New_York",
+        "timezone": _TZ,
     },
     {
         "name": "Weekly Relationship Digest",
@@ -129,7 +132,7 @@ REMINDERS = [
         "message_type": "prompt",
         "message_content": COMMUNICATION_GAPS_PROMPT,
         "enabled": True,
-        "timezone": "America/New_York",
+        "timezone": _TZ,
     },
 ]
 
