@@ -7,11 +7,11 @@ This document is the source of truth for orchestrating implementation of the Lif
 | Phase | Status | Agent | Items | Notes |
 |-------|--------|-------|-------|-------|
 | Phase 0 | **completed** | — | #1 | Infrastructure basics |
-| Phase 1 | **not started** | — | #2 | PersonEntity migration |
-| Phase 2a | **not started** | — | #4 | Chat pipeline unification |
-| Phase 2b | **not started** | — | #5 (all sub-items) | MCP tool coverage |
-| Phase 2c | **not started** | — | #7 | Agent memory |
-| Phase 3 | **not started** | — | #3 | Task queue |
+| Phase 1 | **completed** | — | #2 | PersonEntity JSON→SQLite migration |
+| Phase 2a | **completed** | — | #4 | Chat pipeline unification |
+| Phase 2b | **completed** | mcp-agent | #5 (all sub-items) | MCP write tools |
+| Phase 2c | **completed** | memory-agent | #7 | Agent memory integration |
+| Phase 3 | **completed** | — | #3 | SQLite-backed job queue |
 | Phase 4a | **not started** | — | #6 | Reminder pipeline |
 | Phase 4b | **not started** | — | #8 | Proactive intelligence |
 
@@ -101,13 +101,51 @@ This keeps each agent's context lean and focused.
 - `config/newsyslog-lifeos.conf`: ready for manual install (`sudo cp ... /etc/newsyslog.d/lifeos.conf`) for system-level rotation
 
 ### After Phase 1
-*(not yet completed)*
+
+**PersonEntity JSON→SQLite Migration:**
+- Rewrote `api/services/person_entity.py`: `PersonEntityStore` now backed by SQLite (`data/crm.db` table `person_entities`) with lookup tables (`person_emails`, `person_phones`, `person_names`) and indices
+- Constructor changed from `storage_path: str` to `db_path: str`
+- `save()` is now a no-op (writes are immediate via SQL); added `export_json()` for backup
+- Migration script: `scripts/migrate_person_entities.py` — reads JSON, inserts into SQLite, verifies integrity
+- All 24 person_entity tests + 56 entity_resolver/briefings tests pass
+- Data integrity verified: 14,121 entities match between JSON and SQLite
+- Commit: `a7fbf99`
 
 ### After Phase 2
-*(not yet completed)*
+
+**Phase 2a — Chat Pipeline Unification:**
+- Removed 587 lines of legacy intent handlers from `api/routes/chat.py` (compose, task, reminder, task_and_reminder)
+- All intents now flow through the agentic loop which has `create_email_draft`, `manage_tasks`, `manage_reminders` tools
+- Only two special-case handlers remain: `ambiguous_task_reminder` (user clarification) and `code` (Claude Code delegation)
+- Removed unused `TaskIntentType` import
+- Commit: `65b388d`
+
+**Phase 2b — MCP Write Tools:**
+- Added 6 new tools to `mcp_server.py` CURATED_ENDPOINTS: `lifeos_person_update` (PATCH), `lifeos_reminder_update` (PUT), `lifeos_sync_trigger` (POST, custom handler), `lifeos_person_fact_update` (PUT), `lifeos_person_fact_confirm` (POST), `lifeos_person_fact_delete` (DELETE)
+- Fixed `_call_api`: Added explicit PUT/PATCH/DELETE handling
+- Changed health endpoint from `/health/full` to `/health/services` for richer per-service data
+- Added `_get_fallback_schema()` and `_fallback_schemas()` methods
+- Commit: `c485d27`
+
+**Phase 2c — Agent Memory Integration:**
+- Added `save_memory` and `search_memories` tools to `api/services/agent_tools.py`
+- Injected relevant memory retrieval into `api/services/agent_loop.py` system prompt (top 5 memories per query)
+- Leverages existing `MemoryStore` service and API routes
+- Commit: `708797c`
 
 ### After Phase 3
-*(not yet completed)*
+
+**SQLite-Backed Job Queue:**
+- New: `api/services/job_queue.py` — SQLite `jobs` table (WAL mode) with fields: id, type, status, params, result, timestamps, attempts, max_attempts, priority, error
+- `JobQueue` class: enqueue, get, list, cancel, cleanup operations; pluggable handler registry via `register_job_handler()`
+- Background worker thread: polls every 2s, claims one job at a time, retry logic (failed→pending up to max_attempts, then FAILED)
+- Built-in handlers: `reindex_vault` (calls IndexerService), `sync_source` (subprocess to sync scripts)
+- New: `api/routes/jobs.py` — `GET /api/jobs` (list/filter), `GET /api/jobs/{job_id}` (status), `POST /api/jobs/{job_id}/cancel`
+- Updated `api/routes/admin.py`: `POST /api/admin/reindex` now enqueues a job and returns immediately with `job_id`; duplicate prevention (won't enqueue if already pending/running); removed `BackgroundTasks` import and global `_reindex_in_progress` flag
+- `POST /api/admin/reindex/sync` kept for initial setup (blocking mode)
+- Worker starts in `api/main.py` lifespan, shuts down gracefully on exit
+- 20 new tests in `tests/test_job_queue.py` (queue CRUD, worker execution, retry, failure exhaustion, sequential processing)
+- Database: `data/jobs.db`
 
 ### After Phase 4a
 *(not yet completed)*

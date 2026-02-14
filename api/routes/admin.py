@@ -6,13 +6,14 @@ Provides:
 - System status
 - Configuration info
 """
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 import logging
 
 from api.services.indexer import IndexerService
 from api.services.vectorstore import VectorStore
+from api.services.job_queue import get_job_queue
 from config.settings import settings
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -31,12 +32,8 @@ class ReindexResponse(BaseModel):
     """Response from reindex operation."""
     status: str
     message: str
+    job_id: Optional[str] = None
     files_indexed: Optional[int] = None
-
-
-# Track reindex state
-_reindex_in_progress = False
-_last_reindex_count = 0
 
 
 @router.get("/status", response_model=IndexStatus)
@@ -54,52 +51,50 @@ async def get_status() -> IndexStatus:
         logger.error(f"Error getting document count: {e}")
         count = 0
 
-    global _reindex_in_progress
+    # Check if a reindex job is currently running
+    queue = get_job_queue()
+    running_jobs = queue.list_jobs(status="running", job_type="reindex_vault", limit=1)
+    reindex_in_progress = len(running_jobs) > 0
+
+    # Get last completed reindex result
+    completed_jobs = queue.list_jobs(status="completed", job_type="reindex_vault", limit=1)
+    last_count = 0
+    if completed_jobs and completed_jobs[0].result:
+        last_count = completed_jobs[0].result.get("files_indexed", 0)
 
     return IndexStatus(
-        status="reindexing" if _reindex_in_progress else "ready",
+        status="reindexing" if reindex_in_progress else "ready",
         document_count=count,
         vault_path=str(settings.vault_path),
-        message=f"Last reindex: {_last_reindex_count} files" if _last_reindex_count > 0 else None,
+        message=f"Last reindex: {last_count} files" if last_count > 0 else None,
     )
 
 
-def _do_reindex():
-    """Background task to reindex vault."""
-    global _reindex_in_progress, _last_reindex_count
-
-    _reindex_in_progress = True
-    try:
-        indexer = IndexerService(vault_path=settings.vault_path)
-        count = indexer.index_all()
-        _last_reindex_count = count
-        logger.info(f"Reindex complete: {count} files")
-    except Exception as e:
-        logger.error(f"Reindex failed: {e}")
-    finally:
-        _reindex_in_progress = False
-
-
 @router.post("/reindex", response_model=ReindexResponse)
-async def reindex(background_tasks: BackgroundTasks) -> ReindexResponse:
+async def reindex() -> ReindexResponse:
     """
     Trigger a full reindex of the vault.
 
-    Runs in the background. Use /api/admin/status to check progress.
+    Enqueues a background job. Use /api/jobs/{job_id} to check progress.
     """
-    global _reindex_in_progress
+    queue = get_job_queue()
 
-    if _reindex_in_progress:
-        return ReindexResponse(
-            status="already_running",
-            message="Reindex is already in progress. Check /api/admin/status for updates.",
-        )
+    # Check if a reindex is already running or pending
+    for status in ("running", "pending"):
+        existing = queue.list_jobs(status=status, job_type="reindex_vault", limit=1)
+        if existing:
+            return ReindexResponse(
+                status="already_queued",
+                message=f"Reindex is already {status}. Check /api/jobs/{existing[0].id} for updates.",
+                job_id=existing[0].id,
+            )
 
-    background_tasks.add_task(_do_reindex)
+    job_id = queue.enqueue("reindex_vault", priority=5)
 
     return ReindexResponse(
         status="started",
-        message="Reindex started in background. Check /api/admin/status for progress.",
+        message=f"Reindex enqueued. Check /api/jobs/{job_id} for progress.",
+        job_id=job_id,
     )
 
 
@@ -110,23 +105,13 @@ async def reindex_sync() -> ReindexResponse:
 
     Blocks until complete. Use for initial setup.
     """
-    global _reindex_in_progress, _last_reindex_count
-
-    if _reindex_in_progress:
-        return ReindexResponse(
-            status="already_running",
-            message="Reindex is already in progress.",
-        )
-
-    _reindex_in_progress = True
     try:
         indexer = IndexerService(vault_path=settings.vault_path)
         count = indexer.index_all()
-        _last_reindex_count = count
 
         return ReindexResponse(
             status="success",
-            message=f"Reindex complete.",
+            message="Reindex complete.",
             files_indexed=count,
         )
     except Exception as e:
@@ -135,8 +120,6 @@ async def reindex_sync() -> ReindexResponse:
             status="error",
             message=f"Reindex failed: {str(e)}",
         )
-    finally:
-        _reindex_in_progress = False
 
 
 # ============ Granola Processor Endpoints ============
