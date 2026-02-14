@@ -12,8 +12,8 @@ This document is the source of truth for orchestrating implementation of the Lif
 | Phase 2b | **completed** | mcp-agent | #5 (all sub-items) | MCP write tools |
 | Phase 2c | **completed** | memory-agent | #7 | Agent memory integration |
 | Phase 3 | **completed** | — | #3 | SQLite-backed job queue |
-| Phase 4a | **not started** | — | #6 | Reminder pipeline |
-| Phase 4b | **not started** | — | #8 | Proactive intelligence |
+| Phase 4a | **completed** | — | #6 | Reminder pipeline hardening |
+| Phase 4b | **completed** | — | #8 | Proactive intelligence modules |
 
 ## Approach
 
@@ -148,10 +148,28 @@ This keeps each agent's context lean and focused.
 - Database: `data/jobs.db`
 
 ### After Phase 4a
-*(not yet completed)*
+
+**Reminder Pipeline Hardening:**
+- Updated `api/services/reminder_store.py`:
+  - `_fire_reminder()`: Added timing, execution logging (tool calls, cost, elapsed time), error notification via Telegram on failure, `mark_triggered` on both success and failure
+  - `_generate_message()`: Changed return type to `tuple[Optional[str], Optional[dict]]` to return execution metadata alongside the message
+  - New `_execute_prompt_reminder()`: Retry logic (up to 2 attempts) for prompt-type reminders, captures tool statuses/usage/cost
+  - New `_should_suppress()`: Sentinel detection for high-frequency reminders (e.g. "NO_MEETING" from pre-meeting prep)
+- Updated `api/services/telegram.py`:
+  - New `chat_via_api_with_log()`: Like `chat_via_api()` but captures tool_statuses, cost_usd, model, input/output tokens from SSE events
+- Updated `tests/test_reminder_store.py`: Added 14 new tests (TestSuppression: 6 tests, TestPromptExecution: 8 tests covering retry, error notification, suppression, and execution logging)
+- Updated `tests/test_admin.py`: Fixed reindex tests to mock job queue instead of removed `_do_reindex`
 
 ### After Phase 4b
-*(not yet completed)*
+
+**Proactive Intelligence Modules:**
+- New `scripts/seed_proactive_reminders.py`: Seeds three prompt-type cron reminders with carefully crafted prompts. Supports `--dry-run` and `--force` flags, skips duplicates by default.
+- Three modules, each a standard prompt-type reminder (no new infrastructure):
+  1. **Pre-Meeting Prep** (`*/15 8-18 * * 1-5`): Checks calendar every 15 min during work hours; looks up attendees, recent interactions, pending items. Returns "NO_MEETING" sentinel (suppressed) when no meeting is upcoming.
+  2. **Morning Briefing** (`30 6 * * *`): Daily 6:30 AM digest with today's schedule + context, overdue/due tasks, overnight emails, and top relationship gaps.
+  3. **Weekly Relationship Digest** (`0 10 * * 0`): Sunday 10 AM check-in surfacing communication gaps — 14-day threshold for close contacts, 30-day for professional.
+- All modules use the full agentic pipeline (tool access to calendar, CRM, email, tasks) via the Phase 4a hardened execution path.
+- Each module is deletable via standard reminder CRUD — no code changes needed to disable.
 
 ## Agent Prompts
 

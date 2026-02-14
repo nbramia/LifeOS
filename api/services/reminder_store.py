@@ -406,36 +406,119 @@ class ReminderScheduler:
                 await asyncio.sleep(1)
 
     async def _fire_reminder(self, reminder: Reminder):
-        """Execute a single reminder."""
+        """Execute a single reminder with retry and execution logging."""
+        import time as _time
         logger.info(f"Firing reminder: {reminder.name} ({reminder.id})")
+        start = _time.monotonic()
 
         try:
-            message = await self._generate_message(reminder)
-            if message:
-                # Prefix with reminder name
+            message, exec_log = await self._generate_message(reminder)
+            elapsed = _time.monotonic() - start
+
+            if exec_log:
+                exec_log["elapsed_seconds"] = round(elapsed, 1)
+                logger.info(
+                    f"Reminder {reminder.name} executed: "
+                    f"{exec_log.get('tool_calls', 0)} tools, "
+                    f"{exec_log.get('cost_usd', 0):.4f} USD, "
+                    f"{elapsed:.1f}s"
+                )
+
+            if message and not self._should_suppress(message):
                 from api.services.telegram import send_message_async
                 full_message = f"*{reminder.name}*\n\n{message}"
                 await send_message_async(full_message)
+            elif message and self._should_suppress(message):
+                logger.info(f"Reminder {reminder.name}: suppressed (no actionable content)")
+
             self.store.mark_triggered(reminder.id)
         except Exception as e:
-            logger.error(f"Failed to fire reminder {reminder.id}: {e}")
+            elapsed = _time.monotonic() - start
+            logger.error(f"Failed to fire reminder {reminder.id} after {elapsed:.1f}s: {e}")
+            # Never silently fail — send error notification
+            try:
+                from api.services.telegram import send_message_async
+                await send_message_async(
+                    f"*{reminder.name}* (failed)\n\n"
+                    f"Reminder could not execute: {str(e)[:200]}"
+                )
+            except Exception:
+                logger.error(f"Failed to send error notification for reminder {reminder.id}")
+            self.store.mark_triggered(reminder.id)
 
-    async def _generate_message(self, reminder: Reminder) -> Optional[str]:
-        """Generate the message content for a reminder."""
+    async def _generate_message(self, reminder: Reminder) -> tuple[Optional[str], Optional[dict]]:
+        """Generate the message content for a reminder.
+
+        Returns (message, execution_log) where execution_log contains
+        tool_calls, cost_usd, model, etc. for prompt-type reminders.
+        """
         if reminder.message_type == "static":
-            return reminder.message_content
+            return reminder.message_content, None
 
         elif reminder.message_type == "prompt":
-            from api.services.telegram import chat_via_api
-            result = await chat_via_api(reminder.message_content)
-            return result.get("answer", "No response generated.")
+            return await self._execute_prompt_reminder(reminder)
 
         elif reminder.message_type == "endpoint":
-            return await self._call_endpoint(reminder.endpoint_config)
+            result = await self._call_endpoint(reminder.endpoint_config)
+            return result, None
 
         else:
             logger.warning(f"Unknown message type: {reminder.message_type}")
-            return None
+            return None, None
+
+    async def _execute_prompt_reminder(
+        self, reminder: Reminder, max_retries: int = 2
+    ) -> tuple[Optional[str], Optional[dict]]:
+        """Execute a prompt-type reminder with retry and execution logging.
+
+        Calls the full agentic chat pipeline via chat_via_api() and captures
+        tool execution status, usage, and cost from SSE events.
+
+        Returns (answer_text, execution_log).
+        """
+        from api.services.telegram import chat_via_api_with_log
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = await chat_via_api_with_log(reminder.message_content)
+                answer = result.get("answer", "").strip()
+                exec_log = {
+                    "tool_calls": len(result.get("tool_statuses", [])),
+                    "tools_used": result.get("tool_statuses", []),
+                    "cost_usd": result.get("cost_usd", 0),
+                    "model": result.get("model", ""),
+                    "input_tokens": result.get("input_tokens", 0),
+                    "output_tokens": result.get("output_tokens", 0),
+                    "attempt": attempt,
+                }
+                if answer:
+                    return answer, exec_log
+                # Empty answer — retry
+                last_error = "Empty response from chat pipeline"
+                logger.warning(f"Reminder {reminder.name} attempt {attempt}: empty response, retrying")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Reminder {reminder.name} attempt {attempt} failed: {e}")
+
+        # All retries exhausted — return partial result
+        logger.error(f"Reminder {reminder.name}: all {max_retries} attempts failed: {last_error}")
+        return f"(Reminder execution failed after {max_retries} attempts: {last_error})", {
+            "tool_calls": 0,
+            "error": last_error,
+            "attempt": max_retries,
+        }
+
+    @staticmethod
+    def _should_suppress(message: str) -> bool:
+        """Check if a prompt response indicates nothing to report.
+
+        Prompt-type reminders can return sentinel values (e.g. 'NO_MEETING')
+        to signal that no notification should be sent. This prevents noisy
+        messages from high-frequency reminders like pre-meeting prep.
+        """
+        stripped = message.strip().upper()
+        return stripped in ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION")
 
     async def _call_endpoint(self, config: Optional[dict]) -> Optional[str]:
         """Call a LifeOS API endpoint and format the result."""
