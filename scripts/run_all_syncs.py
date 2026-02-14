@@ -669,6 +669,21 @@ def run_all_syncs(
     if not dry_run:
         backup_interactions()
 
+    # Suppress CRITICAL alerts during sync (ChromaDB may have transient SQLite issues
+    # during heavy indexing). 4 hours covers even the longest full reindex.
+    # Uses HTTP API since sync runs as a separate process from the API server.
+    if not dry_run:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://localhost:8000/api/admin/maintenance?duration_seconds=14400",
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info("Entered maintenance mode — CRITICAL alerts suppressed")
+        except Exception as e:
+            logger.warning(f"Could not enter maintenance mode (server may not be running): {e}")
+
     for source in sources:
         if source not in SYNC_SOURCES:
             logger.warning(f"Unknown source: {source}, skipping")
@@ -765,6 +780,19 @@ def run_all_syncs(
         "people_by_source": people_by_source,
         "interactions_by_source": interactions_by_source,
     }
+
+    # Exit maintenance mode now that sync is complete
+    if not dry_run:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://localhost:8000/api/admin/maintenance",
+                method="DELETE",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info("Exited maintenance mode — alerts re-enabled")
+        except Exception as e:
+            logger.warning(f"Could not exit maintenance mode (server may not be running): {e}")
 
     # Log summary to markdown (always, not just on failure)
     log_sync_summary_to_markdown(result, trigger=trigger)

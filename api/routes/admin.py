@@ -122,6 +122,35 @@ async def reindex_sync() -> ReindexResponse:
         )
 
 
+# ============ Maintenance Mode Endpoints ============
+
+
+@router.post("/maintenance")
+async def enter_maintenance_mode(duration_seconds: int = 14400):
+    """
+    Enter maintenance mode — suppress CRITICAL alerts for the given duration.
+
+    Call this before operations that may cause transient service unavailability
+    (nightly sync, manual ChromaDB restart, etc.). Auto-expires after duration.
+
+    Args:
+        duration_seconds: How long to suppress alerts (default: 4 hours)
+    """
+    from api.services.service_health import get_service_health
+    registry = get_service_health()
+    registry.enter_maintenance(duration_seconds)
+    return {"status": "ok", "duration_seconds": duration_seconds}
+
+
+@router.delete("/maintenance")
+async def exit_maintenance_mode():
+    """Exit maintenance mode early — re-enable CRITICAL alerts."""
+    from api.services.service_health import get_service_health
+    registry = get_service_health()
+    registry.exit_maintenance()
+    return {"status": "ok"}
+
+
 # ============ Granola Processor Endpoints ============
 
 
