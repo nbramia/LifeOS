@@ -8,6 +8,7 @@ caller (SSE endpoint) can stream them to the client in real time.
 Event types yielded:
   {"type": "text",   "content": "..."}       -- streamed text chunk
   {"type": "status", "message": "..."}       -- tool execution status
+  {"type": "self_correction"}                -- model retrying (consumers should clear buffered text)
   {"type": "result", "result": AgentResult}  -- final result (last event)
 """
 import asyncio
