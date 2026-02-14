@@ -75,7 +75,7 @@ class TestServiceHealthRegistry:
         assert state.consecutive_failures == 3
 
     def test_healthy_resets_consecutive_failures(self, fresh_registry):
-        """mark_healthy should reset consecutive failure count."""
+        """mark_healthy should reset consecutive failure count and streak."""
         fresh_registry.mark_failed("chromadb", "Error 1")
         fresh_registry.mark_failed("chromadb", "Error 2")
         fresh_registry.mark_healthy("chromadb")
@@ -83,6 +83,7 @@ class TestServiceHealthRegistry:
         state = fresh_registry.get_state("chromadb")
         assert state.status == ServiceStatus.HEALTHY
         assert state.consecutive_failures == 0
+        assert state.failure_streak_start is None
         # Total failure count should persist
         assert state.failure_count == 2
 
@@ -169,7 +170,7 @@ class TestServiceHealthRegistry:
         assert summary["overall_status"] == "degraded"
 
     def test_critical_alert_sent_on_transition(self, fresh_registry):
-        """Critical failure should trigger alert after consecutive failures."""
+        """Critical failure should trigger alert after consecutive failures and duration threshold."""
         from datetime import timedelta
         # Bypass startup grace period
         fresh_registry._startup_time = datetime.now(timezone.utc) - timedelta(minutes=5)
@@ -180,7 +181,15 @@ class TestServiceHealthRegistry:
             fresh_registry.mark_failed("chromadb", "Connection refused", Severity.CRITICAL)
             assert mock_alert.call_count == 0
 
-            # Third failure triggers alert
+            # Third failure still doesn't alert (failure streak too short — under 120s)
+            fresh_registry.mark_failed("chromadb", "Connection refused", Severity.CRITICAL)
+            assert mock_alert.call_count == 0
+
+            # Simulate failure streak started 3 minutes ago (past 120s threshold)
+            state = fresh_registry.get_state("chromadb")
+            state.failure_streak_start = datetime.now(timezone.utc) - timedelta(minutes=3)
+
+            # Now alert should fire
             fresh_registry.mark_failed("chromadb", "Connection refused", Severity.CRITICAL)
             mock_alert.assert_called_once()
             call_args = mock_alert.call_args
@@ -194,15 +203,22 @@ class TestServiceHealthRegistry:
         fresh_registry._startup_time = datetime.now(timezone.utc) - timedelta(minutes=5)
 
         with patch("api.services.notifications.send_alert") as mock_alert:
-            # First 3 failures to trigger alert
+            # Accumulate failures and simulate long-running streak
             fresh_registry.mark_failed("chromadb", "Error 1", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 2", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 3", Severity.CRITICAL)
+
+            # Backdate streak start to pass duration threshold
+            state = fresh_registry.get_state("chromadb")
+            state.failure_streak_start = datetime.now(timezone.utc) - timedelta(minutes=3)
+
+            # This failure triggers the alert (past duration threshold)
+            fresh_registry.mark_failed("chromadb", "Error 4", Severity.CRITICAL)
             assert mock_alert.call_count == 1
 
             # Subsequent failures should NOT alert (cooldown)
-            fresh_registry.mark_failed("chromadb", "Error 4", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 5", Severity.CRITICAL)
+            fresh_registry.mark_failed("chromadb", "Error 6", Severity.CRITICAL)
             assert mock_alert.call_count == 1  # Still just 1
 
     def test_critical_alert_after_recovery(self, fresh_registry):
@@ -212,22 +228,33 @@ class TestServiceHealthRegistry:
         fresh_registry._startup_time = datetime.now(timezone.utc) - timedelta(minutes=5)
 
         with patch("api.services.notifications.send_alert") as mock_alert:
-            # First set of failures to trigger alert
+            # First set of failures
             fresh_registry.mark_failed("chromadb", "Error 1", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 2", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 3", Severity.CRITICAL)
+
+            # Backdate streak to pass duration threshold, then trigger alert
+            state = fresh_registry.get_state("chromadb")
+            state.failure_streak_start = datetime.now(timezone.utc) - timedelta(minutes=3)
+            fresh_registry.mark_failed("chromadb", "Error 3b", Severity.CRITICAL)
             assert mock_alert.call_count == 1
 
-            # Recovery resets consecutive failure count
+            # Recovery resets consecutive failure count and streak
             fresh_registry.mark_healthy("chromadb")
+            assert fresh_registry.get_state("chromadb").failure_streak_start is None
 
             # Clear the cooldown for testing (normally 5 min)
             fresh_registry._alert_cooldowns.clear()
 
-            # New failures after recovery should alert after threshold
+            # New failures after recovery
             fresh_registry.mark_failed("chromadb", "Error 4", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 5", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 6", Severity.CRITICAL)
+
+            # Backdate new streak and trigger
+            state = fresh_registry.get_state("chromadb")
+            state.failure_streak_start = datetime.now(timezone.utc) - timedelta(minutes=3)
+            fresh_registry.mark_failed("chromadb", "Error 7", Severity.CRITICAL)
             assert mock_alert.call_count == 2
 
     def test_startup_grace_period_suppresses_alert(self, fresh_registry):
@@ -240,6 +267,60 @@ class TestServiceHealthRegistry:
             fresh_registry.mark_failed("chromadb", "Error 3", Severity.CRITICAL)
             fresh_registry.mark_failed("chromadb", "Error 4", Severity.CRITICAL)
             mock_alert.assert_not_called()
+
+    def test_failure_duration_threshold_suppresses_alert(self, fresh_registry):
+        """Rapid failures should not alert if streak is under duration threshold."""
+        from datetime import timedelta
+        # Bypass startup grace period
+        fresh_registry._startup_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        with patch("api.services.notifications.send_alert") as mock_alert:
+            # Accumulate many rapid failures (streak started just now)
+            for i in range(10):
+                fresh_registry.mark_failed("chromadb", f"Error {i}", Severity.CRITICAL)
+
+            # No alert — streak duration is under 120s even though we have 10 failures
+            mock_alert.assert_not_called()
+
+    def test_maintenance_mode_suppresses_alert(self, fresh_registry):
+        """Maintenance mode should suppress all CRITICAL alerts."""
+        from datetime import timedelta
+        # Bypass startup grace period
+        fresh_registry._startup_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        with patch("api.services.notifications.send_alert") as mock_alert:
+            # Enter maintenance mode
+            fresh_registry.enter_maintenance(3600)
+            assert fresh_registry.in_maintenance is True
+
+            # Accumulate failures past all other thresholds
+            for i in range(5):
+                fresh_registry.mark_failed("chromadb", f"Error {i}", Severity.CRITICAL)
+
+            # Backdate streak to pass duration threshold
+            state = fresh_registry.get_state("chromadb")
+            state.failure_streak_start = datetime.now(timezone.utc) - timedelta(minutes=10)
+            fresh_registry.mark_failed("chromadb", "Error final", Severity.CRITICAL)
+
+            # Still no alert — maintenance mode suppresses it
+            mock_alert.assert_not_called()
+
+            # Exit maintenance and verify alerts resume
+            fresh_registry.exit_maintenance()
+            assert fresh_registry.in_maintenance is False
+
+            fresh_registry._alert_cooldowns.clear()
+            fresh_registry.mark_failed("chromadb", "Error after maintenance", Severity.CRITICAL)
+            mock_alert.assert_called_once()
+
+    def test_maintenance_mode_auto_expires(self, fresh_registry):
+        """Maintenance mode should auto-expire after duration."""
+        fresh_registry.enter_maintenance(1)  # 1 second
+        assert fresh_registry.in_maintenance is True
+
+        # Manually expire it
+        fresh_registry._maintenance_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        assert fresh_registry.in_maintenance is False
 
     def test_warning_no_immediate_alert(self, fresh_registry):
         """Warning failure should not trigger immediate alert."""

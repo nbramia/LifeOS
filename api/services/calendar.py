@@ -202,6 +202,20 @@ class CalendarService:
             calendar_id=calendar_id
         )
 
+    def has_upcoming_meeting(self, minutes: int = 20) -> bool:
+        """Check if there is a meeting starting within the given number of minutes.
+
+        Lightweight check that avoids a full agent pipeline call.
+        """
+        now = datetime.now(timezone.utc)
+        window_end = now + timedelta(minutes=minutes)
+        events = self.get_events_in_range(
+            start_date=now,
+            end_date=window_end,
+            max_results=1,
+        )
+        return len(events) > 0
+
     def search_events(
         self,
         query: Optional[str] = None,

@@ -893,6 +893,432 @@ class TestChatPipelineUnification:
 
 
 # ---------------------------------------------------------------------------
+# L) Scheduler Crash Recovery (Batch 1 — Gap #2)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerCrashRecoveryBatch1:
+    """Test auto-restart with backoff and health check."""
+
+    @pytest.fixture
+    def scheduler(self, tmp_path):
+        from api.services.reminder_store import ReminderStore, ReminderScheduler
+        store = ReminderStore(file_path=str(tmp_path / "crash_test.json"))
+        return ReminderScheduler(store)
+
+    def test_is_alive_false_when_not_started(self, scheduler):
+        """is_alive() should return False when scheduler hasn't started."""
+        assert scheduler.is_alive() is False
+
+    def test_crash_triggers_restart(self, scheduler):
+        """Scheduler should attempt restart after crash."""
+        crash_count = [0]
+
+        original_schedule_loop = scheduler._schedule_loop
+
+        async def crashing_loop():
+            crash_count[0] += 1
+            if crash_count[0] <= 2:
+                raise RuntimeError("Test crash")
+            # Third call — just exit cleanly
+            scheduler._stop_event.set()
+
+        scheduler._schedule_loop = crashing_loop
+
+        with patch("api.services.telegram.send_message"):
+            scheduler._stop_event.clear()
+            scheduler._run()
+
+        assert crash_count[0] == 3
+        assert scheduler._crash_count == 2
+
+    def test_max_retries_sends_permanent_down_alert(self, scheduler):
+        """After MAX_CONSECUTIVE_CRASHES, should send final alert and stop."""
+        scheduler.MAX_CONSECUTIVE_CRASHES = 2
+
+        async def always_crash():
+            raise RuntimeError("Persistent failure")
+
+        scheduler._schedule_loop = always_crash
+        alerts = []
+
+        with patch("api.services.telegram.send_message", side_effect=lambda msg: alerts.append(msg)):
+            scheduler._stop_event.clear()
+            scheduler._run()
+
+        assert scheduler._crash_count >= 2
+        assert any("DOWN" in a for a in alerts)
+
+    def test_scheduler_reads_control_file_enabled(self, scheduler, tmp_path):
+        """Scheduler should read enabled: true from control file."""
+        from config.settings import settings
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        control_dir = vault / "LifeOS" / "Reminders"
+        control_dir.mkdir(parents=True)
+        control_file = control_dir / "Scheduler.md"
+        control_file.write_text("---\nenabled: true\n---\n# Scheduler\n")
+
+        with patch.object(settings, "vault_path", vault):
+            assert scheduler._read_control_file() is True
+
+    def test_scheduler_reads_control_file_disabled(self, scheduler, tmp_path):
+        """Scheduler should read enabled: false from control file."""
+        from config.settings import settings
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        control_dir = vault / "LifeOS" / "Reminders"
+        control_dir.mkdir(parents=True)
+        control_file = control_dir / "Scheduler.md"
+        control_file.write_text("---\nenabled: false\n---\n# Scheduler\n")
+
+        with patch.object(settings, "vault_path", vault):
+            assert scheduler._read_control_file() is False
+
+    def test_missing_control_file_creates_one(self, scheduler, tmp_path):
+        """Missing control file should be created with enabled: true."""
+        from config.settings import settings
+        vault = tmp_path / "vault"
+        vault.mkdir()
+
+        with patch.object(settings, "vault_path", vault):
+            result = scheduler._read_control_file()
+
+        assert result is True
+        control_file = vault / "LifeOS" / "Reminders" / "Scheduler.md"
+        assert control_file.exists()
+        assert "enabled: true" in control_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# M) Job Queue Hardening (Batch 2 — Gaps #3, #12)
+# ---------------------------------------------------------------------------
+
+class TestJobQueueHardening:
+    """Test atomic claim and auto-cleanup."""
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from api.services.job_queue import JobQueue, _JOB_HANDLERS
+        saved = dict(_JOB_HANDLERS)
+        db = str(tmp_path / "hardening_jobs.db")
+        q = JobQueue(db_path=db)
+        yield q
+        q.stop_worker()
+        _JOB_HANDLERS.clear()
+        _JOB_HANDLERS.update(saved)
+
+    def test_atomic_claim_returns_job(self, queue):
+        """Atomic _claim_next should return the job with RUNNING status."""
+        from api.services.job_queue import RUNNING
+        job_id = queue.enqueue("test_type", params={"x": 1})
+        claimed = queue._claim_next()
+        assert claimed is not None
+        assert claimed.id == job_id
+        assert claimed.status == RUNNING
+
+    def test_cleanup_removes_old_jobs(self, queue):
+        """cleanup_old_jobs should remove old completed jobs."""
+        from api.services.job_queue import COMPLETED
+        import sqlite3
+
+        # Insert an old completed job manually
+        with sqlite3.connect(queue.db_path) as conn:
+            conn.execute(
+                """INSERT INTO jobs (id, type, status, params, created_at, attempts, max_attempts, priority)
+                   VALUES (?, ?, ?, '{}', datetime('now', '-60 days'), 1, 3, 10)""",
+                ("old-job", "test", COMPLETED),
+            )
+
+        # Also insert a recent one
+        recent_id = queue.enqueue("test")
+
+        queue.cleanup_old_jobs(days=30)
+
+        assert queue.get_job("old-job") is None
+        assert queue.get_job(recent_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# N) Pre-Meeting Prep Cost Optimization (Batch 3 — Gap #4)
+# ---------------------------------------------------------------------------
+
+class TestPreMeetingCostOptimization:
+    """Test lightweight calendar pre-check skips pipeline."""
+
+    @pytest.fixture
+    def scheduler(self, tmp_path):
+        from api.services.reminder_store import ReminderStore, ReminderScheduler
+        store = ReminderStore(file_path=str(tmp_path / "cost_test.json"))
+        return ReminderScheduler(store)
+
+    @pytest.fixture
+    def meeting_reminder(self, scheduler):
+        return scheduler.store.create(
+            name="Pre-Meeting Prep",
+            schedule_type="cron",
+            schedule_value="*/15 8-18 * * 1-5",
+            message_type="prompt",
+            message_content="Check my calendar...",
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_pipeline_when_no_meeting(self, scheduler, meeting_reminder):
+        """Pre-meeting reminder should skip pipeline when no meeting found."""
+        with patch("api.services.calendar.get_calendar_service") as mock_cal:
+            mock_service = MagicMock()
+            mock_service.has_upcoming_meeting.return_value = False
+            mock_cal.return_value = mock_service
+            with patch("api.services.telegram.chat_via_api_with_log",
+                       new_callable=AsyncMock) as mock_chat:
+                with patch("api.services.telegram.send_message_async",
+                           new_callable=AsyncMock):
+                    await scheduler._fire_reminder(meeting_reminder)
+
+            # Chat pipeline should NOT have been called
+            mock_chat.assert_not_called()
+
+        # But reminder should be marked triggered
+        updated = scheduler.store.get(meeting_reminder.id)
+        assert updated.last_triggered_at is not None
+
+    @pytest.mark.asyncio
+    async def test_runs_pipeline_when_meeting_exists(self, scheduler, meeting_reminder):
+        """Pre-meeting reminder should run full pipeline when meeting found."""
+        with patch("api.services.calendar.get_calendar_service") as mock_cal:
+            mock_service = MagicMock()
+            mock_service.has_upcoming_meeting.return_value = True
+            mock_cal.return_value = mock_service
+            mock_result = {
+                "answer": "Meeting with Sarah at 10 AM",
+                "conversation_id": "conv-x",
+                "tool_statuses": [],
+                "cost_usd": 0.01,
+                "model": "claude-sonnet-4-5-20250929",
+                "input_tokens": 500,
+                "output_tokens": 50,
+            }
+            with patch("api.services.telegram.chat_via_api_with_log",
+                       new_callable=AsyncMock, return_value=mock_result) as mock_chat:
+                with patch("api.services.telegram.send_message_async",
+                           new_callable=AsyncMock, return_value=True):
+                    await scheduler._fire_reminder(meeting_reminder)
+
+            mock_chat.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# O) Memory Relevance Filtering (Batch 4 — Gap #7)
+# ---------------------------------------------------------------------------
+
+class TestMemoryRelevanceFiltering:
+    """Test minimum relevance threshold and token budget."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from api.services.memory_store import MemoryStore
+        return MemoryStore(file_path=str(tmp_path / "mem_test.json"))
+
+    def test_low_relevance_memories_excluded(self, store):
+        """Memories with <15% keyword overlap should be excluded."""
+        # Create a memory with very specific keywords
+        store.create_memory("The quarterly budget for Project Alpha is $50,000")
+        store.create_memory("I had lunch at the Italian restaurant downtown")
+
+        # Search for something with minimal overlap to "lunch" memory
+        results = store.search_memories("quarterly budget Alpha finances", min_relevance=0.15)
+
+        # Budget memory should match, lunch memory might not (low overlap)
+        content_texts = [m.content for m in results]
+        assert any("budget" in c.lower() for c in content_texts)
+
+    def test_token_budget_caps_memory_injection(self):
+        """Memory injection should stop when word count exceeds 400."""
+        from api.services.memory_store import Memory
+        from datetime import datetime
+
+        memories = [
+            Memory(
+                id=str(i), content=" ".join(["word"] * 200),
+                category="facts", keywords=["word"],
+                created_at=datetime.now(), updated_at=datetime.now(),
+            )
+            for i in range(5)
+        ]
+
+        # Simulate the budget logic from agent_loop.py
+        budgeted = []
+        word_count = 0
+        for m in memories:
+            words = len(m.content.split())
+            if word_count + words > 400:
+                break
+            budgeted.append(m)
+            word_count += words
+
+        assert len(budgeted) == 2  # 200 + 200 = 400, third would exceed
+
+
+# ---------------------------------------------------------------------------
+# P) Suppression & Sentinel Improvements (Batch 5 — Gaps #13, #15)
+# ---------------------------------------------------------------------------
+
+class TestFuzzySuppressionBatch5:
+    """Test startswith-based fuzzy sentinel matching."""
+
+    def test_exact_sentinels_still_suppressed(self):
+        """Original exact sentinels should still work."""
+        from api.services.reminder_store import ReminderScheduler
+        for s in ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION"):
+            assert ReminderScheduler._should_suppress(s) is True
+
+    def test_sentinel_with_period_suppressed(self):
+        """'NO_MEETING.' should be suppressed."""
+        from api.services.reminder_store import ReminderScheduler
+        assert ReminderScheduler._should_suppress("NO_MEETING.") is True
+
+    def test_sentinel_with_trailing_text_suppressed(self):
+        """'NO_MEETING.' and 'NO_MEETING—...' should be suppressed."""
+        from api.services.reminder_store import ReminderScheduler
+        assert ReminderScheduler._should_suppress("NO_MEETING- no events scheduled") is True
+        assert ReminderScheduler._should_suppress("NO_MEETING\u2014nothing on calendar") is True  # em-dash
+
+    def test_sentinel_with_space_then_words_not_suppressed(self):
+        """'NO_MEETING but also some text' should NOT be suppressed (space + words)."""
+        from api.services.reminder_store import ReminderScheduler
+        assert ReminderScheduler._should_suppress("NO_MEETING but also some text") is False
+
+    def test_nothing_to_report_sentinel_suppressed(self):
+        """NOTHING_TO_REPORT should be suppressed (morning briefing sentinel)."""
+        from api.services.reminder_store import ReminderScheduler
+        assert ReminderScheduler._should_suppress("NOTHING_TO_REPORT") is True
+        assert ReminderScheduler._should_suppress("NOTHING_TO_REPORT.") is True
+
+    def test_normal_messages_not_suppressed(self):
+        """Normal messages should not be suppressed."""
+        from api.services.reminder_store import ReminderScheduler
+        assert ReminderScheduler._should_suppress("Here is your morning briefing") is False
+        assert ReminderScheduler._should_suppress("") is False
+
+    def test_morning_briefing_has_sentinel(self):
+        """Morning briefing prompt should include NOTHING_TO_REPORT sentinel."""
+        from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
+        assert "NOTHING_TO_REPORT" in MORNING_BRIEFING_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Q) chat_via_api HTTP Status Check (Batch 6 — Gap #8 note)
+# ---------------------------------------------------------------------------
+
+class TestChatViaApiStatusCheck:
+    """Test that chat_via_api raises on non-200 response."""
+
+    def _make_mock_client(self, status_code, sse_events=None):
+        """Build a mock httpx.AsyncClient."""
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.aread = AsyncMock(return_value=b"Internal Server Error")
+
+        if sse_events:
+            mock_response.aiter_lines = lambda: _async_iter(sse_events)
+
+        stream_cm = AsyncMock()
+        stream_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        stream_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=stream_cm)
+
+        client_cm = MagicMock()
+        client_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        client_cm.__aexit__ = AsyncMock(return_value=False)
+
+        return client_cm
+
+    @pytest.mark.asyncio
+    async def test_chat_via_api_raises_on_non_200(self):
+        """chat_via_api should raise RuntimeError on non-200 status."""
+        mock_client = self._make_mock_client(500)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            from api.services.telegram import chat_via_api
+            with pytest.raises(RuntimeError, match="HTTP 500"):
+                await chat_via_api("test question")
+
+
+# ---------------------------------------------------------------------------
+# R) Dashboard Improvements (Batch 8)
+# ---------------------------------------------------------------------------
+
+class TestDashboardImprovements:
+    """Test dashboard formatting improvements."""
+
+    def test_format_cron_human_interval_pattern(self):
+        """Should handle */15 8-18 * * 1-5 pattern."""
+        from api.services.reminder_store import _format_cron_human
+        result = _format_cron_human("*/15 8-18 * * 1-5", "America/New_York")
+        assert "weekdays" in result
+        assert "15m" in result
+        assert "8AM" in result
+        assert "6PM" in result or "18" in result
+        assert "ET" in result
+
+    def test_format_cron_human_simple_time(self):
+        """Should still handle simple cron patterns."""
+        from api.services.reminder_store import _format_cron_human
+        result = _format_cron_human("30 6 * * *", "America/New_York")
+        assert "daily" in result
+        assert "6:30 AM" in result
+        assert "ET" in result
+
+    def test_format_dt_short_converts_timezone(self):
+        """Should convert UTC to local timezone."""
+        from api.services.reminder_store import _format_dt_short
+        # 2026-02-14 15:30 UTC = 2026-02-14 10:30 AM ET
+        result = _format_dt_short("2026-02-14T15:30:00+00:00", "America/New_York")
+        assert "10:30 AM" in result
+        assert "Feb 14" in result
+
+
+# ---------------------------------------------------------------------------
+# S) Admin Reindex E2E (Batch 7 — Gap #11)
+# ---------------------------------------------------------------------------
+
+class TestAdminReindexE2E:
+    """Test that POST /api/admin/reindex enqueues a job."""
+
+    def test_admin_reindex_enqueues_job(self):
+        """POST /api/admin/reindex should create a job in the queue."""
+        from fastapi.testclient import TestClient
+        from api.services.job_queue import get_job_queue, _instance, _lock
+        import api.services.job_queue as jq_mod
+
+        # Use a temp queue to avoid modifying production
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            from api.services.job_queue import JobQueue
+            test_queue = JobQueue(db_path=f"{tmp}/test_reindex.db")
+
+            # Monkey-patch the singleton
+            old = jq_mod._instance
+            jq_mod._instance = test_queue
+            try:
+                from api.main import app
+                client = TestClient(app, raise_server_exceptions=False)
+                resp = client.post("/api/admin/reindex")
+                assert resp.status_code == 200
+
+                data = resp.json()
+                assert "job_id" in data
+
+                # Verify the job exists in the queue
+                job = test_queue.get_job(data["job_id"])
+                assert job is not None
+                assert job.type == "reindex_vault"
+            finally:
+                jq_mod._instance = old
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

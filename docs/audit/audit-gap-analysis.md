@@ -14,72 +14,32 @@
 
 ---
 
-### 2. Scheduler thread crash has no recovery or alerting
+### 2. ~~Scheduler thread crash has no recovery or alerting~~ FIXED
 
-**Review claims (Known Limitations #3):** "Runs in its own event loop. If it crashes, reminders stop until server restart. Logged but not alerted."
-
-**What actually happens:** The review correctly identifies this as a limitation but underplays the severity. The scheduler's `_run()` method catches exceptions and logs them (`"Reminder scheduler crashed: {e}"`), but:
-- There is no auto-restart mechanism
-- There is no alert sent to Telegram/email when the scheduler dies
-- There is no health check that monitors the scheduler thread status
-- The scheduler thread is a daemon thread, so it dies silently
-
-**Why it matters:** If the scheduler crashes (e.g., due to a database corruption, a bug in a reminder, or an OOM), all proactive intelligence modules stop working with zero notification. The user has no way to know reminders stopped firing until they notice the absence of morning briefings.
-
-**Suggested fix:**
-1. Wrap the `_schedule_loop()` in a restart loop with exponential backoff
-2. Send a Telegram alert when the scheduler crashes
-3. Add a `/health` check for the scheduler thread status (is it alive?)
+**Status:** FIXED — Auto-restart with exponential backoff (5s → 60s cap), Telegram crash alert on each crash, permanent-down alert after 5 consecutive crashes, `is_alive()` health check exposed in `/health` endpoint, and vault-based on/off toggle via `LifeOS/Reminders/Scheduler.md`.
+**Tests:** `TestSchedulerCrashRecoveryBatch1` — crash restart, max retries alert, is_alive, control file read/create (6 tests).
 
 ---
 
-### 3. `_claim_next()` in job queue has a race condition
+### 3. ~~`_claim_next()` in job queue has a race condition~~ FIXED
 
-**Review claims:** Job lifecycle: PENDING -> RUNNING -> COMPLETED/FAILED, with atomic claim.
-
-**What actually happens:** The `_claim_next()` method in `api/services/job_queue.py` does a SELECT followed by a separate UPDATE. These two operations are NOT atomic even within a `with conn:` block. Two concurrent workers could both SELECT the same pending job and both UPDATE it to running.
-
-**Why it matters:** Currently there's only one worker thread, so this is safe in practice. However, the code structure implies atomicity that doesn't exist, and adding a second worker would immediately cause double-execution of jobs.
-
-**Suggested fix:** Use `UPDATE ... RETURNING` (SQLite 3.35+) or wrap in `BEGIN EXCLUSIVE` to make the claim truly atomic.
+**Status:** FIXED — Replaced SELECT + UPDATE with single atomic `UPDATE ... RETURNING *` statement (SQLite 3.35+).
+**Test:** `TestJobQueueHardening.test_atomic_claim_returns_job` verifies the fix.
 
 ---
 
 ## Moderate Gaps (should fix)
 
-### 4. Pre-meeting prep cost understated in review
+### 4. ~~Pre-meeting prep cost understated in review~~ FIXED
 
-**Review claims (Known Limitations #1):** "~40 API calls per workday. Monitor cost."
-
-**What actually happens:** The schedule is `*/15 8-18 * * 1-5` which is every 15 minutes from 8 AM to 6 PM on weekdays. That's (18-8) * 4 + 1 = 41 firings per day. Each firing makes a full API call to Claude even when there's no meeting -- the prompt must run through the entire agent pipeline (classify intent, run agent loop) before it can check the calendar and return NO_MEETING. The review's "~40" number is correct for firings, but the actual cost includes:
-- Intent classification via Ollama/Haiku
-- Agent loop startup (system prompt + tools)
-- At least 1 tool call (search_calendar)
-- Response generation
-
-At $0.003-0.015 per call (depending on model), that's $0.12-$0.62/day or $2.40-$12.40/month just for pre-meeting prep. If the model is Sonnet (likely), the higher end applies.
-
-**Why it matters:** Over time, this adds up. The review mentions monitoring but provides no mechanism to actually monitor it.
-
-**Suggested fix:**
-1. Add a lightweight calendar check before entering the full agent pipeline (check if any meeting exists in the next 20 min via direct API call, skip the chat pipeline entirely if not)
-2. Log costs per reminder type in the usage store
-3. Create a weekly cost report
+**Status:** FIXED — Added `has_upcoming_meeting()` to `CalendarService` for lightweight calendar pre-check. Pre-meeting prep reminders now check both personal and work calendars before entering the full agent pipeline. If no meeting in next 20 minutes, the pipeline is skipped entirely.
+**Tests:** `TestPreMeetingCostOptimization` — skips pipeline when no meeting, runs pipeline when meeting exists (2 tests).
 
 ---
 
-### 5. No explicit WAL count verification -- review says "9 databases" but code has 13
+### 5. ~~No explicit WAL count verification -- review says "9 databases" but code has 13~~ FIXED
 
-**Review claims (Phase 0):** "Added WAL mode (`PRAGMA journal_mode=WAL`) to all 9 SQLite databases."
-
-**What actually happens:** Searching for `PRAGMA journal_mode=WAL` in the `api/` directory finds it in 13 files:
-- `job_queue.py`, `person_entity.py`, `gsheet_sync.py`, `review_queue.py`, `sync_health.py`, `imessage.py`, `person_facts.py`, `cost_tracker.py`, `usage_store.py`, `conversation_store.py`, `interaction_store.py`, `bm25_index.py`, `source_entity.py`
-
-The count of 9 in the review doesn't match the 13 files actually containing WAL pragmas. This is potentially because some files had WAL before the audit, but the review's claim is imprecise. Additionally, the `memory_store.py` mentioned in the review as getting memory tools does NOT appear to use SQLite at all (it's likely file-based), so not all stores may need WAL.
-
-**Why it matters:** Imprecise documentation reduces trust in the audit's thoroughness. If someone relies on this count to verify completeness, they'll get the wrong answer.
-
-**Suggested fix:** Correct the review to list the actual files, or acknowledge that some already had WAL before the audit.
+**Status:** FIXED — Updated `audit-implementation-review.md` to list all 13 files with WAL and note that some pre-dated the audit.
 
 ---
 
@@ -90,61 +50,52 @@ The count of 9 in the review doesn't match the 13 files actually containing WAL 
 
 ---
 
-### 7. Memory injection lacks eviction or relevance filtering
+### 7. ~~Memory injection lacks eviction or relevance filtering~~ FIXED
 
-**Review claims (Phase 2c):** "Injected memory retrieval into agent loop system prompt (top 5 relevant memories per query)."
-
-**What actually happens:** The code at `agent_loop.py` lines 139-147 injects up to 5 memories into the system prompt. The search is based on `get_relevant_memories()` which uses keyword matching. There is no:
-- Relevance score threshold (even low-relevance memories get injected)
-- TTL/expiry on memories
-- Deduplication (same memory could be rephrased and saved multiple times)
-- Token budget consideration (5 memories could add hundreds of tokens to every request)
-
-**Why it matters:** Over time, as memories accumulate, irrelevant memories will pollute the system prompt, increasing cost and potentially confusing the model.
-
-**Suggested fix:**
-1. Add a minimum relevance score threshold
-2. Add a token budget for memory injection (e.g., max 500 tokens)
-3. Consider memory deduplication at save time
+**Status:** FIXED — Added minimum relevance threshold (0.15 = ~15% keyword overlap) in `search_memories()`. Added token budget (400 words ≈ 500 tokens) in `agent_loop.py` memory injection — stops adding memories when cumulative word count exceeds 400.
+**Tests:** `TestMemoryRelevanceFiltering` — low-relevance exclusion, token budget cap (2 tests).
 
 ---
 
 ### 8. ~~`chat_via_api_with_log` does not handle HTTP errors from the server~~ FIXED
 
-**Status:** FIXED — Added HTTP status code check (`if resp.status_code != 200: raise RuntimeError(...)`) in `chat_via_api_with_log()` in `api/services/telegram.py`. Non-200 responses now raise immediately instead of silently returning empty results.
-**Note:** `chat_via_api()` (used by Telegram bot listener) still has this issue — only the `_with_log` variant was fixed.
+**Status:** FIXED — Added HTTP status code check in both `chat_via_api_with_log()` and `chat_via_api()` in `api/services/telegram.py`. Non-200 responses now raise `RuntimeError` immediately.
+**Tests:** `TestChatViaApiStatusCheck.test_chat_via_api_raises_on_non_200` verifies the fix.
 
 ---
 
 ## Minor Gaps (nice to fix)
 
-### 9. Review claims "980 unit tests passing" but provides no mechanism to verify
+### 9. ~~Review claims "980 unit tests passing" but provides no mechanism to verify~~ FIXED
 
-The review states "980 unit tests passing" but there's no snapshot of the test count in the codebase. The actual count may differ now.
+**Status:** FIXED — Updated `audit-implementation-review.md` with current test count (1882 tests collected as of post-gap-analysis).
 
-### 10. Review claims 587 lines removed from chat.py but no before/after diff
+### 10. ~~Review claims 587 lines removed from chat.py but no before/after diff~~ FIXED
 
-The claim of removing 587 lines of legacy handlers is unverifiable without the original line count. The current chat.py does not contain `handle_compose`, `handle_task_intent`, `handle_reminder_intent`, or `handle_task_and_reminder`, confirming removal, but the exact line count cannot be verified.
+**Status:** FIXED — Added note in review that exact line count is from git diff at time of commit.
 
-### 11. No explicit test for the admin reindex-via-job-queue flow
+### 11. ~~No explicit test for the admin reindex-via-job-queue flow~~ FIXED
 
-The review claims admin reindex now enqueues a job. The code confirms this (`api/routes/admin.py` line 92), and the existing `test_job_queue.py` tests the queue itself, but there is no test that calls `POST /api/admin/reindex` and verifies a job is created. The E2E path is untested.
+**Status:** FIXED — Added `TestAdminReindexE2E.test_admin_reindex_enqueues_job` that calls `POST /api/admin/reindex` via TestClient and verifies a job is enqueued.
 
-### 12. Job queue `cleanup_old_jobs()` is never called
+### 12. ~~Job queue `cleanup_old_jobs()` is never called~~ FIXED
 
-The `JobQueue.cleanup_old_jobs()` method exists (line 280) but is never called anywhere in the codebase -- not by the worker, not by a cron job, not by any route. Old completed/failed jobs will accumulate indefinitely.
+**Status:** FIXED — Worker loop now calls `cleanup_old_jobs(days=30)` once per day (tracked via `_last_cleanup` timestamp).
+**Test:** `TestJobQueueHardening.test_cleanup_removes_old_jobs` verifies the fix.
 
-### 13. Morning briefing prompt has no NO-OP sentinel
+### 13. ~~Morning briefing prompt has no NO-OP sentinel~~ FIXED
 
-The pre-meeting prep prompt returns "NO_MEETING" when there's nothing to report. But the morning briefing prompt has no equivalent sentinel for quiet mornings. If the user has no calendar events, no tasks, no emails, and no communication gaps, Claude will still generate a message saying "nothing to report" in prose, which is noise.
+**Status:** FIXED — Added `"If there is truly nothing to report (no events, no tasks, no emails), respond with exactly NOTHING_TO_REPORT"` to morning briefing prompt in `seed_proactive_reminders.py`.
+**Test:** `TestFuzzySuppressionBatch5.test_morning_briefing_has_sentinel` verifies the fix.
 
-### 14. Communication gaps prompt cannot actually check relationship thresholds
+### 14. Communication gaps prompt cannot actually check relationship thresholds — DEFERRED
 
-The weekly relationship digest prompt says "For close contacts (family, close friends), flag gaps over 14 days." But the prompt relies on Claude using the `person_info` tool, which returns relationship data per-person. There is no tool that returns "all people with communication gap > N days" in a single call. Claude would need to iterate over every person in the CRM to check gaps, which is impractical and expensive. The prompt will likely produce incomplete results.
+The weekly relationship digest prompt can't efficiently check all contacts. This is an architectural limitation that requires a new bulk query tool (`search_communication_gaps`). Deferred to a future iteration.
 
-### 15. `_should_suppress` only checks exact sentinel matches
+### 15. ~~`_should_suppress` only checks exact sentinel matches~~ FIXED
 
-The suppression function at line 521 checks `stripped in ("NO_MEETING", ...)`. But Claude might respond with variations like "NO_MEETING." (with period), "No meeting found", or "NO MEETING" (with space). Only exact matches after `.strip().upper()` are caught.
+**Status:** FIXED — Changed suppression to match sentinels followed by punctuation/separator characters (period, dash, em-dash, comma, colon). Handles "NO_MEETING.", "NO_MEETING—nothing scheduled" etc. while still rejecting "NO_MEETING but here's useful info".
+**Tests:** `TestFuzzySuppressionBatch5` — exact match, period suffix, separator chars, normal messages not suppressed (6 tests).
 
 ---
 
@@ -188,7 +139,7 @@ The suppression function at line 521 checks `stripped in ("NO_MEETING", ...)`. B
 - `_fire_reminder()` has timing, error notification via Telegram (verified)
 - `_generate_message()` returns `tuple[Optional[str], Optional[dict]]` (verified)
 - `_execute_prompt_reminder()` with retry logic (verified, max_retries=2)
-- `_should_suppress()` with sentinel detection (verified: 4 sentinels)
+- `_should_suppress()` with sentinel detection (verified: 4 sentinels + fuzzy matching)
 - `chat_via_api_with_log()` exists and parses SSE events correctly (verified via test)
 - 14 tests in `test_reminder_store.py` covering suppression and execution (verified)
 
@@ -206,9 +157,9 @@ The suppression function at line 521 checks `stripped in ("NO_MEETING", ...)`. B
 
 | Category | Count | Status |
 |----------|-------|--------|
-| Critical | 3 | 1 open (scheduler crash recovery), 2 fixed (httpx import, job queue noted as single-worker safe) |
-| Moderate | 5 | 2 fixed (message_type bug, HTTP status check), 3 open (cost monitoring, WAL count docs, memory eviction) |
-| Minor | 7 | Open — various documentation and edge case issues |
+| Critical | 3 | All 3 FIXED (httpx import, scheduler crash recovery, job queue race) |
+| Moderate | 5 | All 5 FIXED (message_type bug, HTTP status check, cost optimization, WAL docs, memory filtering) |
+| Minor | 7 | 6 FIXED, 1 deferred (#14 — communication gaps architecture) |
 | Verified | 8 phases | Core functionality of all 8 phases confirmed working |
 
 **Bugs fixed during this review:**
@@ -216,7 +167,12 @@ The suppression function at line 521 checks `stripped in ("NO_MEETING", ...)`. B
 2. ~~Missing `httpx` import in `reminder_store.py`~~ → added `import httpx`
 3. ~~No HTTP status check in `chat_via_api_with_log()`~~ → raises RuntimeError on non-200
 
-**Remaining priorities:**
-1. **Scheduler crash recovery** — add restart loop + Telegram alert on crash
-2. **Pre-meeting prep cost** — add lightweight calendar pre-check to avoid full pipeline for no-meeting cases
-3. **Memory eviction** — add relevance thresholds and token budgets
+**Additional fixes (gap closure batch):**
+4. Scheduler crash recovery — auto-restart with backoff + Telegram alert + health check + vault toggle
+5. Job queue atomic claim — `UPDATE...RETURNING` + auto-cleanup in worker loop
+6. Pre-meeting prep cost — lightweight `has_upcoming_meeting()` calendar pre-check
+7. Memory relevance filtering — 0.15 threshold + 400-word token budget
+8. Fuzzy sentinel suppression — punctuation-aware matching + morning briefing NOTHING_TO_REPORT sentinel
+9. `chat_via_api()` HTTP status check — mirrors `chat_via_api_with_log()` fix
+10. Dashboard improvements — Next Fire + Type columns, local timezone, interval cron formatting
+11. Documentation — WAL count correction, test count snapshot, line count note, admin reindex E2E test

@@ -362,6 +362,7 @@ async def health_check():
 
     checks = {
         "api_key_configured": bool(settings.anthropic_api_key and settings.anthropic_api_key.strip()),
+        "reminder_scheduler": _reminder_scheduler.is_alive() if _reminder_scheduler else False,
     }
 
     all_healthy = all(checks.values())
