@@ -235,6 +235,9 @@ class TestAPIOpenAPISync:
         paths = openapi_spec.get("paths", {})
 
         for path_key, config in module.CURATED_ENDPOINTS.items():
+            # Skip tools with custom handlers (no direct API endpoint mapping)
+            if config.get("custom_handler"):
+                continue
             # Use explicit path if provided, otherwise strip :METHOD suffix
             actual_path = config.get("path", path_key.split(":")[0])
             # Handle path parameters
