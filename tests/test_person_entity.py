@@ -294,15 +294,13 @@ class TestPersonEntityStore:
     """Tests for PersonEntityStore."""
 
     @pytest.fixture
-    def temp_store(self):
+    def temp_store(self, tmp_path):
         """Create a temporary store for testing."""
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            store = PersonEntityStore(f.name)
-            # Clear blocklist to ensure test isolation from production data
-            store._blocklist.clear()
-            yield store
-            # Cleanup
-            Path(f.name).unlink(missing_ok=True)
+        db_path = str(tmp_path / "test_person_entity.db")
+        store = PersonEntityStore(db_path)
+        # Clear blocklist to ensure test isolation from production data
+        store._blocklist.clear()
+        yield store
 
     def test_add_and_get_by_id(self, temp_store):
         """Test adding an entity and retrieving by ID."""
@@ -442,32 +440,27 @@ class TestPersonEntityStore:
         result = temp_store.delete("fake-id")
         assert result is False
 
-    def test_persistence(self):
+    def test_persistence(self, tmp_path):
         """Test that entities persist across store instances."""
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            storage_path = f.name
+        db_path = str(tmp_path / "test_persist.db")
 
-        try:
-            # Create store and add entity
-            store1 = PersonEntityStore(storage_path)
-            entity = PersonEntity(
-                canonical_name="Persistent Person",
-                emails=["persist@test.com"],
-                company="Test Corp",
-            )
-            store1.add(entity)
-            store1.save()
+        # Create store and add entity
+        store1 = PersonEntityStore(db_path)
+        entity = PersonEntity(
+            canonical_name="Persistent Person",
+            emails=["persist@test.com"],
+            company="Test Corp",
+        )
+        store1.add(entity)
 
-            # Create new store instance from same file
-            store2 = PersonEntityStore(storage_path)
+        # Create new store instance from same database
+        store2 = PersonEntityStore(db_path)
 
-            # Should load the entity
-            retrieved = store2.get_by_email("persist@test.com")
-            assert retrieved is not None
-            assert retrieved.canonical_name == "Persistent Person"
-            assert retrieved.company == "Test Corp"
-        finally:
-            Path(storage_path).unlink(missing_ok=True)
+        # Should find the entity (persisted immediately)
+        retrieved = store2.get_by_email("persist@test.com")
+        assert retrieved is not None
+        assert retrieved.canonical_name == "Persistent Person"
+        assert retrieved.company == "Test Corp"
 
     def test_statistics(self, temp_store):
         """Test getting store statistics."""

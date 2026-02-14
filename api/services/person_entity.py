@@ -8,10 +8,8 @@ Key changes from PersonRecord:
 - Includes confidence_score for merge quality tracking
 - Includes display_name for disambiguation (e.g., "Sarah (Movement)")
 """
-import fcntl
 import json
 import logging
-import os
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -423,85 +421,231 @@ class PersonEntity:
 
 class PersonEntityStore:
     """
-    Storage layer for PersonEntity objects.
+    Storage layer for PersonEntity objects using SQLite.
 
-    Provides CRUD operations and persistence to JSON file.
+    Provides CRUD operations with immediate persistence to SQLite database.
+    Each add/update/delete operation is committed immediately — there is no
+    need to call save() (retained as a no-op for backward compatibility).
 
     IMPORTANT - ID DURABILITY WARNING:
     ==================================
     Person IDs (UUIDs) are generated ONCE when a person is first created and
-    are persisted in the storage file. These IDs are:
+    are persisted in the database. These IDs are:
     - Referenced by relationships, interactions, and source entities
     - Hardcoded in settings (e.g., my_person_id for the CRM owner)
     - Used in merged_person_ids.json to track person merges
 
-    NEVER delete or rebuild people_entities.json from scratch unless absolutely
-    necessary. Doing so will:
+    NEVER drop the person_entities table unless absolutely necessary. Doing so
+    will:
     - Generate NEW IDs for everyone, breaking all relationships
     - Invalidate hardcoded IDs like my_person_id in settings
     - Break the merge history tracking
 
     If you need to fix data issues, prefer:
-    - Editing individual entities via the API or directly in the JSON
+    - Editing individual entities via the API
     - Using the merge/split functionality to reorganize people
     - Running incremental syncs (which look up existing entities by email/phone/name)
     """
 
     # Path to merged IDs file (secondary_id -> primary_id mapping)
     MERGED_IDS_PATH = Path(__file__).parent.parent.parent / "data" / "merged_person_ids.json"
-    # Path to CRM database (shared with link_override)
+    # Path to CRM database (shared with link_override, blocklist, etc.)
     CRM_DB_PATH = Path(__file__).parent.parent.parent / "data" / "crm.db"
 
-    def __init__(self, storage_path: str = "./data/people_entities.json"):
+    # Column names for INSERT/UPDATE statements
+    _COLUMNS = (
+        "id", "canonical_name", "display_name", "emails", "company", "position",
+        "linkedin_url", "category", "vault_contexts", "sources", "first_seen", "last_seen",
+        "meeting_count", "email_count", "mention_count", "message_count", "slack_message_count",
+        "related_notes", "aliases", "phone_numbers", "phone_primary", "confidence_score",
+        "tags", "notes", "source_entity_count", "birthday", "hidden", "hidden_at",
+        "hidden_reason", "relationship_strength", "is_peripheral_contact", "dunbar_circle",
+    )
+    _PLACEHOLDERS = ", ".join(["?"] * len(_COLUMNS))
+    _COLUMNS_STR = ", ".join(_COLUMNS)
+
+    def __init__(self, db_path: str = None):
         """
         Initialize the entity store.
 
         Args:
-            storage_path: Path to JSON file for persistence
+            db_path: Path to SQLite database. Defaults to ./data/crm.db.
         """
-        self.storage_path = Path(storage_path)
-        self._entities: dict[str, PersonEntity] = {}  # Keyed by entity ID
-        self._email_index: dict[str, str] = {}  # email.lower() → entity ID
-        self._name_index: dict[str, str] = {}  # canonical_name.lower() → entity ID
-        self._phone_index: dict[str, str] = {}  # E.164 phone → entity ID
+        if db_path is None:
+            db_path = str(self.CRM_DB_PATH)
+        self.db_path = Path(db_path)
         self._merged_ids: dict[str, str] = {}  # secondary_id -> primary_id
         self._blocklist: set[str] = set()  # Blocked emails/phones (lowercase)
-        self._ensure_blocklist_table()
+        self._init_db()
         self._load_blocklist()
-        self._load()
         self._load_merged_ids()
 
-    def _load_merged_ids(self) -> None:
-        """Load the merged IDs mapping for durability."""
-        if self.MERGED_IDS_PATH.exists():
-            try:
-                with open(self.MERGED_IDS_PATH) as f:
-                    self._merged_ids = json.load(f)
-                if self._merged_ids:
-                    logger.info(f"Loaded {len(self._merged_ids)} merged ID mappings")
-            except Exception as e:
-                logger.warning(f"Failed to load merged IDs: {e}")
+    def _init_db(self) -> None:
+        """Create SQLite tables and indices if they don't exist."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS person_entities (
+                    id TEXT PRIMARY KEY,
+                    canonical_name TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    emails TEXT NOT NULL DEFAULT '[]',
+                    company TEXT,
+                    position TEXT,
+                    linkedin_url TEXT,
+                    category TEXT NOT NULL DEFAULT 'unknown',
+                    vault_contexts TEXT NOT NULL DEFAULT '[]',
+                    sources TEXT NOT NULL DEFAULT '[]',
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    meeting_count INTEGER NOT NULL DEFAULT 0,
+                    email_count INTEGER NOT NULL DEFAULT 0,
+                    mention_count INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    slack_message_count INTEGER NOT NULL DEFAULT 0,
+                    related_notes TEXT NOT NULL DEFAULT '[]',
+                    aliases TEXT NOT NULL DEFAULT '[]',
+                    phone_numbers TEXT NOT NULL DEFAULT '[]',
+                    phone_primary TEXT,
+                    confidence_score REAL NOT NULL DEFAULT 1.0,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    source_entity_count INTEGER NOT NULL DEFAULT 0,
+                    birthday TEXT,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    hidden_at TEXT,
+                    hidden_reason TEXT NOT NULL DEFAULT '',
+                    relationship_strength REAL,
+                    is_peripheral_contact INTEGER NOT NULL DEFAULT 0,
+                    dunbar_circle INTEGER
+                );
 
-    def _ensure_blocklist_table(self) -> None:
-        """Create the person_blocklist table if it doesn't exist."""
-        self.CRM_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.CRM_DB_PATH)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS person_blocklist (
-                identifier TEXT PRIMARY KEY,  -- Email or phone (lowercase)
-                identifier_type TEXT NOT NULL,  -- 'email' or 'phone'
-                person_name TEXT,  -- Original person name (for reference)
-                reason TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        conn.close()
+                CREATE TABLE IF NOT EXISTS person_emails (
+                    email TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS person_phones (
+                    phone TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS person_names (
+                    name TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS person_blocklist (
+                    identifier TEXT PRIMARY KEY,
+                    identifier_type TEXT NOT NULL,
+                    person_name TEXT,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pe_canonical_name ON person_entities(canonical_name);
+                CREATE INDEX IF NOT EXISTS idx_pe_category ON person_entities(category);
+                CREATE INDEX IF NOT EXISTS idx_pe_hidden ON person_entities(hidden);
+                CREATE INDEX IF NOT EXISTS idx_pe_last_seen ON person_entities(last_seen);
+                CREATE INDEX IF NOT EXISTS idx_person_emails_pid ON person_emails(person_id);
+                CREATE INDEX IF NOT EXISTS idx_person_phones_pid ON person_phones(person_id);
+                CREATE INDEX IF NOT EXISTS idx_person_names_pid ON person_names(person_id);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a new SQLite connection with WAL mode and row factory."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _entity_to_values(self, entity: PersonEntity) -> tuple:
+        """Convert PersonEntity to tuple of values for SQL INSERT/UPDATE."""
+        return (
+            entity.id,
+            entity.canonical_name,
+            entity.display_name,
+            json.dumps(entity.emails),
+            entity.company,
+            entity.position,
+            entity.linkedin_url,
+            entity.category,
+            json.dumps(entity.vault_contexts),
+            json.dumps(entity.sources),
+            entity.first_seen.isoformat() if entity.first_seen else None,
+            entity.last_seen.isoformat() if entity.last_seen else None,
+            entity.meeting_count,
+            entity.email_count,
+            entity.mention_count,
+            entity.message_count,
+            entity.slack_message_count,
+            json.dumps(entity.related_notes),
+            json.dumps(entity.aliases),
+            json.dumps(entity.phone_numbers),
+            entity.phone_primary,
+            entity.confidence_score,
+            json.dumps(entity.tags),
+            entity.notes,
+            entity.source_entity_count,
+            entity.birthday,
+            1 if entity.hidden else 0,
+            entity.hidden_at.isoformat() if entity.hidden_at else None,
+            entity.hidden_reason,
+            entity._relationship_strength,
+            1 if entity.is_peripheral_contact else 0,
+            entity.dunbar_circle,
+        )
+
+    def _row_to_entity(self, row: sqlite3.Row) -> PersonEntity:
+        """Convert SQLite row to PersonEntity."""
+        data = dict(row)
+        # Parse JSON list fields
+        for list_field in ('emails', 'vault_contexts', 'sources', 'related_notes',
+                           'aliases', 'phone_numbers', 'tags'):
+            val = data.get(list_field)
+            data[list_field] = json.loads(val) if val else []
+        # Convert SQLite integer to boolean
+        data['hidden'] = bool(data.get('hidden', 0))
+        data['is_peripheral_contact'] = bool(data.get('is_peripheral_contact', 0))
+        return PersonEntity.from_dict(data)
+
+    def _update_lookup_tables(self, conn: sqlite3.Connection, entity: PersonEntity) -> None:
+        """Update email, phone, and name lookup tables for an entity."""
+        pid = entity.id
+        conn.execute("DELETE FROM person_emails WHERE person_id = ?", (pid,))
+        conn.execute("DELETE FROM person_phones WHERE person_id = ?", (pid,))
+        conn.execute("DELETE FROM person_names WHERE person_id = ?", (pid,))
+
+        for email in entity.emails:
+            conn.execute(
+                "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
+                (email.lower(), pid))
+        for phone in entity.phone_numbers:
+            if phone:
+                conn.execute(
+                    "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
+                    (phone, pid))
+        if entity.canonical_name:
+            conn.execute(
+                "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
+                (entity.canonical_name.lower(), pid))
+        for alias in entity.aliases:
+            if alias:
+                conn.execute(
+                    "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
+                    (alias.lower(), pid))
+
+    # --- Blocklist methods ---
 
     def _load_blocklist(self) -> None:
         """Load blocked identifiers from database."""
         try:
-            conn = sqlite3.connect(self.CRM_DB_PATH)
+            conn = self._get_connection()
             cursor = conn.execute("SELECT identifier FROM person_blocklist")
             self._blocklist = {row[0] for row in cursor}
             conn.close()
@@ -526,15 +670,17 @@ class PersonEntityStore:
                           person_name: str, reason: str) -> None:
         """Add an identifier to the blocklist."""
         identifier = identifier.lower()
-        conn = sqlite3.connect(self.CRM_DB_PATH)
-        conn.execute("""
-            INSERT OR REPLACE INTO person_blocklist
-            (identifier, identifier_type, person_name, reason, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (identifier, identifier_type, person_name, reason,
-              datetime.now(timezone.utc).isoformat()))
-        conn.commit()
-        conn.close()
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO person_blocklist
+                (identifier, identifier_type, person_name, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (identifier, identifier_type, person_name, reason,
+                  datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
         self._blocklist.add(identifier)
 
     def hide_person(self, entity_id: str, reason: str = "") -> Optional[PersonEntity]:
@@ -551,7 +697,7 @@ class PersonEntityStore:
         Returns:
             The hidden PersonEntity, or None if not found
         """
-        entity = self._entities.get(entity_id)
+        entity = self.get_by_id(entity_id)
         if not entity:
             return None
 
@@ -566,13 +712,14 @@ class PersonEntityStore:
         for phone in entity.phone_numbers:
             self._add_to_blocklist(phone, "phone", entity.canonical_name, reason)
 
-        # Update and save
+        # Update in database
         self.update(entity)
-        self.save()
 
         logger.info(f"Hidden person '{entity.canonical_name}' (ID: {entity_id[:8]}), "
                     f"blocklisted {len(entity.emails)} emails, {len(entity.phone_numbers)} phones")
         return entity
+
+    # --- Merge chain methods ---
 
     def get_canonical_id(self, person_id: str) -> str:
         """
@@ -587,142 +734,32 @@ class PersonEntityStore:
             person_id = self._merged_ids[person_id]
         return person_id
 
-    def _load(self) -> None:
-        """Load entities from disk."""
-        if not self.storage_path.exists():
-            logger.info(f"No existing entity store at {self.storage_path}")
-            return
+    def _load_merged_ids(self) -> None:
+        """Load the merged IDs mapping for durability."""
+        if self.MERGED_IDS_PATH.exists():
+            try:
+                with open(self.MERGED_IDS_PATH) as f:
+                    self._merged_ids = json.load(f)
+                if self._merged_ids:
+                    logger.info(f"Loaded {len(self._merged_ids)} merged ID mappings")
+            except Exception as e:
+                logger.warning(f"Failed to load merged IDs: {e}")
 
-        # Check for empty file
-        if self.storage_path.stat().st_size == 0:
-            logger.info(f"Empty entity store at {self.storage_path}")
-            return
+    def reload_merged_ids(self) -> None:
+        """Reload merged IDs mapping from disk (call after a merge operation)."""
+        self._load_merged_ids()
 
-        try:
-            with open(self.storage_path, "r") as f:
-                data = json.load(f)
-
-            for entity_data in data:
-                entity = PersonEntity.from_dict(entity_data)
-                self._entities[entity.id] = entity
-                self._index_entity(entity)
-
-            logger.info(f"Loaded {len(self._entities)} entities from {self.storage_path}")
-        except Exception as e:
-            logger.error(f"Failed to load entity store: {e}")
-
-    def _index_entity(self, entity: PersonEntity) -> None:
-        """Add entity to lookup indices."""
-        # Email index
-        for email in entity.emails:
-            self._email_index[email.lower()] = entity.id
-
-        # Name index
-        if entity.canonical_name:
-            self._name_index[entity.canonical_name.lower()] = entity.id
-
-        # Alias index (also add to name index)
-        for alias in entity.aliases:
-            if alias:
-                self._name_index[alias.lower()] = entity.id
-
-        # Phone index
-        for phone in entity.phone_numbers:
-            if phone:
-                self._phone_index[phone] = entity.id
-
-    def _remove_from_indices(self, entity: PersonEntity) -> None:
-        """Remove entity from lookup indices."""
-        for email in entity.emails:
-            self._email_index.pop(email.lower(), None)
-
-        if entity.canonical_name:
-            self._name_index.pop(entity.canonical_name.lower(), None)
-
-        for alias in entity.aliases:
-            if alias:
-                self._name_index.pop(alias.lower(), None)
-
-        for phone in entity.phone_numbers:
-            if phone:
-                self._phone_index.pop(phone, None)
+    # --- CRUD methods ---
 
     def save(self) -> None:
         """
-        Persist entities to disk with atomic writes and rolling backups.
+        No-op: SQLite persists changes immediately on each operation.
 
-        Safety features:
-        1. Writes to temp file first, validates JSON, then atomic rename
-        2. Creates rolling backup before each save (keeps last 5)
-        3. Validates entity count doesn't drastically drop (>50% loss = abort)
+        Retained for backward compatibility with code that calls save()
+        after batch add/update operations. With SQLite, each add/update/delete
+        is committed immediately, so explicit save() is no longer needed.
         """
-        import shutil
-        import tempfile
-
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        data = [entity.to_dict() for entity in self._entities.values()]
-
-        # Pre-save validation: prevent drastic entity count drops
-        if self.storage_path.exists():
-            try:
-                with open(self.storage_path) as f:
-                    old_data = json.load(f)
-                old_count = len(old_data)
-                new_count = len(data)
-                # If we're losing more than 50% of entities, abort (likely corruption)
-                if old_count > 100 and new_count < old_count * 0.5:
-                    raise ValueError(
-                        f"Save aborted: entity count dropped from {old_count} to {new_count} "
-                        f"(>{50}% loss). This may indicate corruption. Check data before saving."
-                    )
-            except json.JSONDecodeError:
-                pass  # Old file was corrupt, OK to overwrite
-
-        # Create rolling backup before save
-        if self.storage_path.exists():
-            try:
-                from config.settings import settings
-                backup_dir = Path(settings.backup_path)
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = backup_dir / f"people_entities.{timestamp}.json"
-                shutil.copy(self.storage_path, backup_path)
-                logger.info(f"Created backup: {backup_path}")
-
-                # Keep only last 2 backups
-                backups = sorted(backup_dir.glob("people_entities.*.json"))
-                for old_backup in backups[:-2]:
-                    old_backup.unlink()
-                    logger.debug(f"Removed old backup: {old_backup}")
-            except Exception as e:
-                logger.warning(f"Could not create backup: {e}")
-                # Continue with save - backup failure shouldn't block saves
-
-        # Write to temp file first (atomic write pattern)
-        temp_fd, temp_path = tempfile.mkstemp(
-            suffix=".json", dir=self.storage_path.parent
-        )
-        try:
-            with os.fdopen(temp_fd, "w") as f:
-                json.dump(data, f, indent=2)
-
-            # Validate the temp file: re-read and verify count
-            with open(temp_path) as f:
-                validated_data = json.load(f)
-            if len(validated_data) != len(data):
-                raise ValueError(
-                    f"Write validation failed: expected {len(data)}, got {len(validated_data)}"
-                )
-
-            # Atomic rename (same filesystem = atomic on POSIX)
-            shutil.move(temp_path, self.storage_path)
-            logger.info(f"Saved {len(data)} entities to {self.storage_path}")
-
-        except Exception:
-            # Clean up temp file on failure
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+        pass
 
     def add(self, entity: PersonEntity) -> Optional[PersonEntity]:
         """
@@ -749,11 +786,19 @@ class PersonEntityStore:
                             f"phone {phone} is blocklisted")
                 return None
 
-        # Store a copy to avoid reference issues
-        stored = PersonEntity.from_dict(entity.to_dict())
-        self._entities[stored.id] = stored
-        self._index_entity(stored)
-        return stored
+        values = self._entity_to_values(entity)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                f"INSERT OR REPLACE INTO person_entities ({self._COLUMNS_STR}) "
+                f"VALUES ({self._PLACEHOLDERS})", values)
+            self._update_lookup_tables(conn, entity)
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Return a copy to avoid reference issues
+        return PersonEntity.from_dict(entity.to_dict())
 
     def update(self, entity: PersonEntity) -> PersonEntity:
         """
@@ -765,16 +810,18 @@ class PersonEntityStore:
         Returns:
             The updated entity (a copy is stored internally)
         """
-        # Get the OLD stored entity (not the passed-in one which may have been modified)
-        old_entity = self._entities.get(entity.id)
-        if old_entity:
-            self._remove_from_indices(old_entity)
+        values = self._entity_to_values(entity)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                f"INSERT OR REPLACE INTO person_entities ({self._COLUMNS_STR}) "
+                f"VALUES ({self._PLACEHOLDERS})", values)
+            self._update_lookup_tables(conn, entity)
+            conn.commit()
+        finally:
+            conn.close()
 
-        # Store a copy to avoid reference issues
-        stored = PersonEntity.from_dict(entity.to_dict())
-        self._entities[stored.id] = stored
-        self._index_entity(stored)
-        return stored
+        return PersonEntity.from_dict(entity.to_dict())
 
     def delete(self, entity_id: str) -> bool:
         """
@@ -786,11 +833,20 @@ class PersonEntityStore:
         Returns:
             True if deleted, False if not found
         """
-        entity = self._entities.pop(entity_id, None)
-        if entity:
-            self._remove_from_indices(entity)
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM person_entities WHERE id = ?", (entity_id,)).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM person_emails WHERE person_id = ?", (entity_id,))
+            conn.execute("DELETE FROM person_phones WHERE person_id = ?", (entity_id,))
+            conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
+            conn.execute("DELETE FROM person_entities WHERE id = ?", (entity_id,))
+            conn.commit()
             return True
-        return False
+        finally:
+            conn.close()
 
     def get_by_id(self, entity_id: str) -> Optional[PersonEntity]:
         """
@@ -799,36 +855,58 @@ class PersonEntityStore:
         If this ID was merged into another person, returns the surviving
         primary person instead.
         """
-        # Follow merge chain to get canonical ID
         canonical_id = self.get_canonical_id(entity_id)
-        return self._entities.get(canonical_id)
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM person_entities WHERE id = ?", (canonical_id,)).fetchone()
+            if row:
+                return self._row_to_entity(row)
+            return None
+        finally:
+            conn.close()
 
     def get_by_email(self, email: str) -> Optional[PersonEntity]:
         """Get entity by email address (case-insensitive), following merge chain."""
-        entity_id = self._email_index.get(email.lower())
-        if entity_id:
-            return self.get_by_id(entity_id)  # Uses canonical ID
-        return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT person_id FROM person_emails WHERE email = ?",
+                (email.lower(),)).fetchone()
+            if row:
+                return self.get_by_id(row['person_id'])
+            return None
+        finally:
+            conn.close()
 
     def get_by_phone(self, phone: str) -> Optional[PersonEntity]:
         """Get entity by phone number (E.164 format), following merge chain."""
-        entity_id = self._phone_index.get(phone)
-        if entity_id:
-            return self.get_by_id(entity_id)  # Uses canonical ID
-        return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT person_id FROM person_phones WHERE phone = ?",
+                (phone,)).fetchone()
+            if row:
+                return self.get_by_id(row['person_id'])
+            return None
+        finally:
+            conn.close()
 
     def get_by_name(self, name: str) -> Optional[PersonEntity]:
         """Get entity by canonical name or alias (case-insensitive), following merge chain."""
-        entity_id = self._name_index.get(name.lower())
-        if entity_id:
-            return self.get_by_id(entity_id)  # Uses canonical ID
-        return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT person_id FROM person_names WHERE name = ?",
+                (name.lower(),)).fetchone()
+            if row:
+                return self.get_by_id(row['person_id'])
+            return None
+        finally:
+            conn.close()
 
-    def reload_merged_ids(self) -> None:
-        """Reload merged IDs mapping from disk (call after a merge operation)."""
-        self._load_merged_ids()
-
-    def search(self, query: str, limit: int = 20, include_hidden: bool = False, include_merged: bool = False) -> list[PersonEntity]:
+    def search(self, query: str, limit: int = 20, include_hidden: bool = False,
+               include_merged: bool = False) -> list[PersonEntity]:
         """
         Search entities by name, email, or alias.
 
@@ -842,49 +920,40 @@ class PersonEntityStore:
             List of matching entities
         """
         query_lower = query.lower()
-        results = []
+        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+        pattern = f"%{query_lower}%"
 
-        for entity in self._entities.values():
-            # Skip hidden entities unless explicitly requested
-            if entity.hidden and not include_hidden:
-                continue
+        conn = self._get_connection()
+        try:
+            conditions = [
+                "(LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ? "
+                "OR LOWER(emails) LIKE ? OR LOWER(aliases) LIKE ?)"
+            ]
+            params: list = [pattern, pattern, pattern, pattern]
 
-            # Skip entities that were merged into another person
-            if entity.id in self._merged_ids and not include_merged:
-                continue
+            if not include_hidden:
+                conditions.append("hidden = 0")
 
-            # Check canonical name
-            if query_lower in entity.canonical_name.lower():
-                results.append(entity)
-                continue
+            where = " AND ".join(conditions)
+            sql = (f"SELECT * FROM person_entities WHERE {where} "
+                   f"ORDER BY last_seen DESC, canonical_name ASC")
 
-            # Check display name
-            if query_lower in entity.display_name.lower():
-                results.append(entity)
-                continue
+            rows = conn.execute(sql, params).fetchall()
 
-            # Check emails
-            if any(query_lower in email.lower() for email in entity.emails):
-                results.append(entity)
-                continue
+            results = []
+            for row in rows:
+                if row['id'] in merged_ids:
+                    continue
+                results.append(self._row_to_entity(row))
+                if len(results) >= limit:
+                    break
 
-            # Check aliases
-            if any(query_lower in alias.lower() for alias in entity.aliases):
-                results.append(entity)
-                continue
+            return results
+        finally:
+            conn.close()
 
-            if len(results) >= limit:
-                break
-
-        # Sort by last_seen (most recent first), then by name
-        results.sort(
-            key=lambda e: (e.last_seen or datetime.min, e.canonical_name),
-            reverse=True,
-        )
-
-        return results[:limit]
-
-    def get_all(self, include_hidden: bool = False, include_merged: bool = False) -> list[PersonEntity]:
+    def get_all(self, include_hidden: bool = False,
+                include_merged: bool = False) -> list[PersonEntity]:
         """
         Get all entities.
 
@@ -895,61 +964,105 @@ class PersonEntityStore:
         Returns:
             List of PersonEntity objects
         """
-        results = []
-        for entity in self._entities.values():
-            # Skip hidden entities unless explicitly requested
-            if entity.hidden and not include_hidden:
-                continue
-            # Skip entities that were merged into another person
-            # (their ID is in _merged_ids as a secondary ID)
-            if entity.id in self._merged_ids and not include_merged:
-                continue
-            results.append(entity)
-        return results
+        merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
+
+        conn = self._get_connection()
+        try:
+            if include_hidden:
+                rows = conn.execute("SELECT * FROM person_entities").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM person_entities WHERE hidden = 0").fetchall()
+
+            results = []
+            for row in rows:
+                if row['id'] in merged_ids:
+                    continue
+                results.append(self._row_to_entity(row))
+
+            return results
+        finally:
+            conn.close()
 
     def count(self) -> int:
         """Get total number of entities."""
-        return len(self._entities)
+        conn = self._get_connection()
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM person_entities").fetchone()
+            return row[0]
+        finally:
+            conn.close()
 
     def get_statistics(self) -> dict:
         """Get aggregate statistics about stored entities."""
-        by_source: dict[str, int] = {}
-        by_category: dict[str, int] = {}
+        conn = self._get_connection()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM person_entities").fetchone()[0]
+            email_count = conn.execute("SELECT COUNT(*) FROM person_emails").fetchone()[0]
+            name_count = conn.execute("SELECT COUNT(*) FROM person_names").fetchone()[0]
+            phone_count = conn.execute("SELECT COUNT(*) FROM person_phones").fetchone()[0]
 
-        for entity in self._entities.values():
-            for source in entity.sources:
-                by_source[source] = by_source.get(source, 0) + 1
-            by_category[entity.category] = by_category.get(entity.category, 0) + 1
+            # Category breakdown
+            by_category: dict[str, int] = {}
+            for row in conn.execute(
+                    "SELECT category, COUNT(*) as cnt FROM person_entities GROUP BY category"):
+                by_category[row['category']] = row['cnt']
 
-        return {
-            "total_entities": len(self._entities),
-            "by_source": by_source,
-            "by_category": by_category,
-            "total_emails_indexed": len(self._email_index),
-            "total_names_indexed": len(self._name_index),
-            "total_phones_indexed": len(self._phone_index),
-        }
+            # Source breakdown (parse JSON column)
+            by_source: dict[str, int] = {}
+            for row in conn.execute("SELECT sources FROM person_entities"):
+                sources = json.loads(row['sources']) if row['sources'] else []
+                for source in sources:
+                    by_source[source] = by_source.get(source, 0) + 1
+
+            return {
+                "total_entities": total,
+                "by_source": by_source,
+                "by_category": by_category,
+                "total_emails_indexed": email_count,
+                "total_names_indexed": name_count,
+                "total_phones_indexed": phone_count,
+            }
+        finally:
+            conn.close()
+
+    def export_json(self, path: str = None) -> str:
+        """
+        Export all entities to JSON file for backup.
+
+        Args:
+            path: Output file path. Defaults to ./data/people_entities.json.
+
+        Returns:
+            The path of the exported file.
+        """
+        if path is None:
+            path = str(self.db_path.parent / "people_entities.json")
+        entities = self.get_all(include_hidden=True, include_merged=True)
+        data = [e.to_dict() for e in entities]
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"Exported {len(data)} entities to {path}")
+        return path
 
 
 # Singleton instance
 _entity_store: Optional[PersonEntityStore] = None
 
 
-def get_person_entity_store(
-    storage_path: str = "./data/people_entities.json",
-) -> PersonEntityStore:
+def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
     """
     Get or create the singleton PersonEntityStore.
 
     Args:
-        storage_path: Path to JSON file for persistence
+        db_path: Path to SQLite database. Defaults to ./data/crm.db.
 
     Returns:
         PersonEntityStore instance
     """
     global _entity_store
     if _entity_store is None:
-        _entity_store = PersonEntityStore(storage_path)
+        _entity_store = PersonEntityStore(db_path)
     return _entity_store
 
 
