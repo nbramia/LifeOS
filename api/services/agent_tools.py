@@ -850,7 +850,7 @@ def _reminder_create(inp: dict) -> str:
         name=inp["name"],
         schedule_type=inp["schedule_type"],
         schedule_value=inp["schedule_value"],
-        message_type="telegram",
+        message_type="static",
         message_content=inp["message_content"],
     )
     return f"Reminder created: \"{reminder.name}\" (id: {reminder.id}, next: {reminder.next_trigger_at})"

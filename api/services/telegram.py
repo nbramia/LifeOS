@@ -273,6 +273,9 @@ async def chat_via_api_with_log(question: str) -> dict:
             f"http://localhost:{port}/api/ask/stream",
             json=body,
         ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                raise RuntimeError(f"Chat pipeline returned HTTP {resp.status_code}: {error_body[:500]}")
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
