@@ -76,6 +76,7 @@ class ServiceState:
     last_check: Optional[datetime] = None
     last_healthy: Optional[datetime] = None
     last_failed: Optional[datetime] = None
+    failure_streak_start: Optional[datetime] = None  # When current failure streak began
     failure_count: int = 0
     consecutive_failures: int = 0
     last_error: Optional[str] = None
@@ -101,6 +102,10 @@ STARTUP_GRACE_PERIOD_SECONDS = 30
 
 # Minimum consecutive failures before alerting (handles transient issues)
 MIN_CONSECUTIVE_FAILURES_FOR_ALERT = 3
+
+# Minimum duration (seconds) a service must be continuously failing before alerting.
+# Prevents false alerts during dev restarts or transient ChromaDB/SQLite blips.
+FAILURE_DURATION_THRESHOLD_SECONDS = 120
 
 
 class ServiceHealthRegistry:
@@ -135,6 +140,7 @@ class ServiceHealthRegistry:
         self._states: dict[str, ServiceState] = {}
         self._degradation_events: list[DegradationEvent] = []
         self._alert_cooldowns: dict[str, datetime] = {}  # service -> last alert time
+        self._maintenance_until: Optional[datetime] = None  # Suppress all alerts until this time
         self._state_lock = threading.Lock()
         self._event_lock = threading.Lock()
         self._startup_time = datetime.now(timezone.utc)  # Track when registry was created
@@ -144,6 +150,31 @@ class ServiceHealthRegistry:
             self._states[service] = ServiceState()
 
         self._initialized = True
+
+    def enter_maintenance(self, duration_seconds: int) -> None:
+        """
+        Suppress all CRITICAL alerts for the given duration.
+
+        Use this before operations that may cause transient service unavailability
+        (nightly sync, reindex, manual ChromaDB restarts, etc.).
+        """
+        self._maintenance_until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+        logger.info(f"Maintenance mode: alerts suppressed for {duration_seconds}s")
+
+    def exit_maintenance(self) -> None:
+        """Exit maintenance mode early."""
+        self._maintenance_until = None
+        logger.info("Maintenance mode ended")
+
+    @property
+    def in_maintenance(self) -> bool:
+        """Check if we're currently in maintenance mode."""
+        if self._maintenance_until is None:
+            return False
+        if datetime.now(timezone.utc) >= self._maintenance_until:
+            self._maintenance_until = None  # Auto-expire
+            return False
+        return True
 
     def mark_healthy(self, service: str) -> None:
         """
@@ -165,6 +196,7 @@ class ServiceHealthRegistry:
             state.last_check = now
             state.last_healthy = now
             state.consecutive_failures = 0
+            state.failure_streak_start = None
             state.using_fallback = False
             state.fallback_name = None
 
@@ -204,6 +236,10 @@ class ServiceHealthRegistry:
             state.consecutive_failures += 1
             state.last_error = error[:500] if error else None  # Truncate long errors
 
+            # Track when this failure streak started
+            if state.failure_streak_start is None:
+                state.failure_streak_start = now
+
             # Get default severity if not specified
             if severity is None:
                 severity = SERVICE_CONFIG.get(service, (Severity.WARNING, ""))[0]
@@ -214,13 +250,22 @@ class ServiceHealthRegistry:
 
             # Determine if we should send an alert
             if severity == Severity.CRITICAL:
+                # Check maintenance mode (nightly sync, reindex, manual operations)
+                if self.in_maintenance:
+                    logger.info(f"Suppressing alert for {service} - maintenance mode active")
                 # Check startup grace period (don't alert during restarts)
-                time_since_startup = (now - self._startup_time).total_seconds()
-                if time_since_startup < STARTUP_GRACE_PERIOD_SECONDS:
+                elif (now - self._startup_time).total_seconds() < STARTUP_GRACE_PERIOD_SECONDS:
                     logger.info(f"Suppressing alert for {service} - within startup grace period")
                 # Check minimum consecutive failures (handles transient issues)
                 elif state.consecutive_failures < MIN_CONSECUTIVE_FAILURES_FOR_ALERT:
                     logger.info(f"Suppressing alert for {service} - only {state.consecutive_failures} consecutive failures")
+                # Check failure duration (handles dev restarts / transient blips)
+                elif (now - state.failure_streak_start).total_seconds() < FAILURE_DURATION_THRESHOLD_SECONDS:
+                    logger.info(
+                        f"Suppressing alert for {service} - failing for only "
+                        f"{(now - state.failure_streak_start).total_seconds():.0f}s "
+                        f"(threshold: {FAILURE_DURATION_THRESHOLD_SECONDS}s)"
+                    )
                 else:
                     # Check cooldown
                     last_alert = self._alert_cooldowns.get(service)
@@ -433,6 +478,16 @@ def mark_service_failed(
 ) -> None:
     """Mark a service as failed (convenience wrapper)."""
     get_service_health().mark_failed(service, error, severity)
+
+
+def enter_maintenance(duration_seconds: int) -> None:
+    """Suppress CRITICAL alerts for the given duration (convenience wrapper)."""
+    get_service_health().enter_maintenance(duration_seconds)
+
+
+def exit_maintenance() -> None:
+    """Exit maintenance mode early (convenience wrapper)."""
+    get_service_health().exit_maintenance()
 
 
 def reset_service_health() -> None:

@@ -135,14 +135,24 @@ async def run_agent_loop(
     model = get_claude_model_name(model_tier)
     system_prompt = build_system_prompt()
 
-    # Inject relevant memories into system prompt
+    # Inject relevant memories into system prompt (with token budget)
     try:
         from api.services.memory_store import get_memory_store, format_memories_for_prompt
         memory_store = get_memory_store()
         relevant_memories = memory_store.get_relevant_memories(question, limit=5)
         if relevant_memories:
-            memory_text = format_memories_for_prompt(relevant_memories)
-            system_prompt.append({"type": "text", "text": memory_text})
+            # Apply token budget: ~400 words ≈ 500 tokens
+            budgeted = []
+            word_count = 0
+            for m in relevant_memories:
+                words = len(m.content.split())
+                if word_count + words > 400:
+                    break
+                budgeted.append(m)
+                word_count += words
+            if budgeted:
+                memory_text = format_memories_for_prompt(budgeted)
+                system_prompt.append({"type": "text", "text": memory_text})
     except Exception as e:
         logger.warning(f"Failed to load memories: {e}")
 

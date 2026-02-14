@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import threading
+import time as _time_mod
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import yaml
 
 from croniter import croniter
 from zoneinfo import ZoneInfo
@@ -119,6 +121,33 @@ def _format_cron_human(cron_expr: str, tz_name: str = "America/New_York") -> str
     if len(parts) < 5:
         return cron_expr
     minute, hour, _, _, dow = parts
+
+    # Timezone abbreviation
+    tz_abbrev = "ET" if "New_York" in tz_name else tz_name.split("/")[-1]
+
+    dow_map = {"*": "daily", "1-5": "weekdays", "0,6": "weekends",
+               "0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed",
+               "4": "Thu", "5": "Fri", "6": "Sat"}
+    day_str = dow_map.get(dow, dow)
+
+    # Handle interval patterns like */15 with hour ranges like 8-18
+    if minute.startswith("*/"):
+        interval = minute[2:]
+        if "-" in hour:
+            # Hour range: e.g. 8-18
+            h_start, h_end = hour.split("-", 1)
+            try:
+                hs = int(h_start)
+                he = int(h_end)
+                s_ampm = "AM" if hs < 12 else "PM"
+                e_ampm = "AM" if he < 12 else "PM"
+                hs12 = hs % 12 or 12
+                he12 = he % 12 or 12
+                return f"{day_str} every {interval}m, {hs12}{s_ampm}\u2013{he12}{e_ampm} {tz_abbrev}"
+            except ValueError:
+                pass
+        return f"{day_str} every {interval}m {tz_abbrev}"
+
     try:
         h = int(hour)
         m = int(minute)
@@ -128,21 +157,19 @@ def _format_cron_human(cron_expr: str, tz_name: str = "America/New_York") -> str
     except ValueError:
         return cron_expr
 
-    dow_map = {"*": "daily", "1-5": "weekdays", "0,6": "weekends",
-               "0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed",
-               "4": "Thu", "5": "Fri", "6": "Sat"}
-    day_str = dow_map.get(dow, dow)
-
-    # Add timezone abbreviation
-    tz_abbrev = "ET" if "New_York" in tz_name else tz_name.split("/")[-1]
     return f"{day_str} at {time_str} {tz_abbrev}"
 
 
-def _format_dt_short(iso_str: str) -> str:
-    """Format an ISO datetime string to a short display."""
+def _format_dt_short(iso_str: str, tz_name: str = "America/New_York") -> str:
+    """Format an ISO datetime string to a short display in local timezone."""
     try:
         dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%b %d, %Y %I:%M %p")
+        tz = ZoneInfo(tz_name)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(tz)
+        else:
+            dt = dt.replace(tzinfo=tz)
+        return dt.strftime("%b %d, %I:%M %p")
     except (ValueError, TypeError):
         return iso_str or "—"
 
@@ -221,12 +248,14 @@ class ReminderStore:
             lines.append("## Recurring")
             if active_recurring:
                 lines.append("")
-                lines.append("| Name | Schedule | Last Triggered |")
-                lines.append("|------|----------|----------------|")
+                lines.append("| Name | Schedule | Next Fire | Last Triggered | Type |")
+                lines.append("|------|----------|-----------|----------------|------|")
                 for r in active_recurring:
-                    sched = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
-                    last = _format_dt_short(r.last_triggered_at) if r.last_triggered_at else "—"
-                    lines.append(f"| {r.name} | {sched} | {last} |")
+                    tz = r.timezone or "America/New_York"
+                    sched = _format_cron_human(r.schedule_value, tz)
+                    nxt = _format_dt_short(r.next_trigger_at, tz) if r.next_trigger_at else "—"
+                    last = _format_dt_short(r.last_triggered_at, tz) if r.last_triggered_at else "—"
+                    lines.append(f"| {r.name} | {sched} | {nxt} | {last} | {r.message_type} |")
             else:
                 lines.append("\n_No recurring reminders._")
             lines.append("")
@@ -235,12 +264,13 @@ class ReminderStore:
             lines.append("## Upcoming")
             if upcoming_once:
                 lines.append("")
-                lines.append("| Name | Scheduled For | Created |")
-                lines.append("|------|---------------|---------|")
+                lines.append("| Name | Scheduled For | Created | Type |")
+                lines.append("|------|---------------|---------|------|")
                 for r in upcoming_once:
-                    trigger = _format_dt_short(r.next_trigger_at) if r.next_trigger_at else "—"
-                    created = _format_dt_short(r.created_at) if r.created_at else "—"
-                    lines.append(f"| {r.name} | {trigger} | {created} |")
+                    tz = r.timezone or "America/New_York"
+                    trigger = _format_dt_short(r.next_trigger_at, tz) if r.next_trigger_at else "—"
+                    created = _format_dt_short(r.created_at, tz) if r.created_at else "—"
+                    lines.append(f"| {r.name} | {trigger} | {created} | {r.message_type} |")
             else:
                 lines.append("\n_No upcoming reminders._")
             lines.append("")
@@ -353,12 +383,29 @@ class ReminderScheduler:
     - static: send message_content via Telegram
     - prompt: run message_content through chat_via_api, send result via Telegram
     - endpoint: call LifeOS API endpoint, format result, send via Telegram
+
+    Crash recovery:
+    - Auto-restarts with exponential backoff (5s → 60s cap)
+    - Sends Telegram alert on each crash
+    - After 5 consecutive crashes, stops retrying and sends final alert
+    - Crash counter resets after 10 minutes of healthy operation
+
+    Vault toggle:
+    - Reads {vault}/LifeOS/Reminders/Scheduler.md frontmatter each iteration
+    - If `enabled: false`, skips firing but keeps thread alive
     """
+
+    MAX_CONSECUTIVE_CRASHES = 5
+    BACKOFF_BASE = 5  # seconds
+    BACKOFF_CAP = 60  # seconds
+    HEALTHY_RESET_SECONDS = 600  # 10 minutes
 
     def __init__(self, store: ReminderStore):
         self.store = store
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._crash_count = 0
+        self._last_crash_time: Optional[float] = None
 
     def start(self):
         if not settings.telegram_enabled:
@@ -366,6 +413,8 @@ class ReminderScheduler:
             return
 
         self._stop_event.clear()
+        self._crash_count = 0
+        self._last_crash_time = None
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -380,24 +429,125 @@ class ReminderScheduler:
             self._thread.join(timeout=5)
         logger.info("Reminder scheduler stopped")
 
+    def is_alive(self) -> bool:
+        """Check if the scheduler thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
+
     def _run(self):
-        """Main scheduler loop."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        """Main scheduler loop with crash recovery."""
+        while not self._stop_event.is_set():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._schedule_loop())
+                break  # Clean exit (stop_event was set)
+            except Exception as e:
+                loop.close()
+                if self._stop_event.is_set():
+                    break
+
+                # Reset crash counter if healthy for HEALTHY_RESET_SECONDS
+                now = _time_mod.monotonic()
+                if (self._last_crash_time is not None
+                        and now - self._last_crash_time > self.HEALTHY_RESET_SECONDS):
+                    self._crash_count = 0
+
+                self._crash_count += 1
+                self._last_crash_time = now
+                logger.error(f"Reminder scheduler crashed (attempt {self._crash_count}): {e}")
+
+                # Send Telegram alert
+                try:
+                    from api.services.telegram import send_message
+                    if self._crash_count >= self.MAX_CONSECUTIVE_CRASHES:
+                        send_message(
+                            f"*Reminder Scheduler DOWN*\n\n"
+                            f"Crashed {self._crash_count} times consecutively. "
+                            f"Giving up. Last error: {str(e)[:200]}\n\n"
+                            f"Restart the server to recover."
+                        )
+                    else:
+                        send_message(
+                            f"*Reminder Scheduler Crashed*\n\n"
+                            f"Error: {str(e)[:200]}\n"
+                            f"Restarting (attempt {self._crash_count}/{self.MAX_CONSECUTIVE_CRASHES})..."
+                        )
+                except Exception:
+                    logger.error("Failed to send scheduler crash alert")
+
+                if self._crash_count >= self.MAX_CONSECUTIVE_CRASHES:
+                    logger.error("Reminder scheduler permanently down after max crashes")
+                    break
+
+                # Exponential backoff
+                backoff = min(
+                    self.BACKOFF_BASE * (2 ** (self._crash_count - 1)),
+                    self.BACKOFF_CAP,
+                )
+                self._stop_event.wait(timeout=backoff)
+            finally:
+                if not loop.is_closed():
+                    loop.close()
+
+    def _read_control_file(self) -> bool:
+        """Read the vault control file and return whether the scheduler is enabled.
+
+        Also updates the status section of the control file.
+        Returns True if enabled (default), False if paused.
+        """
         try:
-            loop.run_until_complete(self._schedule_loop())
+            vault_path = settings.vault_path
+            control_dir = vault_path / "LifeOS" / "Reminders"
+            control_file = control_dir / "Scheduler.md"
+
+            enabled = True
+
+            if control_file.exists():
+                content = control_file.read_text(encoding="utf-8")
+                # Parse YAML frontmatter
+                if content.startswith("---"):
+                    parts = content.split("---", 2)
+                    if len(parts) >= 3:
+                        try:
+                            frontmatter = yaml.safe_load(parts[1])
+                            if isinstance(frontmatter, dict):
+                                enabled = frontmatter.get("enabled", True)
+                        except yaml.YAMLError:
+                            pass
+            else:
+                # Create control file with defaults
+                control_dir.mkdir(parents=True, exist_ok=True)
+
+            # Update status section
+            status = "running" if enabled else "paused"
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            new_content = (
+                f"---\nenabled: {'true' if enabled else 'false'}\n---\n"
+                f"# Reminder Scheduler\n\n"
+                f"Toggle the scheduler by changing `enabled` to `false`.\n"
+                f"Status updates below are auto-generated.\n\n"
+                f"**Status:** {status}\n"
+                f"**Last check:** {now_str}\n"
+                f"**Crashes:** {self._crash_count}\n"
+            )
+            control_file.write_text(new_content, encoding="utf-8")
+            return enabled
         except Exception as e:
-            logger.error(f"Reminder scheduler crashed: {e}")
-        finally:
-            loop.close()
+            logger.debug(f"Failed to read scheduler control file: {e}")
+            return True  # Default to enabled on error
 
     async def _schedule_loop(self):
         """Check for due reminders every 60 seconds."""
         while not self._stop_event.is_set():
             try:
-                due = self.store.get_due_reminders()
-                for reminder in due:
-                    await self._fire_reminder(reminder)
+                # Check vault control file
+                enabled = self._read_control_file()
+                if enabled:
+                    due = self.store.get_due_reminders()
+                    for reminder in due:
+                        await self._fire_reminder(reminder)
+                else:
+                    logger.debug("Reminder scheduler paused via control file")
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
 
@@ -407,10 +557,36 @@ class ReminderScheduler:
                     return
                 await asyncio.sleep(1)
 
+    def _should_skip_pre_meeting(self, reminder: Reminder) -> bool:
+        """Check if a pre-meeting prep reminder can be skipped (no upcoming meeting)."""
+        if "pre-meeting" not in reminder.name.lower():
+            return False
+        try:
+            from api.services.calendar import get_calendar_service
+            from api.services.google_auth import GoogleAccount
+            for account in (GoogleAccount.PERSONAL, GoogleAccount.WORK):
+                try:
+                    cal = get_calendar_service(account)
+                    if cal.has_upcoming_meeting(20):
+                        return False
+                except Exception:
+                    continue
+            logger.info(f"Reminder {reminder.name}: no upcoming meeting, skipping pipeline")
+            return True
+        except Exception as e:
+            logger.debug(f"Pre-meeting check failed, running pipeline: {e}")
+            return False
+
     async def _fire_reminder(self, reminder: Reminder):
         """Execute a single reminder with retry and execution logging."""
         import time as _time
         logger.info(f"Firing reminder: {reminder.name} ({reminder.id})")
+
+        # Lightweight pre-check for pre-meeting prep reminders
+        if reminder.message_type == "prompt" and self._should_skip_pre_meeting(reminder):
+            self.store.mark_triggered(reminder.id)
+            return
+
         start = _time.monotonic()
 
         try:
@@ -511,6 +687,8 @@ class ReminderScheduler:
             "attempt": max_retries,
         }
 
+    _SUPPRESS_SENTINELS = ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION")
+
     @staticmethod
     def _should_suppress(message: str) -> bool:
         """Check if a prompt response indicates nothing to report.
@@ -518,9 +696,22 @@ class ReminderScheduler:
         Prompt-type reminders can return sentinel values (e.g. 'NO_MEETING')
         to signal that no notification should be sent. This prevents noisy
         messages from high-frequency reminders like pre-meeting prep.
+
+        Matches sentinels exactly or followed by punctuation/separator chars
+        (period, dash, em-dash, comma, colon, newline) to handle variants like
+        "NO_MEETING." and "NO_MEETING — nothing scheduled" while not
+        matching "NO_MEETING but here's something useful".
         """
         stripped = message.strip().upper()
-        return stripped in ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION")
+        _SEP = set(".,;:!?\n\r-\u2014\u2013")  # punctuation and dashes
+        for sentinel in ReminderScheduler._SUPPRESS_SENTINELS:
+            if stripped == sentinel:
+                return True
+            if stripped.startswith(sentinel) and len(stripped) > len(sentinel):
+                next_char = stripped[len(sentinel)]
+                if next_char in _SEP:
+                    return True
+        return False
 
     async def _call_endpoint(self, config: Optional[dict]) -> Optional[str]:
         """Call a LifeOS API endpoint and format the result."""

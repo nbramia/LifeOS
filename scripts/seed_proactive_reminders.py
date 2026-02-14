@@ -73,7 +73,9 @@ Check for communication gaps — anyone important I haven't contacted in over 14
 Only mention the top 2-3 most relevant gaps, not an exhaustive list.
 
 Keep the entire briefing concise — aim for something I can read in 2 minutes. \
-Use bullet points, not paragraphs. Skip any section that has nothing to report.\
+Use bullet points, not paragraphs. Skip any section that has nothing to report.
+
+If there is truly nothing to report (no events, no tasks, no emails), respond with exactly NOTHING_TO_REPORT\
 """
 
 COMMUNICATION_GAPS_PROMPT = """\

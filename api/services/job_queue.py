@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -80,6 +81,7 @@ class JobQueue:
         self.db_path = db_path or _DEFAULT_DB_PATH
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
+        self._last_cleanup: float = 0.0
         self._init_db()
 
     def _init_db(self):
@@ -169,22 +171,22 @@ class JobQueue:
         return cur.rowcount > 0
 
     def _claim_next(self) -> Job | None:
-        """Claim the next pending job (atomic). Returns None if queue is empty."""
+        """Claim the next pending job (atomic UPDATE...RETURNING). Returns None if queue is empty."""
+        now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
             row = conn.execute(
-                """SELECT * FROM jobs
-                   WHERE status = ?
-                   ORDER BY priority ASC, created_at ASC
-                   LIMIT 1""",
-                (PENDING,),
+                """UPDATE jobs SET status = ?, started_at = ?, attempts = attempts + 1
+                   WHERE id = (
+                       SELECT id FROM jobs
+                       WHERE status = ?
+                       ORDER BY priority ASC, created_at ASC
+                       LIMIT 1
+                   )
+                   RETURNING *""",
+                (RUNNING, now, PENDING),
             ).fetchone()
             if not row:
                 return None
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "UPDATE jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?",
-                (RUNNING, now, row["id"]),
-            )
         return self._row_to_job(row)
 
     def _mark_completed(self, job_id: str, result: dict | None = None):
@@ -251,6 +253,11 @@ class JobQueue:
         logger.info("Job queue worker loop started")
         while not self._stop_event.is_set():
             try:
+                # Auto-cleanup old jobs once per day
+                if time.time() - self._last_cleanup > 86400:
+                    self.cleanup_old_jobs()
+                    self._last_cleanup = time.time()
+
                 job = self._claim_next()
                 if job:
                     self._execute_job(job)
@@ -265,17 +272,17 @@ class JobQueue:
         """Execute a single job."""
         handler = _JOB_HANDLERS.get(job.type)
         if not handler:
-            self._mark_failed(job.id, f"No handler for job type: {job.type}", job.attempts + 1, job.max_attempts)
+            self._mark_failed(job.id, f"No handler for job type: {job.type}", job.attempts, job.max_attempts)
             return
 
-        logger.info(f"Executing job {job.id} ({job.type}), attempt {job.attempts + 1}/{job.max_attempts}")
+        logger.info(f"Executing job {job.id} ({job.type}), attempt {job.attempts}/{job.max_attempts}")
         try:
             result = handler(job.params)
             self._mark_completed(job.id, result)
             logger.info(f"Job {job.id} completed")
         except Exception as e:
             logger.error(f"Job {job.id} failed: {e}", exc_info=True)
-            self._mark_failed(job.id, str(e), job.attempts + 1, job.max_attempts)
+            self._mark_failed(job.id, str(e), job.attempts, job.max_attempts)
 
     def cleanup_old_jobs(self, days: int = 30):
         """Delete completed/failed jobs older than N days."""
@@ -296,10 +303,17 @@ class JobQueue:
 def _handle_reindex_vault(params: dict) -> dict:
     """Reindex the vault (runs in worker thread)."""
     from api.services.indexer import IndexerService
+    from api.services.service_health import enter_maintenance, exit_maintenance
     from config.settings import settings
-    indexer = IndexerService(vault_path=settings.vault_path)
-    count = indexer.index_all()
-    return {"files_indexed": count}
+
+    # Suppress alerts during reindex (heavy ChromaDB writes can cause transient errors)
+    enter_maintenance(4 * 3600)
+    try:
+        indexer = IndexerService(vault_path=settings.vault_path)
+        count = indexer.index_all()
+        return {"files_indexed": count}
+    finally:
+        exit_maintenance()
 
 
 def _handle_sync_source(params: dict) -> dict:

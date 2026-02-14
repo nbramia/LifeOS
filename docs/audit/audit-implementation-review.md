@@ -23,7 +23,8 @@ The LifeOS audit identified 8 improvement areas across infrastructure, data inte
 
 ### Test Results
 
-- **980 unit tests passing** (pre-commit hook verified on final commit)
+- **980 unit tests passing** at time of audit (pre-commit hook verified on final commit)
+- **1882 tests collected** as of 2026-02-14 post-gap-analysis fixes
 - **0 test failures** introduced by audit changes
 - Server starts and restarts cleanly after every phase
 
@@ -34,7 +35,7 @@ The LifeOS audit identified 8 improvement areas across infrastructure, data inte
 ### Phase 0: Infrastructure Basics
 
 **What was done:**
-- Added WAL mode (`PRAGMA journal_mode=WAL`) to all 9 SQLite databases
+- Added WAL mode (`PRAGMA journal_mode=WAL`) to all 13 SQLite databases: `job_queue.py`, `person_entity.py`, `gsheet_sync.py`, `review_queue.py`, `sync_health.py`, `imessage.py`, `person_facts.py`, `cost_tracker.py`, `usage_store.py`, `conversation_store.py`, `interaction_store.py`, `bm25_index.py`, `source_entity.py` (original review said 9; some files had WAL before the audit)
 - Created `scripts/backup.sh`: hot backups via `sqlite3 .backup` for all databases + config files, 7-day rotation
 - Fixed `config/launchd/com.lifeos.api.plist`: corrected binary path, added required environment variables
 - Added log rotation: server.sh rotates on restart when >10MB, backup.sh cleans old logs >30 days
@@ -68,7 +69,7 @@ The LifeOS audit identified 8 improvement areas across infrastructure, data inte
 ### Phase 2a: Chat Pipeline Unification
 
 **What was done:**
-- Removed 587 lines of legacy intent handlers from `api/routes/chat.py` (compose, task, reminder, task_and_reminder)
+- Removed 587 lines of legacy intent handlers from `api/routes/chat.py` (compose, task, reminder, task_and_reminder). *Note: exact line count from git diff at time of commit; not independently verifiable now.*
 - All intents now flow through the agentic loop with Claude autonomously selecting tools
 - Only two special-case handlers remain: `ambiguous_task_reminder` (needs user clarification) and `code` (Claude Code delegation)
 

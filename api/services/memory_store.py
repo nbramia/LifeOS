@@ -346,13 +346,15 @@ class MemoryStore:
 
         return True
 
-    def search_memories(self, query: str, limit: int = 10) -> list[Memory]:
+    def search_memories(self, query: str, limit: int = 10, min_relevance: float = 0.15) -> list[Memory]:
         """
-        Search memories by keyword matching.
+        Search memories by keyword matching with relevance filtering.
 
         Args:
             query: Search query
             limit: Maximum results to return
+            min_relevance: Minimum relevance score (overlap / search_terms count).
+                           Default 0.15 requires ~15% keyword overlap.
 
         Returns:
             List of matching Memory objects
@@ -361,6 +363,7 @@ class MemoryStore:
         query_keywords = set(extract_keywords(query))
         query_words = set(query.lower().split())
         search_terms = query_keywords | query_words
+        term_count = max(len(search_terms), 1)
 
         # Get all active memories and score them
         memories = self.list_memories(limit=1000)
@@ -374,7 +377,9 @@ class MemoryStore:
 
             overlap = len(search_terms & all_terms)
             if overlap > 0:
-                scored.append((memory, overlap))
+                relevance = overlap / term_count
+                if relevance >= min_relevance:
+                    scored.append((memory, overlap))
 
         # Sort by score descending
         scored.sort(key=lambda x: -x[1])

@@ -141,6 +141,7 @@ class TestChatViaApi:
         ]
 
         class MockStream:
+            status_code = 200
             async def __aenter__(self):
                 return self
             async def __aexit__(self, *args):
