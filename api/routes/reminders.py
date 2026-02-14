@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from api.services.reminder_store import get_reminder_store, get_reminder_scheduler, Reminder
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class CreateReminderRequest(BaseModel):
     message_content: str = Field(default="", description="Static text or natural language prompt")
     endpoint_config: Optional[dict] = Field(default=None, description="For endpoint type: {endpoint, method, params}")
     enabled: bool = Field(default=True)
-    timezone: str = Field(default="America/New_York", description="Timezone for interpreting schedule times (e.g., 'America/New_York')")
+    timezone: str = Field(default_factory=lambda: settings.timezone, description="Timezone for interpreting schedule times (e.g., 'America/New_York')")
 
 
 class UpdateReminderRequest(BaseModel):
@@ -70,7 +71,7 @@ class ReminderResponse(BaseModel):
             created_at=r.created_at or "",
             last_triggered_at=r.last_triggered_at,
             next_trigger_at=r.next_trigger_at,
-            timezone=r.timezone or "America/New_York",
+            timezone=r.timezone or settings.timezone,
         )
 
 

@@ -26,9 +26,10 @@ Environment variables and configuration files for LifeOS.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `LIFEOS_USER_NAME` | Your first name (used in prompts) | `Nathan` |
-| `LIFEOS_MY_PERSON_ID` | Your CRM person ID | UUID |
+| `LIFEOS_USER_NAME` | Your first name (used in AI prompts) | `Nathan` |
+| `LIFEOS_MY_PERSON_ID` | Your CRM person ID (set after first sync) | UUID |
 | `LIFEOS_WORK_DOMAIN` | Work email domain | `yourcompany.com` |
+| `LIFEOS_TIMEZONE` | IANA timezone for schedules and prompts | `America/New_York` |
 
 ### Relationships
 
@@ -94,7 +95,7 @@ When both are set, Telegram is enabled as a conversational client (full chat pip
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LIFEOS_CLAUDE_BINARY` | Path to Claude CLI binary | `/Users/nathanramia/.local/bin/claude` |
+| `LIFEOS_CLAUDE_BINARY` | Path to Claude CLI binary | `claude` (or full path) |
 | `LIFEOS_CLAUDE_TIMEOUT` | Safety-net timeout (seconds) | `3600` |
 
 Requires Claude Code installed and authenticated on the Mac Mini. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.

@@ -11,6 +11,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import GoogleAccount
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,14 @@ EASTERN = ZoneInfo("America/New_York")
 # Tool definitions (Anthropic schema)
 # ---------------------------------------------------------------------------
 
+_user = settings.user_name
+
 TOOL_DEFINITIONS = [
     # -- Retrieval --
     {
         "name": "search_vault",
         "description": (
-            "Search Nathan's Obsidian vault (notes, meeting transcripts, journals, project docs). "
+            f"Search {_user}'s Obsidian vault (notes, meeting transcripts, journals, project docs). "
             "Returns relevance-ranked text chunks with file names. "
             "Good for written records, decisions, project details. Returns chunks, not full files."
         ),
@@ -49,7 +52,7 @@ TOOL_DEFINITIONS = [
         "description": (
             "Search Google Calendar events across personal and work accounts. "
             "Returns event titles, dates, times, attendees, and locations. "
-            "Shows when Nathan met with someone or has upcoming meetings."
+            f"Shows when {_user} met with someone or has upcoming meetings."
         ),
         "input_schema": {
             "type": "object",

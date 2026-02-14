@@ -1519,8 +1519,9 @@ async def split_person(request: PersonSplitRequest):
 
             # Extract context patterns from source_id
             if source_type in ('vault', 'granola') and source_id:
-                if 'Work/ML' in source_id:
-                    patterns[key]['contexts'].add('Work/ML/')
+                _work = settings.current_work_path.rstrip('/')
+                if _work in source_id:
+                    patterns[key]['contexts'].add(f'{_work}/')
                 elif 'Work/' in source_id:
                     patterns[key]['contexts'].add('Work/')
 

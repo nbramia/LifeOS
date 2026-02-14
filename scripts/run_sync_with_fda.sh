@@ -8,11 +8,11 @@
 # This runs at 2:50 AM via cron, 10 minutes before the main 3 AM sync.
 # The main sync will detect these were recently completed and skip them.
 #
-# Schedule: 50 2 * * * /Users/nathanramia/Documents/Code/LifeOS/scripts/run_sync_with_fda.sh
+# Schedule: 50 2 * * * /path/to/LifeOS/scripts/run_sync_with_fda.sh
 #
 # See also: scripts/run_fda_syncs.py (the actual sync runner with health tracking)
 
-LIFEOS_DIR="/Users/nathanramia/Documents/Code/LifeOS"
+LIFEOS_DIR="${LIFEOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 # Wake NVMe before running Python (Homebrew/venv live on the NVMe)
 ls /opt/homebrew/bin > /dev/null 2>&1

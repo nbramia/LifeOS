@@ -204,7 +204,7 @@ async def _execute_action_after(
                     message_type=params.get("message_type", "static"),
                     message_content=params.get("message_content", ""),
                     enabled=True,
-                    timezone=params.get("timezone", "America/New_York"),
+                    timezone=params.get("timezone", settings.timezone),
                 )
                 display_time = params.get("display_time", params["schedule_value"])
                 return f"---\nI've also set a reminder for **{display_time}**: {reminder.name}"
@@ -326,7 +326,7 @@ async def extract_reminder_params(query: str, conversation_history: list = None)
     from zoneinfo import ZoneInfo
 
     # Get current time for context
-    eastern = ZoneInfo("America/New_York")
+    eastern = ZoneInfo(settings.timezone)
     now = datetime.now(eastern)
     current_datetime = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
 
@@ -431,7 +431,7 @@ async def extract_reminder_edit_params(query: str, reminder_name: str) -> Option
     """
     from zoneinfo import ZoneInfo
 
-    eastern = ZoneInfo("America/New_York")
+    eastern = ZoneInfo(settings.timezone)
     now = datetime.now(eastern)
 
     # Try to parse time from query
@@ -568,7 +568,7 @@ def format_reminders_for_context(reminders: list) -> str:
     lines = ["Current reminders:"]
     for i, r in enumerate(reminders, 1):
         if r.schedule_type == "cron":
-            schedule = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
+            schedule = _format_cron_human(r.schedule_value, r.timezone or settings.timezone)
         else:
             try:
                 trigger_dt = datetime.fromisoformat(r.schedule_value)
@@ -665,7 +665,7 @@ def format_reminder_selection_prompt(reminders: list, action: str) -> tuple[str,
 
     for i, r in enumerate(reminders, 1):
         if r.schedule_type == "cron":
-            schedule = _format_cron_human(r.schedule_value, r.timezone or "America/New_York")
+            schedule = _format_cron_human(r.schedule_value, r.timezone or settings.timezone)
         else:
             try:
                 trigger_dt = datetime.fromisoformat(r.schedule_value)
@@ -700,7 +700,7 @@ async def extract_task_params(query: str, conversation_history: list = None) -> 
     """
     from zoneinfo import ZoneInfo
 
-    eastern = ZoneInfo("America/New_York")
+    eastern = ZoneInfo(settings.timezone)
     now = datetime.now(eastern)
     current_datetime = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
 

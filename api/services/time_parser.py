@@ -9,9 +9,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from config.settings import settings
 
 # Default timezone for the user
-DEFAULT_TIMEZONE = ZoneInfo("America/New_York")
+DEFAULT_TIMEZONE = ZoneInfo(settings.timezone)
 
 
 def get_smart_default_time(now: Optional[datetime] = None) -> datetime:

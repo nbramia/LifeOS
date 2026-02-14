@@ -50,7 +50,7 @@ _reminder_scheduler = None
 _job_queue = None
 
 
-def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[int, int]] = None, timezone: str = "America/New_York"):
+def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[int, int]] = None, timezone: str = ""):
     """
     Background thread for health checks and failure notifications.
 
@@ -67,6 +67,7 @@ def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[i
     """
     if schedule_times is None:
         schedule_times = [(2, 30), (7, 0)]  # 2:30 AM pre-sync, 7:00 AM post-sync
+    timezone = timezone or settings.timezone
 
     tz = ZoneInfo(timezone)
 
@@ -196,7 +197,7 @@ async def lifespan(app: FastAPI):
         # Sync at 8 AM, noon, and 3 PM Eastern
         _calendar_indexer.start_time_scheduler(
             schedule_times=[(8, 0), (12, 0), (15, 0)],
-            timezone="America/New_York"
+            timezone=settings.timezone
         )
         logger.info("Calendar indexer scheduler started (8:00, 12:00, 15:00 Eastern)")
     except Exception as e:
@@ -209,7 +210,7 @@ async def lifespan(app: FastAPI):
         _people_v2_sync_thread = threading.Thread(
             target=_health_check_loop,
             args=(_people_v2_stop_event,),
-            kwargs={"schedule_times": [(2, 30), (7, 0)], "timezone": "America/New_York"},
+            kwargs={"schedule_times": [(2, 30), (7, 0)], "timezone": settings.timezone},
             daemon=True,
             name="HealthCheckThread"
         )
@@ -242,6 +243,14 @@ async def lifespan(app: FastAPI):
         logger.info("Job queue worker started")
     except Exception as e:
         logger.error(f"Failed to start job queue worker: {e}")
+
+    # Hint for new users who haven't set their person ID yet
+    if not settings.my_person_id and settings.user_name and settings.user_name != "User":
+        logger.info(
+            "LIFEOS_MY_PERSON_ID not set. After your first sync, find your ID with:\n"
+            f'  curl "http://localhost:8000/api/crm/people?q={settings.user_name}" | jq \'.people[0].id\'\n'
+            "Then add to .env: LIFEOS_MY_PERSON_ID=<your-id>"
+        )
 
     yield  # Application runs here
 

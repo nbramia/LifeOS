@@ -112,6 +112,13 @@ class Settings(BaseSettings):
         description="Enable syncing Slack workspace messages"
     )
 
+    # Timezone (IANA format)
+    timezone: str = Field(
+        default="America/New_York",
+        alias="LIFEOS_TIMEZONE",
+        description="IANA timezone for schedules, reminders, and AI context"
+    )
+
     # User name for fact extraction prompts
     user_name: str = Field(
         default="User",
@@ -228,9 +235,9 @@ class Settings(BaseSettings):
 
     # Claude Code orchestration
     claude_binary: str = Field(
-        default="/Users/nathanramia/.local/bin/claude",
+        default="claude",
         alias="LIFEOS_CLAUDE_BINARY",
-        description="Path to claude CLI binary"
+        description="Path to claude CLI binary (or just 'claude' if on PATH)"
     )
     claude_timeout_seconds: int = Field(
         default=3600,

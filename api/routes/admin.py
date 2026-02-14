@@ -651,7 +651,7 @@ async def trigger_calendar_sync(days_past: int = 30, days_future: int = 30) -> C
 async def start_calendar_scheduler(
     interval_hours: Optional[float] = None,
     use_time_schedule: bool = True,
-    timezone: str = "America/New_York"
+    timezone: str = ""
 ):
     """
     Start the calendar sync scheduler.
@@ -659,8 +659,9 @@ async def start_calendar_scheduler(
     Args:
         interval_hours: Hours between syncs (if not using time schedule)
         use_time_schedule: Use time-of-day schedule (default: True, syncs at 8 AM, noon, 3 PM)
-        timezone: Timezone for time schedule (default: America/New_York)
+        timezone: Timezone for time schedule (defaults to settings.timezone)
     """
+    timezone = timezone or settings.timezone
     try:
         from api.services.calendar_indexer import get_calendar_indexer
         indexer = get_calendar_indexer()

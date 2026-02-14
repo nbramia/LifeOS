@@ -32,6 +32,7 @@ from api.services.person_entity import get_person_entity_store, PersonEntity
 from api.services.source_entity import get_source_entity_store
 from api.services.interaction_store import get_interaction_db_path
 from api.services.link_override import get_link_override_store, LinkOverride
+from config.settings import settings
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -193,8 +194,9 @@ def create_link_overrides(
 
         # Extract context from source_id (for vault sources)
         if source_type in ('vault', 'granola') and source_id:
-            if 'Work/ML' in source_id:
-                patterns[key]['contexts'].add('Work/ML/')
+            _work = settings.current_work_path.rstrip('/')
+            if _work in source_id:
+                patterns[key]['contexts'].add(f'{_work}/')
             elif 'Work/' in source_id:
                 patterns[key]['contexts'].add('Work/')
             elif 'Personal/' in source_id:
