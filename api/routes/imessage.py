@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from api.services.imessage import get_imessage_store, IMessageRecord
+from api.services.imessage import get_imessage_store, IMessageRecord, resolve_entity_id
 
 router = APIRouter(prefix="/api/imessage", tags=["imessage"])
 
@@ -141,8 +141,18 @@ async def search_messages(
                 detail="direction must be 'sent' or 'received'"
             )
 
+        # Resolve entity_id if it's not a UUID (e.g. name slug like "john-doe")
+        resolved_entity_id = entity_id
+        if entity_id:
+            resolved_entity_id = resolve_entity_id(entity_id)
+            if not resolved_entity_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not resolve person '{entity_id}'. Use lifeos_people_search first to find the correct entity ID."
+                )
+
         messages = store.query_messages(
-            entity_id=entity_id,
+            entity_id=resolved_entity_id,
             phone=phone,
             search_term=q,
             start_date=start_date,
@@ -251,11 +261,19 @@ async def get_messages_for_person(
     Use `people_v2_resolve` first to get the entity_id for a person.
     """
     try:
+        # Resolve entity_id if it's not a UUID (e.g. name slug like "john-doe")
+        resolved_entity_id = resolve_entity_id(entity_id)
+        if not resolved_entity_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Could not resolve person '{entity_id}'. Use lifeos_people_search first to find the correct entity ID."
+            )
+
         store = get_imessage_store()
         since = datetime.now(timezone.utc) - __import__('datetime').timedelta(days=days)
 
         messages = store.get_messages_for_entity(
-            entity_id=entity_id,
+            entity_id=resolved_entity_id,
             limit=limit,
             since=since,
         )
@@ -266,5 +284,7 @@ async def get_messages_for_person(
             query=f"entity:{entity_id}",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get messages: {e}")

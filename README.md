@@ -13,22 +13,30 @@ Everything runs locally on your Mac. Your data never leaves your machine — the
 ## What You Can Do
 
 **Ask questions about your life – search across all the channels you use**: 
-- Interface with it conversationally through Telegram, or a dedicated chat UI, or by using Claude Code to leverage the MCP tools directly
+- Interface with it conversationally through Telegram, or a dedicated chat UI, or by using Claude Desktop / Claude Code to leverage the MCP tools directly
 - "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
 - "What were the key recommendations Sarah made on the Acme project last month?" will synthesize and answer from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
 - "What should I get Jane for her birthday" will pull context from up to 10 years of data to generate ideas tailored to her
 
-**Manage and complete tasks** 
+**Manage and complete tasks**
 - "Remind me to follow up with John next Tuesday" creates a reminder (pushed to you through Telegram)
 - "Tomorrow at 3pm, check that the sync completed as expected and shoot me a note to confirm it did" schedules a task and a push notification
 - "Next Wednesday I need to pull down my 1099 from Schwab" creates a task in your task management system
 - "I just saw an error in the sync, can you investigate and get it fixed?" will spin up and manage Claude Code to get things working again
 - "Add an idea to that backlog markdown file in the X project folder - I want the system to be able to do Y" will find and directly edit the right file
 
+**Proactive intelligence** — the system doesn't just wait for you to ask:
+- Before meetings, it checks your calendar and pushes a prep briefing with attendee context from your CRM
+- Each morning, it summarizes your day: calendar, tasks, important emails
+- Weekly, it reviews who you haven't been in touch with and nudges you
+- If there's nothing to report, it stays quiet — no noise
+
 **Track relationships**: 
 - Visualize and explore your relationships with each person in your life through a CRM UI
 - Track and analyze your relationships with those closest to you, like family and a designated partner
 - Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
+
+The assistant also remembers context you share with it across conversations — preferences, facts about people, things you've told it — and uses that context to give better answers over time.
 
 You can also interface with it for general queries in the same way you'd interact with any AI model, and it'll intelligently route the query to Opus, Google, your personal data, etc.
 
@@ -250,6 +258,8 @@ flowchart LR
 | Synthesis | Claude API |
 | Backend | FastAPI |
 | Frontend | Vanilla JS |
+| Job Queue | SQLite (background reindex, sync) |
+| Reminders | SQLite + cron scheduler |
 
 ---
 

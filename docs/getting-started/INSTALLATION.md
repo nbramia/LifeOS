@@ -1,5 +1,8 @@
 # Installation Guide
 
+> **Quick start**: If you have Claude Code, run it in the project root and point it at
+> [SETUP.md](SETUP.md) — it will walk you through the full setup interactively.
+
 Complete walkthrough for setting up LifeOS on macOS.
 
 ---
