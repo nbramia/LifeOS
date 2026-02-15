@@ -257,7 +257,7 @@ SYNC_ORDER = [
     "gmail",                    # Gmail sent + received + CC
     "calendar",                 # Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
-    "contacts",                 # Apple Contacts CSV
+    "contacts",                 # Apple Contacts (native via pyobjc)
     # NOTE: phone and imessage are NOT in this list - they require Full Disk Access
     # which launchd doesn't have. They run via cron at 2:50 AM through Terminal.app:
     #   - scripts/run_sync_with_fda.sh (cron entry, opens Terminal)
@@ -303,7 +303,7 @@ SYNC_SCRIPTS = {
     "gmail": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--gmail-only", "--days", "30"]),
     "calendar": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--days", "30"]),
     "linkedin": ("scripts/sync_linkedin.py", ["--execute"]),
-    "contacts": ("scripts/sync_contacts_csv.py", ["--execute"]),
+    "contacts": ("scripts/sync_apple_contacts.py", ["--execute"]),
     "phone": ("scripts/sync_phone_calls.py", ["--execute"]),
     "whatsapp": ("scripts/sync_whatsapp.py", ["--execute"]),
     "imessage": ("scripts/sync_imessage_interactions.py", ["--execute"]),

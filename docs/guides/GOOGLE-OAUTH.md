@@ -56,6 +56,11 @@ Add these scopes:
 
 In "Test users" section, add your email address.
 
+### Publish the App
+
+Go to **APIs & Services** → **OAuth consent screen** → **Audience** and click **Publish App**.
+Without this, Google blocks the auth flow even for test users.
+
 ---
 
 ## Step 4: Create Credentials
@@ -92,10 +97,10 @@ Run the authentication script:
 
 ```bash
 # For personal account
-uv run python scripts/google_auth.py --account personal
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account personal
 
 # For work account
-uv run python scripts/google_auth.py --account work
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account work
 ```
 
 This will:
@@ -138,7 +143,7 @@ curl "http://localhost:8000/api/drive/search?q=document&account=personal" | jq
 
 **Solution**: Re-run authentication script:
 ```bash
-uv run python scripts/google_auth.py --account personal
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account personal
 ```
 
 ### "Quota exceeded"

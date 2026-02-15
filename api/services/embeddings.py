@@ -37,7 +37,7 @@ class EmbeddingService:
             cache_dir: Directory to cache model files (defaults to settings).
         """
         self.model_name = model_name or settings.embedding_model
-        self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None)
+        self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
 
     @property

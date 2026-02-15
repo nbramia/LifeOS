@@ -39,13 +39,14 @@ brew --version      # Need Homebrew
 git --version       # Need git
 ```
 
-Install anything missing:
-
+**Note:** If Homebrew is not installed, the user must install it manually in a terminal
+(it requires interactive `sudo`). Tell them to run:
 ```bash
-# If Homebrew is missing:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
 
-# If Python 3.11+ is missing:
+If Python 3.11+ is missing:
+```bash
 brew install python@3.12
 ```
 
@@ -198,7 +199,8 @@ All services should show healthy status. ChromaDB and Ollama should be connected
 
 ## Phase 6: First Index
 
-Trigger the initial vault index:
+Trigger the initial vault index. The embedding model will be downloaded automatically
+on first run (~300MB for the default model, ~90MB for all-MiniLM-L6-v2). This is expected.
 
 ```bash
 curl -s -X POST http://localhost:8000/api/admin/reindex/sync | python3 -m json.tool
@@ -219,6 +221,13 @@ curl -s -X POST http://localhost:8000/api/search \
 ---
 
 ## Phase 7: Person ID Setup
+
+**Note:** Person entities are created during data syncs (contacts, email, calendar), not
+during vault indexing. On a fresh install, the CRM will be empty after Phase 6.
+
+Skip this phase for now. After running the first full sync (Phase 8 or manually via
+`~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --execute`), come back and complete
+this step:
 
 Look up the user's person entity ID:
 
@@ -257,11 +266,13 @@ curl -s http://localhost:8000/health/full | python3 -m json.tool
 
 **[ASK USER]** Do you want to configure LifeOS to run automatically on boot?
 
-If yes:
+If yes, pass the vault path and `--yes` for non-interactive execution:
 
 ```bash
-./scripts/setup-launchd.sh
+./scripts/setup-launchd.sh "$LIFEOS_VAULT_PATH" --yes
 ```
+
+(Replace `$LIFEOS_VAULT_PATH` with the actual vault path from `.env`.)
 
 Set up the ChromaDB cron watchdog:
 
@@ -277,15 +288,92 @@ launchctl list | grep lifeos
 
 ---
 
-## Phase 9: Optional Integrations
+## Phase 9: FDA Wrapper (for iMessage/Phone sync)
+
+Phone calls, FaceTime, and iMessage sync **require Full Disk Access** to read system
+databases. Without this phase, those data sources will not sync.
+
+**[ASK USER]** Do you want to set up phone/iMessage sync?
+
+If yes:
+
+### Create the app bundle
+
+```bash
+./scripts/create-lifeos-app.sh --force
+```
+
+### Grant Full Disk Access
+
+**[ASK USER]** The user must do these steps manually in System Settings:
+
+1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
+2. Click `+` and add `/Applications/LifeOS.app`
+3. Also ensure **Terminal.app** has Full Disk Access (it's in `/Applications/Utilities/`)
+
+### Add the cron job for nightly FDA sync
+
+```bash
+(crontab -l 2>/dev/null; echo "50 2 * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS fda-sync") | crontab -
+```
+
+This runs at 2:50 AM, 10 minutes before the main nightly sync.
+
+**[VERIFY]** The app bundle exists and is executable:
+
+```bash
+/Applications/LifeOS.app/Contents/MacOS/LifeOS watchdog
+```
+
+---
+
+## Phase 10: Optional Integrations
 
 **[ASK USER]** Which integrations do you want to set up?
 
-- **Google OAuth** (Calendar, Gmail, Drive) — follow `docs/guides/GOOGLE-OAUTH.md`
-- **Telegram bot** — create a bot via @BotFather, add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `.env`
-- **Slack** — set up workspace OAuth, add `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_USER_TOKEN` to `.env`
-- **MCP for Claude Code** — `claude mcp add lifeos -- curl -s -X POST http://localhost:8000/api/mcp`
-- **LifeOS.app FDA wrapper** (for iMessage/Phone sync) — `./scripts/create-lifeos-app.sh`
+### Google OAuth (Calendar, Gmail, Drive)
+
+Follow `docs/guides/GOOGLE-OAUTH.md`. Key steps:
+1. Create Google Cloud project and enable Calendar/Gmail/Drive APIs
+2. Configure OAuth consent screen and **publish the app** (Audience → Publish)
+3. Create OAuth credentials, save as `config/credentials-personal.json`
+4. Run: `~/.venvs/lifeos/bin/python scripts/google_auth.py --account personal`
+
+### Telegram Bot
+
+1. Create a bot via @BotFather on Telegram
+2. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `.env`
+3. Restart: `./scripts/server.sh restart`
+
+### Slack
+
+1. Set up workspace OAuth
+2. Add `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_USER_TOKEN` to `.env`
+3. Restart: `./scripts/server.sh restart`
+
+### MCP for Claude Code
+
+**Note:** This command must be run in a separate terminal, not from within Claude Code.
+
+```bash
+claude mcp add lifeos http://localhost:8000/api/mcp
+```
+
+### Monarch Money (Financial Data)
+
+1. Add `MONARCH_EMAIL` and `MONARCH_PASSWORD` to `.env`
+2. Run the interactive MFA authentication (requires a code sent via email/SMS):
+   ```bash
+   ~/.venvs/lifeos/bin/python -c "
+   import asyncio
+   from monarchmoney import MonarchMoney
+   mm = MonarchMoney()
+   asyncio.run(mm.interactive_login())
+   mm.save_session('data/monarch_session.pickle')
+   print('Session saved!')
+   "
+   ```
+3. Restart: `./scripts/server.sh restart`
 
 Each integration can be added later. None are required for core functionality.
 
@@ -299,5 +387,7 @@ LifeOS is running. Core functionality available:
 - Chat: `POST /api/chat`
 - CRM: `GET /api/crm/people`
 - Health: `GET /health/full`
+
+**Remember:** Come back to Phase 7 after the first full sync to set your person ID.
 
 For ongoing maintenance, see the project `CLAUDE.md` and `README.md`.
