@@ -192,6 +192,7 @@ class ClaudeSession:
     pending_clarification: str = ""  # Last [CLARIFY] question text
     last_activity: str = ""  # Brief description of last tool/action for heartbeat context
     notifications_sent: int = 0  # Count of [NOTIFY] messages relayed during this session
+    last_assistant_text: str = ""  # Last assistant text block (for fallback completion message)
 
 
 FOLLOWUP_WINDOW = 300  # 5 minutes to send follow-ups to completed sessions
@@ -463,6 +464,9 @@ class ClaudeOrchestrator:
             for block in content_blocks:
                 if block.get("type") == "text":
                     text = block.get("text", "")
+                    # Track last assistant text for completion fallback
+                    if text.strip():
+                        session.last_assistant_text = text.strip()
                     for match in _CLARIFY_RE.finditer(text):
                         clarify_text = match.group(1).strip()
                         if clarify_text:
@@ -514,11 +518,28 @@ class ClaudeOrchestrator:
                         "Reply 'approve' to proceed or 'reject' to cancel."
                     )
             else:
-                # Task complete — only send a fallback if no [NOTIFY] was
-                # already relayed.  Never send raw result_text: it contains
-                # reasoning/thinking plus duplicate [NOTIFY] content.
-                if self._notification_callback and not session.notifications_sent:
-                    self._notification_callback("Claude Code session completed.")
+                # Task complete — send the final answer to the user.
+                # Priority: [NOTIFY] in result > raw result_text > last assistant text.
+                # Strip [NOTIFY]/[CLARIFY] tags from fallback text to avoid
+                # duplicating messages that were already relayed.
+                if self._notification_callback:
+                    final_notifies = _NOTIFY_RE.findall(result_text)
+                    if final_notifies:
+                        self._notification_callback(final_notifies[-1].strip())
+                    else:
+                        # Use result_text or last assistant text as the answer
+                        fallback = result_text.strip() or session.last_assistant_text
+                        # Strip already-relayed [NOTIFY]/[CLARIFY] lines
+                        fallback = _NOTIFY_RE.sub("", fallback)
+                        fallback = _CLARIFY_RE.sub("", fallback)
+                        fallback = fallback.strip()
+                        if fallback:
+                            # Truncate for Telegram (4096 char limit)
+                            if len(fallback) > 3500:
+                                fallback = fallback[:3500] + "\n\n…(truncated)"
+                            self._notification_callback(fallback)
+                        else:
+                            self._notification_callback("Claude Code session completed.")
                 self._cleanup("completed")
 
     def _on_timeout(self, session: ClaudeSession):

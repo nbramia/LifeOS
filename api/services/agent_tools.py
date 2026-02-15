@@ -6,7 +6,7 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -712,29 +712,124 @@ async def _tool_search_web(inp: dict) -> str:
     return synthesized or "No web results found."
 
 
+def _format_whatsapp_interactions(interactions: list) -> str:
+    """Format WhatsApp interactions into the same markdown style as iMessage."""
+    if not interactions:
+        return ""
+
+    lines = []
+    current_date = None
+
+    for inter in interactions:
+        msg_date = inter.timestamp.strftime("%Y-%m-%d")
+
+        if msg_date != current_date:
+            if current_date is not None:
+                lines.append("")
+            lines.append(f"### {msg_date}")
+            current_date = msg_date
+
+        time_str = inter.timestamp.strftime("%H:%M")
+        # Parse direction from title: "WhatsApp → Name" = sent, "WhatsApp ← Name" = received
+        direction = "→ " if "→" in (inter.title or "") else "← "
+        text = (inter.snippet or "").replace("\n", " ").strip()
+        if len(text) > 300:
+            text = text[:300] + "..."
+        lines.append(f"- **{time_str}** {direction}{text}")
+
+    return "\n".join(lines)
+
+
 def _tool_get_message_history(inp: dict) -> str:
-    from api.services.imessage import query_person_messages
+    from api.services.imessage import query_person_messages, resolve_entity_id
+    from api.services.interaction_store import get_interaction_store
+
+    entity_id = inp["entity_id"]
+    resolved_id = resolve_entity_id(entity_id)
+    if not resolved_id:
+        return f"Could not resolve person '{entity_id}'. Use person_info first."
 
     start_date = inp.get("start_date")
     end_date = inp.get("end_date")
+    search_term = inp.get("search_term")
+    limit = inp.get("limit", 100)
     if not start_date and not end_date:
         start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-    result = query_person_messages(
-        entity_id=inp["entity_id"],
-        search_term=inp.get("search_term"),
+    # 1. iMessage/SMS
+    imessage_result = query_person_messages(
+        entity_id=resolved_id,
+        search_term=search_term,
         start_date=start_date,
         end_date=end_date,
-        limit=inp.get("limit", 100),
+        limit=limit,
     )
-    if result["count"] == 0:
+
+    # 2. WhatsApp from interaction store
+    store = get_interaction_store()
+    days_back = 30
+    if start_date:
+        try:
+            delta = datetime.now() - datetime.strptime(start_date, "%Y-%m-%d")
+            days_back = max(delta.days, 1)
+        except (ValueError, TypeError):
+            pass
+
+    whatsapp_interactions = store.get_for_person(
+        person_id=resolved_id,
+        days_back=days_back,
+        source_type="whatsapp",
+        limit=limit,
+    )
+
+    # Filter WhatsApp by search_term
+    if search_term and whatsapp_interactions:
+        term_lower = search_term.lower()
+        whatsapp_interactions = [
+            i for i in whatsapp_interactions
+            if i.snippet and term_lower in i.snippet.lower()
+        ]
+
+    # Filter WhatsApp by end_date
+    if end_date and whatsapp_interactions:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc
+            )
+            whatsapp_interactions = [
+                i for i in whatsapp_interactions if i.timestamp <= end_dt
+            ]
+        except (ValueError, TypeError):
+            pass
+
+    # Sort WhatsApp chronologically (store returns most recent first)
+    whatsapp_interactions.sort(key=lambda i: i.timestamp)
+
+    imessage_count = imessage_result["count"]
+    whatsapp_count = len(whatsapp_interactions)
+
+    if imessage_count == 0 and whatsapp_count == 0:
         return "No messages found."
 
-    date_info = ""
-    if result.get("date_range"):
-        dr = result["date_range"]
-        date_info = f" ({dr['start'][:10]} to {dr['end'][:10]})"
-    return f"{result['count']} messages{date_info}:\n\n{result['formatted']}"
+    # Build output
+    parts = []
+
+    if imessage_count > 0 and whatsapp_count > 0:
+        # Both sources — label each section
+        dr = imessage_result.get("date_range")
+        date_info = f" ({dr['start'][:10]} to {dr['end'][:10]})" if dr else ""
+        parts.append(f"## iMessage ({imessage_count} messages{date_info})\n\n{imessage_result['formatted']}")
+        parts.append(f"## WhatsApp ({whatsapp_count} messages)\n\n{_format_whatsapp_interactions(whatsapp_interactions)}")
+        total = imessage_count + whatsapp_count
+        return f"{total} messages from iMessage and WhatsApp:\n\n" + "\n\n".join(parts)
+    elif imessage_count > 0:
+        date_info = ""
+        if imessage_result.get("date_range"):
+            dr = imessage_result["date_range"]
+            date_info = f" ({dr['start'][:10]} to {dr['end'][:10]})"
+        return f"{imessage_count} messages{date_info}:\n\n{imessage_result['formatted']}"
+    else:
+        return f"{whatsapp_count} WhatsApp messages:\n\n{_format_whatsapp_interactions(whatsapp_interactions)}"
 
 
 # -- People helpers --
