@@ -16,20 +16,20 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from api.services.google_auth import get_google_auth, GoogleAccount
+from api.services.google_auth import get_google_auth, resolve_account
 
 
 def main():
     parser = argparse.ArgumentParser(description="Google OAuth authentication for LifeOS")
     parser.add_argument(
         "--account",
-        choices=["personal", "work"],
+        choices=["personal", "work", "work2"],
         default="personal",
         help="Account type to authenticate (default: personal)",
     )
     args = parser.parse_args()
 
-    account = GoogleAccount.PERSONAL if args.account == "personal" else GoogleAccount.WORK
+    account = resolve_account(args.account)
 
     print(f"Authenticating {args.account} Google account...")
     print("A browser window will open for Google sign-in.\n")

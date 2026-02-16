@@ -14,7 +14,7 @@ from api.services.calendar import (
     CalendarEvent,
     format_event_time,
 )
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import resolve_account
 from api.services.meeting_prep import get_meeting_prep, MeetingPrep, RelatedNote
 
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
@@ -147,7 +147,7 @@ async def get_upcoming_events(
     Query both `account=personal` AND `account=work` for complete schedule.
     """
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_calendar_service(account_type)
         events = service.get_upcoming_events(days=days, max_results=max_results)
 
@@ -190,7 +190,7 @@ async def search_events(
         )
 
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_calendar_service(account_type)
         events = service.search_events(
             query=q,
@@ -218,7 +218,7 @@ async def get_event(
 ):
     """Get a specific calendar event by ID."""
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_calendar_service(account_type)
 
         # Fetch from API directly
@@ -248,7 +248,7 @@ async def create_event(request: CreateEventRequest):
     automatically sent to attendees.
     """
     try:
-        account_type = GoogleAccount.PERSONAL if request.account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(request.account)
         service = get_calendar_service(account_type)
         event = service.create_event(
             title=request.title,
@@ -277,7 +277,7 @@ async def update_event(
     Update emails are sent to attendees.
     """
     try:
-        account_type = GoogleAccount.PERSONAL if request.account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(request.account)
         service = get_calendar_service(account_type)
         event = service.update_event(
             event_id=event_id,
@@ -306,7 +306,7 @@ async def delete_event(
     Cancellation emails are sent to attendees.
     """
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_calendar_service(account_type)
         service.delete_event(event_id=event_id)
         return {"deleted": True, "event_id": event_id}

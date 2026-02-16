@@ -71,7 +71,7 @@ Without this, Google blocks the auth flow even for test users.
 4. Name: "LifeOS Desktop"
 5. Click **Create**
 6. Click **Download JSON**
-7. Save as `config/credentials-personal.json` (or `credentials-work.json`)
+7. Save as `config/credentials-personal.json` (or `credentials-work.json` / `credentials-work2.json`)
 
 ---
 
@@ -101,6 +101,9 @@ Run the authentication script:
 
 # For work account
 ~/.venvs/lifeos/bin/python scripts/google_auth.py --account work
+
+# For second work account
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account work2
 ```
 
 This will:
@@ -175,19 +178,24 @@ curl "http://localhost:8000/api/drive/search?q=document&account=personal" | jq
 
 For separate personal and work accounts:
 
-1. Create two Google Cloud projects
+1. Create a Google Cloud project per account
 2. Configure each with OAuth credentials
-3. Set both in `.env`:
+3. Save credential files:
+   - `config/credentials-personal.json`
+   - `config/credentials-work.json`
+   - `config/credentials-work2.json` (optional second work account)
+4. Authenticate each: `scripts/google_auth.py --account personal|work|work2`
+5. Use `account=personal`, `account=work`, or `account=work2` in API calls:
    ```bash
-   GOOGLE_CREDENTIALS_PERSONAL=./config/credentials-personal.json
-   GOOGLE_TOKEN_PERSONAL=./config/token-personal.json
-   GOOGLE_CREDENTIALS_WORK=./config/credentials-work.json
-   GOOGLE_TOKEN_WORK=./config/token-work.json
+   curl "http://localhost:8000/api/gmail/search?q=test&account=work2"
    ```
-4. Use `account=personal` or `account=work` in API calls:
-   ```bash
-   curl "http://localhost:8000/api/gmail/search?q=test&account=work"
-   ```
+
+For the second work account, also set in `.env`:
+```bash
+LIFEOS_WORK_DOMAIN_2=othercompany.com
+LIFEOS_SYNC_WORK2_GMAIL=true
+LIFEOS_SYNC_WORK2_CALENDAR=true
+```
 
 ---
 

@@ -1123,7 +1123,7 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
     from config.settings import settings
     from api.services.source_entity import get_source_entity_store
 
-    work_email_domain = settings.work_email_domain if hasattr(settings, 'work_email_domain') and settings.work_email_domain else "example.com"
+    work_email_domains = settings.work_email_domains if settings.work_email_domains else ["example.com"]
 
     # 1. Check if this is "me" (the CRM owner)
     if person.id == settings.my_person_id:
@@ -1141,9 +1141,10 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
 
     # 3. Check for work indicators
     # Check person's own emails first
-    for email in person.emails:
-        if email and work_email_domain in email.lower():
-            return "work"
+    for domain in work_email_domains:
+        for email in person.emails:
+            if email and domain in email.lower():
+                return "work"
 
     # Check sources list for slack
     if "slack" in person.sources:
@@ -1157,9 +1158,10 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
     for se in source_entities:
         if se.source_type == "slack":
             return "work"
-        if se.observed_email and work_email_domain in se.observed_email.lower():
-            return "work"
-        if se.metadata and se.metadata.get("account") == "work":
+        for domain in work_email_domains:
+            if se.observed_email and domain in se.observed_email.lower():
+                return "work"
+        if se.metadata and se.metadata.get("account") in ("work", "work2"):
             return "work"
 
     # 4. Default to personal

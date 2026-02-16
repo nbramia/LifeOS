@@ -12,7 +12,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.calendar import get_calendar_service, CalendarEvent, format_event_time
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import get_configured_accounts
 from api.services.hybrid_search import get_hybrid_search
 
 logger = logging.getLogger(__name__)
@@ -376,7 +376,7 @@ def get_meeting_prep(
     # Fetch events from both calendars
     all_events: list[CalendarEvent] = []
 
-    for account in [GoogleAccount.WORK, GoogleAccount.PERSONAL]:
+    for account in get_configured_accounts():
         try:
             service = get_calendar_service(account)
             events = service.get_events_in_range(

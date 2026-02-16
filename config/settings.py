@@ -97,6 +97,11 @@ class Settings(BaseSettings):
         alias="LIFEOS_WORK_DOMAIN",
         description="Your work email domain (e.g., yourcompany.com) for categorizing work contacts"
     )
+    work_email_domain_2: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAIN_2",
+        description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
+    )
 
     # ==========================================================================
     # WORK INTEGRATION TOGGLES
@@ -116,6 +121,16 @@ class Settings(BaseSettings):
         default=False,
         alias="LIFEOS_SYNC_WORK_CALENDAR",
         description="Enable syncing work Google Calendar (requires work_email_domain)"
+    )
+    sync_work2_gmail: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK2_GMAIL",
+        description="Enable syncing second work Gmail account (requires work_email_domain_2)"
+    )
+    sync_work2_calendar: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK2_CALENDAR",
+        description="Enable syncing second work Google Calendar (requires work_email_domain_2)"
     )
     sync_slack: bool = Field(
         default=False,
@@ -168,6 +183,19 @@ class Settings(BaseSettings):
         if not self.current_colleagues_raw:
             return []
         return [x.strip() for x in self.current_colleagues_raw.split(",") if x.strip()]
+
+    @property
+    def work_email_domains(self) -> list[str]:
+        """All configured work email domains."""
+        return [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+
+    def is_sync_enabled(self, account: str, service: str) -> bool:
+        """Check if sync is enabled for account+service (gmail/calendar)."""
+        if account == "work":
+            return self.sync_work_gmail if service == "gmail" else self.sync_work_calendar
+        elif account == "work2":
+            return self.sync_work2_gmail if service == "gmail" else self.sync_work2_calendar
+        return True  # personal always enabled
 
     # Personal relationship patterns for Granola meeting routing
     # Regex patterns (pipe-separated) to match meeting titles for routing to Personal/Relationship

@@ -19,7 +19,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.calendar import CalendarService, CalendarEvent
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import get_configured_accounts
 from api.services.vectorstore import VectorStore, get_vector_store
 from config.settings import settings
 
@@ -146,29 +146,17 @@ class CalendarIndexer:
         start_date = now - timedelta(days=days_past)
         end_date = now + timedelta(days=days_future)
 
-        # Try personal calendar
-        try:
-            personal_calendar = CalendarService(account_type=GoogleAccount.PERSONAL)
-            personal_events = personal_calendar.get_events_in_range(start_date, end_date)
-            indexed = self.index_events(personal_events)
-            total_indexed += indexed
-            logger.info(f"Indexed {indexed} personal calendar events")
-        except Exception as e:
-            error_msg = f"Personal calendar sync failed: {e}"
-            logger.warning(error_msg)
-            errors.append(error_msg)
-
-        # Try work calendar
-        try:
-            work_calendar = CalendarService(account_type=GoogleAccount.WORK)
-            work_events = work_calendar.get_events_in_range(start_date, end_date)
-            indexed = self.index_events(work_events)
-            total_indexed += indexed
-            logger.info(f"Indexed {indexed} work calendar events")
-        except Exception as e:
-            error_msg = f"Work calendar sync failed: {e}"
-            logger.warning(error_msg)
-            errors.append(error_msg)
+        for account in get_configured_accounts():
+            try:
+                calendar = CalendarService(account_type=account)
+                events = calendar.get_events_in_range(start_date, end_date)
+                indexed = self.index_events(events)
+                total_indexed += indexed
+                logger.info(f"Indexed {indexed} {account.value} calendar events")
+            except Exception as e:
+                error_msg = f"{account.value.capitalize()} calendar sync failed: {e}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
 
         self._last_sync = datetime.now()
         elapsed = (datetime.now() - start_time).total_seconds()

@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services.gmail import get_gmail_service, EmailMessage, DraftMessage
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import resolve_account
 
 router = APIRouter(prefix="/api/gmail", tags=["gmail"])
 
@@ -105,7 +105,7 @@ async def search_emails(
         )
 
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_gmail_service(account_type)
 
         # Parse dates if provided
@@ -140,7 +140,7 @@ async def get_email(
 ):
     """Get a specific email by message ID."""
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_gmail_service(account_type)
 
         message = service.get_message(message_id, include_body=include_body)
@@ -192,7 +192,7 @@ async def create_draft(
         raise HTTPException(status_code=400, detail="Body is required")
 
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_gmail_service(account_type)
 
         draft = service.create_draft(
