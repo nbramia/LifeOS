@@ -6,6 +6,10 @@
     "grammy",
     "grandpa"
   ],
+  "family_person_ids": [
+    "uuid-of-partner",
+    "uuid-of-sibling"
+  ],
   "tracked_relationships": [
     {
       "name": "Parent Relationship",
