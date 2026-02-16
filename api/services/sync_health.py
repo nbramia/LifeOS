@@ -26,14 +26,38 @@ SYNC_STALE_HOURS = 24
 # =============================================================================
 SYNC_SOURCES = {
     # === Phase 1: Data Collection ===
-    "gmail": {
-        "description": "Gmail emails (sent + received + CC) via Google API",
+    "gmail_personal": {
+        "description": "Personal Gmail emails (sent + received + CC)",
         "script": "scripts/sync_gmail_calendar_interactions.py",
         "frequency": "daily",
         "phase": 1,
     },
-    "calendar": {
-        "description": "Google Calendar events",
+    "gmail_work": {
+        "description": "Work Gmail emails (sent + received + CC)",
+        "script": "scripts/sync_gmail_calendar_interactions.py",
+        "frequency": "daily",
+        "phase": 1,
+    },
+    "gmail_work2": {
+        "description": "Second work Gmail emails (sent + received + CC)",
+        "script": "scripts/sync_gmail_calendar_interactions.py",
+        "frequency": "daily",
+        "phase": 1,
+    },
+    "calendar_personal": {
+        "description": "Personal Google Calendar events",
+        "script": "scripts/sync_gmail_calendar_interactions.py",
+        "frequency": "daily",
+        "phase": 1,
+    },
+    "calendar_work": {
+        "description": "Work Google Calendar events",
+        "script": "scripts/sync_gmail_calendar_interactions.py",
+        "frequency": "daily",
+        "phase": 1,
+    },
+    "calendar_work2": {
+        "description": "Second work Google Calendar events",
         "script": "scripts/sync_gmail_calendar_interactions.py",
         "frequency": "daily",
         "phase": 1,

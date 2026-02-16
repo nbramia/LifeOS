@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
 
+from config.settings import settings
 from api.services.people import resolve_person_name, PEOPLE_DICTIONARY
 from api.services.hybrid_search import HybridSearch
 from api.services.task_manager import TaskManager, get_task_manager
@@ -72,7 +73,7 @@ class BriefingContext:
     notes: str = ""                                          # User notes on person
 
 
-BRIEFING_PROMPT = """You are LifeOS, preparing a stakeholder briefing for Nathan.
+BRIEFING_PROMPT = """You are LifeOS, preparing a stakeholder briefing for {user_name}.
 
 Generate a concise, actionable briefing about {person_name} based on the context below.
 
@@ -142,7 +143,7 @@ Generate a briefing in this exact format:
 ---
 Sources: [list source files]
 
-Keep it concise and actionable. Focus on what Nathan needs to know for his next interaction."""
+Keep it concise and actionable. Focus on what {user_name} needs to know for their next interaction."""
 
 
 class BriefingsService:
@@ -451,6 +452,7 @@ class BriefingsService:
             related_notes_text=related_notes_text,
             action_items_text=action_items_text,
             linkedin_line=linkedin_line,
+            user_name=settings.user_name,
         )
 
         # Generate briefing with Claude
