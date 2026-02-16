@@ -73,17 +73,14 @@ def get_summary_tier(file_path: str) -> SummaryTier:
     path = Path(file_path)
 
     # Get the top-level directory within the vault
-    # Path structure: /Users/.../Notes 2025/TopLevelDir/...
-    parts = path.parts
-
-    # Find "Notes 2025" in path and get the next part
-    for i, part in enumerate(parts):
-        if "Notes" in part and "2025" in part:
-            if i + 1 < len(parts):
-                top_dir = parts[i + 1].lower()
-
-                if top_dir in SKIP_DIRECTORIES:
-                    return SummaryTier.SKIP
+    # Check if path is inside the vault, then get the first subdirectory
+    vault_str = str(settings.vault_path)
+    file_str = str(path)
+    if file_str.startswith(vault_str):
+        relative = file_str[len(vault_str):].strip("/")
+        top_dir = relative.split("/")[0].lower() if "/" in relative else ""
+        if top_dir in SKIP_DIRECTORIES:
+            return SummaryTier.SKIP
 
     # Default: summarize (HIGH tier)
     return SummaryTier.HIGH

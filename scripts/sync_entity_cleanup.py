@@ -219,7 +219,7 @@ def check_email_username_match(
 
     Args:
         email_name: The email address used as a name (e.g., "user@gmail.com")
-        candidate_name: A real person name to compare (e.g., "Nathan Ramia")
+        candidate_name: A real person name to compare (e.g., "Jane Smith")
 
     Returns:
         (is_match, confidence, match_reason)

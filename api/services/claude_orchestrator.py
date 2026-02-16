@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -23,8 +24,34 @@ TELEGRAM_API = "https://api.telegram.org"
 
 logger = logging.getLogger(__name__)
 
+# Common install locations for the Claude CLI (launchd has a minimal PATH)
+_CLAUDE_SEARCH_PATHS = [
+    os.path.expanduser("~/.local/bin/claude"),
+    "/usr/local/bin/claude",
+    os.path.expanduser("~/.npm/bin/claude"),
+    "/opt/homebrew/bin/claude",
+]
+
+
+def _resolve_claude_binary() -> str:
+    """Resolve the Claude CLI binary path, searching common locations if needed."""
+    configured = settings.claude_binary
+    # If an absolute path is configured, use it as-is
+    if os.path.isabs(configured):
+        return configured
+    # If the bare command is on PATH, use it
+    if shutil.which(configured):
+        return configured
+    # Search common install locations
+    for path in _CLAUDE_SEARCH_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            logger.info(f"Claude binary not on PATH, found at {path}")
+            return path
+    # Fall back to configured value (will fail with a clear error at spawn time)
+    return configured
+
 _SYSTEM_PROMPT = """\
-You are being orchestrated by LifeOS on behalf of the user (Nathan).
+You are being orchestrated by LifeOS on behalf of the user ({user_name}).
 The user sent this task via Telegram and cannot see your full output.
 Only messages prefixed with [NOTIFY] will be relayed to the user.
 
@@ -76,7 +103,7 @@ ENVIRONMENT:
 - Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
 
 KEY LOCATIONS:
-- Obsidian vault: ~/Notes 2025/ — Nathan's personal knowledge base. Markdown files with YAML frontmatter.
+- Obsidian vault: {vault_path}/ — personal knowledge base. Markdown files with YAML frontmatter.
   - People/Name.md — files about specific people (contact info, notes, facts)
   - Daily logs — date-named files (e.g. 2026-01-12.md) with journal entries, meeting notes
   - Meeting notes, project docs, task files
@@ -87,7 +114,7 @@ KEY LOCATIONS:
 - Other projects: ~/Documents/Code/
 
 LIFEOS DATA ACCESS:
-You have LifeOS MCP tools for searching Nathan's personal data. Always use these
+You have LifeOS MCP tools for searching {user_name}'s personal data. Always use these
 before saying you don't have information. The data is there — find it.
 
 People tools (always start with lifeos_people_search to get entity_id):
@@ -346,7 +373,7 @@ class ClaudeOrchestrator:
     def _spawn(self, prompt: str, session: ClaudeSession, resume_session_id: str = None):
         """Build the CLI command and spawn the subprocess."""
         cmd = [
-            settings.claude_binary,
+            _resolve_claude_binary(),
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
@@ -354,7 +381,7 @@ class ClaudeOrchestrator:
             "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
             "--chrome",
-            "--append-system-prompt", _SYSTEM_PROMPT,
+            "--append-system-prompt", _SYSTEM_PROMPT.format(vault_path=settings.vault_path, user_name=settings.user_name),
         ]
         if resume_session_id:
             cmd.extend(["-r", resume_session_id])
