@@ -94,7 +94,7 @@ cp .env.example .env
 **[ASK USER]** Which optional integrations do you want to set up? (All can be added later.)
 
 - **Google OAuth** — Calendar, Gmail, Drive sync (personal account)
-- **Google OAuth (work)** — Separate work account for Calendar/Gmail
+- **Google OAuth (work)** — Separate work account for Calendar/Gmail (supports up to 2 work accounts)
 - **Monarch Money** — Financial data (account balances, transactions, budgets)
 - **Telegram bot** — Chat interface and push notifications
 - **Slack** — Workspace message sync
@@ -105,6 +105,7 @@ Record the selections — they'll be configured in Phase 10.
 If the user wants **Google OAuth (work)**, also collect:
 - `LIFEOS_WORK_DOMAIN` — their work email domain (e.g., `acme.com`)
 - Set `LIFEOS_SYNC_WORK_GMAIL=true` and/or `LIFEOS_SYNC_WORK_CALENDAR=true` as desired
+- For a second work account: `LIFEOS_WORK_DOMAIN_2`, `LIFEOS_SYNC_WORK2_GMAIL`, `LIFEOS_SYNC_WORK2_CALENDAR`
 
 If the user wants **Monarch Money**, collect:
 - `MONARCH_EMAIL` — Monarch Money account email
@@ -367,6 +368,11 @@ If the user selected work Google account in Phase 3:
 4. Run: `~/.venvs/lifeos/bin/python scripts/google_auth.py --account work`
 5. Verify `LIFEOS_WORK_DOMAIN`, `LIFEOS_SYNC_WORK_GMAIL`, and/or `LIFEOS_SYNC_WORK_CALENDAR`
    are set in `.env` (should already be from Phase 3)
+
+For a **second work account**, repeat with `--account work2`:
+1. Save credentials as `config/credentials-work2.json`
+2. Run: `~/.venvs/lifeos/bin/python scripts/google_auth.py --account work2`
+3. Set `LIFEOS_WORK_DOMAIN_2`, `LIFEOS_SYNC_WORK2_GMAIL`, `LIFEOS_SYNC_WORK2_CALENDAR` in `.env`
 
 ### Telegram Bot
 

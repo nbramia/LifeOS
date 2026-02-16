@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from api.services.drive import get_drive_service, DriveFile, get_drive_link
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import resolve_account
 
 router = APIRouter(prefix="/api/drive", tags=["drive"])
 
@@ -78,7 +78,7 @@ async def search_files(
         )
 
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_drive_service(account_type)
 
         files = service.search(
@@ -107,7 +107,7 @@ async def get_file(
 ):
     """Get a specific file by ID."""
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_drive_service(account_type)
 
         file = service.get_file(file_id)
@@ -134,7 +134,7 @@ async def get_file_content(
 ):
     """Get file content as plain text."""
     try:
-        account_type = GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+        account_type = resolve_account(account)
         service = get_drive_service(account_type)
 
         file = service.get_file(file_id)

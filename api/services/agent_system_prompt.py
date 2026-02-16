@@ -8,6 +8,7 @@ requests within a 5-minute window.
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from api.services.google_auth import get_configured_accounts
 from config.settings import settings
 
 _STATIC_PROMPT_TEMPLATE = """\
@@ -117,11 +118,15 @@ Call MULTIPLE tools in a SINGLE round whenever possible.
 
 ## Context
 
-- {name} has two Google accounts: personal and work. All Google tools search both.
+- {name} has Google accounts: {google_accounts}. All Google tools search all configured accounts.
 - The Obsidian vault contains: daily journals, meeting notes, project docs, people files, task files."""
 
 # Built once at import time (settings.user_name is stable for process lifetime)
-_STATIC_PROMPT = _STATIC_PROMPT_TEMPLATE.format(name=settings.user_name)
+_configured_accounts = ", ".join(a.value for a in get_configured_accounts())
+_STATIC_PROMPT = _STATIC_PROMPT_TEMPLATE.format(
+    name=settings.user_name,
+    google_accounts=_configured_accounts,
+)
 
 
 def build_system_prompt() -> list[dict]:

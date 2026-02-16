@@ -565,8 +565,8 @@ class ReminderScheduler:
             return False
         try:
             from api.services.calendar import get_calendar_service
-            from api.services.google_auth import GoogleAccount
-            for account in (GoogleAccount.PERSONAL, GoogleAccount.WORK):
+            from api.services.google_auth import get_configured_accounts
+            for account in get_configured_accounts():
                 try:
                     cal = get_calendar_service(account)
                     if cal.has_upcoming_meeting(20):

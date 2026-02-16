@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import resolve_account, get_configured_accounts
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -586,7 +586,7 @@ async def _tool_search_calendar(inp: dict) -> str:
     days_range = inp.get("days_range", 1)
 
     all_events = []
-    for account in (GoogleAccount.PERSONAL, GoogleAccount.WORK):
+    for account in get_configured_accounts():
         try:
             cal = CalendarService(account)
             if query:
@@ -620,7 +620,7 @@ async def _tool_search_email(inp: dict) -> str:
 
     max_results = inp.get("max_results", 5)
     all_messages = []
-    for account in (GoogleAccount.PERSONAL, GoogleAccount.WORK):
+    for account in get_configured_accounts():
         try:
             gmail = GmailService(account)
             messages = gmail.search(
@@ -662,7 +662,7 @@ async def _tool_search_drive(inp: dict) -> str:
 
     max_results = inp.get("max_results", 5)
     all_files = []
-    for account in (GoogleAccount.PERSONAL, GoogleAccount.WORK):
+    for account in get_configured_accounts():
         try:
             drive = DriveService(account)
             files = drive.search(full_text=inp["query"], max_results=max_results)
@@ -979,7 +979,7 @@ def _tool_manage_reminders(inp: dict):
 async def _tool_create_email_draft(inp: dict) -> str:
     from api.services.gmail import GmailService
     account_str = inp.get("account", "personal")
-    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    account = resolve_account(account_str)
     gmail = GmailService(account)
     draft = gmail.create_draft(
         to=inp["to"],
@@ -994,7 +994,7 @@ async def _tool_create_email_draft(inp: dict) -> str:
 def _tool_create_calendar_event(inp: dict) -> str:
     from api.services.calendar import CalendarService
     account_str = inp.get("account", "personal")
-    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    account = resolve_account(account_str)
     cal = CalendarService(account)
     event = cal.create_event(
         title=inp["title"],
@@ -1017,7 +1017,7 @@ def _tool_create_calendar_event(inp: dict) -> str:
 def _tool_update_calendar_event(inp: dict) -> str:
     from api.services.calendar import CalendarService
     account_str = inp.get("account", "personal")
-    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    account = resolve_account(account_str)
     cal = CalendarService(account)
     event = cal.update_event(
         event_id=inp["event_id"],
@@ -1040,7 +1040,7 @@ def _tool_update_calendar_event(inp: dict) -> str:
 def _tool_delete_calendar_event(inp: dict) -> str:
     from api.services.calendar import CalendarService
     account_str = inp.get("account", "personal")
-    account = GoogleAccount.WORK if account_str == "work" else GoogleAccount.PERSONAL
+    account = resolve_account(account_str)
     cal = CalendarService(account)
     cal.delete_event(event_id=inp["event_id"])
     return f"Event deleted (id: {inp['event_id']}, account: {account_str})"

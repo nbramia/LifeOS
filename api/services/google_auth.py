@@ -36,6 +36,25 @@ class GoogleAccount(Enum):
     """Google account types."""
     PERSONAL = "personal"
     WORK = "work"
+    WORK2 = "work2"
+
+
+def resolve_account(account: str) -> GoogleAccount:
+    """Resolve account string to GoogleAccount enum."""
+    try:
+        return GoogleAccount(account)
+    except ValueError:
+        return GoogleAccount.PERSONAL
+
+
+def get_configured_accounts() -> list[GoogleAccount]:
+    """Return list of accounts that have credentials configured."""
+    accounts = [GoogleAccount.PERSONAL]
+    config_dir = Path("./config")
+    for account in [GoogleAccount.WORK, GoogleAccount.WORK2]:
+        if (config_dir / f"credentials-{account.value}.json").exists():
+            accounts.append(account)
+    return accounts
 
 
 class GoogleAuthService:
@@ -67,7 +86,7 @@ class GoogleAuthService:
         self.credentials_path = Path(credentials_path)
         self.token_path = Path(token_path)
         self.account_type = account_type
-        self.scopes = SCOPES_PERSONAL if account_type == GoogleAccount.PERSONAL else SCOPES_WORK
+        self.scopes = SCOPES_PERSONAL if account_type == GoogleAccount.PERSONAL else SCOPES_WORK  # WORK2 uses work scopes
         self._credentials: Optional[Credentials] = None
 
     def get_credentials(self) -> Credentials:
@@ -225,7 +244,7 @@ def get_google_auth(
 
 def authenticate_all_accounts() -> dict[str, bool]:
     """
-    Authenticate both personal and work accounts.
+    Authenticate all configured accounts (personal, work, work2).
 
     This will open browser windows for any accounts that need authentication.
 
