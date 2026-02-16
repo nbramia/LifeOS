@@ -98,6 +98,7 @@ cp .env.example .env
 - **Monarch Money** — Financial data (account balances, transactions, budgets)
 - **Telegram bot** — Chat interface and push notifications
 - **Slack** — Workspace message sync
+- **WhatsApp** — Chat history sync via wacli
 - **MCP for Claude Code** — Use LifeOS as a tool from Claude Code/Desktop
 
 Record the selections — they'll be configured in Phase 10.
@@ -385,6 +386,12 @@ For a **second work account**, repeat with `--account work2`:
 1. Set up workspace OAuth
 2. Add `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_USER_TOKEN` to `.env`
 3. Restart: `./scripts/server.sh restart`
+
+### WhatsApp
+
+1. Install: `brew install steipete/tap/wacli`
+2. Authenticate: `wacli auth` (scan QR code with WhatsApp > Linked Devices)
+3. Verify: `wacli chats list --limit 5`
 
 ### MCP for Claude Code
 
