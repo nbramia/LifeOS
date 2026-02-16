@@ -366,6 +366,7 @@ class PersonUpdateRequest(BaseModel):
     tags: Optional[list[str]] = None
     category: Optional[str] = None
     birthday: Optional[str] = None  # "MM-DD" format (month-day only), empty string to clear
+    display_name: Optional[str] = None
 
 
 class PersonMergeRequest(BaseModel):
@@ -764,6 +765,12 @@ async def update_person(person_id: str, request: PersonUpdateRequest):
 
     if request.category is not None:
         person.category = request.category
+
+    if request.display_name is not None:
+        name = request.display_name.strip()
+        if name:
+            person.display_name = name
+            person.canonical_name = name
 
     if request.birthday is not None:
         if request.birthday == "":

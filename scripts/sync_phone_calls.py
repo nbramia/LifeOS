@@ -85,7 +85,7 @@ def format_duration(seconds: float) -> str:
 
 
 def sync_phone_calls(
-    days_back: int = 365,
+    days_back: int = 3650,
     dry_run: bool = True,
     batch_size: int = 100,
 ) -> dict:
@@ -359,7 +359,7 @@ def _insert_batch(conn: sqlite3.Connection, batch: list):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sync phone call history to CRM')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
-    parser.add_argument('--days', type=int, default=365, help='Days back to sync')
+    parser.add_argument('--days', type=int, default=3650, help='Days back to sync')
     args = parser.parse_args()
 
     sync_phone_calls(days_back=args.days, dry_run=not args.execute)

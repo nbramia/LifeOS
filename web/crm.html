@@ -1615,6 +1615,22 @@
             margin-bottom: 0.25rem;
         }
 
+        .name-edit-btn {
+            opacity: 0;
+            cursor: pointer;
+            font-size: 0.75em;
+            margin-left: 0.25rem;
+            transition: opacity 0.15s;
+        }
+
+        .detail-name:hover .name-edit-btn {
+            opacity: 0.5;
+        }
+
+        .name-edit-btn:hover {
+            opacity: 1 !important;
+        }
+
         .detail-company {
             font-size: 0.875rem;
             color: var(--text-secondary);
@@ -11023,7 +11039,7 @@
                 document.getElementById('detailCompany').textContent = 'Personal CRM Overview';
             } else {
                 document.getElementById('detailAvatar').textContent = getInitials(person.canonical_name);
-                document.getElementById('detailName').textContent = person.canonical_name;
+                document.getElementById('detailName').innerHTML = escapeHtml(person.canonical_name) + ' <span class="name-edit-btn" onclick="editDisplayName()" title="Edit name">✎</span>';
                 document.getElementById('detailCompany').textContent = [person.company, person.position].filter(Boolean).join(' · ');
                 // Load profile photo for detail avatar
                 loadDetailProfilePhoto(person.id);
@@ -11685,6 +11701,26 @@
                 await loadPersonDetail(selectedPersonId);
             } catch (error) {
                 console.error('Failed to remove birthday:', error);
+            }
+        }
+
+        // Edit display name
+        async function editDisplayName() {
+            const person = people.find(p => p.id === selectedPersonId);
+            if (!person || !selectedPersonId) return;
+            const newName = prompt('Edit name:', person.canonical_name);
+            if (!newName || !newName.trim() || newName.trim() === person.canonical_name) return;
+            try {
+                await api(`/people/${selectedPersonId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ display_name: newName.trim() })
+                });
+                await loadPersonDetail(selectedPersonId);
+                person.canonical_name = newName.trim();
+                person.display_name = newName.trim();
+                renderPeopleList();
+            } catch (error) {
+                alert('Failed to update name.');
             }
         }
 

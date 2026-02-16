@@ -9,11 +9,15 @@ Creates Interaction records for:
 Syncs from both personal and work Google accounts.
 """
 import sqlite3
+import sys
 import uuid
 import logging
 import argparse
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.gmail import GmailService
 from api.services.calendar import CalendarService
@@ -92,7 +96,7 @@ def is_marketing_email(email: str, sender_name: str = None) -> bool:
 
 def sync_gmail_interactions(
     account_type: GoogleAccount,
-    days_back: int = 365,
+    days_back: int = 3650,
     dry_run: bool = True,
     batch_size: int = 100,
     domain_filter: str | None = None,
@@ -460,7 +464,7 @@ def sync_gmail_interactions(
 
 def sync_calendar_interactions(
     account_type: GoogleAccount,
-    days_back: int = 365,
+    days_back: int = 3650,
     dry_run: bool = True,
 ) -> dict:
     """
@@ -769,7 +773,7 @@ def _insert_batch(conn: sqlite3.Connection, batch: list):
 def main():
     parser = argparse.ArgumentParser(description='Sync Gmail and Calendar to interactions')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
-    parser.add_argument('--days', type=int, default=365, help='Days back to sync')
+    parser.add_argument('--days', type=int, default=3650, help='Days back to sync')
     parser.add_argument('--gmail-only', action='store_true', help='Only sync Gmail')
     parser.add_argument('--calendar-only', action='store_true', help='Only sync Calendar')
     parser.add_argument('--personal-only', action='store_true', help='Only sync personal account')
