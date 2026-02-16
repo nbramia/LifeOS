@@ -1079,14 +1079,15 @@ def _load_family_config():
                 config = json.load(f)
             return (
                 set(name.lower() for name in config.get("family_last_names", [])),
-                set(name.lower() for name in config.get("family_exact_names", []))
+                set(name.lower() for name in config.get("family_exact_names", [])),
+                set(config.get("family_person_ids", []))
             )
         except Exception as e:
             logger.warning(f"Failed to load family config: {e}")
-    return set(), set()
+    return set(), set(), set()
 
 
-FAMILY_LAST_NAMES, FAMILY_EXACT_NAMES = _load_family_config()
+FAMILY_LAST_NAMES, FAMILY_EXACT_NAMES, FAMILY_PERSON_IDS = _load_family_config()
 
 
 def _is_family_member(name: str) -> bool:
@@ -1129,7 +1130,9 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
     if person.id == settings.my_person_id:
         return "self"
 
-    # 2. Check family membership (by name)
+    # 2. Check family membership (by ID first, then by name)
+    if person.id in FAMILY_PERSON_IDS:
+        return "family"
     if _is_family_member(person.canonical_name):
         return "family"
     # Also check display name and aliases
