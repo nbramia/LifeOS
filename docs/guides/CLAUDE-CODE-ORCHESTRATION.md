@@ -20,10 +20,10 @@ Claude Code must be authenticated on the Mac Mini where the LifeOS server runs. 
 
 ```bash
 # SSH to the Mac Mini
-ssh nathanramia@100.95.233.70
+ssh <your-user>@<your-tailscale-ip>
 
 # Run the setup-token command (requires Claude Max/Pro subscription)
-/Users/nathanramia/.local/bin/claude setup-token
+~/.local/bin/claude setup-token
 ```
 
 This creates a persistent authentication token that works in headless mode (no browser/TTY needed).
@@ -31,8 +31,8 @@ This creates a persistent authentication token that works in headless mode (no b
 **Verify it works:**
 
 ```bash
-ssh nathanramia@100.95.233.70 \
-  "/Users/nathanramia/.local/bin/claude -p 'say hello' \
+ssh <your-user>@<your-tailscale-ip> \
+  "~/.local/bin/claude -p 'say hello' \
    --output-format stream-json --verbose 2>&1 | head -3"
 ```
 
@@ -48,14 +48,14 @@ Two optional environment variables in `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LIFEOS_CLAUDE_BINARY` | `/Users/nathanramia/.local/bin/claude` | Path to the Claude CLI binary |
+| `LIFEOS_CLAUDE_BINARY` | `~/.local/bin/claude` | Path to the Claude CLI binary |
 | `LIFEOS_CLAUDE_TIMEOUT` | `3600` (1 hour) | Safety-net timeout per session in seconds. Heartbeats keep you informed; this is a backstop. |
 
 These rarely need changing. The binary path matches the standard Claude Code installation location.
 
 After changing these values, restart the server:
 ```bash
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"
+ssh <your-user>@<your-tailscale-ip> "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"
 ```
 
 ---
@@ -179,25 +179,25 @@ Every 5 minutes, if the session is still running, you'll receive an automatic pr
 
 The binary path doesn't exist. Check:
 ```bash
-ssh nathanramia@100.95.233.70 "ls -la /Users/nathanramia/.local/bin/claude"
+ssh <your-user>@<your-tailscale-ip> "ls -la ~/.local/bin/claude"
 ```
 
 If missing, install Claude Code on the Mac Mini:
 ```bash
-ssh nathanramia@100.95.233.70 "curl -fsSL https://claude.ai/install.sh | sh"
+ssh <your-user>@<your-tailscale-ip> "curl -fsSL https://claude.ai/install.sh | sh"
 ```
 
 ### "Invalid API key" or no response
 
 Claude Code isn't authenticated. Run `setup-token`:
 ```bash
-ssh nathanramia@100.95.233.70 "/Users/nathanramia/.local/bin/claude setup-token"
+ssh <your-user>@<your-tailscale-ip> "~/.local/bin/claude setup-token"
 ```
 
 Then verify:
 ```bash
-ssh nathanramia@100.95.233.70 \
-  "/Users/nathanramia/.local/bin/claude -p 'say hello' \
+ssh <your-user>@<your-tailscale-ip> \
+  "~/.local/bin/claude -p 'say hello' \
    --output-format stream-json --verbose 2>&1 | head -3"
 ```
 

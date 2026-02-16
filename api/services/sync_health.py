@@ -113,19 +113,12 @@ SYNC_SOURCES = {
         "phase": 3,
         "depends_on": ["gmail", "calendar", "imessage", "whatsapp", "slack", "link_slack", "link_imessage", "phone"],
     },
-    "person_stats": {
-        "description": "Update person interaction counts",
-        "script": "scripts/sync_person_stats.py",
-        "frequency": "daily",
-        "phase": 3,
-        "depends_on": ["relationship_discovery"],
-    },
     "strengths": {
         "description": "Recalculate relationship strengths for all people",
         "script": "scripts/sync_strengths.py",
         "frequency": "daily",
         "phase": 3,
-        "depends_on": ["person_stats"],
+        "depends_on": ["relationship_discovery"],
     },
     "push_birthdays": {
         "description": "Push LifeOS birthdays to Apple Contacts",

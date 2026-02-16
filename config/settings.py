@@ -39,7 +39,11 @@ class Settings(BaseSettings):
 
     # Embedding Model
     # mxbai-embed-large-v1: Top-tier 1024-dim model, stable and well-tested
-    embedding_model: str = "mixedbread-ai/mxbai-embed-large-v1"
+    # Override via LIFEOS_EMBEDDING_MODEL for constrained hardware (e.g., all-MiniLM-L6-v2)
+    embedding_model: str = Field(
+        default="mixedbread-ai/mxbai-embed-large-v1",
+        alias="LIFEOS_EMBEDDING_MODEL"
+    )
     embedding_cache_dir: str = Field(
         default="~/.cache/huggingface",
         alias="LIFEOS_EMBEDDING_CACHE",
@@ -61,8 +65,15 @@ class Settings(BaseSettings):
 
     # Cross-encoder re-ranking (P9.2)
     # Query-aware reranking: protects BM25 exact matches for factual queries
-    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
-    reranker_enabled: bool = True  # Re-enabled with query-aware protection
+    # Override via LIFEOS_RERANKER_MODEL; set LIFEOS_RERANKER_ENABLED=false to disable
+    reranker_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L6-v2",
+        alias="LIFEOS_RERANKER_MODEL"
+    )
+    reranker_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_RERANKER_ENABLED"
+    )
     reranker_candidates: int = 50
 
     # Notifications

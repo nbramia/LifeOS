@@ -10,6 +10,7 @@ Full Disk Access permission in System Preferences.
 import logging
 import re
 import sqlite3
+import uuid as uuid_mod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -941,6 +942,22 @@ def sync_and_join_imessages() -> dict:
     }
 
 
+def resolve_entity_id(entity_id: str) -> Optional[str]:
+    """If entity_id isn't a UUID, try resolving it as a person name."""
+    try:
+        uuid_mod.UUID(entity_id)
+        return entity_id
+    except ValueError:
+        from api.services.entity_resolver import get_entity_resolver
+        resolver = get_entity_resolver()
+        # Convert slug format (e.g. "omara-taylor") to name with spaces
+        name = entity_id.replace("-", " ")
+        result = resolver.resolve(name=name)
+        if result and result.entity:
+            return result.entity.id
+        return None
+
+
 def query_person_messages(
     entity_id: str,
     search_term: Optional[str] = None,
@@ -968,10 +985,19 @@ def query_person_messages(
         - count: Number of messages returned
         - date_range: Actual date range of returned messages
     """
+    resolved_id = resolve_entity_id(entity_id)
+    if not resolved_id:
+        return {
+            "messages": [],
+            "formatted": f"Could not resolve person '{entity_id}'. Use people search to find the correct entity ID.",
+            "count": 0,
+            "date_range": None,
+        }
+
     store = get_imessage_store()
 
     messages = store.query_messages(
-        entity_id=entity_id,
+        entity_id=resolved_id,
         search_term=search_term,
         start_date=start_date,
         end_date=end_date,
