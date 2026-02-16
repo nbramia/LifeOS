@@ -5,7 +5,8 @@ Sync phone contacts from CSV export to LifeOS CRM.
 Creates SourceEntity records and links them to PersonEntity via entity resolution.
 Updates PersonEntity with contact data (company, position, phones).
 
-Uses CSV export since pyobjc doesn't support Python 3.13 yet.
+Legacy script — kept for one-off CSV imports. The nightly sync uses
+sync_apple_contacts.py (native pyobjc) instead.
 """
 import csv
 import re
@@ -25,8 +26,8 @@ from api.services.person_entity import get_person_entity_store
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Default CSV path
-DEFAULT_CSV_PATH = Path(__file__).parent.parent / "data" / "phonecontacts20260109.csv"
+# Default CSV path (must be provided via --csv flag)
+DEFAULT_CSV_PATH = None
 
 
 def normalize_phone(phone: str) -> str:
@@ -69,7 +70,9 @@ def sync_contacts_csv(csv_path: str = None, dry_run: bool = True) -> dict:
     }
 
     if csv_path is None:
-        csv_path = str(DEFAULT_CSV_PATH)
+        logger.error("No CSV path provided. Use --csv <path> to specify a contacts export file.")
+        stats['error'] = "No CSV path provided"
+        return stats
 
     if not Path(csv_path).exists():
         logger.error(f"CSV file not found: {csv_path}")
