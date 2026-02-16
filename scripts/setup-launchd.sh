@@ -21,17 +21,31 @@ echo "Note: ChromaDB should use cron watchdog instead of launchd."
 echo "See docs/guides/LAUNCHD-SETUP.md for ChromaDB cron setup."
 echo ""
 
-# Prompt for vault path
-read -p "Enter your Obsidian vault path: " VAULT_PATH
+# Accept vault path as CLI argument or prompt interactively
+# Usage: ./scripts/setup-launchd.sh [vault_path] [--yes]
+VAULT_PATH=""
+AUTO_YES=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--yes" ] || [ "$arg" = "-y" ]; then
+        AUTO_YES=true
+    elif [ -z "$VAULT_PATH" ]; then
+        VAULT_PATH="$arg"
+    fi
+done
+
+if [ -z "$VAULT_PATH" ]; then
+    read -p "Enter your Obsidian vault path: " VAULT_PATH
+fi
+
+# Expand ~ if present
+VAULT_PATH="${VAULT_PATH/#\~/$HOME}"
 
 # Validate vault path
 if [ ! -d "$VAULT_PATH" ]; then
     echo "Error: Vault path does not exist: $VAULT_PATH"
     exit 1
 fi
-
-# Expand ~ if present
-VAULT_PATH="${VAULT_PATH/#\~/$HOME}"
 
 echo ""
 echo "Configuration:"
@@ -40,11 +54,13 @@ echo "  LifeOS:     $LIFEOS_PATH"
 echo "  Vault:      $VAULT_PATH"
 echo ""
 
-read -p "Continue? (y/n) " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 0
+if [ "$AUTO_YES" = false ]; then
+    read -p "Continue? (y/n) " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
 fi
 
 # Create logs directory

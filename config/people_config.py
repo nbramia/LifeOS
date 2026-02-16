@@ -55,13 +55,13 @@ def _load_crm_mappings() -> tuple[dict[str, list[str]], dict[str, dict]]:
 
         # Parse domain mappings
         domain_map = dict(default_domain_map)  # Start with defaults
-        for domain, info in config.get("domain_mappings", {}).items():
+        for domain, info in (config.get("domain_mappings") or {}).items():
             if isinstance(info, dict) and "vault_contexts" in info:
                 domain_map[domain.lower()] = info["vault_contexts"]
 
         # Parse company normalization
         company_norm = dict(default_company_norm)
-        for company, info in config.get("company_normalization", {}).items():
+        for company, info in (config.get("company_normalization") or {}).items():
             if isinstance(info, dict):
                 company_norm[company] = {
                     "domains": info.get("domains", []),

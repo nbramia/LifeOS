@@ -45,9 +45,9 @@ class Settings(BaseSettings):
         alias="LIFEOS_EMBEDDING_MODEL"
     )
     embedding_cache_dir: str = Field(
-        default="~/.cache/huggingface",
+        default="",
         alias="LIFEOS_EMBEDDING_CACHE",
-        description="Directory for caching embedding model files"
+        description="Directory for caching embedding model files (leave empty for HuggingFace default)"
     )
 
     # Chunking

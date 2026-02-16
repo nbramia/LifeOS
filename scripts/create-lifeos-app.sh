@@ -15,6 +15,13 @@ set -euo pipefail
 APP_PATH="/Applications/LifeOS.app"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+FORCE=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--force" ] || [ "$arg" = "-f" ]; then
+        FORCE=true
+    fi
+done
 
 echo "LifeOS.app Creator"
 echo "==================="
@@ -25,11 +32,15 @@ echo ""
 
 # Check for existing app
 if [ -d "$APP_PATH" ]; then
-    echo "WARNING: $APP_PATH already exists."
-    read -p "Overwrite? (y/N) " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        echo "Aborted."
-        exit 0
+    if [ "$FORCE" = true ]; then
+        echo "Overwriting existing $APP_PATH (--force)"
+    else
+        echo "WARNING: $APP_PATH already exists."
+        read -p "Overwrite? (y/N) " confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "Aborted."
+            exit 0
+        fi
     fi
     rm -rf "$APP_PATH"
 fi
