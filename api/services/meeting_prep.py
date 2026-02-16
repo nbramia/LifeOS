@@ -92,7 +92,7 @@ def _normalize_title_for_search(title: str) -> str:
     Examples:
         "1:1 with Alex - 2023-01-28" -> "1:1 with Alex"
         "Weekly Team Standup" -> "Team Standup"
-        "Nathan-Sam" -> "Nathan Sam"
+        "Alice-Bob" -> "Alice Bob"
     """
     # Remove date patterns
     title = re.sub(r"\s*[-–]\s*\d{4}[-/]\d{2}[-/]\d{2}", "", title)
@@ -102,7 +102,7 @@ def _normalize_title_for_search(title: str) -> str:
     # Remove common temporal words
     title = re.sub(r"\b(weekly|biweekly|monthly|daily)\b", "", title, flags=re.IGNORECASE)
 
-    # Replace hyphens between names with spaces (Nathan-Brandon -> Nathan Brandon)
+    # Replace hyphens between names with spaces (Alice-Bob -> Alice Bob)
     title = re.sub(r"(\w)-(\w)", r"\1 \2", title)
 
     return title.strip()

@@ -89,7 +89,7 @@ async def search(request: SearchRequest) -> SearchResponse:
     Use this for:
     - "What did we discuss about project X?" → searches meeting notes
     - "Find notes about quarterly planning" → semantic search
-    - "Nathan's phone number" → keyword search for specific info
+    - "John's phone number" → keyword search for specific info
 
     Returns matching content chunks with file path, note type, and relevance score.
     Results are ranked by combined semantic + keyword + recency score.

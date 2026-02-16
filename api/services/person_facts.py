@@ -186,8 +186,8 @@ class PersonFactStore:
                 pass  # Column already exists
 
             # v3: Junction table for dual-association of relationship facts
-            # Allows a fact to be associated with multiple people (e.g., "Taylor is Nathan's wife"
-            # can appear on both Nathan's and Taylor's profile)
+            # Allows a fact to be associated with multiple people (e.g., "Alice is Bob's wife"
+            # can appear on both Alice's and Bob's profile)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS person_fact_associations (
                     fact_id TEXT NOT NULL,
@@ -427,8 +427,8 @@ class PersonFactStore:
         Associate a fact with an additional person.
 
         This enables relationship facts to appear on both people's profiles.
-        For example, "Taylor is Nathan's wife" can be associated with both
-        Taylor's profile (where it's the primary fact) and Nathan's profile.
+        For example, "Alice is Bob's wife" can be associated with both
+        Alice's profile (where it's the primary fact) and Bob's profile.
 
         Args:
             fact_id: The fact to associate

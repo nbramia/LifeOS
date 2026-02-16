@@ -26,7 +26,7 @@ Environment variables and configuration files for LifeOS.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `LIFEOS_USER_NAME` | Your first name (used in AI prompts) | `Nathan` |
+| `LIFEOS_USER_NAME` | Your first name (used in AI prompts) | `Alex` |
 | `LIFEOS_MY_PERSON_ID` | Your CRM person ID (set after first sync) | UUID |
 | `LIFEOS_WORK_DOMAIN` | Work email domain | `yourcompany.com` |
 | `LIFEOS_TIMEZONE` | IANA timezone for schedules and prompts | `America/New_York` |

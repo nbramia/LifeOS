@@ -704,9 +704,9 @@ def _parse_attendees_from_title(title: str) -> list[str]:
 
     Handles patterns like:
     - "1:1 with John Smith"
-    - "Sync: Nathan/Taylor"
+    - "Sync: Alice/Bob"
     - "Meeting with Sarah Chen"
-    - "Nathan <> Rushi"
+    - "Alice <> Charlie"
 
     Args:
         title: Meeting title
@@ -778,26 +778,27 @@ def main():
     parser.add_argument('--calendar-only', action='store_true', help='Only sync Calendar')
     parser.add_argument('--personal-only', action='store_true', help='Only sync personal account')
     parser.add_argument('--work-only', action='store_true', help='Only sync work account(s)')
+    parser.add_argument('--account', type=str, choices=['personal', 'work', 'work2'], help='Sync a specific account only')
     parser.add_argument('--domain', type=str, help='Filter emails by domain (e.g., gmail.com)')
     parser.add_argument('--before-days', type=int, help='Skip emails newer than this many days ago (for historical backfill)')
     args = parser.parse_args()
 
     dry_run = not args.execute
 
-    # Determine which accounts to sync based on flags and settings
-    # Work integrations are disabled by default for safety
+    # Determine which accounts to sync
     accounts = []
-    if args.personal_only:
+    if args.account:
+        accounts = [GoogleAccount(args.account)]
+    elif args.personal_only:
         accounts = [GoogleAccount.PERSONAL]
     elif args.work_only:
-        # Include all work accounts that have any sync enabled
         for work_account in [GoogleAccount.WORK, GoogleAccount.WORK2]:
             if settings.is_sync_enabled(work_account.value, "gmail") or settings.is_sync_enabled(work_account.value, "calendar"):
                 accounts.append(work_account)
         if not accounts:
             accounts = [GoogleAccount.WORK]  # fallback for explicit --work-only
     else:
-        # Default behavior: always include personal, add work accounts if enabled
+        # Default: personal + any enabled work accounts
         accounts = [GoogleAccount.PERSONAL]
 
         for work_account in [GoogleAccount.WORK, GoogleAccount.WORK2]:
@@ -805,9 +806,6 @@ def main():
             has_calendar = settings.is_sync_enabled(work_account.value, "calendar") and not args.gmail_only
             if has_gmail or has_calendar:
                 accounts.append(work_account)
-
-        if GoogleAccount.WORK not in accounts and GoogleAccount.WORK2 not in accounts:
-            logger.info("Work account sync disabled (set LIFEOS_SYNC_WORK_GMAIL=true or LIFEOS_SYNC_WORK2_GMAIL=true to enable)")
 
     all_stats = {}
 

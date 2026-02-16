@@ -48,7 +48,7 @@ from api.services.sync_health import (
 from config.settings import settings
 
 # Markdown error log in Notes directory (for visibility)
-NOTES_ERROR_LOG = Path.home() / "Notes 2025" / "LifeOS" / "sync_errors.md"
+NOTES_ERROR_LOG = settings.vault_path / "LifeOS" / "sync_errors.md"
 
 
 def log_error_to_markdown(source: str, error_msg: str, error_type: str = "error"):
@@ -254,8 +254,12 @@ logger = logging.getLogger(__name__)
 SYNC_ORDER = [
     # === Phase 1: Data Collection ===
     # Pull fresh data from all external sources (no dependencies on each other)
-    "gmail",                    # Gmail sent + received + CC
-    "calendar",                 # Google Calendar events
+    "gmail_personal",            # Personal Gmail sent + received + CC
+    "gmail_work",               # Work Gmail sent + received + CC
+    "gmail_work2",              # Second work Gmail sent + received + CC
+    "calendar_personal",        # Personal Google Calendar events
+    "calendar_work",            # Work Google Calendar events
+    "calendar_work2",           # Second work Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
     "contacts",                 # Apple Contacts (native via pyobjc)
     # NOTE: phone and imessage are NOT in this list - they require Full Disk Access
@@ -300,8 +304,12 @@ SYNC_ORDER = [
 # Scripts that can be run directly
 SYNC_SCRIPTS = {
     # Phase 1: Data Collection
-    "gmail": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--gmail-only", "--days", "30"]),
-    "calendar": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--days", "30"]),
+    "gmail_personal": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--gmail-only", "--account", "personal", "--days", "30"]),
+    "gmail_work": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--gmail-only", "--account", "work", "--days", "30"]),
+    "gmail_work2": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--gmail-only", "--account", "work2", "--days", "30"]),
+    "calendar_personal": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--account", "personal", "--days", "30"]),
+    "calendar_work": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--account", "work", "--days", "30"]),
+    "calendar_work2": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--account", "work2", "--days", "30"]),
     "linkedin": ("scripts/sync_linkedin.py", ["--execute"]),
     "contacts": ("scripts/sync_apple_contacts.py", ["--execute"]),
     "phone": ("scripts/sync_phone_calls.py", ["--execute"]),
@@ -353,17 +361,21 @@ def get_disabled_work_sources() -> set[str]:
     """
     disabled = set()
 
-    # Gmail/Calendar work accounts require both the toggle AND work domain to be set
     has_work_domain = bool(settings.work_email_domain)
 
     if not settings.sync_work_gmail or not has_work_domain:
-        # Gmail sync will still run for personal, but sync script handles work filtering
-        # We just log a warning here - actual filtering happens in sync_gmail_calendar_interactions.py
-        pass
+        disabled.add("gmail_work")
 
     if not settings.sync_work_calendar or not has_work_domain:
-        # Same as above - sync script handles work filtering
-        pass
+        disabled.add("calendar_work")
+
+    has_work2_domain = bool(settings.work_email_domain_2)
+
+    if not settings.sync_work2_gmail or not has_work2_domain:
+        disabled.add("gmail_work2")
+
+    if not settings.sync_work2_calendar or not has_work2_domain:
+        disabled.add("calendar_work2")
 
     # Slack requires explicit opt-in
     if not settings.sync_slack:

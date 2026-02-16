@@ -5,6 +5,8 @@ import os
 import re
 from pathlib import Path
 
+from config.settings import settings
+
 # Multi-word phrases first (checked as substrings), then single words (checked with word boundaries)
 _VAULT_PHRASES = ["meeting notes", "daily note"]
 _VAULT_WORDS = ["note", "notes", "vault", "obsidian", "journal", "backlog"]
@@ -20,7 +22,7 @@ _LIFEOS_WORDS = [
 _CODE_WORDS = ["script", "code", "function", "cron"]
 
 _HOME = os.path.expanduser("~")
-_VAULT_DIR = os.path.join(_HOME, "Notes 2025")
+_VAULT_DIR = str(settings.vault_path)
 _LIFEOS_DIR = os.path.join(_HOME, "Documents", "Code", "LifeOS")
 _CODE_DIR = os.path.join(_HOME, "Documents", "Code")
 

@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
+import json
 import logging
 import sqlite3
 import time
@@ -1769,7 +1770,7 @@ async def get_person_timeline_aggregated(
     interaction_store = get_interaction_store()
 
     # Fetch interactions within the time range
-    # Use high limit for aggregation - need to support heavy users like Taylor (60k+ interactions)
+    # Use high limit for aggregation - need to support heavy users (60k+ interactions)
     # TODO: Optimize by doing aggregation in SQL instead of fetching all to Python
     interactions = interaction_store.get_for_person(
         person_id,
@@ -5152,7 +5153,8 @@ async def analyze_relationship_tone(person_id: Optional[str] = None, months: int
     # Use Claude to analyze tone
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
-    prompt = f"""Analyze the emotional warmth of these iMessage conversations between Nathan and Taylor over time.
+    partner_name = _get_partner_name() or "their partner"
+    prompt = f"""Analyze the emotional warmth of these iMessage conversations between {settings.user_name} and {partner_name} over time.
 
 For each month provided, rate the overall emotional warmth on a scale from 0 to 100:
 - 100 = Extremely warm and supportive: Affectionate, loving, deeply connected, emotionally present
@@ -5235,7 +5237,7 @@ MESSAGES:
 @router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
 async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12):
     """
-    Analyze tone/sentiment separately for Nathan and Taylor in iMessage conversations.
+    Analyze tone/sentiment separately for the user and their partner in iMessage conversations.
 
     Groups messages by week, analyzes each person's tone separately, normalizes 0-100,
     then aggregates to monthly averages. Returns separate scores for each person
