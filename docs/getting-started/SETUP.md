@@ -91,7 +91,26 @@ cp .env.example .env
 | `LIFEOS_PARTNER_NAME` | No | Partner's first name (leave empty to skip) |
 | `LIFEOS_TIMEZONE` | No | IANA timezone (default: `America/New_York`) |
 
-Set these values in `.env`. Then set model overrides from Phase 0:
+**[ASK USER]** Which optional integrations do you want to set up? (All can be added later.)
+
+- **Google OAuth** — Calendar, Gmail, Drive sync (personal account)
+- **Google OAuth (work)** — Separate work account for Calendar/Gmail
+- **Monarch Money** — Financial data (account balances, transactions, budgets)
+- **Telegram bot** — Chat interface and push notifications
+- **Slack** — Workspace message sync
+- **MCP for Claude Code** — Use LifeOS as a tool from Claude Code/Desktop
+
+Record the selections — they'll be configured in Phase 10.
+
+If the user wants **Google OAuth (work)**, also collect:
+- `LIFEOS_WORK_DOMAIN` — their work email domain (e.g., `acme.com`)
+- Set `LIFEOS_SYNC_WORK_GMAIL=true` and/or `LIFEOS_SYNC_WORK_CALENDAR=true` as desired
+
+If the user wants **Monarch Money**, collect:
+- `MONARCH_EMAIL` — Monarch Money account email
+- `MONARCH_PASSWORD` — Monarch Money account password
+
+Set all collected values in `.env`. Then set model overrides from Phase 0:
 
 - If 8 GB RAM:
   ```
@@ -329,15 +348,25 @@ This runs at 2:50 AM, 10 minutes before the main nightly sync.
 
 ## Phase 10: Optional Integrations
 
-**[ASK USER]** Which integrations do you want to set up?
+Set up the integrations selected in Phase 3. Skip any that weren't selected.
 
-### Google OAuth (Calendar, Gmail, Drive)
+### Google OAuth — Personal (Calendar, Gmail, Drive)
 
 Follow `docs/guides/GOOGLE-OAUTH.md`. Key steps:
 1. Create Google Cloud project and enable Calendar/Gmail/Drive APIs
 2. Configure OAuth consent screen and **publish the app** (Audience → Publish)
 3. Create OAuth credentials, save as `config/credentials-personal.json`
 4. Run: `~/.venvs/lifeos/bin/python scripts/google_auth.py --account personal`
+
+### Google OAuth — Work (Calendar, Gmail)
+
+If the user selected work Google account in Phase 3:
+1. Create a **separate** Google Cloud project for the work account
+2. Follow the same OAuth setup steps as personal
+3. Save credentials as `config/credentials-work.json`
+4. Run: `~/.venvs/lifeos/bin/python scripts/google_auth.py --account work`
+5. Verify `LIFEOS_WORK_DOMAIN`, `LIFEOS_SYNC_WORK_GMAIL`, and/or `LIFEOS_SYNC_WORK_CALENDAR`
+   are set in `.env` (should already be from Phase 3)
 
 ### Telegram Bot
 
@@ -361,19 +390,23 @@ claude mcp add lifeos http://localhost:8000/api/mcp
 
 ### Monarch Money (Financial Data)
 
-1. Add `MONARCH_EMAIL` and `MONARCH_PASSWORD` to `.env`
-2. Run the interactive MFA authentication (requires a code sent via email/SMS):
-   ```bash
-   ~/.venvs/lifeos/bin/python -c "
-   import asyncio
-   from monarchmoney import MonarchMoney
-   mm = MonarchMoney()
-   asyncio.run(mm.interactive_login())
-   mm.save_session('data/monarch_session.pickle')
-   print('Session saved!')
-   "
-   ```
-3. Restart: `./scripts/server.sh restart`
+`MONARCH_EMAIL` and `MONARCH_PASSWORD` should already be set in `.env` from Phase 3.
+Now run the interactive MFA authentication (a code will be sent via email/SMS):
+
+**[ASK USER]** The user needs to be ready to enter an MFA code from their email/phone.
+
+```bash
+~/.venvs/lifeos/bin/python -c "
+import asyncio
+from monarchmoney import MonarchMoney
+mm = MonarchMoney()
+asyncio.run(mm.interactive_login())
+mm.save_session('data/monarch_session.pickle')
+print('Session saved!')
+"
+```
+
+Restart: `./scripts/server.sh restart`
 
 Each integration can be added later. None are required for core functionality.
 
