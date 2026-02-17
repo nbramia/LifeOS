@@ -827,6 +827,28 @@ def get_imessage_store(storage_path: str = "./data/imessage.db") -> IMessageStor
     return _imessage_store
 
 
+def resolve_entity_id(entity_id: str) -> Optional[str]:
+    """Resolve an entity_id that may be a UUID or a name slug (e.g. 'john-doe') to a UUID."""
+    import uuid
+    # If it's already a valid UUID, pass through
+    try:
+        uuid.UUID(entity_id)
+        return entity_id
+    except ValueError:
+        pass
+    # Treat as a name slug: "john-doe" -> "john doe", then search
+    try:
+        from api.services.people_aggregator import get_people_aggregator
+        agg = get_people_aggregator()
+        name_query = entity_id.replace("-", " ")
+        results = agg.search(name_query)
+        if results:
+            return results[0].id
+    except Exception:
+        pass
+    return None
+
+
 def sync_imessages() -> dict:
     """
     Convenience function for nightly sync.
