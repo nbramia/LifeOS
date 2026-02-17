@@ -120,6 +120,9 @@ These guidelines bias toward caution over speed. For trivial tasks (simple typo 
 | `config/settings.py` | Environment configuration |
 | `config/people_dictionary.json` | Known people and aliases (restart required after edits) |
 | `README.md` | Architecture documentation including hybrid search system |
+| `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite persistence) |
+| `api/routes/perf.py` | Performance trace query API (`/api/perf/traces`, `/api/perf/stats`) |
+| `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 
 | Script | Purpose |
@@ -331,6 +334,59 @@ The chat supports three query categories:
 3. **Compound queries** - Info gathering + action:
    - "Look up the trash schedule and remind me the night before"
    - "How do I reset AirPods? Add a task to do this later."
+
+---
+
+## Performance Tracing
+
+Every chat request is automatically traced with per-stage timing. Traces are stored in SQLite (`data/perf_traces.db`) and exposed via API.
+
+### How It Works
+
+- `start_trace()` / `finish_trace()` bookend each request in `chat.py`'s `generate()`
+- `trace_span("name")` context manager records wall-clock time for each stage
+- Uses Python `contextvars` for async-safe propagation through await chains
+- The SSE stream emits a `perf_trace` event (before `done`) with trace_id, total_ms, and all spans
+
+### Instrumented Stages
+
+| Span | Location | Parent |
+|------|----------|--------|
+| `intent_classify` | chat.py | — |
+| `query_expand` | chat.py | — |
+| `model_select` | chat.py | — |
+| `memory_inject` | agent_loop.py | — |
+| `claude_api_round_{n}` | agent_loop.py | — |
+| `tool_{name}` | agent_loop.py | — |
+| `search_name_expand` | hybrid_search.py | `tool_search_vault` |
+| `search_vector` | hybrid_search.py | `tool_search_vault` |
+| `search_bm25` | hybrid_search.py | `tool_search_vault` |
+| `search_rrf_boost` | hybrid_search.py | `tool_search_vault` |
+| `search_rerank` | hybrid_search.py | `tool_search_vault` |
+
+### API Endpoints
+
+```bash
+# Aggregate stats (avg/p50/p95/max per stage)
+curl http://localhost:8000/api/perf/stats | jq
+
+# Recent traces
+curl "http://localhost:8000/api/perf/traces?limit=10" | jq
+
+# Single trace with all spans
+curl http://localhost:8000/api/perf/traces/{trace_id} | jq
+```
+
+### Benchmark Suite
+
+`tests/test_perf_benchmark.py` runs queries against a live server, collects perf traces, validates answer quality, and prints a comparison report.
+
+```bash
+# Run benchmarks (requires running server)
+ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
+```
+
+Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal names/topics can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
 
 ---
 
