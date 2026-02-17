@@ -101,31 +101,22 @@ class PersonFact:
         return cls(**data)
 
     @classmethod
-    def from_row(cls, row: tuple) -> "PersonFact":
-        """Create PersonFact from SQLite row.
-
-        Column order (after migration):
-        0: id, 1: person_id, 2: category, 3: key, 4: value, 5: confidence,
-        6: source_interaction_id, 7: extracted_at, 8: confirmed_by_user,
-        9: created_at, 10: source_quote, 11: source_link
-        """
-        # Handle both old schema (10 columns) and new schema (12 columns)
-        source_quote = row[10] if len(row) > 10 else None
-        source_link = row[11] if len(row) > 11 else None
-
+    def from_row(cls, row) -> "PersonFact":
+        """Create PersonFact from SQLite Row (uses named column access to handle
+        both fresh and migrated DB schemas where column order may differ)."""
         return cls(
-            id=row[0],
-            person_id=row[1],
-            category=row[2],
-            key=row[3],
-            value=row[4],
-            confidence=row[5] or 0.5,
-            source_interaction_id=row[6],
-            source_quote=source_quote,
-            source_link=source_link,
-            extracted_at=_make_aware(datetime.fromisoformat(row[7])) if row[7] else datetime.now(timezone.utc),
-            confirmed_by_user=bool(row[8]),
-            created_at=_make_aware(datetime.fromisoformat(row[9])) if row[9] else datetime.now(timezone.utc),
+            id=row["id"],
+            person_id=row["person_id"],
+            category=row["category"],
+            key=row["key"],
+            value=row["value"],
+            confidence=row["confidence"] or 0.5,
+            source_interaction_id=row["source_interaction_id"],
+            source_quote=row["source_quote"] if "source_quote" in row.keys() else None,
+            source_link=row["source_link"] if "source_link" in row.keys() else None,
+            extracted_at=_make_aware(datetime.fromisoformat(row["extracted_at"])) if row["extracted_at"] else datetime.now(timezone.utc),
+            confirmed_by_user=bool(row["confirmed_by_user"]),
+            created_at=_make_aware(datetime.fromisoformat(row["created_at"])) if row["created_at"] else datetime.now(timezone.utc),
         )
 
 
@@ -210,7 +201,9 @@ class PersonFactStore:
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def add(self, fact: PersonFact) -> PersonFact:
         """Add a new fact."""
