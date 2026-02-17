@@ -50,6 +50,7 @@ from api.services.time_parser import (
 )
 from config.settings import settings
 from api.services.google_auth import GoogleAccount
+from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 
 logger = logging.getLogger(__name__)
 
@@ -940,6 +941,9 @@ async def ask_stream(request: AskStreamRequest):
                 store.update_title(conversation_id, title)
                 print(f"Created new conversation: {conversation_id} - {title}")
 
+            # Start performance trace
+            start_trace(conversation_id, request.question)
+
             # Send conversation ID to client
             yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n"
 
@@ -1020,7 +1024,8 @@ async def ask_stream(request: AskStreamRequest):
             # Compose, task, and reminder intents now flow through the agentic
             # loop which has dedicated tools (create_email_draft, manage_tasks,
             # manage_reminders). Only "code" and "ambiguous" need early return.
-            action_intent = await classify_action_intent(request.question, conversation_history)
+            with trace_span("intent_classify"):
+                action_intent = await classify_action_intent(request.question, conversation_history)
 
             if action_intent and action_intent.category == "ambiguous_task_reminder":
                 # ---- AMBIGUOUS: could be task or reminder ----
@@ -1054,27 +1059,33 @@ async def ask_stream(request: AskStreamRequest):
             from api.services.model_selector import classify_query_complexity
 
             # Expand follow-up queries with conversation context
-            effective_question = request.question
-            if conversation_history:
-                expanded = expand_followup_query(request.question, conversation_history)
-                if expanded != request.question:
-                    effective_question = expanded
-                    print(f"Expanded query: '{request.question}' -> '{effective_question}'")
-                else:
-                    from api.services.conversation_context import (
-                        extract_context_from_history,
-                        expand_followup_with_context,
-                    )
-                    conv_context = extract_context_from_history(conversation_history)
-                    if conv_context.has_person_context():
-                        expanded = expand_followup_with_context(request.question, conv_context)
-                        if expanded != request.question:
-                            effective_question = expanded
-                            print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
+            with trace_span("query_expand"):
+                effective_question = request.question
+                if conversation_history:
+                    expanded = expand_followup_query(request.question, conversation_history)
+                    if expanded != request.question:
+                        effective_question = expanded
+                        print(f"Expanded query: '{request.question}' -> '{effective_question}'")
+                    else:
+                        from api.services.conversation_context import (
+                            extract_context_from_history,
+                            expand_followup_with_context,
+                        )
+                        conv_context = extract_context_from_history(conversation_history)
+                        if conv_context.has_person_context():
+                            expanded = expand_followup_with_context(request.question, conv_context)
+                            if expanded != request.question:
+                                effective_question = expanded
+                                print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
             # Select model tier
-            complexity = classify_query_complexity(effective_question)
-            model_tier = complexity.recommended_model
+            with trace_span("model_select"):
+                complexity = classify_query_complexity(effective_question)
+                model_tier = complexity.recommended_model
+            # Update trace with selected model tier
+            _trace = _current_trace.get()
+            if _trace:
+                _trace.model_tier = model_tier
             print(f"\n{'='*60}")
             print(f"QUERY: {request.question}")
             print(f"MODEL: {model_tier} ({complexity.reasoning})")
@@ -1169,9 +1180,15 @@ async def ask_stream(request: AskStreamRequest):
             )
             print(f"Saved assistant response ({len(agent_result.full_text)} chars, {len(agent_result.tool_calls_log)} tool calls)")
 
+            # Finish performance trace and emit it
+            perf_trace = finish_trace()
+            if perf_trace:
+                yield f"data: {json.dumps({'type': 'perf_trace', 'trace_id': perf_trace.trace_id, 'total_ms': round(perf_trace.total_ms, 1), 'spans': [{'name': s.name, 'duration_ms': s.duration_ms, 'parent': s.parent} for s in perf_trace.spans]})}\n\n"
+
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
+            finish_trace()  # Clean up trace on error
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(

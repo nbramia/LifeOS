@@ -31,6 +31,7 @@ from typing import Optional, TYPE_CHECKING
 
 from config.settings import settings
 from api.services.query_classifier import classify_query
+from api.services.perf_trace import trace_span
 
 # Lazy imports to avoid slow ChromaDB initialization at import time
 if TYPE_CHECKING:
@@ -383,13 +384,15 @@ class HybridSearch:
         # Determine how many candidates to fetch
         fetch_k = rerank_candidates if use_reranker else top_k
         # Expand person names (nicknames -> canonical names)
-        expanded_query = expand_person_names(query)
-        if expanded_query != query:
-            logger.debug(f"Expanded query: '{query}' -> '{expanded_query}'")
+        with trace_span("search_name_expand", parent="tool_search_vault"):
+            expanded_query = expand_person_names(query)
+            if expanded_query != query:
+                logger.debug(f"Expanded query: '{query}' -> '{expanded_query}'")
 
         # Get vector results (use expanded query for better semantic matching)
-        vector_store = self._get_vector_store()
-        vector_results = vector_store.search(query=expanded_query, top_k=fetch_k)
+        with trace_span("search_vector", parent="tool_search_vault"):
+            vector_store = self._get_vector_store()
+            vector_results = vector_store.search(query=expanded_query, top_k=fetch_k)
 
         # Extract doc IDs and create lookup
         vector_doc_ids = []
@@ -402,18 +405,19 @@ class HybridSearch:
                 results_by_id[doc_id] = result
 
         # Get BM25 results (use expanded query for name resolution)
-        bm25_index = self._get_bm25_index()
-        bm25_doc_ids = []
-        bm25_results_by_id = {}
+        with trace_span("search_bm25", parent="tool_search_vault"):
+            bm25_index = self._get_bm25_index()
+            bm25_doc_ids = []
+            bm25_results_by_id = {}
 
-        if bm25_index:
-            try:
-                bm25_results = bm25_index.search(expanded_query, limit=fetch_k)
-                bm25_doc_ids = [r["doc_id"] for r in bm25_results]
-                # Store BM25 results for later lookup
-                bm25_results_by_id = {r["doc_id"]: r for r in bm25_results}
-            except Exception as e:
-                logger.warning(f"BM25 search failed: {e}")
+            if bm25_index:
+                try:
+                    bm25_results = bm25_index.search(expanded_query, limit=fetch_k)
+                    bm25_doc_ids = [r["doc_id"] for r in bm25_results]
+                    # Store BM25 results for later lookup
+                    bm25_results_by_id = {r["doc_id"]: r for r in bm25_results}
+                except Exception as e:
+                    logger.warning(f"BM25 search failed: {e}")
 
         # If no BM25 results, return vector results directly
         if not bm25_doc_ids:
@@ -424,106 +428,108 @@ class HybridSearch:
                 record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 index unavailable")
             return vector_results[:top_k]
 
-        # Apply RRF fusion
-        fused = reciprocal_rank_fusion(vector_doc_ids, bm25_doc_ids)
+        # Apply RRF fusion + boosting
+        with trace_span("search_rrf_boost", parent="tool_search_vault"):
+            fused = reciprocal_rank_fusion(vector_doc_ids, bm25_doc_ids)
 
-        # Extract person names from expanded query for filename boosting
-        from api.services.people import ALIAS_MAP
-        query_person_names = set()
-        for word in expanded_query.lower().split():
-            # Remove possessives and punctuation
-            clean = re.sub(r"[''`]s$", "", word)  # Remove 's first
-            clean = re.sub(r"[^a-z]", "", clean)  # Then remove other non-alpha
-            if clean in ALIAS_MAP:
-                query_person_names.add(ALIAS_MAP[clean].lower())
+            # Extract person names from expanded query for filename boosting
+            from api.services.people import ALIAS_MAP
+            query_person_names = set()
+            for word in expanded_query.lower().split():
+                # Remove possessives and punctuation
+                clean = re.sub(r"[''`]s$", "", word)  # Remove 's first
+                clean = re.sub(r"[^a-z]", "", clean)  # Then remove other non-alpha
+                if clean in ALIAS_MAP:
+                    query_person_names.add(ALIAS_MAP[clean].lower())
 
-        # Build final results with recency boost
-        final_results = []
+            # Build final results with recency boost
+            final_results = []
 
-        for doc_id, rrf_score in fused[:fetch_k]:
-            # Get full result data
-            if doc_id in results_by_id:
-                result = results_by_id[doc_id].copy()
-            elif doc_id in bm25_results_by_id:
-                # BM25-only result - use the content from BM25
-                bm25_result = bm25_results_by_id[doc_id]
-                # Extract file path from doc_id (format: /path/to/file.md_chunkN)
-                file_path = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
-                result = {
-                    "id": doc_id,
-                    "content": bm25_result.get("content", ""),
-                    "file_path": file_path,
-                    "file_name": bm25_result.get("file_name", ""),
-                    "people": bm25_result.get("people", []),
-                    "metadata": {
-                        "file_name": bm25_result.get("file_name", ""),
+            for doc_id, rrf_score in fused[:fetch_k]:
+                # Get full result data
+                if doc_id in results_by_id:
+                    result = results_by_id[doc_id].copy()
+                elif doc_id in bm25_results_by_id:
+                    # BM25-only result - use the content from BM25
+                    bm25_result = bm25_results_by_id[doc_id]
+                    # Extract file path from doc_id (format: /path/to/file.md_chunkN)
+                    file_path = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
+                    result = {
+                        "id": doc_id,
+                        "content": bm25_result.get("content", ""),
                         "file_path": file_path,
-                        "source": file_path,
+                        "file_name": bm25_result.get("file_name", ""),
+                        "people": bm25_result.get("people", []),
+                        "metadata": {
+                            "file_name": bm25_result.get("file_name", ""),
+                            "file_path": file_path,
+                            "source": file_path,
+                        }
                     }
-                }
-            else:
-                # Unknown result, create minimal
-                result = {"id": doc_id, "content": "", "metadata": {}}
+                else:
+                    # Unknown result, create minimal
+                    result = {"id": doc_id, "content": "", "metadata": {}}
 
-            # Apply recency boost
-            if apply_recency_boost:
-                date_str = result.get("metadata", {}).get("date")
-                recency_boost = calculate_recency_boost(date_str)
-                final_score = rrf_score * (1 + recency_boost)
-            else:
-                final_score = rrf_score
+                # Apply recency boost
+                if apply_recency_boost:
+                    date_str = result.get("metadata", {}).get("date")
+                    recency_boost = calculate_recency_boost(date_str)
+                    final_score = rrf_score * (1 + recency_boost)
+                else:
+                    final_score = rrf_score
 
-            # Apply filename boost if person name appears in filename
-            # This helps when user asks about "Taylor's passport" and Taylor.md exists
-            if query_person_names:
-                file_name = result.get("file_name", "") or result.get("metadata", {}).get("file_name", "")
-                file_name_lower = file_name.lower()
-                for person_name in query_person_names:
-                    if person_name in file_name_lower:
-                        # Significant boost (2x) for exact person name match in filename
-                        final_score *= 2.0
-                        logger.debug(f"Filename boost applied: {file_name} contains {person_name}")
-                        break
+                # Apply filename boost if person name appears in filename
+                # This helps when user asks about "Taylor's passport" and Taylor.md exists
+                if query_person_names:
+                    file_name = result.get("file_name", "") or result.get("metadata", {}).get("file_name", "")
+                    file_name_lower = file_name.lower()
+                    for person_name in query_person_names:
+                        if person_name in file_name_lower:
+                            # Significant boost (2x) for exact person name match in filename
+                            final_score *= 2.0
+                            logger.debug(f"Filename boost applied: {file_name} contains {person_name}")
+                            break
 
-            result["hybrid_score"] = final_score
-            result["rrf_score"] = rrf_score
-            final_results.append(result)
+                result["hybrid_score"] = final_score
+                result["rrf_score"] = rrf_score
+                final_results.append(result)
 
-        # Re-sort by final score and limit
-        final_results.sort(key=lambda x: -x.get("hybrid_score", 0))
+            # Re-sort by final score and limit
+            final_results.sort(key=lambda x: -x.get("hybrid_score", 0))
 
-        # Deduplicate overlapping chunks (important with 20% overlap)
-        final_results = deduplicate_overlapping_chunks(final_results)
+            # Deduplicate overlapping chunks (important with 20% overlap)
+            final_results = deduplicate_overlapping_chunks(final_results)
 
         # Apply cross-encoder re-ranking if enabled and we have enough candidates
-        if use_reranker and len(final_results) > top_k:
-            try:
-                from api.services.reranker import get_reranker
+        with trace_span("search_rerank", parent="tool_search_vault"):
+            if use_reranker and len(final_results) > top_k:
+                try:
+                    from api.services.reranker import get_reranker
 
-                # Find protected indices for factual queries
-                protected = find_protected_indices(
-                    expanded_query,
-                    final_results,
-                    max_protected=3
-                )
+                    # Find protected indices for factual queries
+                    protected = find_protected_indices(
+                        expanded_query,
+                        final_results,
+                        max_protected=3
+                    )
 
-                reranker = get_reranker()
-                final_results = reranker.rerank(
-                    query=expanded_query,
-                    results=final_results,
-                    top_k=top_k,
-                    content_key="content",
-                    protected_indices=protected if protected else None
-                )
+                    reranker = get_reranker()
+                    final_results = reranker.rerank(
+                        query=expanded_query,
+                        results=final_results,
+                        top_k=top_k,
+                        content_key="content",
+                        protected_indices=protected if protected else None
+                    )
 
-                if protected:
-                    logger.debug(f"Protected {len(protected)} results from reranking")
-                logger.debug(f"Re-ranked {len(final_results)} results with cross-encoder")
-            except Exception as e:
-                logger.warning(f"Re-ranking failed, using hybrid scores: {e}")
+                    if protected:
+                        logger.debug(f"Protected {len(protected)} results from reranking")
+                    logger.debug(f"Re-ranked {len(final_results)} results with cross-encoder")
+                except Exception as e:
+                    logger.warning(f"Re-ranking failed, using hybrid scores: {e}")
+                    final_results = final_results[:top_k]
+            else:
                 final_results = final_results[:top_k]
-        else:
-            final_results = final_results[:top_k]
 
         return final_results
 
