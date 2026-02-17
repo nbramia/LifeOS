@@ -139,22 +139,41 @@ class TestPersonFact:
         fact = PersonFact.from_dict(data)
         assert fact.category == "family"
 
-    def test_from_row_12_columns(self):
-        """from_row handles full 12-column schema."""
-        row = (
-            "fact-id",
-            "person-id",
-            "interests",
-            "hobby",
-            "hiking",
-            0.85,
-            "interaction-123",
-            "2025-01-15T10:00:00",
-            0,  # confirmed_by_user
-            "2025-01-14T09:00:00",
-            "I love hiking in the mountains",  # source_quote
-            "obsidian://open?vault=Notes&file=Meetings/2025-01-15",  # source_link
+    # Column types matching the real person_facts schema
+    _COLUMN_TYPES = {
+        "confidence": "REAL",
+        "confirmed_by_user": "INTEGER",
+    }
+
+    def _make_sqlite_row(self, columns, values):
+        """Create a sqlite3.Row from column names and values."""
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        col_defs = ", ".join(
+            f"{c} {self._COLUMN_TYPES.get(c, 'TEXT')}" for c in columns
         )
+        conn.execute(f"CREATE TABLE t ({col_defs})")
+        placeholders = ", ".join("?" for _ in values)
+        conn.execute(f"INSERT INTO t VALUES ({placeholders})", values)
+        row = conn.execute("SELECT * FROM t").fetchone()
+        conn.close()
+        return row
+
+    def test_from_row_12_columns(self):
+        """from_row handles full 12-column schema (fresh DB with source_quote/source_link)."""
+        columns = [
+            "id", "person_id", "category", "key", "value", "confidence",
+            "source_interaction_id", "source_quote", "source_link",
+            "extracted_at", "confirmed_by_user", "created_at",
+        ]
+        values = (
+            "fact-id", "person-id", "interests", "hobby", "hiking", 0.85,
+            "interaction-123", "I love hiking in the mountains",
+            "obsidian://open?vault=Notes&file=Meetings/2025-01-15",
+            "2025-01-15T10:00:00", 0, "2025-01-14T09:00:00",
+        )
+        row = self._make_sqlite_row(columns, values)
         fact = PersonFact.from_row(row)
 
         assert fact.id == "fact-id"
@@ -167,19 +186,16 @@ class TestPersonFact:
         assert "obsidian://" in fact.source_link
 
     def test_from_row_10_columns_legacy(self):
-        """from_row handles legacy 10-column schema."""
-        row = (
-            "fact-id",
-            "person-id",
-            "work",
-            "company",
-            "Acme Inc",
-            0.9,
-            "interaction-456",
-            "2025-01-15T10:00:00",
-            1,  # confirmed_by_user
-            "2025-01-14T09:00:00",
+        """from_row handles legacy 10-column schema (migrated DB without source_quote/source_link)."""
+        columns = [
+            "id", "person_id", "category", "key", "value", "confidence",
+            "source_interaction_id", "extracted_at", "confirmed_by_user", "created_at",
+        ]
+        values = (
+            "fact-id", "person-id", "work", "company", "Acme Inc", 0.9,
+            "interaction-456", "2025-01-15T10:00:00", 1, "2025-01-14T09:00:00",
         )
+        row = self._make_sqlite_row(columns, values)
         fact = PersonFact.from_row(row)
 
         assert fact.id == "fact-id"
