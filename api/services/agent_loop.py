@@ -22,6 +22,7 @@ from api.services.model_selector import get_claude_model_name
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
 from api.services.synthesizer import build_message_content
+from api.services.perf_trace import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -136,25 +137,26 @@ async def run_agent_loop(
     system_prompt = build_system_prompt()
 
     # Inject relevant memories into system prompt (with token budget)
-    try:
-        from api.services.memory_store import get_memory_store, format_memories_for_prompt
-        memory_store = get_memory_store()
-        relevant_memories = memory_store.get_relevant_memories(question, limit=5)
-        if relevant_memories:
-            # Apply token budget: ~400 words ≈ 500 tokens
-            budgeted = []
-            word_count = 0
-            for m in relevant_memories:
-                words = len(m.content.split())
-                if word_count + words > 400:
-                    break
-                budgeted.append(m)
-                word_count += words
-            if budgeted:
-                memory_text = format_memories_for_prompt(budgeted)
-                system_prompt.append({"type": "text", "text": memory_text})
-    except Exception as e:
-        logger.warning(f"Failed to load memories: {e}")
+    with trace_span("memory_inject"):
+        try:
+            from api.services.memory_store import get_memory_store, format_memories_for_prompt
+            memory_store = get_memory_store()
+            relevant_memories = memory_store.get_relevant_memories(question, limit=5)
+            if relevant_memories:
+                # Apply token budget: ~400 words ≈ 500 tokens
+                budgeted = []
+                word_count = 0
+                for m in relevant_memories:
+                    words = len(m.content.split())
+                    if word_count + words > 400:
+                        break
+                    budgeted.append(m)
+                    word_count += words
+                if budgeted:
+                    memory_text = format_memories_for_prompt(budgeted)
+                    system_prompt.append({"type": "text", "text": memory_text})
+        except Exception as e:
+            logger.warning(f"Failed to load memories: {e}")
 
     # Build messages array from conversation history
     messages = []
@@ -209,20 +211,21 @@ async def run_agent_loop(
         tool_use_blocks = []
         final_msg = None
 
-        try:
-            async for item in _stream_round(call_kwargs):
-                if isinstance(item, str):
-                    text_this_round += item
-                    yield {"type": "text", "content": item}
+        with trace_span(f"claude_api_round_{round_num}"):
+            try:
+                async for item in _stream_round(call_kwargs):
+                    if isinstance(item, str):
+                        text_this_round += item
+                        yield {"type": "text", "content": item}
+                    else:
+                        final_msg = item
+            except Exception as e:
+                print(f"[agent] Round {round_num} API error: {e}")
+                if result.full_text:
+                    yield {"type": "text", "content": f"\n\n(Search interrupted: {e})"}
                 else:
-                    final_msg = item
-        except Exception as e:
-            print(f"[agent] Round {round_num} API error: {e}")
-            if result.full_text:
-                yield {"type": "text", "content": f"\n\n(Search interrupted: {e})"}
-            else:
-                yield {"type": "text", "content": f"Sorry, I encountered an error: {e}"}
-            break
+                    yield {"type": "text", "content": f"Sorry, I encountered an error: {e}"}
+                break
 
         _track_usage(final_msg)
         result.full_text += text_this_round
@@ -267,7 +270,8 @@ async def run_agent_loop(
         async def _exec_one(block):
             name = block.name
             logger.info(f"Executing tool: {name} with input: {block.input}")
-            tool_result_str = await execute_tool_parallel(name, block.input)
+            with trace_span(f"tool_{name}"):
+                tool_result_str = await execute_tool_parallel(name, block.input)
             is_error = tool_result_str.startswith("Error:")
             result.tool_calls_log.append({
                 "tool": name,

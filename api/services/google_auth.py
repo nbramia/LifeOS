@@ -205,6 +205,16 @@ class GoogleAuthService:
             return False
 
 
+def resolve_account(account: str) -> GoogleAccount:
+    """Resolve a string account name ('personal'/'work') to a GoogleAccount enum."""
+    return GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
+
+
+def get_configured_accounts() -> list[GoogleAccount]:
+    """Return the list of configured Google account types."""
+    return [GoogleAccount.WORK, GoogleAccount.PERSONAL]
+
+
 # Singleton instances for each account
 _auth_services: dict[GoogleAccount, GoogleAuthService] = {}
 
