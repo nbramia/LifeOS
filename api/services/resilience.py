@@ -263,6 +263,19 @@ def is_retryable_status(status_code: int) -> bool:
     return False
 
 
+def is_retryable_api_error(exc: Exception) -> bool:
+    """Check if an exception is a transient Claude/Anthropic API error worth retrying."""
+    try:
+        import anthropic
+        if isinstance(exc, anthropic.APIStatusError):
+            return is_retryable_status(exc.status_code)
+        if isinstance(exc, anthropic.APIConnectionError):
+            return True
+    except ImportError:
+        pass
+    return isinstance(exc, (ConnectionError, TimeoutError))
+
+
 # Pre-configured retry configs for common use cases
 GOOGLE_API_RETRY = RetryConfig(
     max_retries=3,
