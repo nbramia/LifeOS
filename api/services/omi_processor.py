@@ -143,6 +143,9 @@ class OmiProcessor:
         self._timer: Optional[threading.Timer] = None
         self._running = False
         self._lock = threading.Lock()
+        # Cache: omi_id -> set of file paths (built lazily on first use)
+        self._id_cache: dict[str, set[Path]] = {}
+        self._cache_built = False
 
         # Destination folders (all under vault_path)
         # Work path loaded from settings
@@ -156,29 +159,57 @@ class OmiProcessor:
         self.dest_therapy = "Personal/Self-Improvement/Therapy and coaching/Omi"
         self.dest_work = f"{work_path}/Meetings/Omi"
 
+    def _ensure_cache(self):
+        """Build the omi_id -> file path cache on first use (one vault scan)."""
+        if self._cache_built:
+            return
+        self._id_cache = {}
+        for md_file in self.vault_path.rglob("*.md"):
+            try:
+                content = md_file.read_text(encoding="utf-8")
+                post = frontmatter.loads(content)
+                oid = post.metadata.get("omi_id")
+                if oid:
+                    if oid not in self._id_cache:
+                        self._id_cache[oid] = set()
+                    self._id_cache[oid].add(md_file)
+            except Exception:
+                continue
+        self._cache_built = True
+        logger.info(f"Built omi_id cache: {len(self._id_cache)} unique IDs")
+
+    def _update_cache(self, omi_id: str, old_path: Optional[Path], new_path: Optional[Path]):
+        """Update the cache after a file move/delete."""
+        if not self._cache_built or not omi_id:
+            return
+        if omi_id not in self._id_cache:
+            self._id_cache[omi_id] = set()
+        if old_path:
+            self._id_cache[omi_id].discard(old_path)
+        if new_path:
+            self._id_cache[omi_id].add(new_path)
+
     def find_files_by_omi_id(self, omi_id: str, exclude_path: Optional[Path] = None) -> list[Path]:
         """
         Find all files in the vault with the given omi_id.
 
-        Args:
-            omi_id: The Omi ID to search for
-            exclude_path: Path to exclude from results (typically the source file)
-
-        Returns:
-            List of paths to files with matching omi_id
+        Uses an in-memory cache (built once on first call) instead of scanning
+        the entire vault every time.
         """
-        matches = []
-        for md_file in self.vault_path.rglob("*.md"):
-            if exclude_path and md_file == exclude_path:
+        self._ensure_cache()
+        cached = self._id_cache.get(omi_id, set())
+        result = []
+        stale = []
+        for p in cached:
+            if exclude_path and p == exclude_path:
                 continue
-            try:
-                content = md_file.read_text(encoding="utf-8")
-                post = frontmatter.loads(content)
-                if post.metadata.get("omi_id") == omi_id:
-                    matches.append(md_file)
-            except Exception:
-                continue
-        return matches
+            if p.exists():
+                result.append(p)
+            else:
+                stale.append(p)
+        for p in stale:
+            cached.discard(p)
+        return result
 
     def delete_duplicates_by_omi_id(self, omi_id: str, keep_path: Optional[Path] = None) -> int:
         """
@@ -196,6 +227,7 @@ class OmiProcessor:
         for dup_path in duplicates:
             try:
                 dup_path.unlink()
+                self._update_cache(omi_id, old_path=dup_path, new_path=None)
                 logger.info(f"Deleted duplicate omi file: {dup_path}")
                 deleted += 1
             except Exception as e:
@@ -454,6 +486,7 @@ class OmiProcessor:
                     pass
                 return None
 
+        self._update_cache(omi_id, old_path=path, new_path=dest_path)
         logger.info(f"Processed: {path.name} -> {destination} ({rationale})")
         return str(dest_path)
 
@@ -575,6 +608,7 @@ class OmiProcessor:
                     pass
                 return None
 
+        self._update_cache(omi_id, old_path=path, new_path=dest_path)
         logger.info(f"Reclassified: {path.name} -> {destination} ({rationale})")
         return str(dest_path)
 
@@ -628,21 +662,14 @@ class OmiProcessor:
         Returns:
             Dict mapping omi_id to list of file paths (only for IDs with 2+ files)
         """
-        omi_files: dict[str, list[Path]] = {}
-
-        for md_file in self.vault_path.rglob("*.md"):
-            try:
-                content = md_file.read_text(encoding="utf-8")
-                post = frontmatter.loads(content)
-                omi_id = post.metadata.get("omi_id")
-                if omi_id:
-                    if omi_id not in omi_files:
-                        omi_files[omi_id] = []
-                    omi_files[omi_id].append(md_file)
-            except Exception:
-                continue
-
-        return {oid: paths for oid, paths in omi_files.items() if len(paths) > 1}
+        self._ensure_cache()
+        duplicates = {}
+        for oid, paths in self._id_cache.items():
+            existing = [p for p in paths if p.exists()]
+            self._id_cache[oid] = set(existing)
+            if len(existing) > 1:
+                duplicates[oid] = existing
+        return duplicates
 
     def deduplicate_all(self) -> dict:
         """

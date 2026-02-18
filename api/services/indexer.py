@@ -44,56 +44,74 @@ logger = logging.getLogger(__name__)
 
 
 class VaultEventHandler(FileSystemEventHandler):
-    """Handle file system events in the vault."""
+    """Handle file system events in the vault with global batch debouncing.
+
+    Collects all file changes within a window and processes them as a single
+    batch, preventing sustained indexing load from rapid file operations
+    (e.g., Granola/Omi processors moving multiple files).
+    """
+
+    _BATCH_DELAY = 5.0  # seconds - wait for activity to settle before processing
 
     def __init__(self, indexer: "IndexerService"):
         self.indexer = indexer
-        self._debounce_timers: dict[str, threading.Timer] = {}
+        self._pending: dict[str, str] = {}  # file_path -> action ("index" or "delete")
+        self._batch_timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-    def _debounced_process(self, file_path: str, action: str):
-        """Process file change with debouncing."""
+    def _queue(self, file_path: str, action: str):
+        """Queue a file change and reset the batch timer."""
         with self._lock:
-            # Cancel existing timer for this file
-            if file_path in self._debounce_timers:
-                self._debounce_timers[file_path].cancel()
+            self._pending[file_path] = action  # latest action wins
+            if self._batch_timer:
+                self._batch_timer.cancel()
+            self._batch_timer = threading.Timer(self._BATCH_DELAY, self._flush)
+            self._batch_timer.daemon = True
+            self._batch_timer.start()
 
-            # Create new timer
-            def process():
-                with self._lock:
-                    self._debounce_timers.pop(file_path, None)
+    def _flush(self):
+        """Process all pending file changes as a batch."""
+        with self._lock:
+            batch = dict(self._pending)
+            self._pending.clear()
+            self._batch_timer = None
+
+        if not batch:
+            return
+
+        logger.info(f"Processing batch of {len(batch)} file changes")
+        for file_path, action in batch.items():
+            try:
                 if action == "delete":
                     self.indexer.delete_file(file_path)
                 else:
                     self.indexer.index_file(file_path)
-
-            timer = threading.Timer(1.0, process)  # 1 second debounce
-            self._debounce_timers[file_path] = timer
-            timer.start()
+            except Exception as e:
+                logger.error(f"Failed to {action} {file_path}: {e}")
 
     def on_created(self, event: FileSystemEvent):
         if not event.is_directory and event.src_path.endswith(".md"):
             logger.info(f"File created: {event.src_path}")
-            self._debounced_process(event.src_path, "index")
+            self._queue(event.src_path, "index")
 
     def on_modified(self, event: FileSystemEvent):
         if not event.is_directory and event.src_path.endswith(".md"):
             logger.info(f"File modified: {event.src_path}")
-            self._debounced_process(event.src_path, "index")
+            self._queue(event.src_path, "index")
 
     def on_deleted(self, event: FileSystemEvent):
         if not event.is_directory and event.src_path.endswith(".md"):
             logger.info(f"File deleted: {event.src_path}")
-            self._debounced_process(event.src_path, "delete")
+            self._queue(event.src_path, "delete")
 
     def on_moved(self, event: FileSystemEvent):
         if not event.is_directory:
             if hasattr(event, 'src_path') and event.src_path.endswith(".md"):
                 logger.info(f"File moved from: {event.src_path}")
-                self._debounced_process(event.src_path, "delete")
+                self._queue(event.src_path, "delete")
             if hasattr(event, 'dest_path') and event.dest_path.endswith(".md"):
                 logger.info(f"File moved to: {event.dest_path}")
-                self._debounced_process(event.dest_path, "index")
+                self._queue(event.dest_path, "index")
 
 
 class IndexerService:

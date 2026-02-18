@@ -201,30 +201,61 @@ class GranolaProcessor:
         self._timer: Optional[threading.Timer] = None
         self._running = False
         self._lock = threading.Lock()
+        # Cache: granola_id -> set of file paths (built lazily on first use)
+        self._id_cache: dict[str, set[Path]] = {}
+        self._cache_built = False
+
+    def _ensure_cache(self):
+        """Build the granola_id -> file path cache on first use (one vault scan)."""
+        if self._cache_built:
+            return
+        self._id_cache = {}
+        for md_file in self.vault_path.rglob("*.md"):
+            try:
+                content = md_file.read_text(encoding="utf-8")
+                post = frontmatter.loads(content)
+                gid = post.metadata.get("granola_id")
+                if gid:
+                    if gid not in self._id_cache:
+                        self._id_cache[gid] = set()
+                    self._id_cache[gid].add(md_file)
+            except Exception:
+                continue
+        self._cache_built = True
+        logger.info(f"Built granola_id cache: {len(self._id_cache)} unique IDs")
+
+    def _update_cache(self, granola_id: str, old_path: Optional[Path], new_path: Optional[Path]):
+        """Update the cache after a file move/delete."""
+        if not self._cache_built or not granola_id:
+            return
+        if granola_id not in self._id_cache:
+            self._id_cache[granola_id] = set()
+        if old_path:
+            self._id_cache[granola_id].discard(old_path)
+        if new_path:
+            self._id_cache[granola_id].add(new_path)
 
     def find_files_by_granola_id(self, granola_id: str, exclude_path: Optional[Path] = None) -> list[Path]:
         """
         Find all files in the vault with the given granola_id.
 
-        Args:
-            granola_id: The Granola ID to search for
-            exclude_path: Path to exclude from results (typically the source file)
-
-        Returns:
-            List of paths to files with matching granola_id
+        Uses an in-memory cache (built once on first call) instead of scanning
+        the entire vault every time.
         """
-        matches = []
-        for md_file in self.vault_path.rglob("*.md"):
-            if exclude_path and md_file == exclude_path:
+        self._ensure_cache()
+        cached = self._id_cache.get(granola_id, set())
+        result = []
+        stale = []
+        for p in cached:
+            if exclude_path and p == exclude_path:
                 continue
-            try:
-                content = md_file.read_text(encoding="utf-8")
-                post = frontmatter.loads(content)
-                if post.metadata.get("granola_id") == granola_id:
-                    matches.append(md_file)
-            except Exception:
-                continue
-        return matches
+            if p.exists():
+                result.append(p)
+            else:
+                stale.append(p)
+        for p in stale:
+            cached.discard(p)
+        return result
 
     def delete_duplicates_by_granola_id(self, granola_id: str, keep_path: Optional[Path] = None) -> int:
         """
@@ -242,6 +273,7 @@ class GranolaProcessor:
         for dup_path in duplicates:
             try:
                 dup_path.unlink()
+                self._update_cache(granola_id, old_path=dup_path, new_path=None)
                 logger.info(f"Deleted duplicate granola file: {dup_path}")
                 deleted += 1
             except Exception as e:
@@ -484,6 +516,7 @@ class GranolaProcessor:
                     pass
                 return None
 
+        self._update_cache(granola_id, old_path=path, new_path=dest_path)
         logger.info(f"Processed: {path.name} -> {destination} ({rationale})")
         return str(dest_path)
 
@@ -612,6 +645,7 @@ class GranolaProcessor:
                     pass
                 return None
 
+        self._update_cache(granola_id, old_path=path, new_path=dest_path)
         logger.info(f"Reclassified: {path.name} -> {destination} ({rationale})")
         return str(dest_path)
 
@@ -665,22 +699,14 @@ class GranolaProcessor:
         Returns:
             Dict mapping granola_id to list of file paths (only for IDs with 2+ files)
         """
-        granola_files: dict[str, list[Path]] = {}
-
-        for md_file in self.vault_path.rglob("*.md"):
-            try:
-                content = md_file.read_text(encoding="utf-8")
-                post = frontmatter.loads(content)
-                granola_id = post.metadata.get("granola_id")
-                if granola_id:
-                    if granola_id not in granola_files:
-                        granola_files[granola_id] = []
-                    granola_files[granola_id].append(md_file)
-            except Exception:
-                continue
-
-        # Return only duplicates (2+ files with same granola_id)
-        return {gid: paths for gid, paths in granola_files.items() if len(paths) > 1}
+        self._ensure_cache()
+        duplicates = {}
+        for gid, paths in self._id_cache.items():
+            existing = [p for p in paths if p.exists()]
+            self._id_cache[gid] = set(existing)
+            if len(existing) > 1:
+                duplicates[gid] = existing
+        return duplicates
 
     def deduplicate_all(self) -> dict:
         """
