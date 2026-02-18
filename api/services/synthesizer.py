@@ -5,6 +5,7 @@ Handles Claude API calls for RAG synthesis.
 
 NOTE: anthropic library is imported lazily to speed up test collection.
 """
+import asyncio
 import base64
 import logging
 from datetime import datetime
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from config.settings import settings
 from api.services.model_selector import get_claude_model_name
+from api.services.resilience import is_retryable_api_error
 
 if TYPE_CHECKING:
     import anthropic
@@ -157,22 +159,33 @@ class Synthesizer:
         logger.debug(f"Using model: {model}")
 
         import anthropic
+        import time as _time
 
-        try:
-            response = self.client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            return response.content[0].text
-        except anthropic.APIError as e:
-            logger.error(f"Claude API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Synthesizer error: {e}")
-            raise
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                return response.content[0].text
+            except anthropic.APIStatusError as e:
+                if is_retryable_api_error(e) and attempt < max_retries:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(f"Claude API transient error ({e.status_code}), retry {attempt + 1}/{max_retries} in {delay}s")
+                    _time.sleep(delay)
+                    continue
+                logger.error(f"Claude API error: {e}")
+                raise
+            except anthropic.APIError as e:
+                logger.error(f"Claude API error: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Synthesizer error: {e}")
+                raise
 
     async def stream_response(
         self,
@@ -212,46 +225,59 @@ class Synthesizer:
 
         import anthropic
 
-        try:
-            with self.client.messages.stream(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "user", "content": message_content}
-                ]
-            ) as stream:
-                for text in stream.text_stream:
-                    yield text
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            text_yielded = False
+            try:
+                with self.client.messages.stream(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "user", "content": message_content}
+                    ]
+                ) as stream:
+                    for text in stream.text_stream:
+                        text_yielded = True
+                        yield text
 
-                # Get final message with usage data
-                final_message = stream.get_final_message()
-                if final_message and final_message.usage:
-                    usage = final_message.usage
-                    # Calculate cost based on model pricing (per million tokens)
-                    # Sonnet 3.5: $3/M input, $15/M output
-                    # Haiku 3.5: $0.80/M input, $4/M output
-                    if "haiku" in model.lower():
-                        input_cost = (usage.input_tokens / 1_000_000) * 0.80
-                        output_cost = (usage.output_tokens / 1_000_000) * 4.00
-                    else:  # Default to Sonnet pricing
-                        input_cost = (usage.input_tokens / 1_000_000) * 3.00
-                        output_cost = (usage.output_tokens / 1_000_000) * 15.00
+                    # Get final message with usage data
+                    final_message = stream.get_final_message()
+                    if final_message and final_message.usage:
+                        usage = final_message.usage
+                        # Calculate cost based on model pricing (per million tokens)
+                        # Sonnet 3.5: $3/M input, $15/M output
+                        # Haiku 3.5: $0.80/M input, $4/M output
+                        if "haiku" in model.lower():
+                            input_cost = (usage.input_tokens / 1_000_000) * 0.80
+                            output_cost = (usage.output_tokens / 1_000_000) * 4.00
+                        else:  # Default to Sonnet pricing
+                            input_cost = (usage.input_tokens / 1_000_000) * 3.00
+                            output_cost = (usage.output_tokens / 1_000_000) * 15.00
 
-                    total_cost = input_cost + output_cost
+                        total_cost = input_cost + output_cost
 
-                    yield {
-                        "type": "usage",
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "cost_usd": total_cost,
-                        "model": model
-                    }
-        except anthropic.APIError as e:
-            logger.error(f"Claude API streaming error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Synthesizer streaming error: {e}")
-            raise
+                        yield {
+                            "type": "usage",
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cost_usd": total_cost,
+                            "model": model
+                        }
+                break  # success
+            except anthropic.APIStatusError as e:
+                if not text_yielded and is_retryable_api_error(e) and attempt < max_retries:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(f"Claude API streaming transient error ({e.status_code}), retry {attempt + 1}/{max_retries} in {delay}s")
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(f"Claude API streaming error: {e}")
+                raise
+            except anthropic.APIError as e:
+                logger.error(f"Claude API streaming error: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Synthesizer streaming error: {e}")
+                raise
 
     async def get_response(
         self,

@@ -119,7 +119,7 @@ SYNC_SOURCES = {
         "script": "scripts/link_source_entities.py",
         "frequency": "daily",
         "phase": 2,
-        "depends_on": ["gmail", "calendar", "contacts", "linkedin"],
+        "depends_on": ["gmail_personal", "gmail_work", "calendar_personal", "calendar_work", "contacts", "linkedin"],
     },
     "photos": {
         "description": "Sync Apple Photos face recognition to CRM",
@@ -135,7 +135,7 @@ SYNC_SOURCES = {
         "script": "scripts/sync_relationship_discovery.py",
         "frequency": "daily",
         "phase": 3,
-        "depends_on": ["gmail", "calendar", "imessage", "whatsapp", "slack", "link_slack", "link_imessage", "phone"],
+        "depends_on": ["gmail_personal", "gmail_work", "calendar_personal", "calendar_work", "imessage", "whatsapp", "slack", "link_slack", "link_imessage", "phone"],
     },
     "strengths": {
         "description": "Recalculate relationship strengths for all people",

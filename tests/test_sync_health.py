@@ -234,7 +234,7 @@ class TestSyncHealthSummary:
         """Test summary when some sources have issues."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             # One fresh success
-            run_id = record_sync_start("gmail")
+            run_id = record_sync_start("gmail_personal")
             record_sync_complete(run_id, SyncStatus.SUCCESS)
 
             # One failure
@@ -289,7 +289,7 @@ class TestSyncSourceConfiguration:
 
     def test_all_sources_have_valid_frequency(self):
         """Test that all sync sources have valid frequency."""
-        valid_frequencies = ["daily", "weekly", "hourly"]
+        valid_frequencies = ["daily", "weekly", "hourly", "monthly"]
 
         for source, config in SYNC_SOURCES.items():
             assert config["frequency"] in valid_frequencies, \
@@ -394,14 +394,20 @@ class TestSyncHealthDailyCheck:
         # should be synced at appropriate intervals
         assert SYNC_STALE_HOURS == 24, "Stale threshold must be 24 hours"
 
-        # Most sources should sync daily, some can be weekly
-        allowed_frequencies = ["daily", "hourly", "weekly"]
-        weekly_allowed = ["contacts"]  # Contacts don't change often
+        # Most sources should sync daily; contacts weekly, financial monthly
+        allowed_frequencies = ["daily", "hourly", "weekly", "monthly"]
+        less_frequent_allowed = {
+            "contacts": "weekly",        # Contacts don't change often
+            "monarch_money": "monthly",  # Financial summaries are monthly
+        }
 
         for source, config in SYNC_SOURCES.items():
             assert config["frequency"] in allowed_frequencies, \
                 f"Source {source} has invalid frequency: {config['frequency']}"
 
-            if source not in weekly_allowed:
+            if source in less_frequent_allowed:
+                assert config["frequency"] == less_frequent_allowed[source], \
+                    f"Source {source} should be {less_frequent_allowed[source]}, not {config['frequency']}"
+            else:
                 assert config["frequency"] in ["daily", "hourly"], \
                     f"Source {source} must sync at least daily, not {config['frequency']}"

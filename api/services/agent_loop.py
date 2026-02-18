@@ -23,6 +23,7 @@ from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
+from api.services.resilience import is_retryable_api_error
 
 logger = logging.getLogger(__name__)
 
@@ -211,21 +212,37 @@ async def run_agent_loop(
         tool_use_blocks = []
         final_msg = None
 
+        api_error_fatal = False
         with trace_span(f"claude_api_round_{round_num}"):
-            try:
-                async for item in _stream_round(call_kwargs):
-                    if isinstance(item, str):
-                        text_this_round += item
-                        yield {"type": "text", "content": item}
+            max_api_retries = 2
+            for api_attempt in range(max_api_retries + 1):
+                try:
+                    async for item in _stream_round(call_kwargs):
+                        if isinstance(item, str):
+                            text_this_round += item
+                            yield {"type": "text", "content": item}
+                        else:
+                            final_msg = item
+                    break  # success
+                except Exception as e:
+                    if is_retryable_api_error(e) and api_attempt < max_api_retries:
+                        delay = 2 * (2 ** api_attempt)  # 2s, 4s
+                        logger.warning(f"Round {round_num} transient error ({e}), retry {api_attempt + 1}/{max_api_retries} in {delay}s")
+                        if text_this_round:
+                            yield {"type": "self_correction"}
+                            text_this_round = ""
+                        yield {"type": "status", "message": f"API temporarily unavailable, retrying in {delay}s..."}
+                        await asyncio.sleep(delay)
+                        continue
+                    print(f"[agent] Round {round_num} API error: {e}")
+                    if result.full_text:
+                        yield {"type": "text", "content": f"\n\n(Search interrupted: {e})"}
                     else:
-                        final_msg = item
-            except Exception as e:
-                print(f"[agent] Round {round_num} API error: {e}")
-                if result.full_text:
-                    yield {"type": "text", "content": f"\n\n(Search interrupted: {e})"}
-                else:
-                    yield {"type": "text", "content": f"Sorry, I encountered an error: {e}"}
-                break
+                        yield {"type": "text", "content": f"Sorry, I encountered an error: {e}"}
+                    api_error_fatal = True
+                    break
+        if api_error_fatal:
+            break
 
         _track_usage(final_msg)
         result.full_text += text_this_round
