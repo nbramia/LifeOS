@@ -46,11 +46,11 @@ You can also interface with it for general queries in the same way you'd interac
 
 | Getting Started | Guides | Reference |
 |-----------------|--------|-----------|
-| [Installation](docs/getting-started/INSTALLATION.md) | [Google OAuth](docs/guides/GOOGLE-OAUTH.md) | [API Reference](docs/architecture/API-MCP-REFERENCE.md) |
-| [Configuration](docs/getting-started/CONFIGURATION.md) | [Slack Integration](docs/guides/SLACK-INTEGRATION.md) | [Scripts](docs/reference/SCRIPTS.md) |
-| [First Run](docs/getting-started/FIRST-RUN.md) | [Task Management](docs/guides/TASK-MANAGEMENT.md) | [Troubleshooting](docs/reference/TROUBLESHOOTING.md) |
-|  | [Reminders](docs/guides/REMINDERS.md) | |
-|  | [Launchd Setup](docs/guides/LAUNCHD-SETUP.md) | |
+| [Installation](docs/guides/installation.md) | [Google OAuth](docs/guides/google-oauth.md) | [API Reference](docs/specs/product/api-reference.md) |
+| [Configuration](docs/guides/configuration.md) | [Slack Integration](docs/guides/slack-integration.md) | [Scripts](docs/guides/scripts.md) |
+| [First Run](docs/guides/first-run.md) | [Task Management](docs/specs/product/task-management.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
+|  | [Reminders](docs/guides/reminders.md) | |
+|  | [Launchd Setup](docs/guides/launchd-setup.md) | |
 
 ---
 
@@ -88,7 +88,7 @@ cp .env.example .env
 # 5. Open http://localhost:8000
 ```
 
-See [Installation Guide](docs/getting-started/INSTALLATION.md) for detailed instructions.
+See [Installation Guide](docs/guides/installation.md) for detailed instructions.
 
 ---
 
@@ -265,15 +265,20 @@ flowchart LR
 
 ## Documentation
 
-### Architecture
-- [Data & Sync](docs/architecture/DATA-AND-SYNC.md) - Data sources and sync processes
-- [API & MCP Reference](docs/architecture/API-MCP-REFERENCE.md) - API endpoints and MCP tools
-- [Frontend](docs/architecture/FRONTEND.md) - UI components
+### Specifications
+- [Data Model](docs/specs/product/data-model.md) - Two-tier entity model and relationships
+- [API Reference](docs/specs/product/api-reference.md) - API endpoints and MCP tools
+- [Data & Sync](docs/specs/technical/data-and-sync.md) - Sync pipeline and data sources
+- [Search & Indexing](docs/specs/technical/search-indexing.md) - Hybrid search internals
+- [Frontend](docs/specs/technical/frontend.md) - UI components
 
-### PRDs
-- [Chat UI](docs/prd/CHAT-UI.md)
-- [CRM UI](docs/prd/CRM-UI.md)
-- [MCP Tools](docs/prd/MCP-TOOLS.md)
+### Product
+- [Chat UI](docs/specs/product/chat-ui.md)
+- [CRM UI](docs/specs/product/crm-ui.md)
+- [MCP Tools](docs/specs/product/mcp-tools.md)
+
+### Architecture Decisions
+- [ADR Index](docs/adr/) - Why we chose Python/FastAPI, ChromaDB, hybrid search, and more
 
 ---
 
