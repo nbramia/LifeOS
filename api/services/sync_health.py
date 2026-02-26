@@ -130,6 +130,13 @@ SYNC_SOURCES = {
     },
 
     # === Phase 3: Relationship Building ===
+    "person_stats_full": {
+        "description": "Full refresh of all PersonEntity counts and timestamps",
+        "script": "scripts/sync_person_stats.py",
+        "frequency": "daily",
+        "phase": 3,
+        "depends_on": ["photos", "link_source_entities"],
+    },
     "relationship_discovery": {
         "description": "Discover relationships and populate edge weights",
         "script": "scripts/sync_relationship_discovery.py",
