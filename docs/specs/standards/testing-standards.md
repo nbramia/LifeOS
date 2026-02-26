@@ -1,0 +1,182 @@
+# Testing Standards
+
+> **Status:** Complete
+> **Last Updated:** 2026-02-19
+> **Audience:** All developers and AI agents
+
+Testing patterns and conventions for the LifeOS codebase.
+
+These are rules, not suggestions. PRs that violate testing standards should be rejected.
+
+---
+
+## Test Organization
+
+All tests live in the `tests/` directory. Files follow the `test_<module>.py` naming convention. There is no nested directory structure -- all test files are at the top level (except `tests/e2e/`, `tests/archive/`, and `tests/fixtures/`).
+
+| Pattern | Example |
+|---------|---------|
+| Service tests | `test_task_manager.py` |
+| API route tests | `test_tasks_api.py` |
+| E2E / browser tests | `test_e2e_flow.py`, `test_ui_browser.py` |
+| Benchmark tests | `test_perf_benchmark.py` |
+
+## Test Levels
+
+| Level | Command | What it runs |
+|-------|---------|-------------|
+| Unit | `./scripts/test.sh` | Fast tests, no external deps (~30s) |
+| Smoke | `./scripts/test.sh smoke` | Unit + critical browser test (used by deploy) |
+| All | `./scripts/test.sh all` | Unit + integration + browser |
+| Health | `./scripts/test.sh health` | Quick server health check |
+
+Unit tests are the default and exclude markers: `browser`, `requires_server`, `integration`, `slow`.
+
+## Remote Testing Workflow
+
+Tests run on the Mac Mini (server), not locally on the MacBook. The virtual environment only exists on the Mac Mini.
+
+```bash
+# Run unit tests
+ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"
+
+# Run a specific test file
+ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && \
+  ~/.venvs/lifeos/bin/python -m pytest tests/test_task_manager.py -v --tb=short"
+
+# Run smoke tests (unit + critical browser)
+ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh smoke"
+```
+
+## Test Naming
+
+- Test functions: `test_<description>` with descriptive names (e.g., `test_create_basic_task`, `test_complete_task_not_found`).
+- Test classes: `Test<Feature>` grouping related tests (e.g., `TestCreate`, `TestStatusTransitions`, `TestTasksAPI`).
+- Docstrings on every test function describing what is being verified.
+
+```python
+class TestCreate:
+    """Tests for create method."""
+
+    def test_create_basic_task(self, task_manager):
+        """Test creating a basic task."""
+        task = task_manager.create("Test task")
+        assert task.id
+        assert task.status == "todo"
+```
+
+## Markers
+
+Custom markers are registered in `conftest.py`:
+
+| Marker | Purpose |
+|--------|---------|
+| `@pytest.mark.unit` | Fast unit tests |
+| `@pytest.mark.slow` | Tests needing ChromaDB, embeddings, or file watchers |
+| `@pytest.mark.integration` | Tests requiring a running server |
+| `@pytest.mark.browser` | Playwright browser tests |
+| `@pytest.mark.requires_ollama` | Tests requiring Ollama LLM |
+| `@pytest.mark.requires_server` | Tests requiring the API server |
+| `@pytest.mark.requires_db` | Tests needing direct database access |
+
+Apply `pytestmark = pytest.mark.unit` at the module level for unit test files.
+
+## Fixture Patterns
+
+Shared fixtures are in `tests/conftest.py`. Key fixtures:
+
+| Fixture | Scope | Purpose |
+|---------|-------|---------|
+| `test_vault_path` | session | Temporary vault directory with standard folders |
+| `test_data_path` | session | Temporary data directory for ChromaDB/SQLite |
+| `mock_settings` | function | Patched `config.settings.settings` with temp paths |
+| `server_available` | session | Checks if API server is running |
+| `ollama_available` | session | Checks if Ollama is available |
+| `reset_singletons_after_test` | function (autouse) | Resets service singletons to prevent test pollution |
+
+Test-specific fixtures use `tmp_path` for isolated file system state:
+
+```python
+@pytest.fixture
+def task_manager(tmp_vault, tmp_index):
+    """Create a TaskManager with temporary paths."""
+    return TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+```
+
+## Mocking Patterns
+
+API route tests mock the service singleton via `unittest.mock.patch`:
+
+```python
+@pytest.fixture
+def mock_task_manager(self):
+    with patch("api.routes.tasks.get_task_manager") as mock:
+        manager = mock.return_value
+        manager.create.return_value = sample_task
+        manager.get.return_value = sample_task
+        yield manager
+```
+
+Route tests use FastAPI's `TestClient`:
+
+```python
+@pytest.fixture
+def client(self):
+    from fastapi.testclient import TestClient
+    from api.main import app
+    return TestClient(app)
+```
+
+Service tests use real objects with temporary paths -- no mocking of the service under test.
+
+## Pre-existing Test Failures
+
+These tests fail on clean `main` and are NOT caused by new changes:
+
+- `test_mcp_server.py::TestAPIOpenAPISync::test_openapi_endpoints_match_curated` -- curated endpoint path format mismatch
+- `test_p91_data_integrity.py` -- stale person IDs in interactions database
+
+Do not spend time fixing these unless explicitly asked.
+
+## When Tests Fail After Your Changes
+
+The default assumption is that your code is wrong, not the test. Before modifying any test, answer all three:
+
+1. **What was this test originally meant to verify?** Read the test name, docstring, and assertions carefully.
+2. **Why is it failing now — what specific change caused the failure?** Trace the failure to your diff.
+3. **Is the correct fix to (a) fix your code, (b) update the test to match intentionally changed behavior, or (c) remove the test because the behavior no longer exists?**
+
+Option (a) is the default. Options (b) and (c) require explicit justification in the commit message.
+
+**Never:**
+- Delete a failing test to make the suite pass.
+- Mark a test as skipped/xfail to unblock a commit.
+- Rewrite a test you don't fully understand.
+- Weaken assertions (e.g., changing `assertEqual` to `assertIn`) without justification.
+
+## Benchmark Tests
+
+`test_perf_benchmark.py` runs queries against a **live server**, collects perf traces, and validates answer quality. It is not part of the unit test suite.
+
+```bash
+ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && \
+  ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
+```
+
+Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal data can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
+
+## Singleton Reset
+
+The `reset_singletons_after_test` autouse fixture (in `conftest.py`) calls `tests/reset_singletons.py` after every test to clear cached service instances. This prevents state leakage between tests. ML singletons (embedding model) are only reset once at session end to avoid expensive reloads.
+
+## Coverage
+
+There is no enforced coverage threshold. The project relies on targeted tests for each service and route rather than coverage metrics.
+
+---
+
+## Related Documents
+
+- [specs/technical/architecture.md](../technical/architecture.md) -- system architecture and code structure
+- [AGENTS.md](../../../AGENTS.md) -- development workflow and agent instructions
+- [Python Conventions](python-conventions.md) -- coding style and module patterns
