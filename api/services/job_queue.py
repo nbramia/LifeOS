@@ -10,6 +10,7 @@ Usage:
     job_id = queue.enqueue("reindex_vault", params={"force": True})
     status = queue.get_job(job_id)
 """
+import contextlib
 import json
 import logging
 import sqlite3
@@ -108,10 +109,18 @@ class JobQueue:
                 ON jobs (status, priority, created_at)
             """)
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _conn(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def enqueue(
         self,
