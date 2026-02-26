@@ -34,6 +34,7 @@ from api.services.source_entity import (
     LINK_STATUS_AUTO,
 )
 from api.services.person_entity import get_person_entity_store
+from config.settings import settings
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -370,6 +371,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
 
     resolver = get_entity_resolver()
     interaction_db = get_interaction_db_path()
+    my_person_id = settings.my_person_id
 
     # Connect to wacli database
     wacli_conn = sqlite3.connect(str(wacli_db_path))
@@ -502,6 +504,9 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
                         continue
 
                     person_id = result.entity.id
+                    # Skip self - don't create self-referential interactions
+                    if person_id == my_person_id:
+                        continue
                     affected_person_ids.add(person_id)
                     p_display = p_name or p_phone
                     title = f"WhatsApp → {chat_name} ({p_display})"
