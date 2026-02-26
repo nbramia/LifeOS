@@ -207,6 +207,7 @@ class ApplePhotosSync:
             SyncStats with sync results
         """
         stats = SyncStats()
+        photos_person_to_entity: dict[int, str] = {}
 
         try:
             photos_reader = self._get_photos_reader()
@@ -226,8 +227,6 @@ class ApplePhotosSync:
             logger.info(f"Found {len(people_with_contacts)} people linked to Contacts")
 
             # Match each Photos person to PersonEntity
-            photos_person_to_entity: dict[int, str] = {}
-
             for photos_person in people_with_contacts:
                 stats.contact_lookups_attempted += 1
 
@@ -278,6 +277,13 @@ class ApplePhotosSync:
         except Exception as e:
             logger.error(f"Error in Photos sync: {e}")
             stats.errors += 1
+
+        # Refresh stats for all people who got photo interactions
+        affected_person_ids = list(photos_person_to_entity.values())
+        if affected_person_ids and stats.interactions_created > 0:
+            from api.services.person_stats import refresh_person_stats
+            logger.info(f"Refreshing stats for {len(affected_person_ids)} people with photo interactions...")
+            refresh_person_stats(affected_person_ids)
 
         logger.info(
             f"Photos sync complete: {stats.source_entities_created} sources, "

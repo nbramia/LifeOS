@@ -279,8 +279,9 @@ SYNC_ORDER = [
 
     # === Phase 3: Relationship Building ===
     # Build relationships using all collected interaction data
-    # Note: person_stats is no longer in sync order - each sync script refreshes
-    # its own affected PersonEntity stats via refresh_person_stats()
+    # Each sync script refreshes its own affected stats, but we do a full
+    # refresh here to catch anything missed (photos, edge cases, timestamps)
+    "person_stats_full",        # Full refresh of all PersonEntity counts + timestamps
     "relationship_discovery",   # Discover relationships, populate edge weights
     "strengths",                # Calculate relationship strength scores
     "push_birthdays",           # Push LifeOS birthdays to Apple Contacts
@@ -324,7 +325,7 @@ SYNC_SCRIPTS = {
     "photos": ("scripts/sync_photos.py", ["--execute"]),
 
     # Phase 3: Relationship Building
-    # Note: person_stats removed - each sync script now refreshes its own stats
+    "person_stats_full": ("scripts/sync_person_stats.py", ["--full", "--execute"]),
     "relationship_discovery": ("scripts/sync_relationship_discovery.py", ["--execute"]),
     "strengths": ("scripts/sync_strengths.py", ["--execute"]),
     "push_birthdays": ("scripts/push_birthdays_to_contacts.py", ["--execute"]),
