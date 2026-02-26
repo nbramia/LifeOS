@@ -329,7 +329,9 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
         'interactions_created': 0,
         'interactions_skipped': 0,
         'skipped_lid': 0,
+        'resolved_lid': 0,
         'skipped_large_group': 0,
+        'outgoing_group_created': 0,
         'persons_not_found': 0,
         'errors': 0,
     }
@@ -382,6 +384,21 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     """)
     group_sizes = {row['group_jid']: row['participant_count'] for row in wacli_cursor.fetchall()}
     logger.info(f"Loaded sizes for {len(group_sizes)} groups")
+
+    # Build LID-to-push_name dictionary for name-based resolution
+    wacli_cursor.execute("""
+        SELECT jid, push_name FROM contacts
+        WHERE jid LIKE '%@lid' AND push_name IS NOT NULL AND push_name != ''
+    """)
+    lid_names = {row['jid']: row['push_name'] for row in wacli_cursor.fetchall()}
+    logger.info(f"Loaded {len(lid_names)} LID push_names")
+
+    # Build group -> participant list for outgoing group fan-out
+    wacli_cursor.execute("SELECT group_jid, user_jid FROM group_participants")
+    group_members: dict[str, list[str]] = {}
+    for row in wacli_cursor.fetchall():
+        group_members.setdefault(row['group_jid'], []).append(row['user_jid'])
+    logger.info(f"Loaded participants for {len(group_members)} groups")
 
     # Connect to interaction database
     int_conn = sqlite3.connect(interaction_db)
@@ -442,50 +459,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
                     stats['skipped_large_group'] += 1
                     continue
 
-            # Determine the phone/person for this interaction
-            # For incoming messages (from_me=0): use sender_jid
-            # For outgoing messages (from_me=1): use chat_jid (the recipient)
-            if from_me:
-                # Outgoing message - skip if group (no single recipient)
-                if is_group:
-                    stats['interactions_skipped'] += 1
-                    continue
-                # For DMs, the chat_jid is the recipient
-                target_jid = chat_jid
-                target_name = chat_name or sender_name
-            else:
-                # Incoming message - use sender
-                target_jid = sender_jid
-                target_name = sender_name
-
-                # Skip linked device IDs for incoming messages
-                if target_jid and '@lid' in target_jid:
-                    stats['skipped_lid'] += 1
-                    continue
-
-            # Extract phone from target JID
-            phone = extract_phone_from_jid(target_jid)
-            if not phone:
-                stats['interactions_skipped'] += 1
-                continue
-
-            # Resolve to PersonEntity
-            result = resolver.resolve(
-                name=target_name if target_name else None,
-                phone=phone,
-                create_if_missing=True,  # Create new person if not found (matches contact sync)
-            )
-
-            if not result or not result.entity:
-                stats['persons_not_found'] += 1
-                continue
-
-            person_id = result.entity.id
-
-            # Track for stats refresh
-            affected_person_ids.add(person_id)
-
-            # Parse timestamp
+            # Parse timestamp early (used by all paths)
             try:
                 if isinstance(timestamp, str):
                     ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
@@ -494,14 +468,104 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
             except Exception:
                 ts = datetime.now(timezone.utc)
 
-            # Create interaction record
-            interaction_id = str(uuid.uuid4())
-            direction = "→" if from_me else "←"
-            title = f"WhatsApp {direction} {target_name or phone}"
             snippet = text[:500] if text else ""
 
+            # Determine the phone/person for this interaction
+            # For incoming messages (from_me=0): use sender_jid
+            # For outgoing messages (from_me=1): use chat_jid (the recipient)
+            if from_me and is_group:
+                # Outgoing group message - fan out to each participant
+                participants = group_members.get(chat_jid, [])
+                for participant_jid in participants:
+                    participant_source_id = f"whatsapp_{msg_id}:{participant_jid}"
+                    if participant_source_id in existing_ids:
+                        continue
+
+                    # Resolve participant by phone or LID name
+                    p_phone = None
+                    p_name = None
+                    if '@lid' in participant_jid:
+                        p_name = lid_names.get(participant_jid)
+                        if not p_name:
+                            continue
+                    else:
+                        p_phone = extract_phone_from_jid(participant_jid)
+                        if not p_phone:
+                            continue
+
+                    result = resolver.resolve(
+                        name=p_name,
+                        phone=p_phone,
+                        create_if_missing=False,
+                    )
+                    if not result or not result.entity:
+                        continue
+
+                    person_id = result.entity.id
+                    affected_person_ids.add(person_id)
+                    p_display = p_name or p_phone
+                    title = f"WhatsApp → {chat_name} ({p_display})"
+
+                    batch.append((
+                        str(uuid.uuid4()),
+                        person_id,
+                        ts.isoformat(),
+                        'whatsapp',
+                        title,
+                        snippet,
+                        None,
+                        participant_source_id,
+                        datetime.now(timezone.utc).isoformat(),
+                    ))
+                    stats['interactions_created'] += 1
+                    stats['outgoing_group_created'] += 1
+                continue
+
+            if from_me:
+                # Outgoing DM - the chat_jid is the recipient
+                target_jid = chat_jid
+                target_name = chat_name or sender_name
+            else:
+                # Incoming message - use sender
+                target_jid = sender_jid
+                target_name = sender_name
+
+            # Resolve target: by phone for @s.whatsapp.net, by name for @lid
+            phone = None
+            if target_jid and '@lid' in target_jid:
+                push_name = lid_names.get(target_jid)
+                if push_name:
+                    target_name = push_name
+                    stats['resolved_lid'] += 1
+                else:
+                    stats['skipped_lid'] += 1
+                    continue
+            else:
+                phone = extract_phone_from_jid(target_jid)
+                if not phone:
+                    stats['interactions_skipped'] += 1
+                    continue
+
+            # Resolve to PersonEntity
+            result = resolver.resolve(
+                name=target_name if target_name else None,
+                phone=phone,
+                create_if_missing=True,
+            )
+
+            if not result or not result.entity:
+                stats['persons_not_found'] += 1
+                continue
+
+            person_id = result.entity.id
+            affected_person_ids.add(person_id)
+
+            # Create interaction record
+            direction = "→" if from_me else "←"
+            title = f"WhatsApp {direction} {target_name or phone}"
+
             batch.append((
-                interaction_id,
+                str(uuid.uuid4()),
                 person_id,
                 ts.isoformat(),
                 'whatsapp',
@@ -545,7 +609,9 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     logger.info(f"Messages read: {stats['messages_read']}")
     logger.info(f"Interactions created: {stats['interactions_created']}")
     logger.info(f"Interactions skipped (duplicates): {stats['interactions_skipped']}")
-    logger.info(f"Skipped (linked device IDs): {stats['skipped_lid']}")
+    logger.info(f"Resolved LID by push_name: {stats['resolved_lid']}")
+    logger.info(f"Skipped (LID without push_name): {stats['skipped_lid']}")
+    logger.info(f"Outgoing group interactions: {stats['outgoing_group_created']}")
     logger.info(f"Skipped (large groups >20): {stats['skipped_large_group']}")
     logger.info(f"Persons not found: {stats['persons_not_found']}")
     logger.info(f"Errors: {stats['errors']}")

@@ -14,11 +14,15 @@ from datetime import datetime, timezone
 
 
 class TestRecalculatePersonStats:
-    """Tests for _recalculate_person_stats helper function."""
+    """Tests for _recalculate_person_stats helper function.
+
+    _recalculate_person_stats delegates to refresh_person_stats() for actual
+    computation. These tests verify the delegation and return value contract.
+    """
 
     @pytest.fixture
     def mock_int_conn(self):
-        """Create an in-memory SQLite connection with test data."""
+        """Create an in-memory SQLite connection (passed but unused after refactor)."""
         conn = sqlite3.connect(":memory:")
         conn.execute("""
             CREATE TABLE interactions (
@@ -28,25 +32,12 @@ class TestRecalculatePersonStats:
                 timestamp TEXT
             )
         """)
-        # Insert test interactions
-        test_data = [
-            ("i1", "person-1", "gmail", "2024-01-01T10:00:00"),
-            ("i2", "person-1", "gmail", "2024-01-02T10:00:00"),
-            ("i3", "person-1", "calendar", "2024-01-03T10:00:00"),
-            ("i4", "person-1", "imessage", "2024-01-04T10:00:00"),
-            ("i5", "person-1", "vault", "2024-01-05T10:00:00"),
-            ("i6", "person-2", "gmail", "2024-01-06T10:00:00"),
-        ]
-        conn.executemany(
-            "INSERT INTO interactions VALUES (?, ?, ?, ?)",
-            test_data
-        )
         conn.commit()
         return conn
 
     @pytest.fixture
     def mock_person_store(self):
-        """Create mock person store."""
+        """Create mock person store that simulates refresh_person_stats updating the entity."""
         from api.services.person_entity import PersonEntity
 
         person = PersonEntity(
@@ -58,28 +49,42 @@ class TestRecalculatePersonStats:
             mention_count=1,
         )
 
+        def mock_refresh(person_ids, save=True):
+            """Simulate refresh_person_stats updating the entity in-place."""
+            person.email_count = 2
+            person.meeting_count = 1
+            person.message_count = 1
+            person.mention_count = 1
+            return {'updated': 1, 'total_interactions': 5}
+
         store = MagicMock()
         store.get_by_id.return_value = person
         store.update.return_value = None
-        return store
+        return store, mock_refresh
 
     def test_recalculates_stats_from_interactions(self, mock_int_conn, mock_person_store):
-        """Stats are recalculated from interactions table."""
+        """Stats are recalculated via refresh_person_stats delegation."""
         from api.routes.crm import _recalculate_person_stats
 
-        result = _recalculate_person_stats("person-1", mock_int_conn, mock_person_store)
+        store, mock_refresh = mock_person_store
+
+        with patch("api.services.person_stats.refresh_person_stats", side_effect=mock_refresh):
+            result = _recalculate_person_stats("person-1", mock_int_conn, store)
 
         # Verify stats were recalculated
-        assert result['new']['email_count'] == 2  # 2 gmail interactions
-        assert result['new']['meeting_count'] == 1  # 1 calendar interaction
-        assert result['new']['message_count'] == 1  # 1 imessage interaction
-        assert result['new']['mention_count'] == 1  # 1 vault interaction
+        assert result['new']['email_count'] == 2
+        assert result['new']['meeting_count'] == 1
+        assert result['new']['message_count'] == 1
+        assert result['new']['mention_count'] == 1
 
     def test_preserves_old_stats_for_comparison(self, mock_int_conn, mock_person_store):
         """Old stats are returned for logging/comparison."""
         from api.routes.crm import _recalculate_person_stats
 
-        result = _recalculate_person_stats("person-1", mock_int_conn, mock_person_store)
+        store, mock_refresh = mock_person_store
+
+        with patch("api.services.person_stats.refresh_person_stats", side_effect=mock_refresh):
+            result = _recalculate_person_stats("person-1", mock_int_conn, store)
 
         assert result['old']['email_count'] == 10
         assert result['old']['meeting_count'] == 5
