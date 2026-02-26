@@ -887,25 +887,17 @@ def _recalculate_person_stats(person_id: str, int_conn, person_store) -> dict:
     """
     Recalculate person stats from the interactions table.
 
+    Delegates to refresh_person_stats() as the single source of truth for
+    count and timestamp computation.
+
     Returns dict of updated stats for logging.
     """
-    from datetime import datetime, timezone
+    from api.services.person_stats import refresh_person_stats
 
     person = person_store.get_by_id(person_id)
     if not person:
         return {}
 
-    # Query interaction counts by source_type
-    cursor = int_conn.execute("""
-        SELECT source_type, COUNT(*) as count
-        FROM interactions
-        WHERE person_id = ?
-        GROUP BY source_type
-    """, (person_id,))
-
-    counts = {row[0]: row[1] for row in cursor.fetchall()}
-
-    # Map source_types to person stats
     old_stats = {
         'email_count': person.email_count,
         'meeting_count': person.meeting_count,
@@ -913,63 +905,10 @@ def _recalculate_person_stats(person_id: str, int_conn, person_store) -> dict:
         'mention_count': person.mention_count,
     }
 
-    person.email_count = counts.get('gmail', 0)
-    person.meeting_count = counts.get('calendar', 0)
-    person.message_count = (
-        counts.get('imessage', 0) +
-        counts.get('whatsapp', 0) +
-        counts.get('phone', 0)
-    )
-    person.mention_count = counts.get('vault', 0) + counts.get('granola', 0)
+    refresh_person_stats([person_id], save=True)
 
-    # Update first_seen/last_seen from interactions
-    cursor = int_conn.execute("""
-        SELECT MIN(timestamp), MAX(timestamp)
-        FROM interactions
-        WHERE person_id = ?
-    """, (person_id,))
-    row = cursor.fetchone()
-    interaction_first = None
-    interaction_last = None
-    if row and row[0]:
-        interaction_first = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
-    if row and row[1]:
-        interaction_last = datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc)
-
-    # Also check source_entities for earliest observed_at (may have older history)
-    crm_conn = sqlite3.connect(Path("data/crm.db"))
-    crm_cursor = crm_conn.execute("""
-        SELECT MIN(observed_at), MAX(observed_at)
-        FROM source_entities
-        WHERE canonical_person_id = ?
-    """, (person_id,))
-    se_row = crm_cursor.fetchone()
-    crm_conn.close()
-
-    source_first = None
-    source_last = None
-    if se_row and se_row[0]:
-        source_first = datetime.fromisoformat(se_row[0]).replace(tzinfo=timezone.utc)
-    if se_row and se_row[1]:
-        source_last = datetime.fromisoformat(se_row[1]).replace(tzinfo=timezone.utc)
-
-    # Use earliest first_seen from either source
-    if interaction_first and source_first:
-        person.first_seen = min(interaction_first, source_first)
-    else:
-        person.first_seen = interaction_first or source_first
-
-    # Use latest last_seen from either source (but cap at today for future calendar events)
-    now = datetime.now(timezone.utc)
-    if interaction_last and source_last:
-        person.last_seen = min(max(interaction_last, source_last), now)
-    elif interaction_last:
-        person.last_seen = min(interaction_last, now)
-    elif source_last:
-        person.last_seen = min(source_last, now)
-
-    person_store.update(person)
-
+    # Re-fetch to get updated stats
+    person = person_store.get_by_id(person_id)
     new_stats = {
         'email_count': person.email_count,
         'meeting_count': person.meeting_count,
