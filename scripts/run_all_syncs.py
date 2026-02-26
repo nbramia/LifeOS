@@ -813,6 +813,23 @@ def run_all_syncs(
     if not dry_run:
         send_sync_summary_telegram(result, trigger=trigger)
 
+    # Restart server to pick up any changes and clear stale state
+    if not dry_run:
+        try:
+            restart_result = subprocess.run(
+                [str(Path(__file__).parent / "server.sh"), "restart"],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(Path(__file__).parent.parent),
+            )
+            if restart_result.returncode == 0:
+                logger.info("Server restarted successfully after sync")
+            else:
+                logger.warning(f"Server restart failed: {restart_result.stderr[:200]}")
+        except subprocess.TimeoutExpired:
+            logger.warning("Server restart timed out (300s)")
+        except Exception as e:
+            logger.warning(f"Could not restart server post-sync: {e}")
+
     return result
 
 
