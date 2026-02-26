@@ -90,7 +90,7 @@ class PersonEntity:
     hidden_reason: str = ""
 
     # Relationship strength (computed, not stored - see relationship_metrics.py)
-    # Formula: (recency × 0.3) + (frequency × 0.4) + (diversity × 0.3)
+    # Formula: (recency × 0.3) + (frequency × 0.6) + (diversity × 0.1)
     _relationship_strength: Optional[float] = field(default=None, repr=False)
 
     # Peripheral contact flag - True means excluded from expensive aggregations
