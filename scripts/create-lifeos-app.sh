@@ -76,10 +76,11 @@ cat > "$APP_PATH/Contents/MacOS/LifeOS" << SCRIPT
 # All scripts that need FDA or access to ~/Documents/ should route through here.
 #
 # Usage:
-#   LifeOS              - Start the API server (default, used by launchd)
-#   LifeOS fda-sync     - Run FDA sync (phone/iMessage via Terminal.app)
-#   LifeOS watchdog     - ChromaDB health check and auto-restart
-#   LifeOS exec <cmd>   - Run arbitrary command with FDA permissions
+#   LifeOS                  - Start the API server (default, used by launchd)
+#   LifeOS fda-sync         - Run FDA sync (phone/iMessage via Terminal.app)
+#   LifeOS watchdog         - ChromaDB health check and auto-restart
+#   LifeOS server-watchdog  - Server health check and auto-restart
+#   LifeOS exec <cmd>       - Run arbitrary command with FDA permissions
 
 LIFEOS_DIR="$PROJECT_DIR"
 
@@ -107,6 +108,10 @@ EOF
         osascript -e "tell application \"Terminal\" to do script \"cd \$LIFEOS_DIR && ~/.venvs/lifeos/bin/python scripts/run_fda_syncs.py && sleep 2 && exit\""
         ;;
 
+    server-watchdog)
+        exec "\$LIFEOS_DIR/scripts/server-watchdog.sh"
+        ;;
+
     watchdog)
         HEALTH_URL="http://localhost:8001/api/v2/heartbeat"
         LOG="\$LIFEOS_DIR/logs/chromadb-watchdog.log"
@@ -130,7 +135,7 @@ EOF
 
     *)
         echo "Unknown command: \$1" >&2
-        echo "Usage: LifeOS [server|fda-sync|watchdog|exec <cmd>]" >&2
+        echo "Usage: LifeOS [server|fda-sync|watchdog|server-watchdog|exec <cmd>]" >&2
         exit 1
         ;;
 esac
