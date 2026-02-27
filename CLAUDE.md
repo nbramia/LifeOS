@@ -7,6 +7,19 @@
 - Use plan mode for non-trivial tasks (3+ files, architectural decisions, unclear requirements).
 - After modifying docs, verify compliance with [docs/AGENTS.md](docs/AGENTS.md) standards.
 - After modifying code, restart server on Mac Mini before testing.
+- When creating new directories or modules, check if an AGENTS.md + CLAUDE.md pair is appropriate.
+
+## Skills
+
+Available as slash commands. See `.claude/skills/` for full details.
+
+| Skill | Purpose |
+|-------|---------|
+| `/implement <task>` | Full lifecycle: plan → implement → PR → adversarial review → merge |
+| `/review-pr <number>` | Adversarial PR review with specialist subagents |
+| `/address-review <number>` | Address PR review feedback with independent verification |
+| `/pr-check [number]` | Validate PR against standards before requesting review |
+| `/merge-pr <number>` | Merge PR, update linked issues |
 
 ## Remote Development
 
