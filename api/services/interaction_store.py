@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # while being filterable in timeline views
 UNDATED_SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# Reject interactions with source_ids pointing to temp directories (test artifacts)
+TEMP_PREFIXES = ('/tmp', '/private/var/folders', '/var/folders')
+
 
 def get_interaction_db_path() -> str:
     """Get the path to the interactions database."""
@@ -273,6 +276,11 @@ class InteractionStore:
         Returns:
             The added interaction
         """
+        # Guard: reject interactions with temp-dir source_ids (test artifacts)
+        if interaction.source_id and any(interaction.source_id.startswith(p) for p in TEMP_PREFIXES):
+            logger.warning("Skipping interaction with temp-dir source_id: %s", interaction.source_id[:80])
+            return interaction
+
         # Follow merge chain to get the canonical person ID
         from api.services.person_entity import get_person_entity_store
         person_store = get_person_entity_store()

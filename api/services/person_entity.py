@@ -839,6 +839,16 @@ class PersonEntityStore:
                 "SELECT id FROM person_entities WHERE id = ?", (entity_id,)).fetchone()
             if not row:
                 return False
+
+            # Safety guard: refuse to delete if interactions exist
+            from api.services.interaction_store import get_interaction_store
+            int_store = get_interaction_store()
+            if int_store.get_for_person(entity_id, limit=1):
+                raise ValueError(
+                    f"Cannot delete person {entity_id}: has interactions. "
+                    "Use merge_people.py to merge, or delete interactions first."
+                )
+
             conn.execute("DELETE FROM person_emails WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_phones WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
