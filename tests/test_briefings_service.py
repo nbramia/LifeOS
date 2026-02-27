@@ -29,7 +29,7 @@ def temp_entity_store(tmp_path):
 def temp_interaction_store():
     """Create a temporary interaction store."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        store = InteractionStore(f.name)
+        store = InteractionStore(f.name, strict=False)
         yield store
         Path(f.name).unlink(missing_ok=True)
 
