@@ -81,6 +81,14 @@ def extract_phone_from_jid(jid: str) -> str:
     return normalize_phone(phone_part)
 
 
+def resolve_lid_phone(lid_jid: str, lid_phones: dict[str, str]) -> str:
+    """Look up phone number for a LID JID via the whatsmeow lid_map."""
+    if not lid_jid or '@lid' not in lid_jid:
+        return ""
+    bare = lid_jid.split('@')[0].split(':')[0]  # strip @lid and :N suffix
+    return lid_phones.get(bare, "")
+
+
 def is_group_jid(jid: str) -> bool:
     """
     Check if JID is a group chat.
@@ -331,6 +339,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
         'interactions_skipped': 0,
         'skipped_lid': 0,
         'resolved_lid': 0,
+        'resolved_lid_phone': 0,
         'skipped_large_group': 0,
         'outgoing_group_created': 0,
         'persons_not_found': 0,
@@ -394,6 +403,21 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     """)
     lid_names = {row['jid']: row['push_name'] for row in wacli_cursor.fetchall()}
     logger.info(f"Loaded {len(lid_names)} LID push_names")
+
+    # Load LID-to-phone mappings from whatsmeow session database
+    lid_phones: dict[str, str] = {}
+    session_db_path = Path.home() / ".wacli" / "session.db"
+    if session_db_path.exists():
+        try:
+            session_conn = sqlite3.connect(f"file:{session_db_path}?mode=ro", uri=True)
+            for row in session_conn.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+                phone = normalize_phone(row[1])
+                if phone:
+                    lid_phones[row[0]] = phone
+            session_conn.close()
+            logger.info(f"Loaded {len(lid_phones)} LID-to-phone mappings")
+        except Exception as e:
+            logger.warning(f"Could not load LID phone map: {e}")
 
     # Build group -> participant list for outgoing group fan-out
     wacli_cursor.execute("SELECT group_jid, user_jid FROM group_participants")
@@ -487,9 +511,12 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
                     p_phone = None
                     p_name = None
                     if '@lid' in participant_jid:
+                        p_phone = resolve_lid_phone(participant_jid, lid_phones)
                         p_name = lid_names.get(participant_jid)
-                        if not p_name:
+                        if not p_phone and not p_name:
                             continue
+                        if p_phone:
+                            stats['resolved_lid_phone'] += 1
                     else:
                         p_phone = extract_phone_from_jid(participant_jid)
                         if not p_phone:
@@ -538,13 +565,21 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
             # Resolve target: by phone for @s.whatsapp.net, by name for @lid
             phone = None
             if target_jid and '@lid' in target_jid:
-                push_name = lid_names.get(target_jid)
-                if push_name:
-                    target_name = push_name
-                    stats['resolved_lid'] += 1
+                lid_phone = resolve_lid_phone(target_jid, lid_phones)
+                if lid_phone:
+                    phone = lid_phone
+                    push_name = lid_names.get(target_jid)
+                    if push_name:
+                        target_name = push_name
+                    stats['resolved_lid_phone'] += 1
                 else:
-                    stats['skipped_lid'] += 1
-                    continue
+                    push_name = lid_names.get(target_jid)
+                    if push_name:
+                        target_name = push_name
+                        stats['resolved_lid'] += 1
+                    else:
+                        stats['skipped_lid'] += 1
+                        continue
             else:
                 phone = extract_phone_from_jid(target_jid)
                 if not phone:
@@ -614,6 +649,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     logger.info(f"Messages read: {stats['messages_read']}")
     logger.info(f"Interactions created: {stats['interactions_created']}")
     logger.info(f"Interactions skipped (duplicates): {stats['interactions_skipped']}")
+    logger.info(f"LID resolved by phone: {stats['resolved_lid_phone']}")
     logger.info(f"Resolved LID by push_name: {stats['resolved_lid']}")
     logger.info(f"Skipped (LID without push_name): {stats['skipped_lid']}")
     logger.info(f"Outgoing group interactions: {stats['outgoing_group_created']}")
