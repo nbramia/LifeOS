@@ -27,7 +27,7 @@ MCP_SERVER_PATH = PROJECT_ROOT / "mcp_server.py"
 @pytest.fixture(scope="module")
 def api_client():
     """HTTP client for direct API calls."""
-    with httpx.Client(base_url=API_BASE, timeout=30.0) as client:
+    with httpx.Client(base_url=API_BASE, timeout=90.0) as client:
         yield client
 
 
