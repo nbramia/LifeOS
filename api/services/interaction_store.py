@@ -187,14 +187,17 @@ class InteractionStore:
     Manages interaction records with efficient queries by person and time range.
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, strict: bool = True):
         """
         Initialize interaction store.
 
         Args:
             db_path: Path to SQLite database (default from settings)
+            strict: If True, validate person_id exists before inserting.
+                    Set False in tests that use fake person_ids.
         """
         self.db_path = db_path or get_interaction_db_path()
+        self._strict = strict
         self._init_db()
 
     def _init_db(self):
@@ -323,6 +326,11 @@ class InteractionStore:
         from api.services.person_entity import get_person_entity_store
         person_store = get_person_entity_store()
         resolved_person_id = person_store.get_canonical_id(interaction.person_id)
+
+        if self._strict and person_store.get_by_id(resolved_person_id) is None:
+            raise ValueError(
+                f"Cannot add interaction: person_id '{resolved_person_id}' does not exist"
+            )
 
         conn = self._get_connection()
         try:
