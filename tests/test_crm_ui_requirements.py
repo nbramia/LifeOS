@@ -160,6 +160,7 @@ class TestStatsMatchDatabase:
         cursor = conn.execute("""
             SELECT person_id, COUNT(*) as cnt
             FROM interactions
+            WHERE source_type IN ('gmail','calendar','vault','granola','imessage','whatsapp','phone','slack')
             GROUP BY person_id
             ORDER BY cnt DESC
             LIMIT 1
