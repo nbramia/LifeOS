@@ -305,7 +305,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 primary.emails = []
             primary.emails.append(email)
             stats['emails_merged'] += 1
-            logger.info(f"   + Email: {email}")
+            logger.info("   + Email merged")
 
     # Merge phone numbers
     for phone in (secondary.phone_numbers or []):
@@ -314,7 +314,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 primary.phone_numbers = []
             primary.phone_numbers.append(phone)
             stats['phones_merged'] += 1
-            logger.info(f"   + Phone: {phone}")
+            logger.info("   + Phone merged")
 
     # Add secondary's name as alias
     if secondary.canonical_name and secondary.canonical_name != primary.canonical_name:
@@ -737,7 +737,23 @@ def recover_incomplete_merge() -> bool:
 
     store = get_person_entity_store()
     primary = store.get_by_id(primary_id)
-    secondary = store.get_by_id(secondary_id)
+
+    # IMPORTANT: Don't use get_by_id(secondary_id) — it follows the merge chain.
+    # If merged_person_ids.json was already written, get_by_id(secondary) resolves
+    # to the primary, causing a self-merge that deletes the primary.
+    # Instead: check if secondary_id is in the merge map. If so, it's logically gone.
+    merged_ids = load_merged_ids()
+    secondary_is_merged = secondary_id in merged_ids
+
+    if secondary_is_merged:
+        # The secondary was already recorded as merged. Check if its physical
+        # record still exists by doing a raw lookup (not following merge chain).
+        secondary_result = store.get_by_id(secondary_id)
+        # get_by_id follows chain, so if it returns the primary, secondary is gone
+        secondary_exists = secondary_result is not None and secondary_result.id == secondary_id
+    else:
+        secondary_result = store.get_by_id(secondary_id)
+        secondary_exists = secondary_result is not None
 
     if not primary:
         # Primary doesn't exist — can't recover meaningfully
@@ -745,7 +761,7 @@ def recover_incomplete_merge() -> bool:
         clear_merge_log()
         return False
 
-    if not secondary:
+    if not secondary_exists:
         # Secondary already deleted — merge was mostly/fully done.
         # Run post-merge cleanup and clear log.
         logger.info("Secondary already deleted — running cleanup steps only")

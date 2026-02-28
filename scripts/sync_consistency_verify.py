@@ -93,23 +93,27 @@ def _check_stale_merged_ids(valid_ids: set, store, dry_run: bool, fix_threshold:
         if canonical != pid and canonical in valid_ids:
             repoint_map[pid] = canonical
 
-    # Count interactions that can be re-pointed
+    # Count interactions that can be re-pointed (use temp table to avoid 999-var limit)
     count = 0
     if repoint_map:
-        placeholders = ','.join(['?'] * len(repoint_map))
+        conn.execute("CREATE TEMP TABLE stale_ids (old_id TEXT PRIMARY KEY, new_id TEXT)")
+        conn.executemany(
+            "INSERT INTO stale_ids (old_id, new_id) VALUES (?, ?)",
+            list(repoint_map.items())
+        )
         cursor = conn.execute(
-            f"SELECT COUNT(*) FROM interactions WHERE person_id IN ({placeholders})",
-            list(repoint_map.keys())
+            "SELECT COUNT(*) FROM interactions i "
+            "JOIN stale_ids s ON i.person_id = s.old_id"
         )
         count = cursor.fetchone()[0]
 
     fixed = 0
     if not dry_run and count > 0 and count <= fix_threshold:
-        for old_id, new_id in repoint_map.items():
-            conn.execute(
-                "UPDATE interactions SET person_id = ? WHERE person_id = ?",
-                (new_id, old_id)
-            )
+        conn.execute(
+            "UPDATE interactions SET person_id = ("
+            "  SELECT s.new_id FROM stale_ids s WHERE s.old_id = interactions.person_id"
+            ") WHERE person_id IN (SELECT old_id FROM stale_ids)"
+        )
         fixed = count
         conn.commit()
 
@@ -180,6 +184,7 @@ def _check_orphaned_crm_records(valid_ids: set, dry_run: bool, fix_threshold: in
                        OR NOT EXISTS (SELECT 1 FROM valid_ids v WHERE v.id = r.person_b_id)
                 )
             """)
+            total_fixed += rel_count
         if facts_count > 0:
             conn.execute("""
                 DELETE FROM person_facts WHERE id IN (
@@ -187,6 +192,7 @@ def _check_orphaned_crm_records(valid_ids: set, dry_run: bool, fix_threshold: in
                     WHERE NOT EXISTS (SELECT 1 FROM valid_ids v WHERE v.id = f.person_id)
                 )
             """)
+            total_fixed += facts_count
         if overrides_count > 0:
             try:
                 conn.execute("""
@@ -195,8 +201,9 @@ def _check_orphaned_crm_records(valid_ids: set, dry_run: bool, fix_threshold: in
                         WHERE NOT EXISTS (SELECT 1 FROM valid_ids v WHERE v.id = o.preferred_person_id)
                     )
                 """)
+                total_fixed += overrides_count
             except sqlite3.OperationalError:
-                pass
+                pass  # Table may not exist — don't count as fixed
         if se_count > 0:
             conn.execute("""
                 UPDATE source_entities
@@ -204,8 +211,8 @@ def _check_orphaned_crm_records(valid_ids: set, dry_run: bool, fix_threshold: in
                 WHERE canonical_person_id IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM valid_ids v WHERE v.id = source_entities.canonical_person_id)
             """)
+            total_fixed += se_count
         conn.commit()
-        total_fixed = total_count
 
     conn.close()
     details = f"relationships={rel_count}, facts={facts_count}, overrides={overrides_count}, source_entities={se_count}"
@@ -224,6 +231,18 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
         Dict with per-check results and totals.
     """
     valid_ids, store = _get_valid_person_ids()
+
+    if not valid_ids:
+        logger.error("valid_ids is empty — aborting consistency checks to prevent data loss")
+        return {
+            "person_stats_mismatches": {"count": 0, "fixed": 0, "details": "aborted: no valid person IDs"},
+            "orphaned_interactions": {"count": 0, "fixed": 0},
+            "stale_merged_ids": {"count": 0, "fixed": 0},
+            "orphaned_crm_records": {"count": 0, "fixed": 0},
+            "total_issues": 0,
+            "total_fixed": 0,
+            "auto_fix_skipped": False,
+        }
 
     # Person stats always fixes (threshold doesn't apply — it updates cached counts, not deletes)
     person_stats = _check_person_stats(dry_run)

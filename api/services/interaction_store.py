@@ -273,7 +273,7 @@ class InteractionStore:
                 if updated:
                     logger.info("Migration: scoped %d photos source_ids by person_id", updated)
 
-                # Deduplicate: keep earliest created_at per (source_type, source_id)
+                # Deduplicate: keep first-inserted row per (source_type, source_id)
                 deleted = conn.execute("""
                     DELETE FROM interactions
                     WHERE source_id IS NOT NULL
