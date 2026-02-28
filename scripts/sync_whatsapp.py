@@ -586,7 +586,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
             # Insert in batches
             if len(batch) >= batch_size and not dry_run:
                 int_cursor.executemany("""
-                    INSERT INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
+                    INSERT OR IGNORE INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, batch)
                 int_conn.commit()
@@ -600,7 +600,7 @@ def sync_whatsapp_messages(dry_run: bool = True) -> dict:
     # Insert remaining batch
     if batch and not dry_run:
         int_cursor.executemany("""
-            INSERT INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
+            INSERT OR IGNORE INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, batch)
         int_conn.commit()
