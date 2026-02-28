@@ -129,7 +129,7 @@ class TestInteractionStore:
     def temp_store(self):
         """Create a temporary store for testing."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            store = InteractionStore(f.name)
+            store = InteractionStore(f.name, strict=False)
             yield store
             Path(f.name).unlink(missing_ok=True)
 
@@ -466,6 +466,142 @@ class TestInteractionStore:
             temp_store.add(interaction)
 
         assert temp_store.count() == 3
+
+
+    def test_unique_constraint_prevents_duplicate_source(self, temp_store):
+        """Test that DB-level UNIQUE constraint blocks duplicate (source_type, source_id)."""
+        interaction1 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="First",
+            source_id="msg-dup-1",
+        )
+        interaction2 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-456",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Second",
+            source_id="msg-dup-1",  # Same source_type + source_id
+        )
+
+        temp_store.add(interaction1)
+        temp_store.add(interaction2)  # Should be silently skipped via ON CONFLICT DO NOTHING
+
+        # Only the first should exist
+        result = temp_store.get_by_source("gmail", "msg-dup-1")
+        assert result is not None
+        assert result.title == "First"
+        assert temp_store.count() == 1
+
+    def test_null_source_id_allows_multiple_rows(self, temp_store):
+        """Test that NULL source_id rows are not affected by the UNIQUE constraint."""
+        for i in range(3):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id="person-123",
+                timestamp=datetime.now(),
+                source_type="vault",
+                title=f"Note {i}",
+                source_id=None,
+            )
+            temp_store.add(interaction)
+
+        assert temp_store.count() == 3
+
+    def test_same_source_id_different_source_type(self, temp_store):
+        """Test that same source_id with different source_type is allowed."""
+        for source_type in ["gmail", "calendar", "vault"]:
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id="person-123",
+                timestamp=datetime.now(),
+                source_type=source_type,
+                title=f"Test {source_type}",
+                source_id="shared-id-123",
+            )
+            temp_store.add(interaction)
+
+        assert temp_store.count() == 3
+
+    def test_migration_idempotency(self, temp_store):
+        """Test that calling _init_db() twice doesn't break the store."""
+        # Add an interaction before re-init
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Before re-init",
+            source_id="msg-idempotent",
+        )
+        temp_store.add(interaction)
+
+        # Re-run _init_db() — should be a no-op
+        temp_store._init_db()
+
+        # Verify data survived
+        result = temp_store.get_by_source("gmail", "msg-idempotent")
+        assert result is not None
+        assert result.title == "Before re-init"
+        assert temp_store.count() == 1
+
+    def test_strict_mode_rejects_nonexistent_person(self):
+        """Test that strict mode rejects interactions with nonexistent person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "ghost-person"
+                mock_person_store.get_by_id.return_value = None
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="ghost-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Orphan Email",
+                    )
+                    with pytest.raises(ValueError, match="does not exist"):
+                        store.add(interaction)
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+    def test_strict_mode_allows_valid_person(self):
+        """Test that strict mode allows interactions with valid person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "real-person"
+                mock_person_store.get_by_id.return_value = MagicMock()  # Person exists
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="real-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Valid Email",
+                    )
+                    result = store.add(interaction)
+                    assert result.person_id == "real-person"
+                    assert store.count() == 1
+            finally:
+                Path(f.name).unlink(missing_ok=True)
 
 
 class TestInteractionFactories:
