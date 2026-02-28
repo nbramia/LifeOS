@@ -57,6 +57,7 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
 | Why was X chosen over Y? | `docs/adr/` (specific ADR) |
+| How do we review PRs? | `/review-pr`, `/pr-check`, `/implement` skills in `.claude/skills/` |
 
 ---
 
@@ -387,6 +388,19 @@ Services are tracked on-use, not by polling. Degradation events (fallback usage)
 6. **Creating a venv locally** → The venv only exists on the Mac Mini
 7. **Running pytest locally** → Dependencies aren't installed on the MacBook
 8. **Using wrong SSH hostname** → Use Tailscale IP `100.95.233.70`, not `.local`
+
+---
+
+## Documentation Rules (Quick Reference)
+
+Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
+
+- **Product specs** describe WHAT (consumer view). Implementation details go in `specs/technical/`.
+- **ADRs are immutable.** To change a decision, create a new ADR that supersedes.
+- **Every doc** must have a Related Documents section with bidirectional links.
+- **No task lists in specs.** Specs describe target state. Tasks go in `docs/plans/` or GitHub issues.
+- **Synthetic data only** in all examples and test fixtures.
+- **Completed plans** must be moved to `docs/plans/archive/`.
 
 ---
 

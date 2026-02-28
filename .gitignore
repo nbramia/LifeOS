@@ -132,8 +132,10 @@ scripts/clear-caches.sh
 # Personal planning docs
 docs/plans/LifeOS Backlog.md
 
-# Claude Code local settings
-.claude/
+# Claude Code — ignore local state, track shared config
+.claude/*
+!.claude/settings.json
+!.claude/skills/
 
 # Duplicate of CLAUDE.md
 AGENTS.md
