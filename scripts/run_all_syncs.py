@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
@@ -181,6 +182,19 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
                 if count > 0:
                     lines.append(f"  • {src}: {count}")
 
+    # Consistency verification results
+    consistency = result.get("results", {}).get("consistency_verify", {})
+    if consistency.get("success") and not consistency.get("dry_run"):
+        total_issues = consistency.get("total_issues", 0)
+        total_fixed = consistency.get("total_fixed", 0)
+        if total_issues > 0:
+            lines.append("")
+            if consistency.get("auto_fix_skipped"):
+                lines.append(f"⚠️ *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
+                lines.append("  Manual review needed — threshold exceeded")
+            else:
+                lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
+
     try:
         success = send_message("\n".join(lines))
         if success:
@@ -300,6 +314,10 @@ SYNC_ORDER = [
     # === Phase 6: Post-Sync Cleanup ===
     # Clean up entity data quality issues after all other syncs
     "entity_cleanup",           # Auto-hide non-humans, queue duplicates for review
+
+    # === Phase 7: Consistency Verification ===
+    # Verify cross-store data consistency after all syncs complete
+    "consistency_verify",       # Check orphans, stale merged IDs, cached counts
 ]
 
 # Scripts that can be run directly
@@ -341,6 +359,9 @@ SYNC_SCRIPTS = {
 
     # Phase 6: Post-Sync Cleanup
     "entity_cleanup": ("scripts/sync_entity_cleanup.py", ["--execute"]),
+
+    # Phase 7: Consistency Verification
+    "consistency_verify": ("scripts/sync_consistency_verify.py", ["--execute"]),
 }
 
 # Per-source timeout overrides (seconds)
@@ -614,6 +635,15 @@ def _parse_sync_output(output: str) -> dict:
         stats["people_created"] + stats["interactions_created"] + stats["source_entities_created"]
     )
     stats["updated"] = max(stats["updated"], stats["people_updated"])
+
+    # Parse consistency verification summary (Phase 7)
+    consistency_match = re.search(r"CONSISTENCY_SUMMARY:(\{.*\})", output)
+    if consistency_match:
+        try:
+            consistency_data = json.loads(consistency_match.group(1))
+            stats.update(consistency_data)
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     return stats
 
