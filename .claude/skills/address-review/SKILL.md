@@ -75,11 +75,15 @@ After addressing all feedback:
 
 ### Step 6: Post Summary and Re-request Review
 
-Post a comment on the PR summarizing how each finding was addressed, then re-request review:
+Post a comment on the PR summarizing how each finding was addressed, then re-request review from the original reviewer(s):
 
 ```
 gh pr comment $ARGUMENTS --body "<summary>"
-gh pr edit $ARGUMENTS --add-reviewer <reviewer>
+
+# Re-request review from original reviewer(s)
+gh pr view $ARGUMENTS --json reviews,reviewRequests \
+  --jq '([.reviews[].author.login] + [.reviewRequests[].login]) | unique | .[]' \
+  | while read reviewer; do gh pr edit $ARGUMENTS --add-reviewer "$reviewer"; done
 ```
 
 Use this format for the summary:
