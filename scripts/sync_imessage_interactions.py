@@ -224,7 +224,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
 def _insert_batch(conn: sqlite3.Connection, batch: list):
     """Insert a batch of interactions."""
     conn.executemany("""
-        INSERT OR IGNORE INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
+        INSERT INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, batch)
 

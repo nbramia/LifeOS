@@ -205,15 +205,6 @@ SYNC_SOURCES = {
         "phase": 6,
         "depends_on": ["crm_vectorstore"],
     },
-
-    # === Phase 7: Consistency Verification ===
-    "consistency_verify": {
-        "description": "Cross-store data consistency verification and auto-fix",
-        "script": "scripts/sync_consistency_verify.py",
-        "frequency": "daily",
-        "phase": 7,
-        "depends_on": ["entity_cleanup"],
-    },
 }
 
 
