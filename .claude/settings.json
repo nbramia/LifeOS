@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rm -f page-*.png screenshot-*.png && rm -rf .playwright-mcp/",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
