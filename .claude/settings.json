@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f *.png && rm -rf .playwright-mcp/",
+            "command": "rm -f page-*.png screenshot-*.png && rm -rf .playwright-mcp/",
             "timeout": 10
           }
         ]
