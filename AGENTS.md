@@ -178,6 +178,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 ## Development Workflow
 
+**Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
+
 1. **Edit code** (locally on MacBook — filesystem is synced)
 2. **Restart server** on Mac Mini: `./scripts/server.sh restart`
 3. **Test manually** or run tests: `./scripts/test.sh`
