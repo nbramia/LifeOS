@@ -356,7 +356,7 @@ class ApplePhotosSync:
                 source_type=SOURCE_TYPE_PHOTOS,
                 title="Photo",
                 source_link=f"photos://asset/{photo.uuid}",
-                source_id=f"{photo.uuid}:{photos_person.pk}",
+                source_id=photo.uuid,
             )
 
             # Check if interaction already exists
@@ -364,9 +364,8 @@ class ApplePhotosSync:
                 entity_id,
                 source_type=SOURCE_TYPE_PHOTOS,
             )
-            scoped_source_id = f"{photo.uuid}:{photos_person.pk}"
             already_exists = any(
-                i.source_id == scoped_source_id for i in existing_interactions
+                i.source_id == photo.uuid for i in existing_interactions
             )
             if not already_exists:
                 interaction_store.add(interaction)

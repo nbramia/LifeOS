@@ -187,17 +187,14 @@ class InteractionStore:
     Manages interaction records with efficient queries by person and time range.
     """
 
-    def __init__(self, db_path: Optional[str] = None, strict: bool = True):
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize interaction store.
 
         Args:
             db_path: Path to SQLite database (default from settings)
-            strict: If True, validate person_id exists before inserting.
-                    Set False in tests that use fake person_ids.
         """
         self.db_path = db_path or get_interaction_db_path()
-        self._strict = strict
         self._init_db()
 
     def _init_db(self):
@@ -257,44 +254,6 @@ class InteractionStore:
                 conn.execute("ALTER TABLE interactions ADD COLUMN attendee_count INTEGER")
                 logger.info("Added attendee_count column to interactions table")
 
-            # Migration: Enforce UNIQUE(source_type, source_id) at the DB level
-            unique_idx_exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_interactions_source_unique'"
-            ).fetchone()
-            if not unique_idx_exists:
-                # Fix existing photos rows: scope source_id by person_id
-                updated = conn.execute("""
-                    UPDATE interactions
-                    SET source_id = source_id || ':' || person_id
-                    WHERE source_type = 'photos'
-                      AND source_id IS NOT NULL
-                      AND source_id NOT LIKE '%:%'
-                """).rowcount
-                if updated:
-                    logger.info("Migration: scoped %d photos source_ids by person_id", updated)
-
-                # Deduplicate: keep earliest created_at per (source_type, source_id)
-                deleted = conn.execute("""
-                    DELETE FROM interactions
-                    WHERE source_id IS NOT NULL
-                      AND rowid NOT IN (
-                          SELECT MIN(rowid)
-                          FROM interactions
-                          WHERE source_id IS NOT NULL
-                          GROUP BY source_type, source_id
-                      )
-                """).rowcount
-                if deleted:
-                    logger.info("Migration: removed %d duplicate interactions", deleted)
-
-                # Replace old non-unique index with UNIQUE index
-                conn.execute("DROP INDEX IF EXISTS idx_interactions_source")
-                conn.execute("""
-                    CREATE UNIQUE INDEX idx_interactions_source_unique
-                    ON interactions(source_type, source_id)
-                """)
-                logger.info("Migration: created UNIQUE index idx_interactions_source_unique")
-
             conn.commit()
             logger.info(f"Initialized interaction database at {self.db_path}")
         finally:
@@ -327,19 +286,13 @@ class InteractionStore:
         person_store = get_person_entity_store()
         resolved_person_id = person_store.get_canonical_id(interaction.person_id)
 
-        if self._strict and person_store.get_by_id(resolved_person_id) is None:
-            raise ValueError(
-                f"Cannot add interaction: person_id '{resolved_person_id}' does not exist"
-            )
-
         conn = self._get_connection()
         try:
-            cursor = conn.execute(
+            conn.execute(
                 """
                 INSERT INTO interactions
                 (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_type, source_id) DO NOTHING
             """,
                 (
                     interaction.id,
@@ -353,8 +306,6 @@ class InteractionStore:
                     interaction.created_at.isoformat(),
                 ),
             )
-            if cursor.rowcount == 0 and interaction.source_id is not None:
-                logger.debug("Duplicate interaction skipped: %s/%s", interaction.source_type, interaction.source_id)
             conn.commit()
             # Update the interaction object with the resolved ID
             interaction.person_id = resolved_person_id

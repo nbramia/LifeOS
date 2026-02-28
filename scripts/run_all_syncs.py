@@ -25,7 +25,6 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 import argparse
-import json
 import logging
 import subprocess
 import sys
@@ -107,15 +106,6 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             error_short = error[:80] + "..." if len(error) > 80 else error
             lines.append(f"- {src}: {error_short}")
 
-    # Dependency-skipped sources
-    dep_skipped_sources = result.get("dep_skipped_sources", [])
-    if dep_skipped_sources:
-        lines.append("")
-        lines.append(f"**Skipped — dependency failed ({len(dep_skipped_sources)}):**")
-        for src in dep_skipped_sources:
-            failed_deps = result.get("results", {}).get(src, {}).get("failed_dependencies", [])
-            lines.append(f"- {src} (needs: {', '.join(failed_deps)})")
-
     # New records summary
     people_created = result.get("people_created", 0)
     interactions_created = result.get("interactions_created", 0)
@@ -171,15 +161,6 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         for src in result.get("failed_sources", []):
             lines.append(f"  • {src}")
 
-    # Dependency-skipped sources
-    dep_skipped_sources = result.get("dep_skipped_sources", [])
-    if dep_skipped_sources:
-        lines.append("")
-        lines.append(f"*Skipped — dependency failed ({len(dep_skipped_sources)}):*")
-        for src in dep_skipped_sources:
-            failed_deps = result.get("results", {}).get(src, {}).get("failed_dependencies", [])
-            lines.append(f"  • {src} (needs: {', '.join(failed_deps)})")
-
     # New records summary
     people_created = result.get("people_created", 0)
     interactions_created = result.get("interactions_created", 0)
@@ -199,19 +180,6 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
             for src, count in interactions_by_src.items():
                 if count > 0:
                     lines.append(f"  • {src}: {count}")
-
-    # Consistency verification results
-    consistency = result.get("results", {}).get("consistency_verify", {})
-    if consistency.get("success") and not consistency.get("dry_run"):
-        total_issues = consistency.get("total_issues", 0)
-        total_fixed = consistency.get("total_fixed", 0)
-        if total_issues > 0:
-            lines.append("")
-            if consistency.get("auto_fix_skipped"):
-                lines.append(f"⚠️ *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
-                lines.append("  Manual review needed — threshold exceeded")
-            else:
-                lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
 
     try:
         success = send_message("\n".join(lines))
@@ -332,10 +300,6 @@ SYNC_ORDER = [
     # === Phase 6: Post-Sync Cleanup ===
     # Clean up entity data quality issues after all other syncs
     "entity_cleanup",           # Auto-hide non-humans, queue duplicates for review
-
-    # === Phase 7: Consistency Verification ===
-    # Verify cross-store data consistency after all syncs complete
-    "consistency_verify",       # Check orphans, stale merged IDs, cached counts
 ]
 
 # Scripts that can be run directly
@@ -377,9 +341,6 @@ SYNC_SCRIPTS = {
 
     # Phase 6: Post-Sync Cleanup
     "entity_cleanup": ("scripts/sync_entity_cleanup.py", ["--execute"]),
-
-    # Phase 7: Consistency Verification
-    "consistency_verify": ("scripts/sync_consistency_verify.py", ["--execute"]),
 }
 
 # Per-source timeout overrides (seconds)
@@ -654,15 +615,6 @@ def _parse_sync_output(output: str) -> dict:
     )
     stats["updated"] = max(stats["updated"], stats["people_updated"])
 
-    # Parse consistency verification summary (Phase 7)
-    consistency_match = re.search(r"CONSISTENCY_SUMMARY:(\{.*\})", output)
-    if consistency_match:
-        try:
-            consistency_data = json.loads(consistency_match.group(1))
-            stats.update(consistency_data)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
     return stats
 
 
@@ -698,7 +650,6 @@ def run_all_syncs(
     sources = sources or SYNC_ORDER
     results = {}
     failed = []
-    dep_skipped = set()  # Sources skipped because a dependency failed
     start_time = datetime.now()
 
     # Check for disabled work integrations
@@ -774,20 +725,6 @@ def run_all_syncs(
                     results[source] = {"skipped": True, "reason": "recently_synced"}
                     continue
 
-        # Check if any dependency failed or was dependency-skipped
-        deps = source_info.get("depends_on", [])
-        if deps:
-            failed_deps = [d for d in deps if d in failed or d in dep_skipped]
-            if failed_deps:
-                logger.warning(f"Skipping {source}: dependency failed ({', '.join(failed_deps)})")
-                results[source] = {
-                    "skipped": True,
-                    "reason": "dependency_failed",
-                    "failed_dependencies": failed_deps,
-                }
-                dep_skipped.add(source)
-                continue
-
         success, stats = run_sync(source, dry_run=dry_run)
         results[source] = {"success": success, **stats}
 
@@ -802,8 +739,6 @@ def run_all_syncs(
     logger.info(f"Failed: {len(failed)}")
     if failed:
         logger.error(f"Failed sources: {', '.join(failed)}")
-    if dep_skipped:
-        logger.warning(f"Dependency-skipped sources: {', '.join(sorted(dep_skipped))}")
     logger.info("=" * 60)
 
     # Check overall health
@@ -857,7 +792,6 @@ def run_all_syncs(
         "source_entities_created": source_entities_created,
         "people_by_source": people_by_source,
         "interactions_by_source": interactions_by_source,
-        "dep_skipped_sources": sorted(dep_skipped),
     }
 
     # Exit maintenance mode now that sync is complete
