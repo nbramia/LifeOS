@@ -129,7 +129,7 @@ class TestInteractionStore:
     def temp_store(self):
         """Create a temporary store for testing."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            store = InteractionStore(f.name)
+            store = InteractionStore(f.name, strict=False)
             yield store
             Path(f.name).unlink(missing_ok=True)
 
@@ -547,6 +547,61 @@ class TestInteractionStore:
         assert result is not None
         assert result.title == "Before re-init"
         assert temp_store.count() == 1
+
+    def test_strict_mode_rejects_nonexistent_person(self):
+        """Test that strict mode rejects interactions with nonexistent person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "ghost-person"
+                mock_person_store.get_by_id.return_value = None
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="ghost-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Orphan Email",
+                    )
+                    with pytest.raises(ValueError, match="does not exist"):
+                        store.add(interaction)
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+    def test_strict_mode_allows_valid_person(self):
+        """Test that strict mode allows interactions with valid person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "real-person"
+                mock_person_store.get_by_id.return_value = MagicMock()  # Person exists
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="real-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Valid Email",
+                    )
+                    result = store.add(interaction)
+                    assert result.person_id == "real-person"
+                    assert store.count() == 1
+            finally:
+                Path(f.name).unlink(missing_ok=True)
 
 
 class TestInteractionFactories:
