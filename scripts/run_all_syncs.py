@@ -350,6 +350,9 @@ DEFAULT_SYNC_TIMEOUT = 3600  # 60 minutes
 
 SYNC_TIMEOUTS = {
     "vault_reindex": None,           # No timeout - runs as long as needed
+    "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
+    "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
+    "google_sheets": 300,            # 5 minutes - normally takes ~1s, hangs on expired OAuth
 }
 
 
