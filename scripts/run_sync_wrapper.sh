@@ -29,6 +29,8 @@ for i in $(seq 1 $MAX_RETRIES); do
     # Test that the venv Python can actually start and import dotenv
     if "$PYTHON" -c "from dotenv import load_dotenv" 2>/dev/null; then
         # Everything works - hand off to Python
+        # LIFEOS_HEADLESS prevents Google OAuth from blocking on browser flow
+        export LIFEOS_HEADLESS=true
         exec "$PYTHON" "$SYNC_SCRIPT" "$@"
     fi
 
