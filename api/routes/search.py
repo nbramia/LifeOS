@@ -3,6 +3,7 @@ Vector Search API endpoint.
 
 POST /api/search - Search the indexed vault for relevant content.
 """
+import logging
 import time
 from typing import Optional
 from datetime import datetime
@@ -13,6 +14,7 @@ from api.services.vectorstore import VectorStore
 from api.services.hybrid_search import HybridSearch
 from config.settings import settings
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["search"])
 
 # Initialize vector store (singleton)
@@ -110,11 +112,15 @@ async def search(request: SearchRequest) -> SearchResponse:
         # For now, we'll filter in post-processing if needed
 
     # Search using hybrid search (vector + BM25 keyword)
-    hybrid_search = get_hybrid_search()
-    raw_results = hybrid_search.search(
-        query=request.query,
-        top_k=request.top_k
-    )
+    try:
+        hybrid_search = get_hybrid_search()
+        raw_results = hybrid_search.search(
+            query=request.query,
+            top_k=request.top_k
+        )
+    except Exception as e:
+        logger.error(f"Hybrid search error: {e}")
+        raise HTTPException(status_code=503, detail="Search service unavailable")
 
     # Post-process results
     results = []
