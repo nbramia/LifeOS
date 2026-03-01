@@ -49,6 +49,15 @@ Each commit message should follow `<type>: <summary>` format. No "WIP", "fixup",
 **7. References**
 If the change relates to a GitHub issue, it should reference it with `Closes #N` or `Relates to #N`. WARN if no references found (not all PRs need them, but flag for awareness).
 
+**8. Secrets & Sensitive Data**
+This project is open-source. The diff MUST NOT contain any of the following. FAIL immediately if found:
+- **API keys, tokens, or secrets** — any string that looks like a bearer token, API key, bot token, OAuth secret, or password (check for patterns like `sk-`, `ghp_`, `bot[0-9]`, `xoxb-`, `Bearer `, long hex/base64 strings assigned to credential variables). Tokens in test mocks/fixtures using obviously fake values are OK.
+- **Hardcoded user-specific paths** — absolute paths referencing a specific user's home directory (e.g., `/Users/nathanramia/`, `/home/username/`). Relative paths and `~/` are OK. Paths in CLAUDE.md, AGENTS.md, and documentation that describe the project setup are exempt.
+- **Real personal names or emails** — real people's names, email addresses, phone numbers, or other PII in code or test fixtures. Synthetic/obviously fake data is OK (e.g., "John Doe", "test@example.com"). Names in git commit metadata, CLAUDE.md, and AGENTS.md are exempt.
+- **Internal infrastructure details** — Tailscale IPs, internal hostnames, or private network addresses in code (their presence in CLAUDE.md/AGENTS.md for developer setup is OK).
+
+To check, read the full diff: !`git diff main..HEAD -- ':!CLAUDE.md' ':!AGENTS.md'`
+
 ### Output Format
 
 ```
@@ -63,8 +72,9 @@ If the change relates to a GitHub issue, it should reference it with `Closes #N`
 | 5 | Sizing | PASS/WARN/FAIL | ... |
 | 6 | Commit messages | PASS/WARN/FAIL | ... |
 | 7 | References | PASS/WARN/FAIL | ... |
+| 8 | Secrets & sensitive data | PASS/WARN/FAIL | ... |
 
-**Result: X/7 passing, Y warnings, Z failures**
+**Result: X/8 passing, Y warnings, Z failures**
 ```
 
 If there are failures, add a brief "Suggested Fixes" section listing what to change.

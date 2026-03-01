@@ -147,10 +147,12 @@ class TestGoogleAuthService:
             mock_creds_class.from_authorized_user_file.assert_called_once()
 
     @patch('api.services.google_auth.InstalledAppFlow')
+    @patch('api.services.google_auth.sys')
     def test_initiates_oauth_flow_when_no_token(
-        self, mock_flow_class, mock_credentials_personal, temp_config_dir
+        self, mock_sys, mock_flow_class, mock_credentials_personal, temp_config_dir
     ):
         """Should initiate OAuth flow when no token exists."""
+        mock_sys.stdin.isatty.return_value = True
         token_path = temp_config_dir / "token-personal.json"
 
         service = GoogleAuthService(
@@ -221,10 +223,12 @@ class TestGoogleAuthService:
         assert "credentials" in str(exc_info.value).lower()
 
     @patch('api.services.google_auth.InstalledAppFlow')
+    @patch('api.services.google_auth.sys')
     def test_reauth_when_token_revoked(
-        self, mock_flow_class, mock_credentials_personal, temp_config_dir
+        self, mock_sys, mock_flow_class, mock_credentials_personal, temp_config_dir
     ):
         """Should re-authenticate when token is revoked."""
+        mock_sys.stdin.isatty.return_value = True
         token_path = temp_config_dir / "token-personal.json"
 
         # Create a token that will fail refresh (simulating revoked)
@@ -265,6 +269,23 @@ class TestGoogleAuthService:
 
             # Should have initiated new OAuth flow
             mock_flow.run_local_server.assert_called_once()
+
+    @patch('api.services.google_auth.sys')
+    def test_headless_raises_when_token_expired(
+        self, mock_sys, mock_credentials_personal, temp_config_dir
+    ):
+        """Should raise RuntimeError in headless mode when token needs re-auth."""
+        mock_sys.stdin.isatty.return_value = False
+        token_path = temp_config_dir / "token-personal.json"
+
+        service = GoogleAuthService(
+            credentials_path=str(mock_credentials_personal),
+            token_path=str(token_path),
+            account_type=GoogleAccount.PERSONAL
+        )
+
+        with pytest.raises(RuntimeError, match="headless"):
+            service.get_credentials()
 
     def test_separate_tokens_per_account(self, temp_config_dir):
         """Should maintain separate tokens for personal and work accounts."""
