@@ -6,6 +6,8 @@ with separate credentials and token storage.
 """
 import json
 import logging
+import os
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -137,7 +139,14 @@ class GoogleAuthService:
                     logger.warning(f"Token refresh failed (may be revoked): {e}")
                     # Fall through to re-authenticate
 
-        # Need to authenticate via browser
+        # Need to authenticate via browser — fail fast if headless
+        if os.environ.get("LIFEOS_HEADLESS", "").lower() in ("1", "true", "yes") or not sys.stdin.isatty():
+            raise RuntimeError(
+                f"Google OAuth token for {self.account_type.value} account is expired/revoked "
+                f"and cannot be refreshed in a headless environment. "
+                f"Run interactively: ~/.venvs/lifeos/bin/python scripts/authenticate_google.py"
+            )
+
         logger.info(f"Initiating OAuth flow for {self.account_type.value} account")
         self._credentials = self._run_oauth_flow()
         self._save_token(self._credentials)

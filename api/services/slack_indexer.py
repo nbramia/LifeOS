@@ -11,7 +11,9 @@ Features:
 - Handles incremental and full sync modes
 """
 import logging
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from api.services.slack_integration import (
@@ -59,6 +61,39 @@ class SlackIndexer:
         self._client = client
         self._user_cache: dict[str, SlackUser] = {}
         self._channel_cache: dict[str, SlackChannel] = {}
+        self._ts_db_path = Path("data/slack_sync_timestamps.db")
+        self._init_timestamp_db()
+
+    def _init_timestamp_db(self):
+        """Initialize SQLite DB for tracking per-channel latest timestamps."""
+        self._ts_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._ts_db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS channel_timestamps (
+                    channel_id TEXT PRIMARY KEY,
+                    latest_timestamp TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _update_channel_timestamp(self, channel_id: str, timestamp: datetime):
+        """Update the latest timestamp for a channel if newer."""
+        ts_str = timestamp.isoformat()
+        conn = sqlite3.connect(str(self._ts_db_path))
+        try:
+            conn.execute("""
+                INSERT INTO channel_timestamps (channel_id, latest_timestamp)
+                VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE
+                SET latest_timestamp = excluded.latest_timestamp
+                WHERE excluded.latest_timestamp > channel_timestamps.latest_timestamp
+            """, (channel_id, ts_str))
+            conn.commit()
+        finally:
+            conn.close()
 
     @property
     def vector_store(self) -> VectorStore:
@@ -183,6 +218,10 @@ class SlackIndexer:
 
             # Add to vector store (upsert behavior via delete + add)
             self.vector_store.add_document(chunks=chunks, metadata=metadata)
+
+            # Update timestamp cache for incremental sync
+            self._update_channel_timestamp(message.channel_id, message.timestamp)
+
             return True
 
         except Exception as e:
@@ -305,7 +344,8 @@ class SlackIndexer:
         """
         Get the latest indexed message timestamp for a channel.
 
-        Useful for incremental sync to only fetch newer messages.
+        Uses SQLite cache for fast lookup. Falls back to ChromaDB scan
+        on first run after deployment (cold-start) and seeds the cache.
 
         Args:
             channel_id: Channel ID to check
@@ -313,25 +353,44 @@ class SlackIndexer:
         Returns:
             Latest message timestamp or None if no messages indexed
         """
-        results = self.collection.get(
-            where={"channel_id": channel_id},
-            include=["metadatas"]
-        )
+        # Fast path: check SQLite cache
+        conn = sqlite3.connect(str(self._ts_db_path))
+        try:
+            row = conn.execute(
+                "SELECT latest_timestamp FROM channel_timestamps WHERE channel_id = ?",
+                (channel_id,)
+            ).fetchone()
+            if row:
+                return datetime.fromisoformat(row[0])
+        finally:
+            conn.close()
 
-        if not results["metadatas"]:
+        # Cold-start fallback: scan ChromaDB and seed cache
+        try:
+            results = self.collection.get(
+                where={"channel_id": channel_id},
+                include=["metadatas"]
+            )
+            if not results["metadatas"]:
+                return None
+
+            latest = None
+            for meta in results["metadatas"]:
+                if meta and "timestamp" in meta:
+                    try:
+                        ts = datetime.fromisoformat(meta["timestamp"])
+                        if latest is None or ts > latest:
+                            latest = ts
+                    except (ValueError, TypeError):
+                        continue
+
+            if latest:
+                logger.info(f"Seeding timestamp cache for channel {channel_id} from ChromaDB")
+                self._update_channel_timestamp(channel_id, latest)
+            return latest
+        except Exception as e:
+            logger.warning(f"ChromaDB fallback failed for {channel_id}: {e}")
             return None
-
-        latest = None
-        for meta in results["metadatas"]:
-            if meta and "timestamp" in meta:
-                try:
-                    ts = datetime.fromisoformat(meta["timestamp"])
-                    if latest is None or ts > latest:
-                        latest = ts
-                except (ValueError, TypeError):
-                    continue
-
-        return latest
 
 
 # Singleton instance

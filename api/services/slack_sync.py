@@ -191,6 +191,10 @@ class SlackSync:
                     continue
 
                 # Skip unlinked DM users if linked_only is True
+                # Note: mpim (group DMs) are not filtered because conversations.list
+                # does not return member IDs — filtering would require an extra API
+                # call per channel. Incremental sync handles them efficiently since
+                # channels with no new messages return quickly.
                 if linked_only and channel.is_im:
                     if channel.name not in linked_user_ids:
                         stats["channels_skipped"] += 1
@@ -218,7 +222,7 @@ class SlackSync:
                     stats["errors"].append(error_msg)
 
                 # Rate limit: small delay between channels
-                time.sleep(0.5)
+                time.sleep(0.1)
 
         except Exception as e:
             error_msg = f"Error listing channels: {e}"
@@ -534,6 +538,7 @@ class SlackSync:
         Perform an incremental sync of new Slack data.
 
         Only fetches messages newer than the last indexed timestamp.
+        Only processes DMs for users linked to CRM people (same as full_sync).
 
         Args:
             create_interactions: If True, create CRM Interaction records
@@ -547,6 +552,7 @@ class SlackSync:
             full=False,
             dm_only=True,
             create_interactions=create_interactions,
+            linked_only=True,
         )
 
         # Store actual Slack message counts on PersonEntity (incremental = accumulate)
