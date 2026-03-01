@@ -93,11 +93,15 @@ async def ask(request: AskRequest) -> AskResponse:
     # Step 1: Retrieve relevant context using hybrid search (vector + BM25)
     retrieval_start = time.time()
 
-    hybrid_search = get_hybrid_search()
-    chunks = hybrid_search.search(
-        query=request.question,
-        top_k=10  # Get top 10 chunks for context
-    )
+    try:
+        hybrid_search = get_hybrid_search()
+        chunks = hybrid_search.search(
+            query=request.question,
+            top_k=10  # Get top 10 chunks for context
+        )
+    except Exception as e:
+        logger.warning(f"Hybrid search error: {e}")
+        chunks = []
 
     retrieval_ms = int((time.time() - retrieval_start) * 1000)
 
