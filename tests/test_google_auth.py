@@ -271,11 +271,29 @@ class TestGoogleAuthService:
             mock_flow.run_local_server.assert_called_once()
 
     @patch('api.services.google_auth.sys')
-    def test_headless_raises_when_token_expired(
+    def test_headless_raises_when_no_tty(
         self, mock_sys, mock_credentials_personal, temp_config_dir
     ):
-        """Should raise RuntimeError in headless mode when token needs re-auth."""
+        """Should raise RuntimeError in headless mode (no TTY) when token needs re-auth."""
         mock_sys.stdin.isatty.return_value = False
+        token_path = temp_config_dir / "token-personal.json"
+
+        service = GoogleAuthService(
+            credentials_path=str(mock_credentials_personal),
+            token_path=str(token_path),
+            account_type=GoogleAccount.PERSONAL
+        )
+
+        with pytest.raises(RuntimeError, match="headless"):
+            service.get_credentials()
+
+    @patch('api.services.google_auth.sys')
+    @patch.dict('os.environ', {'LIFEOS_HEADLESS': 'true'})
+    def test_headless_raises_when_env_var_set(
+        self, mock_sys, mock_credentials_personal, temp_config_dir
+    ):
+        """Should raise RuntimeError when LIFEOS_HEADLESS=true even with TTY."""
+        mock_sys.stdin.isatty.return_value = True
         token_path = temp_config_dir / "token-personal.json"
 
         service = GoogleAuthService(

@@ -140,7 +140,7 @@ class GoogleAuthService:
                     # Fall through to re-authenticate
 
         # Need to authenticate via browser — fail fast if headless
-        if os.environ.get("LIFEOS_HEADLESS") or not sys.stdin.isatty():
+        if os.environ.get("LIFEOS_HEADLESS", "").lower() in ("1", "true", "yes") or not sys.stdin.isatty():
             raise RuntimeError(
                 f"Google OAuth token for {self.account_type.value} account is expired/revoked "
                 f"and cannot be refreshed in a headless environment. "

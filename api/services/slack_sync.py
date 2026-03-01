@@ -191,16 +191,14 @@ class SlackSync:
                     continue
 
                 # Skip unlinked DM users if linked_only is True
-                if linked_only:
-                    if channel.is_im:
-                        if channel.name not in linked_user_ids:
-                            stats["channels_skipped"] += 1
-                            continue
-                    elif channel.is_mpim:
-                        # Skip group DMs where no member is linked
-                        if not any(m in linked_user_ids for m in channel.members):
-                            stats["channels_skipped"] += 1
-                            continue
+                # Note: mpim (group DMs) are not filtered because conversations.list
+                # does not return member IDs — filtering would require an extra API
+                # call per channel. Incremental sync handles them efficiently since
+                # channels with no new messages return quickly.
+                if linked_only and channel.is_im:
+                    if channel.name not in linked_user_ids:
+                        stats["channels_skipped"] += 1
+                        continue
 
                 try:
                     channel_stats = self._sync_channel(
