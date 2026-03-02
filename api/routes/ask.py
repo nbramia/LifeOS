@@ -100,7 +100,7 @@ async def ask(request: AskRequest) -> AskResponse:
             top_k=10  # Get top 10 chunks for context
         )
     except Exception as e:
-        logger.error(f"Hybrid search error: {e}")
+        logger.warning(f"Hybrid search error: {e}")
         chunks = []
 
     retrieval_ms = int((time.time() - retrieval_start) * 1000)

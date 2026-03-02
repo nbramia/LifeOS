@@ -120,7 +120,7 @@ async def search(request: SearchRequest) -> SearchResponse:
         )
     except Exception as e:
         logger.error(f"Hybrid search error: {e}")
-        raise HTTPException(status_code=503, detail=f"Search service unavailable: {e}")
+        raise HTTPException(status_code=503, detail="Search service unavailable")
 
     # Post-process results
     results = []
