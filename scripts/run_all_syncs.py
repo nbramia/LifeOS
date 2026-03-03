@@ -26,6 +26,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 import argparse
 import logging
+import signal
 import subprocess
 import sys
 import traceback
@@ -46,6 +47,27 @@ from api.services.sync_health import (
     check_sync_health,
 )
 from config.settings import settings
+
+# Track current sync run for SIGTERM cleanup
+_active_run_id: int | None = None
+_active_source: str | None = None
+
+
+def _handle_sigterm(signum, frame):
+    """Clean up sync_health.db on SIGTERM so we don't leave stale RUNNING rows."""
+    if _active_run_id is not None:
+        try:
+            record_sync_complete(
+                _active_run_id,
+                SyncStatus.FAILED,
+                error_message=f"Process killed by signal {signum} during {_active_source}",
+            )
+        except Exception:
+            pass  # Best-effort — DB may be locked
+    sys.exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # Markdown error log in Notes directory (for visibility)
 NOTES_ERROR_LOG = settings.vault_path / "LifeOS" / "sync_errors.md"
@@ -345,11 +367,10 @@ SYNC_SCRIPTS = {
 
 # Per-source timeout overrides (seconds)
 # Default is 60 minutes (3600).
-# Note: vault_reindex has no timeout - it runs as long as needed
 DEFAULT_SYNC_TIMEOUT = 3600  # 60 minutes
 
 SYNC_TIMEOUTS = {
-    "vault_reindex": None,           # No timeout - runs as long as needed
+    "vault_reindex": 7200,           # 2 hours - typically 30-90min, bounded for safety
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
     "google_sheets": 300,            # 5 minutes - normally takes ~1s, hangs on expired OAuth
@@ -411,8 +432,15 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         logger.info(f"[DRY RUN] Would run: python {script_path} {' '.join(args)}")
         return True, {"dry_run": True}
 
-    # Record sync start
+    # Record sync start — track globally for SIGTERM cleanup.
+    # Mask SIGTERM briefly so a signal can't arrive between the DB insert
+    # and the global assignment, which would leave a stale RUNNING row.
+    global _active_run_id, _active_source
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     run_id = record_sync_start(source)
+    _active_run_id = run_id
+    _active_source = source
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     try:
         logger.info(f"Starting sync for {source}...")
@@ -457,6 +485,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 interactions_created=stats.get("interactions_created", 0),
                 source_entities_created=stats.get("source_entities_created", 0),
             )
+            _active_run_id = None
 
             record_sync_error(
                 source,
@@ -484,6 +513,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             interactions_created=stats.get("interactions_created", 0),
             source_entities_created=stats.get("source_entities_created", 0),
         )
+        _active_run_id = None
 
         return True, stats
 
@@ -521,6 +551,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             interactions_created=stats.get("interactions_created", 0),
             source_entities_created=stats.get("source_entities_created", 0),
         )
+        _active_run_id = None
 
         # Include partial output in markdown log for visibility
         full_error_msg = error_msg
@@ -542,6 +573,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             errors=1,
             error_message=error_msg[:500],
         )
+        _active_run_id = None
 
         record_sync_error(
             source,
@@ -555,6 +587,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         log_error_to_markdown(source, full_error, type(e).__name__)
 
         return False, {"error": error_msg}
+
+    finally:
+        _active_run_id = None
+        _active_source = None
 
 
 def _parse_sync_output(output: str) -> dict:
