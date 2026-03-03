@@ -17,6 +17,10 @@ PYTHON="$HOME/.venvs/lifeos/bin/python"
 SYNC_SCRIPT="$LIFEOS_DIR/scripts/run_all_syncs.py"
 LOG="$LIFEOS_DIR/logs/crm-sync-error.log"
 
+# Maximum wall-clock runtime (6 hours). If the sync process hangs for any
+# reason, this watchdog kills it so launchd can fire the next night's run.
+MAX_RUNTIME=21600
+
 # --- NVMe pre-flight check ---
 
 MAX_RETRIES=3
@@ -31,6 +35,18 @@ for i in $(seq 1 $MAX_RETRIES); do
         # Everything works - hand off to Python
         # LIFEOS_HEADLESS prevents Google OAuth from blocking on browser flow
         export LIFEOS_HEADLESS=true
+
+        # Start a watchdog that kills the sync if it exceeds MAX_RUNTIME.
+        # After exec, $$ still refers to this process (now Python).
+        # SIGTERM first (Python handler cleans up), SIGKILL after 60s as backstop.
+        (
+            sleep "$MAX_RUNTIME"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync after ${MAX_RUNTIME}s" >> "$LOG"
+            kill -TERM $$ 2>/dev/null
+            sleep 60
+            kill -KILL $$ 2>/dev/null
+        ) &
+
         exec "$PYTHON" "$SYNC_SCRIPT" "$@"
     fi
 
