@@ -432,11 +432,15 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         logger.info(f"[DRY RUN] Would run: python {script_path} {' '.join(args)}")
         return True, {"dry_run": True}
 
-    # Record sync start — track globally for SIGTERM cleanup
+    # Record sync start — track globally for SIGTERM cleanup.
+    # Mask SIGTERM briefly so a signal can't arrive between the DB insert
+    # and the global assignment, which would leave a stale RUNNING row.
     global _active_run_id, _active_source
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     run_id = record_sync_start(source)
     _active_run_id = run_id
     _active_source = source
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     try:
         logger.info(f"Starting sync for {source}...")
@@ -481,6 +485,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 interactions_created=stats.get("interactions_created", 0),
                 source_entities_created=stats.get("source_entities_created", 0),
             )
+            _active_run_id = None
 
             record_sync_error(
                 source,
@@ -508,6 +513,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             interactions_created=stats.get("interactions_created", 0),
             source_entities_created=stats.get("source_entities_created", 0),
         )
+        _active_run_id = None
 
         return True, stats
 
@@ -545,6 +551,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             interactions_created=stats.get("interactions_created", 0),
             source_entities_created=stats.get("source_entities_created", 0),
         )
+        _active_run_id = None
 
         # Include partial output in markdown log for visibility
         full_error_msg = error_msg
@@ -566,6 +573,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             errors=1,
             error_message=error_msg[:500],
         )
+        _active_run_id = None
 
         record_sync_error(
             source,

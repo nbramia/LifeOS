@@ -36,18 +36,28 @@ for i in $(seq 1 $MAX_RETRIES); do
         # LIFEOS_HEADLESS prevents Google OAuth from blocking on browser flow
         export LIFEOS_HEADLESS=true
 
-        # Start a watchdog that kills the sync if it exceeds MAX_RUNTIME.
-        # After exec, $$ still refers to this process (now Python).
-        # SIGTERM first (Python handler cleans up), SIGKILL after 60s as backstop.
+        # Run Python in the background so we can start a watchdog alongside it.
+        # When Python exits normally, we kill the watchdog to prevent it from
+        # firing kill on a recycled PID hours later.
+        "$PYTHON" "$SYNC_SCRIPT" "$@" &
+        SYNC_PID=$!
+
+        # Watchdog: SIGTERM after MAX_RUNTIME, SIGKILL 60s later as backstop.
         (
             sleep "$MAX_RUNTIME"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync after ${MAX_RUNTIME}s" >> "$LOG"
-            kill -TERM $$ 2>/dev/null
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync (PID $SYNC_PID) after ${MAX_RUNTIME}s" >> "$LOG"
+            kill -TERM "$SYNC_PID" 2>/dev/null
             sleep 60
-            kill -KILL $$ 2>/dev/null
+            kill -KILL "$SYNC_PID" 2>/dev/null
         ) &
+        WATCHDOG_PID=$!
 
-        exec "$PYTHON" "$SYNC_SCRIPT" "$@"
+        # Wait for sync to finish, then clean up watchdog
+        wait "$SYNC_PID"
+        EXIT_CODE=$?
+        kill "$WATCHDOG_PID" 2>/dev/null
+        wait "$WATCHDOG_PID" 2>/dev/null
+        exit "$EXIT_CODE"
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Python/NVMe not ready (attempt $i/$MAX_RETRIES)" >> "$LOG"
