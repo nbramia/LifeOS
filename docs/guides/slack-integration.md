@@ -195,7 +195,7 @@ curl -X POST http://localhost:8000/api/slack/sync
 
 ## Next Steps
 
-- [Launchd Setup](launchd-setup.md) for automated syncs
+- [Launchd Setup](launchd-setup.md) for automated syncs (macOS); use `setup-systemd.sh` on Linux
 - [First Run Guide](first-run.md)
 
 ## Related Documents

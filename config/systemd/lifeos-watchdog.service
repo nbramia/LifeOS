@@ -1,0 +1,9 @@
+[Unit]
+Description=LifeOS ChromaDB Watchdog Health Check
+After=lifeos-chromadb.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/chromadb.sh status

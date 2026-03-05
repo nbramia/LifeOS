@@ -6,7 +6,7 @@
 
 - Use plan mode for non-trivial tasks (3+ files, architectural decisions, unclear requirements).
 - After modifying docs, verify compliance with [docs/AGENTS.md](docs/AGENTS.md) standards.
-- After modifying code, restart server on Mac Mini before testing.
+- After modifying code, restart server before testing.
 - When creating new directories or modules, check if an AGENTS.md + CLAUDE.md pair is appropriate.
 
 ## Skills
@@ -20,18 +20,6 @@ Available as slash commands. See `.claude/skills/` for full details.
 | `/address-review <number>` | Address PR review feedback with independent verification |
 | `/pr-check [number]` | Validate PR against standards before requesting review |
 | `/merge-pr <number>` | Merge PR, update linked issues |
-
-## Remote Development
-
-LifeOS runs on a **Mac Mini** (server at `100.95.233.70` via Tailscale). Code is edited on a **MacBook Pro** — the filesystem is synced, so edits are visible on both machines immediately.
-
-| Task | Where | Command |
-|------|-------|---------|
-| Edit code | MacBook (local) | Normal file editing |
-| Run tests | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"` |
-| Restart server | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"` |
-| Install deps | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "~/.venvs/lifeos/bin/pip install -r ~/Documents/Code/LifeOS/requirements.txt"` |
-| Git operations | MacBook (local) | Normal git commands |
 
 ## Quick Reference
 
@@ -50,10 +38,8 @@ curl http://localhost:8000/health/full | jq   # Health check
 ## Critical Invariants
 
 - **Never run uvicorn directly** — always use `./scripts/server.sh`
-- **Never create a venv locally** — it only exists on the Mac Mini at `~/.venvs/lifeos`
-- **Never run pytest locally** — dependencies aren't installed on the MacBook
 - **Always restart server after Python changes** — no auto-reload
-- **SSH uses Tailscale IP** — `100.95.233.70`, not `.local` hostnames
+- **Venv lives on the server** at `~/.venvs/lifeos` — don't create one elsewhere
 
 ## Common Mistakes
 
@@ -66,4 +52,4 @@ curl http://localhost:8000/health/full | jq   # Health check
 7. **Leaving stale plans in `docs/plans/`** → Completed or superseded plans must be moved to `docs/plans/archive/`.
 8. **Over-documenting routine changes** → Not every change needs a docs update. Write what helps the next reader understand current state.
 9. **Deleting or modifying a failing test to unblock a commit** → See AGENTS.md § "Tests Are Sacred" for the full decision framework.
-10. **Committing without running the test suite** → Run tests on Mac Mini before every commit. No exceptions.
+10. **Committing without running the test suite** → Run `./scripts/test.sh` before every commit. No exceptions.

@@ -677,9 +677,9 @@ SLACK_REDIRECT_URI=http://localhost:8000/api/crm/slack/callback
 ### P11.2: Apple Contacts Integration
 
 **Requirements:**
-Read contacts from macOS Contacts.app to enhance person records.
+Read contacts from Apple Contacts to enhance person records.
 
-**Platform:** macOS only (uses pyobjc-framework-Contacts)
+**Platform:** macOS (direct via pyobjc-framework-Contacts) or Linux (via Apple Data Agent import)
 
 **API Endpoints:**
 - `GET /api/crm/contacts/status` - Check availability and authorization
@@ -1287,13 +1287,13 @@ The fact extraction system helps users recall personal details about contacts th
 2. **Self-reported confidence** - Model assigns its own confidence (unreliable)
 3. **No context for messages** - Single iMessage/WhatsApp messages analyzed without conversation context
 4. **Overconfidence** - "Mentioned jogging once" becomes "avid runner"
-5. **Local Ollama underutilized** - Expensive Claude calls for everything
+5. **Local LLM underutilized** - Expensive Claude calls for everything
 
 ### P14.1: Multi-Stage Extraction Pipeline
 
 **Architecture:**
 ```
-Stage 1: Filtering (Ollama - local, fast)
+Stage 1: Filtering (local LLM via llm_client - fast)
 ├─ For each interaction, with context window for messages
 ├─ "Does this contain memorable personal facts about {person}?"
 └─ Output: High-signal interactions shortlist
@@ -1304,7 +1304,7 @@ Stage 2: Deep Extraction (Claude)
 ├─ Exclude: job titles, companies, obvious professional info
 └─ Output: Candidate facts with source quotes (no confidence yet)
 
-Stage 3: Validation + Confidence (Ollama - local)
+Stage 3: Validation + Confidence (local LLM via llm_client)
 ├─ For each candidate fact:
 │   ├─ Does the quote actually support this fact?
 │   ├─ Is this about {person} or someone else?
@@ -1314,7 +1314,7 @@ Stage 3: Validation + Confidence (Ollama - local)
 
 **Acceptance Criteria:**
 ```
-[ ] Stage 1 runs locally on Ollama (llama3.2:3b or similar)
+[ ] Stage 1 runs locally via llm_client.py
 [ ] Stage 1 includes message context (5 messages before/after for iMessage/WhatsApp)
 [ ] Stage 2 prompt focuses on memorable details, not biography
 [ ] Stage 3 validates entity attribution (not about the user, not about third parties)
@@ -1422,25 +1422,22 @@ They CAN'T find "{person}'s dog is named Max" anywhere else.
 [ ] Job title/company extracted only if unusual or significant
 ```
 
-### P14.5: Ollama Integration
+### P14.5: Local LLM Integration
 
 **Requirements:**
-- Use local Ollama for Stage 1 (filtering) and Stage 3 (validation)
-- Claude for Stage 2 (deep extraction) only
-- Fall back to Claude if Ollama unavailable
+- Use local LLM (via `api/services/llm_client.py`) for Stage 1 (filtering) and Stage 3 (validation)
+- Claude or local LLM for Stage 2 (deep extraction) depending on `LIFEOS_LLM_BACKEND`
+- Fall back gracefully if local LLM unavailable
 
 **Configuration:**
-```python
-OLLAMA_HOST = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.2:3b"  # Fast, local
-```
+Controlled by `LIFEOS_LLM_BACKEND` setting (`local` or `anthropic`). The local backend uses llama-server on port 8080 via `llm_client.py`. Ollama is still used separately for query routing.
 
 **Acceptance Criteria:**
 ```
-[ ] Stage 1 uses Ollama by default
-[ ] Stage 3 uses Ollama by default
-[ ] Ollama availability checked at pipeline start
-[ ] Graceful fallback to Claude if Ollama down
+[ ] Stage 1 uses local LLM by default
+[ ] Stage 3 uses local LLM by default
+[ ] LLM availability checked at pipeline start
+[ ] Graceful fallback if local LLM down
 [ ] Cost reduction: ~70% fewer Claude API calls
 ```
 
@@ -1449,7 +1446,7 @@ OLLAMA_MODEL = "llama3.2:3b"  # Fast, local
 | File | Purpose |
 |------|---------|
 | `api/services/person_facts.py` | Fact extraction pipeline |
-| `api/services/ollama_client.py` | Ollama API client |
+| `api/services/llm_client.py` | LLM client (local llama-server or Anthropic) |
 | `api/routes/crm.py` | Extract facts endpoint |
 | `config/prompts/fact_extraction.py` | Prompt templates |
 
@@ -1467,7 +1464,7 @@ API: `POST /api/crm/people/{id}/facts/extract?model=haiku|sonnet`
 2. **Usefulness**: >70% of facts are "memorable" not "obvious"
 3. **Confidence calibration**: Single mentions don't exceed 0.5 confidence
 4. **Entity attribution**: <5% of facts incorrectly attributed
-5. **Cost**: 70% reduction in Claude API calls via Ollama
+5. **Cost**: 70% reduction in Claude API calls via local LLM
 
 ---
 

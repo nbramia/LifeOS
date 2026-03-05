@@ -1,11 +1,12 @@
 #!/bin/bash
-# LifeOS Service Management Script (launchd)
-# ===========================================
+# LifeOS Service Management Script (launchd / systemd)
+# =====================================================
 #
 # Usage: ./scripts/service.sh [install|uninstall|start|stop|restart|status|logs]
 #
-# This script manages LifeOS as a macOS launchd service for auto-start on boot.
-# For day-to-day server management (without launchd), use server.sh instead.
+# On macOS: manages LifeOS as a launchd service (auto-start on boot)
+# On Linux: manages LifeOS as systemd services
+# For day-to-day server management (without service managers), use server.sh instead.
 #
 # Commands:
 #   install    - Install and start the service (auto-start on boot)
@@ -29,12 +30,21 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-PLIST_NAME="com.lifeos.api"
-PLIST_SRC="$PROJECT_DIR/config/launchd/$PLIST_NAME.plist"
-PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 LOG_DIR="$PROJECT_DIR/logs"
 LOG_FILE="$LOG_DIR/lifeos-api.log"
 ERROR_LOG="$LOG_DIR/lifeos-api-error.log"
+
+# OS detection
+OS="$(uname)"
+
+# macOS-specific config
+PLIST_NAME="com.lifeos.api"
+PLIST_SRC="$PROJECT_DIR/config/launchd/$PLIST_NAME.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+
+# Linux-specific config
+SYSTEMD_SERVICES="lifeos-chromadb lifeos-api"
+SYSTEMD_TIMERS="lifeos-watchdog lifeos-sync"
 
 # Colors for output
 RED='\033[0;31m'
@@ -61,8 +71,9 @@ ensure_logs_dir() {
     fi
 }
 
-setup_log_rotation() {
-    # Create newsyslog config for log rotation (100MB max, 5 archives)
+# ===== macOS (launchd) =====
+
+setup_log_rotation_macos() {
     NEWSYSLOG_CONF="/etc/newsyslog.d/lifeos.conf"
 
     if [ ! -f "$NEWSYSLOG_CONF" ]; then
@@ -75,16 +86,12 @@ $ERROR_LOG $CURRENT_USER:staff  644  5  102400  *  J" | sudo tee "$NEWSYSLOG_CON
     fi
 }
 
-install() {
-    log_info "Installing LifeOS service..."
+install_macos() {
+    log_info "Installing LifeOS service (launchd)..."
 
-    # Ensure logs directory exists
     ensure_logs_dir
-
-    # Create LaunchAgents directory if needed
     mkdir -p "$HOME/Library/LaunchAgents"
 
-    # Copy plist file
     if [ -f "$PLIST_SRC" ]; then
         cp "$PLIST_SRC" "$PLIST_DST"
         log_info "Installed plist to $PLIST_DST"
@@ -93,22 +100,20 @@ install() {
         exit 1
     fi
 
-    # Load the service
     launchctl load "$PLIST_DST"
     log_info "Service loaded and started"
 
-    # Setup log rotation (optional, requires sudo)
     read -p "Setup log rotation (requires sudo)? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        setup_log_rotation
+        setup_log_rotation_macos
     fi
 
     log_info "Installation complete!"
-    status
+    status_macos
 }
 
-uninstall() {
+uninstall_macos() {
     log_info "Uninstalling LifeOS service..."
 
     if [ -f "$PLIST_DST" ]; then
@@ -120,7 +125,7 @@ uninstall() {
     fi
 }
 
-start() {
+start_macos() {
     log_info "Starting LifeOS service..."
     ensure_logs_dir
 
@@ -128,14 +133,14 @@ start() {
         launchctl start "$PLIST_NAME"
         log_info "Service started"
         sleep 2
-        status
+        status_macos
     else
         log_error "Service not installed. Run './scripts/service.sh install' first."
         exit 1
     fi
 }
 
-stop() {
+stop_macos() {
     log_info "Stopping LifeOS service..."
 
     if [ -f "$PLIST_DST" ]; then
@@ -146,24 +151,15 @@ stop() {
     fi
 }
 
-restart() {
-    log_info "Restarting LifeOS service..."
-    stop
-    sleep 2
-    start
-}
-
-status() {
+status_macos() {
     log_info "Checking LifeOS service status..."
     echo ""
 
-    # Check if plist is installed
     if [ ! -f "$PLIST_DST" ]; then
         log_warn "Service not installed"
         return
     fi
 
-    # Check launchctl status
     if launchctl list | grep -q "$PLIST_NAME"; then
         PID=$(launchctl list | grep "$PLIST_NAME" | awk '{print $1}')
         if [ "$PID" != "-" ] && [ -n "$PID" ]; then
@@ -175,7 +171,90 @@ status() {
         log_warn "Service is NOT LOADED"
     fi
 
-    # Check health endpoint
+    check_health
+}
+
+# ===== Linux (systemd) =====
+
+install_linux() {
+    log_info "Installing LifeOS services (systemd)..."
+    log_info "Run: sudo ./scripts/setup-systemd.sh"
+    log_info "(setup-systemd.sh copies unit files, enables services, and starts them)"
+}
+
+uninstall_linux() {
+    log_info "Uninstalling LifeOS services..."
+
+    for timer in $SYSTEMD_TIMERS; do
+        systemctl --user disable --now "${timer}.timer" 2>/dev/null || \
+            sudo systemctl disable --now "${timer}.timer" 2>/dev/null || true
+    done
+
+    for svc in $SYSTEMD_SERVICES; do
+        systemctl --user disable --now "${svc}.service" 2>/dev/null || \
+            sudo systemctl disable --now "${svc}.service" 2>/dev/null || true
+    done
+
+    log_info "Services disabled. Unit files remain in /etc/systemd/system/."
+}
+
+start_linux() {
+    log_info "Starting LifeOS services..."
+
+    for svc in $SYSTEMD_SERVICES; do
+        sudo systemctl start "${svc}.service" 2>/dev/null || systemctl --user start "${svc}.service"
+    done
+
+    for timer in $SYSTEMD_TIMERS; do
+        sudo systemctl start "${timer}.timer" 2>/dev/null || systemctl --user start "${timer}.timer"
+    done
+
+    log_info "Services started"
+    sleep 2
+    status_linux
+}
+
+stop_linux() {
+    log_info "Stopping LifeOS services..."
+
+    for svc in $SYSTEMD_SERVICES; do
+        sudo systemctl stop "${svc}.service" 2>/dev/null || systemctl --user stop "${svc}.service" 2>/dev/null || true
+    done
+
+    log_info "Services stopped"
+}
+
+status_linux() {
+    log_info "Checking LifeOS service status..."
+    echo ""
+
+    for svc in $SYSTEMD_SERVICES; do
+        local state
+        state=$(systemctl is-active "${svc}.service" 2>/dev/null || echo "unknown")
+        if [ "$state" = "active" ]; then
+            log_info "${svc}: RUNNING"
+        else
+            log_warn "${svc}: $state"
+        fi
+    done
+
+    echo ""
+    for timer in $SYSTEMD_TIMERS; do
+        local state
+        state=$(systemctl is-active "${timer}.timer" 2>/dev/null || echo "unknown")
+        if [ "$state" = "active" ]; then
+            log_info "${timer}.timer: ACTIVE"
+        else
+            log_warn "${timer}.timer: $state"
+        fi
+    done
+
+    check_health
+}
+
+# ===== Shared =====
+
+check_health() {
     echo ""
     log_info "Checking health endpoint..."
     if curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health | grep -q "200"; then
@@ -190,6 +269,13 @@ logs() {
     log_info "Showing LifeOS logs (Ctrl+C to exit)..."
     echo ""
 
+    if [[ "$OS" == "Linux" ]]; then
+        # Try journalctl first, fall back to log files
+        if journalctl -u lifeos-api -f 2>/dev/null; then
+            return
+        fi
+    fi
+
     if [ -f "$LOG_FILE" ]; then
         tail -f "$LOG_FILE" "$ERROR_LOG"
     else
@@ -197,31 +283,50 @@ logs() {
     fi
 }
 
+# ===== Dispatch =====
+
+dispatch() {
+    local action="$1"
+
+    if [[ "$OS" == "Darwin" ]]; then
+        case "$action" in
+            install)   install_macos ;;
+            uninstall) uninstall_macos ;;
+            start)     start_macos ;;
+            stop)      stop_macos ;;
+            restart)   stop_macos; sleep 2; start_macos ;;
+            status)    status_macos ;;
+            logs)      logs ;;
+        esac
+    elif [[ "$OS" == "Linux" ]]; then
+        case "$action" in
+            install)   install_linux ;;
+            uninstall) uninstall_linux ;;
+            start)     start_linux ;;
+            stop)      stop_linux ;;
+            restart)   stop_linux; sleep 2; start_linux ;;
+            status)    status_linux ;;
+            logs)      logs ;;
+        esac
+    else
+        log_error "Unsupported OS: $OS"
+        exit 1
+    fi
+}
+
 # Main
 case "${1:-}" in
-    install)
-        install
-        ;;
-    uninstall)
-        uninstall
-        ;;
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    restart)
-        restart
-        ;;
-    status)
-        status
-        ;;
-    logs)
-        logs
+    install|uninstall|start|stop|restart|status|logs)
+        dispatch "$1"
         ;;
     *)
         echo "LifeOS Service Manager"
+        echo ""
+        if [[ "$OS" == "Darwin" ]]; then
+            echo "Platform: macOS (launchd)"
+        else
+            echo "Platform: Linux (systemd)"
+        fi
         echo ""
         echo "Usage: $0 {install|uninstall|start|stop|restart|status|logs}"
         echo ""
