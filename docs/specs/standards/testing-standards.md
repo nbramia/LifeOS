@@ -38,14 +38,14 @@ Tests run on the Mac Mini (server), not locally on the MacBook. The virtual envi
 
 ```bash
 # Run unit tests
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"
+ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"
 
 # Run a specific test file
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && \
+ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && \
   ~/.venvs/lifeos/bin/python -m pytest tests/test_task_manager.py -v --tb=short"
 
 # Run smoke tests (unit + critical browser)
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh smoke"
+ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && ./scripts/test.sh smoke"
 ```
 
 ## Test Naming
@@ -159,7 +159,7 @@ Option (a) is the default. Options (b) and (c) require explicit justification in
 `test_perf_benchmark.py` runs queries against a **live server**, collects perf traces, and validates answer quality. It is not part of the unit test suite.
 
 ```bash
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && \
+ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && \
   ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
 ```
 

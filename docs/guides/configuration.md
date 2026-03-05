@@ -58,7 +58,7 @@ Environment variables and configuration files for LifeOS.
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `LIFEOS_PARTNER_NAME` | Partner's first name | `Taylor` |
-| `LIFEOS_THERAPIST_PATTERNS` | Therapist names (pipe-separated) | `Dr. Smith\|Amy Morgan` |
+| `LIFEOS_THERAPIST_PATTERNS` | Therapist names (pipe-separated) | `Dr. Smith\|Jane Doe` |
 | `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS` | Personal meeting patterns | `Taylor\|Tay` |
 
 ### Vault Structure

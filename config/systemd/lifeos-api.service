@@ -5,15 +5,15 @@ Wants=lifeos-chromadb.service lifeos-llm.service
 
 [Service]
 Type=simple
-User=nathanramia
-WorkingDirectory=/home/nathanramia/Documents/Code/LifeOS
-EnvironmentFile=/home/nathanramia/Documents/Code/LifeOS/.env
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=__LIFEOS_DIR__/.env
 Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
-ExecStart=/home/nathanramia/Documents/Code/LifeOS/scripts/server.sh foreground
+ExecStart=__LIFEOS_DIR__/scripts/server.sh foreground
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/home/nathanramia/Documents/Code/LifeOS/logs/server.log
-StandardError=append:/home/nathanramia/Documents/Code/LifeOS/logs/server.log
+StandardOutput=append:__LIFEOS_DIR__/logs/server.log
+StandardError=append:__LIFEOS_DIR__/logs/server.log
 
 [Install]
 WantedBy=multi-user.target

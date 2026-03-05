@@ -325,8 +325,8 @@ class RelationshipInsightGenerator:
         Parse date from note title in yyyymmdd format.
 
         Examples:
-        - "Couples Therapy Erica Turner 20230115" -> 2023-01-15
-        - "Amy Morgan therapy 20251230" -> 2025-12-30
+        - "Couples Therapy Jane Doe 20230115" -> 2023-01-15
+        - "Dr Smith therapy 20251230" -> 2025-12-30
         """
         # Look for 8-digit date at start of title
         match = re.match(r'^(\d{8})\s', title)
@@ -402,7 +402,8 @@ class RelationshipInsightGenerator:
                 is_couples = therapist_type == "couples"
 
                 # Create obsidian link
-                obsidian_link = f"obsidian://open?vault=Notes%202025&file={md_file.relative_to(therapy_path.parent.parent).as_posix()}"
+                vault_name = settings.vault_path.name if hasattr(settings, 'vault_path') else "vault"
+                obsidian_link = f"obsidian://open?vault={vault_name.replace(' ', '%20')}&file={md_file.relative_to(therapy_path.parent.parent).as_posix()}"
 
                 notes.append({
                     "title": title,

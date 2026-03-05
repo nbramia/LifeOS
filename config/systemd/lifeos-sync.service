@@ -4,11 +4,11 @@ After=network.target lifeos-api.service
 
 [Service]
 Type=oneshot
-User=nathanramia
-WorkingDirectory=/home/nathanramia/Documents/Code/LifeOS
-EnvironmentFile=/home/nathanramia/Documents/Code/LifeOS/.env
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=__LIFEOS_DIR__/.env
 Environment=LIFEOS_HEADLESS=true
-ExecStart=/home/nathanramia/Documents/Code/LifeOS/scripts/run_sync_wrapper.sh --execute --trigger scheduled
+ExecStart=__LIFEOS_DIR__/scripts/run_sync_wrapper.sh --execute --trigger scheduled
 TimeoutStartSec=21600
-StandardOutput=append:/home/nathanramia/Documents/Code/LifeOS/logs/sync.log
-StandardError=append:/home/nathanramia/Documents/Code/LifeOS/logs/sync.log
+StandardOutput=append:__LIFEOS_DIR__/logs/sync.log
+StandardError=append:__LIFEOS_DIR__/logs/sync.log

@@ -23,15 +23,15 @@ Available as slash commands. See `.claude/skills/` for full details.
 
 ## Remote Development
 
-LifeOS runs on a **Linux server** (`100.68.0.120` via Tailscale) with a local LLM. Code is edited on a **MacBook Pro** — the filesystem is synced, so edits are visible on both machines immediately. A **Mac Mini** (`100.95.233.70`) runs as an Apple Data Agent, exporting iMessage/phone/contacts data nightly.
+LifeOS runs on a **Linux server** (`100.68.0.120` via Tailscale) with a local LLM. Code is edited either **directly on the Linux server** or on a **MacBook Pro** (synced via Syncthing or GitHub). A **Mac Mini** (`100.95.233.70`) runs as an Apple Data Agent, exporting iMessage/phone/contacts data nightly.
 
 | Task | Where | Command |
 |------|-------|---------|
-| Edit code | MacBook (local) | Normal file editing |
-| Run tests | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"` |
-| Restart server | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"` |
-| Install deps | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "~/.venvs/lifeos/bin/pip install -r ~/Documents/Code/LifeOS/requirements.txt"` |
-| Git operations | MacBook (local) | Normal git commands |
+| Edit code | Linux server or MacBook | Normal file editing |
+| Run tests | Linux server | `./scripts/test.sh` |
+| Restart server | Linux server | `./scripts/server.sh restart` |
+| Install deps | Linux server | `~/.venvs/lifeos/bin/pip install -r requirements.txt` |
+| Git operations | Either machine | Normal git commands |
 
 ## Quick Reference
 

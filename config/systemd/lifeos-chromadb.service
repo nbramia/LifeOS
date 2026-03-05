@@ -4,13 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=nathanramia
-WorkingDirectory=/home/nathanramia/Documents/Code/LifeOS
-ExecStart=/home/nathanramia/.venvs/lifeos/bin/chroma run --host localhost --port 8001 --path /home/nathanramia/Documents/Code/LifeOS/data/chromadb
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__VENV__/bin/chroma run --host localhost --port 8001 --path __LIFEOS_DIR__/data/chromadb
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/home/nathanramia/Documents/Code/LifeOS/logs/chromadb.log
-StandardError=append:/home/nathanramia/Documents/Code/LifeOS/logs/chromadb.log
+StandardOutput=append:__LIFEOS_DIR__/logs/chromadb.log
+StandardError=append:__LIFEOS_DIR__/logs/chromadb.log
 
 [Install]
 WantedBy=multi-user.target

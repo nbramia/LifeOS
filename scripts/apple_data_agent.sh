@@ -23,8 +23,8 @@ set -euo pipefail
 
 LIFEOS_DIR="${LIFEOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 PYTHON="${LIFEOS_DIR}/../.venvs/lifeos/bin/python"
-LINUX_SERVER="${LIFEOS_LINUX_HOST:-100.68.0.120}"
-LINUX_USER="${LIFEOS_LINUX_USER:-nathanramia}"
+LINUX_SERVER="${LIFEOS_LINUX_HOST:?Set LIFEOS_LINUX_HOST to your Linux server IP}"
+LINUX_USER="${LIFEOS_LINUX_USER:-$USER}"
 LINUX_LIFEOS="/home/${LINUX_USER}/Documents/Code/LifeOS"
 LOG_DIR="${LIFEOS_DIR}/logs"
 LOG_FILE="${LOG_DIR}/apple_agent_$(date +%Y%m%d_%H%M%S).log"

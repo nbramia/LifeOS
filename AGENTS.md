@@ -182,8 +182,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 **Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
 
-1. **Edit code** (locally on MacBook — filesystem is synced to server)
-2. **Restart server** on Linux server: `./scripts/server.sh restart`
+1. **Edit code** — on the Linux server directly or on the MacBook (synced via Syncthing/GitHub)
+2. **Restart server**: `./scripts/server.sh restart` (or `sudo systemctl restart lifeos-api`)
 3. **Test manually** or run tests: `./scripts/test.sh`
 4. **Deploy**: `./scripts/deploy.sh "Your commit message"`
 

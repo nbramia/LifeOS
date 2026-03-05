@@ -453,20 +453,204 @@ class LocalLLMClient:
             return False
 
 
+class AnthropicLLMClient:
+    """Client that wraps the Anthropic SDK behind the same interface as LocalLLMClient.
+
+    Allows switching between local and Anthropic backends via LIFEOS_LLM_BACKEND.
+    """
+
+    def __init__(self, api_key: str | None = None, model: str = "claude-sonnet-4-20250514"):
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError("anthropic package required for Anthropic backend: pip install anthropic")
+        self._api_key = api_key or getattr(settings, "anthropic_api_key", "")
+        self._model = model
+        self._sync_client = anthropic.Anthropic(api_key=self._api_key)
+        self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
+
+    def _extract_system(self, system: str | list | None) -> str | None:
+        if system is None:
+            return None
+        if isinstance(system, list):
+            return "\n\n".join(
+                block["text"] for block in system if block.get("type") == "text"
+            )
+        return system
+
+    def create(
+        self,
+        messages: list[dict],
+        *,
+        system: str | list | None = None,
+        max_tokens: int = 4096,
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        """Synchronous chat completion via Anthropic API."""
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        sys_text = self._extract_system(system)
+        if sys_text:
+            kwargs["system"] = sys_text
+        if tools:
+            kwargs["tools"] = tools
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        resp = self._sync_client.messages.create(**kwargs)
+        return self._parse_anthropic_response(resp)
+
+    async def acreate(
+        self,
+        messages: list[dict],
+        *,
+        system: str | list | None = None,
+        max_tokens: int = 4096,
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        """Async chat completion via Anthropic API."""
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        sys_text = self._extract_system(system)
+        if sys_text:
+            kwargs["system"] = sys_text
+        if tools:
+            kwargs["tools"] = tools
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        resp = await self._async_client.messages.create(**kwargs)
+        return self._parse_anthropic_response(resp)
+
+    async def astream(
+        self,
+        messages: list[dict],
+        *,
+        system: str | list | None = None,
+        max_tokens: int = 4096,
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """Async streaming via Anthropic API.
+
+        Yields the same event format as LocalLLMClient.astream().
+        """
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        sys_text = self._extract_system(system)
+        if sys_text:
+            kwargs["system"] = sys_text
+        if tools:
+            kwargs["tools"] = tools
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        async with self._async_client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                if hasattr(event, "type"):
+                    if event.type == "content_block_delta":
+                        if hasattr(event.delta, "text"):
+                            yield {"type": "text", "content": event.delta.text}
+
+            # Get the final message for tool calls and usage
+            msg = await stream.get_final_message()
+            tool_calls = []
+            for block in msg.content:
+                if block.type == "tool_use":
+                    tool_calls.append({
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            "arguments": json.dumps(block.input),
+                        },
+                    })
+            if tool_calls:
+                yield {"type": "tool_calls", "calls": tool_calls}
+            yield {
+                "type": "done",
+                "usage": LLMUsage(
+                    input_tokens=msg.usage.input_tokens,
+                    output_tokens=msg.usage.output_tokens,
+                    total_tokens=msg.usage.input_tokens + msg.usage.output_tokens,
+                ),
+                "finish_reason": msg.stop_reason or "end_turn",
+            }
+
+    def _parse_anthropic_response(self, resp) -> LLMResponse:
+        """Parse Anthropic response into LLMResponse."""
+        text = ""
+        tool_calls = None
+        for block in resp.content:
+            if block.type == "text":
+                text = block.text
+            elif block.type == "tool_use":
+                if tool_calls is None:
+                    tool_calls = []
+                tool_calls.append({
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input),
+                    },
+                })
+        return LLMResponse(
+            text=text,
+            usage=LLMUsage(
+                input_tokens=resp.usage.input_tokens,
+                output_tokens=resp.usage.output_tokens,
+                total_tokens=resp.usage.input_tokens + resp.usage.output_tokens,
+            ),
+            model=resp.model,
+            finish_reason=resp.stop_reason or "",
+            tool_calls=tool_calls,
+        )
+
+    def is_available(self) -> bool:
+        """Check if Anthropic API is reachable."""
+        return bool(self._api_key)
+
+    async def ais_available(self) -> bool:
+        """Async check if Anthropic API is reachable."""
+        return bool(self._api_key)
+
+
 # --- Singleton ---
 
-_local_client: LocalLLMClient | None = None
+_llm_client: LocalLLMClient | AnthropicLLMClient | None = None
 
 
-def get_local_llm() -> LocalLLMClient:
-    """Get or create the local LLM client singleton."""
-    global _local_client
-    if _local_client is None:
-        _local_client = LocalLLMClient()
-    return _local_client
+def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
+    """Get or create the LLM client singleton.
+
+    Returns LocalLLMClient or AnthropicLLMClient based on LIFEOS_LLM_BACKEND setting.
+    Set LIFEOS_LLM_BACKEND=anthropic in .env to use Claude API instead of local model.
+    """
+    global _llm_client
+    if _llm_client is None:
+        backend = getattr(settings, "llm_backend", "local").lower()
+        if backend == "anthropic":
+            logger.info("Using Anthropic LLM backend")
+            _llm_client = AnthropicLLMClient()
+        else:
+            logger.info("Using local LLM backend at %s", settings.local_llm_url)
+            _llm_client = LocalLLMClient()
+    return _llm_client
 
 
 def reset_local_llm() -> None:
     """Reset the singleton (for testing)."""
-    global _local_client
-    _local_client = None
+    global _llm_client
+    _llm_client = None

@@ -3,8 +3,12 @@
 #
 # Usage: sudo ./scripts/setup-systemd.sh
 #
-# This copies unit files from config/systemd/ into /etc/systemd/system/,
-# reloads systemd, and enables+starts all LifeOS services and timers.
+# Template variables are substituted at install time:
+#   __USER__          → current $SUDO_USER (the user who ran sudo)
+#   __LIFEOS_DIR__    → project directory (auto-detected)
+#   __VENV__          → venv path (default: ~/.venvs/lifeos)
+#   __LLAMA_CPP_DIR__ → llama.cpp directory (default: ~/llama.cpp)
+#   __LLM_MODEL__     → HuggingFace model ID (default: ggml-org/gpt-oss-120b-GGUF)
 
 set -euo pipefail
 
@@ -23,15 +27,34 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Resolve the actual user (not root)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(eval echo "~$REAL_USER")
+VENV_DIR="${LIFEOS_VENV:-$REAL_HOME/.venvs/lifeos}"
+LLAMA_DIR="${LIFEOS_LLAMA_DIR:-$REAL_HOME/llama.cpp}"
+LLM_MODEL="${LIFEOS_LLM_MODEL:-ggml-org/gpt-oss-120b-GGUF}"
+
 echo "=== LifeOS systemd Setup ==="
 echo ""
+echo "  User:       $REAL_USER"
+echo "  Project:    $PROJECT_DIR"
+echo "  Venv:       $VENV_DIR"
+echo "  llama.cpp:  $LLAMA_DIR"
+echo "  LLM Model:  $LLM_MODEL"
+echo ""
 
-# Copy unit files
-echo "Copying unit files to $SYSTEMD_DST..."
+# Install unit files with variable substitution
+echo "Installing unit files to $SYSTEMD_DST..."
 for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
     [ -f "$unit" ] || continue
     name=$(basename "$unit")
-    cp "$unit" "$SYSTEMD_DST/$name"
+    sed \
+        -e "s|__USER__|$REAL_USER|g" \
+        -e "s|__LIFEOS_DIR__|$PROJECT_DIR|g" \
+        -e "s|__VENV__|$VENV_DIR|g" \
+        -e "s|__LLAMA_CPP_DIR__|$LLAMA_DIR|g" \
+        -e "s|__LLM_MODEL__|$LLM_MODEL|g" \
+        "$unit" > "$SYSTEMD_DST/$name"
     echo "  Installed $name"
 done
 
@@ -59,12 +82,12 @@ echo "  lifeos-watchdog.timer: $(systemctl is-active lifeos-watchdog.timer)"
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 
-# Install logrotate config
+# Install logrotate config with substitution
 LOGROTATE_SRC="$PROJECT_DIR/config/logrotate-lifeos.conf"
 if [ -f "$LOGROTATE_SRC" ]; then
     echo ""
     echo "Installing logrotate config..."
-    cp "$LOGROTATE_SRC" /etc/logrotate.d/lifeos
+    sed "s|__LIFEOS_DIR__|$PROJECT_DIR|g" "$LOGROTATE_SRC" > /etc/logrotate.d/lifeos
     echo "  Installed /etc/logrotate.d/lifeos"
 fi
 

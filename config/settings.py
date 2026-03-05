@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # Search
     default_top_k: int = 20
 
+    # LLM Backend: "local" (default) or "anthropic"
+    llm_backend: str = Field(default="local", alias="LIFEOS_LLM_BACKEND")
+
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
     local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
@@ -221,7 +224,7 @@ class Settings(BaseSettings):
     therapist_patterns: str = Field(
         default="",
         alias="LIFEOS_THERAPIST_PATTERNS",
-        description="Pipe-separated therapist names for meeting routing (e.g., 'Amy Morgan|Erica Turner')"
+        description="Pipe-separated therapist names for meeting routing (e.g., 'Dr. Smith|Jane Doe')"
     )
 
     # Current work vault path (include trailing slash)
