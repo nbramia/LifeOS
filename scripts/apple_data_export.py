@@ -150,10 +150,11 @@ def export_phone_calls(dry_run: bool = False) -> dict:
         16: "FaceTime Video",
     }
 
+    # Must use "phone" to match sync_phone_calls.py and relationship_discovery.py
     SOURCE_TYPE_MAP = {
-        1: "phone_call",
-        8: "facetime_audio",
-        16: "facetime_video",
+        1: "phone",
+        8: "phone",
+        16: "phone",
     }
 
     def normalize_phone(phone: str) -> str:
@@ -215,36 +216,48 @@ def export_phone_calls(dry_run: bool = False) -> dict:
         return {"status": "dry_run", "count": len(calls)}
 
     export = []
+    errors = 0
     for row in calls:
-        unique_id, zdate, duration, address, name, originated, answered, call_type = row
+        try:
+            unique_id, zdate, duration, address, name, originated, answered, call_type = row
 
-        phone = normalize_phone(address)
-        if not phone:
-            continue
+            if zdate is None:
+                continue
 
-        timestamp = CORE_DATA_EPOCH + timedelta(seconds=zdate)
+            phone = normalize_phone(address)
+            if not phone:
+                continue
 
-        direction = "Outgoing" if originated else "Incoming"
-        status = "answered" if answered else "missed"
-        call_type_name = CALL_TYPE_NAMES.get(call_type, "Call")
-        contact_name = name or phone
-        source_type = SOURCE_TYPE_MAP.get(call_type, "phone_call")
+            timestamp = CORE_DATA_EPOCH + timedelta(seconds=zdate)
 
-        if duration and duration > 0:
-            title = f"{direction} {call_type_name} with {contact_name} ({format_duration(duration)})"
-        else:
-            title = f"{direction} {call_type_name} ({status}) - {contact_name}"
+            direction = "Outgoing" if originated else "Incoming"
+            status = "answered" if answered else "missed"
+            call_type_name = CALL_TYPE_NAMES.get(call_type, "Call")
+            contact_name = name or phone
+            source_type = SOURCE_TYPE_MAP.get(call_type, "phone")
 
-        export.append({
-            "id": str(uuid.uuid4()),
-            "source_id": unique_id,
-            "source_type": source_type,
-            "person_id": "",
-            "timestamp": timestamp.isoformat(),
-            "title": title,
-            "snippet": None,
-            "source_link": "",
-        })
+            if duration and duration > 0:
+                title = f"{direction} {call_type_name} with {contact_name} ({format_duration(duration)})"
+            else:
+                title = f"{direction} {call_type_name} ({status}) - {contact_name}"
+
+            export.append({
+                "id": str(uuid.uuid4()),
+                "source_id": unique_id,
+                "source_type": source_type,
+                "person_id": "",
+                "timestamp": timestamp.isoformat(),
+                "title": title,
+                "snippet": None,
+                "source_link": "",
+            })
+        except Exception as e:
+            errors += 1
+            if errors <= 5:
+                logger.warning(f"Skipping call row: {e}")
+
+    if errors:
+        logger.warning(f"Skipped {errors} calls due to errors")
 
     out_path = EXPORT_DIR / "phone_calls.json"
     with open(out_path, "w") as f:
