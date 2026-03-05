@@ -21,47 +21,28 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 class TestConfigurationValidation:
     """Tests that verify configuration errors are caught early."""
 
-    def test_missing_api_key_raises_clear_error(self):
-        """Missing API key should raise a clear error, not hang."""
+    def test_local_llm_url_defaults_configured(self):
+        """Local LLM URL should have a sensible default."""
         from config.settings import Settings
 
-        # Simulate missing API key
-        with patch.dict('os.environ', {'ANTHROPIC_API_KEY': ''}, clear=False):
-            settings = Settings(_env_file=None)
-            # Should be empty or None
-            assert not settings.anthropic_api_key or settings.anthropic_api_key == ''
+        settings = Settings(_env_file=None)
+        assert settings.local_llm_url  # should default to http://localhost:8080
 
-    def test_synthesizer_validates_api_key_on_init(self):
-        """Synthesizer should validate API key exists before making calls."""
+    def test_synthesizer_uses_local_llm(self):
+        """Synthesizer should use local LLM client."""
         from api.services.synthesizer import Synthesizer
 
-        # Create synthesizer with empty key
-        synth = Synthesizer(api_key="")
+        mock_response = MagicMock()
+        mock_response.text = "Test response"
 
-        # Attempting to use it should fail fast, not hang
-        with pytest.raises(ValueError) as exc_info:
-            synth.synthesize("test prompt")
+        mock_client = MagicMock()
+        mock_client.create.return_value = mock_response
 
-        # Error should mention API key
-        error_msg = str(exc_info.value).lower()
-        assert 'api key' in error_msg or 'anthropic' in error_msg
-
-    def test_synthesizer_stream_validates_api_key(self):
-        """Streaming should also validate API key before making calls."""
-        import asyncio
-        from api.services.synthesizer import Synthesizer
-
-        synth = Synthesizer(api_key="")
-
-        async def try_stream():
-            async for _ in synth.stream_response("test"):
-                pass
-
-        with pytest.raises(ValueError) as exc_info:
-            asyncio.run(try_stream())
-
-        error_msg = str(exc_info.value).lower()
-        assert 'api key' in error_msg or 'anthropic' in error_msg
+        synth = Synthesizer()
+        synth._client = mock_client
+        result = synth.synthesize("test prompt")
+        assert result == "Test response"
+        mock_client.create.assert_called_once()
 
 
 class TestErrorHandling:
@@ -216,8 +197,8 @@ class TestHealthCheck:
         except httpx.ConnectError:
             pytest.skip("Server not running")
 
-    def test_health_returns_degraded_without_api_key(self):
-        """Health should return degraded status if API key missing."""
+    def test_health_returns_degraded_without_llm_url(self):
+        """Health should return degraded status if local LLM URL missing."""
         # This is a unit test of the health logic
         from fastapi.testclient import TestClient
         from unittest.mock import patch, MagicMock
@@ -225,9 +206,9 @@ class TestHealthCheck:
         from api.main import app
         client = TestClient(app)
 
-        # Mock settings to have no API key
+        # Mock settings to have no LLM URL
         mock_settings = MagicMock()
-        mock_settings.anthropic_api_key = ""
+        mock_settings.local_llm_url = ""
 
         with patch('config.settings.settings', mock_settings):
             response = client.get("/health")

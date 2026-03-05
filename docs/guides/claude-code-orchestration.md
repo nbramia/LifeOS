@@ -10,20 +10,20 @@ Run Claude Code tasks remotely from Telegram. Send `/code <task>` and get result
 
 1. **Telegram configured** — `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set in `.env`. See [Configuration](../getting-started/CONFIGURATION.md#telegram).
 
-2. **Claude Code installed on the Mac Mini** — the CLI binary must exist at the configured path.
+2. **Claude Code installed on the server** — the CLI binary must exist at the configured path.
 
-3. **Claude Code authenticated on the Mac Mini** — this is the most common setup issue. See [Authentication Setup](#authentication-setup) below.
+3. **Claude Code authenticated on the server** — this is the most common setup issue. See [Authentication Setup](#authentication-setup) below.
 
 ---
 
 ## Authentication Setup
 
-Claude Code must be authenticated on the Mac Mini where the LifeOS server runs. Interactive login (`/login`) stores tokens that may not persist for headless/subprocess usage.
+Claude Code must be authenticated on the server where the LifeOS server runs. Interactive login (`/login`) stores tokens that may not persist for headless/subprocess usage.
 
 **Recommended: Set up a long-lived token:**
 
 ```bash
-# SSH to the Mac Mini
+# SSH to the server
 ssh <your-user>@<your-tailscale-ip>
 
 # Run the setup-token command (requires Claude Max/Pro subscription)
@@ -42,7 +42,7 @@ ssh <your-user>@<your-tailscale-ip> \
 
 You should see a `system` init event followed by an `assistant` event with Claude's response. If you see `"Invalid API key"`, the token isn't configured — run `setup-token` again.
 
-**Why this is needed:** The LifeOS server runs as a launchd agent with a minimal environment. The launchd PATH does not include `~/.local/bin`, and interactive OAuth tokens may not be accessible from the server process context. The `setup-token` command stores credentials that are accessible regardless of how the process is launched.
+**Why this is needed:** The LifeOS server runs as a systemd service (Linux) or launchd agent (macOS) with a minimal environment. The service PATH does not include `~/.local/bin`, and interactive OAuth tokens may not be accessible from the server process context. The `setup-token` command stores credentials that are accessible regardless of how the process is launched.
 
 ---
 
@@ -59,7 +59,7 @@ These rarely need changing. The binary path matches the standard Claude Code ins
 
 After changing these values, restart the server:
 ```bash
-ssh <your-user>@<your-tailscale-ip> "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"
+ssh <your-user>@<your-tailscale-ip> "cd ~/Code/LifeOS && ./scripts/server.sh restart"
 ```
 
 ---
@@ -100,9 +100,9 @@ The orchestrator picks the working directory based on keywords in your task:
 | Say this... | Claude works in... |
 |-------------|-------------------|
 | "edit the backlog", "update my journal" | `~/Notes 2025` (vault) |
-| "fix the lifeos server", "update sync" | `~/Documents/Code/LifeOS` |
-| "update the MyProject readme" | `~/Documents/Code/MyProject` |
-| "write a script", "create a cron job" | `~/Documents/Code` |
+| "fix the lifeos server", "update sync" | `~/Code/LifeOS` |
+| "update the MyProject readme" | `~/Code/MyProject` |
+| "write a script", "create a cron job" | `~/Code` |
 | anything else | `~` (home) |
 
 ### Plan Mode
@@ -147,7 +147,7 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 
 ## How It Works
 
-1. **Subprocess spawning**: `/code` spawns `claude -p <task>` as a subprocess on the Mac Mini with `--output-format stream-json` for structured output parsing.
+1. **Subprocess spawning**: `/code` spawns `claude -p <task>` as a subprocess on the server with `--output-format stream-json` for structured output parsing.
 
 2. **Stream parsing**: A background thread reads the subprocess stdout line-by-line, parsing JSON events (init, assistant, result).
 
@@ -186,7 +186,7 @@ The binary path doesn't exist. Check:
 ssh <your-user>@<your-tailscale-ip> "ls -la ~/.local/bin/claude"
 ```
 
-If missing, install Claude Code on the Mac Mini:
+If missing, install Claude Code on the server:
 ```bash
 ssh <your-user>@<your-tailscale-ip> "curl -fsSL https://claude.ai/install.sh | sh"
 ```
@@ -229,7 +229,7 @@ If Claude is working in the wrong directory, make your task description more exp
 - **One session at a time** — serial execution only; cancel before starting a new one
 - **No interactive input** — Claude runs with `--dangerously-skip-permissions` (no approval prompts)
 - **No streaming to Telegram** — you get `[NOTIFY]` checkpoints, not real-time output
-- **File sync lag** — if you edit a file on the MacBook and immediately ask Claude to read it via `/code`, there may be a brief iCloud sync delay
+- **File sync lag** — if you edit a file and immediately ask Claude to read it via `/code`, there may be a brief sync delay
 
 ---
 

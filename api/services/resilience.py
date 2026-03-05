@@ -264,7 +264,17 @@ def is_retryable_status(status_code: int) -> bool:
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
-    """Check if an exception is a transient Claude/Anthropic API error worth retrying."""
+    """Check if an exception is a transient LLM API error worth retrying."""
+    # Handle httpx errors (used by OpenAI-compatible local LLM client)
+    try:
+        import httpx
+        if isinstance(exc, httpx.HTTPStatusError):
+            return is_retryable_status(exc.response.status_code)
+        if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+            return True
+    except ImportError:
+        pass
+    # Handle Anthropic errors if library is available (fallback)
     try:
         import anthropic
         if isinstance(exc, anthropic.APIStatusError):

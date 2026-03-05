@@ -110,11 +110,14 @@ api/
 - `reranker.py` - Result reranking
 - `embeddings.py` - Embedding generation
 
+**LLM Integration:**
+- `llm_client.py` - Unified LLM client supporting local (llama-server, OpenAI-compatible API on port 8080) and Anthropic backends. Handles tool format translation between Anthropic and OpenAI schemas. Backend selected via `LIFEOS_LLM_BACKEND` setting (`local` default, `anthropic` optional).
+
 **Chat & Query Processing:**
-- `chat_helpers.py` - Query parsing, intent classification (ambiguous task/reminder, code), date extraction. Uses LLM-based classification (Ollama → Haiku → pattern fallback). Compose/task/reminder intents now flow through the agentic loop.
+- `chat_helpers.py` - Query parsing, intent classification (ambiguous task/reminder, code), date extraction. Uses LLM-based classification (local LLM → pattern fallback). Compose/task/reminder intents now flow through the agentic loop.
 - `agent_loop.py` - Agentic chat loop: multi-turn conversation where Claude autonomously calls tools. Async generator yielding streamed text, tool status, and final result with cost tracking. Supports prompt caching.
-- `agent_tools.py` - Tool definitions (Anthropic schema) and handlers for 15 tools. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads, `save_memory` and `search_memories` for agent memory. Prompt cache breakpoint on tool definitions.
-- `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block for Anthropic prompt caching.
+- `agent_tools.py` - Tool definitions and handlers for 15 tools. Tool format translation (Anthropic ↔ OpenAI) handled by `llm_client.py`. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads, `save_memory` and `search_memories` for agent memory.
+- `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block. Prompt caching is Anthropic-specific (used when `LIFEOS_LLM_BACKEND=anthropic`).
 - `query_router.py` - LLM-based query routing with person name extraction (used by non-agentic paths)
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)
 

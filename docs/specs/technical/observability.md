@@ -62,7 +62,7 @@ curl http://localhost:8000/api/perf/traces/{trace_id} | jq
 
 ```bash
 # Run benchmarks (requires running server)
-ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
 ```
 
 Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal names/topics can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
@@ -76,7 +76,7 @@ Test queries and expected results are defined in `BENCHMARK_QUERIES` within the 
 | Severity | When Sent | Examples |
 |----------|-----------|----------|
 | **CRITICAL** | Immediately (rate-limited) | ChromaDB down, embedding model failed, vault inaccessible |
-| **WARNING** | Batched nightly (7 AM ET) | Ollama unavailable, backup failed, >5 degradation events |
+| **WARNING** | Batched nightly (7 AM ET) | Local LLM unavailable, backup failed, >5 degradation events |
 | **INFO** | Log only | Telegram retry, config defaults used |
 
 ### Rate Limiting
@@ -106,7 +106,7 @@ Set in `.env`:
 | `chromadb` | CRITICAL | None (core functionality) |
 | `embedding_model` | CRITICAL | None (core functionality) |
 | `vault_filesystem` | CRITICAL | None (core functionality) |
-| `ollama` | WARNING | Haiku LLM → pattern matching |
+| `ollama` | WARNING | Local LLM fallback → pattern matching |
 | `bm25_index` | WARNING | Vector-only search |
 | `google_calendar` | WARNING | Cached data |
 | `google_gmail` | WARNING | Cached data |

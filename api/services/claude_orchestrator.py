@@ -7,6 +7,7 @@ and supports plan-then-implement workflows via session resume.
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -96,10 +97,10 @@ PERSISTENCE:
   at the root cause. Let the user decide next steps rather than looping indefinitely.
 
 ENVIRONMENT:
-- Mac Mini running macOS
+- {platform_desc}
 - You have full filesystem access — you can read, write, search, and edit any file
-- You have a browser (Chrome) for web tasks
-- Git, cron, and standard macOS tools are available
+- You have a browser (Chrome/Chromium) for web tasks
+- Git and standard system tools are available
 - Python venv: ~/.venvs/lifeos (for LifeOS dependencies)
 
 KEY LOCATIONS:
@@ -110,8 +111,8 @@ KEY LOCATIONS:
   You can read these files directly with Read/Glob/Grep. Use this when you know the filename
   or want full file content. Use the LifeOS MCP search tools when you need to search across
   many files or need structured data like entity_ids and relationship scores.
-- LifeOS project: ~/Documents/Code/LifeOS (has CLAUDE.md with project conventions)
-- Other projects: ~/Documents/Code/
+- LifeOS project: {code_dir}/LifeOS (has CLAUDE.md with project conventions)
+- Other projects: {code_dir}/
 
 LIFEOS DATA ACCESS:
 You have LifeOS MCP tools for searching {user_name}'s personal data. Always use these
@@ -381,7 +382,12 @@ class ClaudeOrchestrator:
             "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
             "--chrome",
-            "--append-system-prompt", _SYSTEM_PROMPT.format(vault_path=settings.vault_path, user_name=settings.user_name),
+            "--append-system-prompt", _SYSTEM_PROMPT.format(
+                vault_path=settings.vault_path,
+                user_name=settings.user_name,
+                code_dir=settings.code_dir,
+                platform_desc="Linux server running Ubuntu" if platform.system() == "Linux" else "Mac Mini running macOS",
+            ),
         ]
         if resume_session_id:
             cmd.extend(["-r", resume_session_id])

@@ -67,7 +67,7 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 
 ## Query Routing
 
-The local LLM (Llama 3.2 3B via Ollama) routes queries to appropriate data sources.
+The local LLM (Qwen 2.5 via Ollama) routes queries to appropriate data sources.
 
 | Source | Content | Example Queries |
 |--------|---------|-----------------|
@@ -85,9 +85,9 @@ The local LLM (Llama 3.2 3B via Ollama) routes queries to appropriate data sourc
 
 **Router Prompt:** Configurable at `config/prompts/query_router.txt`
 
-**Person Name Extraction:** The LLM router extracts person names from queries as part of routing (via `people_mentioned` in the JSON response). Falls back to regex patterns when Ollama is unavailable.
+**Person Name Extraction:** The LLM router extracts person names from queries as part of routing (via `people_mentioned` in the JSON response). Falls back to regex patterns when the local LLM is unavailable.
 
-**Fallback:** If Ollama is unavailable, keyword-based routing kicks in automatically.
+**Fallback:** If the local LLM is unavailable, keyword-based routing kicks in automatically.
 
 ---
 

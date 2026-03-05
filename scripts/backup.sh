@@ -45,14 +45,24 @@ backup_db() {
     fi
 
     # Skip empty databases
-    local size=$(stat -f%z "$src" 2>/dev/null || echo "0")
+    local size
+    if [[ "$(uname)" == "Darwin" ]]; then
+        size=$(stat -f%z "$src" 2>/dev/null || echo "0")
+    else
+        size=$(stat -c%s "$src" 2>/dev/null || echo "0")
+    fi
     if [ "$size" -eq 0 ]; then
         return
     fi
 
     local dst="$TODAY_DIR/$name"
     if $SQLITE "$src" ".backup '$dst'" 2>>"$LOG_FILE"; then
-        local dst_size=$(stat -f%z "$dst" 2>/dev/null || echo "?")
+        local dst_size
+        if [[ "$(uname)" == "Darwin" ]]; then
+            dst_size=$(stat -f%z "$dst" 2>/dev/null || echo "?")
+        else
+            dst_size=$(stat -c%s "$dst" 2>/dev/null || echo "?")
+        fi
         log "  OK   $name ($(numfmt_bytes $dst_size))"
         BACKED_UP=$((BACKED_UP + 1))
     else
@@ -119,7 +129,11 @@ for dir in "$BACKUP_DIR"/????-??-??; do
     if [ -d "$dir" ] && [ "$dir" != "$TODAY_DIR" ]; then
         dir_date=$(basename "$dir")
         # Calculate age in days
-        dir_epoch=$(date -j -f "%Y-%m-%d" "$dir_date" "+%s" 2>/dev/null || continue)
+        if [[ "$(uname)" == "Darwin" ]]; then
+            dir_epoch=$(date -j -f "%Y-%m-%d" "$dir_date" "+%s" 2>/dev/null || continue)
+        else
+            dir_epoch=$(date -d "$dir_date" "+%s" 2>/dev/null || continue)
+        fi
         now_epoch=$(date "+%s")
         age_days=$(( (now_epoch - dir_epoch) / 86400 ))
         if [ "$age_days" -ge "$KEEP_DAYS" ]; then
@@ -139,7 +153,11 @@ for pattern in "sync_*.log" "fda_sync_*.log" "slack_sync_monitor*.log" "slack_ca
     for f in "$LOG_DIR"/$pattern; do
         [ -f "$f" ] || continue
         # Use file modification time
-        file_epoch=$(stat -f%m "$f" 2>/dev/null || continue)
+        if [[ "$(uname)" == "Darwin" ]]; then
+            file_epoch=$(stat -f%m "$f" 2>/dev/null || continue)
+        else
+            file_epoch=$(stat -c%Y "$f" 2>/dev/null || continue)
+        fi
         now_epoch=$(date "+%s")
         age_days=$(( (now_epoch - file_epoch) / 86400 ))
         if [ "$age_days" -ge "$LOG_KEEP_DAYS" ]; then

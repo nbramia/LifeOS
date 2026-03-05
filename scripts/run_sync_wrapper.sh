@@ -17,19 +17,49 @@ PYTHON="$HOME/.venvs/lifeos/bin/python"
 SYNC_SCRIPT="$LIFEOS_DIR/scripts/run_all_syncs.py"
 LOG="$LIFEOS_DIR/logs/crm-sync-error.log"
 
+# Maximum wall-clock runtime (6 hours). If the sync process hangs for any
+# reason, this watchdog kills it so launchd can fire the next night's run.
+MAX_RUNTIME=21600
+
 # --- NVMe pre-flight check ---
 
 MAX_RETRIES=3
 RETRY_DELAY=5
 
 for i in $(seq 1 $MAX_RETRIES); do
-    # Try to wake the NVMe by listing the Homebrew directory
-    ls /opt/homebrew/bin > /dev/null 2>&1
+    # On macOS, wake the NVMe by listing the Homebrew directory
+    if [[ "$(uname)" == "Darwin" ]]; then
+        ls /opt/homebrew/bin > /dev/null 2>&1
+    fi
 
     # Test that the venv Python can actually start and import dotenv
     if "$PYTHON" -c "from dotenv import load_dotenv" 2>/dev/null; then
         # Everything works - hand off to Python
-        exec "$PYTHON" "$SYNC_SCRIPT" "$@"
+        # LIFEOS_HEADLESS prevents Google OAuth from blocking on browser flow
+        export LIFEOS_HEADLESS=true
+
+        # Run Python in the background so we can start a watchdog alongside it.
+        # When Python exits normally, we kill the watchdog to prevent it from
+        # firing kill on a recycled PID hours later.
+        "$PYTHON" "$SYNC_SCRIPT" "$@" &
+        SYNC_PID=$!
+
+        # Watchdog: SIGTERM after MAX_RUNTIME, SIGKILL 60s later as backstop.
+        (
+            sleep "$MAX_RUNTIME"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync (PID $SYNC_PID) after ${MAX_RUNTIME}s" >> "$LOG"
+            kill -TERM "$SYNC_PID" 2>/dev/null
+            sleep 60
+            kill -KILL "$SYNC_PID" 2>/dev/null
+        ) &
+        WATCHDOG_PID=$!
+
+        # Wait for sync to finish, then clean up watchdog
+        wait "$SYNC_PID"
+        EXIT_CODE=$?
+        kill "$WATCHDOG_PID" 2>/dev/null
+        wait "$WATCHDOG_PID" 2>/dev/null
+        exit "$EXIT_CODE"
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Python/NVMe not ready (attempt $i/$MAX_RETRIES)" >> "$LOG"

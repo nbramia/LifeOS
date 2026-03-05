@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS Nightly Sync Timer (3:30 AM)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

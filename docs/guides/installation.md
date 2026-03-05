@@ -7,16 +7,16 @@
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
 > [SETUP.md](setup.md) -- it will walk you through the full setup interactively.
 
-Complete walkthrough for setting up LifeOS on macOS.
+Complete walkthrough for setting up LifeOS on Linux or macOS.
 
 ---
 
 ## Prerequisites
 
-- **macOS** (required for Apple integrations: iMessage, Contacts, Photos)
+- **Linux** (primary) or **macOS** (required only for Apple Data Agent: iMessage, Contacts, Photos)
 - **Python 3.11+**
-- **Homebrew** (for installing Ollama)
-- **Anthropic API key** (for Claude synthesis)
+- **Ollama** (for query routing; install via package manager or [ollama.com](https://ollama.com))
+- **Anthropic API key** (only needed if `LIFEOS_LLM_BACKEND=anthropic`; local LLM is the default)
 
 ---
 
@@ -31,10 +31,10 @@ cd LifeOS
 
 ## Step 2: Create Virtual Environment
 
-**Important**: Create the venv outside the project directory to avoid macOS TCC security scanning delays when running via launchd.
+**Important**: Create the venv outside the project directory. This is a convention that also avoids macOS TCC security scanning delays if running on macOS.
 
 ```bash
-# Create venv in ~/.venvs/ (recommended for launchd)
+# Create venv in ~/.venvs/ (recommended)
 mkdir -p ~/.venvs
 python3 -m venv ~/.venvs/lifeos
 
@@ -45,7 +45,7 @@ source ~/.venvs/lifeos/bin/activate
 pip install -r requirements.txt
 ```
 
-**Why external venv?** macOS Transparency, Consent, and Control (TCC) scans directories launched by launchd. Venvs inside the project directory can cause multi-minute delays on startup.
+**Why external venv?** Convention; keeps the project directory clean. On macOS, it also avoids TCC scanning delays when running via launchd.
 
 ---
 
@@ -54,7 +54,10 @@ pip install -r requirements.txt
 Ollama provides local LLM for query routing (determining if a query needs semantic search, keyword search, or both).
 
 ```bash
-# Install via Homebrew
+# Install Ollama
+# Linux:
+curl -fsSL https://ollama.com/install.sh | sh
+# macOS:
 brew install ollama
 
 # Start Ollama service
@@ -77,7 +80,7 @@ ChromaDB stores vector embeddings for semantic search. It runs as a separate ser
 
 ### Option A: Cron Watchdog (Recommended)
 
-ChromaDB has issues with launchd on macOS (exit code 78). Use a cron watchdog instead:
+On Linux, ChromaDB can be managed via systemd (see `setup-systemd.sh`). On macOS, ChromaDB has issues with launchd (exit code 78), so use a cron watchdog instead:
 
 ```bash
 # Add to crontab (crontab -e)
@@ -109,8 +112,13 @@ Edit `.env` with your settings:
 
 ```bash
 # Required
-ANTHROPIC_API_KEY=sk-ant-...
 LIFEOS_VAULT_PATH=/path/to/your/obsidian/vault
+
+# LLM backend: "local" (default, uses llama-server on port 8080) or "anthropic"
+LIFEOS_LLM_BACKEND=local
+
+# Only required if LIFEOS_LLM_BACKEND=anthropic
+# ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional but recommended
 LIFEOS_USER_NAME=YourFirstName
@@ -171,9 +179,10 @@ All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLES
 
 1. **Configure integrations**: See [Configuration](CONFIGURATION.md)
 2. **Set up Google OAuth**: See [Google OAuth Guide](../guides/GOOGLE-OAUTH.md)
-3. **Set up FDA wrapper** (for iMessage/Phone sync): `./scripts/create-lifeos-app.sh`
-4. **Configure launchd services**: See [Launchd Setup](../guides/LAUNCHD-SETUP.md)
-5. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
+3. **Set up systemd services** (Linux): `sudo ./scripts/setup-systemd.sh`
+4. **Set up FDA wrapper** (macOS, for Apple Data Agent): `./scripts/create-lifeos-app.sh`
+5. **Configure launchd services** (macOS): See [Launchd Setup](../guides/LAUNCHD-SETUP.md)
+6. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
 
 ---
 

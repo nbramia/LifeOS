@@ -5,6 +5,7 @@ Sync phone call history to LifeOS CRM.
 Reads from macOS CallHistoryDB and creates Interaction records.
 Requires Full Disk Access permission for Terminal.
 """
+import sys
 import sqlite3
 import uuid
 import logging
@@ -12,6 +13,9 @@ import argparse
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.entity_resolver import get_entity_resolver
 from api.services.interaction_store import get_interaction_db_path

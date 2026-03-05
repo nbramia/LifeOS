@@ -1,9 +1,8 @@
 """
 Synthesizer service for LifeOS.
 
-Handles Claude API calls for RAG synthesis.
-
-NOTE: anthropic library is imported lazily to speed up test collection.
+Handles LLM API calls for RAG synthesis.
+Uses the local LLM (OpenAI-compatible llama-server) by default.
 """
 import asyncio
 import base64
@@ -13,18 +12,15 @@ from typing import Optional, Any, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from config.settings import settings
-from api.services.model_selector import get_claude_model_name
+from api.services.llm_client import get_local_llm
 from api.services.resilience import is_retryable_api_error
-
-if TYPE_CHECKING:
-    import anthropic
 
 logger = logging.getLogger(__name__)
 
 
 def build_message_content(prompt: str, attachments: list[dict] = None) -> str | list:
     """
-    Build Claude message content, handling multi-modal if needed.
+    Build message content, handling multi-modal if needed.
 
     Args:
         prompt: The text prompt
@@ -49,28 +45,15 @@ def build_message_content(prompt: str, attachments: list[dict] = None) -> str | 
         data = att["data"]
 
         if media_type.startswith("image/"):
-            # Image attachments - send as image blocks
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": data
-                }
-            })
-            logger.debug(f"Added image attachment: {filename}")
+            # Image attachments — local model can't process images directly,
+            # so we note their presence in the prompt
+            content.append(f"[Image attached: {filename}]")
+            logger.debug(f"Image attachment noted: {filename} (not processed by local model)")
 
         elif media_type == "application/pdf":
-            # PDF attachments - send as document blocks
-            content.append({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": data
-                }
-            })
-            logger.debug(f"Added PDF attachment: {filename}")
+            # PDF attachments — similarly just noted
+            content.append(f"[PDF attached: {filename}]")
+            logger.debug(f"PDF attachment noted: {filename}")
 
         elif media_type.startswith("text/") or media_type == "application/json":
             # Text file attachments - decode and include in prompt
@@ -87,43 +70,33 @@ def build_message_content(prompt: str, attachments: list[dict] = None) -> str | 
     if text_file_contents:
         prompt = prompt + "".join(text_file_contents)
 
-    # Add text prompt last (Claude expects images before text for best results)
-    content.append({"type": "text", "text": prompt})
+    # For local model, flatten everything into a single string
+    if content:
+        prefix = "\n".join(content) + "\n\n"
+        return prefix + prompt
+    return prompt
 
-    return content
-
-# Default model tier
+# Default model tier (kept for API compatibility)
 DEFAULT_MODEL_TIER = "sonnet"
 
 
 class Synthesizer:
-    """Service for synthesizing answers using Claude."""
+    """Service for synthesizing answers using the local LLM."""
 
     def __init__(self, api_key: Optional[str] = None):
         """
         Initialize synthesizer.
 
         Args:
-            api_key: Anthropic API key (defaults to settings)
+            api_key: Ignored (kept for API compatibility).
         """
-        # Use provided key, but only fall back to settings if not explicitly passed
-        self.api_key = api_key if api_key is not None else settings.anthropic_api_key
-        self._client: Any = None
-
-    def _validate_api_key(self):
-        """Validate that API key is configured."""
-        if not self.api_key or not self.api_key.strip():
-            raise ValueError(
-                "Anthropic API key not configured. "
-                "Please set ANTHROPIC_API_KEY in your .env file."
-            )
+        self._client = None
 
     @property
-    def client(self) -> "anthropic.Anthropic":
-        """Lazy-load the Anthropic client."""
+    def client(self):
+        """Lazy-load the LLM client."""
         if self._client is None:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=self.api_key)
+            self._client = get_local_llm()
         return self._client
 
     def synthesize(
@@ -134,57 +107,35 @@ class Synthesizer:
         model_tier: str = None
     ) -> str:
         """
-        Generate a synthesized response using Claude.
+        Generate a synthesized response.
 
         Args:
             prompt: The full prompt including context and question
             max_tokens: Maximum response length
-            model: Full Claude model name (overrides model_tier)
-            model_tier: Model tier ("haiku", "sonnet", "opus")
+            model: Ignored (kept for API compatibility)
+            model_tier: Ignored (kept for API compatibility)
 
         Returns:
             Generated response text
-
-        Raises:
-            Exception: If API call fails
         """
-        # Validate API key before making request
-        self._validate_api_key()
-
-        # Resolve model name: explicit model > model_tier > default
-        if model is None:
-            tier = model_tier or DEFAULT_MODEL_TIER
-            model = get_claude_model_name(tier)
-
-        logger.debug(f"Using model: {model}")
-
-        import anthropic
-        import time as _time
+        logger.debug("Synthesizing response via local LLM")
 
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                response = self.client.messages.create(
-                    model=model,
+                response = self.client.create(
+                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=max_tokens,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
                 )
-                return response.content[0].text
-            except anthropic.APIStatusError as e:
-                if is_retryable_api_error(e) and attempt < max_retries:
+                return response.text
+            except Exception as e:
+                if attempt < max_retries and is_retryable_api_error(e):
+                    import time as _time
                     delay = 2 * (2 ** attempt)
-                    logger.warning(f"Claude API transient error ({e.status_code}), retry {attempt + 1}/{max_retries} in {delay}s")
+                    logger.warning(f"LLM transient error, retry {attempt + 1}/{max_retries} in {delay}s: {e}")
                     _time.sleep(delay)
                     continue
-                logger.error(f"Claude API error: {e}")
-                raise
-            except anthropic.APIError as e:
-                logger.error(f"Claude API error: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Synthesizer error: {e}")
+                logger.error(f"LLM error: {e}")
                 raise
 
     async def stream_response(
@@ -196,87 +147,53 @@ class Synthesizer:
         model_tier: str = None
     ):
         """
-        Stream a response from Claude.
+        Stream a response from the LLM.
 
         Args:
             prompt: The full prompt including context and question
             attachments: Optional list of attachments for multi-modal requests
             max_tokens: Maximum response length
-            model: Full Claude model name (overrides model_tier)
-            model_tier: Model tier ("haiku", "sonnet", "opus")
+            model: Ignored (kept for API compatibility)
+            model_tier: Ignored (kept for API compatibility)
 
         Yields:
             Text chunks as they arrive, then a final dict with usage info
         """
-        # Validate API key before making request
-        self._validate_api_key()
+        logger.debug("Streaming response via local LLM")
 
-        # Resolve model name: explicit model > model_tier > default
-        if model is None:
-            tier = model_tier or DEFAULT_MODEL_TIER
-            model = get_claude_model_name(tier)
-
-        logger.debug(f"Streaming with model: {model}")
-
-        # Build message content (handles multi-modal if attachments present)
+        # Build message content (handles attachments)
         message_content = build_message_content(prompt, attachments)
         if attachments:
-            logger.info(f"Multi-modal request with {len(attachments)} attachment(s)")
-
-        import anthropic
+            logger.info(f"Request with {len(attachments)} attachment(s)")
 
         max_retries = 2
         for attempt in range(max_retries + 1):
             text_yielded = False
             try:
-                with self.client.messages.stream(
-                    model=model,
+                async for event in self.client.astream(
+                    messages=[{"role": "user", "content": message_content}],
                     max_tokens=max_tokens,
-                    messages=[
-                        {"role": "user", "content": message_content}
-                    ]
-                ) as stream:
-                    for text in stream.text_stream:
+                ):
+                    if event["type"] == "text":
                         text_yielded = True
-                        yield text
-
-                    # Get final message with usage data
-                    final_message = stream.get_final_message()
-                    if final_message and final_message.usage:
-                        usage = final_message.usage
-                        # Calculate cost based on model pricing (per million tokens)
-                        # Sonnet 3.5: $3/M input, $15/M output
-                        # Haiku 3.5: $0.80/M input, $4/M output
-                        if "haiku" in model.lower():
-                            input_cost = (usage.input_tokens / 1_000_000) * 0.80
-                            output_cost = (usage.output_tokens / 1_000_000) * 4.00
-                        else:  # Default to Sonnet pricing
-                            input_cost = (usage.input_tokens / 1_000_000) * 3.00
-                            output_cost = (usage.output_tokens / 1_000_000) * 15.00
-
-                        total_cost = input_cost + output_cost
-
+                        yield event["content"]
+                    elif event["type"] == "done":
+                        usage = event["usage"]
                         yield {
                             "type": "usage",
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
-                            "cost_usd": total_cost,
-                            "model": model
+                            "cost_usd": 0.0,  # Local model — no cost
+                            "model": "local"
                         }
                 break  # success
-            except anthropic.APIStatusError as e:
-                if not text_yielded and is_retryable_api_error(e) and attempt < max_retries:
+            except Exception as e:
+                if not text_yielded and attempt < max_retries and is_retryable_api_error(e):
                     delay = 2 * (2 ** attempt)
-                    logger.warning(f"Claude API streaming transient error ({e.status_code}), retry {attempt + 1}/{max_retries} in {delay}s")
+                    logger.warning(f"LLM streaming transient error, retry {attempt + 1}/{max_retries} in {delay}s: {e}")
                     await asyncio.sleep(delay)
                     continue
-                logger.error(f"Claude API streaming error: {e}")
-                raise
-            except anthropic.APIError as e:
-                logger.error(f"Claude API streaming error: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Synthesizer streaming error: {e}")
+                logger.error(f"LLM streaming error: {e}")
                 raise
 
     async def get_response(
@@ -287,13 +204,13 @@ class Synthesizer:
         model_tier: str = None
     ) -> str:
         """
-        Get a complete response from Claude (async wrapper).
+        Get a complete response (async wrapper).
 
         Args:
             prompt: The full prompt
             max_tokens: Maximum response length
-            model: Full Claude model name (overrides model_tier)
-            model_tier: Model tier ("haiku", "sonnet", "opus")
+            model: Ignored (kept for API compatibility)
+            model_tier: Ignored (kept for API compatibility)
 
         Returns:
             Generated response text
@@ -346,7 +263,7 @@ def construct_prompt(
     conversation_history: list = None
 ) -> str:
     """
-    Construct the full prompt for Claude.
+    Construct the full prompt for the LLM.
 
     Args:
         question: User's question
