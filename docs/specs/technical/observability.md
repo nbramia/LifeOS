@@ -62,7 +62,7 @@ curl http://localhost:8000/api/perf/traces/{trace_id} | jq
 
 ```bash
 # Run benchmarks (requires running server)
-ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
 ```
 
 Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal names/topics can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
