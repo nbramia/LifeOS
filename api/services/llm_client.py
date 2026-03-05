@@ -291,6 +291,7 @@ class LocalLLMClient:
         max_tokens: int = 4096,
         tools: list[dict] | None = None,
         temperature: float | None = None,
+        timeout: float | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Async streaming chat completion.
 
@@ -311,8 +312,10 @@ class LocalLLMClient:
         if tools:
             payload["tools"] = _anthropic_tools_to_openai(tools)
 
+        request_timeout = httpx.Timeout(timeout or self.timeout, connect=10.0) if timeout else None
         async with self.async_client.stream(
-            "POST", "/v1/chat/completions", json=payload
+            "POST", "/v1/chat/completions", json=payload,
+            **({"timeout": request_timeout} if request_timeout else {}),
         ) as resp:
             resp.raise_for_status()
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
