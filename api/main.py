@@ -172,6 +172,14 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
     global _granola_processor, _omi_processor, _calendar_indexer, _people_v2_sync_thread, _telegram_listener, _reminder_scheduler, _job_queue
 
+    # Startup: Recover any incomplete merge operations
+    try:
+        from scripts.merge_people import recover_incomplete_merge
+        if recover_incomplete_merge():
+            logger.warning("Recovered incomplete merge operation on startup")
+    except Exception as e:
+        logger.error(f"Failed to check for incomplete merges: {e}")
+
     # Startup: Initialize and start Granola processor
     try:
         from api.services.granola_processor import GranolaProcessor
