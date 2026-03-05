@@ -21,6 +21,7 @@ import json
 import shutil
 import logging
 import argparse
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -223,7 +224,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 continue
 
         interaction = Interaction(
-            id=call.get("id", ""),
+            id=call.get("id") or str(uuid.uuid4()),
             person_id=call.get("person_id", ""),
             timestamp=timestamp,
             source_type=source_type,
