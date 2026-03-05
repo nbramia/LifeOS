@@ -3,16 +3,11 @@
 # and sync it to the Linux server.
 #
 # This replaces the Mac Mini's role as the LifeOS server. Instead, it:
-# 1. Runs FDA syncs (iMessage, phone calls) via Terminal.app
-# 2. Exports contacts, iMessage, phone data to data/apple-exports/
-# 3. Rsyncs exports to the Linux server at data/apple-imports/
+# 1. Exports contacts, iMessage, phone data to data/apple-exports/
+# 2. Rsyncs exports to the Linux server at data/apple-imports/
 #
 # Schedule (Mac Mini crontab):
 #   50 2 * * * /path/to/LifeOS/scripts/apple_data_agent.sh
-#
-# This replaces both:
-#   - run_sync_with_fda.sh (2:50 AM FDA sync)
-#   - The server role (now on Linux)
 #
 # Prerequisites:
 #   - Terminal.app has Full Disk Access
@@ -57,35 +52,10 @@ log "LifeOS dir: ${LIFEOS_DIR}"
 log "Linux server: ${LINUX_USER}@${LINUX_SERVER}"
 
 # -------------------------------------------------------------------
-# Step 1: Run FDA syncs (iMessage + phone calls)
-# These need Terminal.app's Full Disk Access
+# Step 1: Export Apple data to data/apple-exports/
+# The export script reads Apple DBs directly (requires FDA)
 # -------------------------------------------------------------------
-log "Step 1: Running FDA syncs..."
-
-fda_sync() {
-    local source="$1"
-    local script="$2"
-
-    if [[ ! -f "${LIFEOS_DIR}/${script}" ]]; then
-        log "WARNING: Script not found: ${script}"
-        return 1
-    fi
-
-    log "  Syncing ${source}..."
-    if "${PYTHON}" "${LIFEOS_DIR}/${script}" --execute >> "${LOG_FILE}" 2>&1; then
-        log "  ${source}: OK"
-    else
-        log "  ${source}: FAILED (check log)"
-    fi
-}
-
-fda_sync "phone" "scripts/sync_phone_calls.py"
-fda_sync "imessage" "scripts/sync_imessage_interactions.py"
-
-# -------------------------------------------------------------------
-# Step 2: Export Apple data to data/apple-exports/
-# -------------------------------------------------------------------
-log "Step 2: Exporting Apple data..."
+log "Step 1: Exporting Apple data..."
 
 cd "${LIFEOS_DIR}"
 if "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
@@ -96,9 +66,9 @@ else
 fi
 
 # -------------------------------------------------------------------
-# Step 3: Rsync exports to Linux server
+# Step 2: Rsync exports to Linux server
 # -------------------------------------------------------------------
-log "Step 3: Syncing to Linux server..."
+log "Step 2: Syncing to Linux server..."
 
 EXPORT_DIR="${LIFEOS_DIR}/data/apple-exports/"
 IMPORT_DIR="${LINUX_USER}@${LINUX_SERVER}:${LINUX_LIFEOS}/data/apple-imports/"
@@ -121,9 +91,9 @@ else
 fi
 
 # -------------------------------------------------------------------
-# Step 4: Trigger import on Linux server (optional, non-blocking)
+# Step 3: Trigger import on Linux server (optional, non-blocking)
 # -------------------------------------------------------------------
-log "Step 4: Triggering import on Linux server..."
+log "Step 3: Triggering import on Linux server..."
 
 ssh -o ConnectTimeout=10 "${LINUX_USER}@${LINUX_SERVER}" \
     "cd ${LINUX_LIFEOS} && ~/.venvs/lifeos/bin/python scripts/apple_data_import.py --execute" \

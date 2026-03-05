@@ -48,6 +48,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     # STEP 1: Export new messages from Apple's Messages database
     logger.info("Exporting new messages from Messages.app database...")
     imessage_store = get_imessage_store()
+    export_stats = {}
     try:
         export_stats = imessage_store.export_from_source()
         logger.info(f"Exported {export_stats['messages_exported']} new messages")

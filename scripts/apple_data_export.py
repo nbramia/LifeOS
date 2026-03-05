@@ -22,8 +22,11 @@ import json
 import shutil
 import logging
 import argparse
+import uuid
+import sqlite3
+import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -94,11 +97,30 @@ def export_contacts(dry_run: bool = False) -> dict:
 
 
 def export_imessage(dry_run: bool = False) -> dict:
-    """Export iMessage database (copy the local cache)."""
+    """Export iMessage database.
+
+    Calls IMessageStore.export_from_source() to populate data/imessage.db
+    from Apple's Messages.db (requires FDA), then copies it to exports.
+    """
+    from api.services.imessage import get_imessage_store
+
     imessage_db = PROJECT_ROOT / "data" / "imessage.db"
+
+    # Populate imessage.db from Apple's Messages database
+    try:
+        store = get_imessage_store()
+        export_stats = store.export_from_source()
+        logger.info(f"Exported {export_stats.get('messages_exported', 0)} new messages from Messages.app")
+    except FileNotFoundError:
+        logger.warning("Apple Messages database not found — skipping iMessage export")
+        return {"status": "skipped", "reason": "Messages.db not found"}
+    except PermissionError:
+        logger.warning("Cannot access Messages.db — grant Full Disk Access to Terminal")
+        return {"status": "skipped", "reason": "Full Disk Access required"}
+
     if not imessage_db.exists():
-        logger.warning("imessage.db not found — run FDA sync first")
-        return {"status": "skipped", "reason": "imessage.db not found"}
+        logger.warning("imessage.db not found after export")
+        return {"status": "skipped", "reason": "imessage.db not found after export"}
 
     if dry_run:
         size_mb = imessage_db.stat().st_size / (1024 * 1024)
@@ -116,39 +138,126 @@ def export_imessage(dry_run: bool = False) -> dict:
 def export_phone_calls(dry_run: bool = False) -> dict:
     """Export phone call history to JSON.
 
-    Reads from the interaction store (phone calls were already synced by FDA sync).
+    Reads directly from Apple's CallHistoryDB (requires FDA).
+    Produces the same JSON format that apple_data_import.import_phone_calls() expects.
     """
+    # macOS Core Data epoch: 2001-01-01 00:00:00 UTC
+    CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+    CALL_TYPE_NAMES = {
+        1: "Phone",
+        8: "FaceTime Audio",
+        16: "FaceTime Video",
+    }
+
+    # Must use "phone" to match sync_phone_calls.py and relationship_discovery.py
+    SOURCE_TYPE_MAP = {
+        1: "phone",
+        8: "phone",
+        16: "phone",
+    }
+
+    def normalize_phone(phone: str) -> str:
+        if not phone:
+            return ""
+        if "@" in phone:
+            return ""
+        digits = re.sub(r'\D', '', phone)
+        if len(digits) == 10:
+            return f"+1{digits}"
+        elif len(digits) == 11 and digits.startswith('1'):
+            return f"+{digits}"
+        elif len(digits) > 10:
+            return f"+{digits}"
+        return ""
+
+    def format_duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        else:
+            return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+
+    callhistory_path = Path.home() / "Library/Application Support/CallHistoryDB/CallHistory.storedata"
+    if not callhistory_path.exists():
+        logger.warning(f"CallHistoryDB not found at {callhistory_path}")
+        return {"status": "skipped", "reason": "CallHistoryDB not found"}
+
     try:
-        from api.services.interaction_store import get_interaction_store
-    except ImportError:
-        logger.warning("interaction_store not available — skipping phone export")
-        return {"status": "skipped", "reason": "import error"}
+        conn = sqlite3.connect(f"file:{callhistory_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as e:
+        if "unable to open" in str(e):
+            logger.warning("Cannot access CallHistoryDB — grant Full Disk Access to Terminal")
+            return {"status": "skipped", "reason": "Full Disk Access required"}
+        raise
 
-    store = get_interaction_store()
-    # Get all phone/facetime interactions using get_all_in_range with wide bounds
-    epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    calls = []
-    for stype in ("phone_call", "facetime_audio", "facetime_video"):
-        calls += store.get_all_in_range(epoch, now, source_type=stype, limit=50000)
+    query = """
+        SELECT
+            ZUNIQUE_ID,
+            ZDATE,
+            ZDURATION,
+            ZADDRESS,
+            ZNAME,
+            ZORIGINATED,
+            ZANSWERED,
+            ZCALLTYPE
+        FROM ZCALLRECORD
+        ORDER BY ZDATE DESC
+    """
 
-    logger.info(f"Found {len(calls)} phone/FaceTime interactions")
+    cursor = conn.execute(query)
+    calls = cursor.fetchall()
+    conn.close()
+
+    logger.info(f"Found {len(calls)} calls in CallHistoryDB")
 
     if dry_run:
         return {"status": "dry_run", "count": len(calls)}
 
     export = []
-    for call in calls:
-        export.append({
-            "id": call.id,
-            "source_id": call.source_id,
-            "source_type": call.source_type,
-            "person_id": call.person_id,
-            "timestamp": call.timestamp.isoformat() if call.timestamp else None,
-            "title": call.title,
-            "snippet": call.snippet,
-            "source_link": call.source_link,
-        })
+    errors = 0
+    for row in calls:
+        try:
+            unique_id, zdate, duration, address, name, originated, answered, call_type = row
+
+            if zdate is None:
+                continue
+
+            phone = normalize_phone(address)
+            if not phone:
+                continue
+
+            timestamp = CORE_DATA_EPOCH + timedelta(seconds=zdate)
+
+            direction = "Outgoing" if originated else "Incoming"
+            status = "answered" if answered else "missed"
+            call_type_name = CALL_TYPE_NAMES.get(call_type, "Call")
+            contact_name = name or phone
+            source_type = SOURCE_TYPE_MAP.get(call_type, "phone")
+
+            if duration and duration > 0:
+                title = f"{direction} {call_type_name} with {contact_name} ({format_duration(duration)})"
+            else:
+                title = f"{direction} {call_type_name} ({status}) - {contact_name}"
+
+            export.append({
+                "id": str(uuid.uuid4()),
+                "source_id": unique_id,
+                "source_type": source_type,
+                "person_id": "",
+                "timestamp": timestamp.isoformat(),
+                "title": title,
+                "snippet": None,
+                "source_link": "",
+            })
+        except Exception as e:
+            errors += 1
+            if errors <= 5:
+                logger.warning(f"Skipping call row: {e}")
+
+    if errors:
+        logger.warning(f"Skipped {errors} calls due to errors")
 
     out_path = EXPORT_DIR / "phone_calls.json"
     with open(out_path, "w") as f:
