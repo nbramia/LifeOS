@@ -1,10 +1,10 @@
 """
 Web search service for LifeOS.
 
-Uses the local LLM's training knowledge to answer web-style queries.
-The local model doesn't have real-time web access, but can answer many
-factual questions from its training data. For truly real-time queries
-(weather, stock prices, live scores), it will indicate the limitation.
+Uses the Anthropic API to answer web-style queries. The model doesn't
+have real-time web access, but can answer many factual questions from
+its training data. For truly real-time queries (weather, stock prices,
+live scores), it will indicate the limitation.
 """
 import logging
 from typing import Optional
