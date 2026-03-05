@@ -1,7 +1,7 @@
 [Unit]
 Description=LifeOS FastAPI Server
-After=network.target lifeos-chromadb.service ollama.service
-Wants=lifeos-chromadb.service
+After=network.target lifeos-chromadb.service lifeos-llm.service ollama.service
+Wants=lifeos-chromadb.service lifeos-llm.service
 
 [Service]
 Type=simple

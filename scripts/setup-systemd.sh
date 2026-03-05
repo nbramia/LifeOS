@@ -44,6 +44,9 @@ systemctl daemon-reload
 echo ""
 echo "Enabling and starting services..."
 
+systemctl enable --now lifeos-llm.service
+echo "  lifeos-llm: $(systemctl is-active lifeos-llm.service)"
+
 systemctl enable --now lifeos-chromadb.service
 echo "  lifeos-chromadb: $(systemctl is-active lifeos-chromadb.service)"
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=LifeOS Local LLM (GPT-OSS-120B via llama-server)
+After=network.target
+Before=lifeos-api.service
+
+[Service]
+Type=simple
+User=nathanramia
+WorkingDirectory=/home/nathanramia/llama.cpp
+Environment=ROCBLAS_USE_HIPBLASLT=1
+Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
+ExecStart=/home/nathanramia/llama.cpp/build/bin/llama-server \
+    -hf ggml-org/gpt-oss-120b-GGUF \
+    -ngl 99 \
+    -fa on \
+    --jinja \
+    --no-mmap \
+    -c 32768 \
+    --host 0.0.0.0 \
+    --port 8080
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/nathanramia/Documents/Code/LifeOS/logs/llama-server.log
+StandardError=append:/home/nathanramia/Documents/Code/LifeOS/logs/llama-server.log
+
+[Install]
+WantedBy=multi-user.target
