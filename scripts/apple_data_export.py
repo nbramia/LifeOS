@@ -54,7 +54,7 @@ def export_contacts(dry_run: bool = False) -> dict:
         logger.warning("Contacts reader not available — skipping")
         return {"status": "skipped", "reason": "Contacts framework not available"}
 
-    contacts = reader.fetch_all()
+    contacts = reader.get_all_contacts()
     logger.info(f"Found {len(contacts)} contacts")
 
     if dry_run:
@@ -125,10 +125,12 @@ def export_phone_calls(dry_run: bool = False) -> dict:
         return {"status": "skipped", "reason": "import error"}
 
     store = get_interaction_store()
-    # Get all phone/facetime interactions
-    calls = store.search(source_type="phone_call", limit=50000)
-    calls += store.search(source_type="facetime_audio", limit=50000)
-    calls += store.search(source_type="facetime_video", limit=50000)
+    # Get all phone/facetime interactions using get_all_in_range with wide bounds
+    epoch = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    calls = []
+    for stype in ("phone_call", "facetime_audio", "facetime_video"):
+        calls += store.get_all_in_range(epoch, now, source_type=stype, limit=50000)
 
     logger.info(f"Found {len(calls)} phone/FaceTime interactions")
 
@@ -138,13 +140,14 @@ def export_phone_calls(dry_run: bool = False) -> dict:
     export = []
     for call in calls:
         export.append({
+            "id": call.id,
             "source_id": call.source_id,
             "source_type": call.source_type,
-            "person_entity_id": call.person_entity_id,
+            "person_id": call.person_id,
             "timestamp": call.timestamp.isoformat() if call.timestamp else None,
             "title": call.title,
-            "content": call.content,
-            "metadata": call.metadata if hasattr(call, 'metadata') else {},
+            "snippet": call.snippet,
+            "source_link": call.source_link,
         })
 
     out_path = EXPORT_DIR / "phone_calls.json"
