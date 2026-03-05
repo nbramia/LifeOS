@@ -14,8 +14,7 @@ Environment variables and configuration files for LifeOS.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `ANTHROPIC_API_KEY` | Claude API key | `sk-ant-...` |
-| `LIFEOS_VAULT_PATH` | Obsidian vault path | `/Users/you/Notes` |
+| `LIFEOS_VAULT_PATH` | Obsidian vault path | `~/Notes` |
 
 ### Server
 
@@ -25,6 +24,13 @@ Environment variables and configuration files for LifeOS.
 | `LIFEOS_PORT` | Server port | `8000` |
 | `LIFEOS_CHROMA_URL` | ChromaDB server URL | `http://localhost:8001` |
 | `LIFEOS_CHROMA_PATH` | ChromaDB data directory | `./data/chromadb` |
+
+### LLM Backend
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LIFEOS_LLM_BACKEND` | LLM backend for chat synthesis: `local` (llama-server) or `anthropic` (Claude API) | `local` |
+| `ANTHROPIC_API_KEY` | Claude API key (only required with `LIFEOS_LLM_BACKEND=anthropic`) | — |
 
 ### Embedding & Search
 
@@ -148,7 +154,7 @@ When both are set, Telegram is enabled as a conversational client (full chat pip
 | `LIFEOS_CLAUDE_MAX_TURNS` | Max Claude Code turns per session | `50` |
 | `LIFEOS_CLAUDE_MAX_COST` | Max Claude Code cost per session (USD) | `2.0` |
 
-Requires Claude Code installed and authenticated on the Mac Mini. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.
+Requires Claude Code installed and authenticated on the server. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.
 
 ### Backup
 
@@ -239,8 +245,11 @@ curl "http://localhost:8000/api/crm/people?q=PersonName" | jq '.people[0].id'
 
 ```bash
 # Required
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-LIFEOS_VAULT_PATH=/Users/you/Notes
+LIFEOS_VAULT_PATH=~/Notes
+
+# LLM Backend (default: local)
+# LIFEOS_LLM_BACKEND=local
+# ANTHROPIC_API_KEY=sk-ant-your-key-here  # only needed with LIFEOS_LLM_BACKEND=anthropic
 
 # Identity
 LIFEOS_USER_NAME=YourName

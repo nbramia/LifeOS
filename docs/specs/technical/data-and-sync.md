@@ -28,11 +28,11 @@ How LifeOS ingests and stores data from multiple sources.
 |--------|-------------|----------------|
 | Gmail | Google API | From/To/CC, subjects, timestamps, threads |
 | Calendar | Google API | Attendees, organizer, titles, times |
-| Apple Contacts | Native API (pyobjc) | Names, emails, phone numbers, companies |
-| Apple Photos | Photos.sqlite | Face recognition, co-appearances, timestamps |
-| Phone Calls | macOS CallHistoryDB | Numbers, names, duration, direction |
+| Apple Contacts | Apple Data Agent (Mac Mini export via rsync) | Names, emails, phone numbers, companies |
+| Apple Photos | Apple Data Agent (Mac Mini export via rsync) | Face recognition, co-appearances, timestamps |
+| Phone Calls | Apple Data Agent (Mac Mini export via rsync) | Numbers, names, duration, direction |
 | WhatsApp | wacli CLI | JIDs, names, phone numbers |
-| iMessage | macOS chat.db | Phone/email, message content, timestamps |
+| iMessage | Apple Data Agent (Mac Mini export via rsync) | Phone/email, message content, timestamps |
 | Slack | Slack API (OAuth) | User profiles, DMs, channels |
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
@@ -74,9 +74,10 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 03:04          └─ WhatsApp (wacli database)
 03:05          └─ Slack (users + DM messages)
 
-02:50          Phone + iMessage (separate FDA cron, not in main pipeline)
-               └─ Requires Full Disk Access via Terminal.app
-               └─ scripts/run_sync_with_fda.sh → scripts/run_fda_syncs.py
+02:50          Apple Data Agent export (Mac Mini → Linux server via rsync)
+               └─ Exports contacts, phone calls, iMessage, photos
+               └─ scripts/apple_data_agent.sh → scripts/apple_data_export.py (Mac Mini)
+               └─ scripts/apple_data_import.py (Linux server)
 
                === PHASE 2: Entity Processing ===
                Link source entities to canonical PersonEntity records
@@ -129,14 +130,14 @@ The 6-phase structure ensures correct data flow:
 5. **Content Sync** pulls external content (indexed on next run)
 6. **Post-Sync Cleanup** cleans up entity data quality issues after all other syncs
 
-**Note:** Phone and iMessage sync separately via FDA cron (`scripts/run_sync_with_fda.sh`) at 2:50 AM, before the main pipeline. They require Full Disk Access which launchd does not have.
+**Note:** Apple data (contacts, phone calls, iMessage, photos) is exported from the Mac Mini via the Apple Data Agent (`scripts/apple_data_agent.sh`) at 2:50 AM, before the main pipeline. The export runs on the Mac Mini (which has FDA access) and syncs to the Linux server via rsync.
 
 ### Process Summary
 
 | Process | Schedule | Reads From | Writes To |
 |---------|----------|------------|-----------|
 | ChromaDB Server | Continuous (boot) | HTTP requests | Vector data |
-| Launchd API Service | Continuous (boot) | All data | API logs |
+| systemd/launchd API Service | Continuous (boot) | All data | API logs |
 | Unified Sync | Daily 3:00 AM ET | All sources | All stores |
 | Calendar Indexer | 8 AM, 12 PM, 3 PM ET | Google Calendar | ChromaDB (`lifeos_calendar`) |
 | Vault File Watcher | Continuous | Vault filesystem | ChromaDB, BM25 |
@@ -183,11 +184,19 @@ All sync scripts in `scripts/` follow the pattern:
 |--------|---------|-------------|
 | `sync_gmail_calendar_interactions.py` | Sync emails (sent+received+CC) and calendar | Gmail/Calendar API |
 | `sync_linkedin.py` | Sync LinkedIn connections | CSV export |
-| `sync_apple_contacts.py` | Sync Apple Contacts (native API) | Apple Contacts (pyobjc) |
-| `sync_phone_calls.py` | Sync phone calls | macOS CallHistoryDB |
+| `sync_apple_contacts.py` | Sync Apple Contacts | Apple Data Agent export |
+| `sync_phone_calls.py` | Sync phone calls | Apple Data Agent export |
 | `sync_whatsapp.py` | Sync WhatsApp contacts and messages | `~/.wacli/wacli.db` |
-| `sync_imessage_interactions.py` | Sync iMessage | macOS chat.db |
+| `sync_imessage_interactions.py` | Sync iMessage | Apple Data Agent export |
 | `sync_slack.py` | Sync Slack users and DMs | Slack API |
+
+### Apple Data Agent
+
+| Script | Purpose | Runs On |
+|--------|---------|---------|
+| `apple_data_export.py` | Export Apple data (contacts, phone, iMessage, photos) | Mac Mini |
+| `apple_data_import.py` | Import Apple data exports into LifeOS | Linux server |
+| `apple_data_agent.sh` | Orchestrate export + rsync + import | Mac Mini (cron) |
 
 ### Phase 2: Entity Processing
 
@@ -196,7 +205,7 @@ All sync scripts in `scripts/` follow the pattern:
 | `link_slack_entities.py` | Link Slack users to people by email | `data/crm.db` |
 | `link_imessage_entities.py` | Link iMessage handles to people by phone | `data/imessage.db` |
 | `link_source_entities.py` | Retroactive linking for all unlinked entities | `data/crm.db` |
-| `sync_photos.py` | Sync Photos face recognition to people | Photos.sqlite |
+| `sync_photos.py` | Sync Photos face recognition to people | Apple Data Agent export |
 
 ### Phase 3: Relationship Building
 
@@ -320,11 +329,11 @@ The unified sync runner (`run_all_syncs.py`) executes in this order:
 1. `gmail` - Email sync (sent + received + CC)
 2. `calendar` - Calendar sync
 3. `linkedin` - LinkedIn connections
-4. `contacts` - Apple Contacts (native via pyobjc)
+4. `contacts` - Apple Contacts (via Apple Data Agent export)
 5. `whatsapp` - WhatsApp contacts and messages
 6. `slack` - Slack users and DMs
 
-**Note:** `phone` and `imessage` run separately via FDA cron at 2:50 AM (not in main pipeline). They require Full Disk Access which launchd does not have.
+**Note:** `phone` and `imessage` data is exported from the Mac Mini via the Apple Data Agent at 2:50 AM (before the main pipeline) and imported on the Linux server.
 
 **Phase 2: Entity Processing**
 7. `link_slack` - Link Slack entities by email
@@ -350,8 +359,8 @@ The unified sync runner (`run_all_syncs.py`) executes in this order:
 **Phase 6: Post-Sync Cleanup**
 19. `entity_cleanup` - Auto-hide non-humans, queue duplicates for review
 
-**Automated via launchd:**
-- Service: `com.lifeos.crm-sync`
+**Automated via systemd (Linux) / launchd (macOS):**
+- Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)
 - Schedule: Daily at 3:00 AM
 - Script: `scripts/run_all_syncs.py`
 

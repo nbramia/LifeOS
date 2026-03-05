@@ -141,11 +141,12 @@ See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md) for full tool li
 
 ## Step 6: Set Up Automated Services
 
-For production use, configure launchd services for:
+For production use, configure system services for:
 - API server auto-start on boot
 - Nightly data sync at 3 AM
 
-See [Launchd Setup Guide](../guides/LAUNCHD-SETUP.md).
+- **Linux**: `sudo ./scripts/setup-systemd.sh`
+- **macOS**: See [Launchd Setup Guide](../guides/LAUNCHD-SETUP.md)
 
 ---
 
@@ -172,7 +173,8 @@ Run this checklist to ensure everything is working:
    - [Slack Integration](../guides/SLACK-INTEGRATION.md) for Slack messages
 
 2. **Set up services**:
-   - [Launchd Setup](../guides/LAUNCHD-SETUP.md) for auto-start
+   - Linux: `sudo ./scripts/setup-systemd.sh`
+   - macOS: [Launchd Setup](../guides/LAUNCHD-SETUP.md) for auto-start
 
 3. **Learn the API**:
    - [API Reference](../architecture/API-MCP-REFERENCE.md)

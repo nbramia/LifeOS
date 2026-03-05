@@ -15,12 +15,13 @@ Reference for all LifeOS scripts with usage examples.
 Manage the LifeOS API server.
 
 ```bash
-./scripts/server.sh start      # Start server
+./scripts/server.sh start      # Start server (background)
 ./scripts/server.sh stop       # Stop server
 ./scripts/server.sh restart    # Restart (after code changes)
 ./scripts/server.sh status     # Check if running
 ./scripts/server.sh wait       # Wait for server to become healthy
 ./scripts/server.sh preflight  # Check prerequisites before first start
+./scripts/server.sh foreground # Start server in foreground (for systemd)
 ```
 
 **Important**: Always use this script. Never run `uvicorn` directly.
@@ -180,8 +181,11 @@ Example:
 | `clear-caches.sh` | Clear embedding and search caches |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
-| `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync |
-| `run_fda_syncs.py` | Python FDA sync orchestrator |
+| `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
+| `run_fda_syncs.py` | Python FDA sync orchestrator (macOS) |
+| `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS |
+| `apple_data_import.py` | Import Apple data exports on the server |
+| `apple_data_agent.sh` | Apple Data Agent orchestrator (runs on macOS, rsyncs to server) |
 
 ---
 
@@ -189,7 +193,7 @@ Example:
 
 ### service.sh
 
-Manage launchd services.
+Manage system services (systemd on Linux, launchd on macOS).
 
 ```bash
 ./scripts/service.sh install    # Install and start the service (auto-start on boot)
@@ -203,9 +207,21 @@ Manage launchd services.
 
 ---
 
+### setup-systemd.sh
+
+Configure systemd services on Linux.
+
+```bash
+sudo ./scripts/setup-systemd.sh
+```
+
+Creates and enables systemd units for the LifeOS API server and ChromaDB.
+
+---
+
 ### setup-launchd.sh
 
-Configure launchd services from templates.
+Configure launchd services from templates (macOS only).
 
 ```bash
 ./scripts/setup-launchd.sh
@@ -275,7 +291,7 @@ curl -X POST http://localhost:8000/api/crm/strengths/update
 ### Environment
 
 Scripts expect:
-- `~/.venvs/lifeos` on Mac Mini
+- `~/.venvs/lifeos` on the server
 - `.env` file with configuration
 - ChromaDB running for vector operations
 - Server running for API-based operations
@@ -284,7 +300,7 @@ Scripts expect:
 
 Sync logs go to:
 - stdout/stderr during execution
-- `logs/crm-sync.log` when run via launchd
+- `logs/crm-sync.log` when run via systemd/launchd
 - `~/Notes/LifeOS/sync_errors.md` for error summaries
 
 ---
@@ -338,5 +354,5 @@ curl -X POST http://localhost:8000/api/admin/reindex/sync
 
 ## Related Documents
 
-- [Launchd Setup](launchd-setup.md) -- Automated service management
+- [Launchd Setup](launchd-setup.md) -- Automated service management (macOS)
 - [Troubleshooting](troubleshooting.md) -- Common issues and solutions

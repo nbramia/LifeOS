@@ -27,7 +27,7 @@ LifeOS indexes personal data from every source, resolves entities across platfor
 
 ## What LifeOS Is Not
 
-- **Not a cloud service.** Everything runs locally on a Mac Mini. Privacy is the foundation, not a feature.
+- **Not a cloud service.** Everything runs locally on a Linux workstation. Privacy is the foundation, not a feature.
 - **Not a data platform or infrastructure.** LifeOS is an application — it consumes data from existing sources and makes it useful. It does not replace or abstract storage systems.
 - **Not a replacement for individual apps.** Users continue using Gmail, iMessage, Obsidian, etc. LifeOS sits above them, indexing and unifying without interfering.
 - **Not multi-user.** LifeOS is designed for a single user's personal data. There is no multi-tenant architecture, no user management, no access control beyond macOS permissions.
@@ -40,7 +40,7 @@ LifeOS handles the most sensitive data a person has: emails, therapy notes, fina
 
 ### Local-First, Always
 
-All data processing, indexing, and storage happens locally. External API calls (Claude for synthesis, Ollama for routing) send minimal context and receive only generated text. The system must function fully if the network is unavailable — only Claude synthesis requires connectivity.
+All data processing, indexing, and storage happens locally. LLM calls (local model for synthesis, Ollama for routing) send minimal context and receive only generated text. When using the Anthropic backend, discrete query payloads are sent to Claude for synthesis. The system must function fully if the network is unavailable — only the Anthropic backend requires connectivity.
 
 ### Intelligence Over Organization
 

@@ -14,6 +14,12 @@ Ask the user where marked **[ASK USER]**. Do not skip verification steps.
 Determine hardware capabilities to select appropriate models.
 
 ```bash
+# Linux:
+free -h
+lscpu
+uname -a
+
+# macOS:
 sysctl hw.memsize | awk '{print $2/1073741824 " GB RAM"}'
 system_profiler SPHardwareDataType | grep "Chip\|Total Number of Cores\|Memory"
 sw_vers
@@ -39,11 +45,17 @@ Check each prerequisite:
 
 ```bash
 python3 --version   # Need 3.11+
-brew --version      # Need Homebrew
 git --version       # Need git
+
+# Linux: ensure pip and venv are available
+# Debian/Ubuntu: sudo apt install python3-pip python3-venv
+# Fedora: sudo dnf install python3-pip
+
+# macOS: Homebrew recommended
+brew --version
 ```
 
-**Note:** If Homebrew is not installed, the user must install it manually in a terminal
+**Note (macOS):** If Homebrew is not installed, the user must install it manually in a terminal
 (it requires interactive `sudo`). Tell them to run:
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -51,16 +63,19 @@ git --version       # Need git
 
 If Python 3.11+ is missing:
 ```bash
+# Linux (Debian/Ubuntu):
+sudo apt install python3.12
+# macOS:
 brew install python@3.12
 ```
 
-**[VERIFY]** All three commands return valid versions. Python is 3.11 or higher.
+**[VERIFY]** Python is 3.11 or higher and git is available.
 
 ---
 
 ## Phase 2: Virtual Environment
 
-Create the venv outside the project to avoid macOS TCC scanning delays with launchd.
+Create the venv outside the project directory. This is a convention that also avoids macOS TCC scanning delays if running on macOS.
 
 ```bash
 mkdir -p ~/.venvs
@@ -89,9 +104,10 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | Claude API key (starts with `sk-ant-`) |
 | `LIFEOS_VAULT_PATH` | Yes | Absolute path to Obsidian vault |
 | `LIFEOS_USER_NAME` | Yes | First name (used in prompts) |
+| `LIFEOS_LLM_BACKEND` | No | `local` (default, uses llama-server) or `anthropic` |
+| `ANTHROPIC_API_KEY` | Only if `anthropic` backend | Claude API key (starts with `sk-ant-`) |
 | `LIFEOS_PARTNER_NAME` | No | Partner's first name (leave empty to skip) |
 | `LIFEOS_TIMEZONE` | No | IANA timezone (default: `America/New_York`) |
 
@@ -130,10 +146,10 @@ Set all collected values in `.env`. Then set model overrides from Phase 0:
   ```
 - If 32 GB+ RAM: defaults are fine, no overrides needed.
 
-**[VERIFY]** `.env` contains `ANTHROPIC_API_KEY` and `LIFEOS_VAULT_PATH` with real values:
+**[VERIFY]** `.env` contains `LIFEOS_VAULT_PATH` with a real value (and `ANTHROPIC_API_KEY` if using the anthropic backend):
 
 ```bash
-grep -E "^ANTHROPIC_API_KEY=|^LIFEOS_VAULT_PATH=" .env
+grep -E "^LIFEOS_VAULT_PATH=|^LIFEOS_LLM_BACKEND=|^ANTHROPIC_API_KEY=" .env
 ```
 
 ---
@@ -190,6 +206,11 @@ ls config/crm_mappings.yaml config/linkedin_industry_mappings.json config/people
 ### Install and start Ollama
 
 ```bash
+# Linux:
+curl -fsSL https://ollama.com/install.sh | sh
+systemctl start ollama
+
+# macOS:
 brew install ollama
 brew services start ollama
 ```
@@ -287,11 +308,25 @@ curl -s http://localhost:8000/health/full | python3 -m json.tool
 
 ---
 
-## Phase 8: Launchd Services (optional)
+## Phase 8: System Services (optional)
 
 **[ASK USER]** Do you want to configure LifeOS to run automatically on boot?
 
-If yes, pass the vault path and `--yes` for non-interactive execution:
+### Linux (systemd)
+
+```bash
+sudo ./scripts/setup-systemd.sh
+```
+
+**[VERIFY]** systemd services are active:
+
+```bash
+systemctl status lifeos-api lifeos-chromadb
+```
+
+### macOS (launchd)
+
+Pass the vault path and `--yes` for non-interactive execution:
 
 ```bash
 ./scripts/setup-launchd.sh "$LIFEOS_VAULT_PATH" --yes
@@ -305,7 +340,7 @@ Set up the ChromaDB cron watchdog:
 (crontab -l 2>/dev/null; echo "*/5 * * * * pgrep -f 'chroma run' || (cd $(pwd) && ./scripts/chromadb.sh start)") | crontab -
 ```
 
-**[VERIFY]** Launchd services are loaded:
+**[VERIFY]** launchd services are loaded:
 
 ```bash
 launchctl list | grep lifeos
@@ -313,7 +348,10 @@ launchctl list | grep lifeos
 
 ---
 
-## Phase 9: FDA Wrapper (for iMessage/Phone sync)
+## Phase 9: FDA Wrapper (macOS Apple Data Agent only)
+
+> **Note:** This phase applies only to macOS machines running the Apple Data Agent.
+> On Linux, Apple data is imported via `apple_data_import.py` from nightly rsync exports.
 
 Phone calls, FaceTime, and iMessage sync **require Full Disk Access** to read system
 databases. Without this phase, those data sources will not sync.

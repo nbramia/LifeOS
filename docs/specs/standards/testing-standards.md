@@ -34,7 +34,7 @@ Unit tests are the default and exclude markers: `browser`, `requires_server`, `i
 
 ## Remote Testing Workflow
 
-Tests run on the Mac Mini (server), not locally on the MacBook. The virtual environment only exists on the Mac Mini.
+Tests run on the server, not locally on the development machine. The virtual environment only exists on the server.
 
 ```bash
 # Run unit tests
