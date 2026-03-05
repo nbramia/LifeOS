@@ -111,8 +111,8 @@ KEY LOCATIONS:
   You can read these files directly with Read/Glob/Grep. Use this when you know the filename
   or want full file content. Use the LifeOS MCP search tools when you need to search across
   many files or need structured data like entity_ids and relationship scores.
-- LifeOS project: ~/Documents/Code/LifeOS (has CLAUDE.md with project conventions)
-- Other projects: ~/Documents/Code/
+- LifeOS project: {code_dir}/LifeOS (has CLAUDE.md with project conventions)
+- Other projects: {code_dir}/
 
 LIFEOS DATA ACCESS:
 You have LifeOS MCP tools for searching {user_name}'s personal data. Always use these
@@ -385,6 +385,7 @@ class ClaudeOrchestrator:
             "--append-system-prompt", _SYSTEM_PROMPT.format(
                 vault_path=settings.vault_path,
                 user_name=settings.user_name,
+                code_dir=settings.code_dir,
                 platform_desc="Linux server running Ubuntu" if platform.system() == "Linux" else "Mac Mini running macOS",
             ),
         ]

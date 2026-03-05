@@ -23,15 +23,15 @@ _CODE_WORDS = ["script", "code", "function", "cron"]
 
 _HOME = os.path.expanduser("~")
 _VAULT_DIR = str(settings.vault_path)
-_LIFEOS_DIR = os.path.join(_HOME, "Documents", "Code", "LifeOS")
-_CODE_DIR = os.path.join(_HOME, "Documents", "Code")
+_CODE_DIR = os.path.expanduser(settings.code_dir)
+_LIFEOS_DIR = os.path.join(_CODE_DIR, "LifeOS")
 
 # Cache for scanned project directories
 _project_dirs: list[tuple[str, str]] | None = None
 
 
 def _scan_projects() -> list[tuple[str, str]]:
-    """Scan ~/Documents/Code/ for project directories. Returns (name_lower, full_path) sorted longest-name-first."""
+    """Scan code directory for project directories. Returns (name_lower, full_path) sorted longest-name-first."""
     global _project_dirs
     if _project_dirs is not None:
         return _project_dirs

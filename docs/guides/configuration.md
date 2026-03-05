@@ -24,6 +24,7 @@ Environment variables and configuration files for LifeOS.
 | `LIFEOS_PORT` | Server port | `8000` |
 | `LIFEOS_CHROMA_URL` | ChromaDB server URL | `http://localhost:8001` |
 | `LIFEOS_CHROMA_PATH` | ChromaDB data directory | `./data/chromadb` |
+| `LIFEOS_CODE_DIR` | Parent directory containing LifeOS and other projects | `~/Code` |
 
 ### LLM Backend
 
