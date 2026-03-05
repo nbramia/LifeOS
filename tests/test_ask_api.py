@@ -169,35 +169,35 @@ class TestPromptConstruction:
 class TestSynthesizerService:
     """Test the synthesizer service."""
 
-    def test_synthesizer_calls_claude(self):
-        """Should call Claude API with constructed prompt."""
-        with patch('anthropic.Anthropic') as mock_anthropic:
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create.return_value = MagicMock(
-                content=[MagicMock(text="Test response")]
-            )
+    def test_synthesizer_calls_llm(self):
+        """Should call local LLM with constructed prompt."""
+        mock_response = MagicMock()
+        mock_response.text = "Test response"
 
+        mock_client = MagicMock()
+        mock_client.create.return_value = mock_response
+
+        with patch('api.services.synthesizer.get_local_llm', return_value=mock_client):
             from api.services.synthesizer import Synthesizer
-            synth = Synthesizer(api_key="test-key")
+            synth = Synthesizer()
+            # Reset the cached client so the mock takes effect
+            synth._client = mock_client
             result = synth.synthesize("Test prompt")
 
-            mock_client.messages.create.assert_called_once()
+            mock_client.create.assert_called_once()
 
     def test_synthesizer_handles_api_error(self):
         """Should handle API errors gracefully."""
-        with patch('anthropic.Anthropic') as mock_anthropic:
-            mock_client = MagicMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create.side_effect = Exception("API Error")
+        mock_client = MagicMock()
+        mock_client.create.side_effect = Exception("API Error")
 
-            from api.services.synthesizer import Synthesizer
-            synth = Synthesizer(api_key="test-key")
+        from api.services.synthesizer import Synthesizer
+        synth = Synthesizer()
+        synth._client = mock_client
 
-            # Should not raise, should return error response
-            try:
-                result = synth.synthesize("Test prompt")
-                # If it returns instead of raising, check for error indication
-            except Exception as e:
-                # Re-raising is also acceptable if handled at route level
-                pass
+        # Should raise after retries (handled at route level)
+        try:
+            result = synth.synthesize("Test prompt")
+        except Exception as e:
+            # Re-raising is acceptable if handled at route level
+            pass

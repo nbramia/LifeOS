@@ -1,0 +1,19 @@
+[Unit]
+Description=LifeOS FastAPI Server
+After=network.target lifeos-chromadb.service lifeos-llm.service ollama.service
+Wants=lifeos-chromadb.service lifeos-llm.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=__LIFEOS_DIR__/.env
+Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
+ExecStart=__LIFEOS_DIR__/scripts/server.sh foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:__LIFEOS_DIR__/logs/server.log
+StandardError=append:__LIFEOS_DIR__/logs/server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -43,7 +43,7 @@ This skill runs five phases. You **MUST** use task tracking (TaskCreate/TaskUpda
 1. **Create a branch** if not already on a feature branch: `<type>/<short-description>` per AGENTS.md § Development Workflow.
 2. **Write tests first** for identified test cases. They should fail until implementation is complete.
 3. **Write production code** to make tests pass. Follow existing patterns. Surgical changes only.
-4. **Run the full test suite** on the Mac Mini: `ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"`. All tests must pass before proceeding.
+4. **Run the full test suite** on the server: `./scripts/test.sh`. All tests must pass before proceeding.
 5. **Self-review your diff.** Read every changed file. Check for: unused imports, style mismatches, missing error handling, changes that do not trace to the task.
 
 ### Phase 3: Create PR

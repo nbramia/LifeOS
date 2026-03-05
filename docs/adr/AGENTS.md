@@ -8,6 +8,7 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `004-hybrid-search.md` — Vector (ChromaDB) + keyword (BM25/FTS5) with RRF fusion
 - `005-external-venv-macos-tcc.md` — Virtual environment at ~/.venvs to avoid TCC scanning
 - `006-ollama-query-routing.md` — Local Ollama + Qwen 2.5 for query classification
+- `007-linux-migration.md` — Linux migration and local LLM orchestration (supersedes 005)
 
 ## Key Principles
 

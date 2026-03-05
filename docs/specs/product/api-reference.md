@@ -92,7 +92,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `save_memory` | Save a memory for future reference |
 | `search_memories` | Search previously saved memories |
 
-**Prompt caching:** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
+**Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 
 ### POST /api/search
 
@@ -853,7 +853,7 @@ Get Apple Contacts integration status (availability and authorization).
 
 #### POST /api/crm/contacts/sync
 
-Sync Apple Contacts to the CRM. Creates SourceEntity records for all contacts. Requires macOS and Contacts permission.
+Sync Apple Contacts to the CRM. Creates SourceEntity records for all contacts. On macOS, reads directly via Contacts framework. On Linux, imports via Apple Data Agent exports.
 
 ---
 

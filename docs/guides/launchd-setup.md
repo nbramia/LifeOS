@@ -4,6 +4,8 @@
 > **Last Updated:** 2026-02-19
 > **Audience:** Operators
 
+> **Note:** This guide is for macOS only. For Linux, use `sudo ./scripts/setup-systemd.sh`.
+
 Configure macOS launchd services for automatic startup and scheduled sync.
 
 ---

@@ -500,11 +500,10 @@ class PersonFactExtractor:
     PRIORITY_SOURCES = {"calendar", "vault", "granola"}
     PRIORITY_BONUS = 1.5  # Priority sources get 50% more of their share
 
-    # Model options
-    # Use non-dated aliases for durability (always gets latest version)
-    MODEL_SONNET = "claude-sonnet-4-5"
-    MODEL_HAIKU = "claude-haiku-4-5"
-    DEFAULT_MODEL = MODEL_HAIKU  # Default to Haiku for auto-extraction
+    # Model options (kept for compatibility, actual model is local)
+    MODEL_SONNET = "local"
+    MODEL_HAIKU = "local"
+    DEFAULT_MODEL = MODEL_HAIKU
 
     def __init__(self, fact_store: Optional[PersonFactStore] = None):
         """Initialize extractor."""
@@ -513,10 +512,10 @@ class PersonFactExtractor:
 
     @property
     def client(self):
-        """Lazy-load the Anthropic client."""
+        """Lazy-load the LLM client."""
         if self._client is None:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+            from api.services.llm_client import get_anthropic_llm
+            self._client = get_anthropic_llm()
         return self._client
 
     def _generate_fact_key(self, category: str, value: str) -> str:
@@ -835,13 +834,12 @@ class PersonFactExtractor:
             )
 
             try:
-                response = self.client.messages.create(
-                    model=model,
+                response = self.client.create(
+                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=4096,
-                    messages=[{"role": "user", "content": prompt}]
                 )
 
-                response_text = response.content[0].text
+                response_text = response.text
                 facts = self._parse_extraction_response(
                     response_text, person_id, interaction_lookup
                 )
@@ -1620,13 +1618,12 @@ Interactions:
 {summary_text}"""
 
         try:
-            response = self.client.messages.create(
-                model=model,
+            response = self.client.create(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=2048,
-                messages=[{"role": "user", "content": prompt}]
             )
 
-            response_text = response.content[0].text
+            response_text = response.text
 
             # Handle markdown code blocks
             if "```json" in response_text:

@@ -82,7 +82,7 @@ THERAPISTS = {
 COUPLES_THERAPIST = THERAPISTS["couples"]["name"]
 
 # Model for insight generation
-INSIGHTS_MODEL = "claude-opus-4-5-20251101"
+INSIGHTS_MODEL = "local"  # Uses local LLM via llm_client
 
 
 @dataclass
@@ -314,10 +314,10 @@ class RelationshipInsightGenerator:
 
     @property
     def client(self):
-        """Lazy-load the Anthropic client."""
+        """Lazy-load the LLM client."""
         if self._client is None:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+            from api.services.llm_client import get_anthropic_llm
+            self._client = get_anthropic_llm()
         return self._client
 
     def _parse_date_from_title(self, title: str) -> Optional[datetime]:
@@ -325,8 +325,8 @@ class RelationshipInsightGenerator:
         Parse date from note title in yyyymmdd format.
 
         Examples:
-        - "Couples Therapy Erica Turner 20230115" -> 2023-01-15
-        - "Amy Morgan therapy 20251230" -> 2025-12-30
+        - "Couples Therapy Jane Doe 20230115" -> 2023-01-15
+        - "Dr Smith therapy 20251230" -> 2025-12-30
         """
         # Look for 8-digit date at start of title
         match = re.match(r'^(\d{8})\s', title)
@@ -402,7 +402,8 @@ class RelationshipInsightGenerator:
                 is_couples = therapist_type == "couples"
 
                 # Create obsidian link
-                obsidian_link = f"obsidian://open?vault=Notes%202025&file={md_file.relative_to(therapy_path.parent.parent).as_posix()}"
+                vault_name = settings.vault_path.name if hasattr(settings, 'vault_path') else "vault"
+                obsidian_link = f"obsidian://open?vault={vault_name.replace(' ', '%20')}&file={md_file.relative_to(therapy_path.parent.parent).as_posix()}"
 
                 notes.append({
                     "title": title,
@@ -503,15 +504,14 @@ class RelationshipInsightGenerator:
         # Build prompt (category-specific or all)
         prompt = self._build_generation_prompt(notes_text, exclusion_text, category=category)
 
-        # Call Claude
+        # Call local LLM
         try:
-            response = self.client.messages.create(
-                model=INSIGHTS_MODEL,
+            response = self.client.create(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}]
             )
 
-            response_text = response.content[0].text
+            response_text = response.text
             new_insights = self._parse_response(response_text, person_id, couples_notes, target_category=category)
 
             # Filter out duplicates
