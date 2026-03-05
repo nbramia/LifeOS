@@ -272,13 +272,16 @@ async def run_agent_loop(
         messages.append({"role": "user", "content": list(tool_results)})
 
     else:
-        # Exhausted all tool rounds — force a final synthesis round without tools
+        # Exhausted all tool rounds — force a final synthesis round without tools.
+        # Use a longer timeout: the accumulated context from multiple tool rounds
+        # can be very large, and prompt processing alone may exceed the default timeout.
         print("[agent] Exhausted tool rounds, running synthesis round")
         try:
             async for event in client.astream(
                 messages,
                 system=system_prompt,
                 max_tokens=4096,
+                timeout=180,
             ):
                 if event["type"] == "text":
                     result.full_text += event["content"]
@@ -286,8 +289,9 @@ async def run_agent_loop(
                 elif event["type"] == "done":
                     _track_usage(event["usage"])
         except Exception as e:
-            print(f"[agent] Synthesis round error: {e}")
-            yield {"type": "text", "content": f"\n\n(Error during synthesis: {e})"}
+            error_msg = str(e) or f"{type(e).__name__} (no message)"
+            print(f"[agent] Synthesis round error: {error_msg}")
+            yield {"type": "text", "content": f"\n\n(Error during synthesis: {error_msg})"}
 
     print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
     # Yield the final result
