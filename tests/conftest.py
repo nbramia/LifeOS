@@ -124,7 +124,7 @@ def mock_settings(test_vault_path, test_data_path, monkeypatch):
     mock = Settings(
         vault_path=test_vault_path,
         chroma_path=test_data_path / "chromadb",
-        anthropic_api_key="test-key-for-testing",
+        local_llm_url="http://localhost:8080",
     )
 
     # Patch the global settings

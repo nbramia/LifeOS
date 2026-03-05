@@ -27,8 +27,10 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 
 for i in $(seq 1 $MAX_RETRIES); do
-    # Try to wake the NVMe by listing the Homebrew directory
-    ls /opt/homebrew/bin > /dev/null 2>&1
+    # On macOS, wake the NVMe by listing the Homebrew directory
+    if [[ "$(uname)" == "Darwin" ]]; then
+        ls /opt/homebrew/bin > /dev/null 2>&1
+    fi
 
     # Test that the venv Python can actually start and import dotenv
     if "$PYTHON" -c "from dotenv import load_dotenv" 2>/dev/null; then

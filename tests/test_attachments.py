@@ -148,8 +148,8 @@ class TestBuildMessageContent:
         assert isinstance(result, str)
         assert result == "Hello, Claude!"
 
-    def test_with_image_returns_list(self):
-        """Test that prompts with images return a list of content blocks."""
+    def test_with_image_returns_string_with_note(self):
+        """Test that prompts with images return string with image note (local model)."""
         data = base64.b64encode(b"fake image data").decode()
         attachments = [{
             "filename": "screenshot.png",
@@ -158,20 +158,13 @@ class TestBuildMessageContent:
         }]
         result = build_message_content("What is in this image?", attachments)
 
-        assert isinstance(result, list)
-        assert len(result) == 2  # image + text
+        # Local model: flattened to string with image note
+        assert isinstance(result, str)
+        assert "[Image attached: screenshot.png]" in result
+        assert "What is in this image?" in result
 
-        # First should be image
-        assert result[0]["type"] == "image"
-        assert result[0]["source"]["type"] == "base64"
-        assert result[0]["source"]["media_type"] == "image/png"
-
-        # Last should be text
-        assert result[-1]["type"] == "text"
-        assert "What is in this image?" in result[-1]["text"]
-
-    def test_with_pdf_returns_document_block(self):
-        """Test that PDFs are converted to document blocks."""
+    def test_with_pdf_returns_string_with_note(self):
+        """Test that PDFs are noted in the flattened string (local model)."""
         data = base64.b64encode(b"fake pdf data").decode()
         attachments = [{
             "filename": "document.pdf",
@@ -180,9 +173,9 @@ class TestBuildMessageContent:
         }]
         result = build_message_content("Summarize this PDF", attachments)
 
-        assert isinstance(result, list)
-        assert result[0]["type"] == "document"
-        assert result[0]["source"]["media_type"] == "application/pdf"
+        assert isinstance(result, str)
+        assert "[PDF attached: document.pdf]" in result
+        assert "Summarize this PDF" in result
 
     def test_text_file_appended_to_prompt(self):
         """Test that text files are decoded and appended to prompt."""
@@ -195,12 +188,9 @@ class TestBuildMessageContent:
         }]
         result = build_message_content("What does this file say?", attachments)
 
-        assert isinstance(result, list)
-        # Only text block (text files are appended to prompt, not separate)
-        assert len(result) == 1
-        assert result[0]["type"] == "text"
-        assert "notes.txt" in result[0]["text"]
-        assert text_content in result[0]["text"]
+        assert isinstance(result, str)
+        assert "notes.txt" in result
+        assert text_content in result
 
     def test_mixed_attachments(self):
         """Test handling of mixed attachment types."""
@@ -214,12 +204,10 @@ class TestBuildMessageContent:
         ]
         result = build_message_content("Describe this", attachments)
 
-        assert isinstance(result, list)
-        # Should have: image block + text block (with notes.txt content appended)
-        assert len(result) == 2
-        assert result[0]["type"] == "image"
-        assert result[1]["type"] == "text"
-        assert text_content in result[1]["text"]
+        # Local model: flattened to string
+        assert isinstance(result, str)
+        assert "[Image attached: photo.png]" in result
+        assert text_content in result
 
     def test_multiple_images(self):
         """Test handling of multiple image attachments."""
@@ -232,11 +220,10 @@ class TestBuildMessageContent:
         ]
         result = build_message_content("Compare these images", attachments)
 
-        assert isinstance(result, list)
-        assert len(result) == 3  # 2 images + text
-        assert result[0]["type"] == "image"
-        assert result[1]["type"] == "image"
-        assert result[2]["type"] == "text"
+        assert isinstance(result, str)
+        assert "[Image attached: img1.png]" in result
+        assert "[Image attached: img2.jpg]" in result
+        assert "Compare these images" in result
 
 
 class TestAllowedMediaTypes:

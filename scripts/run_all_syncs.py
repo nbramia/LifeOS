@@ -283,12 +283,15 @@ SYNC_ORDER = [
     "calendar_work",            # Work Google Calendar events
     "calendar_work2",           # Second work Google Calendar events
     "linkedin",                 # LinkedIn connections CSV
-    "contacts",                 # Apple Contacts (native via pyobjc)
-    # NOTE: phone and imessage are NOT in this list - they require Full Disk Access
+    "contacts",                 # Apple Contacts (native via pyobjc, or imported from Mac Mini)
+    # NOTE: phone and imessage are NOT in this list on macOS - they require Full Disk Access
     # which launchd doesn't have. They run via cron at 2:50 AM through Terminal.app:
     #   - scripts/run_sync_with_fda.sh (cron entry, opens Terminal)
     #   - scripts/run_fda_syncs.py (actual sync runner with health tracking)
     # Cron schedule: 50 2 * * * /path/to/run_sync_with_fda.sh
+    #
+    # On Linux, Apple data is imported from Mac Mini exports:
+    "apple_import",             # Import Apple data from Mac Mini (Linux only)
     "whatsapp",                 # WhatsApp contacts + messages
     "slack",                    # Slack users + DM messages
 
@@ -335,6 +338,7 @@ SYNC_SCRIPTS = {
     "calendar_work2": ("scripts/sync_gmail_calendar_interactions.py", ["--execute", "--calendar-only", "--account", "work2", "--days", "30"]),
     "linkedin": ("scripts/sync_linkedin.py", ["--execute"]),
     "contacts": ("scripts/sync_apple_contacts.py", ["--execute"]),
+    "apple_import": ("scripts/apple_data_import.py", ["--execute"]),
     "phone": ("scripts/sync_phone_calls.py", ["--execute"]),
     "whatsapp": ("scripts/sync_whatsapp.py", ["--execute"]),
     "imessage": ("scripts/sync_imessage_interactions.py", ["--execute"]),
@@ -701,9 +705,9 @@ def run_all_syncs(
     logger.info(f"Starting sync run for {len(sources)} sources...")
     logger.info(f"Log file: {log_file}")
 
-    # Trigger Photos.app to open and start iCloud sync in background
+    # Trigger Photos.app to open and start iCloud sync in background (macOS only)
     # This runs at the beginning so Photos can sync throughout the entire process
-    if not dry_run:
+    if not dry_run and sys.platform == "darwin":
         try:
             logger.info("Opening Photos.app to trigger iCloud sync in background...")
             subprocess.run(

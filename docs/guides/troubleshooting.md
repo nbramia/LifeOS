@@ -89,7 +89,7 @@ The server does NOT auto-reload.
 
 ## ChromaDB Issues
 
-### Exit Code 78 (launchd)
+### Exit Code 78 (macOS only — launchd)
 
 **Symptom**: ChromaDB fails with exit code 78 when run via launchd.
 
@@ -219,7 +219,9 @@ curl http://localhost:11434/api/tags | jq
 
 ---
 
-## macOS Permission Issues
+## macOS Permission Issues (Apple Data Agent only)
+
+These issues apply only to macOS machines running the Apple Data Agent for iMessage, Contacts, and Photos sync.
 
 ### Full Disk Access Required
 
@@ -305,7 +307,7 @@ curl http://localhost:11434/api/tags | jq
 **Symptom**: Process using excessive RAM.
 
 **Solution**:
-1. Check which process: `top -o MEM`
+1. Check which process: `top -o %MEM` (Linux) or `top -o MEM` (macOS)
 2. Restart services: `./scripts/server.sh restart`
 3. For sync scripts, they have memory monitoring built in
 
@@ -395,7 +397,7 @@ If these solutions don't work:
 3. Open a new issue with:
    - Error message
    - Steps to reproduce
-   - Environment (macOS version, Python version)
+   - Environment (OS version, Python version)
    - Relevant log output
 
 ## Related Documents

@@ -1,0 +1,16 @@
+[Unit]
+Description=LifeOS ChromaDB Vector Database
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__VENV__/bin/chroma run --host localhost --port 8001 --path __LIFEOS_DIR__/data/chromadb
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:__LIFEOS_DIR__/logs/chromadb.log
+StandardError=append:__LIFEOS_DIR__/logs/chromadb.log
+
+[Install]
+WantedBy=multi-user.target

@@ -14,6 +14,12 @@
 
 LIFEOS_DIR="${LIFEOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 
+if [[ "$(uname)" != "Darwin" ]]; then
+    echo "This script requires macOS (Full Disk Access via Terminal.app)."
+    echo "On Linux, FDA syncs (iMessage, phone calls) are handled via the Apple Data Bridge."
+    exit 0
+fi
+
 # Wake NVMe before running Python (Homebrew/venv live on the NVMe)
 ls /opt/homebrew/bin > /dev/null 2>&1
 sleep 2
