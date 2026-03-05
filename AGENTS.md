@@ -2,9 +2,9 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-03-04
 
-LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, messages, photos, financial data) for semantic search, synthesis, and proactive intelligence. Everything runs locally on macOS.
+LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, messages, photos, financial data) for semantic search, synthesis, and proactive intelligence. Runs on Linux or macOS. The primary server runs on a Linux workstation with a local LLM; a Mac Mini acts as an Apple Data Agent for iMessage, phone calls, and contacts.
 
 ---
 
@@ -14,7 +14,7 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 - **Hybrid search**: Vector similarity (ChromaDB) + keyword matching (BM25/FTS5), fused via Reciprocal Rank Fusion. See [ADR-004](docs/adr/004-hybrid-search.md).
 - **Entity resolution**: Links emails, phones, and names across sources to canonical people using fuzzy matching with scoring.
 - **Sync phases**: Five-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync.
-- **Agentic chat**: Claude autonomously calls 15 tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
+- **Agentic chat**: Local LLM autonomously calls 15 tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
 
 ## Tech Stack
 
@@ -24,11 +24,13 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
 | Query Router | Ollama + Qwen 2.5 (local) |
-| Synthesis | Claude API (Anthropic) |
-| Embeddings | sentence-transformers |
+| LLM (orchestration + synthesis) | Local model via OpenAI-compatible API (llama-server, port 8080) |
+| LLM Client | `api/services/llm_client.py` — unified wrapper with Anthropic↔OpenAI tool format translation |
+| Embeddings | sentence-transformers (GPU via ROCm) |
 | Frontend | Vanilla HTML/JS (no build step) |
 | Job Queue | SQLite-backed background workers |
 | Reminders | SQLite + cron scheduler |
+| Service Management | systemd (Linux) / launchd (macOS) |
 
 ## Documentation Structure
 
@@ -145,7 +147,7 @@ Option (a) is the default. Options (b) and (c) require explicit justification.
 
 - LifeOS handles deeply personal data: emails, messages, photos, finances, therapy notes.
 - Never log, expose, or transmit personal data beyond what the system requires.
-- All data stays local. Claude API is only used for discrete queries.
+- All data stays local. LLM inference runs locally — no data leaves the machine.
 - Use obviously synthetic data in all documentation and test fixtures.
 - Security-sensitive implementation details belong in code, not docs.
 - When in doubt about whether something is a privacy concern, treat it as one.
@@ -158,7 +160,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 | Tier | Action |
 |------|--------|
-| **Always** | Run full test suite on Mac Mini before commit |
+| **Always** | Run full test suite on the server before commit |
 | **Always** | Restart server after Python changes |
 | **Always** | Use `./scripts/server.sh` for server management |
 | **Always** | Use obviously synthetic data in tests and docs |
@@ -172,7 +174,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | **Never** | Skip pre-commit hooks (`--no-verify`) |
 | **Never** | Log, print, or expose real personal data |
 | **Never** | Run uvicorn directly (use `./scripts/server.sh`) |
-| **Never** | Create a venv locally (only exists on Mac Mini) |
+| **Never** | Create a venv on the MacBook (only exists on the server at `~/.venvs/lifeos`) |
 
 ---
 
@@ -180,8 +182,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 **Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
 
-1. **Edit code** (locally on MacBook — filesystem is synced)
-2. **Restart server** on Mac Mini: `./scripts/server.sh restart`
+1. **Edit code** (locally on MacBook — filesystem is synced to server)
+2. **Restart server** on Linux server: `./scripts/server.sh restart`
 3. **Test manually** or run tests: `./scripts/test.sh`
 4. **Deploy**: `./scripts/deploy.sh "Your commit message"`
 
@@ -192,6 +194,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | File | Purpose |
 |------|---------|
 | `api/main.py` | FastAPI application entry point |
+| `api/services/llm_client.py` | Unified LLM wrapper (OpenAI-compatible API with tool format translation) |
 | `api/services/task_manager.py` | Task management service (Obsidian Tasks integration) |
 | `api/routes/tasks.py` | Task CRUD API endpoints |
 | `config/settings.py` | Environment configuration |
@@ -203,24 +206,27 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 | Script | Purpose |
 |--------|---------|
-| `./scripts/server.sh` | Start/stop/restart server |
+| `./scripts/server.sh` | Start/stop/restart/foreground server |
 | `./scripts/deploy.sh` | Test → restart → commit → push |
 | `./scripts/test.sh` | Run test suites |
-| `./scripts/service.sh` | launchd service management |
-| `/Applications/LifeOS.app/Contents/MacOS/LifeOS` | FDA wrapper for cron jobs |
-| `./scripts/run_sync_wrapper.sh` | NVMe wake + Python pre-flight for nightly sync |
+| `./scripts/service.sh` | systemd (Linux) / launchd (macOS) service management |
+| `./scripts/setup-systemd.sh` | Install systemd units and enable services (Linux, run with sudo) |
+| `./scripts/run_sync_wrapper.sh` | Pre-flight checks for nightly sync |
+| `./scripts/apple_data_export.py` | Export Apple data on Mac Mini (contacts, iMessage, phone) |
+| `./scripts/apple_data_import.py` | Import Apple data on Linux server |
+| `./scripts/apple_data_agent.sh` | Mac Mini cron wrapper: FDA sync → export → rsync to Linux |
 
 ---
 
 ## Dependency Management
 
 **Single source of truth**: `requirements.txt`
-**Virtual environment**: `~/.venvs/lifeos` (external, on Mac Mini only — see [ADR-005](docs/adr/005-external-venv-macos-tcc.md))
+**Virtual environment**: `~/.venvs/lifeos` (external, on the server — see [ADR-005](docs/adr/005-external-venv-macos-tcc.md))
 
 ### Adding a new dependency
 
 1. Add to `requirements.txt`
-2. Install on Mac Mini: `~/.venvs/lifeos/bin/pip install -r requirements.txt`
+2. Install on server: `~/.venvs/lifeos/bin/pip install -r requirements.txt`
 3. Restart server: `./scripts/server.sh restart`
 
 ### Testing
@@ -238,10 +244,20 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 **NEVER run uvicorn or start the server directly.** Always use the provided scripts:
 
 ```bash
-./scripts/server.sh start    # Start server
+./scripts/server.sh start    # Start server (background)
 ./scripts/server.sh stop     # Stop server
 ./scripts/server.sh restart  # Restart after code changes
 ./scripts/server.sh status   # Check if running
+```
+
+On Linux, services are managed by systemd (installed via `sudo ./scripts/setup-systemd.sh`):
+
+```bash
+sudo systemctl restart lifeos-api        # Restart API server
+sudo systemctl status lifeos-api         # Check status
+sudo systemctl status lifeos-chromadb    # Check ChromaDB
+sudo systemctl status lifeos-llm         # Check local LLM (llama-server)
+systemctl list-timers lifeos-*           # Check sync/watchdog timers
 ```
 
 Always restart the server after modifying Python files. The server does NOT auto-reload.
@@ -318,23 +334,22 @@ curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
 
 ---
 
-## macOS Permissions & FDA
+## Mac Mini — Apple Data Agent
 
-`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. Cron and launchd cannot access `~/Documents/` without FDA, so all cron jobs route through this wrapper.
+The Mac Mini (`100.95.233.70`) no longer runs the LifeOS server. Its only role is exporting Apple ecosystem data (iMessage, phone calls, contacts) that requires macOS Full Disk Access, and rsyncing it to the Linux server nightly.
 
-**Commands:**
-- `LifeOS server` — Start API server (used by launchd)
-- `LifeOS fda-sync` — FDA sync (phone/iMessage via Terminal.app)
-- `LifeOS watchdog` — ChromaDB health check and auto-restart
-- `LifeOS exec <cmd>` — Run arbitrary command with FDA permissions
-
-**Cron entries:**
+**Cron entry (Mac Mini):**
 ```
-*/5 * * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS watchdog
-50 2 * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS fda-sync
+50 2 * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS exec ~/Documents/Code/LifeOS/scripts/apple_data_agent.sh
 ```
 
-If adding new cron jobs or scripts that need to access `~/Documents/`, route them through `LifeOS exec`.
+This runs at 2:50 AM: FDA syncs → exports data → rsyncs to Linux → triggers import on the Linux server.
+
+### macOS FDA (Full Disk Access)
+
+`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. macOS cron cannot access `~/Library/Messages/` without FDA, so the Apple Data Agent cron job routes through this wrapper.
+
+If adding new cron jobs or scripts on the Mac Mini that need to access protected directories, route them through `LifeOS exec`.
 
 ### Monarch Money (Financial Data)
 
@@ -387,9 +402,9 @@ Services are tracked on-use, not by polling. Degradation events (fallback usage)
 3. **Committing without testing** → Use `./scripts/deploy.sh`
 4. **Starting server on localhost only** → Must use 0.0.0.0 for Tailscale
 5. **Overfitting to specific test cases** → Consider effects on the full system
-6. **Creating a venv locally** → The venv only exists on the Mac Mini
-7. **Running pytest locally** → Dependencies aren't installed on the MacBook
-8. **Using wrong SSH hostname** → Use Tailscale IP `100.95.233.70`, not `.local`
+6. **Creating a venv on the MacBook** → The venv only exists on the server at `~/.venvs/lifeos`
+7. **Running pytest on the MacBook** → Dependencies aren't installed there
+8. **Using wrong SSH hostname** → Use Tailscale IP `100.68.0.120` (Linux server), not `.local`
 
 ---
 

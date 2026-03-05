@@ -6,7 +6,7 @@
 
 - Use plan mode for non-trivial tasks (3+ files, architectural decisions, unclear requirements).
 - After modifying docs, verify compliance with [docs/AGENTS.md](docs/AGENTS.md) standards.
-- After modifying code, restart server on Mac Mini before testing.
+- After modifying code, restart server on the Linux server before testing.
 - When creating new directories or modules, check if an AGENTS.md + CLAUDE.md pair is appropriate.
 
 ## Skills
@@ -23,14 +23,14 @@ Available as slash commands. See `.claude/skills/` for full details.
 
 ## Remote Development
 
-LifeOS runs on a **Mac Mini** (server at `100.95.233.70` via Tailscale). Code is edited on a **MacBook Pro** — the filesystem is synced, so edits are visible on both machines immediately.
+LifeOS runs on a **Linux server** (`100.68.0.120` via Tailscale) with a local LLM. Code is edited on a **MacBook Pro** — the filesystem is synced, so edits are visible on both machines immediately. A **Mac Mini** (`100.95.233.70`) runs as an Apple Data Agent, exporting iMessage/phone/contacts data nightly.
 
 | Task | Where | Command |
 |------|-------|---------|
 | Edit code | MacBook (local) | Normal file editing |
-| Run tests | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"` |
-| Restart server | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"` |
-| Install deps | Mac Mini (SSH) | `ssh nathanramia@100.95.233.70 "~/.venvs/lifeos/bin/pip install -r ~/Documents/Code/LifeOS/requirements.txt"` |
+| Run tests | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"` |
+| Restart server | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"` |
+| Install deps | Linux server (SSH) | `ssh nathanramia@100.68.0.120 "~/.venvs/lifeos/bin/pip install -r ~/Documents/Code/LifeOS/requirements.txt"` |
 | Git operations | MacBook (local) | Normal git commands |
 
 ## Quick Reference
@@ -50,10 +50,10 @@ curl http://localhost:8000/health/full | jq   # Health check
 ## Critical Invariants
 
 - **Never run uvicorn directly** — always use `./scripts/server.sh`
-- **Never create a venv locally** — it only exists on the Mac Mini at `~/.venvs/lifeos`
-- **Never run pytest locally** — dependencies aren't installed on the MacBook
+- **Never create a venv on the MacBook** — it exists on the Linux server at `~/.venvs/lifeos`
+- **Never run pytest on the MacBook** — dependencies aren't installed there
 - **Always restart server after Python changes** — no auto-reload
-- **SSH uses Tailscale IP** — `100.95.233.70`, not `.local` hostnames
+- **SSH uses Tailscale IP** — `100.68.0.120` (Linux server), not `.local` hostnames
 
 ## Common Mistakes
 
@@ -66,4 +66,4 @@ curl http://localhost:8000/health/full | jq   # Health check
 7. **Leaving stale plans in `docs/plans/`** → Completed or superseded plans must be moved to `docs/plans/archive/`.
 8. **Over-documenting routine changes** → Not every change needs a docs update. Write what helps the next reader understand current state.
 9. **Deleting or modifying a failing test to unblock a commit** → See AGENTS.md § "Tests Are Sacred" for the full decision framework.
-10. **Committing without running the test suite** → Run tests on Mac Mini before every commit. No exceptions.
+10. **Committing without running the test suite** → Run tests on the Linux server before every commit. No exceptions.
