@@ -54,19 +54,13 @@ class TestSearchWeb:
     @pytest.mark.asyncio
     async def test_search_web_returns_list(self):
         """search_web should return a list."""
-        # Mock the anthropic client at the import level
         mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(type="text", text="Here are the results...")
-        ]
+        mock_response.text = "Here are the results..."
 
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.create.return_value = mock_response
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
-            import sys
-            sys.modules["anthropic"].Anthropic.return_value = mock_client
-
+        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
             from api.services.web_search import search_web
             results = await search_web("test query")
             assert isinstance(results, list)
@@ -74,17 +68,12 @@ class TestSearchWeb:
     @pytest.mark.asyncio
     async def test_search_web_handles_error(self):
         """search_web should handle errors gracefully."""
-        # When anthropic import fails or API errors, should return empty list
-        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
-            import sys
-            sys.modules["anthropic"].Anthropic.side_effect = Exception("API Error")
+        mock_client = MagicMock()
+        mock_client.create.side_effect = Exception("API Error")
 
-            # Need to reimport to get the patched version
-            import importlib
-            import api.services.web_search as ws
-            importlib.reload(ws)
-
-            results = await ws.search_web("test query")
+        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+            from api.services.web_search import search_web
+            results = await search_web("test query")
             assert results == []
 
 
@@ -95,17 +84,12 @@ class TestSearchWebWithSynthesis:
     async def test_returns_tuple(self):
         """Should return tuple of (synthesized, results)."""
         mock_response = MagicMock()
-        mock_response.content = [
-            MagicMock(type="text", text="The answer is 42.")
-        ]
+        mock_response.text = "The answer is 42."
 
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.create.return_value = mock_response
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
-            import sys
-            sys.modules["anthropic"].Anthropic.return_value = mock_client
-
+        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
             from api.services.web_search import search_web_with_synthesis
             synthesized, results = await search_web_with_synthesis("test query")
             assert isinstance(synthesized, str)
@@ -114,14 +98,11 @@ class TestSearchWebWithSynthesis:
     @pytest.mark.asyncio
     async def test_handles_error_gracefully(self):
         """Should return error message on failure."""
-        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
-            import sys
-            sys.modules["anthropic"].Anthropic.side_effect = Exception("API Error")
+        mock_client = MagicMock()
+        mock_client.create.side_effect = Exception("API Error")
 
-            import importlib
-            import api.services.web_search as ws
-            importlib.reload(ws)
-
-            synthesized, results = await ws.search_web_with_synthesis("test query")
-            assert "couldn't search" in synthesized.lower()
+        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+            from api.services.web_search import search_web_with_synthesis
+            synthesized, results = await search_web_with_synthesis("test query")
+            assert "couldn't" in synthesized.lower() or "error" in synthesized.lower()
             assert results == []

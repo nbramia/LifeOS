@@ -130,7 +130,12 @@ rotate_log() {
     local max_rotations=5
 
     if [ -f "$LOG_FILE" ]; then
-        local size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo "0")
+        local size
+        if [[ "$(uname)" == "Darwin" ]]; then
+            size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo "0")
+        else
+            size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo "0")
+        fi
         if [ "$size" -ge "$max_size" ]; then
             log_info "Rotating server.log ($(($size / 1048576))MB)..."
             # Shift existing rotations
@@ -143,6 +148,26 @@ rotate_log() {
             [ -f "$LOG_FILE.$((max_rotations + 1))" ] && rm "$LOG_FILE.$((max_rotations + 1))"
         fi
     fi
+}
+
+# Run the server in the foreground (for systemd)
+run_foreground() {
+    log_info "Starting LifeOS server in foreground mode..."
+
+    # Check ChromaDB is running (required dependency)
+    if ! chromadb_healthy; then
+        log_error "ChromaDB server not running. Start it first."
+        return 1
+    fi
+
+    log_info "ChromaDB: Running"
+    log_info "Launching uvicorn on $HOST:$PORT (foreground)..."
+
+    # Exec replaces this process — systemd manages the lifecycle
+    exec "$HOME/.venvs/lifeos/bin/python" -c "
+import uvicorn
+uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info')
+"
 }
 
 # Start the server
@@ -246,6 +271,9 @@ case "${1:-status}" in
         log_info "Restarting server..."
         start_server
         ;;
+    foreground)
+        run_foreground
+        ;;
     status)
         show_status
         ;;
@@ -258,15 +286,16 @@ case "${1:-status}" in
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|preflight}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight}"
         echo ""
         echo "Commands:"
-        echo "  start     - Start server (kills existing, waits for healthy)"
-        echo "  stop      - Stop the server"
-        echo "  restart   - Restart the server"
-        echo "  status    - Show server status"
-        echo "  wait      - Wait for server to become healthy"
-        echo "  preflight - Check prerequisites before first start"
+        echo "  start      - Start server (kills existing, waits for healthy)"
+        echo "  stop       - Stop the server"
+        echo "  restart    - Restart the server"
+        echo "  foreground - Run in foreground (for systemd)"
+        echo "  status     - Show server status"
+        echo "  wait       - Wait for server to become healthy"
+        echo "  preflight  - Check prerequisites before first start"
         echo ""
         echo "Expected startup time: 30-60 seconds (ML model loading)"
         exit 1

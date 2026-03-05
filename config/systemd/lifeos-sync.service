@@ -1,0 +1,14 @@
+[Unit]
+Description=LifeOS Nightly Data Sync
+After=network.target lifeos-api.service
+
+[Service]
+Type=oneshot
+User=nathanramia
+WorkingDirectory=/home/nathanramia/Documents/Code/LifeOS
+EnvironmentFile=/home/nathanramia/Documents/Code/LifeOS/.env
+Environment=LIFEOS_HEADLESS=true
+ExecStart=/home/nathanramia/Documents/Code/LifeOS/scripts/run_sync_wrapper.sh --execute --trigger scheduled
+TimeoutStartSec=21600
+StandardOutput=append:/home/nathanramia/Documents/Code/LifeOS/logs/sync.log
+StandardError=append:/home/nathanramia/Documents/Code/LifeOS/logs/sync.log

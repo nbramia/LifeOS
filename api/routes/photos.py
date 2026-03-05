@@ -481,6 +481,13 @@ async def open_photo_in_app(uuid: str):
     _check_photos_enabled()
 
     import subprocess
+    import sys
+
+    if sys.platform != "darwin":
+        raise HTTPException(
+            status_code=501,
+            detail="Photo opening requires macOS (Photos.app)"
+        )
 
     # Try to find and open the original file
     file_path = _get_photo_file_path(uuid)

@@ -82,7 +82,7 @@ THERAPISTS = {
 COUPLES_THERAPIST = THERAPISTS["couples"]["name"]
 
 # Model for insight generation
-INSIGHTS_MODEL = "claude-opus-4-5-20251101"
+INSIGHTS_MODEL = "local"  # Uses local LLM via llm_client
 
 
 @dataclass
@@ -314,10 +314,10 @@ class RelationshipInsightGenerator:
 
     @property
     def client(self):
-        """Lazy-load the Anthropic client."""
+        """Lazy-load the LLM client."""
         if self._client is None:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+            from api.services.llm_client import get_local_llm
+            self._client = get_local_llm()
         return self._client
 
     def _parse_date_from_title(self, title: str) -> Optional[datetime]:
@@ -503,15 +503,14 @@ class RelationshipInsightGenerator:
         # Build prompt (category-specific or all)
         prompt = self._build_generation_prompt(notes_text, exclusion_text, category=category)
 
-        # Call Claude
+        # Call local LLM
         try:
-            response = self.client.messages.create(
-                model=INSIGHTS_MODEL,
+            response = self.client.create(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}]
             )
 
-            response_text = response.content[0].text
+            response_text = response.text
             new_insights = self._parse_response(response_text, person_id, couples_notes, target_category=category)
 
             # Filter out duplicates

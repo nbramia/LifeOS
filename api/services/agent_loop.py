@@ -1,9 +1,11 @@
 """
 Agentic chat loop for LifeOS.
 
-Runs a multi-turn conversation with Claude where the model can call tools
+Runs a multi-turn conversation where the model can call tools
 autonomously. Implemented as an async generator that yields events so the
 caller (SSE endpoint) can stream them to the client in real time.
+
+Uses the local LLM (OpenAI-compatible llama-server) by default.
 
 Event types yielded:
   {"type": "text",   "content": "..."}       -- streamed text chunk
@@ -12,27 +14,20 @@ Event types yielded:
   {"type": "result", "result": AgentResult}  -- final result (last event)
 """
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
 
 from config.settings import settings
-from api.services.model_selector import get_claude_model_name
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
-from api.services.resilience import is_retryable_api_error
+from api.services.llm_client import get_local_llm, _openai_tool_calls_to_anthropic, LLMUsage
 
 logger = logging.getLogger(__name__)
-
-# Pricing per million tokens
-_PRICING = {
-    "haiku":  {"input": 0.80,  "output": 4.00},
-    "sonnet": {"input": 3.00,  "output": 15.00},
-    "opus":   {"input": 15.00, "output": 75.00},
-}
 
 # Consolidated tools that use sub-action status messages
 _CONSOLIDATED_TOOLS = {"manage_tasks", "manage_reminders", "person_info"}
@@ -66,33 +61,6 @@ def _looks_like_giving_up(text: str) -> bool:
     return bool(_GIVE_UP_PATTERNS.search(text))
 
 
-def _calc_cost(
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read: int = 0,
-    cache_creation: int = 0,
-) -> float:
-    """Calculate cost in USD accounting for prompt caching.
-
-    Anthropic API returns input_tokens as non-cached count (excludes cache tokens).
-    Cache reads cost 0.1x and cache creation costs 1.25x the input price.
-    """
-    tier = "sonnet"
-    model_lower = model.lower()
-    if "haiku" in model_lower:
-        tier = "haiku"
-    elif "opus" in model_lower:
-        tier = "opus"
-    pricing = _PRICING[tier]
-    return (
-        (input_tokens / 1_000_000) * pricing["input"]
-        + (cache_read / 1_000_000) * pricing["input"] * 0.1
-        + (cache_creation / 1_000_000) * pricing["input"] * 1.25
-        + (output_tokens / 1_000_000) * pricing["output"]
-    )
-
-
 @dataclass
 class AgentResult:
     """Result of an agentic chat loop run."""
@@ -122,19 +90,13 @@ async def run_agent_loop(
         question: The user's current question.
         conversation_history: Previous messages (list of Message objects with .role, .content).
         attachments: Optional file attachments (list of dicts with filename, media_type, data).
-        model_tier: "haiku", "sonnet", or "opus".
+        model_tier: "haiku", "sonnet", or "opus" (ignored for local model, kept for API compat).
         max_tool_rounds: Max number of tool-use rounds before forcing a text response.
 
     Yields:
         Dicts with "type" key: "text", "status", or "result".
     """
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(
-        api_key=settings.anthropic_api_key,
-        timeout=90.0,  # 90s per API call (default is 600s)
-    )
-    model = get_claude_model_name(model_tier)
+    client = get_local_llm()
     system_prompt = build_system_prompt()
 
     # Inject relevant memories into system prompt (with token budget)
@@ -170,68 +132,60 @@ async def run_agent_loop(
     user_content = build_message_content(question, attachments)
     messages.append({"role": "user", "content": user_content})
 
-    result = AgentResult(full_text="", model=model)
+    result = AgentResult(full_text="", model="local")
 
-    async def _stream_round(call_kwargs: dict):
-        """Run one Claude API round. Returns (text, final_msg)."""
-        text = ""
-        async with client.messages.stream(**call_kwargs) as stream:
-            async for event in stream:
-                if hasattr(event, "type") and event.type == "content_block_delta":
-                    delta = event.delta
-                    if hasattr(delta, "text") and delta.text:
-                        text += delta.text
-                        yield delta.text
-            yield await stream.get_final_message()
+    def _track_usage(usage: LLMUsage):
+        result.total_input_tokens += usage.input_tokens
+        result.total_output_tokens += usage.output_tokens
+        # Local model has no cost
+        result.total_cost_usd = 0.0
 
-    def _track_usage(final_msg):
-        if final_msg and final_msg.usage:
-            usage = final_msg.usage
-            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-            cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            result.total_input_tokens += usage.input_tokens
-            result.total_output_tokens += usage.output_tokens
-            result.total_cache_read_tokens += cache_read
-            result.total_cache_creation_tokens += cache_creation
-            result.total_cost_usd += _calc_cost(
-                model, usage.input_tokens, usage.output_tokens,
-                cache_read=cache_read, cache_creation=cache_creation,
-            )
+    # Strip cache_control from tool definitions (Anthropic-specific)
+    tools = []
+    for t in TOOL_DEFINITIONS:
+        tool_copy = dict(t)
+        tool_copy.pop("cache_control", None)
+        schema = dict(tool_copy.get("input_schema", {}))
+        schema.pop("cache_control", None)
+        tool_copy["input_schema"] = schema
+        tools.append(tool_copy)
 
     for round_num in range(1, max_tool_rounds + 1):
         print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
-        call_kwargs = {
-            "model": model,
-            "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": messages,
-            "tools": TOOL_DEFINITIONS,
-        }
 
         text_this_round = ""
         tool_use_blocks = []
-        final_msg = None
+        usage_this_round = LLMUsage()
+        finish_reason = ""
 
         api_error_fatal = False
-        with trace_span(f"claude_api_round_{round_num}"):
+        with trace_span(f"llm_api_round_{round_num}"):
             max_api_retries = 2
             for api_attempt in range(max_api_retries + 1):
                 try:
-                    async for item in _stream_round(call_kwargs):
-                        if isinstance(item, str):
-                            text_this_round += item
-                            yield {"type": "text", "content": item}
-                        else:
-                            final_msg = item
+                    async for event in client.astream(
+                        messages,
+                        system=system_prompt,
+                        max_tokens=4096,
+                        tools=tools,
+                    ):
+                        if event["type"] == "text":
+                            text_this_round += event["content"]
+                            yield {"type": "text", "content": event["content"]}
+                        elif event["type"] == "tool_calls":
+                            tool_use_blocks = _openai_tool_calls_to_anthropic(event["calls"])
+                        elif event["type"] == "done":
+                            usage_this_round = event["usage"]
+                            finish_reason = event.get("finish_reason", "")
                     break  # success
                 except Exception as e:
-                    if is_retryable_api_error(e) and api_attempt < max_api_retries:
+                    if api_attempt < max_api_retries:
                         delay = 2 * (2 ** api_attempt)  # 2s, 4s
                         logger.warning(f"Round {round_num} transient error ({e}), retry {api_attempt + 1}/{max_api_retries} in {delay}s")
                         if text_this_round:
                             yield {"type": "self_correction"}
                             text_this_round = ""
-                        yield {"type": "status", "message": f"API temporarily unavailable, retrying in {delay}s..."}
+                        yield {"type": "status", "message": f"LLM temporarily unavailable, retrying in {delay}s..."}
                         await asyncio.sleep(delay)
                         continue
                     print(f"[agent] Round {round_num} API error: {e}")
@@ -244,28 +198,26 @@ async def run_agent_loop(
         if api_error_fatal:
             break
 
-        _track_usage(final_msg)
+        _track_usage(usage_this_round)
         result.full_text += text_this_round
 
-        # Extract tool use blocks from the final message
+        # Build assistant content for message history
         assistant_content = []
-        for block in final_msg.content:
-            if block.type == "text":
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                tool_use_blocks.append(block)
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+        if text_this_round:
+            assistant_content.append({"type": "text", "text": text_this_round})
+        for block in tool_use_blocks:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
 
         tool_names = [b.name for b in tool_use_blocks]
-        print(f"[agent] Round {round_num} done: stop={final_msg.stop_reason}, tools={tool_names}, text={len(text_this_round)}ch")
+        print(f"[agent] Round {round_num} done: stop={finish_reason}, tools={tool_names}, text={len(text_this_round)}ch")
 
         # If no tool calls, we're done — unless the model is giving up without trying
-        if final_msg.stop_reason != "tool_use" or not tool_use_blocks:
+        if finish_reason != "tool_calls" or not tool_use_blocks:
             if (
                 round_num == 1
                 and not result.tool_calls_log
@@ -321,24 +273,20 @@ async def run_agent_loop(
     else:
         # Exhausted all tool rounds — force a final synthesis round without tools
         print("[agent] Exhausted tool rounds, running synthesis round")
-        call_kwargs = {
-            "model": model,
-            "max_tokens": 4096,
-            "system": system_prompt,
-            "messages": messages,
-        }
-        final_msg = None
         try:
-            async for item in _stream_round(call_kwargs):
-                if isinstance(item, str):
-                    result.full_text += item
-                    yield {"type": "text", "content": item}
-                else:
-                    final_msg = item
+            async for event in client.astream(
+                messages,
+                system=system_prompt,
+                max_tokens=4096,
+            ):
+                if event["type"] == "text":
+                    result.full_text += event["content"]
+                    yield {"type": "text", "content": event["content"]}
+                elif event["type"] == "done":
+                    _track_usage(event["usage"])
         except Exception as e:
             print(f"[agent] Synthesis round error: {e}")
             yield {"type": "text", "content": f"\n\n(Error during synthesis: {e})"}
-        _track_usage(final_msg)
 
     print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
     # Yield the final result

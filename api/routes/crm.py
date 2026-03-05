@@ -5035,7 +5035,7 @@ async def analyze_relationship_tone(person_id: Optional[str] = None, months: int
     Samples messages from each month and uses Claude to classify emotional tone.
     Returns monthly tone scores and overall trend.
     """
-    import anthropic
+    from api.services.llm_client import get_local_llm
     from datetime import datetime, timezone, timedelta
 
     target_id = person_id or PARTNER_PERSON_ID
@@ -5089,8 +5089,8 @@ async def analyze_relationship_tone(person_id: Optional[str] = None, months: int
             generated_at=now.isoformat(),
         )
 
-    # Use Claude to analyze tone
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    # Use local LLM to analyze tone
+    client = get_local_llm()
 
     partner_name = _get_partner_name() or "their partner"
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {settings.user_name} and {partner_name} over time.
@@ -5124,13 +5124,12 @@ MESSAGES:
 {chr(10).join(sampled_text)}"""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
+        response = client.create(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
         )
 
-        response_text = response.content[0].text
+        response_text = response.text
 
         # Parse JSON
         if "```json" in response_text:
@@ -5182,7 +5181,7 @@ async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, mo
     then aggregates to monthly averages. Returns separate scores for each person
     plus a combined average.
     """
-    import anthropic
+    from api.services.llm_client import get_local_llm
     import json
     from datetime import datetime, timezone, timedelta
     from collections import defaultdict
@@ -5257,8 +5256,8 @@ async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, mo
     user_text = format_weekly_samples(user_by_week, user_name)
     partner_text = format_weekly_samples(partner_by_week, partner_name)
 
-    # Use Claude to analyze tone for each person
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    # Use local LLM to analyze tone for each person
+    client = get_local_llm()
 
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {user_name} and {partner_name}.
 Messages are grouped by week and separated by sender.
@@ -5292,13 +5291,12 @@ Trend options: stable-positive, stable-neutral, improving, declining, variable
 If a person has no messages for a week, omit their score for that week (don't put null)."""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
+        response = client.create(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}]
         )
 
-        response_text = response.content[0].text
+        response_text = response.text
 
         # Parse JSON
         if "```json" in response_text:

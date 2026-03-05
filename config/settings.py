@@ -57,7 +57,11 @@ class Settings(BaseSettings):
     # Search
     default_top_k: int = 20
 
-    # Local LLM Router (Ollama)
+    # Local LLM (OpenAI-compatible server, e.g. llama-server)
+    local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
+    local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
+
+    # Local LLM Router (Ollama — used for query routing only)
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_model: str = Field(default="qwen2.5:7b-instruct", alias="OLLAMA_MODEL")
     ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")  # 7B model needs more time

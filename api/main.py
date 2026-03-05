@@ -371,7 +371,7 @@ async def health_check():
     from config.settings import settings
 
     checks = {
-        "api_key_configured": bool(settings.anthropic_api_key and settings.anthropic_api_key.strip()),
+        "api_key_configured": bool(settings.local_llm_url and settings.local_llm_url.strip()),
         "reminder_scheduler": _reminder_scheduler.is_alive() if _reminder_scheduler else False,
     }
 
@@ -467,12 +467,12 @@ async def full_health_check():
             results["errors"].append(f"{name}: {str(e)}")
             return False
 
-    # 1. Config check (no HTTP needed)
-    if settings.anthropic_api_key and settings.anthropic_api_key.strip():
-        results["checks"]["anthropic_api_key"] = {"status": "ok", "detail": "configured"}
+    # 1. Config check — local LLM URL
+    if settings.local_llm_url and settings.local_llm_url.strip():
+        results["checks"]["local_llm"] = {"status": "ok", "detail": f"configured ({settings.local_llm_url})"}
     else:
-        results["checks"]["anthropic_api_key"] = {"status": "error", "error": "not configured"}
-        results["errors"].append("anthropic_api_key: not configured")
+        results["checks"]["local_llm"] = {"status": "error", "error": "not configured"}
+        results["errors"].append("local_llm_url: not configured")
 
     # 2. ChromaDB Server (direct health check)
     start = time.time()
