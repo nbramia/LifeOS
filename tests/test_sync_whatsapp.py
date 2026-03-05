@@ -9,6 +9,7 @@ from scripts.sync_whatsapp import (
     normalize_phone,
     extract_phone_from_jid,
     is_group_jid,
+    resolve_lid_phone,
     run_wacli,
     check_wacli_auth,
     sync_whatsapp_messages,
@@ -219,6 +220,16 @@ def _setup_interaction_db(db_path: str, existing_ids: list[str] = None):
         conn.execute(
             "INSERT INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at) VALUES (?, '', '', 'whatsapp', '', '', NULL, ?, '')",
             (sid, sid))
+    conn.commit()
+    conn.close()
+
+
+def _setup_session_db(db_path: str, lid_map: list[tuple] = None):
+    """Create a mock session.db with whatsmeow_lid_map table."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT)")
+    for row in (lid_map or []):
+        conn.execute("INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)", row)
     conn.commit()
     conn.close()
 
@@ -538,3 +549,252 @@ class TestOutgoingGroupMessages:
         assert stats['skipped_large_group'] == 1
         assert stats['outgoing_group_created'] == 0
         mock_resolver.resolve.assert_not_called()
+
+
+class TestResolveLidPhone:
+    """Unit tests for resolve_lid_phone()."""
+
+    def test_standard_lid(self):
+        """Standard LID JID resolves to phone."""
+        lid_phones = {"164712046162027": "+12036417454"}
+        assert resolve_lid_phone("164712046162027@lid", lid_phones) == "+12036417454"
+
+    def test_lid_with_colon_suffix(self):
+        """LID JID with :N device suffix still resolves."""
+        lid_phones = {"164712046162027": "+12036417454"}
+        assert resolve_lid_phone("164712046162027:0@lid", lid_phones) == "+12036417454"
+
+    def test_lid_not_in_map(self):
+        """LID not in map returns empty string."""
+        lid_phones = {"164712046162027": "+12036417454"}
+        assert resolve_lid_phone("999999999999@lid", lid_phones) == ""
+
+    def test_non_lid_jid(self):
+        """Non-LID JID returns empty string."""
+        lid_phones = {"15551234567": "+15551234567"}
+        assert resolve_lid_phone("15551234567@s.whatsapp.net", lid_phones) == ""
+
+    def test_empty_input(self):
+        """Empty/None input returns empty string."""
+        assert resolve_lid_phone("", {}) == ""
+        assert resolve_lid_phone(None, {}) == ""
+
+
+class TestLidPhoneResolution:
+    """Integration tests for LID phone resolution via session.db."""
+
+    def _mock_home(self, tmp_path, wacli_db, session_db=None):
+        """Build a mock Path.home() that routes .wacli/wacli.db and .wacli/session.db."""
+        class FakeWacliDir:
+            def __truediv__(self, name):
+                if name == "wacli.db":
+                    p = MagicMock()
+                    p.exists.return_value = True
+                    p.__str__ = lambda self: wacli_db
+                    return p
+                if name == "session.db":
+                    p = MagicMock()
+                    if session_db:
+                        p.exists.return_value = True
+                        p.__str__ = lambda self: session_db
+                    else:
+                        p.exists.return_value = False
+                    return p
+                return MagicMock()
+
+        class FakeHome:
+            def __truediv__(self, name):
+                if name == ".wacli":
+                    return FakeWacliDir()
+                return MagicMock()
+
+        return FakeHome()
+
+    def test_lid_resolved_by_phone(self, tmp_path):
+        """LID with phone mapping in session.db should resolve by phone."""
+        wacli_db = str(tmp_path / "wacli.db")
+        session_db = str(tmp_path / "session.db")
+        int_db = str(tmp_path / "interactions.db")
+
+        _setup_wacli_db(wacli_db, messages=[{
+            'msg_id': 'msg_lid_phone_01',
+            'chat_jid': '120363001@g.us',
+            'chat_name': 'Test Group',
+            'sender_jid': '164712046162027@lid',
+            'sender_name': '',
+            'ts': '2026-02-25T10:00:00+00:00',
+            'from_me': 0,
+        }], contacts=[
+            ('164712046162027@lid', 'Jonathan'),
+        ], group_participants=[
+            ('120363001@g.us', '164712046162027@lid'),
+        ])
+        _setup_session_db(session_db, lid_map=[
+            ('164712046162027', '12036417454'),
+        ])
+        _setup_interaction_db(int_db)
+
+        mock_entity = MagicMock()
+        mock_entity.id = "person-jonathan-esty"
+        mock_result = MagicMock()
+        mock_result.entity = mock_entity
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = mock_result
+
+        with patch("scripts.sync_whatsapp.subprocess.run") as mock_run, \
+             patch("scripts.sync_whatsapp.get_entity_resolver", return_value=mock_resolver), \
+             patch("scripts.sync_whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("scripts.sync_whatsapp.Path.home") as mock_home, \
+             patch("api.services.person_stats.refresh_person_stats"):
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_home.return_value = self._mock_home(tmp_path, wacli_db, session_db)
+
+            stats = sync_whatsapp_messages(dry_run=False)
+
+        assert stats['resolved_lid_phone'] == 1
+        # Resolver should have been called with phone, not just name
+        mock_resolver.resolve.assert_called_with(
+            name='Jonathan', phone='+12036417454', create_if_missing=True,
+        )
+
+    def test_lid_falls_back_to_name_without_phone(self, tmp_path):
+        """LID without phone mapping should fall back to push_name resolution."""
+        wacli_db = str(tmp_path / "wacli.db")
+        session_db = str(tmp_path / "session.db")
+        int_db = str(tmp_path / "interactions.db")
+
+        _setup_wacli_db(wacli_db, messages=[{
+            'msg_id': 'msg_lid_name_01',
+            'chat_jid': '120363001@g.us',
+            'chat_name': 'Test Group',
+            'sender_jid': '999888777666@lid',
+            'sender_name': '',
+            'ts': '2026-02-25T10:00:00+00:00',
+            'from_me': 0,
+        }], contacts=[
+            ('999888777666@lid', 'Hannah'),
+        ], group_participants=[
+            ('120363001@g.us', '999888777666@lid'),
+        ])
+        # session.db exists but doesn't have this LID
+        _setup_session_db(session_db, lid_map=[])
+        _setup_interaction_db(int_db)
+
+        mock_entity = MagicMock()
+        mock_entity.id = "person-hannah"
+        mock_result = MagicMock()
+        mock_result.entity = mock_entity
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = mock_result
+
+        with patch("scripts.sync_whatsapp.subprocess.run") as mock_run, \
+             patch("scripts.sync_whatsapp.get_entity_resolver", return_value=mock_resolver), \
+             patch("scripts.sync_whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("scripts.sync_whatsapp.Path.home") as mock_home, \
+             patch("api.services.person_stats.refresh_person_stats"):
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_home.return_value = self._mock_home(tmp_path, wacli_db, session_db)
+
+            stats = sync_whatsapp_messages(dry_run=False)
+
+        assert stats['resolved_lid_phone'] == 0
+        assert stats['resolved_lid'] == 1
+        # Resolver should have been called with name only
+        mock_resolver.resolve.assert_called_with(
+            name='Hannah', phone=None, create_if_missing=True,
+        )
+
+    def test_missing_session_db_graceful(self, tmp_path):
+        """Missing session.db should not crash — falls back to name-only resolution."""
+        wacli_db = str(tmp_path / "wacli.db")
+        int_db = str(tmp_path / "interactions.db")
+
+        _setup_wacli_db(wacli_db, messages=[{
+            'msg_id': 'msg_no_session_01',
+            'chat_jid': '120363001@g.us',
+            'chat_name': 'Test Group',
+            'sender_jid': '246698660126807@lid',
+            'sender_name': '',
+            'ts': '2026-02-25T10:00:00+00:00',
+            'from_me': 0,
+        }], contacts=[
+            ('246698660126807@lid', 'Hannah'),
+        ], group_participants=[
+            ('120363001@g.us', '246698660126807@lid'),
+        ])
+        _setup_interaction_db(int_db)
+
+        mock_entity = MagicMock()
+        mock_entity.id = "person-hannah"
+        mock_result = MagicMock()
+        mock_result.entity = mock_entity
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = mock_result
+
+        with patch("scripts.sync_whatsapp.subprocess.run") as mock_run, \
+             patch("scripts.sync_whatsapp.get_entity_resolver", return_value=mock_resolver), \
+             patch("scripts.sync_whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("scripts.sync_whatsapp.Path.home") as mock_home, \
+             patch("api.services.person_stats.refresh_person_stats"):
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            # No session_db — pass None to _mock_home
+            mock_home.return_value = self._mock_home(tmp_path, wacli_db, session_db=None)
+
+            stats = sync_whatsapp_messages(dry_run=False)
+
+        assert stats['resolved_lid_phone'] == 0
+        assert stats['resolved_lid'] == 1
+        # Should still work via name fallback
+        mock_resolver.resolve.assert_called_with(
+            name='Hannah', phone=None, create_if_missing=True,
+        )
+
+    def test_outgoing_group_lid_resolved_by_phone(self, tmp_path):
+        """Outgoing group fan-out should resolve LID participants by phone when available."""
+        wacli_db = str(tmp_path / "wacli.db")
+        session_db = str(tmp_path / "session.db")
+        int_db = str(tmp_path / "interactions.db")
+
+        _setup_wacli_db(wacli_db, messages=[{
+            'msg_id': 'msg_out_lid_phone_01',
+            'chat_jid': '120363001@g.us',
+            'chat_name': 'Ski Group',
+            'sender_jid': 'me@s.whatsapp.net',
+            'sender_name': 'Me',
+            'ts': '2026-02-25T10:00:00+00:00',
+            'from_me': 1,
+        }], contacts=[
+            ('164712046162027@lid', 'Jonathan'),
+        ], group_participants=[
+            ('120363001@g.us', '164712046162027@lid'),
+        ])
+        _setup_session_db(session_db, lid_map=[
+            ('164712046162027', '12036417454'),
+        ])
+        _setup_interaction_db(int_db)
+
+        mock_entity = MagicMock()
+        mock_entity.id = "person-jonathan-esty"
+        mock_result = MagicMock()
+        mock_result.entity = mock_entity
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = mock_result
+
+        with patch("scripts.sync_whatsapp.subprocess.run") as mock_run, \
+             patch("scripts.sync_whatsapp.get_entity_resolver", return_value=mock_resolver), \
+             patch("scripts.sync_whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("scripts.sync_whatsapp.Path.home") as mock_home, \
+             patch("scripts.sync_whatsapp.settings") as mock_settings, \
+             patch("api.services.person_stats.refresh_person_stats"):
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_settings.my_person_id = "my-person-id"
+            mock_home.return_value = self._mock_home(tmp_path, wacli_db, session_db)
+
+            stats = sync_whatsapp_messages(dry_run=False)
+
+        assert stats['resolved_lid_phone'] == 1
+        assert stats['outgoing_group_created'] == 1
+        # Resolver should have been called with both name and phone
+        mock_resolver.resolve.assert_called_with(
+            name='Jonathan', phone='+12036417454', create_if_missing=False,
+        )

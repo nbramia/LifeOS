@@ -18,6 +18,7 @@ import json
 import sqlite3
 import logging
 import argparse
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 # File to track merged person IDs for durability
 MERGED_IDS_FILE = Path(__file__).parent.parent / "data" / "merged_person_ids.json"
+# File to track in-progress merge for crash recovery
+MERGE_LOG_FILE = Path(__file__).parent.parent / "data" / "merge_log.json"
 
 
 def load_merged_ids() -> dict:
@@ -62,6 +65,66 @@ def save_merged_ids(merged_ids: dict):
         if os.path.exists(temp_path):
             os.unlink(temp_path)
         raise
+
+
+def write_merge_intent(primary_id: str, secondary_id: str):
+    """Write intent log for crash recovery. Atomic write like save_merged_ids()."""
+    import tempfile
+    import os
+
+    log = {
+        "operation": "merge",
+        "primary_id": primary_id,
+        "secondary_id": secondary_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "phase": "pending",
+    }
+    MERGE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".json", dir=MERGE_LOG_FILE.parent)
+    try:
+        with os.fdopen(temp_fd, "w") as f:
+            json.dump(log, f, indent=2)
+        import shutil
+        shutil.move(temp_path, MERGE_LOG_FILE)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
+def update_merge_phase(phase: str):
+    """Atomically update the phase field in the merge intent log."""
+    import tempfile
+    import os
+
+    log = load_merge_log()
+    if log is None:
+        raise RuntimeError("No merge log to update")
+    log["phase"] = phase
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".json", dir=MERGE_LOG_FILE.parent)
+    try:
+        with os.fdopen(temp_fd, "w") as f:
+            json.dump(log, f, indent=2)
+        import shutil
+        shutil.move(temp_path, MERGE_LOG_FILE)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
+def load_merge_log() -> dict | None:
+    """Load the merge intent log, or None if absent."""
+    if MERGE_LOG_FILE.exists():
+        with open(MERGE_LOG_FILE) as f:
+            return json.load(f)
+    return None
+
+
+def clear_merge_log():
+    """Delete the merge intent log file."""
+    if MERGE_LOG_FILE.exists():
+        MERGE_LOG_FILE.unlink()
 
 
 def get_canonical_person_id(person_id: str) -> str:
@@ -162,6 +225,35 @@ def find_potential_duplicates() -> list:
     return duplicates
 
 
+def _merge_contexts_json(a_json: str | None, b_json: str | None) -> str:
+    """Merge two JSON-encoded context lists, deduplicating."""
+    a = json.loads(a_json) if a_json else []
+    b = json.loads(b_json) if b_json else []
+    merged = list(a)
+    for ctx in b:
+        if ctx not in merged:
+            merged.append(ctx)
+    return json.dumps(merged)
+
+
+def _earliest(a: str | None, b: str | None) -> str | None:
+    """Return the earlier of two ISO timestamp strings."""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if a < b else b
+
+
+def _latest(a: str | None, b: str | None) -> str | None:
+    """Return the later of two ISO timestamp strings."""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if a > b else b
+
+
 def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> dict:
     """
     Merge secondary person into primary person.
@@ -213,7 +305,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 primary.emails = []
             primary.emails.append(email)
             stats['emails_merged'] += 1
-            logger.info(f"   + Email: {email}")
+            logger.info("   + Email merged")
 
     # Merge phone numbers
     for phone in (secondary.phone_numbers or []):
@@ -222,7 +314,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 primary.phone_numbers = []
             primary.phone_numbers.append(phone)
             stats['phones_merged'] += 1
-            logger.info(f"   + Phone: {phone}")
+            logger.info("   + Phone merged")
 
     # Add secondary's name as alias
     if secondary.canonical_name and secondary.canonical_name != primary.canonical_name:
@@ -282,228 +374,333 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             stats['notes_merged'] = 1
             logger.info(f"   + Notes: copied from secondary")
 
-    # 2. Update interactions
-    logger.info("\n2. Updating interactions...")
+    if dry_run:
+        # Dry run: gather stats without modifying anything
+        # 2. Count interactions
+        logger.info("\n2. Counting interactions...")
+        interactions_db = get_interaction_db_path()
+        int_conn = sqlite3.connect(interactions_db)
+        ids_to_migrate = [canonical_secondary_id]
+        if secondary_id != canonical_secondary_id:
+            ids_to_migrate.append(secondary_id)
+        total_count = 0
+        for old_id in ids_to_migrate:
+            count = int_conn.execute(
+                "SELECT COUNT(*) FROM interactions WHERE person_id = ?", (old_id,)
+            ).fetchone()[0]
+            if count > 0:
+                logger.info(f"   {count} interactions to update for {old_id}")
+            total_count += count
+        stats['interactions_updated'] = total_count
+        logger.info(f"   Total: {total_count} interactions" if total_count else "   No interactions to update")
+        int_conn.close()
+
+        # 3. Count source entities / facts
+        crm_db = get_crm_db_path()
+        crm_conn = sqlite3.connect(crm_db)
+        stats['source_entities_updated'] = crm_conn.execute(
+            "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?",
+            (canonical_secondary_id,)
+        ).fetchone()[0]
+        logger.info(f"\n3. {stats['source_entities_updated']} source entities to update")
+        stats['facts_cleared'] = crm_conn.execute(
+            "SELECT COUNT(*) FROM person_facts WHERE person_id IN (?, ?)",
+            (canonical_primary_id, canonical_secondary_id)
+        ).fetchone()[0]
+        logger.info(f"4. {stats['facts_cleared']} facts to clear")
+
+        # 4. Count relationships
+        from api.services.relationship import get_relationship_store
+        rel_store = get_relationship_store()
+        secondary_rels = rel_store.get_for_person(canonical_secondary_id)
+        stats['relationships_updated'] = 0
+        stats['relationships_merged'] = 0
+        stats['relationships_deleted'] = 0
+        for rel in secondary_rels:
+            other_id = rel.other_person(canonical_secondary_id)
+            if not other_id:
+                continue
+            if other_id == canonical_primary_id:
+                stats['relationships_deleted'] += 1
+            elif rel_store.get_between(canonical_primary_id, other_id):
+                stats['relationships_merged'] += 1
+            else:
+                stats['relationships_updated'] += 1
+        logger.info(f"5. {len(secondary_rels)} relationships to process")
+        crm_conn.close()
+
+        logger.info(f"\n=== Merge Summary (DRY RUN) ===")
+        logger.info(f"Primary: {primary.canonical_name} ({canonical_primary_id})")
+        logger.info(f"Secondary: {secondary.canonical_name} ({canonical_secondary_id})")
+        logger.info(f"Interactions: {stats['interactions_updated']}")
+        logger.info(f"Source entities: {stats['source_entities_updated']}")
+        logger.info(f"Facts: {stats['facts_cleared']}")
+        logger.info(f"Relationships: {stats['relationships_updated']} transfer, {stats['relationships_merged']} merge, {stats['relationships_deleted']} delete")
+        logger.info(f"Emails: +{stats['emails_merged']}, Phones: +{stats['phones_merged']}, Aliases: +{stats['aliases_added']}")
+        logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
+        return stats
+
+    # === EXECUTE PATH (crash-safe with intent log) ===
+
+    # Update last_seen/first_seen on in-memory primary before persisting
+    if secondary.last_seen:
+        if primary.last_seen is None or secondary.last_seen > primary.last_seen:
+            primary.last_seen = secondary.last_seen
+    if secondary.first_seen:
+        if primary.first_seen is None or secondary.first_seen < primary.first_seen:
+            primary.first_seen = secondary.first_seen
+
+    # Step 1: Write intent log
+    logger.info("\n2. Writing intent log...")
+    write_merge_intent(canonical_primary_id, canonical_secondary_id)
+
+    # Step 2: Update merged_person_ids.json (early — prevents sync from recreating dupes)
+    logger.info("\n3. Recording merge IDs...")
+    merged_ids = load_merged_ids()
+    merged_ids[secondary_id] = canonical_primary_id
+    if canonical_secondary_id != secondary_id:
+        merged_ids[canonical_secondary_id] = canonical_primary_id
+    save_merged_ids(merged_ids)
+    update_merge_phase("ids_written")
+    logger.info(f"   Recorded: {secondary_id} -> {canonical_primary_id}")
+
+    # Step 3: Update interactions.db
+    logger.info("\n4. Updating interactions...")
     interactions_db = get_interaction_db_path()
     int_conn = sqlite3.connect(interactions_db)
-
-    # Update interactions for both the canonical secondary ID AND the original secondary_id
-    # (in case they differ due to previous merges)
     ids_to_migrate = [canonical_secondary_id]
     if secondary_id != canonical_secondary_id:
         ids_to_migrate.append(secondary_id)
-
     total_count = 0
     for old_id in ids_to_migrate:
-        cursor = int_conn.execute(
-            "SELECT COUNT(*) FROM interactions WHERE person_id = ?",
-            (old_id,)
-        )
-        count = cursor.fetchone()[0]
+        count = int_conn.execute(
+            "SELECT COUNT(*) FROM interactions WHERE person_id = ?", (old_id,)
+        ).fetchone()[0]
         if count > 0:
             logger.info(f"   {count} interactions to update for {old_id}")
-            if not dry_run:
-                int_conn.execute(
-                    "UPDATE interactions SET person_id = ? WHERE person_id = ?",
-                    (canonical_primary_id, old_id)
-                )
-            total_count += count
-
+            int_conn.execute(
+                "UPDATE interactions SET person_id = ? WHERE person_id = ?",
+                (canonical_primary_id, old_id)
+            )
+        total_count += count
     stats['interactions_updated'] = total_count
     if total_count > 0:
+        int_conn.commit()
         logger.info(f"   Total: {total_count} interactions updated")
     else:
         logger.info(f"   No interactions to update")
-
-    if not dry_run:
-        int_conn.commit()
     int_conn.close()
+    update_merge_phase("interactions_done")
 
-    # 3. Update source entities
-    logger.info("\n3. Updating source entities...")
+    # Step 4: Single crm.db transaction
+    # Groups: source_entities, facts, relationships, person_entities update+delete
+    logger.info("\n5. Updating CRM database (single transaction)...")
     crm_db = get_crm_db_path()
     crm_conn = sqlite3.connect(crm_db)
+    crm_conn.execute("BEGIN IMMEDIATE")
 
-    cursor = crm_conn.execute(
-        "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?",
-        (canonical_secondary_id,)
-    )
-    count = cursor.fetchone()[0]
-    stats['source_entities_updated'] = count
-    logger.info(f"   {count} source entities to update")
-
-    if not dry_run and count > 0:
-        crm_conn.execute(
-            "UPDATE source_entities SET canonical_person_id = ? WHERE canonical_person_id = ?",
-            (canonical_primary_id, canonical_secondary_id)
+    try:
+        # 4a. Update source entities
+        cursor = crm_conn.execute(
+            "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?",
+            (canonical_secondary_id,)
         )
-        crm_conn.commit()
-
-    # 4. Clear facts (will be regenerated from combined interactions)
-    logger.info("\n4. Clearing facts for regeneration...")
-    cursor = crm_conn.execute(
-        "SELECT COUNT(*) FROM person_facts WHERE person_id IN (?, ?)",
-        (canonical_primary_id, canonical_secondary_id)
-    )
-    count = cursor.fetchone()[0]
-    stats['facts_cleared'] = count
-    logger.info(f"   {count} facts to clear (will regenerate from combined interactions)")
-
-    if not dry_run and count > 0:
-        crm_conn.execute(
-            "DELETE FROM person_facts WHERE person_id IN (?, ?)",
-            (canonical_primary_id, canonical_secondary_id)
-        )
-        crm_conn.commit()
-
-    crm_conn.close()
-
-    # 5. Merge relationships
-    logger.info("\n5. Merging relationships...")
-    stats['relationships_updated'] = 0
-    stats['relationships_merged'] = 0
-    stats['relationships_deleted'] = 0
-
-    from api.services.relationship import get_relationship_store, Relationship
-    rel_store = get_relationship_store()
-
-    # Get all relationships involving the secondary person
-    secondary_rels = rel_store.get_for_person(canonical_secondary_id)
-    logger.info(f"   {len(secondary_rels)} relationships to process")
-
-    for rel in secondary_rels:
-        # Find the "other" person in this relationship
-        other_id = rel.other_person(canonical_secondary_id)
-        if not other_id:
-            continue
-
-        # Skip if other person is the primary (self-relationship after merge)
-        if other_id == canonical_primary_id:
-            # Delete this relationship - it would be a self-loop
-            if not dry_run:
-                rel_store.delete(rel.id)
-            stats['relationships_deleted'] += 1
-            logger.info(f"   - Deleted self-loop relationship")
-            continue
-
-        # Check if primary already has a relationship with the other person
-        existing = rel_store.get_between(canonical_primary_id, other_id)
-
-        if existing:
-            # Merge relationship data into existing
-            existing.shared_events_count = (existing.shared_events_count or 0) + (rel.shared_events_count or 0)
-            existing.shared_threads_count = (existing.shared_threads_count or 0) + (rel.shared_threads_count or 0)
-            existing.shared_messages_count = (existing.shared_messages_count or 0) + (rel.shared_messages_count or 0)
-            existing.shared_whatsapp_count = (existing.shared_whatsapp_count or 0) + (rel.shared_whatsapp_count or 0)
-            existing.shared_slack_count = (existing.shared_slack_count or 0) + (rel.shared_slack_count or 0)
-            existing.shared_phone_calls_count = (existing.shared_phone_calls_count or 0) + (rel.shared_phone_calls_count or 0)
-
-            # Merge shared contexts
-            for ctx in (rel.shared_contexts or []):
-                if ctx not in (existing.shared_contexts or []):
-                    if existing.shared_contexts is None:
-                        existing.shared_contexts = []
-                    existing.shared_contexts.append(ctx)
-
-            # Update dates
-            if rel.first_seen_together:
-                if not existing.first_seen_together or rel.first_seen_together < existing.first_seen_together:
-                    existing.first_seen_together = rel.first_seen_together
-            if rel.last_seen_together:
-                if not existing.last_seen_together or rel.last_seen_together > existing.last_seen_together:
-                    existing.last_seen_together = rel.last_seen_together
-
-            # LinkedIn connection - true if either was connected
-            if rel.is_linkedin_connection:
-                existing.is_linkedin_connection = True
-
-            if not dry_run:
-                rel_store.update(existing)
-                rel_store.delete(rel.id)
-
-            stats['relationships_merged'] += 1
-            logger.info(f"   ~ Merged relationship with {other_id}")
-        else:
-            # Transfer relationship to primary - create new to trigger normalization
-            new_rel = Relationship(
-                person_a_id=canonical_primary_id if rel.person_a_id == canonical_secondary_id else rel.person_a_id,
-                person_b_id=canonical_primary_id if rel.person_b_id == canonical_secondary_id else rel.person_b_id,
-                relationship_type=rel.relationship_type,
-                shared_contexts=rel.shared_contexts,
-                shared_events_count=rel.shared_events_count,
-                shared_threads_count=rel.shared_threads_count,
-                shared_messages_count=rel.shared_messages_count,
-                shared_whatsapp_count=rel.shared_whatsapp_count,
-                shared_slack_count=rel.shared_slack_count,
-                shared_phone_calls_count=rel.shared_phone_calls_count,
-                is_linkedin_connection=rel.is_linkedin_connection,
-                first_seen_together=rel.first_seen_together,
-                last_seen_together=rel.last_seen_together,
+        stats['source_entities_updated'] = cursor.fetchone()[0]
+        if stats['source_entities_updated'] > 0:
+            crm_conn.execute(
+                "UPDATE source_entities SET canonical_person_id = ? WHERE canonical_person_id = ?",
+                (canonical_primary_id, canonical_secondary_id)
             )
+        logger.info(f"   Source entities: {stats['source_entities_updated']} updated")
 
-            if not dry_run:
-                rel_store.delete(rel.id)
-                rel_store.add(new_rel)
+        # 4b. Clear facts
+        cursor = crm_conn.execute(
+            "SELECT COUNT(*) FROM person_facts WHERE person_id IN (?, ?)",
+            (canonical_primary_id, canonical_secondary_id)
+        )
+        stats['facts_cleared'] = cursor.fetchone()[0]
+        if stats['facts_cleared'] > 0:
+            crm_conn.execute(
+                "DELETE FROM person_facts WHERE person_id IN (?, ?)",
+                (canonical_primary_id, canonical_secondary_id)
+            )
+        logger.info(f"   Facts cleared: {stats['facts_cleared']}")
 
-            stats['relationships_updated'] += 1
-            logger.info(f"   > Transferred relationship with {other_id}")
+        # 4c. Merge relationships (raw SQL within same transaction)
+        stats['relationships_updated'] = 0
+        stats['relationships_merged'] = 0
+        stats['relationships_deleted'] = 0
 
-    # 6. Save merge mapping for durability
-    logger.info("\n6. Recording merge for durability...")
-    if not dry_run:
-        merged_ids = load_merged_ids()
-        # Record both the original secondary_id and canonical_secondary_id pointing to canonical primary
-        # This ensures lookups for either ID resolve correctly
-        merged_ids[secondary_id] = canonical_primary_id
-        if canonical_secondary_id != secondary_id:
-            merged_ids[canonical_secondary_id] = canonical_primary_id
-        save_merged_ids(merged_ids)
-        logger.info(f"   Recorded: {secondary_id} -> {canonical_primary_id}")
+        # Read all secondary relationships
+        secondary_rels = crm_conn.execute(
+            "SELECT * FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
+            (canonical_secondary_id, canonical_secondary_id)
+        ).fetchall()
+        col_names = [desc[0] for desc in crm_conn.execute("SELECT * FROM relationships LIMIT 0").description]
+        logger.info(f"   Relationships: {len(secondary_rels)} to process")
 
-    # 7. Update primary metadata and delete secondary
-    logger.info("\n7. Updating metadata and cleaning up...")
-    if not dry_run:
-        # Update last_seen to most recent
-        if secondary.last_seen:
-            if primary.last_seen is None or secondary.last_seen > primary.last_seen:
-                primary.last_seen = secondary.last_seen
+        for row in secondary_rels:
+            rel = dict(zip(col_names, row))
+            # Find the "other" person
+            if rel['person_a_id'] == canonical_secondary_id:
+                other_id = rel['person_b_id']
+            else:
+                other_id = rel['person_a_id']
 
-        # Update first_seen to earliest
-        if secondary.first_seen:
-            if primary.first_seen is None or secondary.first_seen < primary.first_seen:
-                primary.first_seen = secondary.first_seen
+            if other_id == canonical_primary_id:
+                # Self-loop — delete
+                crm_conn.execute("DELETE FROM relationships WHERE id = ?", (rel['id'],))
+                stats['relationships_deleted'] += 1
+                logger.info(f"   - Deleted self-loop relationship")
+                continue
 
-        # Save primary
-        store.update(primary)
+            # Normalize IDs for the primary-other pair
+            norm_a, norm_b = (canonical_primary_id, other_id) if canonical_primary_id < other_id else (other_id, canonical_primary_id)
 
-        # Delete secondary
-        store.delete(canonical_secondary_id)
+            existing = crm_conn.execute(
+                "SELECT * FROM relationships WHERE person_a_id = ? AND person_b_id = ?",
+                (norm_a, norm_b)
+            ).fetchone()
 
-        # Save store
-        store.save()
+            if existing:
+                ex = dict(zip(col_names, existing))
+                # Merge counts
+                now = datetime.now(timezone.utc).isoformat()
+                crm_conn.execute("""
+                    UPDATE relationships SET
+                        shared_events_count = ?,
+                        shared_threads_count = ?,
+                        shared_messages_count = ?,
+                        shared_whatsapp_count = ?,
+                        shared_slack_count = ?,
+                        shared_phone_calls_count = ?,
+                        shared_photos_count = ?,
+                        shared_contexts = ?,
+                        first_seen_together = ?,
+                        last_seen_together = ?,
+                        is_linkedin_connection = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                """, (
+                    (ex.get('shared_events_count') or 0) + (rel.get('shared_events_count') or 0),
+                    (ex.get('shared_threads_count') or 0) + (rel.get('shared_threads_count') or 0),
+                    (ex.get('shared_messages_count') or 0) + (rel.get('shared_messages_count') or 0),
+                    (ex.get('shared_whatsapp_count') or 0) + (rel.get('shared_whatsapp_count') or 0),
+                    (ex.get('shared_slack_count') or 0) + (rel.get('shared_slack_count') or 0),
+                    (ex.get('shared_phone_calls_count') or 0) + (rel.get('shared_phone_calls_count') or 0),
+                    (ex.get('shared_photos_count') or 0) + (rel.get('shared_photos_count') or 0),
+                    _merge_contexts_json(ex.get('shared_contexts'), rel.get('shared_contexts')),
+                    _earliest(ex.get('first_seen_together'), rel.get('first_seen_together')),
+                    _latest(ex.get('last_seen_together'), rel.get('last_seen_together')),
+                    1 if (ex.get('is_linkedin_connection') or rel.get('is_linkedin_connection')) else 0,
+                    now,
+                    ex['id'],
+                ))
+                # Delete the secondary's relationship
+                crm_conn.execute("DELETE FROM relationships WHERE id = ?", (rel['id'],))
+                stats['relationships_merged'] += 1
+                logger.info(f"   ~ Merged relationship with {other_id}")
+            else:
+                # Transfer: delete old, insert new with primary ID
+                new_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc).isoformat()
+                crm_conn.execute("DELETE FROM relationships WHERE id = ?", (rel['id'],))
+                crm_conn.execute("""
+                    INSERT INTO relationships
+                    (id, person_a_id, person_b_id, relationship_type, shared_contexts,
+                     shared_events_count, shared_threads_count, first_seen_together,
+                     last_seen_together, created_at, updated_at,
+                     shared_messages_count, shared_whatsapp_count, shared_slack_count,
+                     is_linkedin_connection, shared_phone_calls_count, shared_photos_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    new_id, norm_a, norm_b,
+                    rel.get('relationship_type'),
+                    rel.get('shared_contexts'),
+                    rel.get('shared_events_count') or 0,
+                    rel.get('shared_threads_count') or 0,
+                    rel.get('first_seen_together'),
+                    rel.get('last_seen_together'),
+                    rel.get('created_at') or now,
+                    now,
+                    rel.get('shared_messages_count') or 0,
+                    rel.get('shared_whatsapp_count') or 0,
+                    rel.get('shared_slack_count') or 0,
+                    1 if rel.get('is_linkedin_connection') else 0,
+                    rel.get('shared_phone_calls_count') or 0,
+                    rel.get('shared_photos_count') or 0,
+                ))
+                stats['relationships_updated'] += 1
+                logger.info(f"   > Transferred relationship with {other_id}")
 
-        logger.info(f"   Deleted secondary record: {secondary.canonical_name}")
+        # 4d. INSERT OR REPLACE primary person entity
+        primary_values = store._entity_to_values(primary)
+        from api.services.person_entity import PersonEntityStore
+        crm_conn.execute(
+            f"INSERT OR REPLACE INTO person_entities ({PersonEntityStore._COLUMNS_STR}) "
+            f"VALUES ({PersonEntityStore._PLACEHOLDERS})",
+            primary_values
+        )
 
-        # Refresh stats from InteractionStore (the source of truth)
-        from api.services.person_stats import refresh_person_stats
-        logger.info("   Refreshing stats from InteractionStore...")
-        refresh_person_stats([canonical_primary_id])
+        # 4e. Update lookup tables for primary
+        crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_primary_id,))
+        crm_conn.execute("DELETE FROM person_phones WHERE person_id = ?", (canonical_primary_id,))
+        crm_conn.execute("DELETE FROM person_names WHERE person_id = ?", (canonical_primary_id,))
+        for email in (primary.emails or []):
+            crm_conn.execute(
+                "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
+                (email.lower(), canonical_primary_id))
+        for phone in (primary.phone_numbers or []):
+            if phone:
+                crm_conn.execute(
+                    "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
+                    (phone, canonical_primary_id))
+        if primary.canonical_name:
+            crm_conn.execute(
+                "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
+                (primary.canonical_name.lower(), canonical_primary_id))
+        for alias in (primary.aliases or []):
+            if alias:
+                crm_conn.execute(
+                    "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
+                    (alias.lower(), canonical_primary_id))
 
-        # Reload to get updated counts
-        primary = store.get_by_id(canonical_primary_id)
+        # 4f. Delete secondary person entity + lookup tables
+        crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_secondary_id,))
+        crm_conn.execute("DELETE FROM person_phones WHERE person_id = ?", (canonical_secondary_id,))
+        crm_conn.execute("DELETE FROM person_names WHERE person_id = ?", (canonical_secondary_id,))
+        crm_conn.execute("DELETE FROM person_entities WHERE id = ?", (canonical_secondary_id,))
 
-    # 8. Recalculate relationship strength for primary
-    # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
-    logger.info("\n8. Recalculating relationship strength...")
-    if not dry_run:
-        from api.services.relationship_metrics import update_strength_for_person
-        old_strength = primary.relationship_strength
-        new_strength = update_strength_for_person(canonical_primary_id)
-        if new_strength != old_strength:
-            logger.info(f"   Strength: {old_strength} -> {new_strength}")
-        else:
-            logger.info(f"   Strength unchanged: {new_strength}")
-        store.save()
+        crm_conn.commit()
+        logger.info("   CRM transaction committed")
+    except Exception:
+        crm_conn.rollback()
+        crm_conn.close()
+        raise
+    crm_conn.close()
+    update_merge_phase("crm_done")
+
+    logger.info(f"   Deleted secondary record: {secondary.canonical_name}")
+
+    # Step 5: Post-merge cleanup (stats refresh + relationship strength)
+    logger.info("\n6. Post-merge cleanup...")
+    from api.services.person_stats import refresh_person_stats
+    logger.info("   Refreshing stats from InteractionStore...")
+    refresh_person_stats([canonical_primary_id])
+
+    from api.services.relationship_metrics import update_strength_for_person
+    primary = store.get_by_id(canonical_primary_id)
+    old_strength = primary.relationship_strength if primary else None
+    new_strength = update_strength_for_person(canonical_primary_id)
+    if new_strength != old_strength:
+        logger.info(f"   Strength: {old_strength} -> {new_strength}")
+    else:
+        logger.info(f"   Strength unchanged: {new_strength}")
+
+    # Step 6: Clear intent log
+    update_merge_phase("complete")
+    clear_merge_log()
+    logger.info("   Intent log cleared")
 
     # Summary
     logger.info(f"\n=== Merge Summary ===")
@@ -517,10 +714,71 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     logger.info(f"Phones merged: {stats['phones_merged']}")
     logger.info(f"Aliases added: {stats['aliases_added']}")
 
-    if dry_run:
-        logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
-
     return stats
+
+
+def recover_incomplete_merge() -> bool:
+    """
+    Check for and recover an incomplete merge operation.
+
+    Returns True if a recovery was performed, False if nothing to recover.
+    """
+    log = load_merge_log()
+    if log is None:
+        return False
+
+    if log.get("phase") == "complete":
+        clear_merge_log()
+        return False
+
+    primary_id = log["primary_id"]
+    secondary_id = log["secondary_id"]
+    logger.warning(f"Found incomplete merge: {secondary_id} -> {primary_id} (phase: {log.get('phase')})")
+
+    store = get_person_entity_store()
+    primary = store.get_by_id(primary_id)
+
+    # IMPORTANT: Don't use get_by_id(secondary_id) — it follows the merge chain.
+    # If merged_person_ids.json was already written, get_by_id(secondary) resolves
+    # to the primary, causing a self-merge that deletes the primary.
+    # Instead: check if secondary_id is in the merge map. If so, it's logically gone.
+    merged_ids = load_merged_ids()
+    secondary_is_merged = secondary_id in merged_ids
+
+    if secondary_is_merged:
+        # The secondary was already recorded as merged. Check if its physical
+        # record still exists by doing a raw lookup (not following merge chain).
+        secondary_result = store.get_by_id(secondary_id)
+        # get_by_id follows chain, so if it returns the primary, secondary is gone
+        secondary_exists = secondary_result is not None and secondary_result.id == secondary_id
+    else:
+        secondary_result = store.get_by_id(secondary_id)
+        secondary_exists = secondary_result is not None
+
+    if not primary:
+        # Primary doesn't exist — can't recover meaningfully
+        logger.error(f"Recovery failed: primary person {primary_id} not found")
+        clear_merge_log()
+        return False
+
+    if not secondary_exists:
+        # Secondary already deleted — merge was mostly/fully done.
+        # Run post-merge cleanup and clear log.
+        logger.info("Secondary already deleted — running cleanup steps only")
+        try:
+            from api.services.person_stats import refresh_person_stats
+            refresh_person_stats([primary_id])
+            from api.services.relationship_metrics import update_strength_for_person
+            update_strength_for_person(primary_id)
+        except Exception as e:
+            logger.warning(f"Post-merge cleanup during recovery had issues: {e}")
+        clear_merge_log()
+        return True
+
+    # Both exist — re-run the full merge (all steps are idempotent)
+    logger.info("Re-running merge for crash recovery...")
+    merge_people(primary_id, secondary_id, dry_run=False)
+    return True
 
 
 def main():
@@ -530,7 +788,15 @@ def main():
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
     parser.add_argument('--list-duplicates', action='store_true', help='List potential duplicates')
     parser.add_argument('--search', help='Search for people by name/email/phone')
+    parser.add_argument('--recover', action='store_true', help='Recover an incomplete merge')
     args = parser.parse_args()
+
+    if args.recover:
+        if recover_incomplete_merge():
+            print("Recovery completed successfully.")
+        else:
+            print("No incomplete merge to recover.")
+        return
 
     if args.list_duplicates:
         duplicates = find_potential_duplicates()
