@@ -38,6 +38,7 @@ def reset_lightweight_singletons() -> None:
     from api.services.hybrid_search import reset_hybrid_search
     from api.services.bm25_index import reset_bm25_index
     from api.services.perf_trace import reset_perf_trace_store
+    from api.services.llm_client import reset_local_llm
 
     reset_service_health()
     reset_model_selector()
@@ -45,6 +46,7 @@ def reset_lightweight_singletons() -> None:
     reset_hybrid_search()
     reset_bm25_index()
     reset_perf_trace_store()
+    reset_local_llm()
 
 
 def reset_ml_singletons() -> None:

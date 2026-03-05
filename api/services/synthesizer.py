@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from config.settings import settings
 from api.services.llm_client import get_local_llm
+from api.services.resilience import is_retryable_api_error
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ class Synthesizer:
                 )
                 return response.text
             except Exception as e:
-                if attempt < max_retries:
+                if attempt < max_retries and is_retryable_api_error(e):
                     import time as _time
                     delay = 2 * (2 ** attempt)
                     logger.warning(f"LLM transient error, retry {attempt + 1}/{max_retries} in {delay}s: {e}")
@@ -187,7 +188,7 @@ class Synthesizer:
                         }
                 break  # success
             except Exception as e:
-                if not text_yielded and attempt < max_retries:
+                if not text_yielded and attempt < max_retries and is_retryable_api_error(e):
                     delay = 2 * (2 ** attempt)
                     logger.warning(f"LLM streaming transient error, retry {attempt + 1}/{max_retries} in {delay}s: {e}")
                     await asyncio.sleep(delay)

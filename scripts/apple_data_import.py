@@ -70,7 +70,9 @@ def import_contacts(dry_run: bool = False) -> dict:
     if dry_run:
         return {"status": "dry_run", "count": len(contacts)}
 
-    from api.services.source_entity import get_source_entity_store, LINK_STATUS_AUTO
+    from api.services.source_entity import (
+        get_source_entity_store, SourceEntity, LINK_STATUS_AUTO,
+    )
     from api.services.entity_resolver import get_entity_resolver
     from api.services.person_entity import get_person_entity_store
 
@@ -88,64 +90,66 @@ def import_contacts(dry_run: bool = False) -> dict:
         if not full_name:
             continue
 
-        # Create/update source entity
         source_id = f"contacts:{identifier}"
-        existing = se_store.get_by_source_id(source_id)
+        emails = [e["value"].lower() for e in contact.get("emails", []) if e.get("value")]
+        phones = [p["value"] for p in contact.get("phones", []) if p.get("value")]
 
-        entity_data = {
-            "source_id": source_id,
-            "source_type": "contacts",
-            "name": full_name,
-            "emails": [e["value"] for e in contact.get("emails", []) if e.get("value")],
-            "phones": [p["value"] for p in contact.get("phones", []) if p.get("value")],
-            "raw_data": json.dumps(contact),
-        }
+        # Create/update source entity using actual SourceEntity dataclass
+        existing = se_store.get_by_source("contacts", source_id)
+
+        entity = SourceEntity(
+            source_type="contacts",
+            source_id=source_id,
+            observed_name=full_name,
+            observed_email=emails[0] if emails else None,
+            observed_phone=phones[0] if phones else None,
+            metadata={"raw": contact, "emails": emails, "phones": phones},
+        )
 
         if existing:
-            se_store.update(source_id, entity_data)
+            entity.id = existing.id
+            se_store.update(entity)
             updated += 1
         else:
-            se_store.create(entity_data)
+            se_store.add(entity)
             created += 1
 
         # Resolve to person entity
-        emails = entity_data["emails"]
-        phones = entity_data["phones"]
-
-        person_id = None
+        person = None
         for email in emails:
-            person_id = resolver.resolve_by_email(email)
-            if person_id:
+            person = resolver.resolve_by_email(email)
+            if person:
                 break
-        if not person_id:
+        if not person:
             for phone in phones:
-                person_id = resolver.resolve_by_phone(phone)
-                if person_id:
+                person = resolver.resolve_by_phone(phone)
+                if person:
                     break
 
-        if person_id:
+        if person:
             # Update person entity with contact data
-            updates = {}
             if contact.get("organization"):
-                updates["company"] = contact["organization"]
+                person.company = contact["organization"]
             if contact.get("job_title"):
-                updates["position"] = contact["job_title"]
-            if emails:
-                updates["emails"] = emails
-            if phones:
-                updates["phones"] = phones
+                person.position = contact["job_title"]
+            # Merge emails/phones (don't overwrite existing)
+            for email in emails:
+                if email not in person.emails:
+                    person.emails.append(email)
+            for phone in phones:
+                if phone not in person.phone_numbers:
+                    person.phone_numbers.append(phone)
             if contact.get("birthday"):
                 try:
                     bday = datetime.fromisoformat(contact["birthday"])
-                    updates["birthday"] = bday.strftime("%m-%d")
+                    person.birthday = bday.strftime("%m-%d")
                 except (ValueError, TypeError):
                     pass
 
-            if updates:
-                pe_store.update(person_id, updates)
+            pe_store.update(person)
 
-            # Link source entity
-            se_store.link(source_id, person_id, LINK_STATUS_AUTO)
+            # Link source entity to person
+            se_store.link_to_person(entity.id, person.id, confidence=0.95, status=LINK_STATUS_AUTO)
             linked += 1
 
     logger.info(f"Contacts: {created} created, {updated} updated, {linked} linked")
@@ -190,7 +194,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
     if dry_run:
         return {"status": "dry_run", "count": len(calls)}
 
-    from api.services.interaction_store import get_interaction_store
+    from api.services.interaction_store import get_interaction_store, Interaction
 
     store = get_interaction_store()
     imported = 0
@@ -202,8 +206,10 @@ def import_phone_calls(dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
+        source_type = call.get("source_type", "phone_call")
+
         # Check if already exists
-        existing = store.get_by_source_id(source_id)
+        existing = store.get_by_source(source_type, source_id)
         if existing:
             skipped += 1
             continue
@@ -216,14 +222,17 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
-        store.create(
-            source_id=source_id,
-            source_type=call.get("source_type", "phone_call"),
-            person_entity_id=call.get("person_entity_id"),
+        interaction = Interaction(
+            id=call.get("id", ""),
+            person_id=call.get("person_id", ""),
             timestamp=timestamp,
+            source_type=source_type,
             title=call.get("title", ""),
-            content=call.get("content", ""),
+            snippet=call.get("snippet"),
+            source_link=call.get("source_link", ""),
+            source_id=source_id,
         )
+        store.add_if_not_exists(interaction)
         imported += 1
 
     logger.info(f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid)")

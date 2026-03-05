@@ -62,7 +62,7 @@ def _anthropic_tools_to_openai(tools: list[dict]) -> list[dict]:
     return result
 
 
-def _openai_tool_calls_to_anthropic(tool_calls: list[dict]) -> list[dict]:
+def openai_tool_calls_to_anthropic(tool_calls: list[dict]) -> list[dict]:
     """Convert OpenAI tool_calls response format to Anthropic-style blocks.
 
     OpenAI format (from response):
@@ -98,9 +98,9 @@ class _ToolUseBlock:
 class LocalLLMClient:
     """Client for the local OpenAI-compatible LLM server (llama-server)."""
 
-    def __init__(self, base_url: str | None = None, timeout: float = 90.0):
+    def __init__(self, base_url: str | None = None, timeout: float | None = None):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
         self._async_client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
 
@@ -121,48 +121,6 @@ class LocalLLMClient:
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
             )
         return self._sync_client
-
-    def _build_payload(
-        self,
-        messages: list[dict],
-        *,
-        system: str | list | None = None,
-        max_tokens: int = 4096,
-        tools: list[dict] | None = None,
-        stream: bool = False,
-        temperature: float | None = None,
-    ) -> dict:
-        """Build the OpenAI chat completions payload."""
-        # Prepend system message if provided
-        all_messages = []
-        if system:
-            if isinstance(system, list):
-                # Anthropic-style system blocks: [{"type": "text", "text": "..."}]
-                sys_text = "\n\n".join(
-                    block["text"] for block in system if block.get("type") == "text"
-                )
-            else:
-                sys_text = system
-            if sys_text:
-                all_messages.append({"role": "system", "content": sys_text})
-
-        # Convert messages: handle Anthropic-style content blocks
-        for msg in messages:
-            converted = self._convert_message(msg)
-            if converted:
-                all_messages.append(converted)
-
-        payload: dict[str, Any] = {
-            "model": "local",  # llama-server ignores this but requires it
-            "messages": all_messages,
-            "max_tokens": max_tokens,
-            "stream": stream,
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if tools:
-            payload["tools"] = _anthropic_tools_to_openai(tools)
-        return payload
 
     def _convert_message(self, msg: dict) -> dict | None:
         """Convert a single message from Anthropic format to OpenAI format."""

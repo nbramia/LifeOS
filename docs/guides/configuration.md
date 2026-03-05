@@ -30,6 +30,8 @@ Environment variables and configuration files for LifeOS.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LIFEOS_LLM_BACKEND` | LLM backend for chat synthesis: `local` (llama-server) or `anthropic` (Claude API) | `local` |
+| `LIFEOS_LOCAL_LLM_URL` | Local LLM server URL | `http://localhost:8080` |
+| `LIFEOS_LOCAL_LLM_TIMEOUT` | Local LLM request timeout (seconds) | `90` |
 | `ANTHROPIC_API_KEY` | Claude API key (only required with `LIFEOS_LLM_BACKEND=anthropic`) | — |
 
 ### Embedding & Search

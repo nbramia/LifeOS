@@ -42,7 +42,7 @@ Create a unified LLM client (`api/services/llm_client.py`) that abstracts over b
 - Stop reason normalization (`tool_use` vs `tool_calls`)
 - System prompt format conversion (content blocks vs single string)
 
-Add `LIFEOS_LLM_BACKEND` setting to `config/settings.py` to switch between `local` and `anthropic` backends without code changes. Specialized Claude API calls (relationship insights, fact extraction, tone analysis, web search) are retained on Anthropic where frontier model quality provides clear value.
+Add `LIFEOS_LLM_BACKEND` setting to `config/settings.py` to switch between `local` and `anthropic` backends without code changes. All LLM calls — including specialist tasks like relationship insights, fact extraction, tone analysis, and web search — route through the same backend. When the backend is `local`, everything runs on the local model; when switched to `anthropic`, everything uses the Claude API.
 
 ### Mac Mini role change
 

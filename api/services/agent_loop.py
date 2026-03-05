@@ -25,7 +25,8 @@ from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
-from api.services.llm_client import get_local_llm, _openai_tool_calls_to_anthropic, LLMUsage
+from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage
+from api.services.resilience import is_retryable_api_error
 
 logger = logging.getLogger(__name__)
 
@@ -173,13 +174,13 @@ async def run_agent_loop(
                             text_this_round += event["content"]
                             yield {"type": "text", "content": event["content"]}
                         elif event["type"] == "tool_calls":
-                            tool_use_blocks = _openai_tool_calls_to_anthropic(event["calls"])
+                            tool_use_blocks = openai_tool_calls_to_anthropic(event["calls"])
                         elif event["type"] == "done":
                             usage_this_round = event["usage"]
                             finish_reason = event.get("finish_reason", "")
                     break  # success
                 except Exception as e:
-                    if api_attempt < max_api_retries:
+                    if api_attempt < max_api_retries and is_retryable_api_error(e):
                         delay = 2 * (2 ** api_attempt)  # 2s, 4s
                         logger.warning(f"Round {round_num} transient error ({e}), retry {api_attempt + 1}/{max_api_retries} in {delay}s")
                         if text_this_round:
