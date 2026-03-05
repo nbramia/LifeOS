@@ -36,20 +36,20 @@ class TestResolveWorkingDirectory:
         assert result != os.path.join(HOME, "Notes 2025")
 
     def test_lifeos_keywords(self):
-        assert self._resolve("fix the lifeos server") == os.path.join(HOME, "Documents", "Code", "LifeOS")
-        assert self._resolve("update the sync logic") == os.path.join(HOME, "Documents", "Code", "LifeOS")
-        assert self._resolve("change the telegram bot") == os.path.join(HOME, "Documents", "Code", "LifeOS")
-        assert self._resolve("check chromadb status") == os.path.join(HOME, "Documents", "Code", "LifeOS")
-        assert self._resolve("add an api endpoint") == os.path.join(HOME, "Documents", "Code", "LifeOS")
+        assert self._resolve("fix the lifeos server") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("update the sync logic") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("change the telegram bot") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("check chromadb status") == os.path.join(HOME, "Code", "LifeOS")
+        assert self._resolve("add an api endpoint") == os.path.join(HOME, "Code", "LifeOS")
 
     def test_code_keywords(self):
-        code_dir = os.path.join(HOME, "Documents", "Code")
+        code_dir = os.path.join(HOME, "Code")
         assert self._resolve("write a script to automate") == code_dir
         assert self._resolve("create a cron job") == code_dir
 
     def test_code_word_boundary(self):
         """'code' should match as a word, not inside 'encode'."""
-        code_dir = os.path.join(HOME, "Documents", "Code")
+        code_dir = os.path.join(HOME, "Code")
         assert self._resolve("write some code") == code_dir
         # 'encode' contains 'code' but shouldn't match code keyword
         # (it would still match via word boundary since 'code' appears at end)
@@ -81,14 +81,14 @@ class TestResolveWorkingDirectory:
         mock_path_cls.return_value = mock_code_path
 
         # Patch str() on entries to return full paths
-        mock_entry1.__str__ = lambda self: f"{HOME}/Documents/Code/MyProject"
-        mock_entry2.__str__ = lambda self: f"{HOME}/Documents/Code/AnotherApp"
+        mock_entry1.__str__ = lambda self: f"{HOME}/Code/MyProject"
+        mock_entry2.__str__ = lambda self: f"{HOME}/Code/AnotherApp"
 
         # Need to also patch the entry str representation via the append
         mod._project_dirs = [
-            ("myproject", f"{HOME}/Documents/Code/MyProject"),
-            ("anotherapp", f"{HOME}/Documents/Code/AnotherApp"),
+            ("myproject", f"{HOME}/Code/MyProject"),
+            ("anotherapp", f"{HOME}/Code/AnotherApp"),
         ]
 
         result = mod.resolve_working_directory("update the myproject docs")
-        assert result == f"{HOME}/Documents/Code/MyProject"
+        assert result == f"{HOME}/Code/MyProject"

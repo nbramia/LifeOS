@@ -59,7 +59,7 @@ These rarely need changing. The binary path matches the standard Claude Code ins
 
 After changing these values, restart the server:
 ```bash
-ssh <your-user>@<your-tailscale-ip> "cd ~/Documents/Code/LifeOS && ./scripts/server.sh restart"
+ssh <your-user>@<your-tailscale-ip> "cd ~/Code/LifeOS && ./scripts/server.sh restart"
 ```
 
 ---
@@ -100,9 +100,9 @@ The orchestrator picks the working directory based on keywords in your task:
 | Say this... | Claude works in... |
 |-------------|-------------------|
 | "edit the backlog", "update my journal" | `~/Notes 2025` (vault) |
-| "fix the lifeos server", "update sync" | `~/Documents/Code/LifeOS` |
-| "update the MyProject readme" | `~/Documents/Code/MyProject` |
-| "write a script", "create a cron job" | `~/Documents/Code` |
+| "fix the lifeos server", "update sync" | `~/Code/LifeOS` |
+| "update the MyProject readme" | `~/Code/MyProject` |
+| "write a script", "create a cron job" | `~/Code` |
 | anything else | `~` (home) |
 
 ### Plan Mode
