@@ -9,7 +9,7 @@ factual questions from its training data. For truly real-time queries
 import logging
 from typing import Optional
 
-from api.services.llm_client import get_local_llm
+from api.services.llm_client import get_anthropic_llm
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ async def search_web(query: str, max_results: int = 5) -> list[dict]:
         List of results, each with: title, url, snippet
     """
     try:
-        client = get_local_llm()
+        client = get_anthropic_llm()
         response = client.create(
             messages=[{
                 "role": "user",
@@ -90,7 +90,7 @@ async def search_web_with_synthesis(query: str) -> tuple[str, list[dict]]:
         Tuple of (synthesized_answer, raw_results)
     """
     try:
-        client = get_local_llm()
+        client = get_anthropic_llm()
         response = client.create(
             messages=[{"role": "user", "content": query}],
             system=(

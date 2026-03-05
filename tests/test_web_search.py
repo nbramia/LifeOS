@@ -60,7 +60,7 @@ class TestSearchWeb:
         mock_client = MagicMock()
         mock_client.create.return_value = mock_response
 
-        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
             from api.services.web_search import search_web
             results = await search_web("test query")
             assert isinstance(results, list)
@@ -71,7 +71,7 @@ class TestSearchWeb:
         mock_client = MagicMock()
         mock_client.create.side_effect = Exception("API Error")
 
-        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
             from api.services.web_search import search_web
             results = await search_web("test query")
             assert results == []
@@ -89,7 +89,7 @@ class TestSearchWebWithSynthesis:
         mock_client = MagicMock()
         mock_client.create.return_value = mock_response
 
-        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
             from api.services.web_search import search_web_with_synthesis
             synthesized, results = await search_web_with_synthesis("test query")
             assert isinstance(synthesized, str)
@@ -101,7 +101,7 @@ class TestSearchWebWithSynthesis:
         mock_client = MagicMock()
         mock_client.create.side_effect = Exception("API Error")
 
-        with patch('api.services.web_search.get_local_llm', return_value=mock_client):
+        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
             from api.services.web_search import search_web_with_synthesis
             synthesized, results = await search_web_with_synthesis("test query")
             assert "couldn't" in synthesized.lower() or "error" in synthesized.lower()

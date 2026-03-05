@@ -316,8 +316,8 @@ class RelationshipInsightGenerator:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            from api.services.llm_client import get_local_llm
-            self._client = get_local_llm()
+            from api.services.llm_client import get_anthropic_llm
+            self._client = get_anthropic_llm()
         return self._client
 
     def _parse_date_from_title(self, title: str) -> Optional[datetime]:

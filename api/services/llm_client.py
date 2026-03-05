@@ -608,7 +608,25 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     return _llm_client
 
 
+_anthropic_client: AnthropicLLMClient | None = None
+
+
+def get_anthropic_llm() -> AnthropicLLMClient:
+    """Get or create a dedicated Anthropic client for specialist calls.
+
+    Used by relationship insights, fact extraction, tone analysis, and web search
+    where frontier model quality provides clear value. These always use the Claude
+    API regardless of the LIFEOS_LLM_BACKEND setting.
+    """
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = AnthropicLLMClient()
+        logger.info("Created Anthropic client for specialist calls")
+    return _anthropic_client
+
+
 def reset_local_llm() -> None:
-    """Reset the singleton (for testing)."""
-    global _llm_client
+    """Reset all singletons (for testing)."""
+    global _llm_client, _anthropic_client
     _llm_client = None
+    _anthropic_client = None
