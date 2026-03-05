@@ -38,14 +38,14 @@ Tests run on the server, not locally on the development machine. The virtual env
 
 ```bash
 # Run unit tests
-ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && ./scripts/test.sh"
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && ./scripts/test.sh"
 
 # Run a specific test file
-ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && \
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && \
   ~/.venvs/lifeos/bin/python -m pytest tests/test_task_manager.py -v --tb=short"
 
 # Run smoke tests (unit + critical browser)
-ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && ./scripts/test.sh smoke"
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && ./scripts/test.sh smoke"
 ```
 
 ## Test Naming
@@ -159,7 +159,7 @@ Option (a) is the default. Options (b) and (c) require explicit justification in
 `test_perf_benchmark.py` runs queries against a **live server**, collects perf traces, and validates answer quality. It is not part of the unit test suite.
 
 ```bash
-ssh <user>@<server-ip> "cd ~/Documents/Code/LifeOS && \
+ssh <user>@<server-ip> "cd ~/Code/LifeOS && \
   ~/.venvs/lifeos/bin/python -m pytest tests/test_perf_benchmark.py -v -s"
 ```
 

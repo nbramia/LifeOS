@@ -30,6 +30,9 @@ class Settings(BaseSettings):
         description="ChromaDB server URL"
     )
 
+    # Code directory (parent directory containing LifeOS and other projects)
+    code_dir: str = Field(default="~/Code", alias="LIFEOS_CODE_DIR")
+
     # Server (port 8000 is canonical - keep in sync with scripts/server.sh)
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
