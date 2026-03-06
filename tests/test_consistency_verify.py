@@ -140,7 +140,7 @@ class TestNoIssuesCleanState:
             source_entities=[("se1", "gmail", "p1", "confirmed")],
         )
 
-        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, mock_store)), \
+        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, set(), mock_store)), \
              patch("scripts.sync_consistency_verify._check_person_stats", return_value={"count": 0, "fixed": 0}), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db), \
              patch("config.settings.settings") as mock_settings:
@@ -376,7 +376,7 @@ class TestVerifyConsistencyIntegration:
             relationships=[("r1", "p1", "p2", "colleague")],
         )
 
-        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, mock_store)), \
+        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, set(), mock_store)), \
              patch("api.services.person_stats.verify_person_stats", return_value={}), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db), \
              patch("config.settings.settings") as mock_settings:
