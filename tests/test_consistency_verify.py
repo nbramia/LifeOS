@@ -42,7 +42,15 @@ def _create_crm_db(db_path: str, *, relationships=None, facts=None, overrides=No
             id TEXT PRIMARY KEY,
             person_a_id TEXT NOT NULL,
             person_b_id TEXT NOT NULL,
-            relationship_type TEXT
+            relationship_type TEXT,
+            shared_events_count INTEGER DEFAULT 0,
+            shared_threads_count INTEGER DEFAULT 0,
+            shared_messages_count INTEGER DEFAULT 0,
+            shared_whatsapp_count INTEGER DEFAULT 0,
+            shared_slack_count INTEGER DEFAULT 0,
+            shared_phone_calls_count INTEGER DEFAULT 0,
+            shared_photos_count INTEGER DEFAULT 0,
+            UNIQUE(person_a_id, person_b_id)
         )
     """)
     conn.execute("""
@@ -140,7 +148,7 @@ class TestNoIssuesCleanState:
             source_entities=[("se1", "gmail", "p1", "confirmed")],
         )
 
-        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, mock_store)), \
+        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, set(), mock_store)), \
              patch("scripts.sync_consistency_verify._check_person_stats", return_value={"count": 0, "fixed": 0}), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db), \
              patch("config.settings.settings") as mock_settings:
@@ -376,7 +384,7 @@ class TestVerifyConsistencyIntegration:
             relationships=[("r1", "p1", "p2", "colleague")],
         )
 
-        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, mock_store)), \
+        with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, set(), mock_store)), \
              patch("api.services.person_stats.verify_person_stats", return_value={}), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db), \
              patch("config.settings.settings") as mock_settings:
@@ -420,3 +428,284 @@ class TestAutoFixStaleMergedIds:
         row = conn.execute("SELECT person_id FROM interactions WHERE id = 'i2'").fetchone()
         conn.close()
         assert row[0] == "p1"  # re-pointed from p_old to p1
+
+
+class TestCheckHiddenInteractions:
+    """Tests for _check_hidden_interactions."""
+
+    def test_detects_hidden_interactions_dry_run(self, tmp_path):
+        hidden_ids = {"p_hidden"}
+        valid_ids = {"p1", "p_hidden"}
+        interaction_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(interaction_db, [
+            ("i1", "p1", "2024-01-01", "gmail", "Valid", "", "", "src1", "2024-01-01"),
+            ("i2", "p_hidden", "2024-01-01", "gmail", "Hidden", "", "", "src2", "2024-01-01"),
+            ("i3", "p_hidden", "2024-01-01", "calendar", "Hidden2", "", "", "src3", "2024-01-01"),
+        ])
+
+        with patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db):
+            from scripts.sync_consistency_verify import _check_hidden_interactions
+            result = _check_hidden_interactions(hidden_ids, valid_ids, dry_run=True)
+
+        assert result["count"] == 2
+        assert result["fixed"] == 0
+
+        # Verify nothing deleted
+        conn = sqlite3.connect(interaction_db)
+        assert conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0] == 3
+        conn.close()
+
+    def test_deletes_hidden_interactions(self, tmp_path):
+        hidden_ids = {"p_hidden"}
+        valid_ids = {"p1", "p_hidden"}
+        interaction_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(interaction_db, [
+            ("i1", "p1", "2024-01-01", "gmail", "Valid", "", "", "src1", "2024-01-01"),
+            ("i2", "p_hidden", "2024-01-01", "gmail", "Hidden", "", "", "src2", "2024-01-01"),
+        ])
+
+        with patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db):
+            from scripts.sync_consistency_verify import _check_hidden_interactions
+            result = _check_hidden_interactions(hidden_ids, valid_ids, dry_run=False)
+
+        assert result["count"] == 1
+        assert result["fixed"] == 1
+
+        conn = sqlite3.connect(interaction_db)
+        assert conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0] == 1
+        conn.close()
+
+    def test_empty_hidden_ids_noop(self, tmp_path):
+        from scripts.sync_consistency_verify import _check_hidden_interactions
+        result = _check_hidden_interactions(set(), {"p1"}, dry_run=False)
+        assert result == {"count": 0, "fixed": 0}
+
+    def test_safety_guard_skips_when_majority_hidden(self, tmp_path):
+        """If >50% of people are hidden, skip cleanup as a safety guard."""
+        hidden_ids = {"p1", "p2", "p3"}
+        valid_ids = {"p1", "p2", "p3", "p4"}  # 3/4 = 75% hidden
+        interaction_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(interaction_db, [
+            ("i1", "p1", "2024-01-01", "gmail", "Hidden", "", "", "src1", "2024-01-01"),
+        ])
+
+        with patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db):
+            from scripts.sync_consistency_verify import _check_hidden_interactions
+            result = _check_hidden_interactions(hidden_ids, valid_ids, dry_run=False)
+
+        assert result["count"] == 0  # skipped entirely
+        assert result["fixed"] == 0
+
+
+class TestCheckStaleMergedRelationships:
+    """Tests for _check_stale_merged_relationships."""
+
+    def test_detects_stale_merged_relationships_dry_run(self, tmp_path):
+        valid_ids = {"p1", "p2", "p3"}
+        merged_ids = {"p_old": "p1"}
+        mock_store = _mock_store(
+            [_make_person("p1", "Alice"), _make_person("p2", "Bob"), _make_person("p3", "Carol")],
+            merged_ids=merged_ids,
+        )
+
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p_old", "p2", "colleague"),  # stale: p_old → p1
+            ("r2", "p2", "p3", "friend"),          # valid
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_stale_merged_relationships
+            result = _check_stale_merged_relationships(valid_ids, mock_store, dry_run=True)
+
+        assert result["count"] == 1
+        assert result["fixed"] == 0
+
+    def test_repoints_stale_merged_relationships(self, tmp_path):
+        valid_ids = {"p1", "p2", "p3"}
+        merged_ids = {"p_old": "p1"}
+        mock_store = _mock_store(
+            [_make_person("p1", "Alice"), _make_person("p2", "Bob"), _make_person("p3", "Carol")],
+            merged_ids=merged_ids,
+        )
+
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p_old", "p2", "colleague"),  # stale
+            ("r2", "p2", "p3", "friend"),          # valid
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_stale_merged_relationships
+            result = _check_stale_merged_relationships(valid_ids, mock_store, dry_run=False)
+
+        assert result["repointed"] == 1
+
+        # Verify re-pointed
+        conn = sqlite3.connect(crm_db)
+        row = conn.execute("SELECT person_a_id, person_b_id FROM relationships WHERE id = 'r1'").fetchone()
+        conn.close()
+        assert row[0] == "p1"
+        assert row[1] == "p2"
+
+    def test_unique_constraint_handled(self, tmp_path):
+        """When re-pointing would create a duplicate pair, the stale row is deleted."""
+        valid_ids = {"p1", "p2"}
+        merged_ids = {"p_old": "p1"}
+        mock_store = _mock_store(
+            [_make_person("p1", "Alice"), _make_person("p2", "Bob")],
+            merged_ids=merged_ids,
+        )
+
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p2", "colleague"),   # canonical pair already exists
+            ("r2", "p_old", "p2", "friend"),    # stale — re-pointing would duplicate (p1, p2)
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_stale_merged_relationships
+            # Should NOT crash with IntegrityError
+            result = _check_stale_merged_relationships(valid_ids, mock_store, dry_run=False)
+
+        assert result["count"] == 1
+
+        # Only the canonical row should survive
+        conn = sqlite3.connect(crm_db)
+        rows = conn.execute("SELECT id, person_a_id, person_b_id FROM relationships").fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "r1"
+
+    def test_no_stale_ids_noop(self, tmp_path):
+        valid_ids = {"p1", "p2"}
+        mock_store = _mock_store([_make_person("p1", "Alice"), _make_person("p2", "Bob")])
+
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[("r1", "p1", "p2", "colleague")])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_stale_merged_relationships
+            result = _check_stale_merged_relationships(valid_ids, mock_store, dry_run=False)
+
+        assert result["count"] == 0
+
+
+class TestCheckRelationshipHygiene:
+    """Tests for _check_relationship_hygiene."""
+
+    def test_detects_self_loops_dry_run(self, tmp_path):
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p2", "colleague"),
+            ("r2", "p1", "p1", "self-loop"),
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_relationship_hygiene
+            result = _check_relationship_hygiene(set(), {"p1", "p2"}, dry_run=True)
+
+        assert result["self_loops"] == 1
+        assert result["hidden"] == 0
+        assert result["count"] == 1
+        assert result["fixed"] == 0
+
+    def test_deletes_self_loops(self, tmp_path):
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p2", "colleague"),
+            ("r2", "p1", "p1", "self-loop"),
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_relationship_hygiene
+            result = _check_relationship_hygiene(set(), {"p1", "p2"}, dry_run=False)
+
+        assert result["fixed"] == 1
+
+        conn = sqlite3.connect(crm_db)
+        assert conn.execute("SELECT COUNT(*) FROM relationships").fetchone()[0] == 1
+        conn.close()
+
+    def test_detects_hidden_person_relationships(self, tmp_path):
+        hidden_ids = {"p_hidden"}
+        valid_ids = {"p1", "p2", "p_hidden"}
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p2", "colleague"),
+            ("r2", "p1", "p_hidden", "friend"),
+            ("r3", "p_hidden", "p2", "coworker"),
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_relationship_hygiene
+            result = _check_relationship_hygiene(hidden_ids, valid_ids, dry_run=False)
+
+        assert result["hidden"] == 2
+        assert result["fixed"] == 2
+
+        conn = sqlite3.connect(crm_db)
+        assert conn.execute("SELECT COUNT(*) FROM relationships").fetchone()[0] == 1
+        conn.close()
+
+    def test_no_double_counting_self_loop_hidden(self, tmp_path):
+        """A self-loop where the person is also hidden should count once, not twice."""
+        hidden_ids = {"p_hidden"}
+        valid_ids = {"p1", "p_hidden"}
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p_hidden", "friend"),        # hidden only
+            ("r2", "p_hidden", "p_hidden", "self"),     # self-loop AND hidden
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_relationship_hygiene
+            result = _check_relationship_hygiene(hidden_ids, valid_ids, dry_run=True)
+
+        # r2 counted as self_loop only (excluded from hidden count)
+        assert result["self_loops"] == 1
+        assert result["hidden"] == 1  # r1 only
+        assert result["count"] == 2   # not 3
+
+    def test_safety_guard_skips_when_majority_hidden(self, tmp_path):
+        """If >50% of people are hidden, skip hidden cleanup (self-loops still cleaned)."""
+        hidden_ids = {"p1", "p2", "p3"}
+        valid_ids = {"p1", "p2", "p3", "p4"}  # 75% hidden
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, relationships=[
+            ("r1", "p1", "p4", "friend"),
+        ])
+
+        with patch("config.settings.settings") as mock_settings:
+            mock_settings.chroma_path = str(tmp_path / "chroma")
+            Path(mock_settings.chroma_path).mkdir()
+
+            from scripts.sync_consistency_verify import _check_relationship_hygiene
+            result = _check_relationship_hygiene(hidden_ids, valid_ids, dry_run=False)
+
+        assert result["hidden"] == 0  # hidden cleanup skipped
+        assert result["fixed"] == 0

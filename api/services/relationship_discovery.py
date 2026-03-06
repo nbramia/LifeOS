@@ -1312,6 +1312,29 @@ def run_full_discovery(days_back: int = DISCOVERY_WINDOW_DAYS) -> dict:
         "photos": len(discover_from_shared_photos(days_back)),
     }
 
+    # Post-discovery cleanup: remove relationships involving hidden people.
+    # Discovery functions read person_ids from interactions and don't know
+    # which people are hidden, so we clean up after the fact.
+    person_store = get_person_entity_store()
+    all_people = person_store.get_all(include_hidden=True)
+    hidden_ids = {p.id for p in all_people if p.hidden}
+    if hidden_ids and len(hidden_ids) <= len(all_people) * 0.5:
+        import sqlite3
+        from api.services.source_entity import get_crm_db_path
+        conn = sqlite3.connect(get_crm_db_path(), timeout=60.0)
+        conn.execute("CREATE TEMP TABLE hidden_ids (id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT INTO hidden_ids (id) VALUES (?)", [(id,) for id in hidden_ids])
+        cursor = conn.execute(
+            "DELETE FROM relationships "
+            "WHERE person_a_id IN (SELECT id FROM hidden_ids) "
+            "   OR person_b_id IN (SELECT id FROM hidden_ids)"
+        )
+        cleaned = cursor.rowcount
+        if cleaned > 0:
+            conn.commit()
+            logger.info(f"Cleaned {cleaned} relationships involving hidden people")
+        conn.close()
+
     total = sum(results.values())
     logger.info(f"Full discovery complete: {total} relationships updated")
 
