@@ -68,22 +68,10 @@ This skill is for **small, surgical changes**. Before editing, ask yourself:
 - Am I adding/adjusting a single behavioral rule or instruction? → Proceed.
 - Am I tweaking a parameter (like max_tool_rounds)? → Proceed.
 - Would this require restructuring the prompt, adding new tools, or changing multiple
-  modules? → **Stop.** Create a GitHub issue instead:
+  modules? → **Stop.** Use the `/draft-issue` skill to create a GitHub issue:
 
-  ```bash
-  gh issue create \
-    --title "Orchestrator: <summary of needed change>" \
-    --body "## Problem
-  <what went wrong — the user's feedback>
-
-  ## Analysis
-  <your diagnosis of the root cause>
-
-  ## Suggested approach
-  <what you think needs to change and why it's too large for a prompt tweak>
-
-  ## Files involved
-  <list of files that would need changes>"
+  ```
+  Skill tool → skill: "draft-issue", args: "Orchestrator: <summary>. Feedback: <user feedback>. Root cause: <your diagnosis>. Files: <list>. Too large for a prompt tweak because <reason>."
   ```
 
   Then notify the user that an issue was created and stop.
@@ -138,3 +126,12 @@ Report back with:
 - The branch name so the user can review
 
 Keep it to 3-5 sentences. The user is on their phone.
+
+## Related skills
+
+This skill delegates to other skills when needed:
+
+- **`/draft-issue`** — When Step 2 determines the change is too large for a prompt tweak,
+  use the Skill tool to invoke `draft-issue` with context about the problem and diagnosis.
+- **`/implement`** — If the user later asks to implement a filed issue, point them to
+  `/implement #<issue-number>`. Don't invoke it automatically from this skill.
