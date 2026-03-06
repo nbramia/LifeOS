@@ -98,6 +98,12 @@ SYNC_SOURCES = {
         "frequency": "daily",
         "phase": 1,
     },
+    "apple_import": {
+        "description": "Import Apple ecosystem data (contacts, iMessage, phone) from Mac exports",
+        "script": "scripts/apple_data_import.py",
+        "frequency": "daily",
+        "phase": 1,
+    },
 
     # === Phase 2: Entity Processing ===
     "link_slack": {
