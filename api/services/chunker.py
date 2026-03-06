@@ -176,6 +176,11 @@ def chunk_by_tokens(
     return chunks
 
 
+def _strip_base64_images(text: str) -> str:
+    """Strip base64-encoded image data from markdown to prevent OOM during embedding."""
+    return re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+', '[image]', text)
+
+
 def chunk_document(
     content: str,
     is_granola: bool = False,
@@ -199,6 +204,9 @@ def chunk_document(
     Returns:
         List of chunk dicts with 'content', 'chunk_index', and optionally 'header'
     """
+    # Strip base64 images before chunking (they cause OOM in large embedding models)
+    content = _strip_base64_images(content)
+
     # Extract frontmatter first
     metadata, body = extract_frontmatter(content)
 
