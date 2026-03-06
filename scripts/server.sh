@@ -259,17 +259,46 @@ show_status() {
     echo ""
 }
 
+# Check if systemd is managing the service (avoid ghost processes)
+is_systemd_managed() {
+    systemctl is-active lifeos-api.service &>/dev/null ||
+    systemctl is-enabled lifeos-api.service &>/dev/null
+}
+
+# Run systemctl command with sudo (passwordless via sudoers rule from setup-systemd.sh)
+sctl() {
+    sudo systemctl "$@"
+}
+
 # Main
 case "${1:-status}" in
     start)
-        start_server
+        if is_systemd_managed; then
+            log_info "Delegating to systemd..."
+            kill_server  # Clear any ghost processes holding the port
+            sctl start lifeos-api
+            wait_for_healthy
+        else
+            start_server
+        fi
         ;;
     stop)
-        stop_server
+        if is_systemd_managed; then
+            log_info "Delegating to systemd..."
+            sctl stop lifeos-api
+        else
+            stop_server
+        fi
         ;;
     restart)
         log_info "Restarting server..."
-        start_server
+        if is_systemd_managed; then
+            log_info "Delegating to systemd..."
+            sctl restart lifeos-api
+            wait_for_healthy
+        else
+            start_server
+        fi
         ;;
     foreground)
         run_foreground
