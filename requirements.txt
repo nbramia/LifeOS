@@ -6,6 +6,7 @@ pydantic-settings>=2.1.0
 
 # Embeddings & Vector DB
 sentence-transformers>=2.2.0
+transformers>=4.40,<5  # gte-Qwen2 custom code incompatible with transformers 5.x
 chromadb>=0.4.22
 torch>=2.1.0
 
