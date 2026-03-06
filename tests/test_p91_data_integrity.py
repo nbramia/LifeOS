@@ -99,7 +99,7 @@ class TestR2EntityResolution:
         cursor = conn.execute("""
             SELECT person_id, source_id, title FROM interactions
             WHERE source_type IN ('vault', 'granola')
-            AND source_id LIKE '/Users/%'
+            AND source_id LIKE '/%'
             ORDER BY RANDOM()
             LIMIT 20
         """)
@@ -211,7 +211,7 @@ class TestR3VaultLinks:
         cursor = conn.execute("""
             SELECT source_id FROM interactions
             WHERE source_type IN ('vault', 'granola')
-            AND source_id LIKE '/Users/%'
+            AND source_id LIKE '/%'
             LIMIT 1
         """)
         row = cursor.fetchone()
@@ -517,7 +517,7 @@ class TestR8Top10Verification:
             cursor2 = conn.execute("""
                 SELECT source_id FROM interactions
                 WHERE person_id = ? AND source_type IN ('vault', 'granola')
-                AND source_id LIKE '/Users/%'
+                AND source_id LIKE '/%'
                 LIMIT 5
             """, (person_id,))
 
