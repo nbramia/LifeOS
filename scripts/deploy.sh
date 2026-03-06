@@ -174,9 +174,10 @@ commit_changes() {
         COMMIT_MSG="Deploy: Update $CHANGED_FILES file(s)"
     fi
 
-    # Stage and commit
+    # Stage and commit (normalize timestamp to 12:00 UTC for privacy)
     git add -A
-    git commit -m "$COMMIT_MSG"
+    NORMALIZED_DATE="$(date -u -d '12:00' '+%Y-%m-%dT12:00:00+00:00')"
+    GIT_AUTHOR_DATE="$NORMALIZED_DATE" GIT_COMMITTER_DATE="$NORMALIZED_DATE" git commit -m "$COMMIT_MSG"
 
     log_info "Committed: $COMMIT_MSG"
 }

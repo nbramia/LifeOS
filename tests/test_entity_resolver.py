@@ -38,8 +38,8 @@ def populated_resolver(temp_store):
         PersonEntity(
             canonical_name="Alex Johnson",
             emails=["alex@work.example.com"],
-            phone_numbers=["+19012295017"],
-            phone_primary="+19012295017",
+            phone_numbers=["+12125550173"],
+            phone_primary="+12125550173",
             company="Example Corp",
             category="work",
             vault_contexts=["Work/ExampleCorp/"],
@@ -110,7 +110,7 @@ class TestResolveByPhone:
 
     def test_exact_phone_match(self, populated_resolver):
         """Test exact phone match returns entity."""
-        entity = populated_resolver.resolve_by_phone("+19012295017")
+        entity = populated_resolver.resolve_by_phone("+12125550173")
         assert entity is not None
         assert entity.canonical_name == "Alex Johnson"
 
@@ -240,7 +240,7 @@ class TestResolveMain:
         """Test phone matching works when email not found."""
         result = populated_resolver.resolve(
             name="Wrong Name",
-            phone="+19012295017",
+            phone="+12125550173",
         )
         assert result is not None
         assert result.entity.canonical_name == "Alex Johnson"
@@ -250,7 +250,7 @@ class TestResolveMain:
         """Test email takes priority over phone."""
         result = populated_resolver.resolve(
             email="sarah@work.example.com",
-            phone="+19012295017",  # Alex's phone
+            phone="+12125550173",  # Alex's phone
         )
         assert result is not None
         assert result.entity.canonical_name == "Sarah Chen"

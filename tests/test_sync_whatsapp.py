@@ -556,17 +556,17 @@ class TestResolveLidPhone:
 
     def test_standard_lid(self):
         """Standard LID JID resolves to phone."""
-        lid_phones = {"164712046162027": "+12036417454"}
-        assert resolve_lid_phone("164712046162027@lid", lid_phones) == "+12036417454"
+        lid_phones = {"164712046162027": "+12125550142"}
+        assert resolve_lid_phone("164712046162027@lid", lid_phones) == "+12125550142"
 
     def test_lid_with_colon_suffix(self):
         """LID JID with :N device suffix still resolves."""
-        lid_phones = {"164712046162027": "+12036417454"}
-        assert resolve_lid_phone("164712046162027:0@lid", lid_phones) == "+12036417454"
+        lid_phones = {"164712046162027": "+12125550142"}
+        assert resolve_lid_phone("164712046162027:0@lid", lid_phones) == "+12125550142"
 
     def test_lid_not_in_map(self):
         """LID not in map returns empty string."""
-        lid_phones = {"164712046162027": "+12036417454"}
+        lid_phones = {"164712046162027": "+12125550142"}
         assert resolve_lid_phone("999999999999@lid", lid_phones) == ""
 
     def test_non_lid_jid(self):
@@ -630,12 +630,12 @@ class TestLidPhoneResolution:
             ('120363001@g.us', '164712046162027@lid'),
         ])
         _setup_session_db(session_db, lid_map=[
-            ('164712046162027', '12036417454'),
+            ('164712046162027', '12125550142'),
         ])
         _setup_interaction_db(int_db)
 
         mock_entity = MagicMock()
-        mock_entity.id = "person-jonathan-esty"
+        mock_entity.id = "person-test-contact"
         mock_result = MagicMock()
         mock_result.entity = mock_entity
         mock_resolver = MagicMock()
@@ -654,7 +654,7 @@ class TestLidPhoneResolution:
         assert stats['resolved_lid_phone'] == 1
         # Resolver should have been called with phone, not just name
         mock_resolver.resolve.assert_called_with(
-            name='Jonathan', phone='+12036417454', create_if_missing=True,
+            name='Jonathan', phone='+12125550142', create_if_missing=True,
         )
 
     def test_lid_falls_back_to_name_without_phone(self, tmp_path):
@@ -769,12 +769,12 @@ class TestLidPhoneResolution:
             ('120363001@g.us', '164712046162027@lid'),
         ])
         _setup_session_db(session_db, lid_map=[
-            ('164712046162027', '12036417454'),
+            ('164712046162027', '12125550142'),
         ])
         _setup_interaction_db(int_db)
 
         mock_entity = MagicMock()
-        mock_entity.id = "person-jonathan-esty"
+        mock_entity.id = "person-test-contact"
         mock_result = MagicMock()
         mock_result.entity = mock_entity
         mock_resolver = MagicMock()
@@ -796,5 +796,5 @@ class TestLidPhoneResolution:
         assert stats['outgoing_group_created'] == 1
         # Resolver should have been called with both name and phone
         mock_resolver.resolve.assert_called_with(
-            name='Jonathan', phone='+12036417454', create_if_missing=False,
+            name='Jonathan', phone='+12125550142', create_if_missing=False,
         )

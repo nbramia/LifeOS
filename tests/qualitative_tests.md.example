@@ -204,7 +204,7 @@ When a person or project has known context (company, project folder), target tho
 | Source | Query/Filter | Time Range |
 |--------|-------------|------------|
 | People | name match "Sam" OR alias "Sam" | Entity resolution |
-| iMessage | phone = +19012295017 | Last 30 days |
+| iMessage | phone = +12125550173 | Last 30 days |
 | Calendar | attendees contains partner@example.com | Last 30 days + next 30 days |
 | Gmail (personal) | from:partner@example.com OR to:... | Last 30 days |
 | Vault | path:Personal/* AND (Sam OR Samlor) | Last 60 days |

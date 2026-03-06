@@ -18,14 +18,14 @@ def normalize_phone(raw: str) -> Optional[str]:
         E.164 formatted phone (+1XXXXXXXXXX) or None if invalid
 
     Examples:
-        >>> normalize_phone("(901) 229-5017")
-        '+19012295017'
-        >>> normalize_phone("901-229-5017")
-        '+19012295017'
-        >>> normalize_phone("+1 901 229 5017")
-        '+19012295017'
-        >>> normalize_phone("9012295017")
-        '+19012295017'
+        >>> normalize_phone("(212) 555-0173")
+        '+12125550173'
+        >>> normalize_phone("212-555-0173")
+        '+12125550173'
+        >>> normalize_phone("+1 212 555 0173")
+        '+12125550173'
+        >>> normalize_phone("2125550173")
+        '+12125550173'
         >>> normalize_phone("123")
         None
     """
@@ -60,8 +60,8 @@ def format_phone_display(phone: str) -> str:
         Display-friendly format: (XXX) XXX-XXXX for US numbers
 
     Examples:
-        >>> format_phone_display("+19012295017")
-        '(901) 229-5017'
+        >>> format_phone_display("+12125550173")
+        '(212) 555-0173'
         >>> format_phone_display("+447700900123")
         '+447700900123'
     """

@@ -76,10 +76,10 @@ class TestPersonEntity:
         """Test has_phone method."""
         entity = PersonEntity(
             canonical_name="Test",
-            phone_numbers=["+19012295017"],
+            phone_numbers=["+12125550173"],
         )
 
-        assert entity.has_phone("+19012295017")
+        assert entity.has_phone("+12125550173")
         assert not entity.has_phone("+15555555555")
 
     def test_add_phone(self):
@@ -87,17 +87,17 @@ class TestPersonEntity:
         entity = PersonEntity(canonical_name="Test", phone_numbers=[])
 
         # Add first phone - should also set as primary
-        assert entity.add_phone("+19012295017") is True
+        assert entity.add_phone("+12125550173") is True
         assert len(entity.phone_numbers) == 1
-        assert entity.phone_primary == "+19012295017"
+        assert entity.phone_primary == "+12125550173"
 
         # Add second phone
         assert entity.add_phone("+15551234567") is True
         assert len(entity.phone_numbers) == 2
-        assert entity.phone_primary == "+19012295017"  # Still first one
+        assert entity.phone_primary == "+12125550173"  # Still first one
 
         # Try to add duplicate
-        assert entity.add_phone("+19012295017") is False
+        assert entity.add_phone("+12125550173") is False
         assert len(entity.phone_numbers) == 2
 
         # Empty phone
@@ -115,8 +115,8 @@ class TestPersonEntity:
             meeting_count=5,
             email_count=10,
             aliases=["Sarah"],
-            phone_numbers=["+19012295017"],
-            phone_primary="+19012295017",
+            phone_numbers=["+12125550173"],
+            phone_primary="+12125550173",
             confidence_score=0.9,
         )
 
@@ -164,11 +164,11 @@ class TestPersonEntity:
 
         # Should combine phone numbers
         assert len(merged.phone_numbers) == 2
-        assert "+19012295017" in merged.phone_numbers
+        assert "+12125550173" in merged.phone_numbers
         assert "+15551234567" in merged.phone_numbers
 
         # Should preserve first entity's phone_primary
-        assert merged.phone_primary == "+19012295017"
+        assert merged.phone_primary == "+12125550173"
 
         # Should take first non-None values
         assert merged.company == "Example Corp"
@@ -334,13 +334,13 @@ class TestPersonEntityStore:
         entity = PersonEntity(
             canonical_name="Phone Test",
             emails=["phone@example.com"],
-            phone_numbers=["+19012295017", "+15551234567"],
+            phone_numbers=["+12125550173", "+15551234567"],
         )
 
         temp_store.add(entity)
 
         # Phone lookup
-        assert temp_store.get_by_phone("+19012295017") is not None
+        assert temp_store.get_by_phone("+12125550173") is not None
         assert temp_store.get_by_phone("+15551234567") is not None
         assert temp_store.get_by_phone("+15555555555") is None
 
@@ -468,7 +468,7 @@ class TestPersonEntityStore:
             PersonEntity(
                 canonical_name="Work Person",
                 emails=["work@company.com"],
-                phone_numbers=["+19012295017"],
+                phone_numbers=["+12125550173"],
                 sources=["linkedin", "gmail"],
                 category="work",
             ),

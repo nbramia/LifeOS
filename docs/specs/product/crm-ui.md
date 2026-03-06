@@ -1510,9 +1510,9 @@ The Family Dashboard provides an aggregated view of interactions with multiple s
 │                                                                          │
 │  Family Contact Health            Relationship Trends                   │
 │  ┌────────────────────────────┐  ┌────────────────────────────────┐   │
-│  │ Bill Ramia      ██████░░░ │  │ Trends chart                    │   │
-│  │ Patricia Ramia  ████░░░░░ │  │                                  │   │
-│  │ Anna Ramia      ███░░░░░░ │  └────────────────────────────────┘   │
+│  │ David Chen      ██████░░░ │  │ Trends chart                    │   │
+│  │ Maria Chen      ████░░░░░ │  │                                  │   │
+│  │ Sofia Chen      ███░░░░░░ │  └────────────────────────────────┘   │
 │  └────────────────────────────┘                                         │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -1604,7 +1604,7 @@ The Family Dashboard provides an aggregated view of interactions with multiple s
     {
       "id": "interaction-uuid",
       "person_id": "person-uuid",
-      "person_name": "Bill Ramia",
+      "person_name": "David Chen",
       "timestamp": "2026-01-15T10:30:00Z",
       "source_type": "imessage",
       "title": "Text conversation",

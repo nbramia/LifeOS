@@ -21,6 +21,20 @@ fi
 
 cd "$PROJECT_DIR"
 
+# Normalize commit timestamps to 12:00 UTC (privacy: hides work schedule)
+# Guard prevents recursion when the amend triggers this hook again
+if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
+    AUTHOR_DATE=$(git log -1 --format='%aI')
+    COMMIT_DATE=$(git log -1 --format='%cI')
+    NORM_DATE="$(date -u -d "$(git log -1 --format='%ad' --date=short) 12:00" '+%Y-%m-%dT12:00:00+00:00')"
+
+    if [ "$AUTHOR_DATE" != "$NORM_DATE" ] || [ "$COMMIT_DATE" != "$NORM_DATE" ]; then
+        _LIFEOS_SKIP_DATE_NORMALIZE=1 \
+        GIT_AUTHOR_DATE="$NORM_DATE" GIT_COMMITTER_DATE="$NORM_DATE" \
+            git commit --amend --no-edit --no-verify --date="$NORM_DATE" >/dev/null 2>&1
+    fi
+fi
+
 echo ""
 echo "========================================"
 echo "  Restarting LifeOS server..."

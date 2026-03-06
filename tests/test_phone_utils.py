@@ -15,29 +15,29 @@ class TestNormalizePhone:
 
     def test_normalize_10_digit_us(self):
         """Test normalizing 10-digit US numbers."""
-        assert normalize_phone("9012295017") == "+19012295017"
+        assert normalize_phone("2125550173") == "+12125550173"
         assert normalize_phone("5551234567") == "+15551234567"
 
     def test_normalize_with_parentheses(self):
         """Test normalizing numbers with parentheses."""
-        assert normalize_phone("(901) 229-5017") == "+19012295017"
+        assert normalize_phone("(212) 555-0173") == "+12125550173"
         assert normalize_phone("(555) 123-4567") == "+15551234567"
 
     def test_normalize_with_dashes(self):
         """Test normalizing numbers with dashes."""
-        assert normalize_phone("901-229-5017") == "+19012295017"
+        assert normalize_phone("212-555-0173") == "+12125550173"
         assert normalize_phone("555-123-4567") == "+15551234567"
 
     def test_normalize_with_spaces(self):
         """Test normalizing numbers with spaces."""
-        assert normalize_phone("901 229 5017") == "+19012295017"
-        assert normalize_phone("+1 901 229 5017") == "+19012295017"
+        assert normalize_phone("212 555 0173") == "+12125550173"
+        assert normalize_phone("+1 212 555 0173") == "+12125550173"
 
     def test_normalize_with_country_code(self):
         """Test normalizing numbers with +1 country code."""
-        assert normalize_phone("+19012295017") == "+19012295017"
-        assert normalize_phone("19012295017") == "+19012295017"
-        assert normalize_phone("1-901-229-5017") == "+19012295017"
+        assert normalize_phone("+12125550173") == "+12125550173"
+        assert normalize_phone("12125550173") == "+12125550173"
+        assert normalize_phone("1-212-555-0173") == "+12125550173"
 
     def test_normalize_international(self):
         """Test normalizing international numbers (>11 digits)."""
@@ -58,9 +58,9 @@ class TestNormalizePhone:
 
     def test_normalize_mixed_formats(self):
         """Test various mixed format inputs."""
-        assert normalize_phone("(901) 229.5017") == "+19012295017"
-        assert normalize_phone("901.229.5017") == "+19012295017"
-        assert normalize_phone("  901-229-5017  ") == "+19012295017"
+        assert normalize_phone("(212) 555.0173") == "+12125550173"
+        assert normalize_phone("212.555.0173") == "+12125550173"
+        assert normalize_phone("  212-555-0173  ") == "+12125550173"
 
 
 class TestFormatPhoneDisplay:
@@ -68,7 +68,7 @@ class TestFormatPhoneDisplay:
 
     def test_format_us_number(self):
         """Test formatting US numbers."""
-        assert format_phone_display("+19012295017") == "(901) 229-5017"
+        assert format_phone_display("+12125550173") == "(212) 555-0173"
         assert format_phone_display("+15551234567") == "(555) 123-4567"
 
     def test_format_international_number(self):
@@ -86,15 +86,15 @@ class TestIsValidPhone:
 
     def test_valid_e164_numbers(self):
         """Test valid E.164 format numbers."""
-        assert is_valid_phone("+19012295017") is True
+        assert is_valid_phone("+12125550173") is True
         assert is_valid_phone("+15551234567") is True
         assert is_valid_phone("+447700900123") is True
         assert is_valid_phone("+861234567890") is True
 
     def test_invalid_missing_plus(self):
         """Test numbers without + are invalid."""
-        assert is_valid_phone("19012295017") is False
-        assert is_valid_phone("9012295017") is False
+        assert is_valid_phone("12125550173") is False
+        assert is_valid_phone("2125550173") is False
 
     def test_invalid_too_short(self):
         """Test numbers that are too short."""
@@ -111,9 +111,9 @@ class TestIsValidPhone:
 
     def test_invalid_non_numeric(self):
         """Test numbers with non-numeric characters."""
-        assert is_valid_phone("+1-901-229-5017") is False
-        assert is_valid_phone("+1 901 229 5017") is False
-        assert is_valid_phone("+(901) 229-5017") is False
+        assert is_valid_phone("+1-212-555-0173") is False
+        assert is_valid_phone("+1 212 555 0173") is False
+        assert is_valid_phone("+(212) 555-0173") is False
 
     def test_empty(self):
         """Test empty values return False."""

@@ -77,14 +77,14 @@ A compact stats line at the top of the briefing. Use the git stats and PR data p
 
 > **12 commits, 6 PRs merged, +4,713 / -128 lines**
 
-Include: commit count, merged PR count, lines added/removed. If an author filter is active, note it (e.g., "by @nbramia" or "by others").
+Include: commit count, merged PR count, lines added/removed. If an author filter is active, note it (e.g., "by @user" or "by others").
 
 #### Landed
 
 *Group changes by theme/area, not by PR.* Merge related PRs into a single narrative. For each theme:
 - What changed (capabilities added, removed, or modified)
 - Relevant stats if notable (e.g., "new sync phase", "15 new API tests")
-- Which PRs contributed and who authored them (parenthetical references, e.g., "#23, #24 — @nbramia")
+- Which PRs contributed and who authored them (parenthetical references, e.g., "#23, #24 — @user")
 
 Themes should be whatever emerges naturally from the changes — examples: "Sync pipeline", "Search & indexing", "CRM / entity resolution", "API endpoints", "MCP tools", "Documentation", "Tooling", "Test coverage". Don't force categories that don't exist.
 

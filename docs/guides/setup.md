@@ -31,7 +31,8 @@ Based on available RAM, recommend a model configuration:
 |-----|----------------|--------------|----------|
 | 8 GB | `all-MiniLM-L6-v2` | `qwen2.5:1.5b-instruct` | disabled |
 | 16 GB | `mixedbread-ai/mxbai-embed-large-v1` | `qwen2.5:3b-instruct` | enabled |
-| 32 GB+ | `mixedbread-ai/mxbai-embed-large-v1` | `qwen2.5:7b-instruct` | enabled |
+| 32 GB+ | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | `qwen2.5:7b-instruct` | enabled |
+| 64 GB+ (GPU) | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | Local LLM via llama.cpp | enabled |
 
 **[ASK USER]** Present the recommended configuration and confirm before proceeding.
 

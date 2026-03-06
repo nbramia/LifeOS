@@ -130,7 +130,7 @@ def parse_username_to_name_parts(username: str) -> list[tuple[str, str]]:
     Parse a username into potential name parts.
 
     Examples:
-        "nbramia" -> [("n", "bramia"), ("nb", "ramia"), ...]
+        "jdmartin" -> [("j", "dmartin"), ("jd", "martin"), ...]
         "john.doe" -> [("john", "doe")]
         "jsmith123" -> [("j", "smith")]
 
@@ -154,9 +154,9 @@ def parse_username_to_name_parts(username: str) -> list[tuple[str, str]]:
     # Try single initial + rest
     results = []
     if len(clean) >= 3:
-        # Single initial: n + bramia
+        # Single initial: j + dmartin
         results.append((clean[0], clean[1:]))
-        # Double initial: nb + ramia
+        # Double initial: jd + martin
         if len(clean) >= 4:
             results.append((clean[:2], clean[2:]))
 
