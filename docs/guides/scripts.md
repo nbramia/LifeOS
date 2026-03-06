@@ -103,7 +103,8 @@ Orchestrate all data sync operations.
 3. Relationship Building (discover connections)
 4. Vector Store Indexing (reindex vault)
 5. Content Sync (Google Docs/Sheets to vault)
-6. Post-Sync Cleanup (entity cleanup)
+6. Entity Cleanup (auto-hide non-humans, queue duplicates)
+7. Consistency Verification (orphan checks, stats reconciliation)
 
 ---
 

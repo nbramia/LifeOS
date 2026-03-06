@@ -8,9 +8,11 @@ Guidelines for contributing to LifeOS.
 
 ### Prerequisites
 
-- macOS (required for Apple integrations)
-- Python 3.11+
-- Git
+- **Linux** (primary) or **macOS**
+- **Python 3.11+**
+- **Git**
+
+macOS is only required for Apple Data Agent features (iMessage, Contacts, Photos). All other functionality works on both platforms.
 
 ### Setup
 
@@ -33,7 +35,7 @@ Guidelines for contributing to LifeOS.
 4. **Set up environment**:
    ```bash
    cp .env.example .env
-   # Edit .env with your settings
+   # Edit .env with your settings (LIFEOS_VAULT_PATH at minimum)
    ```
 
 5. **Run tests**:
@@ -49,7 +51,7 @@ Guidelines for contributing to LifeOS.
 
 1. Create a feature branch:
    ```bash
-   git checkout -b feature/your-feature-name
+   git checkout -b feat/your-feature-name
    ```
 
 2. Make your changes
@@ -66,7 +68,7 @@ Guidelines for contributing to LifeOS.
 
 5. Commit with a clear message:
    ```bash
-   git commit -m "Add feature: description of what it does"
+   git commit -m "feat: description of what it does"
    ```
 
 ---
@@ -75,33 +77,33 @@ Guidelines for contributing to LifeOS.
 
 ### Python
 
-- **Formatter**: Black (default settings)
-- **Import sorting**: isort
-- **Type hints**: Encouraged but not required
-
-Run formatters:
-```bash
-black .
-isort .
-```
+- Match existing style in the file you're editing
+- Type hints encouraged but not required
+- Keep changes minimal — don't reformat surrounding code
 
 ### Commit Messages
 
-Format: `<type>: <description>`
+Format: `<type>: <imperative description>`
 
 Types:
-- `Add` - New feature
-- `Fix` - Bug fix
-- `Update` - Enhancement to existing feature
-- `Refactor` - Code restructuring
-- `Docs` - Documentation only
-- `Test` - Adding or updating tests
+- `feat` — New feature
+- `fix` — Bug fix
+- `refactor` — Code restructuring (no behavior change)
+- `docs` — Documentation only
+- `test` — Adding or updating tests
+- `chore` — Maintenance, CI, tooling
 
 Examples:
-- `Add: calendar meeting prep endpoint`
-- `Fix: handle empty search results`
-- `Update: improve entity resolution scoring`
-- `Refactor: extract search logic to service`
+- `feat: add calendar meeting prep endpoint`
+- `fix: handle empty search results`
+- `refactor: extract search logic to service`
+- `docs: update installation guide for Linux`
+
+### Branch Naming
+
+Format: `<type>/<short-description>` — lowercase, hyphen-separated.
+
+Examples: `feat/calendar-prep`, `fix/empty-search`, `docs/linux-setup`
 
 ---
 
@@ -122,21 +124,6 @@ Examples:
 - Use pytest fixtures for common setup
 - Test both success and error cases
 
-Example:
-```python
-# tests/test_services/test_search.py
-import pytest
-from api.services.search import search_vault
-
-def test_search_returns_results():
-    results = search_vault("test query")
-    assert len(results) > 0
-
-def test_search_handles_empty_query():
-    results = search_vault("")
-    assert results == []
-```
-
 ---
 
 ## Pull Request Process
@@ -150,7 +137,7 @@ def test_search_handles_empty_query():
 
 3. **Push your branch**:
    ```bash
-   git push origin feature/your-feature-name
+   git push origin feat/your-feature-name
    ```
 
 4. **Open a Pull Request** on GitHub
@@ -170,7 +157,7 @@ def test_search_handles_empty_query():
 
 - One feature or fix per PR
 - Avoid unrelated changes
-- Keep diffs minimal
+- Keep diffs under 400 lines (excluding tests and generated files)
 
 ### Include Tests
 
@@ -181,8 +168,7 @@ def test_search_handles_empty_query():
 ### Documentation
 
 - Update docs for new features
-- Update CHANGELOG if significant
-- Add inline comments for complex logic
+- Add inline comments only for complex logic
 
 ---
 
@@ -197,7 +183,7 @@ LifeOS/
 │   ├── routes/          # API endpoints
 │   └── services/        # Business logic
 ├── config/              # Configuration
-├── scripts/             # CLI tools
+├── scripts/             # CLI tools and service management
 ├── tests/               # Test suite
 └── docs/                # Documentation
 ```
@@ -206,8 +192,26 @@ Key concepts:
 - **Two-tier data model**: SourceEntity (raw) → PersonEntity (canonical)
 - **Hybrid search**: Vector (semantic) + BM25 (keyword)
 - **Entity resolution**: Links identifiers to canonical people
+- **Service management**: systemd on Linux, launchd on macOS
 
-See [Data & Sync](docs/architecture/DATA-AND-SYNC.md) for details.
+See [Data & Sync](docs/specs/technical/data-and-sync.md) for details.
+
+---
+
+## Platform Notes
+
+### Linux
+
+- Primary development platform
+- Services managed via systemd: `sudo ./scripts/setup-systemd.sh`
+- GPU acceleration via ROCm (AMD) or CUDA (NVIDIA)
+
+### macOS
+
+- Required only for Apple Data Agent (iMessage, Contacts, Photos)
+- Services managed via launchd: `./scripts/setup-launchd.sh`
+- Full Disk Access needed for Apple data: see [Launchd Setup](docs/guides/launchd-setup.md)
+- A Mac can act as a satellite, exporting Apple data nightly to a Linux server
 
 ---
 

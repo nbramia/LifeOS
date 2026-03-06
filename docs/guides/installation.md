@@ -16,7 +16,7 @@ Complete walkthrough for setting up LifeOS on Linux or macOS.
 - **Linux** (primary) or **macOS** (required only for Apple Data Agent: iMessage, Contacts, Photos)
 - **Python 3.11+**
 - **Ollama** (for query routing; install via package manager or [ollama.com](https://ollama.com))
-- **Anthropic API key** (only needed if `LIFEOS_LLM_BACKEND=anthropic`; local LLM is the default)
+- **Anthropic API key** (optional — only needed if you prefer Claude over a local LLM; set `LIFEOS_LLM_BACKEND=anthropic` in `.env`)
 
 ---
 

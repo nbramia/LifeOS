@@ -2,17 +2,17 @@
 
 **Your personal operating system, built from the digital exhaust of your life.**
 
-LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **available and actionable through natural language.** 
+LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **available and actionable through natural language.**
 
 LifeOS is also able to take action in response to requests you send through Telegram: not just creating tasks and reminders, but reading/editing files on your computer and autonomously managing Claude Code to accomplish discrete tasks.
 
-Everything runs locally on your Mac. Your data never leaves your machine — the Claude API is only used for discrete queries. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
+Everything runs locally. Your data never leaves your machine — a local LLM handles orchestration and synthesis by default (Claude API is available as an optional backend). A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
 
 ---
 
 ## What You Can Do
 
-**Ask questions about your life – search across all the channels you use**: 
+**Ask questions about your life – search across all the channels you use**:
 - Interface with it conversationally through Telegram, or a dedicated chat UI, or by using Claude Desktop / Claude Code to leverage the MCP tools directly
 - "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
 - "What were the key recommendations Sarah made on the Acme project last month?" will synthesize and answer from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
@@ -31,7 +31,7 @@ Everything runs locally on your Mac. Your data never leaves your machine — the
 - Weekly, it reviews who you haven't been in touch with and nudges you
 - If there's nothing to report, it stays quiet — no noise
 
-**Track relationships**: 
+**Track relationships**:
 - Visualize and explore your relationships with each person in your life through a CRM UI
 - Track and analyze your relationships with those closest to you, like family and a designated partner
 - Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
@@ -50,16 +50,31 @@ You can also interface with it for general queries in the same way you'd interac
 | [Configuration](docs/guides/configuration.md) | [Slack Integration](docs/guides/slack-integration.md) | [Scripts](docs/guides/scripts.md) |
 | [First Run](docs/guides/first-run.md) | [Task Management](docs/specs/product/task-management.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
 |  | [Reminders](docs/guides/reminders.md) | |
-|  | [Launchd Setup](docs/guides/launchd-setup.md) | |
+|  | [Launchd Setup](docs/guides/launchd-setup.md) (macOS) | |
 
 ---
 
 ## Requirements
 
-- **macOS** (required for Apple integrations)
+- **Linux** (primary) or **macOS**
 - **Python 3.11+**
-- **Anthropic API key**
+- **GPU recommended** for local LLM and embedding model (AMD ROCm or NVIDIA CUDA)
 - Obsidian vault (or other markdown notes)
+
+macOS is only required if you want native Apple integrations (iMessage, Contacts, Photos). A Mac can also act as an Apple Data Agent satellite, exporting Apple data nightly to a Linux server.
+
+### LLM Options
+
+LifeOS uses a local LLM by default for orchestration and synthesis — no API key needed. The model size is configurable based on your hardware:
+
+| Hardware | Recommended Model | Config |
+|----------|------------------|--------|
+| 8 GB RAM | Small model (e.g., 7B params) | `LIFEOS_LLM_BACKEND=local` |
+| 16–32 GB RAM | Medium model (e.g., 14–32B params) | `LIFEOS_LLM_BACKEND=local` |
+| 64 GB+ VRAM | Large model (e.g., 70–120B params) | `LIFEOS_LLM_BACKEND=local` |
+| No GPU / prefer cloud | Claude API | `LIFEOS_LLM_BACKEND=anthropic` + API key |
+
+Set `LIFEOS_LLM_BACKEND=anthropic` and provide an `ANTHROPIC_API_KEY` in `.env` to use the Claude API instead of a local model. See the [Configuration Guide](docs/guides/configuration.md) for details.
 
 ---
 
@@ -67,26 +82,32 @@ You can also interface with it for general queries in the same way you'd interac
 
 ```bash
 # 1. Clone and setup
-git clone https://github.com/yourusername/LifeOS.git
+git clone https://github.com/nbramia/LifeOS.git
 cd LifeOS
 python3 -m venv ~/.venvs/lifeos
 source ~/.venvs/lifeos/bin/activate
 pip install -r requirements.txt
 
-# 2. Install Ollama
-brew install ollama && ollama serve &
+# 2. Install Ollama (for query routing)
+# Linux:
+curl -fsSL https://ollama.com/install.sh | sh
+# macOS:
+brew install ollama
+
+ollama serve &
 ollama pull qwen2.5:7b-instruct
 
 # 3. Configure
 cp .env.example .env
-# Edit .env with your settings
+# Edit .env with your settings (LIFEOS_VAULT_PATH at minimum)
 
 # 4. Start services
-./scripts/chromadb.sh start
 ./scripts/server.sh start
 
 # 5. Open http://localhost:8000
 ```
+
+For persistent services on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units.
 
 See [Installation Guide](docs/guides/installation.md) for detailed instructions.
 
@@ -104,12 +125,12 @@ Different query types are handled by different pipelines:
 flowchart LR
     Q["User Query"] --> Router["Router\n(local Ollama)"]
 
-    Router -->|"General"| Direct["Direct Answer\n(Anthropic API)"]
-    Router -->|"Web"| Web["Web Search\n(Anthropic API)"]
+    Router -->|"General"| Direct["Direct Answer\n(local LLM)"]
+    Router -->|"Web"| Web["Web Search\n(local LLM)"]
     Router -->|"Personal"| Hybrid["Hybrid Search\n(local)"]
     Router -->|"Compound"| Both["Web + Personal"]
 
-    Hybrid --> Syn["Synthesis\n(Anthropic API)"]
+    Hybrid --> Syn["Synthesis\n(local LLM)"]
     Both --> Syn
     Direct --> Response["Response"]
     Web --> Response
@@ -117,7 +138,7 @@ flowchart LR
 ```
 
 **Query types:**
-- **General knowledge**: "What's the capital of France?" → Claude answers directly
+- **General knowledge**: "What's the capital of France?" → LLM answers directly
 - **Web search**: "What's the weather in NYC?" → Uses web_search tool
 - **Personal data**: "What did I discuss with John last week?" → Searches your data
 - **Compound**: "Look up the trash schedule and remind me the night before" → Multiple actions
@@ -154,16 +175,18 @@ Translates 10 years of interaction history with thousands of contacts into insig
 | Obsidian | File watcher | Notes, mentions |
 | Gmail | Google API | Emails, threads |
 | Calendar | Google API | Events, attendees |
-| iMessage | macOS chat.db | Messages |
+| iMessage | Apple Data Agent | Messages |
 | Slack | Slack API | DMs, users |
-| Contacts | Apple CSV | Names, emails, phones |
-| Photos | Photos.sqlite | Face recognition |
+| Contacts | Apple Data Agent | Names, emails, phones |
+| Photos | Apple Data Agent | Face recognition |
+| WhatsApp | wacli | Chat history |
 | LinkedIn | CSV import | Connections |
+| Monarch | API | Financial data |
 
 <details>
-<summary><strong>Sync Phases (Daily 3AM)</strong></summary>
+<summary><strong>Sync Phases (Daily 3:30 AM)</strong></summary>
 
-The unified daily sync runs in 5 phases with dependencies:
+The unified daily sync runs in 7 phases with dependencies:
 
 ```mermaid
 flowchart LR
@@ -195,7 +218,17 @@ flowchart LR
         Con["Google Docs\n& Sheets"]
     end
 
-    P1 --> P2 --> P3 --> P4 --> P5
+    subgraph P6["6: Cleanup"]
+        direction TB
+        Clean["Entity cleanup\n& dedup"]
+    end
+
+    subgraph P7["7: Verify"]
+        direction TB
+        Ver["Consistency\nchecks"]
+    end
+
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
 ```
 
 **Why:**
@@ -203,6 +236,8 @@ flowchart LR
 2. Entity Processing must complete before Relationship Building has linked entities
 3. Relationship Building must complete before Vector Indexing has fresh CRM data
 4. Content Sync runs last (indexed on next cycle)
+5. Entity Cleanup auto-hides non-humans and queues duplicates for review
+6. Consistency Verification checks orphaned records, stale merged IDs, and stats mismatches
 
 </details>
 
@@ -230,7 +265,7 @@ flowchart LR
         direction TB
         GCal["Google\nCalendar"]
         Gmail["Google\nGmail"]
-        Anthropic["Anthropic\nClaude"]
+        LLM["LLM Backend\n(local or Claude)"]
     end
 
     style Local fill:#ffcccc
@@ -251,15 +286,17 @@ flowchart LR
 
 | Component | Technology |
 |-----------|------------|
-| Embeddings | sentence-transformers |
-| Vector DB | ChromaDB |
-| Keyword Search | SQLite FTS5 |
+| Backend | FastAPI (port 8000) |
+| LLM (orchestration + synthesis) | Local model via llama.cpp, or Claude API |
+| Embeddings | sentence-transformers (gte-Qwen2-1.5B-instruct) |
+| Vector DB | ChromaDB (port 8001) |
+| Keyword Search | SQLite FTS5 (BM25) |
 | Query Router | Ollama + Qwen 2.5 |
-| Synthesis | Claude API |
-| Backend | FastAPI |
-| Frontend | Vanilla JS |
+| Frontend | Vanilla HTML/JS (no build step) |
 | Job Queue | SQLite (background reindex, sync) |
 | Reminders | SQLite + cron scheduler |
+| Service Management | systemd (Linux) / launchd (macOS) |
+| GPU Acceleration | ROCm (AMD) or CUDA (NVIDIA) |
 
 ---
 

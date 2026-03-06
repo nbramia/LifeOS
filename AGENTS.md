@@ -13,7 +13,7 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 - **Two-tier data model**: SourceEntity (raw observations from each data source) → PersonEntity (canonical, merged records per person). See [ADR-003](docs/adr/003-two-tier-data-model.md).
 - **Hybrid search**: Vector similarity (ChromaDB) + keyword matching (BM25/FTS5), fused via Reciprocal Rank Fusion. See [ADR-004](docs/adr/004-hybrid-search.md).
 - **Entity resolution**: Links emails, phones, and names across sources to canonical people using fuzzy matching with scoring.
-- **Sync phases**: Five-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync.
+- **Sync phases**: Seven-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync → Entity Cleanup → Consistency Verification.
 - **Agentic chat**: Local LLM autonomously calls 15 tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
 
 ## Tech Stack

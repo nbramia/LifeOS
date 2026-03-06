@@ -39,7 +39,7 @@ Environment variables and configuration files for LifeOS.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LIFEOS_EMBEDDING_MODEL` | Override embedding model | `mixedbread-ai/mxbai-embed-large-v1` |
+| `LIFEOS_EMBEDDING_MODEL` | Override embedding model | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` |
 | `LIFEOS_EMBEDDING_CACHE` | Embedding cache directory (empty = HuggingFace default) | — |
 | `LIFEOS_RERANKER_MODEL` | Cross-encoder reranker model | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `LIFEOS_RERANKER_ENABLED` | Enable/disable reranking | `true` |
@@ -260,7 +260,7 @@ LIFEOS_WORK_DOMAIN=yourcompany.com
 LIFEOS_TIMEZONE=America/New_York
 
 # Embedding & Search
-# LIFEOS_EMBEDDING_MODEL=mixedbread-ai/mxbai-embed-large-v1
+# LIFEOS_EMBEDDING_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct
 # LIFEOS_RERANKER_ENABLED=true
 
 # Ollama
