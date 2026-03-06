@@ -91,6 +91,22 @@ if [ -f "$LOGROTATE_SRC" ]; then
     echo "  Installed /etc/logrotate.d/lifeos"
 fi
 
+# Install sudoers rule so server.sh can restart via systemctl without a password
+# (required for nightly sync to restart the server after completion)
+echo ""
+echo "Installing sudoers rule for passwordless systemctl..."
+SUDOERS_FILE="/etc/sudoers.d/lifeos"
+TMP_SUDOERS=$(mktemp)
+echo "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service" > "$TMP_SUDOERS"
+if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
+    mv "$TMP_SUDOERS" "$SUDOERS_FILE"
+    chmod 440 "$SUDOERS_FILE"
+    echo "  Installed $SUDOERS_FILE"
+else
+    rm -f "$TMP_SUDOERS"
+    echo "  ERROR: Invalid sudoers syntax — skipping installation"
+fi
+
 # Show status
 echo ""
 echo "=== Service Status ==="
