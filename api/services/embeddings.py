@@ -47,11 +47,10 @@ class EmbeddingService:
             from sentence_transformers import SentenceTransformer
 
             try:
-                # Load model with cache directory and trust_remote_code for Qwen models
+                # Load model with cache directory
                 self._model = SentenceTransformer(
                     self.model_name,
                     cache_folder=self.cache_dir,
-                    trust_remote_code=True,  # Required for gte-Qwen2 models
                 )
                 # Mark embedding model as healthy
                 from api.services.service_health import mark_service_healthy

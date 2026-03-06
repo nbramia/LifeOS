@@ -17,6 +17,7 @@ from api.services.chunker import (
     generate_chunk_context,
     add_context_to_chunks,
     _infer_topic,
+    _strip_base64_images,
 )
 
 
@@ -353,6 +354,54 @@ class TestChunkByTokens:
             chunk0_set = set(chunk0_words[-10:])
             chunk1_set = set(chunk1_words[:10])
             assert len(chunk0_set & chunk1_set) > 0
+
+
+# =============================================================================
+# _strip_base64_images Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestStripBase64Images:
+    """Tests for _strip_base64_images function."""
+
+    def test_strips_png_base64(self):
+        """Test stripping a PNG base64 image."""
+        text = "Before ![img](data:image/png;base64,iVBORw0KGgo=) After"
+        result = _strip_base64_images(text)
+        assert result == "Before ![img]([image]) After"
+
+    def test_strips_jpeg_base64(self):
+        """Test stripping a JPEG base64 image."""
+        text = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+        result = _strip_base64_images(text)
+        assert result == "[image]"
+
+    def test_no_base64_passthrough(self):
+        """Test that text without base64 images passes through unchanged."""
+        text = "Just some normal markdown text with ![img](https://example.com/img.png)"
+        assert _strip_base64_images(text) == text
+
+    def test_multiple_images_stripped(self):
+        """Test stripping multiple base64 images."""
+        text = "A data:image/png;base64,AAAA== B data:image/gif;base64,R0lGOD== C"
+        result = _strip_base64_images(text)
+        assert result == "A [image] B [image] C"
+
+    def test_preserves_surrounding_text(self):
+        """Test that surrounding text is preserved."""
+        text = "# Meeting Notes\n\nScreenshot: ![](data:image/png;base64,iVBOR=)\n\n## Action Items"
+        result = _strip_base64_images(text)
+        assert "# Meeting Notes" in result
+        assert "## Action Items" in result
+        assert "iVBOR" not in result
+
+    def test_chunk_document_strips_base64(self):
+        """Integration: chunk_document strips base64 before chunking."""
+        content = "Short note with ![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==)"
+        chunks = chunk_document(content)
+        assert len(chunks) >= 1
+        assert "iVBORw0KGgo" not in chunks[0]["content"]
+        assert "[image]" in chunks[0]["content"]
 
 
 # =============================================================================
