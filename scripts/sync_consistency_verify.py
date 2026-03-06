@@ -84,13 +84,17 @@ def _check_orphaned_interactions(valid_ids: set, dry_run: bool, fix_threshold: i
     return {"count": count, "fixed": fixed}
 
 
-def _check_hidden_interactions(hidden_ids: set, dry_run: bool) -> dict:
+def _check_hidden_interactions(hidden_ids: set, valid_ids: set, dry_run: bool) -> dict:
     """Check 2b: Delete interactions for hidden (soft-deleted) people.
 
     These interactions drive unnecessary relationship discovery work and serve
     no purpose since the person is hidden.  Always cleaned up (no threshold).
     """
     if not hidden_ids:
+        return {"count": 0, "fixed": 0}
+    if len(hidden_ids) > len(valid_ids) * 0.5:
+        logger.warning("hidden_ids > 50%% of valid_ids (%d/%d) — skipping hidden cleanup as safety guard",
+                        len(hidden_ids), len(valid_ids))
         return {"count": 0, "fixed": 0}
 
     from api.services.interaction_store import get_interaction_db_path
@@ -156,7 +160,7 @@ def _check_stale_merged_ids(valid_ids: set, store, dry_run: bool, fix_threshold:
     return {"count": count, "fixed": fixed}
 
 
-def _check_stale_merged_relationships(valid_ids: set, store, dry_run: bool, fix_threshold: int) -> dict:
+def _check_stale_merged_relationships(valid_ids: set, store, dry_run: bool) -> dict:
     """Check 3b: Find relationships pointing to merged (old) person IDs that can be re-pointed."""
     from config.settings import settings
     crm_path = Path(settings.chroma_path).parent / "crm.db"
@@ -201,17 +205,25 @@ def _check_stale_merged_relationships(valid_ids: set, store, dry_run: bool, fix_
     # Re-pointing merged IDs is always safe (follows known merge chains),
     # so it's not gated by fix_threshold (which guards against mass deletions).
     if not dry_run and count > 0:
-        # Re-point person_a_id
+        # Re-point person_a_id and person_b_id.  Use OR IGNORE so rows that
+        # would violate UNIQUE(person_a_id, person_b_id) are skipped.
         conn.execute(
-            "UPDATE relationships SET person_a_id = ("
+            "UPDATE OR IGNORE relationships SET person_a_id = ("
             "  SELECT s.new_id FROM stale_rel_ids s WHERE s.old_id = relationships.person_a_id"
             ") WHERE person_a_id IN (SELECT old_id FROM stale_rel_ids)"
         )
-        # Re-point person_b_id
         conn.execute(
-            "UPDATE relationships SET person_b_id = ("
+            "UPDATE OR IGNORE relationships SET person_b_id = ("
             "  SELECT s.new_id FROM stale_rel_ids s WHERE s.old_id = relationships.person_b_id"
             ") WHERE person_b_id IN (SELECT old_id FROM stale_rel_ids)"
+        )
+
+        # Delete rows that still reference stale IDs (skipped due to UNIQUE conflicts —
+        # the canonical equivalent already exists).
+        conn.execute(
+            "DELETE FROM relationships "
+            "WHERE person_a_id IN (SELECT old_id FROM stale_rel_ids) "
+            "   OR person_b_id IN (SELECT old_id FROM stale_rel_ids)"
         )
         repointed = count
 
@@ -228,7 +240,7 @@ def _check_stale_merged_relationships(valid_ids: set, store, dry_run: bool, fix_
         )
 
         # Delete duplicate pairs (keep the one with highest total shared counts)
-        conn.execute("""
+        cursor = conn.execute("""
             DELETE FROM relationships WHERE id NOT IN (
                 SELECT id FROM (
                     SELECT id, ROW_NUMBER() OVER (
@@ -247,14 +259,14 @@ def _check_stale_merged_relationships(valid_ids: set, store, dry_run: bool, fix_
                 ) WHERE rn = 1
             )
         """)
-        deleted_dupes = conn.total_changes - repointed  # approximate
+        deleted_dupes = cursor.rowcount
         conn.commit()
 
     conn.close()
     return {"count": count, "fixed": repointed, "repointed": repointed, "deleted_dupes": deleted_dupes}
 
 
-def _check_relationship_hygiene(hidden_ids: set, dry_run: bool) -> dict:
+def _check_relationship_hygiene(hidden_ids: set, valid_ids: set, dry_run: bool) -> dict:
     """Check 4: Delete self-loop and hidden-person relationships.
 
     Self-loops are data errors. Relationships involving hidden people are
@@ -273,13 +285,15 @@ def _check_relationship_hygiene(hidden_ids: set, dry_run: bool) -> dict:
     ).fetchone()[0]
 
     hidden_rels = 0
-    if hidden_ids:
+    skip_hidden = hidden_ids and len(hidden_ids) > len(valid_ids) * 0.5
+    if hidden_ids and not skip_hidden:
         conn.execute("CREATE TEMP TABLE hidden_ids (id TEXT PRIMARY KEY)")
         conn.executemany("INSERT INTO hidden_ids (id) VALUES (?)", [(id,) for id in hidden_ids])
         hidden_rels = conn.execute(
             "SELECT COUNT(*) FROM relationships r "
-            "WHERE EXISTS (SELECT 1 FROM hidden_ids h WHERE h.id = r.person_a_id) "
-            "   OR EXISTS (SELECT 1 FROM hidden_ids h WHERE h.id = r.person_b_id)"
+            "WHERE (EXISTS (SELECT 1 FROM hidden_ids h WHERE h.id = r.person_a_id) "
+            "    OR EXISTS (SELECT 1 FROM hidden_ids h WHERE h.id = r.person_b_id)) "
+            "  AND r.person_a_id != r.person_b_id"
         ).fetchone()[0]
 
     count = self_loops + hidden_rels
@@ -428,16 +442,17 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
             "auto_fix_skipped": False,
         }
 
-    # Person stats always fixes (threshold doesn't apply — it updates cached counts, not deletes)
-    person_stats = _check_person_stats(dry_run)
+    # Interaction-modifying checks first (deletions change counts)
     orphaned_interactions = _check_orphaned_interactions(valid_ids, dry_run, fix_threshold)
-    hidden_interactions = _check_hidden_interactions(hidden_ids, dry_run)
+    hidden_interactions = _check_hidden_interactions(hidden_ids, valid_ids, dry_run)
     stale_merged_ids = _check_stale_merged_ids(valid_ids, store, dry_run, fix_threshold)
     # Re-point stale merged IDs in relationships BEFORE checking for orphans
-    stale_merged_rels = _check_stale_merged_relationships(valid_ids, store, dry_run, fix_threshold)
+    stale_merged_rels = _check_stale_merged_relationships(valid_ids, store, dry_run)
     # Clean up self-loops and hidden-person relationships BEFORE orphan check
-    rel_hygiene = _check_relationship_hygiene(hidden_ids, dry_run)
+    rel_hygiene = _check_relationship_hygiene(hidden_ids, valid_ids, dry_run)
     orphaned_crm_records = _check_orphaned_crm_records(valid_ids, dry_run, fix_threshold)
+    # Person stats AFTER interaction-modifying checks so counts reflect final state
+    person_stats = _check_person_stats(dry_run)
 
     checks = [
         person_stats, orphaned_interactions, hidden_interactions,

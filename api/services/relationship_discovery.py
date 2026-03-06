@@ -1316,10 +1316,9 @@ def run_full_discovery(days_back: int = DISCOVERY_WINDOW_DAYS) -> dict:
     # Discovery functions read person_ids from interactions and don't know
     # which people are hidden, so we clean up after the fact.
     person_store = get_person_entity_store()
-    hidden_ids = {
-        p.id for p in person_store.get_all(include_hidden=True) if p.hidden
-    }
-    if hidden_ids:
+    all_people = person_store.get_all(include_hidden=True)
+    hidden_ids = {p.id for p in all_people if p.hidden}
+    if hidden_ids and len(hidden_ids) <= len(all_people) * 0.5:
         import sqlite3
         from api.services.source_entity import get_crm_db_path
         conn = sqlite3.connect(get_crm_db_path(), timeout=60.0)
