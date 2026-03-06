@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# create-worktree.sh — Claude Code WorktreeCreate hook.
+#
+# Reads JSON from stdin (fields: name, session_id, cwd, etc.).
+# Prints the absolute worktree path to stdout (hook contract).
+# All logging goes to stderr.
+
+log()   { echo "$*" >&2; }
+warn()  { echo "warning: $*" >&2; }
+debug() { [ "${LIFEOS_WORKTREE_DEBUG:-}" = "1" ] && echo "debug: $*" >&2 || true; }
+die()   { echo "error: $*" >&2; exit 1; }
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not found in PATH"
+
+# ---------------------------------------------------------------------------
+# 1. Parse stdin JSON and extract name
+# ---------------------------------------------------------------------------
+# Use read with a timeout — returns immediately on newline (the hook protocol
+# sends single-line JSON) and times out after 5s if no data arrives. Unlike
+# `cat`, read doesn't wait for EOF so it won't stall when the caller keeps
+# stdin open.
+log "parsing stdin…"
+if ! IFS= read -r -t 5 input; then
+  [ -n "${input:-}" ] || die "timed out or received no data on stdin"
+fi
+debug "raw input length: ${#input}"
+name="$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name',''))" 2>/dev/null)" \
+  || die "failed to parse stdin json"
+
+[ -n "$name" ] || die "worktree name is empty"
+
+# ---------------------------------------------------------------------------
+# 2. Validate name — reject path traversal and shell metacharacters
+# ---------------------------------------------------------------------------
+if [[ "$name" == *..* ]]; then
+  die "name contains path traversal: $name"
+fi
+if [[ ! "$name" =~ ^[A-Za-z0-9./_-]+$ ]]; then
+  die "name contains invalid characters (allowed: A-Za-z0-9./_-): $name"
+fi
+debug "validated name: $name"
+
+# ---------------------------------------------------------------------------
+# 3. Resolve paths
+# ---------------------------------------------------------------------------
+# Flatten slashes for the directory name (e.g. feat/foo → feat-foo) so the
+# worktree lives in a flat directory, not nested subdirectories.
+dir_name="$(echo "$name" | tr '/' '-')"
+
+# Derive repo name via --git-common-dir (correct even inside a worktree).
+repo_name="$(basename "$(cd "$(git rev-parse --git-common-dir)/.." && pwd)")"
+worktree_dir="$HOME/.claude/worktrees/$repo_name"
+worktree_path="$worktree_dir/$dir_name"
+
+debug "worktree_dir=$worktree_dir worktree_path=$worktree_path"
+
+# Ensure parent exists.
+mkdir -p "$worktree_dir"
+
+# ---------------------------------------------------------------------------
+# 4. Idempotent re-entry — if worktree already exists and is fully configured,
+#    return its path. If the worktree exists but .worktree-info is missing
+#    (partial failure on a previous run), skip to port allocation and file writes.
+# ---------------------------------------------------------------------------
+worktree_exists=false
+if [ -d "$worktree_path" ] && git worktree list --porcelain | grep -q "^worktree $worktree_path$"; then
+  if [ -f "$worktree_path/.worktree-info" ]; then
+    debug "idempotent check: worktree exists with .worktree-info"
+    log "worktree already exists: $worktree_path"
+    echo "$worktree_path"
+    exit 0
+  fi
+  debug "idempotent check: worktree exists but .worktree-info missing"
+  log "worktree exists but .worktree-info is missing — re-running setup"
+  worktree_exists=true
+  # Determine the branch from the existing worktree for .worktree-info.
+  branch="$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch="$name"
+fi
+
+if [ "$worktree_exists" = false ]; then
+# ---------------------------------------------------------------------------
+# 5. Branch resolution
+#
+# Candidate A: <name> (exact)
+# Candidate B: if name matches <type>-<rest>, also try <type>/<rest>
+# Order: local branch → remote branch → create new
+# ---------------------------------------------------------------------------
+candidate_a="$name"
+candidate_b=""
+
+if [[ "$name" =~ ^(feat|fix|docs|test|refactor|perf|chore)-(.+)$ ]]; then
+  candidate_b="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+fi
+
+debug "branch candidates: $candidate_a${candidate_b:+ $candidate_b}"
+
+# Fetch latest remote state (best-effort, non-fatal).
+git fetch --quiet origin 2>/dev/null || warn "git fetch failed (non-fatal — using cached remote state)"
+
+resolve_branch() {
+  local candidates=("$candidate_a")
+  [ -n "$candidate_b" ] && candidates+=("$candidate_b")
+
+  for candidate in "${candidates[@]}"; do
+    # Check local branch.
+    if git show-ref --verify --quiet "refs/heads/$candidate" 2>/dev/null; then
+      log "resolved to local branch: $candidate"
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  for candidate in "${candidates[@]}"; do
+    # Check remote branch.
+    if git show-ref --verify --quiet "refs/remotes/origin/$candidate" 2>/dev/null; then
+      log "resolved to remote branch: origin/$candidate"
+      git branch --track "$candidate" "origin/$candidate" >/dev/null 2>/dev/null || true
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  # No match — create new branch from origin/main.
+  local new_branch="${candidate_b:-$candidate_a}"
+  log "creating new branch from origin/main: $new_branch"
+  git branch "$new_branch" origin/main >&2
+  echo "$new_branch"
+}
+
+branch="$(resolve_branch)"
+
+# ---------------------------------------------------------------------------
+# 6. Create worktree
+# ---------------------------------------------------------------------------
+git worktree add "$worktree_path" "$branch" >&2
+log "created worktree at $worktree_path on branch $branch"
+
+fi # worktree_exists
+
+# ---------------------------------------------------------------------------
+# 7. Port allocation (range 8081–8499, mkdir-based lock)
+# ---------------------------------------------------------------------------
+lock_dir="$worktree_dir/.port-lock"
+
+allocate_port() {
+  local key="$1" range_start="$2" range_end="$3"
+
+  # Collect ports already assigned to other worktrees.
+  local used_ports=()
+  for info_file in "$worktree_dir"/*/.worktree-info; do
+    [ -f "$info_file" ] || continue
+    local p
+    p="$(grep "^${key}=" "$info_file" 2>/dev/null | cut -d= -f2)" || true
+    [ -n "$p" ] && used_ports+=("$p")
+  done
+  debug "$key: used ports: ${used_ports[*]+"${used_ports[*]}"}"
+
+  for port in $(seq "$range_start" "$range_end"); do
+    # Skip if already assigned.
+    local skip=false
+    for used in "${used_ports[@]+"${used_ports[@]}"}"; do
+      if [ "$port" = "$used" ]; then
+        skip=true
+        break
+      fi
+    done
+    $skip && continue
+
+    # Skip if something is listening on this port.
+    if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      continue
+    fi
+
+    echo "$port"
+    return 0
+  done
+
+  die "no free port in range $range_start-$range_end"
+}
+
+# Acquire lock (mkdir is atomic on POSIX).
+lock_max_attempts=60          # 60 * 0.5s = 30s wall-clock timeout
+lock_attempts=0
+lock_stale_seconds=300        # Break locks older than 5 minutes
+while ! mkdir "$lock_dir" 2>/dev/null; do
+  # Break stale locks (likely from a killed process).
+  if [ -d "$lock_dir" ]; then
+    lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || echo "0") ))
+    if [ "$lock_age" -gt "$lock_stale_seconds" ]; then
+      log "breaking stale lock (age: ${lock_age}s)"
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+  fi
+  lock_attempts=$((lock_attempts + 1))
+  if [ "$lock_attempts" -ge "$lock_max_attempts" ]; then
+    die "timed out waiting for port allocation lock after ~30s"
+  fi
+  sleep 0.5
+done
+# Ensure lock is released on exit.
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+
+server_port="$(allocate_port SERVER_PORT 8081 8499)"
+log "allocated port: SERVER_PORT=$server_port"
+
+# Release lock early.
+rmdir "$lock_dir" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 8. Write .worktree-info metadata
+# ---------------------------------------------------------------------------
+cat > "$worktree_path/.worktree-info" <<INFO
+NAME=$name
+BRANCH=$branch
+SERVER_PORT=$server_port
+CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+INFO
+log "wrote .worktree-info (SERVER_PORT=$server_port)"
+
+# ---------------------------------------------------------------------------
+# 9. Contract: print absolute worktree path to stdout
+# ---------------------------------------------------------------------------
+log "worktree ready: $worktree_path"
+echo "$worktree_path"
