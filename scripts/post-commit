@@ -2,8 +2,9 @@
 #
 # LifeOS Post-commit Hook
 #
-# Automatically restarts the server after each commit using server.sh
-# for consistent behavior with manual restarts.
+# Normalizes commit timestamps to 12:00 UTC (privacy: hides work schedule).
+# Conditionally restarts the server in the background when api/ or config/
+# files are in the commit.
 #
 # Installation:
 #   cp scripts/post-commit .git/hooks/post-commit
@@ -35,23 +36,14 @@ if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
     fi
 fi
 
-echo ""
-echo "========================================"
-echo "  Restarting LifeOS server..."
-echo "========================================"
+# Only restart server if api/ or config/ files were changed
+CHANGED=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
 
-# Use server.sh for consistent restart behavior
-# This ensures ChromaDB check, proper binding, and correct timeouts
-if [ -x "./scripts/server.sh" ]; then
-    ./scripts/server.sh restart
-    if [ $? -eq 0 ]; then
-        echo "  Server restarted successfully"
-    else
-        echo "  Warning: Server restart may have issues"
+if [ -n "$CHANGED" ]; then
+    if [ -x "./scripts/server.sh" ]; then
+        nohup ./scripts/server.sh restart > /tmp/lifeos-server-restart.log 2>&1 &
+        echo "Server restart triggered (log: /tmp/lifeos-server-restart.log)"
     fi
 else
-    echo "  Error: scripts/server.sh not found"
-    exit 1
+    echo "No server restart needed"
 fi
-
-echo "========================================"

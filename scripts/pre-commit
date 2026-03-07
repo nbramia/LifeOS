@@ -2,61 +2,32 @@
 #
 # LifeOS Pre-commit Hook
 #
-# Runs fast unit tests before allowing commits.
-# Slow tests (ChromaDB, embeddings) are skipped for speed.
-#
-# Test markers:
-#   @pytest.mark.unit        - Fast unit tests (run on commit)
-#   @pytest.mark.slow        - Slow tests (ChromaDB, embeddings)
-#   @pytest.mark.integration - Integration tests (require running server)
+# Runs ruff lint check on staged Python files. Fast (<1s).
+# Tests are deferred to the pre-push hook.
 #
 # Installation:
 #   cp scripts/pre-commit .git/hooks/pre-commit
 #   chmod +x .git/hooks/pre-commit
 #
-# Run all tests manually:
-#   pytest tests/ -v             # All tests
-#   pytest -m unit               # Unit tests only
-#   pytest -m "not slow"         # Skip slow tests
-#   pytest -m "not integration"  # Skip integration tests
-#
 
 set -e
 
-echo "========================================"
-echo "  LifeOS Pre-commit Hook"
-echo "  Running unit tests (fast)..."
-echo "========================================"
-echo ""
+# Get staged Python files
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
-# Get the project root directory
-PROJECT_ROOT="$(git rev-parse --show-toplevel)"
-cd "$PROJECT_ROOT"
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
 
-# Activate virtual environment (located outside Documents for faster startup)
+# Activate virtual environment
 if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
     source "$HOME/.venvs/lifeos/bin/activate"
 fi
 
-# Run only unit tests (fast) - skip slow tests that require ChromaDB or Ollama
-echo "Running: python -m pytest -m 'unit and not slow' tests/ -v --tb=short"
-echo ""
-
-if python -m pytest -m "unit and not slow" tests/ -v --tb=short; then
-    echo ""
-    echo "========================================"
-    echo "  Unit tests passed! Proceeding with commit."
-    echo ""
-    echo "  Run 'pytest' for full test suite."
-    echo "========================================"
+if ruff check $STAGED --quiet 2>/dev/null; then
+    echo "ruff: ok"
     exit 0
 else
-    echo ""
-    echo "========================================"
-    echo "  COMMIT BLOCKED: Unit tests failed!"
-    echo ""
-    echo "  Fix the failing tests before committing."
-    echo "  To bypass (not recommended): git commit --no-verify"
-    echo "========================================"
+    echo "ruff: lint errors found (run 'ruff check --fix' to auto-fix)"
     exit 1
 fi
