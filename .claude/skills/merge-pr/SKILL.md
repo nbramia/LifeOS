@@ -39,6 +39,20 @@ gh pr merge $ARGUMENTS --squash --delete-branch
 
 If the merge fails, report the error and stop.
 
+**Normalize commit timestamp** (privacy: hides work schedule):
+
+After the merge succeeds, pull the merge commit and normalize its timestamp to 12:00 UTC on the same date. This matches the post-commit hook behavior, which doesn't run for GitHub-side merges.
+
+```bash
+git checkout main && git pull origin main
+NORM_DATE="$(date -u -d "$(git log -1 --format='%ad' --date=short) 12:00" '+%Y-%m-%dT12:00:00+00:00')"
+GIT_AUTHOR_DATE="$NORM_DATE" GIT_COMMITTER_DATE="$NORM_DATE" \
+    git commit --amend --no-edit --no-verify --date="$NORM_DATE"
+git push --force-with-lease origin main
+```
+
+If the force-push fails (e.g., another commit landed), warn the user but do not retry. The merge itself already succeeded.
+
 ### Step 3: Update Linked Issues
 
 1. **Extract issue references** from the PR title and description. Look for:
