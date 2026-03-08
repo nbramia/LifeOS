@@ -428,6 +428,9 @@ class TelegramBotListener:
 
         logger.info(f"Telegram message: {text[:100]}")
 
+        # Show typing immediately so the user knows we received their message
+        await send_typing_indicator(chat_id)
+
         # Handle known commands (unrecognized /commands fall through to chat)
         if text.startswith("/"):
             handled = await self._handle_command(text, chat_id)
