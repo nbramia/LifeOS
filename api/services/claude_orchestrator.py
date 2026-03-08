@@ -552,24 +552,31 @@ class ClaudeOrchestrator:
                     )
             else:
                 # Task complete — send the final answer to the user.
-                # Priority: [NOTIFY] in result > raw result_text > last assistant text.
-                # Strip [NOTIFY]/[CLARIFY] tags from fallback text to avoid
-                # duplicating messages that were already relayed.
+                # If notifications were already sent during the session
+                # (via assistant events), don't re-extract [NOTIFY] from
+                # result_text — that would duplicate the message.
                 if self._notification_callback:
-                    final_notifies = _NOTIFY_RE.findall(result_text)
-                    if final_notifies:
-                        self._notification_callback(final_notifies[-1].strip())
-                    else:
-                        # Use result_text or last assistant text as the answer
-                        fallback = result_text.strip() or session.last_assistant_text
-                        # Strip already-relayed [NOTIFY]/[CLARIFY] lines
-                        fallback = _NOTIFY_RE.sub("", fallback)
-                        fallback = _CLARIFY_RE.sub("", fallback)
-                        fallback = fallback.strip()
+                    if session.notifications_sent > 0:
+                        # Already notified during execution — just clean up.
+                        # Send result_text only if it's NEW content (no [NOTIFY] tags).
+                        fallback = _NOTIFY_RE.sub("", result_text or "")
+                        fallback = _CLARIFY_RE.sub("", fallback).strip()
                         if fallback:
                             self._notification_callback(fallback)
+                    else:
+                        # No notifications sent yet — extract from result or use fallback
+                        final_notifies = _NOTIFY_RE.findall(result_text)
+                        if final_notifies:
+                            self._notification_callback(final_notifies[-1].strip())
                         else:
-                            self._notification_callback("Claude Code session completed.")
+                            fallback = result_text.strip() or session.last_assistant_text
+                            fallback = _NOTIFY_RE.sub("", fallback)
+                            fallback = _CLARIFY_RE.sub("", fallback)
+                            fallback = fallback.strip()
+                            if fallback:
+                                self._notification_callback(fallback)
+                            else:
+                                self._notification_callback("Claude Code session completed.")
                 self._cleanup("completed")
 
     def _on_timeout(self, session: ClaudeSession):
