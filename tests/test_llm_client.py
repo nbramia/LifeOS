@@ -333,11 +333,11 @@ class TestSingleton:
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.llm_backend = "anthropic"
             mock_settings.anthropic_api_key = "sk-ant-test-key"
-            mock_settings.anthropic_model = "claude-haiku-4-5-latest"
+            mock_settings.anthropic_model = "claude-haiku-4-5"
             try:
                 client = get_local_llm()
                 assert isinstance(client, AnthropicLLMClient)
-                assert client._model == "claude-haiku-4-5-latest"
+                assert client._model == "claude-haiku-4-5"
             except ImportError:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
@@ -348,7 +348,7 @@ class TestSingleton:
         reset_local_llm()
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test-key"
-            mock_settings.anthropic_model = "claude-haiku-4-5-latest"
+            mock_settings.anthropic_model = "claude-haiku-4-5"
             try:
                 client = get_anthropic_llm()
                 assert isinstance(client, AnthropicLLMClient)

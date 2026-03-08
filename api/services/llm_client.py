@@ -425,7 +425,7 @@ class AnthropicLLMClient:
         except ImportError:
             raise ImportError("anthropic package required for Anthropic backend: pip install anthropic")
         self._api_key = api_key or getattr(settings, "anthropic_api_key", "")
-        self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5-latest")
+        self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
 

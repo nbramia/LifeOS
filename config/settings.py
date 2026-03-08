@@ -63,8 +63,8 @@ class Settings(BaseSettings):
     # LLM Backend: "anthropic" (default) or "local"
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 
-    # Anthropic model for orchestration (uses undated alias for automatic upgrades)
-    anthropic_model: str = Field(default="claude-haiku-4-5-latest", alias="LIFEOS_ANTHROPIC_MODEL")
+    # Anthropic model for orchestration
+    anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
 
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
