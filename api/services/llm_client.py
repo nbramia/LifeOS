@@ -595,12 +595,12 @@ _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
 def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """Get or create the LLM client singleton.
 
-    Returns LocalLLMClient or AnthropicLLMClient based on LIFEOS_LLM_BACKEND setting.
-    Set LIFEOS_LLM_BACKEND=anthropic in .env to use Claude API instead of local model.
+    Returns AnthropicLLMClient (default) or LocalLLMClient based on LIFEOS_LLM_BACKEND.
+    Set LIFEOS_LLM_BACKEND=local in .env to use a local llama-server instead.
     """
     global _llm_client
     if _llm_client is None:
-        backend = getattr(settings, "llm_backend", "local").lower()
+        backend = getattr(settings, "llm_backend", "anthropic").lower()
         if backend == "anthropic":
             logger.info("Using Anthropic LLM backend")
             _llm_client = AnthropicLLMClient()
