@@ -128,13 +128,12 @@ if [ -f "$LOGROTATE_SRC" ]; then
     echo "  Installed /etc/logrotate.d/lifeos"
 fi
 
-# Install sudoers rule so server.sh can restart via systemctl without a password
-# (required for nightly sync to restart the server after completion)
+# Install sudoers rule so server.sh and sync scripts can manage services without a password
 echo ""
 echo "Installing sudoers rule for passwordless systemctl..."
 SUDOERS_FILE="/etc/sudoers.d/lifeos"
 TMP_SUDOERS=$(mktemp)
-echo "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service" > "$TMP_SUDOERS"
+echo "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service" > "$TMP_SUDOERS"
 if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
     mv "$TMP_SUDOERS" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
@@ -142,6 +141,30 @@ if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
 else
     rm -f "$TMP_SUDOERS"
     echo "  ERROR: Invalid sudoers syntax — skipping installation"
+fi
+
+# Set up swap file as OOM safety net (idempotent)
+SWAP_FILE="/swapfile"
+SWAP_SIZE_GB=8
+if [ ! -f "$SWAP_FILE" ]; then
+    echo ""
+    echo "Creating ${SWAP_SIZE_GB}GB swap file as OOM safety net..."
+    dd if=/dev/zero of="$SWAP_FILE" bs=1G count="$SWAP_SIZE_GB" status=progress
+    chmod 600 "$SWAP_FILE"
+    mkswap "$SWAP_FILE"
+    swapon "$SWAP_FILE"
+    # Add to fstab if not already there
+    if ! grep -q "$SWAP_FILE" /etc/fstab; then
+        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+    fi
+    echo "  Swap enabled: ${SWAP_SIZE_GB}GB at $SWAP_FILE"
+else
+    # Ensure it's active
+    if ! swapon --show | grep -q "$SWAP_FILE"; then
+        swapon "$SWAP_FILE" 2>/dev/null || true
+    fi
+    echo ""
+    echo "Swap file already exists: $(swapon --show | grep "$SWAP_FILE" || echo "$SWAP_FILE (inactive)")"
 fi
 
 # Show status
