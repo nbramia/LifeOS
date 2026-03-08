@@ -69,6 +69,17 @@ class Settings(BaseSettings):
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
     local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
+    local_llm_model: str = Field(
+        default="ggml-org/gpt-oss-120b-GGUF",
+        alias="LIFEOS_LLM_MODEL",
+        description="HuggingFace GGUF model ID for llama-server"
+    )
+    local_llm_autostart: bool = Field(
+        default=False,
+        alias="LIFEOS_LOCAL_LLM_AUTOSTART",
+        description="Enable systemd auto-start on boot and crash-restart for local LLM. "
+                    "When false, llama-server must be started manually."
+    )
 
     # Local LLM Router (Ollama — used for query routing only)
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
