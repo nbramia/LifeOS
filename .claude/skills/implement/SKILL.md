@@ -12,7 +12,7 @@ Orchestrate the full implementation lifecycle for: $ARGUMENTS
 
 - Current branch: !`git branch --show-current`
 - Recent commits: !`git log --oneline -5`
-- Issue (if applicable): !`gh issue view $ARGUMENTS --comments 2>/dev/null || echo "NOT_AN_ISSUE"`
+- Issue (if applicable): !`gh issue view "$ARGUMENTS" --comments 2>/dev/null || echo "NOT_AN_ISSUE"`
 
 ## Instructions
 
