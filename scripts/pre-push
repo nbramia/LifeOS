@@ -1,0 +1,36 @@
+#!/bin/bash
+#
+# LifeOS Pre-push Hook
+#
+# Runs unit tests before allowing pushes. Output is redirected to a log
+# file to avoid flooding the terminal — only a pass/fail summary is shown.
+#
+# Installation:
+#   cp scripts/pre-push .git/hooks/pre-push
+#   chmod +x .git/hooks/pre-push
+#
+
+set -e
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$PROJECT_ROOT"
+
+LOG="/tmp/lifeos-prepush-tests.log"
+
+# Activate virtual environment
+if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
+    source "$HOME/.venvs/lifeos/bin/activate"
+fi
+
+echo -n "Running unit tests... "
+
+if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header > "$LOG" 2>&1; then
+    SUMMARY=$(tail -1 "$LOG")
+    echo "passed ($SUMMARY)"
+    exit 0
+else
+    SUMMARY=$(tail -1 "$LOG")
+    echo "FAILED ($SUMMARY)"
+    echo "  Full output: $LOG"
+    exit 1
+fi
