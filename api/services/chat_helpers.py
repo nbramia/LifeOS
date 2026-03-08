@@ -134,12 +134,22 @@ def expand_followup_query(query: str, conversation_history: list) -> str:
         "their ", "they ", "them ", "he ", "she ", "it ",
         "our ", "his ", "her ", "its ",
         "the same", "more about", "anything else",
-        "what else", "tell me more"
+        "what else", "tell me more",
     ]
+
+    # Imperative follow-ups: "look in my email", "check my calendar", "search drive"
+    _imperative_re = re.compile(
+        r"^(?:look|check|search|find|try|scan)\b.*"
+        r"\b(?:email|gmail|calendar|drive|vault|slack|messages?|notes?|"
+        r"for it|for that|again)\b"
+    )
 
     is_followup = (
         len(query.split()) < 10 and  # Short query
-        any(pattern in query_lower for pattern in followup_patterns)
+        (
+            any(pattern in query_lower for pattern in followup_patterns)
+            or bool(_imperative_re.search(query_lower))
+        )
     )
 
     if not is_followup:
