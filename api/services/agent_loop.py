@@ -197,9 +197,9 @@ async def run_agent_loop(
             break
 
         _track_usage(usage_this_round)
-        result.full_text += text_this_round
 
-        # Build assistant content for message history
+        # Build assistant content for message history (keep narration text
+        # for the LLM context even if we strip it from the user-facing response)
         assistant_content = []
         if text_this_round:
             assistant_content.append({"type": "text", "text": text_this_round})
@@ -213,6 +213,14 @@ async def run_agent_loop(
 
         tool_names = [b.name for b in tool_use_blocks]
         print(f"[agent] Round {round_num} done: stop={finish_reason}, tools={tool_names}, text={len(text_this_round)}ch")
+
+        # If model produced text AND tool calls, the text is narration ("I need
+        # to look up...") — clear it from the user-facing response. The LLM
+        # context (assistant_content above) keeps it for continuity.
+        if tool_use_blocks and text_this_round.strip():
+            yield {"type": "self_correction"}
+        else:
+            result.full_text += text_this_round
 
         # If no tool calls, we're done — unless the model is giving up without trying
         if finish_reason != "tool_calls" or not tool_use_blocks:
