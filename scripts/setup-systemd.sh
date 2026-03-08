@@ -143,28 +143,26 @@ else
     echo "  ERROR: Invalid sudoers syntax — skipping installation"
 fi
 
-# Set up swap file as OOM safety net (idempotent)
-SWAP_FILE="/swapfile"
+# Ensure swap is available as OOM safety net (idempotent)
 SWAP_SIZE_GB=8
-if [ ! -f "$SWAP_FILE" ]; then
-    echo ""
-    echo "Creating ${SWAP_SIZE_GB}GB swap file as OOM safety net..."
-    dd if=/dev/zero of="$SWAP_FILE" bs=1G count="$SWAP_SIZE_GB" status=progress
-    chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE"
-    swapon "$SWAP_FILE"
-    # Add to fstab if not already there
-    if ! grep -q "$SWAP_FILE" /etc/fstab; then
-        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    fi
-    echo "  Swap enabled: ${SWAP_SIZE_GB}GB at $SWAP_FILE"
+echo ""
+if swapon --show --noheadings | grep -q .; then
+    SWAP_INFO=$(swapon --show --noheadings | head -1)
+    echo "Swap already active: $SWAP_INFO"
+elif [ -f /swapfile ]; then
+    swapon /swapfile 2>/dev/null && echo "Activated existing /swapfile" || echo "  /swapfile exists but could not be activated"
+elif [ -f /swap.img ]; then
+    swapon /swap.img 2>/dev/null && echo "Activated existing /swap.img" || echo "  /swap.img exists but could not be activated"
 else
-    # Ensure it's active
-    if ! swapon --show | grep -q "$SWAP_FILE"; then
-        swapon "$SWAP_FILE" 2>/dev/null || true
+    echo "Creating ${SWAP_SIZE_GB}GB swap file as OOM safety net..."
+    dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB * 1024)) status=progress
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
     fi
-    echo ""
-    echo "Swap file already exists: $(swapon --show | grep "$SWAP_FILE" || echo "$SWAP_FILE (inactive)")"
+    echo "  Swap enabled: ${SWAP_SIZE_GB}GB at /swapfile"
 fi
 
 # Show status
