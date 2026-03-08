@@ -14,13 +14,10 @@ Event types yielded:
   {"type": "result", "result": AgentResult}  -- final result (last event)
 """
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
-
-from config.settings import settings
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
 from api.services.synthesizer import build_message_content
@@ -273,25 +270,64 @@ async def run_agent_loop(
 
     else:
         # Exhausted all tool rounds — force a final synthesis round without tools.
-        # Use a longer timeout: the accumulated context from multiple tool rounds
-        # can be very large, and prompt processing alone may exceed the default timeout.
+        # Add an explicit instruction so the LLM knows to produce a text answer
+        # instead of trying to call more tools.
         print("[agent] Exhausted tool rounds, running synthesis round")
+        messages.append({
+            "role": "user",
+            "content": (
+                "You have finished gathering information. Now answer the original "
+                "question based on everything you found above. Do not call any more "
+                "tools — just provide your answer in plain text."
+            ),
+        })
         try:
+            synthesis_events = 0
             async for event in client.astream(
                 messages,
                 system=system_prompt,
                 max_tokens=4096,
                 timeout=180,
             ):
+                synthesis_events += 1
                 if event["type"] == "text":
                     result.full_text += event["content"]
                     yield {"type": "text", "content": event["content"]}
+                elif event["type"] == "tool_calls":
+                    # LLM tried to call tools despite no tools in request —
+                    # log and ignore (the text, if any, was already captured)
+                    print(f"[agent] Synthesis round produced tool_calls (ignored): {[c.get('function', {}).get('name', '?') for c in event.get('calls', [])]}")
                 elif event["type"] == "done":
                     _track_usage(event["usage"])
+                    print(f"[agent] Synthesis round done: finish_reason={event.get('finish_reason', '?')}, events={synthesis_events}")
         except Exception as e:
             error_msg = str(e) or f"{type(e).__name__} (no message)"
             print(f"[agent] Synthesis round error: {error_msg}")
             yield {"type": "text", "content": f"\n\n(Error during synthesis: {error_msg})"}
+
+    # If we ran tools but still ended up with no text, construct a fallback
+    # from tool results so the user gets something useful.
+    if not result.full_text.strip() and result.tool_calls_log:
+        # Clear any whitespace-only content that was already streamed
+        if result.full_text:
+            yield {"type": "self_correction"}
+            result.full_text = ""
+        # Exclude sensitive tools from raw fallback output
+        _SENSITIVE_TOOLS = {"get_message_history", "search_email"}
+        non_error_results = [
+            tc["result_preview"]
+            for tc in result.tool_calls_log
+            if not tc.get("is_error")
+            and tc["tool"] not in _SENSITIVE_TOOLS
+            and tc.get("result_preview", "").strip()
+        ]
+        if non_error_results:
+            fallback = "Here's what I found:\n\n" + "\n\n".join(non_error_results)
+        else:
+            fallback = "I searched but couldn't find relevant information to answer your question."
+        result.full_text = fallback
+        yield {"type": "text", "content": fallback}
+        print(f"[agent] Used fallback response ({len(fallback)}ch)")
 
     print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
     # Yield the final result
