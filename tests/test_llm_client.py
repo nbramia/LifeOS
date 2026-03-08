@@ -4,9 +4,8 @@ Tests for the unified LLM client.
 Covers tool format translation, message conversion, response parsing,
 and singleton/backend switching behavior.
 """
-import json
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch
 
 pytestmark = pytest.mark.unit
 
@@ -334,9 +333,11 @@ class TestSingleton:
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.llm_backend = "anthropic"
             mock_settings.anthropic_api_key = "sk-ant-test-key"
+            mock_settings.anthropic_model = "claude-haiku-4-5-latest"
             try:
                 client = get_local_llm()
                 assert isinstance(client, AnthropicLLMClient)
+                assert client._model == "claude-haiku-4-5-latest"
             except ImportError:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
