@@ -1,18 +1,17 @@
 """
 Unified LLM client for LifeOS.
 
-Wraps both local (OpenAI-compatible llama-server) and Claude (Anthropic) backends
-behind a common interface. The local model is the default; Claude is used as a
-fallback or when explicitly requested.
+Wraps both Claude (Anthropic) and local (OpenAI-compatible llama-server) backends
+behind a common interface. Claude is the default; local model is available as a
+fallback or for offline use.
 
 The local model server runs at LIFEOS_LOCAL_LLM_URL (default http://localhost:8080)
 and speaks the OpenAI chat completions API.
 """
-import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator
 
 import httpx
 
@@ -420,13 +419,13 @@ class AnthropicLLMClient:
     Allows switching between local and Anthropic backends via LIFEOS_LLM_BACKEND.
     """
 
-    def __init__(self, api_key: str | None = None, model: str = "claude-sonnet-4-20250514"):
+    def __init__(self, api_key: str | None = None, model: str | None = None):
         try:
             import anthropic
         except ImportError:
             raise ImportError("anthropic package required for Anthropic backend: pip install anthropic")
         self._api_key = api_key or getattr(settings, "anthropic_api_key", "")
-        self._model = model
+        self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5-latest")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
 
@@ -596,12 +595,12 @@ _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
 def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """Get or create the LLM client singleton.
 
-    Returns LocalLLMClient or AnthropicLLMClient based on LIFEOS_LLM_BACKEND setting.
-    Set LIFEOS_LLM_BACKEND=anthropic in .env to use Claude API instead of local model.
+    Returns AnthropicLLMClient (default) or LocalLLMClient based on LIFEOS_LLM_BACKEND.
+    Set LIFEOS_LLM_BACKEND=local in .env to use a local llama-server instead.
     """
     global _llm_client
     if _llm_client is None:
-        backend = getattr(settings, "llm_backend", "local").lower()
+        backend = getattr(settings, "llm_backend", "anthropic").lower()
         if backend == "anthropic":
             logger.info("Using Anthropic LLM backend")
             _llm_client = AnthropicLLMClient()
@@ -620,11 +619,14 @@ def get_anthropic_llm() -> AnthropicLLMClient:
     Used by relationship insights, fact extraction, tone analysis, and web search
     where frontier model quality provides clear value. These always use the Claude
     API regardless of the LIFEOS_LLM_BACKEND setting.
+
+    Pinned to Sonnet for quality — the orchestrator model (LIFEOS_ANTHROPIC_MODEL)
+    is independent of this.
     """
     global _anthropic_client
     if _anthropic_client is None:
-        _anthropic_client = AnthropicLLMClient()
-        logger.info("Created Anthropic client for specialist calls")
+        _anthropic_client = AnthropicLLMClient(model="claude-sonnet-4-20250514")
+        logger.info("Created Anthropic client for specialist calls (claude-sonnet-4-20250514)")
     return _anthropic_client
 
 
