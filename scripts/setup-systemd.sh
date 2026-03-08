@@ -8,7 +8,8 @@
 #   __LIFEOS_DIR__    → project directory (auto-detected)
 #   __VENV__          → venv path (default: ~/.venvs/lifeos)
 #   __LLAMA_CPP_DIR__ → llama.cpp directory (default: ~/llama.cpp)
-#   __LLM_MODEL__     → HuggingFace model ID (default: ggml-org/gpt-oss-120b-GGUF)
+#   __LLM_MODEL__             → HuggingFace model ID (from .env or default)
+#   __LLM_RESTART_POLICY__    → "on-failure" or "no" (from LIFEOS_LOCAL_LLM_AUTOSTART)
 
 set -euo pipefail
 
@@ -32,7 +33,35 @@ REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(eval echo "~$REAL_USER")
 VENV_DIR="${LIFEOS_VENV:-$REAL_HOME/.venvs/lifeos}"
 LLAMA_DIR="${LIFEOS_LLAMA_DIR:-$REAL_HOME/llama.cpp}"
-LLM_MODEL="${LIFEOS_LLM_MODEL:-ggml-org/gpt-oss-120b-GGUF}"
+
+# Read settings from .env (falls back to defaults if not set)
+_read_env() {
+    local key="$1" default="$2"
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        local val
+        val=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" | tr -d '[:space:]')
+        if [ -n "$val" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-ggml-org/gpt-oss-120b-GGUF}")
+LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
+
+# Normalize boolean
+case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) LLM_AUTOSTART="true" ;;
+    *)          LLM_AUTOSTART="false" ;;
+esac
+
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    LLM_RESTART_POLICY="on-failure"
+else
+    LLM_RESTART_POLICY="no"
+fi
 
 echo "=== LifeOS systemd Setup ==="
 echo ""
@@ -41,6 +70,7 @@ echo "  Project:    $PROJECT_DIR"
 echo "  Venv:       $VENV_DIR"
 echo "  llama.cpp:  $LLAMA_DIR"
 echo "  LLM Model:  $LLM_MODEL"
+echo "  LLM Auto:   $LLM_AUTOSTART (restart policy: $LLM_RESTART_POLICY)"
 echo ""
 
 # Install unit files with variable substitution
@@ -54,6 +84,7 @@ for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         -e "s|__VENV__|$VENV_DIR|g" \
         -e "s|__LLAMA_CPP_DIR__|$LLAMA_DIR|g" \
         -e "s|__LLM_MODEL__|$LLM_MODEL|g" \
+        -e "s|__LLM_RESTART_POLICY__|$LLM_RESTART_POLICY|g" \
         "$unit" > "$SYSTEMD_DST/$name"
     echo "  Installed $name"
 done
@@ -67,8 +98,14 @@ systemctl daemon-reload
 echo ""
 echo "Enabling and starting services..."
 
-systemctl enable --now lifeos-llm.service
-echo "  lifeos-llm: $(systemctl is-active lifeos-llm.service)"
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    systemctl enable --now lifeos-llm.service
+    echo "  lifeos-llm: $(systemctl is-active lifeos-llm.service) (autostart enabled)"
+else
+    systemctl disable lifeos-llm.service 2>/dev/null || true
+    systemctl stop lifeos-llm.service 2>/dev/null || true
+    echo "  lifeos-llm: disabled (set LIFEOS_LOCAL_LLM_AUTOSTART=true to enable)"
+fi
 
 systemctl enable --now lifeos-chromadb.service
 echo "  lifeos-chromadb: $(systemctl is-active lifeos-chromadb.service)"

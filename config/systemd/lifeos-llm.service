@@ -17,7 +17,7 @@ ExecStart=__LLAMA_CPP_DIR__/build/bin/llama-server \
     -c 32768 \
     --host 0.0.0.0 \
     --port 8080
-Restart=on-failure
+Restart=__LLM_RESTART_POLICY__
 RestartSec=10
 StandardOutput=append:__LIFEOS_DIR__/logs/llama-server.log
 StandardError=append:__LIFEOS_DIR__/logs/llama-server.log
