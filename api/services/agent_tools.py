@@ -7,7 +7,6 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import resolve_account, get_configured_accounts
@@ -67,7 +66,7 @@ TOOL_DEFINITIONS = [
                 },
                 "days_range": {
                     "type": "integer",
-                    "description": "Number of days around date_ref to search (default 1).",
+                    "description": "Number of days to search. With query: search ±N days (default 180). With date_ref: range from date (default 1).",
                 },
             },
             "required": [],
@@ -583,17 +582,18 @@ async def _tool_search_calendar(inp: dict) -> str:
 
     query = inp.get("query")
     date_ref = inp.get("date_ref")
-    days_range = inp.get("days_range", 1)
+    days_range = inp.get("days_range")
 
     all_events = []
     for account in get_configured_accounts():
         try:
             cal = CalendarService(account)
             if query:
-                events = cal.search_events(query=query, days_back=30, days_forward=30)
+                search_range = days_range or 180
+                events = cal.search_events(query=query, days_back=search_range, days_forward=search_range)
             elif date_ref:
                 start = datetime.strptime(date_ref, "%Y-%m-%d")
-                end = start + timedelta(days=days_range)
+                end = start + timedelta(days=days_range or 1)
                 events = cal.get_events_in_range(start, end)
             else:
                 events = cal.get_upcoming_events(days=7, max_results=15)
@@ -851,6 +851,11 @@ def _lookup_person(inp: dict) -> str:
         parts.append(f"Emails: {', '.join(entity.emails)}")
     if entity.phone_numbers:
         parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
+    if entity.birthday:
+        parts.append(f"Birthday: {entity.birthday}")
+    if entity.company or entity.position:
+        role = " — ".join(filter(None, [entity.position, entity.company]))
+        parts.append(f"Role: {role}")
 
     # Relationship summary
     rel = get_relationship_summary(entity.id)

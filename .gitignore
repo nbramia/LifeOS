@@ -102,6 +102,7 @@ tests/qualitative_tests.md
 tests/qualitative_tests_v2.md
 tests/fixtures/production_test_data.py
 tests/fixtures/benchmark_config.json
+tests/e2e/test_chat_queries.py
 
 # =============================================================================
 # BUILD & DISTRIBUTION
