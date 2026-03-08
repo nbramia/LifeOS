@@ -212,6 +212,9 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     conv_id = conversation_id
     code_intent = False
     task = None
+    sources = []
+    statuses = []
+    perf_trace = None
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
@@ -229,24 +232,36 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                     event = json.loads(line[6:])
                 except json.JSONDecodeError:
                     continue
-                if event.get("type") == "content":
+                etype = event.get("type")
+                if etype == "content":
                     full_text += event.get("content", "")
-                elif event.get("type") == "self_correction":
+                elif etype == "self_correction":
                     full_text = ""
-                elif event.get("type") == "conversation_id":
+                elif etype == "conversation_id":
                     conv_id = event.get("conversation_id", conv_id)
-                elif event.get("type") == "code_intent":
+                elif etype == "code_intent":
                     code_intent = True
                     task = event.get("task", question)
-                elif event.get("type") == "status":
-                    # Agent loop status (e.g. "Searching calendar...") — log only
-                    logger.debug(f"Agent status: {event.get('message', '')}")
-                elif event.get("type") == "error":
+                elif etype == "status":
+                    statuses.append(event.get("message", ""))
+                elif etype == "sources":
+                    sources = event.get("sources", [])
+                elif etype == "perf_trace":
+                    perf_trace = event
+                elif etype == "error":
                     error_msg = event.get("message", "Unknown error")
                     logger.error(f"Chat pipeline error: {error_msg}")
                     full_text += f"\n\nError: {error_msg}" if full_text else f"Error: {error_msg}"
 
-    return {"answer": full_text, "conversation_id": conv_id, "code_intent": code_intent, "task": task}
+    return {
+        "answer": full_text,
+        "conversation_id": conv_id,
+        "code_intent": code_intent,
+        "task": task,
+        "sources": sources,
+        "statuses": statuses,
+        "perf_trace": perf_trace,
+    }
 
 
 async def chat_via_api_with_log(question: str) -> dict:
@@ -332,6 +347,7 @@ class TelegramBotListener:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Conversation state: chat_id -> conversation_id
         self._conversations: dict[str, str] = {}
+        self._last_result: dict | None = None  # Last chat result for /inspect
         self._last_update_id = 0
 
     def start(self):
@@ -457,6 +473,7 @@ class TelegramBotListener:
                 conv_id = self._conversations.get(chat_id)
                 result = await chat_via_api(text, conversation_id=conv_id)
                 self._conversations[chat_id] = result["conversation_id"]
+                self._last_result = result
 
             # Check if the chat pipeline detected a "code" intent
             if result.get("code_intent"):
@@ -520,6 +537,9 @@ class TelegramBotListener:
         elif command in ("/code_cancel", "/codecancel"):
             await self._handle_code_cancel(chat_id)
 
+        elif command == "/inspect":
+            await self._handle_inspect(chat_id)
+
         elif command == "/help":
             help_text = (
                 "*LifeOS Telegram Bot*\n\n"
@@ -527,6 +547,7 @@ class TelegramBotListener:
                 "*Commands:*\n"
                 "/new or /clear - Start a new conversation\n"
                 "/status - Check LifeOS server health\n"
+                "/inspect - Show sources checked in last response\n"
                 "/code <task> - Run a task with Claude Code\n"
                 "/code\\_status - Check active Claude Code session\n"
                 "/code\\_cancel - Cancel active Claude Code session\n"
@@ -698,6 +719,48 @@ class TelegramBotListener:
 
         orch.cancel()
         await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
+
+    async def _handle_inspect(self, chat_id: str):
+        """Show sources checked and results from the last query."""
+        if not self._last_result:
+            await send_message_async("No previous query to inspect.", chat_id=chat_id)
+            return
+
+        r = self._last_result
+        lines = ["*Last query inspection*\n"]
+
+        # Tool actions taken
+        statuses = r.get("statuses", [])
+        if statuses:
+            lines.append("*Actions:*")
+            for s in statuses:
+                lines.append(f"  - {s}")
+            lines.append("")
+
+        # Sources found
+        sources = r.get("sources", [])
+        if sources:
+            lines.append("*Sources checked:*")
+            for src in sources:
+                name = src.get("file_name", "unknown")
+                stype = src.get("source_type", "")
+                lines.append(f"  - [{stype}] {name}")
+            lines.append("")
+
+        # Performance
+        perf = r.get("perf_trace")
+        if perf:
+            total_ms = perf.get("total_ms", 0)
+            lines.append(f"*Time:* {total_ms:.0f}ms")
+            spans = perf.get("spans", [])
+            for span in spans:
+                if span.get("duration_ms", 0) > 50:
+                    lines.append(f"  - {span['name']}: {span['duration_ms']:.0f}ms")
+
+        if len(lines) == 1:
+            lines.append("No tool calls or sources in last response.")
+
+        await send_message_async("\n".join(lines), chat_id=chat_id)
 
 
 # ---------------------------------------------------------------------------
