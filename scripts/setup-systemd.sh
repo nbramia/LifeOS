@@ -133,7 +133,7 @@ echo ""
 echo "Installing sudoers rule for passwordless systemctl..."
 SUDOERS_FILE="/etc/sudoers.d/lifeos"
 TMP_SUDOERS=$(mktemp)
-echo "$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service" > "$TMP_SUDOERS"
+echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service" > "$TMP_SUDOERS"
 if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
     mv "$TMP_SUDOERS" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"

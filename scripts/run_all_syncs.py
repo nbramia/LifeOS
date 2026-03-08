@@ -137,6 +137,10 @@ def _start_llm() -> None:
 _active_run_id: int | None = None
 _active_source: str | None = None
 
+# Track LLM state across signal handlers (module-level for SIGTERM access)
+_llm_stopped_for_sync: bool = False
+_llm_was_running_before_sync: bool = False
+
 
 def _handle_sigterm(signum, frame):
     """Clean up sync_health.db on SIGTERM so we don't leave stale RUNNING rows."""
@@ -149,6 +153,9 @@ def _handle_sigterm(signum, frame):
             )
         except Exception:
             pass  # Best-effort — DB may be locked
+    # Restore LLM if we stopped it
+    if _llm_stopped_for_sync and _llm_was_running_before_sync:
+        _start_llm()
     sys.exit(128 + signum)
 
 
@@ -872,81 +879,90 @@ def run_all_syncs(
         except Exception as e:
             logger.warning(f"Could not enter maintenance mode (server may not be running): {e}")
 
-    for source in sources:
-        if source not in SYNC_SOURCES:
-            logger.warning(f"Unknown source: {source}, skipping")
-            continue
+    global _llm_stopped_for_sync, _llm_was_running_before_sync
+    _llm_stopped_for_sync = False
+    _llm_was_running_before_sync = False
+    # One-shot: only check GPU memory once for the first embedding source,
+    # since conditions won't change mid-sync (LLM is either stopped or not).
+    llm_memory_checked = False
 
-        # Memory-gated LLM management for embedding phases
-        if source in EMBEDDING_SOURCES and not dry_run and "_llm_stopped" not in results:
-            llm_was_running = _is_llm_running()
-            results["_llm_was_running"] = llm_was_running
-            if llm_was_running:
-                available = _get_available_gpu_memory_mb()
-                if available is None or available < _EMBEDDING_MEMORY_THRESHOLD_MB:
-                    logger.info(f"Insufficient GPU memory ({available} MB) for embeddings — stopping LLM")
-                    if _stop_llm_for_embeddings():
-                        results["_llm_stopped"] = True
-                else:
-                    logger.info(f"Sufficient GPU memory ({available} MB) — LLM stays running")
-                    results["_llm_stopped"] = False
-            else:
-                results["_llm_stopped"] = False
-
-        # Skip sources disabled by work integration settings
-        if source in disabled_sources:
-            logger.info(f"Skipping {source}: work integration disabled")
-            results[source] = {"skipped": True, "reason": "work_integration_disabled"}
-            continue
-
-        # Skip monthly sources unless it's the 1st of the month (or forced)
-        source_info = SYNC_SOURCES.get(source, {})
-        if source_info.get("frequency") == "monthly" and not force and not dry_run:
-            if datetime.now().day != 1:
-                logger.info(f"Skipping {source}: monthly sync, not the 1st (use --force to override)")
-                results[source] = {"skipped": True, "reason": "monthly_not_due"}
+    try:
+        for source_idx, source in enumerate(sources):
+            if source not in SYNC_SOURCES:
+                logger.warning(f"Unknown source: {source}, skipping")
                 continue
 
-        # Check if recently synced (unless forced)
-        if not force and not dry_run:
-            health = get_sync_health(source)
-            if health.hours_since_sync is not None and health.hours_since_sync < 1:
-                if health.last_status == SyncStatus.SUCCESS:
-                    logger.info(f"Skipping {source}: recently synced ({health.hours_since_sync*60:.0f}m ago)")
-                    results[source] = {"skipped": True, "reason": "recently_synced"}
+            # Skip sources disabled by work integration settings
+            if source in disabled_sources:
+                logger.info(f"Skipping {source}: work integration disabled")
+                results[source] = {"skipped": True, "reason": "work_integration_disabled"}
+                continue
+
+            # Skip monthly sources unless it's the 1st of the month (or forced)
+            source_info = SYNC_SOURCES.get(source, {})
+            if source_info.get("frequency") == "monthly" and not force and not dry_run:
+                if datetime.now().day != 1:
+                    logger.info(f"Skipping {source}: monthly sync, not the 1st (use --force to override)")
+                    results[source] = {"skipped": True, "reason": "monthly_not_due"}
                     continue
 
-        # Check if any dependency failed or was dependency-skipped
-        deps = source_info.get("depends_on", [])
-        if deps:
-            failed_deps = [d for d in deps if d in failed or d in dep_skipped]
-            if failed_deps:
-                logger.warning(f"Skipping {source}: dependency failed ({', '.join(failed_deps)})")
-                results[source] = {
-                    "skipped": True,
-                    "reason": "dependency_failed",
-                    "failed_dependencies": failed_deps,
-                }
-                dep_skipped.add(source)
-                continue
+            # Check if recently synced (unless forced)
+            if not force and not dry_run:
+                health = get_sync_health(source)
+                if health.hours_since_sync is not None and health.hours_since_sync < 1:
+                    if health.last_status == SyncStatus.SUCCESS:
+                        logger.info(f"Skipping {source}: recently synced ({health.hours_since_sync*60:.0f}m ago)")
+                        results[source] = {"skipped": True, "reason": "recently_synced"}
+                        continue
 
-        success, stats = run_sync(source, dry_run=dry_run)
-        results[source] = {"success": success, **stats}
+            # Check if any dependency failed or was dependency-skipped
+            deps = source_info.get("depends_on", [])
+            if deps:
+                failed_deps = [d for d in deps if d in failed or d in dep_skipped]
+                if failed_deps:
+                    logger.warning(f"Skipping {source}: dependency failed ({', '.join(failed_deps)})")
+                    results[source] = {
+                        "skipped": True,
+                        "reason": "dependency_failed",
+                        "failed_dependencies": failed_deps,
+                    }
+                    dep_skipped.add(source)
+                    continue
 
-        if not success:
-            failed.append(source)
+            # Memory-gated LLM management for embedding phases (after skip guards)
+            if source in EMBEDDING_SOURCES and not dry_run and not llm_memory_checked:
+                llm_memory_checked = True
+                _llm_was_running_before_sync = _is_llm_running()
+                if _llm_was_running_before_sync:
+                    available = _get_available_gpu_memory_mb()
+                    if available is None or available < _EMBEDDING_MEMORY_THRESHOLD_MB:
+                        logger.info(f"Insufficient GPU memory ({available or 'unknown'} MB) for embeddings — stopping LLM")
+                        if _stop_llm_for_embeddings():
+                            _llm_stopped_for_sync = True
+                    else:
+                        logger.info(f"Sufficient GPU memory ({available} MB) — LLM stays running")
 
-        # Restart LLM after embedding phases complete (if we stopped it)
-        if source in EMBEDDING_SOURCES and results.get("_llm_stopped"):
-            # Check if next source is still an embedding source
-            source_idx = sources.index(source) if source in sources else -1
-            next_is_embedding = (
-                source_idx + 1 < len(sources)
-                and sources[source_idx + 1] in EMBEDDING_SOURCES
-            )
-            if not next_is_embedding:
-                _start_llm()
-                results["_llm_stopped"] = False
+            success, stats = run_sync(source, dry_run=dry_run)
+            results[source] = {"success": success, **stats}
+
+            if not success:
+                failed.append(source)
+
+            # Restart LLM after last embedding phase completes (if we stopped it)
+            if source in EMBEDDING_SOURCES and _llm_stopped_for_sync:
+                next_is_embedding = (
+                    source_idx + 1 < len(sources)
+                    and sources[source_idx + 1] in EMBEDDING_SOURCES
+                )
+                if not next_is_embedding:
+                    _start_llm()
+                    _llm_stopped_for_sync = False
+    finally:
+        # Safety net: restart LLM if we stopped it and it's still down
+        if _llm_stopped_for_sync and _llm_was_running_before_sync:
+            logger.warning("LLM was stopped for embeddings but not restarted — restarting now")
+            _start_llm()
+            _llm_stopped_for_sync = False
 
     # Log summary
     logger.info("=" * 60)
@@ -959,15 +975,6 @@ def run_all_syncs(
     if dep_skipped:
         logger.warning(f"Dependency-skipped sources: {', '.join(sorted(dep_skipped))}")
     logger.info("=" * 60)
-
-    # Safety net: restart LLM if we stopped it and it's still down
-    if results.get("_llm_stopped") and results.get("_llm_was_running"):
-        logger.warning("LLM was stopped for embeddings but not restarted — restarting now")
-        _start_llm()
-
-    # Clean up internal tracking keys
-    results.pop("_llm_stopped", None)
-    results.pop("_llm_was_running", None)
 
     # Check overall health
     is_healthy, health_msg = check_sync_health()
