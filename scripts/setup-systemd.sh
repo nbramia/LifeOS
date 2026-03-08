@@ -39,7 +39,7 @@ _read_env() {
     local key="$1" default="$2"
     if [ -f "$PROJECT_DIR/.env" ]; then
         local val
-        val=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" | tr -d '[:space:]')
+        val=$(grep -E "^${key}=" "$PROJECT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//;s/ *#.*//" | tr -d '[:space:]')
         if [ -n "$val" ]; then
             echo "$val"
             return
