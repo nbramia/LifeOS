@@ -223,7 +223,8 @@ async def run_agent_loop(
             result.full_text += text_this_round
 
         # If no tool calls, we're done — unless the model is giving up without trying
-        if finish_reason != "tool_calls" or not tool_use_blocks:
+        # finish_reason is "tool_calls" (OpenAI) or "tool_use" (Anthropic)
+        if finish_reason not in ("tool_calls", "tool_use") or not tool_use_blocks:
             if (
                 round_num == 1
                 and not result.tool_calls_log
