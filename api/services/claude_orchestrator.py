@@ -176,8 +176,8 @@ The user will review and approve the plan before you proceed.
 
 """
 
-_NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.+)")
-_CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.+)")
+_NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
+_CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
 
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 
@@ -567,9 +567,6 @@ class ClaudeOrchestrator:
                         fallback = _CLARIFY_RE.sub("", fallback)
                         fallback = fallback.strip()
                         if fallback:
-                            # Truncate for Telegram (4096 char limit)
-                            if len(fallback) > 3500:
-                                fallback = fallback[:3500] + "\n\n…(truncated)"
                             self._notification_callback(fallback)
                         else:
                             self._notification_callback("Claude Code session completed.")

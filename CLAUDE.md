@@ -20,6 +20,12 @@ Available as slash commands. See `.claude/skills/` for full details.
 | `/address-review <number>` | Address PR review feedback with independent verification |
 | `/pr-check [number]` | Validate PR against standards before requesting review |
 | `/merge-pr <number>` | Merge PR, update linked issues |
+| `/tune <feedback>` | Tune orchestrator prompts based on bad response feedback |
+| `/draft-issue <description>` | Create a GitHub issue from a description or investigation |
+| `/standup [hours]` | Personal daily summary — shipped, in progress, needs attention |
+| `/catchup [period]` | Cross-PR net-effects briefing for a time period |
+| `/stale` | Find stale PRs, orphan branches, stale issues |
+| `/mine-for-ideas <repo>` | Analyze an open-source repo for patterns LifeOS could adopt |
 
 ## Quick Reference
 

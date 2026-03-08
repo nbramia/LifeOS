@@ -4,7 +4,6 @@ Tests for the Claude Code orchestrator.
 Tests event parsing, [NOTIFY] extraction, session lifecycle, and plan mode.
 Does NOT spawn real Claude processes — all subprocess calls are mocked.
 """
-import json
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -31,12 +30,22 @@ class TestNotifyExtraction:
         match = _NOTIFY_RE.search("Just a regular line of text.")
         assert match is None
 
-    def test_notify_in_multiline(self):
+    def test_notify_captures_multiline_content(self):
+        """NOTIFY captures all continuation lines until next tag or end."""
         from api.services.claude_orchestrator import _NOTIFY_RE
         text = "Some preamble\n[NOTIFY] Found the issue.\nMore text"
         matches = list(_NOTIFY_RE.finditer(text))
         assert len(matches) == 1
-        assert matches[0].group(1) == "Found the issue."
+        assert matches[0].group(1).strip() == "Found the issue.\nMore text"
+
+    def test_notify_stops_at_next_tag(self):
+        """Multi-line NOTIFY stops capturing at the next [NOTIFY] or [CLARIFY]."""
+        from api.services.claude_orchestrator import _NOTIFY_RE
+        text = "[NOTIFY] First message\nwith continuation\n[CLARIFY] Question?"
+        matches = list(_NOTIFY_RE.finditer(text))
+        assert len(matches) == 1
+        assert "continuation" in matches[0].group(1)
+        assert "Question" not in matches[0].group(1)
 
     def test_multiple_notifies(self):
         from api.services.claude_orchestrator import _NOTIFY_RE
@@ -62,7 +71,7 @@ class TestHandleEvent:
     """Test event handling logic in the orchestrator."""
 
     def _make_orchestrator(self):
-        from api.services.claude_orchestrator import ClaudeOrchestrator, ClaudeSession
+        from api.services.claude_orchestrator import ClaudeOrchestrator
         orch = ClaudeOrchestrator()
         return orch
 
