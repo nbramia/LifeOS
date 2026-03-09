@@ -737,14 +737,16 @@ class TelegramBotListener:
                 lines.append(f"  - {s}")
             lines.append("")
 
-        # Sources found
+        # Sources found (show only tool name + type, not input args)
         sources = r.get("sources", [])
         if sources:
             lines.append("*Sources checked:*")
             for src in sources:
-                name = src.get("file_name", "unknown")
                 stype = src.get("source_type", "")
-                lines.append(f"  - [{stype}] {name}")
+                # file_name contains tool(args) — extract just the tool name
+                raw = src.get("file_name", "")
+                tool_name = raw.split("(")[0] if "(" in raw else raw
+                lines.append(f"  - [{stype}] {tool_name}")
             lines.append("")
 
         # Performance

@@ -201,6 +201,71 @@ class TestHandleEvent:
         assert "Step 2" in session.plan_text
 
 
+    def test_result_event_no_dedup_when_no_prior_notifications(self):
+        """When no notifications were sent during session, result [NOTIFY] is relayed."""
+        from api.services.claude_orchestrator import ClaudeSession
+        orch = self._make_orchestrator()
+        session = ClaudeSession(task="test")
+        session.notifications_sent = 0
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        event = {
+            "type": "result",
+            "total_cost_usd": 0.001,
+            "result": "[NOTIFY] Task done!",
+        }
+        orch._handle_event(event, session)
+
+        assert len(notifications) == 1
+        assert "Task done!" in notifications[0]
+
+    def test_result_event_dedup_when_notifications_already_sent(self):
+        """When notifications were sent during session, [NOTIFY] in result is not re-sent."""
+        from api.services.claude_orchestrator import ClaudeSession
+        orch = self._make_orchestrator()
+        session = ClaudeSession(task="test")
+        session.notifications_sent = 2  # Already sent during execution
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        event = {
+            "type": "result",
+            "total_cost_usd": 0.001,
+            "result": "[NOTIFY] Task done!",  # This was already sent
+        }
+        orch._handle_event(event, session)
+
+        # Should NOT send the [NOTIFY] again — it was already relayed
+        assert len(notifications) == 0
+
+    def test_result_event_dedup_sends_non_notify_content(self):
+        """When notifications were already sent, non-NOTIFY result text is still forwarded."""
+        from api.services.claude_orchestrator import ClaudeSession
+        orch = self._make_orchestrator()
+        session = ClaudeSession(task="test")
+        session.notifications_sent = 1
+        orch._active_session = session
+        notifications = []
+        orch._notification_callback = lambda msg: notifications.append(msg)
+
+        # result_text with NOTIFY block followed by a separate non-NOTIFY line
+        # The NOTIFY regex captures from [NOTIFY] to next tag or end, so
+        # non-NOTIFY content must precede the [NOTIFY] tag.
+        event = {
+            "type": "result",
+            "total_cost_usd": 0.001,
+            "result": "Extra summary here.\n[NOTIFY] Already sent",
+        }
+        orch._handle_event(event, session)
+
+        assert len(notifications) == 1
+        assert "Extra summary" in notifications[0]
+        assert "NOTIFY" not in notifications[0]
+
+
 class TestOrchestratorLifecycle:
     """Test session lifecycle: busy check, reject, cancel."""
 

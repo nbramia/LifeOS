@@ -14,6 +14,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Imperative follow-ups: "look in my email", "check my calendar", "search drive"
+_IMPERATIVE_FOLLOWUP_RE = re.compile(
+    r"^(?:look|check|search|find|try|scan)\b.*"
+    r"\b(?:email|gmail|calendar|drive|vault|slack|messages?|notes?|"
+    r"for it|for that|again)\b"
+)
+
 
 class ReminderIntentType(Enum):
     """Types of reminder-related intents."""
@@ -137,18 +144,11 @@ def expand_followup_query(query: str, conversation_history: list) -> str:
         "what else", "tell me more",
     ]
 
-    # Imperative follow-ups: "look in my email", "check my calendar", "search drive"
-    _imperative_re = re.compile(
-        r"^(?:look|check|search|find|try|scan)\b.*"
-        r"\b(?:email|gmail|calendar|drive|vault|slack|messages?|notes?|"
-        r"for it|for that|again)\b"
-    )
-
     is_followup = (
         len(query.split()) < 10 and  # Short query
         (
             any(pattern in query_lower for pattern in followup_patterns)
-            or bool(_imperative_re.search(query_lower))
+            or bool(_IMPERATIVE_FOLLOWUP_RE.search(query_lower))
         )
     )
 
