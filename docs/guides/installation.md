@@ -186,6 +186,32 @@ All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLES
 
 ---
 
+## Local LLM Model Selection
+
+LifeOS supports any GGUF model via llama-server. Two models are pre-configured:
+
+| Model | VRAM | Quality | Embeddings coexist? |
+|-------|------|---------|---------------------|
+| `ggml-org/gpt-oss-120b-GGUF` (default) | ~59 GB | Highest | No — sync stops LLM automatically |
+| `Qwen/Qwen3-32B-GGUF` | ~20 GB | Good | Yes — both fit in 80 GB GPU |
+
+### Switching models
+
+```bash
+# 1. Set the model in .env
+LIFEOS_LLM_MODEL=Qwen/Qwen3-32B-GGUF
+
+# 2. Reinstall systemd service (substitutes model into the service file)
+sudo ./scripts/setup-systemd.sh
+
+# 3. Restart (downloads the model on first start)
+sudo systemctl restart lifeos-llm
+```
+
+The first start with a new model downloads the GGUF file (~20 GB for Qwen3-32B Q4_K_M). Subsequent starts use the cached file in `~/.cache/llama.cpp/`.
+
+---
+
 ## GPU Memory (AMD Unified Memory Systems)
 
 If running a local LLM on an AMD APU with unified memory (e.g., Ryzen AI MAX+), the BIOS allocates GPU vs CPU memory from a shared pool.
