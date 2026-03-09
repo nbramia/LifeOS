@@ -186,6 +186,27 @@ All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLES
 
 ---
 
+## GPU Memory (AMD Unified Memory Systems)
+
+If running a local LLM on an AMD APU with unified memory (e.g., Ryzen AI MAX+), the BIOS allocates GPU vs CPU memory from a shared pool.
+
+**Recommended allocation: 80 GB GPU** (for systems with 96+ GB total). This gives:
+- ~59 GB for gpt-oss-120b (MXFP4) with 21 GB GPU headroom
+- ~20 GB for Qwen3-32B (Q4_K_M) with 60 GB GPU headroom
+- ~46 GB visible to the CPU (vs ~30 GB at 96 GB GPU allocation)
+
+The setup script creates an 8 GB swap file as an OOM safety net. The nightly sync pipeline automatically stops the LLM before embedding phases if GPU memory is insufficient, and restarts it afterward.
+
+### Optional: cgroups for dev processes
+
+To prevent test suites from triggering OOM kills:
+
+```bash
+# Create a memory-limited slice for dev work
+sudo systemd-run --scope -p MemoryMax=16G --user bash
+# Or add to ~/.config/systemd/user/dev.slice for persistence
+```
+
 ## Common Issues
 
 | Issue | Solution |

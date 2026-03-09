@@ -42,6 +42,10 @@ markers = [
     "requires_server: Tests that require the API server to be running",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# These scripts intentionally call load_dotenv() before stdlib imports
+"scripts/*.py" = ["E402"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["api*", "config*"]

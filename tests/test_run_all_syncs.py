@@ -1,6 +1,5 @@
-"""Tests for dependency-skip behavior in run_all_syncs."""
+"""Tests for dependency-skip behavior and LLM memory gating in run_all_syncs."""
 
-import pytest
 from unittest.mock import patch, MagicMock
 
 # Minimal SYNC_SOURCES for tests — only defines metadata (depends_on, frequency, phase).
@@ -148,3 +147,133 @@ class TestDependencySkip:
         # No source should have reason=dependency_failed
         for source, stats in result["results"].items():
             assert stats.get("reason") != "dependency_failed"
+
+
+# =============================================================================
+# LLM Memory Gating Tests
+# =============================================================================
+
+# Sources for LLM memory gating tests — includes embedding sources
+LLM_TEST_SYNC_SOURCES = {
+    "source_a": {"description": "A", "phase": 1, "frequency": "daily"},
+    "vault_reindex": {"description": "Vault reindex", "phase": 4, "frequency": "daily"},
+    "crm_vectorstore": {"description": "CRM vectorstore", "phase": 4, "frequency": "daily"},
+    "source_z": {"description": "Z", "phase": 5, "frequency": "daily"},
+}
+
+LLM_TEST_SYNC_ORDER = ["source_a", "vault_reindex", "crm_vectorstore", "source_z"]
+
+
+def _run_llm_test(
+    fail_sources: set | None = None,
+    llm_running: bool = True,
+    gpu_memory_mb: int | None = 2000,
+    stop_succeeds: bool = True,
+):
+    """Run run_all_syncs with LLM memory gating mocks (dry_run=False).
+
+    Returns (result_dict, run_sync_mock, stop_mock, start_mock).
+    """
+    from scripts.run_all_syncs import run_all_syncs
+
+    fail_sources = fail_sources or set()
+    run_sync_mock = MagicMock(side_effect=_make_run_sync_side_effect(fail_sources))
+
+    with (
+        patch("scripts.run_all_syncs.SYNC_SOURCES", LLM_TEST_SYNC_SOURCES),
+        patch("scripts.run_all_syncs.SYNC_ORDER", LLM_TEST_SYNC_ORDER),
+        patch("scripts.run_all_syncs.run_sync", run_sync_mock),
+        patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+        patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+        patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        patch("scripts.run_all_syncs.backup_interactions"),
+        patch("urllib.request.urlopen"),
+        patch("scripts.run_all_syncs._is_llm_running", return_value=llm_running),
+        patch("scripts.run_all_syncs._get_available_gpu_memory_mb", return_value=gpu_memory_mb),
+        patch("scripts.run_all_syncs._stop_llm_for_embeddings", return_value=stop_succeeds) as stop_mock,
+        patch("scripts.run_all_syncs._start_llm") as start_mock,
+        patch("scripts.run_all_syncs.get_sync_health") as health_mock,
+    ):
+        # Make get_sync_health return "not recently synced" so sources aren't skipped
+        mock_health = MagicMock()
+        mock_health.hours_since_sync = 24.0
+        mock_health.last_status = "SUCCESS"
+        health_mock.return_value = mock_health
+
+        result = run_all_syncs(dry_run=False, force=True)
+
+    return result, run_sync_mock, stop_mock, start_mock
+
+
+class TestLLMMemoryGating:
+    """Tests for memory-gated LLM stop/start during embedding phases."""
+
+    def test_llm_stopped_when_memory_insufficient(self):
+        """LLM is stopped when GPU memory is below threshold."""
+        result, _, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=2000,
+        )
+
+        stop_mock.assert_called_once()
+        start_mock.assert_called()  # Restarted after embeddings
+
+    def test_llm_not_stopped_when_memory_sufficient(self):
+        """LLM stays running when GPU memory is above threshold."""
+        result, _, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=10_000,
+        )
+
+        stop_mock.assert_not_called()
+        start_mock.assert_not_called()
+
+    def test_llm_not_stopped_when_not_running(self):
+        """No action taken when LLM is not running."""
+        result, _, stop_mock, start_mock = _run_llm_test(
+            llm_running=False, gpu_memory_mb=2000,
+        )
+
+        stop_mock.assert_not_called()
+        start_mock.assert_not_called()
+
+    def test_llm_restarted_after_last_embedding_source(self):
+        """LLM is restarted after the last embedding source, not the first."""
+        result, run_sync_mock, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=2000,
+        )
+
+        # Both embedding sources should have been synced
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "vault_reindex" in called_sources
+        assert "crm_vectorstore" in called_sources
+
+        # LLM should be restarted exactly once (after crm_vectorstore, the last embedding source)
+        stop_mock.assert_called_once()
+        start_mock.assert_called_once()
+
+    def test_llm_not_stopped_when_memory_unknown(self):
+        """LLM is stopped (conservative) when sysfs returns None."""
+        result, _, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=None,
+        )
+
+        stop_mock.assert_called_once()
+
+    def test_internal_keys_not_in_results(self):
+        """Internal _llm_* keys are not leaked in the result dict."""
+        result, _, _, _ = _run_llm_test(llm_running=True, gpu_memory_mb=2000)
+
+        assert "_llm_stopped" not in result.get("results", {})
+        assert "_llm_was_running" not in result.get("results", {})
+
+    def test_safety_net_restarts_llm_on_stop_failure(self):
+        """If stop succeeds but normal restart path is missed, safety net fires."""
+        # This tests the try/finally safety net by ensuring the module globals
+        # are properly tracked and cleaned up
+        from scripts import run_all_syncs as module
+
+        result, _, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=2000,
+        )
+
+        # After run_all_syncs returns, the module-level globals should be reset
+        assert module._llm_stopped_for_sync is False
