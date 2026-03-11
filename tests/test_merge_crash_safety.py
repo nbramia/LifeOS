@@ -7,7 +7,6 @@ import json
 import sqlite3
 import uuid
 import pytest
-from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime, timezone
 
@@ -352,11 +351,14 @@ class TestCrmSingleTransaction:
                     0, 0, 0, 0, 0, 0)
         """, (str(uuid.uuid4()), norm_a, norm_b))
 
-        # Delete secondary
+        # Soft-delete secondary (keep row, mark hidden)
+        conn.execute(
+            "UPDATE person_entities SET hidden = 1, hidden_at = datetime('now'), hidden_reason = ? WHERE id = ?",
+            (f"merged_into:{primary_id}", secondary_id),
+        )
         conn.execute("DELETE FROM person_emails WHERE person_id = ?", (secondary_id,))
         conn.execute("DELETE FROM person_phones WHERE person_id = ?", (secondary_id,))
         conn.execute("DELETE FROM person_names WHERE person_id = ?", (secondary_id,))
-        conn.execute("DELETE FROM person_entities WHERE id = ?", (secondary_id,))
 
         conn.commit()
         conn.close()
@@ -379,10 +381,13 @@ class TestCrmSingleTransaction:
         assert conn.execute(
             "SELECT COUNT(*) FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
             (primary_id, primary_id)).fetchone()[0] == 1
-        # Secondary deleted
-        assert conn.execute(
-            "SELECT COUNT(*) FROM person_entities WHERE id = ?",
-            (secondary_id,)).fetchone()[0] == 0
+        # Secondary soft-deleted (row exists but hidden)
+        row = conn.execute(
+            "SELECT hidden, hidden_reason FROM person_entities WHERE id = ?",
+            (secondary_id,)).fetchone()
+        assert row is not None, "Secondary entity row should still exist"
+        assert row[0] == 1, "Secondary should be hidden"
+        assert f"merged_into:{primary_id}" in row[1]
         conn.close()
 
     def test_crm_transaction_rolls_back_on_error(self, db_paths):
@@ -595,11 +600,14 @@ class TestRecovery:
             (primary_id,)).fetchone()[0] == 1
         conn.close()
 
-        # Secondary deleted from CRM
+        # Secondary soft-deleted from CRM (row exists but hidden)
         conn = sqlite3.connect(crm_path)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM person_entities WHERE id = ?",
-            (secondary_id,)).fetchone()[0] == 0
+        row = conn.execute(
+            "SELECT hidden, hidden_reason FROM person_entities WHERE id = ?",
+            (secondary_id,)).fetchone()
+        assert row is not None, "Secondary entity row should still exist"
+        assert row[0] == 1, "Secondary should be hidden"
+        assert f"merged_into:{primary_id}" in row[1]
         # Primary still exists with merged emails
         row = conn.execute(
             "SELECT emails FROM person_entities WHERE id = ?",

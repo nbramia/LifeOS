@@ -367,12 +367,12 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             if secondary.notes.strip() != primary.notes.strip():
                 primary.notes = f"{primary.notes}\n\n---\n\n{secondary.notes}"
                 stats['notes_merged'] = 1
-                logger.info(f"   + Notes: concatenated from secondary")
+                logger.info("   + Notes: concatenated from secondary")
         else:
             # Only secondary has notes - use them
             primary.notes = secondary.notes
             stats['notes_merged'] = 1
-            logger.info(f"   + Notes: copied from secondary")
+            logger.info("   + Notes: copied from secondary")
 
     if dry_run:
         # Dry run: gather stats without modifying anything
@@ -429,7 +429,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         logger.info(f"5. {len(secondary_rels)} relationships to process")
         crm_conn.close()
 
-        logger.info(f"\n=== Merge Summary (DRY RUN) ===")
+        logger.info("\n=== Merge Summary (DRY RUN) ===")
         logger.info(f"Primary: {primary.canonical_name} ({canonical_primary_id})")
         logger.info(f"Secondary: {secondary.canonical_name} ({canonical_secondary_id})")
         logger.info(f"Interactions: {stats['interactions_updated']}")
@@ -488,7 +488,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         int_conn.commit()
         logger.info(f"   Total: {total_count} interactions updated")
     else:
-        logger.info(f"   No interactions to update")
+        logger.info("   No interactions to update")
     int_conn.close()
     update_merge_phase("interactions_done")
 
@@ -551,7 +551,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 # Self-loop — delete
                 crm_conn.execute("DELETE FROM relationships WHERE id = ?", (rel['id'],))
                 stats['relationships_deleted'] += 1
-                logger.info(f"   - Deleted self-loop relationship")
+                logger.info("   - Deleted self-loop relationship")
                 continue
 
             # Normalize IDs for the primary-other pair
@@ -665,11 +665,15 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                     "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
                     (alias.lower(), canonical_primary_id))
 
-        # 4f. Delete secondary person entity + lookup tables
+        # 4f. Soft-delete secondary person entity, remove lookup tables
+        now_iso = datetime.now(timezone.utc).isoformat()
+        crm_conn.execute(
+            "UPDATE person_entities SET hidden = 1, hidden_at = ?, hidden_reason = ? WHERE id = ?",
+            (now_iso, f"merged_into:{canonical_primary_id}", canonical_secondary_id),
+        )
         crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_secondary_id,))
         crm_conn.execute("DELETE FROM person_phones WHERE person_id = ?", (canonical_secondary_id,))
         crm_conn.execute("DELETE FROM person_names WHERE person_id = ?", (canonical_secondary_id,))
-        crm_conn.execute("DELETE FROM person_entities WHERE id = ?", (canonical_secondary_id,))
 
         crm_conn.commit()
         logger.info("   CRM transaction committed")
@@ -680,7 +684,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     crm_conn.close()
     update_merge_phase("crm_done")
 
-    logger.info(f"   Deleted secondary record: {secondary.canonical_name}")
+    logger.info(f"   Soft-deleted secondary record: {secondary.canonical_name}")
 
     # Step 5: Post-merge cleanup (stats refresh + relationship strength)
     logger.info("\n6. Post-merge cleanup...")
@@ -703,7 +707,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     logger.info("   Intent log cleared")
 
     # Summary
-    logger.info(f"\n=== Merge Summary ===")
+    logger.info("\n=== Merge Summary ===")
     logger.info(f"Primary: {primary.canonical_name} ({canonical_primary_id})")
     logger.info(f"Secondary: {secondary.canonical_name} ({canonical_secondary_id})")
     logger.info(f"Interactions updated: {stats['interactions_updated']}")
