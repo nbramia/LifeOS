@@ -1,7 +1,8 @@
 """
 Tests for the Telegram service.
 
-Tests message sending, splitting, markdown cleaning, and bot listener.
+Tests message sending, splitting, markdown cleaning, bot listener,
+update offset persistence, and message deduplication.
 """
 import json
 import pytest
@@ -164,3 +165,146 @@ class TestChatViaApi:
             result = await chat_via_api("test question")
             assert result["answer"] == "Hello world"
             assert result["conversation_id"] == "conv-123"
+
+
+# =============================================================================
+# Update Offset Persistence Tests
+# =============================================================================
+
+
+class TestUpdateOffsetPersistence:
+    """Tests for persisting _last_update_id across restarts."""
+
+    def test_load_from_state_file(self, tmp_path):
+        """Loads persisted update_id from state file on init."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+        state_file.write_text(json.dumps({"last_update_id": 42}))
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            assert listener._last_update_id == 42
+
+    def test_default_zero_when_no_file(self, tmp_path):
+        """Defaults to 0 when state file doesn't exist."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "nonexistent.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            assert listener._last_update_id == 0
+
+    def test_default_zero_on_corrupt_file(self, tmp_path):
+        """Defaults to 0 when state file is corrupt."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+        state_file.write_text("not valid json{{{")
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            assert listener._last_update_id == 0
+
+    def test_save_persists_to_file(self, tmp_path):
+        """_save_last_update_id writes to state file."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            listener._last_update_id = 99
+            listener._save_last_update_id()
+
+        data = json.loads(state_file.read_text())
+        assert data["last_update_id"] == 99
+
+    def test_save_creates_parent_directories(self, tmp_path):
+        """_save_last_update_id creates missing parent dirs."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "subdir" / "telegram_state.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            listener._last_update_id = 50
+            listener._save_last_update_id()
+
+        assert state_file.exists()
+        data = json.loads(state_file.read_text())
+        assert data["last_update_id"] == 50
+
+    def test_roundtrip_persistence(self, tmp_path):
+        """Update ID survives save → new instance → load cycle."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            # First instance saves
+            listener1 = TelegramBotListener()
+            listener1._last_update_id = 12345
+            listener1._save_last_update_id()
+
+            # Second instance loads
+            listener2 = TelegramBotListener()
+            assert listener2._last_update_id == 12345
+
+
+# =============================================================================
+# Message Deduplication Tests
+# =============================================================================
+
+
+class TestMessageDedup:
+    """Tests for message-level deduplication safety net."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_message_skipped(self, tmp_path):
+        """Same message_id is not processed twice."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+
+        # First call — should process (but we mock the rest to avoid side effects)
+        update = {"message": {"message_id": 1, "text": "hi", "chat": {"id": "123"}}}
+        with patch.object(listener, "_check_agent_approval", return_value=False), \
+             patch.object(listener, "_check_agent_clarification", return_value=False), \
+             patch.object(listener, "_check_code_followup", return_value=False), \
+             patch("api.services.telegram.settings") as mock_settings, \
+             patch("api.services.telegram.send_typing_indicator"), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat, \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            mock_settings.telegram_chat_id = "123"
+            mock_chat.return_value = {"answer": "response", "conversation_id": "c1", "code_intent": False}
+
+            await listener._handle_update(update)
+            assert mock_chat.call_count == 1
+
+            # Second call with same message_id — should be skipped
+            await listener._handle_update(update)
+            assert mock_chat.call_count == 1  # Not called again
+
+    def test_dedup_window_rolls(self, tmp_path):
+        """Dedup window evicts oldest entries when full."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+
+        # Fill the dedup window
+        for i in range(TelegramBotListener._DEDUP_WINDOW):
+            listener._processed_ids.append(i)
+
+        assert 0 in listener._processed_ids
+        # Add one more — oldest (0) should be evicted
+        listener._processed_ids.append(TelegramBotListener._DEDUP_WINDOW)
+        assert 0 not in listener._processed_ids
+        assert TelegramBotListener._DEDUP_WINDOW in listener._processed_ids
