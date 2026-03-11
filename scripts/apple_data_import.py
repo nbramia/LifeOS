@@ -41,8 +41,17 @@ logger = logging.getLogger(__name__)
 IMPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 
+STALENESS_WARNING_HOURS = 48
+STALENESS_CRITICAL_HOURS = 168  # 7 days
+
+
 def check_manifest() -> dict | None:
-    """Check the import manifest for freshness."""
+    """Check the import manifest for freshness.
+
+    Logs warnings/errors based on data age:
+    - >48h: WARNING (picked up by nightly health batch)
+    - >7d:  CRITICAL-level log (triggers immediate alert if server is running)
+    """
     manifest_path = IMPORT_DIR / "manifest.json"
     if not manifest_path.exists():
         logger.warning("No manifest.json found in apple-imports/")
@@ -51,8 +60,30 @@ def check_manifest() -> dict | None:
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    exported_at = manifest.get("exported_at", "")
-    logger.info(f"Import data exported at: {exported_at} from {manifest.get('hostname', 'unknown')}")
+    exported_at_str = manifest.get("exported_at", "")
+    logger.info(f"Import data exported at: {exported_at_str} from {manifest.get('hostname', 'unknown')}")
+
+    if exported_at_str:
+        try:
+            exported_at = datetime.fromisoformat(exported_at_str)
+            age = datetime.now(timezone.utc) - exported_at
+            age_hours = age.total_seconds() / 3600
+
+            if age_hours > STALENESS_CRITICAL_HOURS:
+                logger.critical(
+                    f"Apple import data is {age.days} days old (exported {exported_at_str}). "
+                    f"Check Mac Mini cron and rsync pipeline."
+                )
+            elif age_hours > STALENESS_WARNING_HOURS:
+                logger.warning(
+                    f"Apple import data is {age_hours:.0f}h old (exported {exported_at_str}). "
+                    f"Expected refresh within {STALENESS_WARNING_HOURS}h."
+                )
+            else:
+                logger.info(f"Apple import data is {age_hours:.0f}h old — fresh")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Cannot parse manifest exported_at: {e}")
+
     return manifest
 
 

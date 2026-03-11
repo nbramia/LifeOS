@@ -24,6 +24,7 @@ import logging
 import argparse
 import uuid
 import sqlite3
+import plistlib
 import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -44,45 +45,112 @@ logger = logging.getLogger(__name__)
 EXPORT_DIR = PROJECT_ROOT / "data" / "apple-exports"
 
 
+def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:
+    """Parse an AddressBook labeled-value dict (Email, Phone, etc.) into [{label, value}]."""
+    if not field_dict or not isinstance(field_dict, dict):
+        return []
+    values = field_dict.get("values", [])
+    labels = field_dict.get("labels", [])
+    result = []
+    for i, val in enumerate(values):
+        if not val:
+            continue
+        label = labels[i] if i < len(labels) else ""
+        # Strip Apple label markers: _$!<Mobile>!$_ → Mobile
+        if label.startswith("_$!<") and label.endswith(">!$_"):
+            label = label[4:-4]
+        result.append({"label": label or "other", "value": str(val)})
+    return result
+
+
+def _parse_abcdp_contact(plist_data: dict, identifier: str) -> dict | None:
+    """Parse a single .abcdp plist into the contacts.json format."""
+    first = plist_data.get("First", "")
+    last = plist_data.get("Last", "")
+    organization = plist_data.get("Organization", "")
+
+    # Skip contacts with no useful name
+    if not first and not last and not organization:
+        return None
+
+    full_name = " ".join(p for p in [first, last] if p)
+    if not full_name:
+        full_name = organization
+
+    emails = _parse_abcdp_labeled(plist_data.get("Email"))
+    phones = _parse_abcdp_labeled(plist_data.get("Phone"))
+
+    birthday = None
+    bd = plist_data.get("Birthday")
+    if isinstance(bd, datetime):
+        birthday = bd.isoformat()
+
+    return {
+        "identifier": identifier,
+        "given_name": first,
+        "family_name": last,
+        "full_name": full_name,
+        "nickname": plist_data.get("Nickname", ""),
+        "organization": organization,
+        "job_title": plist_data.get("JobTitle", ""),
+        "department": plist_data.get("Department", ""),
+        "emails": emails,
+        "phones": phones,
+        "addresses": [],  # Postal addresses have complex plist structure; omit for now
+        "social_profiles": [],
+        "note": "",  # Notes may contain sensitive data; omit from export
+        "image_available": False,
+        "birthday": birthday,
+    }
+
+
 def export_contacts(dry_run: bool = False) -> dict:
-    """Export Apple Contacts to JSON."""
-    try:
-        from api.services.apple_contacts import get_contacts_reader
-    except ImportError:
-        logger.warning("pyobjc not available — skipping contacts export")
-        return {"status": "skipped", "reason": "pyobjc not available"}
+    """Export Apple Contacts by reading .abcdp plist files directly.
 
-    reader = get_contacts_reader()
-    if reader is None:
-        logger.warning("Contacts reader not available — skipping")
-        return {"status": "skipped", "reason": "Contacts framework not available"}
+    Reads from ~/Library/Application Support/AddressBook/Sources/*/Metadata/
+    which requires Full Disk Access but NOT the Contacts TCC permission.
+    This works over SSH and in cron — no per-app Contacts grant needed.
+    """
+    addressbook_dir = Path.home() / "Library" / "Application Support" / "AddressBook"
+    if not addressbook_dir.exists():
+        logger.warning(f"AddressBook directory not found: {addressbook_dir}")
+        return {"status": "skipped", "reason": "AddressBook not found"}
 
-    contacts = reader.get_all_contacts()
-    logger.info(f"Found {len(contacts)} contacts")
+    # Glob all .abcdp person files across all sources
+    abcdp_files = list(addressbook_dir.glob("Sources/*/Metadata/*:ABPerson.abcdp"))
+    logger.info(f"Found {len(abcdp_files)} .abcdp contact files")
+
+    if not abcdp_files:
+        return {"status": "ok", "count": 0, "path": ""}
 
     if dry_run:
-        return {"status": "dry_run", "count": len(contacts)}
+        return {"status": "dry_run", "count": len(abcdp_files)}
 
-    # Serialize contacts to JSON
+    # Parse each file; deduplicate by identifier (UUID from filename)
+    seen_ids: set[str] = set()
     export = []
-    for c in contacts:
-        export.append({
-            "identifier": c.identifier,
-            "given_name": c.given_name,
-            "family_name": c.family_name,
-            "full_name": c.full_name,
-            "nickname": c.nickname,
-            "organization": c.organization,
-            "job_title": c.job_title,
-            "department": c.department,
-            "emails": c.emails,
-            "phones": c.phones,
-            "addresses": c.addresses,
-            "social_profiles": c.social_profiles,
-            "note": c.note,
-            "image_available": c.image_available,
-            "birthday": c.birthday.isoformat() if c.birthday else None,
-        })
+    errors = 0
+    for path in abcdp_files:
+        try:
+            # Filename format: <UUID>:ABPerson.abcdp
+            identifier = path.name.split(":")[0]
+            if identifier in seen_ids:
+                continue
+            seen_ids.add(identifier)
+
+            with open(path, "rb") as f:
+                plist_data = plistlib.load(f)
+
+            contact = _parse_abcdp_contact(plist_data, identifier)
+            if contact:
+                export.append(contact)
+        except Exception as e:
+            errors += 1
+            if errors <= 5:
+                logger.warning(f"Error parsing {path.name}: {e}")
+
+    if errors:
+        logger.warning(f"Skipped {errors} contacts due to parse errors")
 
     out_path = EXPORT_DIR / "contacts.json"
     with open(out_path, "w") as f:
