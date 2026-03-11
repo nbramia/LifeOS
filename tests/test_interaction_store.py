@@ -10,7 +10,6 @@ from pathlib import Path
 from api.services.interaction_store import (
     Interaction,
     InteractionStore,
-    get_interaction_store,
     build_obsidian_link,
     build_gmail_link,
     build_calendar_link,
@@ -701,3 +700,271 @@ class TestTimezoneHandling:
         interaction = Interaction.from_row(row)
         assert interaction.timestamp.tzinfo is not None
         assert interaction.created_at.tzinfo is not None
+
+
+# =============================================================================
+# Batch Operations Tests
+# =============================================================================
+
+
+class TestBatchAdd:
+    """Tests for batch_add() transaction boundaries."""
+
+    @pytest.fixture
+    def temp_store(self):
+        """Create a temporary store for testing."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def _make_interaction(self, source_type="gmail", source_id=None, person_id="person-1"):
+        return Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type=source_type,
+            title=f"Test {source_type}",
+            source_id=source_id or str(uuid.uuid4()),
+        )
+
+    def test_batch_add_inserts_all(self, temp_store):
+        """batch_add inserts N interactions in a single commit."""
+        interactions = [self._make_interaction() for _ in range(50)]
+
+        result = temp_store.batch_add(interactions)
+
+        assert result["added"] == 50
+        assert result["skipped"] == 0
+        assert temp_store.count() == 50
+
+    def test_batch_add_deduplicates(self, temp_store):
+        """batch_add skips duplicates via UNIQUE constraint."""
+        shared_source_id = "dup-source-123"
+        i1 = self._make_interaction(source_id=shared_source_id)
+        i2 = self._make_interaction(source_id=shared_source_id)
+
+        result = temp_store.batch_add([i1, i2])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert temp_store.count() == 1
+
+    def test_batch_add_skips_existing(self, temp_store):
+        """batch_add skips interactions already in the database."""
+        existing = self._make_interaction(source_id="existing-1")
+        temp_store.add(existing)
+        assert temp_store.count() == 1
+
+        new = self._make_interaction(source_id="new-1")
+        dup = self._make_interaction(source_id="existing-1")
+
+        result = temp_store.batch_add([new, dup])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert temp_store.count() == 2
+
+    def test_batch_add_empty_list(self, temp_store):
+        """batch_add with empty list returns zeros."""
+        result = temp_store.batch_add([])
+
+        assert result["added"] == 0
+        assert result["skipped"] == 0
+        assert result["affected_person_ids"] == set()
+
+    def test_batch_add_returns_affected_person_ids(self, temp_store):
+        """batch_add returns the set of canonical person IDs touched."""
+        i1 = self._make_interaction(person_id="person-A")
+        i2 = self._make_interaction(person_id="person-B")
+        i3 = self._make_interaction(person_id="person-A")
+
+        result = temp_store.batch_add([i1, i2, i3])
+
+        assert result["affected_person_ids"] == {"person-A", "person-B"}
+
+    def test_batch_add_atomicity(self, temp_store):
+        """Crash mid-batch results in zero inserts (rollback)."""
+        import sqlite3
+
+        interactions = [self._make_interaction() for _ in range(5)]
+
+        # Corrupt the 3rd row to trigger an error mid-transaction
+        # by closing the connection prematurely via monkey-patching
+        original_get = temp_store._get_connection
+
+        class FailingConnection:
+            """Wraps a real connection but fails on executemany."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated crash")
+
+            def rollback(self):
+                self._conn.rollback()
+
+            def close(self):
+                self._conn.close()
+
+        def failing_connection():
+            return FailingConnection(original_get())
+
+        temp_store._get_connection = failing_connection
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated crash"):
+            temp_store.batch_add(interactions)
+
+        # Restore normal connection and verify nothing was committed
+        temp_store._get_connection = original_get
+        assert temp_store.count() == 0
+
+    def test_batch_add_skips_temp_artifacts(self, temp_store):
+        """batch_add filters out interactions with temp-dir source_ids."""
+        normal = self._make_interaction(source_id="real-source")
+        temp = self._make_interaction(source_id="/tmp/pytest-abc/file.txt")
+
+        result = temp_store.batch_add([normal, temp])
+
+        assert result["added"] == 1
+        assert temp_store.count() == 1
+
+
+class TestAtomicReplace:
+    """Tests for atomic_replace() transaction boundaries."""
+
+    @pytest.fixture
+    def temp_store(self):
+        """Create a temporary store for testing."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def _make_interaction(self, source_type="vault", source_id=None, person_id="person-1"):
+        return Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type=source_type,
+            title=f"Test {source_type}",
+            source_id=source_id or str(uuid.uuid4()),
+        )
+
+    def test_atomic_replace_deletes_and_inserts(self, temp_store):
+        """atomic_replace removes old and adds new in one transaction."""
+        # Add some initial vault interactions
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+        assert temp_store.count() == 3
+
+        # Replace with 5 new ones
+        new = [self._make_interaction(source_type="vault") for _ in range(5)]
+        result = temp_store.atomic_replace("vault", new)
+
+        assert result["deleted"] == 3
+        assert result["added"] == 5
+        assert temp_store.count() == 5
+
+    def test_atomic_replace_only_affects_target_source_type(self, temp_store):
+        """atomic_replace only deletes interactions of the specified source_type."""
+        gmail = [self._make_interaction(source_type="gmail") for _ in range(3)]
+        vault = [self._make_interaction(source_type="vault") for _ in range(2)]
+        temp_store.batch_add(gmail + vault)
+        assert temp_store.count() == 5
+
+        new_vault = [self._make_interaction(source_type="vault")]
+        result = temp_store.atomic_replace("vault", new_vault)
+
+        assert result["deleted"] == 2
+        assert result["added"] == 1
+        assert temp_store.count() == 4  # 3 gmail + 1 new vault
+
+    def test_atomic_replace_with_empty_list(self, temp_store):
+        """atomic_replace with empty list just deletes existing."""
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+
+        result = temp_store.atomic_replace("vault", [])
+
+        assert result["deleted"] == 3
+        assert result["added"] == 0
+        assert temp_store.count() == 0
+
+    def test_atomic_replace_returns_affected_person_ids(self, temp_store):
+        """atomic_replace returns person IDs from both deleted and inserted."""
+        old = self._make_interaction(source_type="vault", person_id="old-person")
+        temp_store.batch_add([old])
+
+        new = self._make_interaction(source_type="vault", person_id="new-person")
+        result = temp_store.atomic_replace("vault", [new])
+
+        assert "old-person" in result["affected_person_ids"]
+        assert "new-person" in result["affected_person_ids"]
+
+    def test_atomic_replace_rollback_on_failure(self, temp_store):
+        """If insert fails, delete is also rolled back."""
+        import sqlite3
+
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+        assert temp_store.count() == 3
+
+        new = [self._make_interaction(source_type="vault") for _ in range(2)]
+
+        original_get = temp_store._get_connection
+
+        class FailOnExecutemany:
+            def __init__(self, conn):
+                self._conn = conn
+                self._exec_count = 0
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def execute(self, *args, **kwargs):
+                return self._conn.execute(*args, **kwargs)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated crash during insert")
+
+            def rollback(self):
+                self._conn.rollback()
+
+            def close(self):
+                self._conn.close()
+
+        def failing_connection():
+            return FailOnExecutemany(original_get())
+
+        temp_store._get_connection = failing_connection
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated crash"):
+            temp_store.atomic_replace("vault", new)
+
+        # Restore and verify: original data should be intact (rollback)
+        temp_store._get_connection = original_get
+        assert temp_store.count() == 3
+
+    def test_atomic_replace_on_empty_source_type(self, temp_store):
+        """atomic_replace on a source_type with no existing data just inserts."""
+        new = [self._make_interaction(source_type="vault") for _ in range(3)]
+        result = temp_store.atomic_replace("vault", new)
+
+        assert result["deleted"] == 0
+        assert result["added"] == 3
+        assert temp_store.count() == 3
+
+    def test_atomic_replace_rejects_mismatched_source_type(self, temp_store):
+        """atomic_replace raises ValueError if interactions have wrong source_type."""
+        mixed = [
+            self._make_interaction(source_type="vault"),
+            self._make_interaction(source_type="gmail"),  # Mismatch
+        ]
+
+        with pytest.raises(ValueError, match="mismatched source_type"):
+            temp_store.atomic_replace("vault", mixed)

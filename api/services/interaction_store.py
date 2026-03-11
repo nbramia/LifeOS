@@ -5,7 +5,6 @@ Stores lightweight interaction records with links to sources.
 Each interaction represents a single touchpoint (email, meeting, note mention).
 """
 import sqlite3
-import json
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -384,6 +383,171 @@ class InteractionStore:
                 return existing, False
 
         return self.add(interaction), True
+
+    def _prepare_rows(
+        self, interactions: list[Interaction]
+    ) -> tuple[list[tuple], set[str]]:
+        """
+        Resolve merge chains, filter temp artifacts, and build INSERT tuples.
+
+        Returns:
+            (rows, affected_person_ids) — rows ready for executemany,
+            and the set of canonical person IDs touched.
+        """
+        from api.services.person_entity import get_person_entity_store
+        person_store = get_person_entity_store()
+
+        rows = []
+        affected_person_ids: set[str] = set()
+        for interaction in interactions:
+            if interaction.source_id and any(
+                interaction.source_id.startswith(p) for p in TEMP_PREFIXES
+            ):
+                continue
+
+            resolved_id = person_store.get_canonical_id(interaction.person_id)
+            if self._strict and person_store.get_by_id(resolved_id) is None:
+                raise ValueError(
+                    f"Cannot add interaction: person_id '{resolved_id}' does not exist"
+                )
+
+            rows.append((
+                interaction.id,
+                resolved_id,
+                interaction.timestamp.isoformat(),
+                interaction.source_type,
+                interaction.title,
+                interaction.snippet,
+                interaction.source_link,
+                interaction.source_id,
+                interaction.created_at.isoformat(),
+            ))
+            affected_person_ids.add(resolved_id)
+
+        return rows, affected_person_ids
+
+    def batch_add(self, interactions: list[Interaction]) -> dict:
+        """
+        Add multiple interactions in a single transaction.
+
+        Uses INSERT OR IGNORE for natural deduplication via the UNIQUE
+        constraint on (source_type, source_id). Resolves merge chains
+        before inserting.
+
+        Args:
+            interactions: List of Interaction objects to add.
+
+        Returns:
+            Dict with 'added' (int), 'skipped' (int),
+            and 'affected_person_ids' (set of canonical person IDs).
+            Caller should call refresh_person_stats() with affected_person_ids.
+        """
+        if not interactions:
+            return {"added": 0, "skipped": 0, "affected_person_ids": set()}
+
+        rows, affected_person_ids = self._prepare_rows(interactions)
+
+        if not rows:
+            return {"added": 0, "skipped": 0, "affected_person_ids": set()}
+
+        conn = self._get_connection()
+        try:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT INTO interactions
+                (id, person_id, timestamp, source_type, title, snippet,
+                 source_link, source_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type, source_id) DO NOTHING
+                """,
+                rows,
+            )
+            added = conn.total_changes - before
+            conn.commit()
+            return {
+                "added": added,
+                "skipped": len(rows) - added,
+                "affected_person_ids": affected_person_ids,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def atomic_replace(self, source_type: str, interactions: list[Interaction]) -> dict:
+        """
+        Replace all interactions for a source_type in a single transaction.
+
+        Deletes all existing interactions of the given source_type, then
+        inserts the new ones. If the insert fails, the delete is also
+        rolled back — no partial state.
+
+        Args:
+            source_type: The source type to replace (e.g., "vault", "granola").
+            interactions: Complete set of interactions for this source type.
+                All interactions must have source_type matching the parameter.
+
+        Returns:
+            Dict with 'deleted' (int), 'added' (int),
+            and 'affected_person_ids' (set of canonical person IDs).
+            Caller should call refresh_person_stats() with affected_person_ids.
+
+        Raises:
+            ValueError: If any interaction has a mismatched source_type.
+        """
+        mismatched = [i for i in interactions if i.source_type != source_type]
+        if mismatched:
+            raise ValueError(
+                f"atomic_replace('{source_type}') received {len(mismatched)} "
+                f"interactions with mismatched source_type"
+            )
+
+        rows, affected_person_ids = self._prepare_rows(interactions)
+
+        conn = self._get_connection()
+        try:
+            # Collect person_ids being deleted so their stats get refreshed too
+            cursor = conn.execute(
+                "SELECT DISTINCT person_id FROM interactions WHERE source_type = ?",
+                (source_type,),
+            )
+            for row in cursor:
+                affected_person_ids.add(row[0])
+
+            delete_cursor = conn.execute(
+                "DELETE FROM interactions WHERE source_type = ?",
+                (source_type,),
+            )
+            deleted = delete_cursor.rowcount
+
+            added = 0
+            if rows:
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    INSERT INTO interactions
+                    (id, person_id, timestamp, source_type, title, snippet,
+                     source_link, source_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_type, source_id) DO NOTHING
+                    """,
+                    rows,
+                )
+                added = conn.total_changes - before
+
+            conn.commit()
+            return {
+                "deleted": deleted,
+                "added": added,
+                "affected_person_ids": affected_person_ids,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_by_id(self, interaction_id: str) -> Optional[Interaction]:
         """Get interaction by ID."""
