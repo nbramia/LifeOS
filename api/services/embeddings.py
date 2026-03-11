@@ -42,12 +42,15 @@ class EmbeddingService:
 
     @property
     def model(self) -> "SentenceTransformer":
-        """Lazy-load the model."""
+        """Lazy-load the model, falling back to CPU if GPU fails."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+            import logging
+
+            logger = logging.getLogger(__name__)
 
             try:
-                # Load model with cache directory
+                # Load model with cache directory (defaults to GPU if available)
                 self._model = SentenceTransformer(
                     self.model_name,
                     cache_folder=self.cache_dir,
@@ -55,8 +58,30 @@ class EmbeddingService:
                 # Mark embedding model as healthy
                 from api.services.service_health import mark_service_healthy
                 mark_service_healthy("embedding_model")
+            except RuntimeError as e:
+                # GPU errors (HIP OOM, GPU hang, invalid device) — fall back to CPU
+                error_msg = str(e).lower()
+                gpu_errors = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
+                if any(keyword in error_msg for keyword in gpu_errors):
+                    logger.warning(f"GPU embedding failed ({e}), falling back to CPU")
+                    try:
+                        self._model = SentenceTransformer(
+                            self.model_name,
+                            cache_folder=self.cache_dir,
+                            device="cpu",
+                        )
+                        from api.services.service_health import mark_service_healthy
+                        mark_service_healthy("embedding_model")
+                    except Exception as cpu_err:
+                        from api.services.service_health import mark_service_failed, Severity
+                        mark_service_failed("embedding_model", f"CPU fallback also failed: {cpu_err}", Severity.CRITICAL)
+                        raise
+                else:
+                    from api.services.service_health import mark_service_failed, Severity
+                    mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
+                    raise
             except Exception as e:
-                # Mark embedding model as failed (critical)
+                # Non-GPU errors — no fallback
                 from api.services.service_health import mark_service_failed, Severity
                 mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
                 raise
