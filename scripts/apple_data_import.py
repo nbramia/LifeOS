@@ -18,6 +18,7 @@ Import source: data/apple-imports/
 """
 import sys
 import json
+import re
 import shutil
 import logging
 import argparse
@@ -213,6 +214,15 @@ def import_imessage(dry_run: bool = False) -> dict:
     return {"status": "ok", "size_mb": round(size_mb, 1)}
 
 
+_PHONE_RE = re.compile(r"\+\d{10,15}")
+
+
+def _extract_phone_from_title(title: str) -> str | None:
+    """Extract E.164 phone number from a call title string."""
+    m = _PHONE_RE.search(title)
+    return m.group(0) if m else None
+
+
 def import_phone_calls(dry_run: bool = False) -> dict:
     """Import phone call history from JSON export."""
     calls_path = IMPORT_DIR / "phone_calls.json"
@@ -229,10 +239,13 @@ def import_phone_calls(dry_run: bool = False) -> dict:
         return {"status": "dry_run", "count": len(calls)}
 
     from api.services.interaction_store import get_interaction_store, Interaction
+    from api.services.entity_resolver import get_entity_resolver
 
     store = get_interaction_store()
+    resolver = get_entity_resolver()
     imported = 0
     skipped = 0
+    unresolved = 0
 
     for call in calls:
         source_id = call.get("source_id", "")
@@ -256,12 +269,21 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
+        # Resolve phone number to a PersonEntity
+        title = call.get("title", "")
+        phone = _extract_phone_from_title(title)
+        person = resolver.resolve_by_phone(phone) if phone else None
+
+        if not person:
+            unresolved += 1
+            continue
+
         interaction = Interaction(
             id=call.get("id") or str(uuid.uuid4()),
-            person_id=call.get("person_id", ""),
+            person_id=person.id,
             timestamp=timestamp,
             source_type=source_type,
-            title=call.get("title", ""),
+            title=title,
             snippet=call.get("snippet"),
             source_link=call.get("source_link", ""),
             source_id=source_id,
@@ -269,8 +291,11 @@ def import_phone_calls(dry_run: bool = False) -> dict:
         store.add_if_not_exists(interaction)
         imported += 1
 
-    logger.info(f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid)")
-    return {"status": "ok", "imported": imported, "skipped": skipped}
+    logger.info(
+        f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid), "
+        f"{unresolved} unresolved (no matching person)"
+    )
+    return {"status": "ok", "imported": imported, "skipped": skipped, "unresolved": unresolved}
 
 
 def main():

@@ -1,4 +1,4 @@
-"""Tests for Apple data pipeline: contacts plist parsing, staleness alerting."""
+"""Tests for Apple data pipeline: contacts plist parsing, phone import, staleness alerting."""
 import json
 import logging
 import plistlib
@@ -330,3 +330,139 @@ class TestStalenessAlerting:
         assert result is not None
         assert "fresh" in caplog.text.lower()
         assert not any("Cannot parse" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Phone import — phone number extraction and person resolution
+# ---------------------------------------------------------------------------
+
+class TestPhoneNumberExtraction:
+    """Test _extract_phone_from_title from apple_data_import."""
+
+    def _get_extract(self):
+        from scripts.apple_data_import import _extract_phone_from_title
+        return _extract_phone_from_title
+
+    def test_incoming_with_duration(self):
+        extract = self._get_extract()
+        assert extract("Incoming Phone with +15712824226 (23s)") == "+15712824226"
+
+    def test_missed_call(self):
+        extract = self._get_extract()
+        assert extract("Incoming Phone (missed) - +18882346268") == "+18882346268"
+
+    def test_outgoing_call(self):
+        extract = self._get_extract()
+        assert extract("Outgoing Phone with +14155551234 (120s)") == "+14155551234"
+
+    def test_no_phone_number(self):
+        extract = self._get_extract()
+        assert extract("Incoming Phone (missed)") is None
+
+    def test_empty_title(self):
+        extract = self._get_extract()
+        assert extract("") is None
+
+
+class TestPhoneImport:
+    """Test import_phone_calls with person resolution."""
+
+    def _write_calls(self, import_dir: Path, calls: list[dict]):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        with open(import_dir / "phone_calls.json", "w") as f:
+            json.dump({"calls": calls, "exported_at": "2026-01-01T00:00:00+00:00"}, f)
+
+    def test_resolved_call_imported(self, tmp_path):
+        """Call with a phone number matching a known person should be imported."""
+        from scripts.apple_data_import import import_phone_calls
+        from unittest.mock import MagicMock
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_calls(import_dir, [{
+            "id": "call-1",
+            "source_id": "SRC-1",
+            "source_type": "phone",
+            "person_id": "",
+            "timestamp": "2026-01-15T10:00:00+00:00",
+            "title": "Incoming Phone with +15551234567 (30s)",
+        }])
+
+        mock_person = MagicMock()
+        mock_person.id = "person-abc"
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve_by_phone.return_value = mock_person
+
+        mock_store = MagicMock()
+        mock_store.get_by_source.return_value = None
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+             patch("api.services.interaction_store.get_interaction_store", return_value=mock_store), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver):
+            result = import_phone_calls(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["imported"] == 1
+        assert result["unresolved"] == 0
+        mock_resolver.resolve_by_phone.assert_called_once_with("+15551234567")
+        # Verify person_id was set on the Interaction
+        added = mock_store.add_if_not_exists.call_args[0][0]
+        assert added.person_id == "person-abc"
+
+    def test_unresolved_call_skipped(self, tmp_path):
+        """Call with no matching person should be skipped."""
+        from scripts.apple_data_import import import_phone_calls
+        from unittest.mock import MagicMock
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_calls(import_dir, [{
+            "id": "call-2",
+            "source_id": "SRC-2",
+            "source_type": "phone",
+            "person_id": "",
+            "timestamp": "2026-01-15T10:00:00+00:00",
+            "title": "Incoming Phone (missed) - +18005551234",
+        }])
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve_by_phone.return_value = None
+
+        mock_store = MagicMock()
+        mock_store.get_by_source.return_value = None
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+             patch("api.services.interaction_store.get_interaction_store", return_value=mock_store), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver):
+            result = import_phone_calls(dry_run=False)
+
+        assert result["imported"] == 0
+        assert result["unresolved"] == 1
+        mock_store.add_if_not_exists.assert_not_called()
+
+    def test_no_phone_in_title_skipped(self, tmp_path):
+        """Call with no extractable phone number should be skipped."""
+        from scripts.apple_data_import import import_phone_calls
+        from unittest.mock import MagicMock
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_calls(import_dir, [{
+            "id": "call-3",
+            "source_id": "SRC-3",
+            "source_type": "phone",
+            "person_id": "",
+            "timestamp": "2026-01-15T10:00:00+00:00",
+            "title": "Incoming Phone (missed)",
+        }])
+
+        mock_store = MagicMock()
+        mock_store.get_by_source.return_value = None
+        mock_resolver = MagicMock()
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+             patch("api.services.interaction_store.get_interaction_store", return_value=mock_store), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver):
+            result = import_phone_calls(dry_run=False)
+
+        assert result["imported"] == 0
+        assert result["unresolved"] == 1
+        mock_resolver.resolve_by_phone.assert_not_called()
