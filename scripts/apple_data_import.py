@@ -66,6 +66,8 @@ def check_manifest() -> dict | None:
     if exported_at_str:
         try:
             exported_at = datetime.fromisoformat(exported_at_str)
+            if exported_at.tzinfo is None:
+                exported_at = exported_at.replace(tzinfo=timezone.utc)
             age = datetime.now(timezone.utc) - exported_at
             age_hours = age.total_seconds() / 3600
 

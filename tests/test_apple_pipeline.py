@@ -1,5 +1,6 @@
-"""Tests for Apple data pipeline: contacts plist parsing, photos import, staleness alerting."""
+"""Tests for Apple data pipeline: contacts plist parsing, staleness alerting."""
 import json
+import logging
 import plistlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -59,6 +60,36 @@ class TestContactsPlistParsing:
         field = {"values": ["test@test.com"], "labels": [""]}
         result = parse_labeled(field)
         assert result[0]["label"] == "other"
+
+    def test_parse_labeled_fewer_labels_than_values(self):
+        parse_labeled, _ = self._get_parse_funcs()
+        field = {"values": ["a@b.com", "c@d.com"], "labels": ["_$!<Home>!$_"]}
+        result = parse_labeled(field)
+        assert len(result) == 2
+        assert result[0]["label"] == "Home"
+        assert result[1]["label"] == "other"
+
+    def test_parse_labeled_none_labels(self):
+        parse_labeled, _ = self._get_parse_funcs()
+        field = {"values": ["test@test.com"], "labels": None}
+        result = parse_labeled(field)
+        assert len(result) == 1
+        assert result[0]["label"] == "other"
+
+    def test_parse_contact_first_name_only(self):
+        _, parse_contact = self._get_parse_funcs()
+        plist = {"First": "Jane"}
+        result = parse_contact(plist, "uuid-fn")
+        assert result["full_name"] == "Jane"
+        assert result["family_name"] == ""
+
+    def test_parse_contact_date_birthday(self):
+        """Birthday stored as date (not datetime) should still be captured."""
+        from datetime import date
+        _, parse_contact = self._get_parse_funcs()
+        plist = {"First": "Test", "Birthday": date(1990, 6, 15)}
+        result = parse_contact(plist, "uuid-db")
+        assert result["birthday"] == "1990-06-15"
 
     def test_parse_contact_basic(self):
         _, parse_contact = self._get_parse_funcs()
@@ -179,6 +210,31 @@ class TestContactsExport:
 
         assert result["count"] == 1
 
+    def test_export_contacts_corrupt_file_skipped(self, tmp_path):
+        """Corrupt .abcdp files should be skipped with a warning, not crash."""
+        from scripts.apple_data_export import export_contacts
+
+        lib_ab = tmp_path / "Library" / "Application Support" / "AddressBook"
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+
+        sources_dir = lib_ab / "Sources" / "SOURCE-1" / "Metadata"
+        sources_dir.mkdir(parents=True)
+
+        # One valid, one corrupt
+        valid = {"First": "Valid", "Last": "Contact"}
+        with open(sources_dir / "VALID-UUID:ABPerson.abcdp", "wb") as f:
+            plistlib.dump(valid, f)
+        with open(sources_dir / "BAD-UUID:ABPerson.abcdp", "wb") as f:
+            f.write(b"this is not a plist")
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Staleness alerting
@@ -201,7 +257,6 @@ class TestStalenessAlerting:
         self._write_manifest(import_dir, fresh.isoformat())
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
-            import logging
             with caplog.at_level(logging.INFO):
                 result = check_manifest()
 
@@ -217,7 +272,6 @@ class TestStalenessAlerting:
         self._write_manifest(import_dir, stale.isoformat())
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
-            import logging
             with caplog.at_level(logging.WARNING):
                 check_manifest()
 
@@ -231,7 +285,6 @@ class TestStalenessAlerting:
         self._write_manifest(import_dir, very_stale.isoformat())
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
-            import logging
             with caplog.at_level(logging.DEBUG):
                 check_manifest()
 
@@ -256,9 +309,24 @@ class TestStalenessAlerting:
         self._write_manifest(import_dir, "not-a-date")
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
-            import logging
             with caplog.at_level(logging.WARNING):
                 result = check_manifest()
 
         assert result is not None
         assert any("Cannot parse" in r.message for r in caplog.records)
+
+    def test_naive_timestamp_treated_as_utc(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        # Naive timestamp (no timezone) — should still compute staleness, not error
+        naive = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._write_manifest(import_dir, naive.strftime("%Y-%m-%dT%H:%M:%S"))
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.INFO):
+                result = check_manifest()
+
+        assert result is not None
+        assert "fresh" in caplog.text.lower()
+        assert not any("Cannot parse" in r.message for r in caplog.records)

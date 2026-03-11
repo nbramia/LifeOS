@@ -49,8 +49,8 @@ def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:
     """Parse an AddressBook labeled-value dict (Email, Phone, etc.) into [{label, value}]."""
     if not field_dict or not isinstance(field_dict, dict):
         return []
-    values = field_dict.get("values", [])
-    labels = field_dict.get("labels", [])
+    values = field_dict.get("values") or []
+    labels = field_dict.get("labels") or []
     result = []
     for i, val in enumerate(values):
         if not val:
@@ -83,6 +83,8 @@ def _parse_abcdp_contact(plist_data: dict, identifier: str) -> dict | None:
     birthday = None
     bd = plist_data.get("Birthday")
     if isinstance(bd, datetime):
+        birthday = bd.isoformat()
+    elif hasattr(bd, "isoformat"):
         birthday = bd.isoformat()
 
     return {
