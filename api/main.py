@@ -626,7 +626,7 @@ _DATA_INTEGRITY_TTL = 3600  # seconds
 
 
 @app.get("/health/data-integrity")
-async def data_integrity_check():
+def data_integrity_check():
     """
     Check cross-store data consistency.
 
@@ -637,6 +637,9 @@ async def data_integrity_check():
     Returns per-check counts and an overall status:
     - "healthy" if all counts are zero
     - "degraded" if any non-zero counts exist
+
+    Declared as a sync def so FastAPI runs it in a threadpool,
+    avoiding event loop blocking during SQLite I/O.
     """
     import time
 
@@ -649,7 +652,11 @@ async def data_integrity_check():
 
     start = time.time()
 
-    result = _run_consistency_check()
+    try:
+        result = _run_consistency_check()
+    except Exception as e:
+        logger.error(f"Data integrity check failed: {e}")
+        return {"status": "error", "error": str(e), "cached": False}
 
     status = "healthy" if result["total_issues"] == 0 else "degraded"
     response = {

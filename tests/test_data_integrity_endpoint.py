@@ -58,28 +58,26 @@ def clear_cache():
 class TestDataIntegrityEndpoint:
     """Tests for /health/data-integrity endpoint."""
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_healthy_returns_status_healthy(self, mock_verify):
+    def test_healthy_returns_status_healthy(self, mock_verify):
         """Zero issues → status 'healthy'."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check
-        result = await data_integrity_check()
+        result = data_integrity_check()
 
         assert result["status"] == "healthy"
         assert result["total_issues"] == 0
         assert all(v == 0 for v in result["checks"].values())
         mock_verify.assert_called_once()
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_degraded_returns_status_degraded(self, mock_verify):
+    def test_degraded_returns_status_degraded(self, mock_verify):
         """Non-zero issues → status 'degraded'."""
         mock_verify.return_value = _degraded_result()
 
         from api.main import data_integrity_check
-        result = await data_integrity_check()
+        result = data_integrity_check()
 
         assert result["status"] == "degraded"
         assert result["total_issues"] == 6
@@ -87,60 +85,56 @@ class TestDataIntegrityEndpoint:
         assert result["checks"]["orphaned_interactions"] == 2
         assert result["checks"]["stale_merged_ids"] == 1
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_cache_returns_cached_result(self, mock_verify):
+    def test_cache_returns_cached_result(self, mock_verify):
         """Second call within TTL returns cached result."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check
 
-        result1 = await data_integrity_check()
+        result1 = data_integrity_check()
         assert result1["cached"] is False
 
-        result2 = await data_integrity_check()
+        result2 = data_integrity_check()
         assert result2["cached"] is True
 
         # verify_consistency only called once
         mock_verify.assert_called_once()
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_cache_expires_after_ttl(self, mock_verify):
+    def test_cache_expires_after_ttl(self, mock_verify):
         """After TTL, cache is refreshed."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check, _data_integrity_cache
 
-        await data_integrity_check()
+        data_integrity_check()
         assert mock_verify.call_count == 1
 
         # Expire the cache
         _data_integrity_cache["timestamp"] = time.time() - 3601
 
-        await data_integrity_check()
+        data_integrity_check()
         assert mock_verify.call_count == 2
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_response_includes_elapsed_ms(self, mock_verify):
+    def test_response_includes_elapsed_ms(self, mock_verify):
         """Response includes elapsed_ms timing."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check
-        result = await data_integrity_check()
+        result = data_integrity_check()
 
         assert "elapsed_ms" in result
         assert isinstance(result["elapsed_ms"], int)
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_all_check_fields_present(self, mock_verify):
+    def test_all_check_fields_present(self, mock_verify):
         """Response includes all expected check fields."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check
-        result = await data_integrity_check()
+        result = data_integrity_check()
 
         expected_checks = {
             "person_stats_mismatches",
@@ -153,13 +147,24 @@ class TestDataIntegrityEndpoint:
         }
         assert set(result["checks"].keys()) == expected_checks
 
-    @pytest.mark.asyncio
     @patch("api.main._run_consistency_check")
-    async def test_called_once_per_request(self, mock_verify):
+    def test_called_once_per_request(self, mock_verify):
         """Endpoint calls the consistency check exactly once (non-cached)."""
         mock_verify.return_value = _healthy_result()
 
         from api.main import data_integrity_check
-        await data_integrity_check()
+        data_integrity_check()
 
         mock_verify.assert_called_once()
+
+    @patch("api.main._run_consistency_check")
+    def test_error_returns_error_status(self, mock_verify):
+        """Exception in verify_consistency → error status, not 500."""
+        mock_verify.side_effect = RuntimeError("database is locked")
+
+        from api.main import data_integrity_check
+        result = data_integrity_check()
+
+        assert result["status"] == "error"
+        assert "database is locked" in result["error"]
+        assert result["cached"] is False
