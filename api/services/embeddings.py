@@ -61,16 +61,21 @@ class EmbeddingService:
             except RuntimeError as e:
                 # GPU errors (HIP OOM, GPU hang, invalid device) — fall back to CPU
                 error_msg = str(e).lower()
-                gpu_errors = ("hip", "cuda", "out of memory", "device", "gpu hang")
+                gpu_errors = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
                 if any(keyword in error_msg for keyword in gpu_errors):
                     logger.warning(f"GPU embedding failed ({e}), falling back to CPU")
-                    self._model = SentenceTransformer(
-                        self.model_name,
-                        cache_folder=self.cache_dir,
-                        device="cpu",
-                    )
-                    from api.services.service_health import mark_service_healthy
-                    mark_service_healthy("embedding_model")
+                    try:
+                        self._model = SentenceTransformer(
+                            self.model_name,
+                            cache_folder=self.cache_dir,
+                            device="cpu",
+                        )
+                        from api.services.service_health import mark_service_healthy
+                        mark_service_healthy("embedding_model")
+                    except Exception as cpu_err:
+                        from api.services.service_health import mark_service_failed, Severity
+                        mark_service_failed("embedding_model", f"CPU fallback also failed: {cpu_err}", Severity.CRITICAL)
+                        raise
                 else:
                     from api.services.service_health import mark_service_failed, Severity
                     mark_service_failed("embedding_model", str(e), Severity.CRITICAL)

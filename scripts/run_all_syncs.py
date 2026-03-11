@@ -906,6 +906,7 @@ def run_all_syncs(
     # since conditions won't change mid-sync (LLM is either stopped or not).
     llm_memory_checked = False
     _skip_embedding_phases = False
+    available_ram = None
 
     try:
         for source_idx, source in enumerate(sources):
