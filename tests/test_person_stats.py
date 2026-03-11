@@ -1,7 +1,5 @@
 """Tests for person stats refresh - counts and timestamp updates."""
 import sqlite3
-import tempfile
-import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -10,7 +8,6 @@ from api.services.person_entity import PersonEntity
 from api.services.person_stats import (
     refresh_person_stats,
     _apply_counts_to_entity,
-    _update_timestamps,
 )
 
 
@@ -204,9 +201,26 @@ class TestApplyCountsToEntity:
             'whatsapp': 4,
             'phone': 1,
             'slack': 6,
+            'photos': 8,
         }
         _apply_counts_to_entity(entity, counts)
         assert entity.email_count == 10
         assert entity.meeting_count == 5
         assert entity.mention_count == 5  # vault + granola
         assert entity.message_count == 18  # imessage + whatsapp + phone + slack
+        assert entity.photo_count == 8
+
+    def test_slack_maps_to_message_count(self):
+        """Verify 'slack' maps to message_count (slack_message_count is managed by slack_sync)."""
+        entity = PersonEntity(canonical_name="Test")
+        counts = {'slack': 10}
+        _apply_counts_to_entity(entity, counts)
+        assert entity.message_count == 10
+        assert entity.slack_message_count == 0  # Not touched by _apply_counts
+
+    def test_photos_maps_to_photo_count(self):
+        """Verify 'photos' maps to photo_count."""
+        entity = PersonEntity(canonical_name="Test")
+        counts = {'photos': 15}
+        _apply_counts_to_entity(entity, counts)
+        assert entity.photo_count == 15

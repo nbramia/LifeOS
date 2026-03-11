@@ -73,11 +73,12 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
         for entity in store.get_all():
             if entity.id not in person_counts:
                 modified = False
-                if entity.email_count or entity.meeting_count or entity.message_count or entity.mention_count:
+                if entity.email_count or entity.meeting_count or entity.message_count or entity.mention_count or entity.photo_count:
                     entity.email_count = 0
                     entity.meeting_count = 0
                     entity.message_count = 0
                     entity.mention_count = 0
+                    entity.photo_count = 0
                     modified = True
                 if _update_timestamps(entity, entity.id, conn):
                     modified = True
@@ -191,6 +192,10 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     - calendar -> meeting_count
     - vault, granola -> mention_count
     - imessage, whatsapp, phone, slack -> message_count
+    - photos -> photo_count
+
+    Note: slack_message_count is managed separately by slack_sync.py
+    (raw message counts, not daily interaction summaries).
     """
     entity.email_count = counts.get('gmail', 0)
     entity.meeting_count = counts.get('calendar', 0)
@@ -201,6 +206,7 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
         counts.get('phone', 0) +
         counts.get('slack', 0)
     )
+    entity.photo_count = counts.get('photos', 0)
 
     # Update sources list to include any source types with interactions
     interaction_sources = set(counts.keys())
@@ -247,11 +253,13 @@ def verify_person_stats(fix: bool = False) -> dict:
             counts.get('phone', 0) +
             counts.get('slack', 0)
         )
+        computed_photo = counts.get('photos', 0)
 
         if (entity.email_count != computed_email or
             entity.meeting_count != computed_meeting or
             entity.mention_count != computed_mention or
-            entity.message_count != computed_message):
+            entity.message_count != computed_message or
+            entity.photo_count != computed_photo):
 
             discrepancies[entity.id] = {
                 'name': entity.canonical_name,
@@ -260,12 +268,14 @@ def verify_person_stats(fix: bool = False) -> dict:
                     'meeting': entity.meeting_count,
                     'mention': entity.mention_count,
                     'message': entity.message_count,
+                    'photo': entity.photo_count,
                 },
                 'computed': {
                     'email': computed_email,
                     'meeting': computed_meeting,
                     'mention': computed_mention,
                     'message': computed_message,
+                    'photo': computed_photo,
                 },
             }
 
