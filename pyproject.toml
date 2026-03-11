@@ -43,8 +43,9 @@ markers = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# These scripts intentionally call load_dotenv() before stdlib imports
+# These files intentionally call load_dotenv() before stdlib imports
 "scripts/*.py" = ["E402"]
+"api/main.py" = ["E402"]
 
 [tool.setuptools.packages.find]
 where = ["."]

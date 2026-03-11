@@ -157,7 +157,7 @@ def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[i
                 failure_lines = [f"- {name}: {error}" for name, error in failures]
                 send_alert(
                     subject=f"LifeOS: {len(failures)} sync issue(s)",
-                    body=f"The following issues were detected in the last 24 hours:\n\n" + "\n".join(failure_lines),
+                    body="The following issues were detected in the last 24 hours:\n\n" + "\n".join(failure_lines),
                 )
             except Exception as e:
                 logger.error(f"Failed to send failure notification: {e}")
@@ -608,6 +608,77 @@ async def service_health_check():
     """
     from api.services.service_health import get_service_health
     return get_service_health().get_summary()
+
+
+def _run_consistency_check() -> dict:
+    """Run Phase 7 consistency verification in read-only mode."""
+    import sys as _sys
+    scripts_dir = str(Path(__file__).parent.parent / "scripts")
+    if scripts_dir not in _sys.path:
+        _sys.path.insert(0, scripts_dir)
+    from sync_consistency_verify import verify_consistency
+    return verify_consistency(dry_run=True)
+
+
+# Cache for data-integrity check results (1-hour TTL)
+_data_integrity_cache: dict = {"result": None, "timestamp": 0.0}
+_DATA_INTEGRITY_TTL = 3600  # seconds
+
+
+@app.get("/health/data-integrity")
+def data_integrity_check():
+    """
+    Check cross-store data consistency.
+
+    Reuses Phase 7 verification logic (sync_consistency_verify.py) in
+    read-only mode. Results are cached for 1 hour since the checks hit
+    multiple databases.
+
+    Returns per-check counts and an overall status:
+    - "healthy" if all counts are zero
+    - "degraded" if any non-zero counts exist
+
+    Declared as a sync def so FastAPI runs it in a threadpool,
+    avoiding event loop blocking during SQLite I/O.
+    """
+    import time
+
+    now = time.time()
+    if (
+        _data_integrity_cache["result"] is not None
+        and now - _data_integrity_cache["timestamp"] < _DATA_INTEGRITY_TTL
+    ):
+        return _data_integrity_cache["result"]
+
+    start = time.time()
+
+    try:
+        result = _run_consistency_check()
+    except Exception as e:
+        logger.error(f"Data integrity check failed: {e}")
+        return {"status": "error", "error": str(e), "cached": False}
+
+    status = "healthy" if result["total_issues"] == 0 else "degraded"
+    response = {
+        "status": status,
+        "checks": {
+            "person_stats_mismatches": result["person_stats_mismatches"]["count"],
+            "orphaned_interactions": result["orphaned_interactions"]["count"],
+            "hidden_interactions": result["hidden_interactions"]["count"],
+            "stale_merged_ids": result["stale_merged_ids"]["count"],
+            "stale_merged_relationships": result["stale_merged_relationships"]["count"],
+            "relationship_hygiene": result["relationship_hygiene"]["count"],
+            "orphaned_crm_records": result["orphaned_crm_records"]["count"],
+        },
+        "total_issues": result["total_issues"],
+        "elapsed_ms": round((time.time() - start) * 1000),
+        "cached": False,
+    }
+
+    _data_integrity_cache["result"] = {**response, "cached": True}
+    _data_integrity_cache["timestamp"] = now
+
+    return response
 
 
 @app.get("/")
