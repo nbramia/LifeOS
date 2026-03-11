@@ -732,11 +732,14 @@ class PersonEntityStore:
 
     def purge_hidden(self, older_than_days: int = 90) -> int:
         """
-        Permanently delete hidden entities older than the retention period.
+        Permanently delete merge-hidden entities older than the retention period.
 
-        Only deletes entities where hidden_at is older than `older_than_days`
-        days ago. Does NOT remove entries from merged_person_ids.json (those
-        must persist to prevent entity resolution from recreating duplicates).
+        Only deletes entities where hidden_reason starts with 'merged_into:'
+        and hidden_at is older than `older_than_days` days ago. Entities hidden
+        via hide_person() (blocklist) are not affected.
+
+        Does NOT remove entries from merged_person_ids.json (those must persist
+        to prevent entity resolution from recreating duplicates).
 
         Args:
             older_than_days: Minimum age in days before purging (default 90)
@@ -749,7 +752,8 @@ class PersonEntityStore:
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                "SELECT id FROM person_entities WHERE hidden = 1 AND hidden_at IS NOT NULL AND hidden_at < ?",
+                "SELECT id FROM person_entities WHERE hidden = 1 AND hidden_at IS NOT NULL AND hidden_at < ?"
+                " AND hidden_reason LIKE 'merged_into:%'",
                 (cutoff,),
             ).fetchall()
 

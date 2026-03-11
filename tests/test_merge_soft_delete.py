@@ -267,12 +267,8 @@ class TestUndoMerge:
 
         with patch("scripts.undo_merge.get_crm_db_path", return_value=crm_db), \
              patch("scripts.undo_merge.get_interaction_db_path", return_value=int_path), \
-             patch("scripts.undo_merge.MERGED_IDS_FILE", merged_ids_file), \
-             patch("scripts.undo_merge.get_person_entity_store") as mock_store_fn, \
+             patch("scripts.merge_people.MERGED_IDS_FILE", merged_ids_file), \
              patch("api.services.person_stats.refresh_person_stats"):
-
-            mock_store = PersonEntityStore(db_path=crm_db)
-            mock_store_fn.return_value = mock_store
 
             from scripts.undo_merge import undo_merge
             undo_merge(secondary_id, dry_run=False)
@@ -313,11 +309,7 @@ class TestUndoMerge:
         int_conn.close()
 
         with patch("scripts.undo_merge.get_crm_db_path", return_value=crm_db), \
-             patch("scripts.undo_merge.get_interaction_db_path", return_value=int_path), \
-             patch("scripts.undo_merge.get_person_entity_store") as mock_store_fn:
-
-            mock_store = PersonEntityStore(db_path=crm_db)
-            mock_store_fn.return_value = mock_store
+             patch("scripts.undo_merge.get_interaction_db_path", return_value=int_path):
 
             from scripts.undo_merge import undo_merge
             undo_merge(secondary_id, dry_run=True)

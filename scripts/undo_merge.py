@@ -10,6 +10,11 @@ Reverses the merge by:
 5. Removing the merge chain entry from merged_person_ids.json
 6. Refreshing stats for both entities
 
+Known limitations:
+- Relationship changes from merge are not reversed (secondary will have no relationships)
+- Notes/tags concatenated during merge are not split back
+- Aliases added to primary during merge are not removed
+
 Usage:
     python scripts/undo_merge.py --secondary <id> [--execute]
     python scripts/undo_merge.py --list-recoverable
@@ -26,24 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
 from api.services.source_entity import get_crm_db_path
+from scripts.merge_people import load_merged_ids, save_merged_ids
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
-
-MERGED_IDS_FILE = Path(__file__).parent.parent / "data" / "merged_person_ids.json"
-
-
-def load_merged_ids() -> dict:
-    if MERGED_IDS_FILE.exists():
-        with open(MERGED_IDS_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_merged_ids(merged_ids: dict):
-    MERGED_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(MERGED_IDS_FILE, "w") as f:
-        json.dump(merged_ids, f, indent=2)
 
 
 def list_recoverable():
@@ -64,11 +55,10 @@ def list_recoverable():
         logger.info("No recoverable merged entities found.")
         return
 
+    store = get_person_entity_store()
     logger.info(f"Found {len(rows)} recoverable merged entities:\n")
     for row in rows:
         primary_id = row["hidden_reason"].replace("merged_into:", "")
-        # Look up primary name
-        store = get_person_entity_store()
         primary = store.get_by_id(primary_id)
         primary_name = primary.canonical_name if primary else "(deleted)"
 
@@ -121,14 +111,21 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
     logger.info(f"Undoing merge: '{secondary_name}' ({secondary_id[:12]}...)")
     logger.info(f"  Was merged into: {primary_id[:12]}...")
 
-    # 2. Verify primary exists
-    store = get_person_entity_store()
-    primary = store.get_by_id(primary_id)
-    if not primary:
+    # 2. Verify primary exists (raw query to avoid merge chain redirection)
+    conn = sqlite3.connect(crm_path)
+    conn.row_factory = sqlite3.Row
+    primary_row = conn.execute(
+        "SELECT * FROM person_entities WHERE id = ?", (primary_id,)
+    ).fetchone()
+    conn.close()
+
+    if not primary_row:
         logger.error(f"Primary entity {primary_id} not found. Cannot undo.")
         return stats
 
-    logger.info(f"  Primary: '{primary.canonical_name}'")
+    primary_emails = json.loads(primary_row["emails"]) if primary_row["emails"] else []
+    primary_phones = json.loads(primary_row["phone_numbers"]) if primary_row["phone_numbers"] else []
+    logger.info(f"  Primary: '{primary_row['canonical_name']}'")
 
     # 3. Find source_entities to move back (those on primary matching secondary's identifiers)
     conn = sqlite3.connect(crm_path)
@@ -179,16 +176,16 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
     stats["interactions_moved"] = len(int_to_move)
 
     # 5. Determine identifiers to remove from primary
-    primary_emails_lower = {e.lower() for e in (primary.emails or [])}
-    primary_phones_set = set(primary.phone_numbers or [])
+    primary_emails_lower = {e.lower() for e in primary_emails}
+    primary_phones_set = set(primary_phones)
 
     emails_to_remove = secondary_emails_lower & primary_emails_lower
     phones_to_remove = secondary_phones_set & primary_phones_set
     stats["emails_removed_from_primary"] = len(emails_to_remove)
     stats["phones_removed_from_primary"] = len(phones_to_remove)
 
-    logger.info(f"  Emails to remove from primary: {emails_to_remove or 'none'}")
-    logger.info(f"  Phones to remove from primary: {phones_to_remove or 'none'}")
+    logger.info(f"  Emails to remove from primary: {len(emails_to_remove)}")
+    logger.info(f"  Phones to remove from primary: {len(phones_to_remove)}")
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
@@ -199,72 +196,77 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
     # --- Execute changes ---
     logger.info("\nApplying changes...")
 
-    # 5a. Restore secondary entity
-    conn.execute(
-        "UPDATE person_entities SET hidden = 0, hidden_at = NULL, hidden_reason = '' WHERE id = ?",
-        (secondary_id,),
-    )
-    # Rebuild lookup tables for secondary
-    for email in secondary_emails:
+    try:
+        # 5a. Restore secondary entity
         conn.execute(
-            "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
-            (email.lower(), secondary_id),
+            "UPDATE person_entities SET hidden = 0, hidden_at = NULL, hidden_reason = '' WHERE id = ?",
+            (secondary_id,),
         )
-    for phone in secondary_phones:
-        conn.execute(
-            "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
-            (phone, secondary_id),
-        )
-    conn.execute(
-        "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
-        (secondary_name.lower(), secondary_id),
-    )
-    logger.info(f"  Restored secondary entity: {secondary_name}")
-
-    # 5b. Move source_entities back
-    if se_to_move:
-        for se_id in se_to_move:
+        # Rebuild lookup tables for secondary
+        for email in secondary_emails:
             conn.execute(
-                "UPDATE source_entities SET canonical_person_id = ? WHERE id = ?",
-                (secondary_id, se_id),
+                "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
+                (email.lower(), secondary_id),
             )
-        logger.info(f"  Moved {len(se_to_move)} source_entities back to secondary")
-
-    # 5c. Move interactions back
-    if int_to_move:
-        for int_id in int_to_move:
-            int_conn.execute(
-                "UPDATE interactions SET person_id = ? WHERE id = ?",
-                (secondary_id, int_id),
+        for phone in secondary_phones:
+            conn.execute(
+                "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
+                (phone, secondary_id),
             )
-        int_conn.commit()
-        logger.info(f"  Moved {len(int_to_move)} interactions back to secondary")
-    int_conn.close()
-
-    # 5d. Remove secondary's identifiers from primary
-    remaining_emails = [e for e in (primary.emails or []) if e.lower() not in emails_to_remove]
-    remaining_phones = [p for p in (primary.phone_numbers or []) if p not in phones_to_remove]
-    conn.execute(
-        "UPDATE person_entities SET emails = ?, phone_numbers = ? WHERE id = ?",
-        (json.dumps(remaining_emails), json.dumps(remaining_phones), primary_id),
-    )
-    # Rebuild primary lookup tables
-    conn.execute("DELETE FROM person_emails WHERE person_id = ?", (primary_id,))
-    for email in remaining_emails:
         conn.execute(
-            "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
-            (email.lower(), primary_id),
+            "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
+            (secondary_name.lower(), secondary_id),
         )
-    conn.execute("DELETE FROM person_phones WHERE person_id = ?", (primary_id,))
-    for phone in remaining_phones:
-        conn.execute(
-            "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
-            (phone, primary_id),
-        )
-    logger.info("  Updated primary identifiers")
+        logger.info(f"  Restored secondary entity: {secondary_name}")
 
-    conn.commit()
-    conn.close()
+        # 5b. Move source_entities back
+        if se_to_move:
+            for se_id in se_to_move:
+                conn.execute(
+                    "UPDATE source_entities SET canonical_person_id = ? WHERE id = ?",
+                    (secondary_id, se_id),
+                )
+            logger.info(f"  Moved {len(se_to_move)} source_entities back to secondary")
+
+        # 5c. Remove secondary's identifiers from primary
+        remaining_emails = [e for e in primary_emails if e.lower() not in emails_to_remove]
+        remaining_phones = [p for p in primary_phones if p not in phones_to_remove]
+        conn.execute(
+            "UPDATE person_entities SET emails = ?, phone_numbers = ? WHERE id = ?",
+            (json.dumps(remaining_emails), json.dumps(remaining_phones), primary_id),
+        )
+        # Rebuild primary lookup tables
+        conn.execute("DELETE FROM person_emails WHERE person_id = ?", (primary_id,))
+        for email in remaining_emails:
+            conn.execute(
+                "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
+                (email.lower(), primary_id),
+            )
+        conn.execute("DELETE FROM person_phones WHERE person_id = ?", (primary_id,))
+        for phone in remaining_phones:
+            conn.execute(
+                "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
+                (phone, primary_id),
+            )
+        logger.info("  Updated primary identifiers")
+
+        # Commit CRM changes first (most critical)
+        conn.commit()
+        logger.info("  CRM changes committed")
+
+        # 5d. Move interactions back (separate DB, committed after CRM)
+        if int_to_move:
+            for int_id in int_to_move:
+                int_conn.execute(
+                    "UPDATE interactions SET person_id = ? WHERE id = ?",
+                    (secondary_id, int_id),
+                )
+            int_conn.commit()
+            logger.info(f"  Moved {len(int_to_move)} interactions back to secondary")
+
+    finally:
+        conn.close()
+        int_conn.close()
 
     # 5e. Remove from merged_person_ids.json
     merged_ids = load_merged_ids()
