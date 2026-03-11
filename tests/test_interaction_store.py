@@ -958,3 +958,13 @@ class TestAtomicReplace:
         assert result["deleted"] == 0
         assert result["added"] == 3
         assert temp_store.count() == 3
+
+    def test_atomic_replace_rejects_mismatched_source_type(self, temp_store):
+        """atomic_replace raises ValueError if interactions have wrong source_type."""
+        mixed = [
+            self._make_interaction(source_type="vault"),
+            self._make_interaction(source_type="gmail"),  # Mismatch
+        ]
+
+        with pytest.raises(ValueError, match="mismatched source_type"):
+            temp_store.atomic_replace("vault", mixed)

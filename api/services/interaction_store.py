@@ -384,25 +384,16 @@ class InteractionStore:
 
         return self.add(interaction), True
 
-    def batch_add(self, interactions: list[Interaction]) -> dict:
+    def _prepare_rows(
+        self, interactions: list[Interaction]
+    ) -> tuple[list[tuple], set[str]]:
         """
-        Add multiple interactions in a single transaction.
-
-        Uses INSERT OR IGNORE for natural deduplication via the UNIQUE
-        constraint on (source_type, source_id). Resolves merge chains
-        before inserting.
-
-        Args:
-            interactions: List of Interaction objects to add.
+        Resolve merge chains, filter temp artifacts, and build INSERT tuples.
 
         Returns:
-            Dict with 'added' (int), 'skipped' (int),
-            and 'affected_person_ids' (set of canonical person IDs).
-            Caller should call refresh_person_stats() with affected_person_ids.
+            (rows, affected_person_ids) — rows ready for executemany,
+            and the set of canonical person IDs touched.
         """
-        if not interactions:
-            return {"added": 0, "skipped": 0, "affected_person_ids": set()}
-
         from api.services.person_entity import get_person_entity_store
         person_store = get_person_entity_store()
 
@@ -432,6 +423,29 @@ class InteractionStore:
                 interaction.created_at.isoformat(),
             ))
             affected_person_ids.add(resolved_id)
+
+        return rows, affected_person_ids
+
+    def batch_add(self, interactions: list[Interaction]) -> dict:
+        """
+        Add multiple interactions in a single transaction.
+
+        Uses INSERT OR IGNORE for natural deduplication via the UNIQUE
+        constraint on (source_type, source_id). Resolves merge chains
+        before inserting.
+
+        Args:
+            interactions: List of Interaction objects to add.
+
+        Returns:
+            Dict with 'added' (int), 'skipped' (int),
+            and 'affected_person_ids' (set of canonical person IDs).
+            Caller should call refresh_person_stats() with affected_person_ids.
+        """
+        if not interactions:
+            return {"added": 0, "skipped": 0, "affected_person_ids": set()}
+
+        rows, affected_person_ids = self._prepare_rows(interactions)
 
         if not rows:
             return {"added": 0, "skipped": 0, "affected_person_ids": set()}
@@ -473,41 +487,24 @@ class InteractionStore:
         Args:
             source_type: The source type to replace (e.g., "vault", "granola").
             interactions: Complete set of interactions for this source type.
+                All interactions must have source_type matching the parameter.
 
         Returns:
             Dict with 'deleted' (int), 'added' (int),
             and 'affected_person_ids' (set of canonical person IDs).
             Caller should call refresh_person_stats() with affected_person_ids.
+
+        Raises:
+            ValueError: If any interaction has a mismatched source_type.
         """
-        from api.services.person_entity import get_person_entity_store
-        person_store = get_person_entity_store()
+        mismatched = [i for i in interactions if i.source_type != source_type]
+        if mismatched:
+            raise ValueError(
+                f"atomic_replace('{source_type}') received {len(mismatched)} "
+                f"interactions with mismatched source_type"
+            )
 
-        rows = []
-        affected_person_ids: set[str] = set()
-        for interaction in interactions:
-            if interaction.source_id and any(
-                interaction.source_id.startswith(p) for p in TEMP_PREFIXES
-            ):
-                continue
-
-            resolved_id = person_store.get_canonical_id(interaction.person_id)
-            if self._strict and person_store.get_by_id(resolved_id) is None:
-                raise ValueError(
-                    f"Cannot add interaction: person_id '{resolved_id}' does not exist"
-                )
-
-            rows.append((
-                interaction.id,
-                resolved_id,
-                interaction.timestamp.isoformat(),
-                interaction.source_type,
-                interaction.title,
-                interaction.snippet,
-                interaction.source_link,
-                interaction.source_id,
-                interaction.created_at.isoformat(),
-            ))
-            affected_person_ids.add(resolved_id)
+        rows, affected_person_ids = self._prepare_rows(interactions)
 
         conn = self._get_connection()
         try:
