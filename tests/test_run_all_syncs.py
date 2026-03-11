@@ -324,6 +324,28 @@ class TestSystemRAMPreFlight:
         assert "source_a" in called_sources
         assert "source_z" in called_sources
 
+    def test_low_ram_with_llm_running_skips_embeddings_without_stopping_llm(self):
+        """When LLM is running but RAM is low, embedding sources are skipped
+        and the LLM is NOT stopped (no point stopping it only to skip the work)."""
+        result, run_sync_mock, stop_mock, start_mock = _run_llm_test(
+            llm_running=True, gpu_memory_mb=2000, system_ram_mb=2000,
+        )
+
+        # Embedding sources should be skipped
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "vault_reindex" not in called_sources
+        assert "crm_vectorstore" not in called_sources
+        assert result["results"]["vault_reindex"]["reason"] == "insufficient_ram"
+        assert result["results"]["crm_vectorstore"]["reason"] == "insufficient_ram"
+
+        # LLM should NOT have been stopped — no point stopping it for skipped work
+        stop_mock.assert_not_called()
+        start_mock.assert_not_called()
+
+        # Non-embedding sources should still run
+        assert "source_a" in called_sources
+        assert "source_z" in called_sources
+
     def test_ram_check_unknown_allows_embeddings(self):
         """When RAM check returns None (unsupported OS), embeddings proceed."""
         result, run_sync_mock, _, _ = _run_llm_test(

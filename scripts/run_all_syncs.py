@@ -984,6 +984,7 @@ def run_all_syncs(
                     "skipped": True,
                     "reason": "insufficient_ram",
                     "available_ram_mb": available_ram,
+                    "error": f"Insufficient system RAM ({available_ram} MB free, need {_EMBEDDING_RAM_THRESHOLD_MB} MB)",
                 }
                 failed.append(source)
                 continue
