@@ -7,7 +7,7 @@ and entity linking workflows.
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 import json
 import logging
 import sqlite3
@@ -28,7 +28,6 @@ from api.services.source_entity import (
 )
 from api.services.relationship import get_relationship_store
 from api.services.relationship_metrics import (
-    compute_strength_for_person,
     get_strength_breakdown,
     update_all_strengths,
     update_strength_for_person,
@@ -36,7 +35,6 @@ from api.services.relationship_metrics import (
 from api.services.relationship_discovery import (
     run_full_discovery,
     get_suggested_connections,
-    get_connection_overlap,
 )
 from api.services.person_facts import (
     PersonFact,
@@ -56,7 +54,7 @@ WORK_EMAIL_DOMAIN = settings.work_email_domain if hasattr(settings, 'work_email_
 MY_PERSON_ID = settings.my_person_id
 
 # Import manual strength overrides from centralized config
-from config.relationship_weights import STRENGTH_OVERRIDES_BY_ID
+from config.relationship_weights import STRENGTH_OVERRIDES_BY_ID  # noqa: E402
 
 
 def _get_strength_override(person_id: str) -> float | None:
@@ -828,10 +826,10 @@ async def merge_people(request: PersonMergeRequest):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from scripts.merge_people import merge_people as do_merge, load_merged_ids, save_merged_ids
+    from scripts.merge_people import merge_people as do_merge
 
     person_store = get_person_entity_store()
-    source_store = get_source_entity_store()
+    _source_store = get_source_entity_store()  # noqa: F841
 
     # Validate primary exists
     primary = person_store.get_by_id(request.primary_id)
@@ -1080,9 +1078,7 @@ async def get_person_contact_sources(person_id: str):
 
     Not: "Message #12345 is linked to Person A"
     """
-    import sqlite3
     from pathlib import Path
-    from collections import defaultdict
 
     person_store = get_person_entity_store()
     person = person_store.get_by_id(person_id)
@@ -1205,7 +1201,6 @@ async def get_person_source_entities(
     Used by the split UI to show what sources comprise a person record.
     Default limit is 500 to prevent performance issues with large records.
     """
-    import sqlite3
     from pathlib import Path
 
     person_store = get_person_entity_store()
@@ -1226,7 +1221,7 @@ async def get_person_source_entities(
 
     cursor = conn.execute("""
         SELECT id, source_type, source_id, observed_name, observed_email, observed_phone,
-               link_confidence, link_status, observed_at
+               link_confidence, link_status, observed_at, link_method
         FROM source_entities
         WHERE canonical_person_id = ?
         ORDER BY source_type, observed_at DESC
@@ -1254,6 +1249,7 @@ async def get_person_source_entities(
             'observed_phone': row['observed_phone'],
             'link_confidence': row['link_confidence'] or 0.0,
             'link_status': row['link_status'] or 'auto',
+            'link_method': row['link_method'],
             'observed_at': row['observed_at'],
         })
 
@@ -1300,7 +1296,6 @@ async def split_person(request: PersonSplitRequest):
 
     If to_person_id is None, a new person is created with new_person_name.
     """
-    import sqlite3
     import uuid
     from pathlib import Path
     from datetime import datetime, timezone
@@ -1308,7 +1303,7 @@ async def split_person(request: PersonSplitRequest):
     from api.services.link_override import get_link_override_store, LinkOverride
 
     person_store = get_person_entity_store()
-    source_store = get_source_entity_store()
+    _source_store = get_source_entity_store()  # noqa: F841
 
     # Validate from_person exists
     from_person = person_store.get_by_id(request.from_person_id)
@@ -1374,7 +1369,7 @@ async def split_person(request: PersonSplitRequest):
     conn.commit()
 
     # Move interactions - get source_types from the source entities
-    source_types = list({se['source_type'] for se in source_entity_details})
+    _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
     source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
 
     interactions_moved = 0
@@ -2944,7 +2939,7 @@ async def get_me_stats():
     Returns total counts across all people in the CRM.
     """
     person_store = get_person_entity_store()
-    interaction_store = get_interaction_store()
+    _interaction_store = get_interaction_store()  # noqa: F841
 
     # Get all people
     all_people = person_store.get_all()
@@ -3615,7 +3610,6 @@ async def get_family_members():
 
     Uses batch interaction fetch to avoid N+1 query problem.
     """
-    from datetime import timedelta
     from collections import defaultdict
 
     person_store = get_person_entity_store()
@@ -4082,7 +4076,6 @@ async def get_family_communication_gaps(
 
     Identifies periods where you went unusually long without contact.
     """
-    from collections import defaultdict
     from datetime import timedelta
 
     # Parse person IDs
@@ -4094,7 +4087,7 @@ async def get_family_communication_gaps(
     interaction_store = get_interaction_store()
 
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=days_back)
+    _cutoff = now - timedelta(days=days_back)  # noqa: F841
 
     gaps = []
     person_summaries = []
@@ -4205,7 +4198,6 @@ async def get_family_channel_mix(
     filtered to the specified time period.
     """
     from collections import defaultdict
-    from datetime import timedelta
 
     # Parse person IDs
     selected_ids = [pid.strip() for pid in person_ids.split(",") if pid.strip()]
@@ -4417,6 +4409,7 @@ class ReviewQueueItem(BaseModel):
     proposed_person_name: str
     confidence: float
     reason: str
+    link_method: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -4431,6 +4424,7 @@ class ReviewQueueResponse(BaseModel):
 async def get_review_queue(
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     max_confidence: float = Query(default=0.85, ge=0.0, le=1.0, description="Maximum confidence"),
+    link_method: Optional[str] = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
     """
@@ -4440,6 +4434,7 @@ async def get_review_queue(
     allowing user to quickly confirm or reject matches.
 
     Default shows matches with confidence < 0.85 (85%).
+    Optionally filter by link_method to review specific resolution types.
     """
     start_time = time.time()
 
@@ -4450,12 +4445,14 @@ async def get_review_queue(
     entities = source_store.get_low_confidence(
         min_confidence=min_confidence,
         max_confidence=max_confidence,
+        link_method=link_method,
         limit=limit,
     )
 
     total = source_store.count_low_confidence(
         min_confidence=min_confidence,
         max_confidence=max_confidence,
+        link_method=link_method,
     )
 
     items = []
@@ -4474,6 +4471,7 @@ async def get_review_queue(
                     proposed_person_name=person.canonical_name,
                     confidence=entity.link_confidence,
                     reason=entity.link_status,
+                    link_method=entity.link_method,
                     created_at=entity.observed_at.isoformat() if entity.observed_at else None,
                 ))
 
@@ -4589,7 +4587,6 @@ async def get_data_health():
 
     Returns metrics on data coverage, sync status, and relationship discovery.
     """
-    import sqlite3
     from pathlib import Path
 
     data_dir = Path(__file__).parent.parent.parent / "data"
@@ -4706,7 +4703,7 @@ async def get_data_health():
             continue
         latest = data.get("latest")
         if latest:
-            from datetime import datetime, timedelta
+            from datetime import datetime
             try:
                 latest_date = datetime.strptime(latest, "%Y-%m-%d")
                 days_old = (datetime.now() - latest_date).days

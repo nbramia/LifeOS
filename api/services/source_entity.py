@@ -14,10 +14,8 @@ import uuid
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Optional
 
-from config.settings import settings
 from api.utils.datetime_utils import make_aware as _make_aware
 from api.utils.db_paths import get_crm_db_path
 
@@ -74,6 +72,7 @@ class SourceEntity:
     canonical_person_id: Optional[str] = None
     link_confidence: float = 0.0  # 0.0-1.0
     link_status: str = LINK_STATUS_AUTO  # auto, confirmed, rejected
+    link_method: Optional[str] = None  # Resolution method (email_exact, phone_exact, name_fuzzy, etc.)
     linked_at: Optional[datetime] = None
 
     # Timestamps
@@ -114,11 +113,13 @@ class SourceEntity:
         """Create SourceEntity from SQLite row."""
         # Row order: id, source_type, source_id, observed_name, observed_email,
         #            observed_phone, metadata, canonical_person_id, link_confidence,
-        #            link_status, linked_at, observed_at, created_at
+        #            link_status, linked_at, observed_at, created_at,
+        #            match_attempted_at[13], match_attempt_count[14], link_method[15]
 
         observed_at = datetime.fromisoformat(row[11]) if row[11] else datetime.now(timezone.utc)
         created_at = datetime.fromisoformat(row[12]) if row[12] else datetime.now(timezone.utc)
         linked_at = datetime.fromisoformat(row[10]) if row[10] else None
+        link_method = row[15] if len(row) > 15 else None
 
         return cls(
             id=row[0],
@@ -131,6 +132,7 @@ class SourceEntity:
             canonical_person_id=row[7],
             link_confidence=row[8] or 0.0,
             link_status=row[9] or LINK_STATUS_AUTO,
+            link_method=link_method,
             linked_at=_make_aware(linked_at),
             observed_at=_make_aware(observed_at),
             created_at=_make_aware(created_at),
@@ -266,6 +268,16 @@ class SourceEntityStore:
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+            # Migration: add link_method column for provenance tracking
+            try:
+                conn.execute("""
+                    ALTER TABLE source_entities
+                    ADD COLUMN link_method TEXT
+                """)
+                logger.info("Added link_method column")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
             # Index for finding entities that need re-matching
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_source_entities_match_attempts
@@ -326,8 +338,8 @@ class SourceEntityStore:
                 INSERT INTO source_entities
                 (id, source_type, source_id, observed_name, observed_email,
                  observed_phone, metadata, canonical_person_id, link_confidence,
-                 link_status, linked_at, observed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 link_status, link_method, linked_at, observed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entity.id,
                 entity.source_type,
@@ -339,6 +351,7 @@ class SourceEntityStore:
                 entity.canonical_person_id,
                 entity.link_confidence,
                 entity.link_status,
+                entity.link_method,
                 entity.linked_at.isoformat() if entity.linked_at else None,
                 entity.observed_at.isoformat(),
                 entity.created_at.isoformat(),
@@ -423,6 +436,7 @@ class SourceEntityStore:
                     canonical_person_id = ?,
                     link_confidence = ?,
                     link_status = ?,
+                    link_method = ?,
                     linked_at = ?,
                     observed_at = ?
                 WHERE id = ?
@@ -436,6 +450,7 @@ class SourceEntityStore:
                 entity.canonical_person_id,
                 entity.link_confidence,
                 entity.link_status,
+                entity.link_method,
                 entity.linked_at.isoformat() if entity.linked_at else None,
                 entity.observed_at.isoformat(),
                 entity.id,
@@ -451,6 +466,7 @@ class SourceEntityStore:
         canonical_person_id: str,
         confidence: float = 1.0,
         status: str = LINK_STATUS_AUTO,
+        method: Optional[str] = None,
     ) -> bool:
         """
         Link a source entity to a canonical person.
@@ -498,12 +514,14 @@ class SourceEntityStore:
                     canonical_person_id = ?,
                     link_confidence = ?,
                     link_status = ?,
+                    link_method = COALESCE(?, link_method),
                     linked_at = ?
                 WHERE id = ?
             """, (
                 resolved_person_id,
                 confidence,
                 status,
+                method,
                 datetime.now(timezone.utc).isoformat(),
                 entity_id,
             ))
@@ -661,6 +679,7 @@ class SourceEntityStore:
         self,
         min_confidence: float = 0.0,
         max_confidence: float = 0.85,
+        link_method: Optional[str] = None,
         limit: int = 100,
     ) -> list[SourceEntity]:
         """
@@ -671,6 +690,7 @@ class SourceEntityStore:
         Args:
             min_confidence: Minimum confidence threshold
             max_confidence: Maximum confidence threshold
+            link_method: Optional filter by resolution method
             limit: Maximum results to return
 
         Returns:
@@ -678,15 +698,20 @@ class SourceEntityStore:
         """
         conn = self._get_connection()
         try:
-            cursor = conn.execute("""
+            sql = """
                 SELECT * FROM source_entities
                 WHERE canonical_person_id IS NOT NULL
                   AND link_confidence >= ?
                   AND link_confidence <= ?
                   AND link_status != 'confirmed'
-                ORDER BY link_confidence ASC
-                LIMIT ?
-            """, (min_confidence, max_confidence, limit))
+            """
+            params: list = [min_confidence, max_confidence]
+            if link_method is not None:
+                sql += "  AND link_method = ?\n"
+                params.append(link_method)
+            sql += "ORDER BY link_confidence ASC\nLIMIT ?"
+            params.append(limit)
+            cursor = conn.execute(sql, params)
 
             return [SourceEntity.from_row(row) for row in cursor.fetchall()]
         finally:
@@ -696,6 +721,7 @@ class SourceEntityStore:
         self,
         min_confidence: float = 0.0,
         max_confidence: float = 0.85,
+        link_method: Optional[str] = None,
     ) -> int:
         """
         Count linked source entities with low confidence.
@@ -703,19 +729,25 @@ class SourceEntityStore:
         Args:
             min_confidence: Minimum confidence threshold
             max_confidence: Maximum confidence threshold
+            link_method: Optional filter by resolution method
 
         Returns:
             Count of entities in confidence range
         """
         conn = self._get_connection()
         try:
-            cursor = conn.execute("""
+            sql = """
                 SELECT COUNT(*) FROM source_entities
                 WHERE canonical_person_id IS NOT NULL
                   AND link_confidence >= ?
                   AND link_confidence <= ?
                   AND link_status != 'confirmed'
-            """, (min_confidence, max_confidence))
+            """
+            params: list = [min_confidence, max_confidence]
+            if link_method is not None:
+                sql += "  AND link_method = ?\n"
+                params.append(link_method)
+            cursor = conn.execute(sql, params)
             return cursor.fetchone()[0]
         finally:
             conn.close()

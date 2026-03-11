@@ -7,7 +7,6 @@ Supports incremental indexing based on file modification times.
 import gc
 import os
 import re
-import time
 import json
 import threading
 import logging
@@ -23,12 +22,11 @@ from api.services.people import extract_people_from_text
 
 # V2 People System integration
 try:
-    from api.services.entity_resolver import EntityResolver, get_entity_resolver
+    from api.services.entity_resolver import EntityResolver, get_entity_resolver  # noqa: F401
     from api.services.interaction_store import (
-        InteractionStore,
+        InteractionStore,  # noqa: F401
         get_interaction_store,
         create_vault_interaction,
-        build_obsidian_link,
         UNDATED_SENTINEL,
     )
     from api.services.source_entity import (
@@ -688,6 +686,7 @@ class IndexerService:
                 # Link to the resolved person
                 source_entity.canonical_person_id = entity.id
                 source_entity.link_confidence = result.confidence
+                source_entity.link_method = result.match_type
                 source_entity.linked_at = datetime.now(timezone.utc)
 
                 # Add or update (handles duplicates on re-index)
