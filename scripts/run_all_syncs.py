@@ -61,6 +61,12 @@ EMBEDDING_SOURCES = {"vault_reindex", "crm_vectorstore"}
 # gte-Qwen2-1.5B needs ~3 GB; add headroom for PyTorch allocator overhead.
 _EMBEDDING_MEMORY_THRESHOLD_MB = 6_000
 
+# Minimum free system RAM (MB) required to run embedding phases.
+# Model loading temporarily needs ~4 GB system RAM even when targeting GPU.
+# Below this threshold, embedding phases are skipped to avoid OOM-killing
+# other processes (Chrome, Claude Code, etc.).
+_EMBEDDING_RAM_THRESHOLD_MB = 4_000
+
 
 def _is_llm_running() -> bool:
     """Check if lifeos-llm systemd service is active."""
@@ -85,6 +91,20 @@ def _get_available_gpu_memory_mb() -> int | None:
                 total = int(vram_total.read_text().strip())
                 used = int(vram_used.read_text().strip())
                 return (total - used) // (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
+
+def _get_available_system_ram_mb() -> int | None:
+    """Get available system RAM in MB from /proc/meminfo, or None if unavailable."""
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        for line in meminfo.splitlines():
+            if line.startswith("MemAvailable:"):
+                # MemAvailable is in kB
+                kb = int(line.split()[1])
+                return kb // 1024
     except Exception:
         pass
     return None
@@ -885,6 +905,7 @@ def run_all_syncs(
     # One-shot: only check GPU memory once for the first embedding source,
     # since conditions won't change mid-sync (LLM is either stopped or not).
     llm_memory_checked = False
+    _skip_embedding_phases = False
 
     try:
         for source_idx, source in enumerate(sources):
@@ -932,8 +953,22 @@ def run_all_syncs(
             # Memory-gated LLM management for embedding phases (after skip guards)
             if source in EMBEDDING_SOURCES and not dry_run and not llm_memory_checked:
                 llm_memory_checked = True
+
+                # Check system RAM first — insufficient RAM causes kernel OOM kills
+                available_ram = _get_available_system_ram_mb()
+                if available_ram is not None and available_ram < _EMBEDDING_RAM_THRESHOLD_MB:
+                    logger.warning(
+                        f"Insufficient system RAM ({available_ram} MB free, need {_EMBEDDING_RAM_THRESHOLD_MB} MB) "
+                        f"— skipping embedding phases to avoid OOM"
+                    )
+                    _skip_embedding_phases = True
+                else:
+                    _skip_embedding_phases = False
+                    if available_ram is not None:
+                        logger.info(f"System RAM check passed: {available_ram} MB available")
+
                 _llm_was_running_before_sync = _is_llm_running()
-                if _llm_was_running_before_sync:
+                if _llm_was_running_before_sync and not _skip_embedding_phases:
                     available = _get_available_gpu_memory_mb()
                     if available is None or available < _EMBEDDING_MEMORY_THRESHOLD_MB:
                         logger.info(f"Insufficient GPU memory ({available or 'unknown'} MB) for embeddings — stopping LLM")
@@ -941,6 +976,16 @@ def run_all_syncs(
                             _llm_stopped_for_sync = True
                     else:
                         logger.info(f"Sufficient GPU memory ({available} MB) — LLM stays running")
+
+            if source in EMBEDDING_SOURCES and not dry_run and _skip_embedding_phases:
+                logger.warning(f"Skipping {source}: insufficient system RAM")
+                results[source] = {
+                    "skipped": True,
+                    "reason": "insufficient_ram",
+                    "available_ram_mb": available_ram,
+                }
+                failed.append(source)
+                continue
 
             success, stats = run_sync(source, dry_run=dry_run)
             results[source] = {"success": success, **stats}

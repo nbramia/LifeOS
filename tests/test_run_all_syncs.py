@@ -169,6 +169,7 @@ def _run_llm_test(
     llm_running: bool = True,
     gpu_memory_mb: int | None = 2000,
     stop_succeeds: bool = True,
+    system_ram_mb: int | None = 16_000,
 ):
     """Run run_all_syncs with LLM memory gating mocks (dry_run=False).
 
@@ -190,6 +191,7 @@ def _run_llm_test(
         patch("urllib.request.urlopen"),
         patch("scripts.run_all_syncs._is_llm_running", return_value=llm_running),
         patch("scripts.run_all_syncs._get_available_gpu_memory_mb", return_value=gpu_memory_mb),
+        patch("scripts.run_all_syncs._get_available_system_ram_mb", return_value=system_ram_mb),
         patch("scripts.run_all_syncs._stop_llm_for_embeddings", return_value=stop_succeeds) as stop_mock,
         patch("scripts.run_all_syncs._start_llm") as start_mock,
         patch("scripts.run_all_syncs.get_sync_health") as health_mock,
@@ -277,3 +279,84 @@ class TestLLMMemoryGating:
 
         # After run_all_syncs returns, the module-level globals should be reset
         assert module._llm_stopped_for_sync is False
+
+
+# =============================================================================
+# System RAM Pre-flight Tests
+# =============================================================================
+
+
+class TestSystemRAMPreFlight:
+    """Tests for system RAM check before embedding phases."""
+
+    def test_embeddings_skipped_when_ram_low(self):
+        """Embedding sources are skipped when system RAM is below threshold."""
+        result, run_sync_mock, _, _ = _run_llm_test(
+            llm_running=False, gpu_memory_mb=50_000, system_ram_mb=2000,
+        )
+
+        # Embedding sources should be skipped, not run
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "vault_reindex" not in called_sources
+        assert "crm_vectorstore" not in called_sources
+
+        # Should be marked with reason
+        assert result["results"]["vault_reindex"]["reason"] == "insufficient_ram"
+        assert result["results"]["crm_vectorstore"]["reason"] == "insufficient_ram"
+
+    def test_embeddings_run_when_ram_sufficient(self):
+        """Embedding sources run normally when system RAM is above threshold."""
+        result, run_sync_mock, _, _ = _run_llm_test(
+            llm_running=False, gpu_memory_mb=50_000, system_ram_mb=16_000,
+        )
+
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "vault_reindex" in called_sources
+        assert "crm_vectorstore" in called_sources
+
+    def test_non_embedding_sources_unaffected_by_low_ram(self):
+        """Non-embedding sources still run even when RAM is low."""
+        result, run_sync_mock, _, _ = _run_llm_test(
+            llm_running=False, gpu_memory_mb=50_000, system_ram_mb=2000,
+        )
+
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "source_a" in called_sources
+        assert "source_z" in called_sources
+
+    def test_ram_check_unknown_allows_embeddings(self):
+        """When RAM check returns None (unsupported OS), embeddings proceed."""
+        result, run_sync_mock, _, _ = _run_llm_test(
+            llm_running=False, gpu_memory_mb=50_000, system_ram_mb=None,
+        )
+
+        called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
+        assert "vault_reindex" in called_sources
+
+
+class TestGetAvailableSystemRAM:
+    """Tests for _get_available_system_ram_mb."""
+
+    def test_parses_meminfo(self):
+        """Correctly parses MemAvailable from /proc/meminfo."""
+        from scripts.run_all_syncs import _get_available_system_ram_mb
+
+        fake_meminfo = (
+            "MemTotal:       32000000 kB\n"
+            "MemFree:         1000000 kB\n"
+            "MemAvailable:   16000000 kB\n"
+            "Buffers:          500000 kB\n"
+        )
+        with patch("pathlib.Path.read_text", return_value=fake_meminfo):
+            result = _get_available_system_ram_mb()
+
+        assert result == 15625  # 16000000 // 1024
+
+    def test_returns_none_on_error(self):
+        """Returns None when /proc/meminfo is unreadable."""
+        from scripts.run_all_syncs import _get_available_system_ram_mb
+
+        with patch("pathlib.Path.read_text", side_effect=FileNotFoundError):
+            result = _get_available_system_ram_mb()
+
+        assert result is None
