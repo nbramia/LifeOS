@@ -107,6 +107,18 @@ class PersonEntity:
         if not self.display_name and self.canonical_name:
             self.display_name = self.canonical_name
 
+    def validate(self) -> None:
+        """Validate required fields and value constraints.
+
+        Raises:
+            ValueError: If any field fails validation.
+        """
+        if not self.id:
+            raise ValueError("PersonEntity.id is required")
+
+        if not self.canonical_name or not self.canonical_name.strip():
+            raise ValueError("PersonEntity.canonical_name is required")
+
     @property
     def primary_email(self) -> Optional[str]:
         """Get the primary (first) email address."""
@@ -828,6 +840,8 @@ class PersonEntityStore:
         Returns:
             The added entity, or None if blocked
         """
+        entity.validate()
+
         # Check blocklist - reject if any identifier is blocked
         for email in entity.emails:
             if self.is_blocked(email):
@@ -864,6 +878,7 @@ class PersonEntityStore:
         Returns:
             The updated entity (a copy is stored internally)
         """
+        entity.validate()
         values = self._entity_to_values(entity)
         conn = self._get_connection()
         try:

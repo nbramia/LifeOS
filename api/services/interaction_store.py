@@ -27,6 +27,16 @@ UNDATED_SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # Reject interactions with source_ids pointing to temp directories (test artifacts)
 TEMP_PREFIXES = ('/tmp', '/private/var/folders', '/var/folders')
 
+# Valid source types for interactions
+VALID_SOURCE_TYPES = frozenset({
+    "gmail", "calendar", "vault", "granola", "imessage",
+    "whatsapp", "contacts", "phone", "photos", "slack",
+})
+
+# Reasonable timestamp bounds
+_MIN_TIMESTAMP = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_MAX_FUTURE_DAYS = 90  # Calendar events can be up to ~30 days out; allow margin
+
 
 def get_interaction_db_path() -> str:
     """Get the path to the interactions database."""
@@ -107,6 +117,30 @@ class Interaction:
             source_account=source_account,
             attendee_count=attendee_count,
         )
+
+    def validate(self) -> None:
+        """Validate required fields and value constraints.
+
+        Raises:
+            ValueError: If any field fails validation.
+        """
+        if not self.person_id:
+            raise ValueError("Interaction.person_id is required")
+
+        if not self.source_type:
+            raise ValueError("Interaction.source_type is required")
+        if self.source_type not in VALID_SOURCE_TYPES:
+            raise ValueError(
+                f"Interaction.source_type {self.source_type!r} not in {sorted(VALID_SOURCE_TYPES)}"
+            )
+
+        if self.timestamp and self.timestamp != UNDATED_SENTINEL:
+            ts = _make_aware(self.timestamp)
+            if ts < _MIN_TIMESTAMP:
+                raise ValueError(f"Interaction.timestamp too old: {self.timestamp}")
+            max_future = datetime.now(timezone.utc) + timedelta(days=_MAX_FUTURE_DAYS)
+            if ts > max_future:
+                raise ValueError(f"Interaction.timestamp is in the future: {self.timestamp}")
 
     @property
     def source_badge(self) -> str:
@@ -316,6 +350,8 @@ class InteractionStore:
         Returns:
             The added interaction
         """
+        interaction.validate()
+
         # Guard: reject interactions with temp-dir source_ids (test artifacts)
         if interaction.source_id and any(interaction.source_id.startswith(p) for p in TEMP_PREFIXES):
             logger.warning("Skipping interaction with temp-dir source_id: %s", interaction.source_id[:80])
@@ -400,6 +436,8 @@ class InteractionStore:
         rows = []
         affected_person_ids: set[str] = set()
         for interaction in interactions:
+            interaction.validate()
+
             if interaction.source_id and any(
                 interaction.source_id.startswith(p) for p in TEMP_PREFIXES
             ):
