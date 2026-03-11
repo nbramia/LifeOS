@@ -37,16 +37,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import sqlite3
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
 from api.services.source_entity import (
-    SourceEntityStore,
     SourceEntity,
     get_source_entity_store,
     LINK_STATUS_AUTO,
 )
-from api.services.entity_resolver import EntityResolver, get_entity_resolver
+from api.services.entity_resolver import get_entity_resolver
 from api.utils.db_paths import get_crm_db_path
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -288,6 +286,7 @@ def relink_source_entities(
                             canonical_person_id=result.entity.id,
                             confidence=result.confidence,
                             status=LINK_STATUS_AUTO,
+                            method=result.match_type,
                         )
 
                     # Log some examples
@@ -309,7 +308,7 @@ def relink_source_entities(
 
     # Print summary
     logger.info(f"\n{'='*50}")
-    logger.info(f"Entity Re-linking Summary")
+    logger.info("Entity Re-linking Summary")
     logger.info(f"{'='*50}")
     logger.info(f"Entities processed:   {stats['entities_processed']:,}")
     logger.info(f"Newly linked:         {stats['newly_linked']:,}")
@@ -319,12 +318,12 @@ def relink_source_entities(
     logger.info(f"Errors:               {stats['errors']:,}")
 
     if stats['by_match_type']:
-        logger.info(f"\nMatches by type:")
+        logger.info("\nMatches by type:")
         for match_type, count in sorted(stats['by_match_type'].items(), key=lambda x: -x[1]):
             logger.info(f"  {match_type}: {count:,}")
 
     if dry_run:
-        logger.info(f"\nDRY RUN - no changes made. Use --execute to apply.")
+        logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
 
     return stats
 

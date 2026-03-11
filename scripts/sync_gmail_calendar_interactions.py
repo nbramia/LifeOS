@@ -285,6 +285,7 @@ def sync_gmail_interactions(
                             )
                             source_entity.canonical_person_id = sender_person_id
                             source_entity.link_confidence = sender_result.confidence if sender_result else 1.0
+                            source_entity.link_method = sender_result.match_type if sender_result else None
                             source_entity.linked_at = datetime.now(timezone.utc)
                             source_entity_store.add_or_update(source_entity)
                             stats['source_entities_created'] += 1
@@ -347,6 +348,7 @@ def sync_gmail_interactions(
                             )
                             source_entity.canonical_person_id = participant_result.entity.id
                             source_entity.link_confidence = participant_result.confidence if participant_result else 1.0
+                            source_entity.link_method = participant_result.match_type if participant_result else None
                             source_entity.linked_at = datetime.now(timezone.utc)
                             source_entity_store.add_or_update(source_entity)
                             stats['source_entities_created'] += 1
@@ -418,6 +420,7 @@ def sync_gmail_interactions(
                             )
                             source_entity.canonical_person_id = recipient_result.entity.id
                             source_entity.link_confidence = recipient_result.confidence
+                            source_entity.link_method = recipient_result.match_type
                             source_entity.linked_at = datetime.now(timezone.utc)
                             source_entity_store.add_or_update(source_entity)
                             stats['source_entities_created'] += 1
@@ -619,6 +622,7 @@ def sync_calendar_interactions(
                     )
                     source_entity.canonical_person_id = person_id
                     source_entity.link_confidence = result.confidence if result else 1.0
+                    source_entity.link_method = result.match_type if result else None
                     source_entity.linked_at = datetime.now(timezone.utc)
                     source_entity_store.add_or_update(source_entity)
                     stats['source_entities_created'] += 1
@@ -717,7 +721,6 @@ def _parse_attendees_from_title(title: str) -> list[str]:
     import re
 
     names = []
-    title_lower = title.lower()
 
     # Pattern: "1:1 with <name>"
     match = re.search(r'1:1\s+with\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)', title, re.IGNORECASE)

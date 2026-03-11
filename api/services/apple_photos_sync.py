@@ -20,7 +20,6 @@ from typing import Optional
 from api.services.apple_photos import (
     ApplePhotosReader,
     PhotosPerson,
-    PhotoAsset,
     get_apple_photos_reader,
 )
 from api.services.apple_contacts import get_contacts_reader
@@ -34,7 +33,7 @@ from api.services.interaction_store import (
     InteractionStore,
     get_interaction_store,
 )
-from api.services.person_entity import PersonEntity, get_person_entity_store
+from api.services.person_entity import get_person_entity_store
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +335,7 @@ class ApplePhotosSync:
                 observed_name=photos_person.full_name,
                 canonical_person_id=entity_id,
                 link_confidence=0.95,  # High confidence from contact UUID match
+                link_method="contact_uuid",
                 observed_at=photo.timestamp or datetime.now(timezone.utc),
                 metadata={
                     "photos_person_pk": photos_person.pk,

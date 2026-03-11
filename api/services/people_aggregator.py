@@ -19,7 +19,6 @@ from typing import Optional
 
 from api.services.people import (
     PEOPLE_DICTIONARY,
-    ALIAS_MAP,
     resolve_person_name,
     extract_people_from_text,
 )
@@ -463,6 +462,7 @@ def sync_linkedin_to_v2(
                     )
                     source_entity.canonical_person_id = result.entity.id
                     source_entity.link_confidence = result.confidence
+                    source_entity.link_method = result.match_type
                     source_entity.linked_at = datetime.now(timezone.utc)
                     source_entity_store.add_or_update(source_entity)
                     stats["source_entities_created"] += 1

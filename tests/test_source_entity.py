@@ -262,6 +262,134 @@ class TestSourceEntityStore:
         assert stats["by_source"]["calendar"] == 1
 
 
+class TestLinkMethod:
+    """Tests for link_method provenance tracking."""
+
+    def test_link_method_in_dataclass(self):
+        """link_method field defaults to None."""
+        entity = SourceEntity(source_type="gmail", source_id="msg1")
+        assert entity.link_method is None
+
+    def test_link_method_set_on_creation(self):
+        """link_method can be set at creation time."""
+        entity = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="email_exact",
+        )
+        assert entity.link_method == "email_exact"
+
+    def test_link_method_persisted_on_add(self, store):
+        """link_method is stored and retrieved via add/get."""
+        entity = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="name_fuzzy",
+        )
+        store.add(entity)
+
+        retrieved = store.get_by_id(entity.id)
+        assert retrieved.link_method == "name_fuzzy"
+
+    def test_link_method_persisted_on_update(self, store):
+        """link_method is preserved through update."""
+        entity = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="email_exact",
+        )
+        store.add(entity)
+
+        entity.link_method = "phone_exact"
+        store.update(entity)
+
+        retrieved = store.get_by_id(entity.id)
+        assert retrieved.link_method == "phone_exact"
+
+    def test_link_to_person_with_method(self, store):
+        """link_to_person sets link_method when provided."""
+        entity = SourceEntity(source_type="gmail", source_id="msg1")
+        store.add(entity)
+
+        store.link_to_person(
+            entity.id, "person1", confidence=0.9, method="email_exact",
+        )
+
+        retrieved = store.get_by_id(entity.id)
+        assert retrieved.link_method == "email_exact"
+
+    def test_link_to_person_preserves_existing_method(self, store):
+        """link_to_person without method keeps existing link_method (COALESCE)."""
+        entity = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="name_fuzzy",
+        )
+        store.add(entity)
+
+        store.link_to_person(entity.id, "person1", confidence=0.95)
+
+        retrieved = store.get_by_id(entity.id)
+        assert retrieved.link_method == "name_fuzzy"
+
+    def test_link_method_in_to_dict(self):
+        """link_method appears in to_dict output."""
+        entity = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="email_exact",
+        )
+        d = entity.to_dict()
+        assert d["link_method"] == "email_exact"
+
+    def test_link_method_roundtrip_from_dict(self):
+        """link_method survives to_dict → from_dict roundtrip."""
+        original = SourceEntity(
+            source_type="gmail",
+            source_id="msg1",
+            link_method="phone_exact",
+        )
+        restored = SourceEntity.from_dict(original.to_dict())
+        assert restored.link_method == "phone_exact"
+
+    def test_get_low_confidence_filter_by_link_method(self, store):
+        """get_low_confidence can filter by link_method."""
+        for i, method in enumerate(["email_exact", "name_fuzzy", "name_fuzzy"]):
+            entity = SourceEntity(
+                source_type="gmail",
+                source_id=f"msg{i}",
+                canonical_person_id="person1",
+                link_confidence=0.7,
+                link_method=method,
+            )
+            store.add(entity, validate_person=False)
+
+        all_low = store.get_low_confidence(max_confidence=0.85)
+        assert len(all_low) == 3
+
+        fuzzy_only = store.get_low_confidence(max_confidence=0.85, link_method="name_fuzzy")
+        assert len(fuzzy_only) == 2
+
+        exact_only = store.get_low_confidence(max_confidence=0.85, link_method="email_exact")
+        assert len(exact_only) == 1
+
+    def test_count_low_confidence_filter_by_link_method(self, store):
+        """count_low_confidence can filter by link_method."""
+        for i, method in enumerate(["email_exact", "name_fuzzy"]):
+            entity = SourceEntity(
+                source_type="gmail",
+                source_id=f"msg{i}",
+                canonical_person_id="person1",
+                link_confidence=0.6,
+                link_method=method,
+            )
+            store.add(entity, validate_person=False)
+
+        assert store.count_low_confidence(max_confidence=0.85) == 2
+        assert store.count_low_confidence(max_confidence=0.85, link_method="name_fuzzy") == 1
+        assert store.count_low_confidence(max_confidence=0.85, link_method="nonexistent") == 0
+
+
 class TestFactoryFunctions:
     """Tests for source entity factory functions."""
 
