@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -729,6 +729,49 @@ class PersonEntityStore:
         logger.info(f"Hidden person '{entity.canonical_name}' (ID: {entity_id[:8]}), "
                     f"blocklisted {len(entity.emails)} emails, {len(entity.phone_numbers)} phones")
         return entity
+
+    def purge_hidden(self, older_than_days: int = 90) -> int:
+        """
+        Permanently delete merge-hidden entities older than the retention period.
+
+        Only deletes entities where hidden_reason starts with 'merged_into:'
+        and hidden_at is older than `older_than_days` days ago. Entities hidden
+        via hide_person() (blocklist) are not affected.
+
+        Does NOT remove entries from merged_person_ids.json (those must persist
+        to prevent entity resolution from recreating duplicates).
+
+        Args:
+            older_than_days: Minimum age in days before purging (default 90)
+
+        Returns:
+            Number of entities permanently deleted
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM person_entities WHERE hidden = 1 AND hidden_at IS NOT NULL AND hidden_at < ?"
+                " AND hidden_reason LIKE 'merged_into:%'",
+                (cutoff,),
+            ).fetchall()
+
+            count = 0
+            for (entity_id,) in rows:
+                conn.execute("DELETE FROM person_emails WHERE person_id = ?", (entity_id,))
+                conn.execute("DELETE FROM person_phones WHERE person_id = ?", (entity_id,))
+                conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
+                conn.execute("DELETE FROM person_entities WHERE id = ?", (entity_id,))
+                count += 1
+
+            if count > 0:
+                conn.commit()
+                logger.info(f"Purged {count} hidden entities older than {older_than_days} days")
+
+            return count
+        finally:
+            conn.close()
 
     # --- Merge chain methods ---
 
