@@ -848,6 +848,7 @@ class SourceEntityStore:
                        canonical_person_id = ?,
                        link_confidence = ?,
                        link_status = ?,
+                       link_method = 'email_exact',
                        linked_at = ?
                    WHERE LOWER(observed_email) = LOWER(?)
                    AND canonical_person_id IS NULL
@@ -897,6 +898,7 @@ class SourceEntityStore:
                        canonical_person_id = ?,
                        link_confidence = ?,
                        link_status = ?,
+                       link_method = 'phone_exact',
                        linked_at = ?
                    WHERE observed_phone = ?
                    AND canonical_person_id IS NULL

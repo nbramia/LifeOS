@@ -178,6 +178,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
             )
             source_entity.canonical_person_id = person_id
             source_entity.link_confidence = 1.0
+            source_entity.link_method = "imessage_handle"
             source_entity.linked_at = datetime.now(timezone.utc)
             source_entity_store.add_or_update(source_entity)
             stats['source_entities_created'] += 1
@@ -202,7 +203,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     imessage_conn.close()
     interactions_conn.close()
 
-    logger.info(f"\n=== iMessage Sync Summary ===")
+    logger.info("\n=== iMessage Sync Summary ===")
     logger.info(f"Messages checked: {stats['messages_checked']}")
     logger.info(f"Already exists: {stats['already_exists']}")
     logger.info(f"Person not found: {stats['person_not_found']}")
