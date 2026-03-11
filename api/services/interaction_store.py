@@ -35,7 +35,7 @@ VALID_SOURCE_TYPES = frozenset({
 
 # Reasonable timestamp bounds
 _MIN_TIMESTAMP = datetime(2000, 1, 1, tzinfo=timezone.utc)
-_MAX_FUTURE_DAYS = 1  # Allow 1 day of clock skew
+_MAX_FUTURE_DAYS = 90  # Calendar events can be up to ~30 days out; allow margin
 
 
 def get_interaction_db_path() -> str:

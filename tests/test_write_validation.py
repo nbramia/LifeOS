@@ -61,15 +61,16 @@ class TestInteractionValidate:
 
     def test_timestamp_in_future_rejected(self):
         interaction = self._make_interaction(
-            timestamp=datetime.now(timezone.utc) + timedelta(days=7)
+            timestamp=datetime.now(timezone.utc) + timedelta(days=180)
         )
         with pytest.raises(ValueError, match="timestamp is in the future"):
             interaction.validate()
 
-    def test_timestamp_slightly_future_ok(self):
-        """Allow up to 1 day of clock skew."""
+    def test_calendar_future_event_ok(self):
+        """Calendar events can be up to ~30 days out; allow 90 days margin."""
         interaction = self._make_interaction(
-            timestamp=datetime.now(timezone.utc) + timedelta(hours=12)
+            source_type="calendar",
+            timestamp=datetime.now(timezone.utc) + timedelta(days=30),
         )
         interaction.validate()  # Should not raise
 
