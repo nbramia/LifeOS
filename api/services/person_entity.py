@@ -64,6 +64,7 @@ class PersonEntity:
     mention_count: int = 0
     message_count: int = 0  # iMessage/SMS count
     slack_message_count: int = 0  # Actual Slack messages (not daily summaries)
+    photo_count: int = 0  # Photos with this person (Apple Photos)
 
     # Related content
     related_notes: list[str] = field(default_factory=list)
@@ -223,6 +224,7 @@ class PersonEntity:
         mention_count = self.mention_count + other.mention_count
         message_count = self.message_count + other.message_count
         slack_message_count = self.slack_message_count + other.slack_message_count
+        photo_count = self.photo_count + other.photo_count
 
         # Combine related notes
         related_notes = list(set(self.related_notes + other.related_notes))
@@ -288,6 +290,7 @@ class PersonEntity:
             mention_count=mention_count,
             message_count=message_count,
             slack_message_count=slack_message_count,
+            photo_count=photo_count,
             related_notes=related_notes,
             aliases=aliases,
             phone_numbers=phone_numbers,
@@ -350,6 +353,7 @@ class PersonEntity:
         data.setdefault("source_entity_count", 0)
         data.setdefault("message_count", 0)
         data.setdefault("slack_message_count", 0)
+        data.setdefault("photo_count", 0)
         # Handle hidden fields (default to not hidden)
         data.setdefault("hidden", False)
         data.setdefault("hidden_at", None)
@@ -456,7 +460,7 @@ class PersonEntityStore:
     _COLUMNS = (
         "id", "canonical_name", "display_name", "emails", "company", "position",
         "linkedin_url", "category", "vault_contexts", "sources", "first_seen", "last_seen",
-        "meeting_count", "email_count", "mention_count", "message_count", "slack_message_count",
+        "meeting_count", "email_count", "mention_count", "message_count", "slack_message_count", "photo_count",
         "related_notes", "aliases", "phone_numbers", "phone_primary", "confidence_score",
         "tags", "notes", "source_entity_count", "birthday", "hidden", "hidden_at",
         "hidden_reason", "relationship_strength", "is_peripheral_contact", "dunbar_circle",
@@ -505,6 +509,7 @@ class PersonEntityStore:
                     mention_count INTEGER NOT NULL DEFAULT 0,
                     message_count INTEGER NOT NULL DEFAULT 0,
                     slack_message_count INTEGER NOT NULL DEFAULT 0,
+                    photo_count INTEGER NOT NULL DEFAULT 0,
                     related_notes TEXT NOT NULL DEFAULT '[]',
                     aliases TEXT NOT NULL DEFAULT '[]',
                     phone_numbers TEXT NOT NULL DEFAULT '[]',
@@ -553,6 +558,11 @@ class PersonEntityStore:
                 CREATE INDEX IF NOT EXISTS idx_person_phones_pid ON person_phones(person_id);
                 CREATE INDEX IF NOT EXISTS idx_person_names_pid ON person_names(person_id);
             """)
+            # Migration: add photo_count column if missing
+            try:
+                conn.execute("ALTER TABLE person_entities ADD COLUMN photo_count INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.commit()
         finally:
             conn.close()
@@ -584,6 +594,7 @@ class PersonEntityStore:
             entity.mention_count,
             entity.message_count,
             entity.slack_message_count,
+            entity.photo_count,
             json.dumps(entity.related_notes),
             json.dumps(entity.aliases),
             json.dumps(entity.phone_numbers),

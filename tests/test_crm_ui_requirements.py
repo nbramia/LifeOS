@@ -9,13 +9,12 @@ Verifies:
 """
 import pytest
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from api.services.person_entity import PersonEntity, get_person_entity_store
+from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
 
 
@@ -160,7 +159,6 @@ class TestStatsMatchDatabase:
         cursor = conn.execute("""
             SELECT person_id, COUNT(*) as cnt
             FROM interactions
-            WHERE source_type IN ('gmail','calendar','vault','granola','imessage','whatsapp','phone','slack')
             GROUP BY person_id
             ORDER BY cnt DESC
             LIMIT 1
@@ -177,7 +175,9 @@ class TestStatsMatchDatabase:
                 person.email_count +
                 person.meeting_count +
                 person.mention_count +
-                person.message_count
+                person.message_count +
+                person.slack_message_count +
+                person.photo_count
             )
 
             # Should match within reasonable margin (some interactions may not count)

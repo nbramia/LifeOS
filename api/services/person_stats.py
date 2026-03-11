@@ -190,7 +190,9 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     - gmail -> email_count
     - calendar -> meeting_count
     - vault, granola -> mention_count
-    - imessage, whatsapp, phone, slack -> message_count
+    - imessage, whatsapp, phone -> message_count
+    - slack -> slack_message_count
+    - photos -> photo_count
     """
     entity.email_count = counts.get('gmail', 0)
     entity.meeting_count = counts.get('calendar', 0)
@@ -198,9 +200,10 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     entity.message_count = (
         counts.get('imessage', 0) +
         counts.get('whatsapp', 0) +
-        counts.get('phone', 0) +
-        counts.get('slack', 0)
+        counts.get('phone', 0)
     )
+    entity.slack_message_count = counts.get('slack', 0)
+    entity.photo_count = counts.get('photos', 0)
 
     # Update sources list to include any source types with interactions
     interaction_sources = set(counts.keys())
@@ -244,14 +247,17 @@ def verify_person_stats(fix: bool = False) -> dict:
         computed_message = (
             counts.get('imessage', 0) +
             counts.get('whatsapp', 0) +
-            counts.get('phone', 0) +
-            counts.get('slack', 0)
+            counts.get('phone', 0)
         )
+        computed_slack = counts.get('slack', 0)
+        computed_photo = counts.get('photos', 0)
 
         if (entity.email_count != computed_email or
             entity.meeting_count != computed_meeting or
             entity.mention_count != computed_mention or
-            entity.message_count != computed_message):
+            entity.message_count != computed_message or
+            entity.slack_message_count != computed_slack or
+            entity.photo_count != computed_photo):
 
             discrepancies[entity.id] = {
                 'name': entity.canonical_name,
@@ -260,12 +266,16 @@ def verify_person_stats(fix: bool = False) -> dict:
                     'meeting': entity.meeting_count,
                     'mention': entity.mention_count,
                     'message': entity.message_count,
+                    'slack': entity.slack_message_count,
+                    'photo': entity.photo_count,
                 },
                 'computed': {
                     'email': computed_email,
                     'meeting': computed_meeting,
                     'mention': computed_mention,
                     'message': computed_message,
+                    'slack': computed_slack,
+                    'photo': computed_photo,
                 },
             }
 
