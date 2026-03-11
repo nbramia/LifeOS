@@ -362,6 +362,9 @@ class TelegramBotListener:
             if self._STATE_FILE.exists():
                 data = json.loads(self._STATE_FILE.read_text())
                 update_id = data.get("last_update_id", 0)
+                if not isinstance(update_id, int) or update_id < 0:
+                    logger.warning(f"Invalid update_id in state file: {update_id!r}, resetting to 0")
+                    return 0
                 logger.info(f"Restored Telegram update offset: {update_id}")
                 return update_id
         except Exception as e:
@@ -369,10 +372,12 @@ class TelegramBotListener:
         return 0
 
     def _save_last_update_id(self):
-        """Persist current update_id to disk."""
+        """Persist current update_id to disk (atomic write)."""
         try:
             self._STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            self._STATE_FILE.write_text(json.dumps({"last_update_id": self._last_update_id}))
+            tmp = self._STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"last_update_id": self._last_update_id}))
+            tmp.rename(self._STATE_FILE)
         except Exception as e:
             logger.warning(f"Could not save Telegram state: {e}")
 
@@ -458,6 +463,14 @@ class TelegramBotListener:
         if not message:
             return
 
+        text = message.get("text", "").strip()
+        chat_id = str(message["chat"]["id"])
+
+        # Auth check first — don't let unauthorized chats pollute the dedup window
+        if chat_id != settings.telegram_chat_id:
+            logger.warning(f"Ignoring message from unauthorized chat: {chat_id}")
+            return
+
         # Dedup safety net: skip messages already processed in this session
         message_id = message.get("message_id")
         if message_id and message_id in self._processed_ids:
@@ -465,14 +478,6 @@ class TelegramBotListener:
             return
         if message_id:
             self._processed_ids.append(message_id)
-
-        text = message.get("text", "").strip()
-        chat_id = str(message["chat"]["id"])
-
-        # Only respond to the configured chat
-        if chat_id != settings.telegram_chat_id:
-            logger.warning(f"Ignoring message from unauthorized chat: {chat_id}")
-            return
 
         if not text:
             return

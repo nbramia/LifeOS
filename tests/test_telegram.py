@@ -207,6 +207,28 @@ class TestUpdateOffsetPersistence:
             listener = TelegramBotListener()
             assert listener._last_update_id == 0
 
+    def test_default_zero_on_invalid_type(self, tmp_path):
+        """Defaults to 0 when update_id is not an int."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+        state_file.write_text(json.dumps({"last_update_id": "not-an-int"}))
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            assert listener._last_update_id == 0
+
+    def test_default_zero_on_negative_value(self, tmp_path):
+        """Defaults to 0 when update_id is negative."""
+        from api.services.telegram import TelegramBotListener
+
+        state_file = tmp_path / "telegram_state.json"
+        state_file.write_text(json.dumps({"last_update_id": -5}))
+
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+            assert listener._last_update_id == 0
+
     def test_save_persists_to_file(self, tmp_path):
         """_save_last_update_id writes to state file."""
         from api.services.telegram import TelegramBotListener
