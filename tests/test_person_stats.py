@@ -207,17 +207,16 @@ class TestApplyCountsToEntity:
         assert entity.email_count == 10
         assert entity.meeting_count == 5
         assert entity.mention_count == 5  # vault + granola
-        assert entity.message_count == 12  # imessage + whatsapp + phone
-        assert entity.slack_message_count == 6
+        assert entity.message_count == 18  # imessage + whatsapp + phone + slack
         assert entity.photo_count == 8
 
-    def test_slack_maps_to_slack_message_count(self):
-        """Verify 'slack' maps to slack_message_count, not message_count."""
+    def test_slack_maps_to_message_count(self):
+        """Verify 'slack' maps to message_count (slack_message_count is managed by slack_sync)."""
         entity = PersonEntity(canonical_name="Test")
         counts = {'slack': 10}
         _apply_counts_to_entity(entity, counts)
-        assert entity.slack_message_count == 10
-        assert entity.message_count == 0
+        assert entity.message_count == 10
+        assert entity.slack_message_count == 0  # Not touched by _apply_counts
 
     def test_photos_maps_to_photo_count(self):
         """Verify 'photos' maps to photo_count."""
