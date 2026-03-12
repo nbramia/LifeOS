@@ -656,7 +656,7 @@ Return JSON: {{"intent": "<intent>", "confidence": <0.0-1.0>}}"""
 
 async def classify_action_intent(query: str, conversation_history: list = None) -> Optional[ActionIntent]:
     """
-    Classify action intent using LLM (Ollama first, Haiku fallback).
+    Classify action intent using Haiku (primary) with pattern matching fallback.
 
     Uses conversation history to understand follow-ups like "Both" or "the second one".
 
@@ -681,28 +681,17 @@ async def classify_action_intent(query: str, conversation_history: list = None) 
 
     prompt = _INTENT_CLASSIFICATION_PROMPT.format(query=query, context=context)
 
-    # Try Ollama (local, fast, free)
-    intent_str = await _classify_via_ollama(prompt)
-    if intent_str:
-        result = _parse_intent_response(intent_str)
-        if result:
-            return result
-
-    # Fallback: Haiku (remote, cheap, reliable)
+    # Primary: Haiku (fast, cheap, reliable)
     intent_str = await _classify_via_haiku(prompt)
     if intent_str:
         result = _parse_intent_response(intent_str)
         if result:
-            # Track degradation: Ollama failed, using Haiku
-            from api.services.service_health import record_degradation
-            record_degradation("ollama", "intent_classification", "haiku_llm", "Ollama unavailable or failed")
             return result
 
-    # Last resort: pattern matching when both LLMs are down
-    logger.warning("Both Ollama and Haiku unavailable for intent classification, using pattern fallback")
-    # Track degradation: both LLMs failed, using pattern matching
+    # Fallback: pattern matching when Haiku is unavailable
+    logger.warning("Haiku unavailable for intent classification, using pattern fallback")
     from api.services.service_health import record_degradation
-    record_degradation("ollama", "intent_classification", "pattern_matching", "Both Ollama and Haiku unavailable")
+    record_degradation("haiku", "intent_classification", "pattern_matching", "Haiku unavailable")
     return _classify_action_intent_patterns(query)
 
 
