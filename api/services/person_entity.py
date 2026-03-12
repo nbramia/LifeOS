@@ -194,7 +194,7 @@ class PersonEntity:
         """
         if not phone:
             return False
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         normalized = normalize_phone(phone)
         if not normalized:
             return False
@@ -965,7 +965,7 @@ class PersonEntityStore:
 
     def get_by_phone(self, phone: str) -> Optional[PersonEntity]:
         """Get entity by phone number (normalizes to E.164), following merge chain."""
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         normalized = normalize_phone(phone)
         if not normalized:
             return None

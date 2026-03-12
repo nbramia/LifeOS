@@ -114,55 +114,55 @@ class TestPhoneNormalization:
     """Test normalize_phone utility."""
 
     def test_parenthesized_area_code(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("(703) 798-6709") == "+17037986709"
 
     def test_ten_digits_no_separators(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("4102591307") == "+14102591307"
 
     def test_already_e164(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("+15551234567") == "+15551234567"
 
     def test_dashes_only(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("703-798-6709") == "+17037986709"
 
     def test_eleven_digits_with_country_code(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("14102591307") == "+14102591307"
 
     def test_spaces(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("703 798 6709") == "+17037986709"
 
     def test_dots(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("703.798.6709") == "+17037986709"
 
     def test_empty_string(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("") is None
 
     def test_none(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone(None) is None
 
     def test_too_short(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("555123") is None
 
     def test_too_long(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("1234567890123456") is None
 
     def test_international_already_e164(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         assert normalize_phone("+447911123456") == "+447911123456"
 
     def test_letters_stripped(self):
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         # "Call me: 703-798-6709" → should extract digits
         assert normalize_phone("703-798-6709 ext123") is None  # 13 digits after strip
 

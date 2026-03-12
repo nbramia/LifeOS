@@ -127,7 +127,7 @@ def import_contacts(dry_run: bool = False) -> dict:
 
         source_id = f"contacts:{identifier}"
         emails = [e["value"].lower() for e in contact.get("emails", []) if e.get("value")]
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         phones = [
             normalize_phone(p["value"]) or p["value"]
             for p in contact.get("phones", []) if p.get("value")

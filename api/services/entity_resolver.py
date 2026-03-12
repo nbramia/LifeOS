@@ -187,7 +187,7 @@ class EntityResolver:
         """
         if not phone:
             return None
-        from api.utils.phone_utils import normalize_phone
+        from api.services.phone_utils import normalize_phone
         normalized = normalize_phone(phone)
         if not normalized:
             return None
@@ -854,12 +854,15 @@ class EntityResolver:
             vault_contexts = get_vault_contexts_for_domain(domain) if domain else []
             category = "work" if vault_contexts else "unknown"
 
+            from api.services.phone_utils import normalize_phone
+            norm_phone = normalize_phone(phone) if phone else None
+
             entity = PersonEntity(
                 canonical_name=name_from_email,
                 display_name=name_from_email,
                 emails=[email.lower()],
-                phone_numbers=[phone] if phone else [],
-                phone_primary=phone,
+                phone_numbers=[norm_phone] if norm_phone else [],
+                phone_primary=norm_phone,
                 vault_contexts=vault_contexts,
                 category=category,
                 first_seen=None,  # Will be set from actual interactions
