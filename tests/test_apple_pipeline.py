@@ -355,6 +355,10 @@ class TestPhoneNumberExtraction:
         extract = self._get_extract()
         assert extract("Outgoing Phone with +14155551234 (120s)") == "+14155551234"
 
+    def test_facetime_audio(self):
+        extract = self._get_extract()
+        assert extract("Incoming FaceTime Audio with +12025250790 (14m 26s)") == "+12025250790"
+
     def test_no_phone_number(self):
         extract = self._get_extract()
         assert extract("Incoming Phone (missed)") is None

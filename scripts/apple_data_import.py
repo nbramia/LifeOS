@@ -253,7 +253,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
             skipped += 1
             continue
 
-        source_type = call.get("source_type", "phone_call")
+        source_type = call.get("source_type", "phone")
 
         # Check if already exists
         existing = store.get_by_source(source_type, source_id)
