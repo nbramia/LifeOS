@@ -184,19 +184,24 @@ class PersonEntity:
         """
         Add a phone number if not already present.
 
+        Normalizes to E.164 format before storing.
+
         Args:
-            phone: E.164 format phone number (+1XXXXXXXXXX)
+            phone: Phone number in any format (will be normalized to E.164)
 
         Returns:
-            True if phone was added, False if already exists
+            True if phone was added, False if already exists or unnormalizable
         """
         if not phone:
             return False
-        if not self.has_phone(phone):
-            self.phone_numbers.append(phone)
-            # Set as primary if first phone number
+        from api.services.phone_utils import normalize_phone
+        normalized = normalize_phone(phone)
+        if not normalized:
+            return False
+        if not self.has_phone(normalized):
+            self.phone_numbers.append(normalized)
             if not self.phone_primary:
-                self.phone_primary = phone
+                self.phone_primary = normalized
             return True
         return False
 
@@ -959,12 +964,16 @@ class PersonEntityStore:
             conn.close()
 
     def get_by_phone(self, phone: str) -> Optional[PersonEntity]:
-        """Get entity by phone number (E.164 format), following merge chain."""
+        """Get entity by phone number (normalizes to E.164), following merge chain."""
+        from api.services.phone_utils import normalize_phone
+        normalized = normalize_phone(phone)
+        if not normalized:
+            return None
         conn = self._get_connection()
         try:
             row = conn.execute(
                 "SELECT person_id FROM person_phones WHERE phone = ?",
-                (phone,)).fetchone()
+                (normalized,)).fetchone()
             if row:
                 return self.get_by_id(row['person_id'])
             return None

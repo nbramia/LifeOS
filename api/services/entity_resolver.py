@@ -9,8 +9,7 @@ Implements three-pass entity resolution:
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
 from rapidfuzz import fuzz
@@ -94,10 +93,9 @@ def parse_name(name: str) -> ParsedName:
             last=parts[-1],
             original=original,
         )
-from api.services.people import resolve_person_name, PEOPLE_DICTIONARY
-from api.services.link_override import get_link_override_store
-from config.people_config import (
-    DOMAIN_CONTEXT_MAP,
+from api.services.people import resolve_person_name  # noqa: E402
+from api.services.link_override import get_link_override_store  # noqa: E402
+from config.people_config import (  # noqa: E402
     COMPANY_NORMALIZATION,
     EntityResolutionConfig,
     get_vault_contexts_for_domain,
@@ -105,13 +103,13 @@ from config.people_config import (
     get_vault_contexts_for_company,
     normalize_domain,
 )
-from config.relationship_weights import (
+from config.relationship_weights import (  # noqa: E402
     RELATIONSHIP_STRENGTH_BOOST_MAX,
     RELATIONSHIP_STRENGTH_BOOST_WEIGHT,
     FIRST_NAME_ONLY_BOOST_MULTIPLIER,
 )
-from config.settings import settings
-from api.utils.datetime_utils import make_aware as _make_aware
+from config.settings import settings  # noqa: E402
+from api.utils.datetime_utils import make_aware as _make_aware  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -179,15 +177,21 @@ class EntityResolver:
         """
         Phone anchor: Exact phone match (E.164 format).
 
+        Normalizes the input to E.164 before lookup.
+
         Args:
-            phone: Phone number in E.164 format (+1XXXXXXXXXX)
+            phone: Phone number in any format (will be normalized)
 
         Returns:
             PersonEntity if found, None otherwise
         """
         if not phone:
             return None
-        return self._store.get_by_phone(phone)
+        from api.services.phone_utils import normalize_phone
+        normalized = normalize_phone(phone)
+        if not normalized:
+            return None
+        return self._store.get_by_phone(normalized)
 
     def resolve_by_name(
         self,
@@ -393,7 +397,7 @@ class EntityResolver:
                 if query_first_lower == entity_first_lower:
                     score += 25  # Exact match
                     first_matched = True
-                    first_name_exact_match = True
+                    first_name_exact_match = True  # noqa: F841 — reserved for future scoring refinement
                 elif is_first_initial and entity_first_lower.startswith(query_first_lower):
                     score += 10  # Initial prefix match
                     first_matched = True
@@ -701,7 +705,6 @@ class EntityResolver:
 
     def _infer_vault_contexts(self, file_path: str) -> list[str]:
         """Infer vault context from file path."""
-        from config.settings import settings
         path_str = str(file_path).replace("\\", "/")
 
         # Check current work path first (most specific)
@@ -725,7 +728,6 @@ class EntityResolver:
 
     def _infer_category(self, file_path: str) -> str:
         """Infer category from file path."""
-        from config.settings import settings
         path_str = str(file_path).replace("\\", "/")
 
         if "Work/" in path_str:
@@ -739,8 +741,6 @@ class EntityResolver:
 
     def _infer_context_suffix(self, file_path: str) -> str:
         """Infer disambiguation suffix from file path."""
-        from config.settings import settings
-        from config.people_config import COMPANY_NORMALIZATION
         path_str = str(file_path).replace("\\", "/")
 
         # Check current work path
@@ -854,12 +854,15 @@ class EntityResolver:
             vault_contexts = get_vault_contexts_for_domain(domain) if domain else []
             category = "work" if vault_contexts else "unknown"
 
+            from api.services.phone_utils import normalize_phone
+            norm_phone = normalize_phone(phone) if phone else None
+
             entity = PersonEntity(
                 canonical_name=name_from_email,
                 display_name=name_from_email,
                 emails=[email.lower()],
-                phone_numbers=[phone] if phone else [],
-                phone_primary=phone,
+                phone_numbers=[norm_phone] if norm_phone else [],
+                phone_primary=norm_phone,
                 vault_contexts=vault_contexts,
                 category=category,
                 first_seen=None,  # Will be set from actual interactions

@@ -6,13 +6,21 @@ Provides normalization to E.164 format and validation.
 import re
 from typing import Optional
 
+# Strip everything except digits and leading +
+_NON_PHONE_RE = re.compile(r"[^\d+]")
 
-def normalize_phone(raw: str) -> Optional[str]:
+
+def normalize_phone(raw: str, default_country: str = "US") -> Optional[str]:
     """
     Normalize phone number to E.164 format.
 
+    Handles common US formats and international numbers with + prefix.
+    Bare digit strings >11 digits are rejected (ambiguous without country code).
+
     Args:
         raw: Raw phone number in any common format
+        default_country: ISO country code for numbers without country prefix.
+            Currently only "US" is supported.
 
     Returns:
         E.164 formatted phone (+1XXXXXXXXXX) or None if invalid
@@ -26,27 +34,37 @@ def normalize_phone(raw: str) -> Optional[str]:
         '+12125550173'
         >>> normalize_phone("2125550173")
         '+12125550173'
+        >>> normalize_phone("+447700900123")
+        '+447700900123'
         >>> normalize_phone("123")
-        None
     """
     if not raw:
         return None
 
-    # Strip all non-digit characters
-    digits = re.sub(r'\D', '', raw)
-
-    if len(digits) == 10:
-        # US number without country code
-        return f"+1{digits}"
-    elif len(digits) == 11 and digits[0] == '1':
-        # US number with country code
-        return f"+{digits}"
-    elif len(digits) > 11:
-        # International number
-        return f"+{digits}"
-    else:
-        # Invalid (too short)
+    # Strip non-digit characters (keep leading +)
+    cleaned = _NON_PHONE_RE.sub("", raw.strip())
+    if not cleaned:
         return None
+
+    # Already has + prefix — validate and return
+    if cleaned.startswith("+"):
+        digits = cleaned[1:]
+        if digits.isdigit() and 10 <= len(digits) <= 15:
+            return cleaned
+        return None
+
+    # All digits from here
+    if not cleaned.isdigit():
+        return None
+
+    if default_country == "US":
+        if len(cleaned) == 11 and cleaned.startswith("1"):
+            return f"+{cleaned}"
+        if len(cleaned) == 10:
+            return f"+1{cleaned}"
+
+    # Can't normalize without country code for non-standard lengths
+    return None
 
 
 def format_phone_display(phone: str) -> str:

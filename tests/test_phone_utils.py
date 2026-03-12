@@ -1,8 +1,6 @@
 """
 Tests for phone number utilities.
 """
-import pytest
-
 from api.services.phone_utils import (
     normalize_phone,
     format_phone_display,
@@ -41,9 +39,10 @@ class TestNormalizePhone:
 
     def test_normalize_international(self):
         """Test normalizing international numbers (>11 digits)."""
-        # UK number
+        # UK number with + prefix
         assert normalize_phone("+447700900123") == "+447700900123"
-        assert normalize_phone("447700900123") == "+447700900123"
+        # Bare digits without + are rejected (ambiguous without country code)
+        assert normalize_phone("447700900123") is None
 
     def test_normalize_invalid_too_short(self):
         """Test that short numbers return None."""
