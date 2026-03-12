@@ -7,9 +7,15 @@ Model files are cached at settings.embedding_cache_dir to save internal disk spa
 NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
 """
+import logging
 from typing import TYPE_CHECKING, Any
 
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+# GPU error keywords — shared between load-time and encode-time fallback
+_GPU_ERROR_KEYWORDS = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -39,37 +45,37 @@ class EmbeddingService:
         self.model_name = model_name or settings.embedding_model
         self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
+        self._force_cpu: bool = False
 
     @property
     def model(self) -> "SentenceTransformer":
         """Lazy-load the model, falling back to CPU if GPU fails."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            import logging
-
-            logger = logging.getLogger(__name__)
 
             try:
-                # Load model with cache directory (defaults to GPU if available)
-                self._model = SentenceTransformer(
-                    self.model_name,
+                load_kwargs = dict(
+                    model_name_or_path=self.model_name,
                     cache_folder=self.cache_dir,
                 )
-                # Mark embedding model as healthy
+                if self._force_cpu:
+                    load_kwargs["device"] = "cpu"
+
+                self._model = SentenceTransformer(**load_kwargs)
                 from api.services.service_health import mark_service_healthy
                 mark_service_healthy("embedding_model")
             except RuntimeError as e:
                 # GPU errors (HIP OOM, GPU hang, invalid device) — fall back to CPU
                 error_msg = str(e).lower()
-                gpu_errors = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
-                if any(keyword in error_msg for keyword in gpu_errors):
-                    logger.warning(f"GPU embedding failed ({e}), falling back to CPU")
+                if any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
+                    logger.warning(f"GPU embedding load failed ({e}), falling back to CPU")
                     try:
                         self._model = SentenceTransformer(
                             self.model_name,
                             cache_folder=self.cache_dir,
                             device="cpu",
                         )
+                        self._force_cpu = True
                         from api.services.service_health import mark_service_healthy
                         mark_service_healthy("embedding_model")
                     except Exception as cpu_err:
@@ -87,6 +93,29 @@ class EmbeddingService:
                 raise
         return self._model
 
+    def _encode_with_fallback(self, data, **kwargs):
+        """Encode with GPU→CPU fallback on RuntimeError.
+
+        If the model was loaded on GPU and encode() raises a GPU error,
+        the model is reloaded on CPU and the encode is retried.
+        """
+        try:
+            return self.model.encode(data, **kwargs)
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if self._force_cpu or not any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
+                raise  # Already on CPU or not a GPU error
+
+            logger.warning(f"GPU encode failed ({e}), reloading model on CPU")
+            from api.services.service_health import record_degradation
+            record_degradation(
+                "embedding_gpu", "encode", "cpu_fallback",
+                f"GPU encode error: {e}",
+            )
+            self._model = None
+            self._force_cpu = True
+            return self.model.encode(data, **kwargs)
+
     def embed_text(self, text: str) -> list[float]:
         """
         Generate embedding for a single text.
@@ -97,7 +126,7 @@ class EmbeddingService:
         Returns:
             List of floats representing the embedding vector
         """
-        embedding = self.model.encode(text, convert_to_numpy=True)
+        embedding = self._encode_with_fallback(text, convert_to_numpy=True)
         return embedding.tolist()
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -110,7 +139,7 @@ class EmbeddingService:
         Returns:
             List of embedding vectors
         """
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
+        embeddings = self._encode_with_fallback(texts, convert_to_numpy=True)
         return [emb.tolist() for emb in embeddings]
 
     @property

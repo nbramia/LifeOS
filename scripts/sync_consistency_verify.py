@@ -146,8 +146,10 @@ def _check_stale_merged_ids(valid_ids: set, store, dry_run: bool, fix_threshold:
         )
         count = cursor.fetchone()[0]
 
+    # Re-pointing merged IDs is always safe (follows known merge chains),
+    # so it's not gated by fix_threshold — same rationale as relationship re-pointing.
     fixed = 0
-    if not dry_run and count > 0 and count <= fix_threshold:
+    if not dry_run and count > 0:
         conn.execute(
             "UPDATE interactions SET person_id = ("
             "  SELECT s.new_id FROM stale_ids s WHERE s.old_id = interactions.person_id"
@@ -463,7 +465,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
 
     auto_fix_skipped = any(
         check["count"] > fix_threshold and check["count"] > 0
-        for check in [orphaned_interactions, stale_merged_ids, orphaned_crm_records]
+        for check in [orphaned_interactions, orphaned_crm_records]
     )
 
     return {
@@ -497,7 +499,7 @@ def main():
     result = verify_consistency(dry_run=dry_run, fix_threshold=args.fix_threshold)
 
     # Print summary for _parse_sync_output() and human readability
-    print(f"\n=== Consistency Verification ===")
+    print("\n=== Consistency Verification ===")
     print(f"Person stats mismatches: {result['person_stats_mismatches']['count']}")
     print(f"Orphaned interactions: {result['orphaned_interactions']['count']}")
     print(f"Hidden-person interactions: {result['hidden_interactions']['count']}")
@@ -517,7 +519,6 @@ def main():
         print("All stores consistent.")
 
     # Machine-readable summary for run_all_syncs.py parsing
-    import json
     summary = {
         "total_issues": result["total_issues"],
         "total_fixed": result["total_fixed"],

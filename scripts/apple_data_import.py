@@ -127,7 +127,11 @@ def import_contacts(dry_run: bool = False) -> dict:
 
         source_id = f"contacts:{identifier}"
         emails = [e["value"].lower() for e in contact.get("emails", []) if e.get("value")]
-        phones = [p["value"] for p in contact.get("phones", []) if p.get("value")]
+        from api.utils.phone_utils import normalize_phone
+        phones = [
+            normalize_phone(p["value"]) or p["value"]
+            for p in contact.get("phones", []) if p.get("value")
+        ]
 
         # Create/update source entity using actual SourceEntity dataclass
         existing = se_store.get_by_source("contacts", source_id)
@@ -172,8 +176,7 @@ def import_contacts(dry_run: bool = False) -> dict:
                 if email not in person.emails:
                     person.emails.append(email)
             for phone in phones:
-                if phone not in person.phone_numbers:
-                    person.phone_numbers.append(phone)
+                person.add_phone(phone)  # normalizes to E.164
             if contact.get("birthday"):
                 try:
                     bday = datetime.fromisoformat(contact["birthday"])

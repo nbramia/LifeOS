@@ -444,6 +444,10 @@ SYNC_ORDER = [
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
+    # === Phase 2b: Stale ID Cleanup ===
+    # Re-point interactions with stale merged person IDs BEFORE relationship building
+    "repoint_stale_ids",        # Fix interactions pointing to old merged person IDs
+
     # === Phase 3: Relationship Building ===
     # Build relationships using all collected interaction data
     # Each sync script refreshes its own affected stats, but we do a full
@@ -495,6 +499,9 @@ SYNC_SCRIPTS = {
     "link_imessage": ("scripts/link_imessage_entities.py", ["--execute"]),
     "link_source_entities": ("scripts/link_source_entities.py", ["--execute"]),
     "photos": ("scripts/sync_photos.py", ["--execute"]),
+
+    # Phase 2b: Stale ID Cleanup
+    "repoint_stale_ids": ("scripts/sync_repoint_stale_ids.py", ["--execute"]),
 
     # Phase 3: Relationship Building
     "person_stats_full": ("scripts/sync_person_stats.py", ["--full", "--execute"]),

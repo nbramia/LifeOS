@@ -12,7 +12,7 @@ Orchestrate the full implementation lifecycle for: $ARGUMENTS
 
 - Current branch: !`git branch --show-current`
 - Recent commits: !`git log --oneline -5`
-- Issue (if applicable): !`gh issue view "$ARGUMENTS" --comments 2>/dev/null || echo "NOT_AN_ISSUE"`
+- Arguments: $ARGUMENTS
 
 ## Instructions
 
@@ -25,7 +25,7 @@ This skill runs five phases. You **MUST** use task tracking (TaskCreate/TaskUpda
 4. **Keep the list truthful.** Delete irrelevant tasks. Update descriptions if scope changes. The list must reflect current reality.
 
 **Entry point — determine where to start:**
-1. If `$ARGUMENTS` starts with `#`, it is a GitHub issue. The issue body is shown in Context above — extract the task description and acceptance criteria. Then proceed to Phase 1.
+1. If `$ARGUMENTS` is a number or starts with `#`, it is a GitHub issue. Fetch the issue with `gh issue view <number> --comments` to get the full description and acceptance criteria. Then proceed to Phase 1.
 2. Run `gh pr list --head <current-branch> --json number,title --jq '.[0]'`. If a PR exists, verify it relates to the current task (check title/description alignment). If it does, record the PR number and **skip to Phase 4**. If it appears unrelated, ignore it and proceed to Phase 1.
 3. Otherwise, treat `$ARGUMENTS` as a freeform task description.
 
@@ -88,8 +88,8 @@ Runs up to **3 rounds**. Each round: Reviewer subagent -> Referee (you) -> Addre
 
 These steps gather everything needed to construct subagent prompts. Do them once; re-fetch the diff each round.
 
-1. **Read the review skill:** Use the Read tool on `.claude/skills/review-pr/SKILL.md`. Store the full content. Strip the YAML frontmatter block (lines between `---` markers) and strip lines that contain `` !`...` `` shell escape sequences (those inject data at skill load time — you will replace them with actual data in the prompt).
-2. **Read the address skill:** Use the Read tool on `.claude/skills/address-review/SKILL.md`. Strip frontmatter and `` !`...` `` shell escape lines the same way. Also strip Step 6 (the "Re-request Review" step) — the orchestrator controls the review loop, so re-requesting review from within the addresser subagent would trigger unwanted notifications.
+1. **Read the review skill:** Use the Read tool on `.claude/skills/review-pr/SKILL.md`. Store the full content. Strip the YAML frontmatter block (lines between `---` markers) and strip lines that contain shell escape sequences (lines starting with `- ` followed by a label and a bang-backtick pattern that inject data at skill load time — you will replace them with actual data in the prompt).
+2. **Read the address skill:** Use the Read tool on `.claude/skills/address-review/SKILL.md`. Strip frontmatter and shell escape lines the same way. Also strip Step 6 (the "Re-request Review" step) — the orchestrator controls the review loop, so re-requesting review from within the addresser subagent would trigger unwanted notifications.
 3. **Fetch PR data:** Run `gh pr view <number>` and `gh pr diff <number>`. Store both outputs. You will re-fetch the diff before each subsequent round since it changes after addressing.
 
 #### Step A: Spawn Reviewer Subagent
