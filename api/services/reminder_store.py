@@ -15,7 +15,7 @@ import logging
 import threading
 import time as _time_mod
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -360,7 +360,12 @@ class ReminderStore:
             self._save()
 
     def get_due_reminders(self) -> list[Reminder]:
-        """Get all enabled reminders that are due to fire."""
+        """Get all enabled reminders that are due to fire.
+
+        Includes a 90-second cooldown: reminders triggered within the last
+        90 seconds are skipped. This prevents duplicate fires on server
+        restart or scheduler race conditions.
+        """
         now = datetime.now(timezone.utc)
         due = []
         for reminder in self._reminders.values():
@@ -370,8 +375,16 @@ class ReminderStore:
                 next_time = datetime.fromisoformat(reminder.next_trigger_at)
                 if next_time.tzinfo is None:
                     next_time = next_time.replace(tzinfo=timezone.utc)
-                if next_time <= now:
-                    due.append(reminder)
+                if next_time > now:
+                    continue
+                # Cooldown: skip if triggered less than 90 seconds ago
+                if reminder.last_triggered_at:
+                    last = datetime.fromisoformat(reminder.last_triggered_at)
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if (now - last).total_seconds() < 90:
+                        continue
+                due.append(reminder)
             except (ValueError, TypeError):
                 continue
         return due
@@ -584,9 +597,12 @@ class ReminderScheduler:
         import time as _time
         logger.info(f"Firing reminder: {reminder.name} ({reminder.id})")
 
+        # Advance next_trigger_at BEFORE generating/sending to prevent
+        # duplicate fires on server restart or scheduler re-entry.
+        self.store.mark_triggered(reminder.id)
+
         # Lightweight pre-check for pre-meeting prep reminders
         if reminder.message_type == "prompt" and self._should_skip_pre_meeting(reminder):
-            self.store.mark_triggered(reminder.id)
             return
 
         start = _time.monotonic()
@@ -610,8 +626,6 @@ class ReminderScheduler:
                 await send_message_async(full_message)
             elif message and self._should_suppress(message):
                 logger.info(f"Reminder {reminder.name}: suppressed (no actionable content)")
-
-            self.store.mark_triggered(reminder.id)
         except Exception as e:
             elapsed = _time.monotonic() - start
             logger.error(f"Failed to fire reminder {reminder.id} after {elapsed:.1f}s: {e}")
@@ -624,7 +638,6 @@ class ReminderScheduler:
                 )
             except Exception:
                 logger.error(f"Failed to send error notification for reminder {reminder.id}")
-            self.store.mark_triggered(reminder.id)
 
     async def _generate_message(self, reminder: Reminder) -> tuple[Optional[str], Optional[dict]]:
         """Generate the message content for a reminder.
