@@ -48,7 +48,7 @@ def repoint_stale_interaction_ids(
 
     if valid_person_ids is None:
         all_people = person_store.get_all(include_hidden=True, include_merged=True)
-        valid_person_ids = {p.id for p in all_people if not p.merged_into}
+        valid_person_ids = {p.id for p in all_people if not p.hidden_reason.startswith("merged_into:")}
 
     conn = sqlite3.connect(db_path, timeout=60.0)
     try:

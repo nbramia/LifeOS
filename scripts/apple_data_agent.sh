@@ -10,7 +10,7 @@
 #   50 2 * * * /path/to/LifeOS/scripts/apple_data_agent.sh
 #
 # Prerequisites:
-#   - Terminal.app has Full Disk Access
+#   - LifeOS.app has Full Disk Access (routes export through it)
 #   - SSH key to Linux server (no password prompt)
 #   - rsync installed on both machines
 
@@ -53,12 +53,13 @@ log "Linux server: ${LINUX_USER}@${LINUX_SERVER}"
 
 # -------------------------------------------------------------------
 # Step 1: Export Apple data to data/apple-exports/
-# The export script reads Apple DBs directly (requires FDA)
+# Route through LifeOS.app for Full Disk Access (required for
+# Messages.db and CallHistoryDB)
 # -------------------------------------------------------------------
-log "Step 1: Exporting Apple data..."
+log "Step 1: Exporting Apple data (via LifeOS.app for FDA)..."
 
 cd "${LIFEOS_DIR}"
-if "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
+if /Applications/LifeOS.app/Contents/MacOS/LifeOS exec "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
     log "Export: OK"
 else
     log "Export: FAILED"
