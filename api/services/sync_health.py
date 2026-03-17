@@ -135,6 +135,15 @@ SYNC_SOURCES = {
         "depends_on": ["contacts"],
     },
 
+    # === Phase 2b: Stale ID Cleanup ===
+    "repoint_stale_ids": {
+        "description": "Re-point interactions with stale merged person IDs to canonical IDs",
+        "script": "scripts/sync_repoint_stale_ids.py",
+        "frequency": "daily",
+        "phase": 2,
+        "depends_on": ["link_imessage", "link_source_entities"],
+    },
+
     # === Phase 3: Relationship Building ===
     "person_stats_full": {
         "description": "Full refresh of all PersonEntity counts and timestamps",
