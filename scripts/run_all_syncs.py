@@ -434,7 +434,6 @@ SYNC_ORDER = [
     #
     # On Linux, Apple data is imported from Mac Mini exports:
     "apple_import",             # Import Apple data from Mac Mini (Linux only)
-    "imessage",                 # Create interactions from iMessage DB
     "whatsapp",                 # WhatsApp contacts + messages
     "slack",                    # Slack users + DM messages
 
@@ -442,6 +441,7 @@ SYNC_ORDER = [
     # Link source entities to canonical PersonEntity records
     "link_slack",               # Link Slack users to people by email
     "link_imessage",            # Link iMessage handles to people by phone
+    "imessage",                 # Create interactions from linked iMessage data
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
