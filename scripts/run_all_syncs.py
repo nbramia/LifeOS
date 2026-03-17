@@ -434,6 +434,7 @@ SYNC_ORDER = [
     #
     # On Linux, Apple data is imported from Mac Mini exports:
     "apple_import",             # Import Apple data from Mac Mini (Linux only)
+    "imessage",                 # Create interactions from iMessage DB
     "whatsapp",                 # WhatsApp contacts + messages
     "slack",                    # Slack users + DM messages
 
