@@ -254,6 +254,12 @@ class IndexerService:
                 if count % save_interval == 0:
                     self._save_index_state(index_state)
                     gc.collect()  # Prevent memory bloat during long indexing runs
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                     logger.info(f"  Indexed {count}/{len(files_to_index)} files (progress saved)...")
 
             except Exception as e:

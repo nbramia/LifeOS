@@ -54,9 +54,11 @@ class EmbeddingService:
             from sentence_transformers import SentenceTransformer
 
             try:
+                import torch
                 load_kwargs = dict(
                     model_name_or_path=self.model_name,
                     cache_folder=self.cache_dir,
+                    model_kwargs={"dtype": torch.float16},
                 )
                 if self._force_cpu:
                     load_kwargs["device"] = "cpu"
