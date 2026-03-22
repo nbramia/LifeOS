@@ -81,10 +81,10 @@ class Settings(BaseSettings):
                     "When false, llama-server must be started manually."
     )
 
-    # Local LLM Router (Ollama — used for query routing only)
+    # Local LLM Router (Ollama — used for query routing, summarization, fact validation)
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_model: str = Field(default="qwen2.5:7b-instruct", alias="OLLAMA_MODEL")
-    ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")  # 7B model needs more time
+    ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")
     ollama_retry_timeout: int = Field(default=60, alias="OLLAMA_RETRY_TIMEOUT")  # Longer timeout for retries
 
     # Cross-encoder re-ranking (P9.2)
