@@ -53,13 +53,14 @@ log "Linux server: ${LINUX_USER}@${LINUX_SERVER}"
 
 # -------------------------------------------------------------------
 # Step 1: Export Apple data to data/apple-exports/
-# Route through LifeOS.app for Full Disk Access (required for
-# Messages.db and CallHistoryDB)
+# cron and /bin/bash both have Full Disk Access on the Mac Mini,
+# so we call Python directly. The LifeOS.app exec wrapper doesn't
+# work because exec replaces the process, losing FDA context.
 # -------------------------------------------------------------------
-log "Step 1: Exporting Apple data (via LifeOS.app for FDA)..."
+log "Step 1: Exporting Apple data..."
 
 cd "${LIFEOS_DIR}"
-if /Applications/LifeOS.app/Contents/MacOS/LifeOS exec "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
+if "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
     log "Export: OK"
 else
     log "Export: FAILED"
