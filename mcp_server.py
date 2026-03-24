@@ -15,7 +15,7 @@ import json
 import sys
 import httpx
 import logging
-from typing import Any
+import os
 
 # Configure logging to stderr (stdout is for MCP protocol)
 logging.basicConfig(
@@ -25,7 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import os
 API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
 
@@ -843,7 +842,8 @@ class LifeOSMCPServer:
                     "end_date": {"type": "string", "description": "End date (YYYY-MM-DD), defaults to today"},
                     "category": {"type": "string", "description": "Filter by category name"},
                     "search": {"type": "string", "description": "Search by merchant name"},
-                    "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100}
+                    "limit": {"type": "integer", "description": "Max results (default: 100)", "default": 100},
+                    "account_id": {"type": "string", "description": "Filter by Monarch account ID"}
                 }
             },
             "lifeos_monarch_cashflow": {
@@ -1199,7 +1199,7 @@ class LifeOSMCPServer:
                 if active:
                     text += f"  Active channels: {', '.join(active)}\n"
                 else:
-                    text += f"  Active channels: none recently\n"
+                    text += "  Active channels: none recently\n"
                 if entity_id:
                     text += f"  Entity ID: {entity_id}\n"
                 text += "\n"
@@ -1482,11 +1482,11 @@ class LifeOSMCPServer:
             if not accounts:
                 return "No accounts found."
             text = f"Found {len(accounts)} accounts:\n\n"
-            text += "| Account | Type | Balance | Institution |\n"
-            text += "|---------|------|---------|-------------|\n"
+            text += "| Account | Type | Balance | Institution | ID |\n"
+            text += "|---------|------|---------|-------------|-----|\n"
             for a in accounts:
                 bal = a.get("balance", 0)
-                text += f"| {a.get('name', '')} | {a.get('type', '')} | ${bal:,.2f} | {a.get('institution', '')} |\n"
+                text += f"| {a.get('name', '')} | {a.get('type', '')} | ${bal:,.2f} | {a.get('institution', '')} | {a.get('id', '')} |\n"
             return text
 
         elif tool_name == "lifeos_monarch_transactions":
@@ -1494,12 +1494,12 @@ class LifeOSMCPServer:
             if not txns:
                 return "No transactions found."
             text = f"Found {len(txns)} transactions ({data.get('start_date', '')} to {data.get('end_date', '')}):\n\n"
-            text += "| Date | Merchant | Category | Amount |\n"
-            text += "|------|----------|----------|--------|\n"
+            text += "| Date | Merchant | Category | Amount | Account |\n"
+            text += "|------|----------|----------|--------|---------|\n"
             for t in txns[:50]:
                 amount = t.get("amount", 0)
                 sign = "" if amount >= 0 else "-"
-                text += f"| {t.get('date', '')} | {t.get('merchant', '')} | {t.get('category', '')} | {sign}${abs(amount):,.2f} |\n"
+                text += f"| {t.get('date', '')} | {t.get('merchant', '')} | {t.get('category', '')} | {sign}${abs(amount):,.2f} | {t.get('account', '')} |\n"
             if len(txns) > 50:
                 text += f"\n_... and {len(txns) - 50} more transactions_\n"
             return text

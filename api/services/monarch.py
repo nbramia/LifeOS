@@ -97,10 +97,13 @@ class MonarchClient:
         search: str = "",
         category: Optional[str] = None,
         limit: int = 500,
+        account_ids: Optional[list[str]] = None,
     ) -> list[dict]:
         """Get transactions, optionally filtered by date range and category."""
         mm = await self._get_client()
         kwargs = {"limit": limit, "offset": 0, "search": search}
+        if account_ids:
+            kwargs["account_ids"] = account_ids
         if start_date:
             kwargs["start_date"] = start_date
         if end_date:
@@ -136,6 +139,10 @@ class MonarchClient:
             if isinstance(txn.get("account"), dict):
                 account_name = txn["account"].get("displayName", "")
 
+            tags = []
+            if isinstance(txn.get("tags"), list):
+                tags = [t.get("name", "") for t in txn["tags"] if isinstance(t, dict)]
+
             result.append({
                 "id": txn.get("id"),
                 "date": txn.get("date", ""),
@@ -145,6 +152,9 @@ class MonarchClient:
                 "account": account_name,
                 "notes": txn.get("notes", ""),
                 "pending": txn.get("pending", False),
+                "is_recurring": txn.get("isRecurring", False),
+                "is_split": txn.get("isSplitTransaction", False),
+                "tags": tags,
             })
 
         return result
