@@ -306,8 +306,17 @@ class TestProcessWhatsAppMessagesOutgoingGroup:
 
         assert stats["outgoing_group_created"] == 2
         assert stats["interactions_created"] == 2
-        for call in resolver.resolve.call_args_list:
+        calls = resolver.resolve.call_args_list
+        assert len(calls) == 2
+        # Both calls must be non-creating
+        for call in calls:
             assert call.kwargs.get("create_if_missing") is False
+        # First call: phone-based participant — resolver receives the E.164 phone
+        assert calls[0].kwargs.get("phone") == "+15559876543"
+        # Second call: LID with push_name only — should be phone=None (not "") so
+        # the resolver gets the explicit "no phone" signal. Mirrors the 1:1 path.
+        assert calls[1].kwargs.get("name") == "Alice"
+        assert calls[1].kwargs.get("phone") is None
 
     def test_outgoing_group_skips_unknown_participants(self, tmp_path):
         int_db = _make_interactions_db(tmp_path)

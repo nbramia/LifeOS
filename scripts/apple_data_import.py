@@ -47,11 +47,15 @@ STALENESS_CRITICAL_HOURS = 168  # 7 days
 
 
 def check_manifest() -> dict | None:
-    """Check the import manifest for freshness.
+    """Check the import manifest for freshness and per-source errors.
 
     Logs warnings/errors based on data age:
     - >48h: WARNING (picked up by nightly health batch)
     - >7d:  CRITICAL-level log (triggers immediate alert if server is running)
+
+    Also walks manifest["results"] and logs CRITICAL for any source the Mac
+    Mini export marked with status == "error". The caller (main) uses the
+    returned manifest to decide exit status.
     """
     manifest_path = IMPORT_DIR / "manifest.json"
     if not manifest_path.exists():
@@ -87,7 +91,35 @@ def check_manifest() -> dict | None:
         except (ValueError, TypeError) as e:
             logger.warning(f"Cannot parse manifest exported_at: {e}")
 
+    # Walk per-source results and log CRITICAL for any export-side errors.
+    # The CRITICAL log level is the existing alerting path — it routes through
+    # email/Telegram when the server is running.
+    results = manifest.get("results") or {}
+    if isinstance(results, dict):
+        for source_name, source_result in results.items():
+            if not isinstance(source_result, dict):
+                continue
+            if source_result.get("status") == "error":
+                reason = source_result.get("reason") or source_result.get("error") or "unknown"
+                logger.critical(
+                    f"Mac Mini export failed for {source_name}: {reason}. "
+                    f"Check wacli/tooling on the Mac Mini."
+                )
+
     return manifest
+
+
+def _manifest_source_errored(manifest: dict | None, source: str) -> bool:
+    """Return True if the manifest marks ``source`` as status=error."""
+    if not manifest:
+        return False
+    results = manifest.get("results") or {}
+    if not isinstance(results, dict):
+        return False
+    source_result = results.get(source)
+    if not isinstance(source_result, dict):
+        return False
+    return source_result.get("status") == "error"
 
 
 def import_contacts(dry_run: bool = False) -> dict:
@@ -452,15 +484,28 @@ def import_photos_faces(dry_run: bool = False) -> dict:
     }
 
 
-def import_whatsapp(dry_run: bool = False) -> dict:
+def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict:
     """Import WhatsApp data exported from the Mac Mini.
 
     Reads data/apple-imports/whatsapp.json (produced by export_whatsapp on
     the Mac) and dispatches to api.services.whatsapp for the actual entity
     resolution and Interaction creation.
+
+    Status semantics:
+    - "skipped": nothing to do (file absent and manifest didn't attempt an
+      export, e.g. a single-source --source contacts run on the Mac).
+    - "error": the Mac-side export failed. If a stale whatsapp.json exists
+      from a previous successful run we still import it (data is better than
+      nothing) but propagate the error so the operator is alerted and the
+      run is recorded as FAILED.
     """
     whatsapp_path = IMPORT_DIR / "whatsapp.json"
+    manifest_errored = _manifest_source_errored(manifest, "whatsapp")
+
     if not whatsapp_path.exists():
+        if manifest_errored:
+            reason = "whatsapp.json not found and Mac export marked whatsapp as error"
+            return {"status": "error", "reason": reason}
         return {"status": "skipped", "reason": "whatsapp.json not found"}
 
     with open(whatsapp_path) as f:
@@ -478,18 +523,24 @@ def import_whatsapp(dry_run: bool = False) -> dict:
     )
 
     if dry_run:
-        return {
-            "status": "dry_run",
+        base = {
             "contacts": len(contacts),
             "messages": len(messages),
         }
+        if manifest_errored:
+            return {
+                "status": "error",
+                "reason": "Mac export marked whatsapp as error (stale file used for dry-run counts)",
+                **base,
+            }
+        return {"status": "dry_run", **base}
 
     from api.services.whatsapp import (
         process_whatsapp_contacts,
         process_whatsapp_messages,
     )
 
-    contact_stats = process_whatsapp_contacts(contacts, dry_run=False)
+    contact_stats = process_whatsapp_contacts(contacts, dry_run=dry_run)
     logger.info(
         f"WhatsApp contacts: {contact_stats['source_entities_created']} created, "
         f"{contact_stats['source_entities_updated']} updated, "
@@ -502,7 +553,7 @@ def import_whatsapp(dry_run: bool = False) -> dict:
         group_participants=group_participants,
         lid_contacts=lid_contacts,
         lid_phones=lid_phones,
-        dry_run=False,
+        dry_run=dry_run,
     )
     logger.info(
         f"WhatsApp messages: {message_stats['interactions_created']} created, "
@@ -510,6 +561,14 @@ def import_whatsapp(dry_run: bool = False) -> dict:
         f"{message_stats['skipped_large_group']} large-group skips, "
         f"{message_stats['outgoing_group_created']} outgoing-group fan-outs"
     )
+
+    if manifest_errored:
+        return {
+            "status": "error",
+            "reason": "Mac export marked whatsapp as error; imported stale whatsapp.json",
+            "contacts": contact_stats,
+            "messages": message_stats,
+        }
 
     return {
         "status": "ok",
@@ -540,12 +599,18 @@ def main():
     if not manifest and not dry_run:
         logger.warning("No manifest found — data may be stale or incomplete")
 
+    # Some sources need the manifest to distinguish "nothing exported" from
+    # "export attempted and failed". Keep the uniform (dry_run,) signature for
+    # the rest so the dispatch stays simple.
+    def _import_whatsapp_wrapper(dry_run: bool = False) -> dict:
+        return import_whatsapp(dry_run=dry_run, manifest=manifest)
+
     sources = {
         "contacts": import_contacts,
         "imessage": import_imessage,
         "phone": import_phone_calls,
         "photos": import_photos_faces,
-        "whatsapp": import_whatsapp,
+        "whatsapp": _import_whatsapp_wrapper,
     }
 
     if args.source:
@@ -560,7 +625,40 @@ def main():
             logger.error(f"Failed to import {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
 
+    # Also surface per-source errors recorded in the manifest for sources we
+    # didn't attempt this run (e.g. --source contacts will skip whatsapp, but
+    # if the manifest says whatsapp errored on the Mac side we still want to
+    # propagate that). Only sources the caller selected are merged so that
+    # --source contacts doesn't spuriously fail on an unrelated phone error.
+    if manifest:
+        manifest_results = manifest.get("results") or {}
+        for name in sources:
+            if name in results:
+                continue
+            manifest_entry = manifest_results.get(name) if isinstance(manifest_results, dict) else None
+            if isinstance(manifest_entry, dict) and manifest_entry.get("status") == "error":
+                results[name] = {
+                    "status": "error",
+                    "reason": manifest_entry.get("reason")
+                    or manifest_entry.get("error")
+                    or "Mac export reported error",
+                }
+
     print(json.dumps({"results": results}, indent=2))
+
+    # Non-zero exit on any per-source error so run_all_syncs.run_sync marks
+    # apple_import as FAILED and sync_health records it. "skipped" is fine —
+    # it means nothing to do.
+    errored_sources = [
+        name
+        for name, result in results.items()
+        if isinstance(result, dict) and result.get("status") == "error"
+    ]
+    if errored_sources:
+        logger.error(
+            f"Apple import finished with errors in: {', '.join(sorted(errored_sources))}"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

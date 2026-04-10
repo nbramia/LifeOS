@@ -316,176 +316,183 @@ def process_whatsapp_messages(
 
     affected_person_ids: set[str] = set()
     int_conn = sqlite3.connect(interaction_db)
-    int_cursor = int_conn.cursor()
+    try:
+        int_cursor = int_conn.cursor()
 
-    # Get existing WhatsApp interactions to avoid duplicates
-    int_cursor.execute(
-        "SELECT source_id FROM interactions WHERE source_type = ?",
-        (SOURCE_WHATSAPP,),
-    )
-    existing_ids = {row[0] for row in int_cursor.fetchall()}
-    logger.info(f"Found {len(existing_ids)} existing WhatsApp interactions")
+        # Get existing WhatsApp interactions to avoid duplicates
+        int_cursor.execute(
+            "SELECT source_id FROM interactions WHERE source_type = ?",
+            (SOURCE_WHATSAPP,),
+        )
+        existing_ids = {row[0] for row in int_cursor.fetchall()}
+        logger.info(f"Found {len(existing_ids)} existing WhatsApp interactions")
 
-    batch: list[tuple] = []
-    batch_size = 500
+        batch: list[tuple] = []
+        batch_size = 500
 
-    def flush_batch():
-        nonlocal batch
-        if batch and not dry_run:
-            int_cursor.executemany(
-                """
-                INSERT OR IGNORE INTO interactions
-                    (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                batch,
-            )
-            int_conn.commit()
-        batch = []
+        def flush_batch():
+            nonlocal batch
+            if batch and not dry_run:
+                int_cursor.executemany(
+                    """
+                    INSERT OR IGNORE INTO interactions
+                        (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+                int_conn.commit()
+            batch = []
 
-    for msg in messages:
-        try:
-            msg_id = msg["msg_id"]
-            source_id = f"whatsapp_{msg_id}"
-            if source_id in existing_ids:
-                stats["interactions_skipped"] += 1
-                continue
-
-            sender_jid = msg.get("sender_jid") or ""
-            sender_name = msg.get("sender_name") or ""
-            chat_jid = msg.get("chat_jid") or ""
-            chat_name = msg.get("chat_name") or ""
-            from_me = bool(msg.get("from_me"))
-            text = msg.get("display_text") or msg.get("text") or ""
-            is_group = is_group_jid(chat_jid)
-
-            if is_group and group_sizes.get(chat_jid, 0) > LARGE_GROUP_THRESHOLD:
-                stats["skipped_large_group"] += 1
-                continue
-
-            ts = parse_message_timestamp(msg.get("ts"))
-            snippet = text[:500] if text else ""
-
-            # Outgoing group: fan out to each non-self participant
-            if from_me and is_group:
-                for participant_jid in group_members.get(chat_jid, []):
-                    participant_source_id = f"whatsapp_{msg_id}:{participant_jid}"
-                    if participant_source_id in existing_ids:
-                        continue
-
-                    p_phone = ""
-                    p_name = None
-                    if "@lid" in participant_jid:
-                        p_phone = resolve_lid_phone(participant_jid, lid_phones)
-                        p_name = lid_names.get(participant_jid)
-                        if not p_phone and not p_name:
-                            continue
-                        if p_phone:
-                            stats["resolved_lid_phone"] += 1
-                    else:
-                        p_phone = extract_phone_from_jid(participant_jid)
-                        if not p_phone:
-                            continue
-
-                    result = resolver.resolve(
-                        name=p_name,
-                        phone=p_phone,
-                        create_if_missing=False,
-                    )
-                    if not result or not result.entity:
-                        continue
-
-                    person_id = result.entity.id
-                    if person_id == my_person_id:
-                        continue
-                    affected_person_ids.add(person_id)
-                    p_display = p_name or p_phone
-                    title = f"WhatsApp → {chat_name} ({p_display})"
-
-                    batch.append((
-                        str(uuid.uuid4()),
-                        person_id,
-                        ts.isoformat(),
-                        SOURCE_WHATSAPP,
-                        title,
-                        snippet,
-                        None,
-                        participant_source_id,
-                        datetime.now(timezone.utc).isoformat(),
-                    ))
-                    stats["interactions_created"] += 1
-                    stats["outgoing_group_created"] += 1
-                continue
-
-            # 1:1 message — outgoing uses chat_jid (recipient), incoming uses sender_jid
-            target_jid = chat_jid if from_me else sender_jid
-            target_name = (chat_name or sender_name) if from_me else sender_name
-
-            # phone may legitimately be None when we resolve a LID by push_name
-            # only — passing None to the resolver is the explicit "no phone" signal.
-            phone: Optional[str] = None
-            if target_jid and "@lid" in target_jid:
-                lid_phone = resolve_lid_phone(target_jid, lid_phones)
-                if lid_phone:
-                    phone = lid_phone
-                    push_name = lid_names.get(target_jid)
-                    if push_name:
-                        target_name = push_name
-                    stats["resolved_lid_phone"] += 1
-                else:
-                    push_name = lid_names.get(target_jid)
-                    if push_name:
-                        target_name = push_name
-                        stats["resolved_lid"] += 1
-                    else:
-                        stats["skipped_lid"] += 1
-                        continue
-            else:
-                phone = extract_phone_from_jid(target_jid)
-                if not phone:
+        for msg in messages:
+            try:
+                msg_id = msg["msg_id"]
+                source_id = f"whatsapp_{msg_id}"
+                if source_id in existing_ids:
                     stats["interactions_skipped"] += 1
                     continue
 
-            result = resolver.resolve(
-                name=target_name or None,
-                phone=phone,
-                create_if_missing=True,
-            )
-            if not result or not result.entity:
-                stats["persons_not_found"] += 1
-                continue
+                sender_jid = msg.get("sender_jid") or ""
+                sender_name = msg.get("sender_name") or ""
+                chat_jid = msg.get("chat_jid") or ""
+                chat_name = msg.get("chat_name") or ""
+                from_me = bool(msg.get("from_me"))
+                text = msg.get("display_text") or msg.get("text") or ""
+                is_group = is_group_jid(chat_jid)
 
-            person_id = result.entity.id
-            affected_person_ids.add(person_id)
+                if is_group and group_sizes.get(chat_jid, 0) > LARGE_GROUP_THRESHOLD:
+                    stats["skipped_large_group"] += 1
+                    continue
 
-            direction = "→" if from_me else "←"
-            title = f"WhatsApp {direction} {target_name or phone}"
+                ts = parse_message_timestamp(msg.get("ts"))
+                snippet = text[:500] if text else ""
 
-            batch.append((
-                str(uuid.uuid4()),
-                person_id,
-                ts.isoformat(),
-                SOURCE_WHATSAPP,
-                title,
-                snippet,
-                None,
-                source_id,
-                datetime.now(timezone.utc).isoformat(),
-            ))
-            stats["interactions_created"] += 1
+                # Outgoing group: fan out to each non-self participant
+                if from_me and is_group:
+                    for participant_jid in group_members.get(chat_jid, []):
+                        participant_source_id = f"whatsapp_{msg_id}:{participant_jid}"
+                        if participant_source_id in existing_ids:
+                            continue
 
-            if len(batch) >= batch_size:
-                flush_batch()
-                logger.info(
-                    f"Inserted batch — {stats['interactions_created']} interactions so far"
+                        # phone stays None when we only have a push_name — passing None
+                        # to the resolver is the explicit "no phone" signal. Matches the
+                        # 1:1 path below.
+                        p_phone: Optional[str] = None
+                        p_name: Optional[str] = None
+                        if "@lid" in participant_jid:
+                            lid_phone = resolve_lid_phone(participant_jid, lid_phones)
+                            if lid_phone:
+                                p_phone = lid_phone
+                                stats["resolved_lid_phone"] += 1
+                            p_name = lid_names.get(participant_jid)
+                            if not p_phone and not p_name:
+                                continue
+                        else:
+                            extracted = extract_phone_from_jid(participant_jid)
+                            if not extracted:
+                                continue
+                            p_phone = extracted
+
+                        result = resolver.resolve(
+                            name=p_name,
+                            phone=p_phone,
+                            create_if_missing=False,
+                        )
+                        if not result or not result.entity:
+                            continue
+
+                        person_id = result.entity.id
+                        if person_id == my_person_id:
+                            continue
+                        affected_person_ids.add(person_id)
+                        p_display = p_name or p_phone
+                        title = f"WhatsApp → {chat_name} ({p_display})"
+
+                        batch.append((
+                            str(uuid.uuid4()),
+                            person_id,
+                            ts.isoformat(),
+                            SOURCE_WHATSAPP,
+                            title,
+                            snippet,
+                            None,
+                            participant_source_id,
+                            datetime.now(timezone.utc).isoformat(),
+                        ))
+                        stats["interactions_created"] += 1
+                        stats["outgoing_group_created"] += 1
+                    continue
+
+                # 1:1 message — outgoing uses chat_jid (recipient), incoming uses sender_jid
+                target_jid = chat_jid if from_me else sender_jid
+                target_name = (chat_name or sender_name) if from_me else sender_name
+
+                # phone may legitimately be None when we resolve a LID by push_name
+                # only — passing None to the resolver is the explicit "no phone" signal.
+                phone: Optional[str] = None
+                if target_jid and "@lid" in target_jid:
+                    lid_phone = resolve_lid_phone(target_jid, lid_phones)
+                    if lid_phone:
+                        phone = lid_phone
+                        push_name = lid_names.get(target_jid)
+                        if push_name:
+                            target_name = push_name
+                        stats["resolved_lid_phone"] += 1
+                    else:
+                        push_name = lid_names.get(target_jid)
+                        if push_name:
+                            target_name = push_name
+                            stats["resolved_lid"] += 1
+                        else:
+                            stats["skipped_lid"] += 1
+                            continue
+                else:
+                    phone = extract_phone_from_jid(target_jid)
+                    if not phone:
+                        stats["interactions_skipped"] += 1
+                        continue
+
+                result = resolver.resolve(
+                    name=target_name or None,
+                    phone=phone,
+                    create_if_missing=True,
                 )
+                if not result or not result.entity:
+                    stats["persons_not_found"] += 1
+                    continue
 
-        except Exception as e:
-            logger.error(f"Error processing message {msg.get('msg_id', '?')}: {e}")
-            stats["errors"] += 1
+                person_id = result.entity.id
+                affected_person_ids.add(person_id)
 
-    flush_batch()
-    int_conn.close()
+                direction = "→" if from_me else "←"
+                title = f"WhatsApp {direction} {target_name or phone}"
+
+                batch.append((
+                    str(uuid.uuid4()),
+                    person_id,
+                    ts.isoformat(),
+                    SOURCE_WHATSAPP,
+                    title,
+                    snippet,
+                    None,
+                    source_id,
+                    datetime.now(timezone.utc).isoformat(),
+                ))
+                stats["interactions_created"] += 1
+
+                if len(batch) >= batch_size:
+                    flush_batch()
+                    logger.info(
+                        f"Inserted batch — {stats['interactions_created']} interactions so far"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error processing message {msg.get('msg_id', '?')}: {e}")
+                stats["errors"] += 1
+
+        flush_batch()
+    finally:
+        int_conn.close()
 
     if not dry_run and affected_person_ids:
         from api.services.person_stats import refresh_person_stats
