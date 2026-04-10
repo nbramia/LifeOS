@@ -372,7 +372,7 @@ FOLLOW-UP TOOLS: Use lifeos_reminder_list to verify the update.""",
         "description": """Trigger a data sync for a specific source. Returns immediately — sync runs in background.
 
 PARAMETERS:
-- source (required): vault, calendar, contacts, slack, photos, gmail, imessage, whatsapp, phone, facetime, or linkedin
+- source (required): vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, or linkedin
 
 FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
         "method": "POST",
@@ -794,7 +794,7 @@ class LifeOSMCPServer:
             "lifeos_sync_trigger": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "Sync source: vault, calendar, contacts, slack, photos, gmail, imessage, whatsapp, phone, facetime, linkedin"}
+                    "source": {"type": "string", "description": "Sync source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin"}
                 },
                 "required": ["source"]
             },
@@ -984,7 +984,7 @@ class LifeOSMCPServer:
         }
 
         valid_sources = list(route_map.keys()) + [
-            "gmail", "imessage", "whatsapp", "phone", "facetime", "linkedin"
+            "gmail", "imessage", "phone", "facetime", "linkedin"
         ]
 
         if source in route_map:
