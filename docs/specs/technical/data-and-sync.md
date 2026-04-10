@@ -186,7 +186,6 @@ All sync scripts in `scripts/` follow the pattern:
 | `sync_linkedin.py` | Sync LinkedIn connections | CSV export |
 | `sync_apple_contacts.py` | Sync Apple Contacts | Apple Data Agent export |
 | `sync_phone_calls.py` | Sync phone calls | Apple Data Agent export |
-| `sync_whatsapp.py` | Sync WhatsApp contacts and messages | `~/.wacli/wacli.db` |
 | `sync_imessage_interactions.py` | Sync iMessage | Apple Data Agent export |
 | `sync_slack.py` | Sync Slack users and DMs | Slack API |
 
@@ -194,9 +193,11 @@ All sync scripts in `scripts/` follow the pattern:
 
 | Script | Purpose | Runs On |
 |--------|---------|---------|
-| `apple_data_export.py` | Export Apple data (contacts, phone, iMessage, photos) | Mac Mini |
+| `apple_data_export.py` | Export Apple data (contacts, phone, iMessage, photos, WhatsApp) | Mac Mini |
 | `apple_data_import.py` | Import Apple data exports into LifeOS | Linux server |
 | `apple_data_agent.sh` | Orchestrate export + rsync + import | Mac Mini (cron) |
+
+WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `wacli` (steipete/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records.
 
 ### Phase 2: Entity Processing
 

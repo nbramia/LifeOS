@@ -465,11 +465,146 @@ def export_photos_faces(dry_run: bool = False) -> dict:
     }
 
 
+def export_whatsapp(dry_run: bool = False) -> dict:
+    """Export WhatsApp data via wacli for import on Linux.
+
+    Routes through the wacli CLI (steipete/tap/wacli) which is macOS-only
+    and reads the WhatsApp Desktop app's local SQLite database. The Mac Mini
+    is the canonical source — Linux can't run wacli, so this export bridges
+    them via a JSON file the Linux importer can consume.
+    """
+    import subprocess
+
+    # Step 1: Have wacli refresh its local database from WhatsApp Desktop.
+    # Best effort — if this fails we still export whatever's already on disk.
+    try:
+        result = subprocess.run(
+            ["wacli", "sync", "--once"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode == 0:
+            logger.info("wacli sync completed")
+        else:
+            logger.warning(f"wacli sync returned non-zero: {result.stderr.strip()[:200]}")
+    except FileNotFoundError:
+        logger.error("wacli not found. Install with: brew install steipete/tap/wacli")
+        return {"status": "error", "reason": "wacli not installed"}
+    except subprocess.TimeoutExpired:
+        logger.warning("wacli sync timed out after 3 minutes — continuing with existing data")
+
+    # Step 2: Verify wacli databases exist
+    wacli_db = Path.home() / ".wacli" / "wacli.db"
+    session_db = Path.home() / ".wacli" / "session.db"
+    if not wacli_db.exists():
+        logger.error(f"wacli database not found at {wacli_db}")
+        return {"status": "error", "reason": "wacli.db not found"}
+
+    # Step 3: Pull the contact list via the wacli command (richer than raw rows)
+    try:
+        result = subprocess.run(
+            ["wacli", "--json", "contacts", "search", ".", "--limit", "10000"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("wacli contacts search timed out")
+        return {"status": "error", "reason": "wacli contacts timeout"}
+
+    contacts: list[dict] = []
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, dict) and "data" in parsed:
+                contacts = parsed.get("data") or []
+            elif isinstance(parsed, list):
+                contacts = parsed
+        except json.JSONDecodeError as e:
+            logger.warning(f"Could not parse wacli contacts JSON: {e}")
+    else:
+        logger.warning(f"wacli contacts search failed: {result.stderr.strip()[:200]}")
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "contacts": len(contacts),
+            "wacli_db_mb": round(wacli_db.stat().st_size / (1024 * 1024), 1),
+        }
+
+    # Step 4: Dump messages, group_participants, lid contacts from wacli.db
+    conn = sqlite3.connect(f"file:{wacli_db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+
+    messages = [
+        dict(row)
+        for row in conn.execute("""
+            SELECT
+                msg_id, chat_jid, chat_name, sender_jid, sender_name,
+                ts, from_me, text, display_text, media_type
+            FROM messages
+            ORDER BY ts DESC
+        """)
+    ]
+
+    group_participants = [
+        dict(row)
+        for row in conn.execute("SELECT group_jid, user_jid FROM group_participants")
+    ]
+
+    lid_contacts = [
+        dict(row)
+        for row in conn.execute("""
+            SELECT jid, push_name FROM contacts
+            WHERE jid LIKE '%@lid' AND push_name IS NOT NULL AND push_name != ''
+        """)
+    ]
+    conn.close()
+
+    # Step 5: Dump the LID-to-phone map from session.db (if present)
+    lid_phones: dict[str, str] = {}
+    if session_db.exists():
+        try:
+            sconn = sqlite3.connect(f"file:{session_db}?mode=ro", uri=True)
+            for row in sconn.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+                if row[0] and row[1]:
+                    lid_phones[row[0]] = row[1]
+            sconn.close()
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Could not read whatsmeow_lid_map: {e}")
+
+    # Step 6: Write JSON
+    out_path = EXPORT_DIR / "whatsapp.json"
+    with open(out_path, "w") as f:
+        json.dump({
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "contacts": contacts,
+            "messages": messages,
+            "group_participants": group_participants,
+            "lid_contacts": lid_contacts,
+            "lid_phones": lid_phones,
+        }, f)  # No indent — file can be large
+
+    logger.info(
+        f"Exported WhatsApp: {len(contacts)} contacts, {len(messages)} messages, "
+        f"{len(group_participants)} group memberships, {len(lid_phones)} LID phones to {out_path}"
+    )
+    return {
+        "status": "ok",
+        "contacts": len(contacts),
+        "messages": len(messages),
+        "group_participants": len(group_participants),
+        "lid_phones": len(lid_phones),
+        "path": str(out_path),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export Apple ecosystem data")
     parser.add_argument("--execute", action="store_true", help="Actually export (not dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="Preview what would be exported")
-    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos"], help="Export single source")
+    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos", "whatsapp"], help="Export single source")
     args = parser.parse_args()
 
     if not args.execute and not args.dry_run:
@@ -490,6 +625,7 @@ def main():
         "imessage": export_imessage,
         "phone": export_phone_calls,
         "photos": export_photos_faces,
+        "whatsapp": export_whatsapp,
     }
 
     if args.source:

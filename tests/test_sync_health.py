@@ -4,10 +4,9 @@ Tests for sync health monitoring system.
 Ensures all data sources remain in sync (at least daily) and errors are visible.
 """
 import pytest
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -17,7 +16,6 @@ from api.services.sync_health import (
     SYNC_STALE_HOURS,
     SyncStatus,
     SyncHealth,
-    SyncResult,
     get_sync_health_db,
     record_sync_start,
     record_sync_complete,
@@ -116,18 +114,18 @@ class TestSyncHealthRecording:
         """Test recording sync errors."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             record_sync_error(
-                "whatsapp",
-                "wacli not found",
-                error_type="FileNotFoundError",
+                "imessage",
+                "Database locked",
+                error_type="OperationalError",
                 stack_trace="Traceback...",
-                context="Running sync_whatsapp.py",
+                context="Running sync_imessage_interactions.py",
             )
 
-            errors = get_recent_errors("whatsapp")
+            errors = get_recent_errors("imessage")
             assert len(errors) == 1
-            assert errors[0]["source"] == "whatsapp"
-            assert errors[0]["error_message"] == "wacli not found"
-            assert errors[0]["error_type"] == "FileNotFoundError"
+            assert errors[0]["source"] == "imessage"
+            assert errors[0]["error_message"] == "Database locked"
+            assert errors[0]["error_type"] == "OperationalError"
 
 
 class TestSyncHealthQueries:

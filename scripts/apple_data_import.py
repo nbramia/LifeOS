@@ -452,11 +452,77 @@ def import_photos_faces(dry_run: bool = False) -> dict:
     }
 
 
+def import_whatsapp(dry_run: bool = False) -> dict:
+    """Import WhatsApp data exported from the Mac Mini.
+
+    Reads data/apple-imports/whatsapp.json (produced by export_whatsapp on
+    the Mac) and dispatches to api.services.whatsapp for the actual entity
+    resolution and Interaction creation.
+    """
+    whatsapp_path = IMPORT_DIR / "whatsapp.json"
+    if not whatsapp_path.exists():
+        return {"status": "skipped", "reason": "whatsapp.json not found"}
+
+    with open(whatsapp_path) as f:
+        data = json.load(f)
+
+    contacts = data.get("contacts") or []
+    messages = data.get("messages") or []
+    group_participants = data.get("group_participants") or []
+    lid_contacts = data.get("lid_contacts") or []
+    lid_phones = data.get("lid_phones") or {}
+
+    logger.info(
+        f"Found WhatsApp export: {len(contacts)} contacts, {len(messages)} messages "
+        f"(exported {data.get('exported_at', '?')})"
+    )
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "contacts": len(contacts),
+            "messages": len(messages),
+        }
+
+    from api.services.whatsapp import (
+        process_whatsapp_contacts,
+        process_whatsapp_messages,
+    )
+
+    contact_stats = process_whatsapp_contacts(contacts, dry_run=False)
+    logger.info(
+        f"WhatsApp contacts: {contact_stats['source_entities_created']} created, "
+        f"{contact_stats['source_entities_updated']} updated, "
+        f"{contact_stats['persons_linked']} linked, "
+        f"{contact_stats['skipped']} skipped"
+    )
+
+    message_stats = process_whatsapp_messages(
+        messages=messages,
+        group_participants=group_participants,
+        lid_contacts=lid_contacts,
+        lid_phones=lid_phones,
+        dry_run=False,
+    )
+    logger.info(
+        f"WhatsApp messages: {message_stats['interactions_created']} created, "
+        f"{message_stats['interactions_skipped']} skipped, "
+        f"{message_stats['skipped_large_group']} large-group skips, "
+        f"{message_stats['outgoing_group_created']} outgoing-group fan-outs"
+    )
+
+    return {
+        "status": "ok",
+        "contacts": contact_stats,
+        "messages": message_stats,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Import Apple ecosystem data from Mac Mini exports")
     parser.add_argument("--execute", action="store_true", help="Actually import")
     parser.add_argument("--dry-run", action="store_true", help="Preview only")
-    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos"], help="Import single source")
+    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos", "whatsapp"], help="Import single source")
     args = parser.parse_args()
 
     if not args.execute and not args.dry_run:
@@ -479,6 +545,7 @@ def main():
         "imessage": import_imessage,
         "phone": import_phone_calls,
         "photos": import_photos_faces,
+        "whatsapp": import_whatsapp,
     }
 
     if args.source:
