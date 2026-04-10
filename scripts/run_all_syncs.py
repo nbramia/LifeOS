@@ -626,8 +626,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             }
         )
 
-        # Parse output for stats
-        stats = _parse_sync_output(result.stdout)
+        # Parse output for stats (check both stdout and stderr — many scripts
+        # log stats via Python's logging module which defaults to stderr)
+        combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+        stats = _parse_sync_output(combined_output)
 
         if result.returncode != 0:
             error_msg = result.stderr or result.stdout or "Unknown error"

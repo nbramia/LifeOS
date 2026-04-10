@@ -301,11 +301,162 @@ def import_phone_calls(dry_run: bool = False) -> dict:
     return {"status": "ok", "imported": imported, "skipped": skipped, "unresolved": unresolved}
 
 
+def import_photos_faces(dry_run: bool = False) -> dict:
+    """Import Photos face recognition data from Mac Mini export.
+
+    Matches Photos people to PersonEntity records using contact UUIDs
+    (via previously imported contacts), then creates SourceEntity and
+    Interaction records — the same records that sync_photos.py would
+    create if the Photos library were available locally.
+    """
+    photos_path = IMPORT_DIR / "photos_faces.json"
+    if not photos_path.exists():
+        return {"status": "skipped", "reason": "photos_faces.json not found"}
+
+    with open(photos_path) as f:
+        data = json.load(f)
+
+    people = data.get("people", [])
+    faces = data.get("face_appearances", [])
+    logger.info(
+        f"Found {len(people)} people, {len(faces)} face appearances "
+        f"(exported {data.get('exported_at', '?')})"
+    )
+
+    if dry_run:
+        return {"status": "dry_run", "people": len(people), "faces": len(faces)}
+
+    from api.services.source_entity import get_source_entity_store, SourceEntity
+    from api.services.interaction_store import get_interaction_store, Interaction
+    from api.services.person_entity import get_person_entity_store
+
+    se_store = get_source_entity_store()
+    ia_store = get_interaction_store()
+    pe_store = get_person_entity_store()
+
+    # Build contact UUID → PersonEntity ID mapping
+    uuid_to_person: dict[str, str | None] = {}
+    for person_data in people:
+        contact_uuid = person_data.get("contact_uuid")
+        if not contact_uuid:
+            continue
+
+        # Look up the imported contact source entity by UUID
+        source_id = f"contacts:{contact_uuid}"
+        contact_se = se_store.get_by_source("contacts", source_id)
+        if contact_se and contact_se.canonical_person_id:
+            uuid_to_person[contact_uuid] = contact_se.canonical_person_id
+            continue
+
+        # Fallback: the contact may be stored with the raw UUID as source_id
+        # (different import batches may use different formats)
+        contact_se = se_store.get_by_source("contacts", contact_uuid)
+        if contact_se and contact_se.canonical_person_id:
+            uuid_to_person[contact_uuid] = contact_se.canonical_person_id
+            continue
+
+        # Final fallback: match by name
+        pe = pe_store.get_by_name(person_data.get("full_name", ""))
+        if pe:
+            uuid_to_person[contact_uuid] = pe.id
+        else:
+            uuid_to_person[contact_uuid] = None
+
+    matched = sum(1 for v in uuid_to_person.values() if v)
+    logger.info(f"Matched {matched}/{len(people)} Photos people to PersonEntity records")
+
+    # Build person_pk → person_id lookup for face appearances
+    pk_to_person: dict[int, str] = {}
+    for person_data in people:
+        contact_uuid = person_data.get("contact_uuid")
+        person_id = uuid_to_person.get(contact_uuid) if contact_uuid else None
+        if person_id:
+            pk_to_person[person_data["photos_pk"]] = person_id
+
+    # Import face appearances
+    sources_created = 0
+    interactions_created = 0
+    skipped = 0
+
+    for face in faces:
+        person_id = pk_to_person.get(face.get("person_pk"))
+        if not person_id:
+            skipped += 1
+            continue
+
+        asset_uuid = face.get("asset_uuid")
+        if not asset_uuid:
+            skipped += 1
+            continue
+
+        source_id = f"{asset_uuid}:{face['person_pk']}"
+
+        # Skip if already exists
+        existing = se_store.get_by_source("photos", source_id)
+        if existing:
+            skipped += 1
+            continue
+
+        timestamp = None
+        if face.get("timestamp"):
+            try:
+                timestamp = datetime.fromisoformat(face["timestamp"])
+            except (ValueError, TypeError):
+                timestamp = datetime.now(timezone.utc)
+
+        # Create SourceEntity
+        se = SourceEntity(
+            source_type="photos",
+            source_id=source_id,
+            observed_name=next(
+                (p["full_name"] for p in people if p["photos_pk"] == face["person_pk"]),
+                "",
+            ),
+            canonical_person_id=person_id,
+            link_confidence=0.95,
+            link_method="contact_uuid",
+            observed_at=timestamp or datetime.now(timezone.utc),
+            metadata={
+                "photos_person_pk": face["person_pk"],
+                "asset_uuid": asset_uuid,
+                "latitude": face.get("latitude"),
+                "longitude": face.get("longitude"),
+            },
+        )
+        se_store.add(se)
+        sources_created += 1
+
+        # Create Interaction
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=timestamp or datetime.now(timezone.utc),
+            source_type="photos",
+            title="Photo",
+            source_link=f"photos://asset/{asset_uuid}",
+            source_id=source_id,
+        )
+        ia_store.add_if_not_exists(interaction)
+        interactions_created += 1
+
+    logger.info(
+        f"Photos: {sources_created} sources, {interactions_created} interactions created, "
+        f"{skipped} skipped"
+    )
+    return {
+        "status": "ok",
+        "people_matched": matched,
+        "sources_created": sources_created,
+        "interactions_created": interactions_created,
+        "skipped": skipped,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Import Apple ecosystem data from Mac Mini exports")
     parser.add_argument("--execute", action="store_true", help="Actually import")
     parser.add_argument("--dry-run", action="store_true", help="Preview only")
-    parser.add_argument("--source", choices=["contacts", "imessage", "phone"], help="Import single source")
+    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos"], help="Import single source")
     args = parser.parse_args()
 
     if not args.execute and not args.dry_run:
@@ -327,6 +478,7 @@ def main():
         "contacts": import_contacts,
         "imessage": import_imessage,
         "phone": import_phone_calls,
+        "photos": import_photos_faces,
     }
 
     if args.source:

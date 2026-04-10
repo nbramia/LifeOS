@@ -341,11 +341,135 @@ def export_phone_calls(dry_run: bool = False) -> dict:
     return {"status": "ok", "count": len(export), "path": str(out_path)}
 
 
+def export_photos_faces(dry_run: bool = False) -> dict:
+    """Export Photos face recognition data as JSON.
+
+    Reads directly from Apple's Photos.sqlite database (requires the Photos
+    library to be mounted). Exports named people and their face appearances
+    so the Linux server can create SourceEntity/Interaction records without
+    needing access to the Photos library.
+    """
+    # Seconds from Unix epoch to Apple epoch (2001-01-01)
+    APPLE_EPOCH_OFFSET = 978307200
+
+    # Try common Photos library locations
+    photos_db = None
+    candidates = [
+        Path.home() / "Pictures" / "Photos Library.photoslibrary" / "database" / "Photos.sqlite",
+        Path("/Volumes/NVMe External Storage/Photos Library.photoslibrary/database/Photos.sqlite"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            photos_db = candidate
+            break
+
+    if not photos_db:
+        logger.warning("Photos.sqlite not found at any known location")
+        return {"status": "skipped", "reason": "Photos.sqlite not found"}
+
+    logger.info(f"Reading Photos database: {photos_db}")
+
+    try:
+        conn = sqlite3.connect(f"file:{photos_db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Cannot open Photos database: {e}")
+        return {"status": "skipped", "reason": str(e)}
+
+    # Get named people with contact links
+    people_rows = conn.execute("""
+        SELECT Z_PK, ZFULLNAME, ZDISPLAYNAME, ZFACECOUNT, ZPERSONURI
+        FROM ZPERSON
+        WHERE ZFULLNAME IS NOT NULL
+          AND ZFACECOUNT > 0
+          AND ZPERSONURI IS NOT NULL
+        ORDER BY ZFACECOUNT DESC
+    """).fetchall()
+
+    logger.info(f"Found {len(people_rows)} Photos people linked to contacts")
+
+    if dry_run:
+        conn.close()
+        return {"status": "dry_run", "people": len(people_rows)}
+
+    people_export = []
+    faces_export = []
+    errors = 0
+
+    for person in people_rows:
+        contact_uri = person["ZPERSONURI"]
+        contact_uuid = contact_uri.replace(":ABPerson", "") if ":ABPerson" in contact_uri else None
+
+        people_export.append({
+            "photos_pk": person["Z_PK"],
+            "full_name": person["ZFULLNAME"],
+            "display_name": person["ZDISPLAYNAME"],
+            "face_count": person["ZFACECOUNT"] or 0,
+            "contact_uuid": contact_uuid,
+            "contact_uri": contact_uri,
+        })
+
+        # Get face appearances for this person
+        try:
+            photos = conn.execute("""
+                SELECT
+                    a.ZUUID,
+                    a.ZDATECREATED,
+                    a.ZLATITUDE,
+                    a.ZLONGITUDE
+                FROM ZASSET a
+                JOIN ZDETECTEDFACE f ON f.ZASSETFORFACE = a.Z_PK
+                WHERE f.ZPERSONFORFACE = ?
+                ORDER BY a.ZDATECREATED DESC
+                LIMIT 5000
+            """, (person["Z_PK"],)).fetchall()
+
+            for photo in photos:
+                ts = None
+                if photo["ZDATECREATED"] is not None:
+                    unix_ts = photo["ZDATECREATED"] + APPLE_EPOCH_OFFSET
+                    ts = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+
+                faces_export.append({
+                    "person_pk": person["Z_PK"],
+                    "asset_uuid": photo["ZUUID"],
+                    "timestamp": ts,
+                    "latitude": photo["ZLATITUDE"],
+                    "longitude": photo["ZLONGITUDE"],
+                })
+        except Exception as e:
+            errors += 1
+            if errors <= 5:
+                logger.warning(f"Error reading photos for {person['ZFULLNAME']}: {e}")
+
+    conn.close()
+
+    out_path = EXPORT_DIR / "photos_faces.json"
+    with open(out_path, "w") as f:
+        json.dump({
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "people_count": len(people_export),
+            "face_appearances_count": len(faces_export),
+            "people": people_export,
+            "face_appearances": faces_export,
+        }, f)  # No indent — this file can be large
+
+    logger.info(
+        f"Exported {len(people_export)} people, {len(faces_export)} face appearances to {out_path}"
+    )
+    return {
+        "status": "ok",
+        "people": len(people_export),
+        "faces": len(faces_export),
+        "path": str(out_path),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export Apple ecosystem data")
     parser.add_argument("--execute", action="store_true", help="Actually export (not dry-run)")
     parser.add_argument("--dry-run", action="store_true", help="Preview what would be exported")
-    parser.add_argument("--source", choices=["contacts", "imessage", "phone"], help="Export single source")
+    parser.add_argument("--source", choices=["contacts", "imessage", "phone", "photos"], help="Export single source")
     args = parser.parse_args()
 
     if not args.execute and not args.dry_run:
@@ -365,6 +489,7 @@ def main():
         "contacts": export_contacts,
         "imessage": export_imessage,
         "phone": export_phone_calls,
+        "photos": export_photos_faces,
     }
 
     if args.source:

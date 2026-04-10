@@ -57,13 +57,15 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
         # Continue anyway - we can still sync existing messages
 
     # STEP 2: Link exported messages to PersonEntity records
-    if export_stats.get('messages_exported', 0) > 0:
-        logger.info("Linking messages to people...")
-        try:
-            join_stats = join_imessages_to_entities()
-            logger.info(f"Linked {join_stats['messages_updated']} messages to people")
-        except Exception as e:
-            logger.error(f"Failed to link messages: {e}")
+    # Always run linking — on Linux, messages arrive via apple_data_import.py
+    # (not from step 1), so there may be unlinked messages even when step 1
+    # exports 0.
+    logger.info("Linking messages to people...")
+    try:
+        join_stats = join_imessages_to_entities()
+        logger.info(f"Linked {join_stats['messages_updated']} messages to people")
+    except Exception as e:
+        logger.error(f"Failed to link messages: {e}")
 
     # STEP 3: Sync linked messages to interactions database
     imessage_db = get_imessage_db_path()

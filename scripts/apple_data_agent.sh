@@ -52,15 +52,27 @@ log "LifeOS dir: ${LIFEOS_DIR}"
 log "Linux server: ${LINUX_USER}@${LINUX_SERVER}"
 
 # -------------------------------------------------------------------
+# Step 0: Ensure Messages and Photos are running for iCloud sync
+# These apps must be open for iCloud to deliver new data to the local
+# SQLite databases. Open them early so they can sync while we work.
+# -------------------------------------------------------------------
+log "Step 0: Opening Messages and Photos for iCloud sync..."
+osascript -e 'tell application "Messages" to activate' >> "${LOG_FILE}" 2>&1 || true
+osascript -e 'tell application "Photos" to activate' >> "${LOG_FILE}" 2>&1 || true
+# Give iCloud a head start before we read the databases
+sleep 600
+
+# -------------------------------------------------------------------
 # Step 1: Export Apple data to data/apple-exports/
-# cron and /bin/bash both have Full Disk Access on the Mac Mini,
-# so we call Python directly. The LifeOS.app exec wrapper doesn't
-# work because exec replaces the process, losing FDA context.
+# Route through LifeOS.app's "run" subcommand so Python inherits
+# Full Disk Access (TCC checks the responsible process — LifeOS.app).
+# "run" keeps LifeOS.app as the parent; "exec" replaces it, losing FDA.
 # -------------------------------------------------------------------
 log "Step 1: Exporting Apple data..."
+LIFEOS_APP="/Applications/LifeOS.app/Contents/MacOS/LifeOS"
 
 cd "${LIFEOS_DIR}"
-if "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
+if "${LIFEOS_APP}" run "${PYTHON}" scripts/apple_data_export.py --execute >> "${LOG_FILE}" 2>&1; then
     log "Export: OK"
 else
     log "Export: FAILED"
