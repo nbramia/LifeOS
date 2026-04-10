@@ -123,7 +123,6 @@ All sync scripts follow the pattern:
 | `sync_contacts_csv.py` | Import Apple Contacts (CSV) |
 | `sync_apple_contacts.py` | Sync Apple Contacts via direct API |
 | `sync_phone_calls.py` | Sync phone call history |
-| `sync_whatsapp.py` | Sync WhatsApp messages |
 | `sync_imessage_interactions.py` | Sync iMessage |
 | `sync_slack.py` | Sync Slack users and DMs |
 | `sync_monarch_money.py` | Sync Monarch Money financial data |

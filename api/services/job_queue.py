@@ -332,13 +332,14 @@ def _handle_sync_source(params: dict) -> dict:
     if not source:
         raise ValueError("Missing 'source' parameter")
 
-    # Map source names to sync scripts
+    # Map source names to sync scripts.
+    # WhatsApp is intentionally absent — it now ships via the Mac Mini Apple
+    # Data Agent (apple_data_export.py → apple_data_import.py).
     script_map = {
         "gmail": "scripts/sync_gmail.py",
         "calendar": "scripts/sync_calendar.py",
         "linkedin": "scripts/sync_linkedin.py",
         "contacts": "scripts/sync_contacts.py",
-        "whatsapp": "scripts/sync_whatsapp.py",
         "slack": "scripts/sync_slack.py",
         "vault": "scripts/sync_vault.py",
     }

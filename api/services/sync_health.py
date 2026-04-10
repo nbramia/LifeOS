@@ -80,12 +80,6 @@ SYNC_SOURCES = {
         "frequency": "daily",
         "phase": 1,
     },
-    "whatsapp": {
-        "description": "WhatsApp contacts and messages via wacli",
-        "script": "scripts/sync_whatsapp.py",
-        "frequency": "daily",
-        "phase": 1,
-    },
     "imessage": {
         "description": "iMessage/SMS conversations",
         "script": "scripts/sync_imessage_interactions.py",
@@ -157,7 +151,7 @@ SYNC_SOURCES = {
         "script": "scripts/sync_relationship_discovery.py",
         "frequency": "daily",
         "phase": 3,
-        "depends_on": ["gmail_personal", "gmail_work", "calendar_personal", "calendar_work", "imessage", "whatsapp", "slack", "link_slack", "link_imessage", "phone"],
+        "depends_on": ["gmail_personal", "gmail_work", "calendar_personal", "calendar_work", "imessage", "slack", "link_slack", "link_imessage", "phone"],
     },
     "strengths": {
         "description": "Recalculate relationship strengths for all people",

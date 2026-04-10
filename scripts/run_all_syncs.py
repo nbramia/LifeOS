@@ -432,9 +432,10 @@ SYNC_ORDER = [
     #   - scripts/run_fda_syncs.py (actual sync runner with health tracking)
     # Cron schedule: 50 2 * * * /path/to/run_sync_with_fda.sh
     #
-    # On Linux, Apple data is imported from Mac Mini exports:
-    "apple_import",             # Import Apple data from Mac Mini (Linux only)
-    "whatsapp",                 # WhatsApp contacts + messages
+    # On Linux, Apple data is imported from Mac Mini exports.
+    # WhatsApp is also bundled into the apple_import step (the Mac Mini runs
+    # wacli and rsyncs whatsapp.json alongside the other exports).
+    "apple_import",             # Import Apple data + WhatsApp from Mac Mini (Linux only)
     "slack",                    # Slack users + DM messages
 
     # === Phase 2: Entity Processing ===
@@ -491,7 +492,6 @@ SYNC_SCRIPTS = {
     "contacts": ("scripts/sync_apple_contacts.py", ["--execute"]),
     "apple_import": ("scripts/apple_data_import.py", ["--execute"]),
     "phone": ("scripts/sync_phone_calls.py", ["--execute"]),
-    "whatsapp": ("scripts/sync_whatsapp.py", ["--execute"]),
     "imessage": ("scripts/sync_imessage_interactions.py", ["--execute"]),
     "slack": ("scripts/sync_slack.py", ["--execute"]),
 
