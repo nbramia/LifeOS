@@ -119,7 +119,9 @@ cp .env.example .env
 - **Monarch Money** — Financial data (account balances, transactions, budgets)
 - **Telegram bot** — Chat interface and push notifications
 - **Slack** — Workspace message sync
-- **WhatsApp** — Chat history sync via wacli
+- **WhatsApp** — Chat history sync via `wacli` on a paired Mac Mini (the LifeOS
+  host runs on Linux; wacli is macOS-only). Data is exported into
+  `data/apple-imports/whatsapp.json` and rsynced alongside contacts/iMessage.
 - **MCP for Claude Code** — Use LifeOS as a tool from Claude Code/Desktop
 
 Record the selections — they'll be configured in Phase 10.
@@ -432,9 +434,24 @@ For a **second work account**, repeat with `--account work2`:
 
 ### WhatsApp
 
+WhatsApp sync runs on the Mac Mini side of the Apple Data Agent pipeline —
+the Linux LifeOS host does not touch wacli directly. These steps must be run
+on the Mac Mini that rsyncs `data/apple-imports/` to the Linux server.
+
+On the Mac Mini:
+
 1. Install: `brew install steipete/tap/wacli`
-2. Authenticate: `wacli auth` (scan QR code with WhatsApp > Linked Devices)
+2. Authenticate: `wacli auth` (scan the QR code with WhatsApp → Linked Devices)
 3. Verify: `wacli chats list --limit 5`
+4. Confirm the exporter picks up WhatsApp:
+   `~/.venvs/lifeos/bin/python scripts/apple_data_export.py --execute --source whatsapp`
+   should produce `data/apple-imports/whatsapp.json`.
+
+On the Linux host, no configuration is needed — the `apple_import` sync step
+already imports `whatsapp.json` through `scripts/apple_data_import.py`. If the
+Mac side can't run wacli (e.g. not installed, not authenticated), the manifest
+marks WhatsApp as `status: "error"`, the Linux importer logs CRITICAL, and
+`sync_health` records the apple_import run as FAILED so you get alerted.
 
 ### MCP for Claude Code
 

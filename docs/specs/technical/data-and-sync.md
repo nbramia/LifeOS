@@ -278,26 +278,51 @@ All scheduled times use **America/New_York** (Eastern Time).
 
 ### WhatsApp Sync
 
-**Data Source:** `~/.wacli/wacli.db` (wacli CLI tool database)
+**Data Source:** `~/.wacli/wacli.db` on the Mac Mini (wacli CLI tool database).
+LifeOS runs on Linux; wacli is macOS-only, so WhatsApp data rides through the
+Apple Data Agent pipeline alongside contacts, iMessage, phone calls, and
+photos.
 
 **Sync Process:**
-1. Sync contacts from wacli's contact database
-2. Sync messages from wacli's message database
-3. Create interactions for each message thread
-4. Link to PersonEntity via phone number (E.164 format)
+1. Mac Mini cron runs `scripts/apple_data_export.py --execute`, which invokes
+   `wacli sync --once` to refresh the local database, then dumps messages,
+   group participants, LID contacts, and the whatsmeow LID→phone map to
+   `data/apple-imports/whatsapp.json`. If `wacli` is missing or fails the
+   manifest records `status: "error"` for the whatsapp source.
+2. rsync ships the export directory to the Linux host.
+3. On Linux, `scripts/apple_data_import.py` (run as the `apple_import` sync
+   source by `run_all_syncs.py`) reads `whatsapp.json` and dispatches to
+   `api.services.whatsapp.process_whatsapp_contacts` /
+   `process_whatsapp_messages` for entity resolution and interaction
+   creation.
+4. If the manifest marks the whatsapp source as `status: "error"`, the
+   importer still ingests any stale `whatsapp.json` on disk (data is better
+   than nothing) but logs `CRITICAL` and exits non-zero, so `sync_health`
+   records the apple_import run as FAILED.
 
 **Phone Number Format:**
 - Expected: E.164 format (`+15551234567`)
 - JID extraction: `15551234567@s.whatsapp.net` → `+15551234567`
 - 10-digit US numbers get `+1` prefix automatically
+- `@lid` JIDs are resolved via the whatsmeow LID→phone map dumped from
+  `~/.wacli/session.db`; LIDs with only a push name fall through to name-based
+  entity resolution.
 
-**Message Types:**
-- DMs: `title = "WhatsApp DM: {contact_name}"`
-- Groups: `title = "WhatsApp group: {group_name}"`
+**Interaction Titles:**
+- Incoming 1:1: `WhatsApp ← {name or phone}`
+- Outgoing 1:1: `WhatsApp → {name or phone}`
+- Outgoing group fan-out (one interaction per non-self participant):
+  `WhatsApp → {group_name} ({participant_name or phone})`
+- Groups larger than `LARGE_GROUP_THRESHOLD` (currently 20) are skipped
+  entirely as broadcast noise.
 
 **Entity Resolution:**
-- Messages sync uses `create_if_missing=True` to create PersonEntity for new contacts
-- Ensures message history from unknown contacts is not lost
+- 1:1 messages use `create_if_missing=True` so unknown contacts still get a
+  PersonEntity — we'd rather have the interaction attached to a thin person
+  than silently drop it.
+- Outgoing group fan-out uses `create_if_missing=False`: group members are
+  typically already known via contacts or other sources, and we don't want to
+  mint one-off PersonEntities for every LID in every group.
 
 ### Slack Sync
 
