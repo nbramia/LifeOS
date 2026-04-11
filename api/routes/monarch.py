@@ -35,6 +35,7 @@ async def list_transactions(
     category: Optional[str] = None,
     search: Optional[str] = None,
     limit: int = 100,
+    account_id: Optional[str] = None,
 ):
     """
     Search/filter recent transactions.
@@ -45,6 +46,7 @@ async def list_transactions(
     - category: Filter by category name
     - search: Search by merchant name
     - limit: Max results (default 100)
+    - account_id: Filter by Monarch account ID
     """
     if not start_date:
         start_date = (date.today() - timedelta(days=30)).isoformat()
@@ -59,6 +61,7 @@ async def list_transactions(
             search=search or "",
             category=category,
             limit=min(limit, 500),
+            account_ids=[account_id] if account_id else None,
         )
         return {
             "transactions": transactions,
