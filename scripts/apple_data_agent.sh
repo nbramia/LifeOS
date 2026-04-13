@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Cron on macOS runs with a minimal PATH that excludes Homebrew. Prepend the
+# standard brew locations so Python subprocesses (e.g. wacli) resolve.
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+
 LIFEOS_DIR="${LIFEOS_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 PYTHON="${LIFEOS_DIR}/../.venvs/lifeos/bin/python"
 LINUX_SERVER="${LIFEOS_LINUX_HOST:?Set LIFEOS_LINUX_HOST to your Linux server IP}"
