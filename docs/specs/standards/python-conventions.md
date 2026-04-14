@@ -155,7 +155,7 @@ logger = logging.getLogger(__name__)
 
 logger.info(f"Created task {task.id}: {description}")
 logger.warning(f"Error loading task index: {e}. Rebuilding.")
-logger.error(f"Failed to start Granola processor: {e}")
+logger.error(f"Failed to start calendar indexer: {e}")
 ```
 
 ### Privacy Constraints

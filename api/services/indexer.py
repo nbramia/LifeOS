@@ -46,7 +46,7 @@ class VaultEventHandler(FileSystemEventHandler):
 
     Collects all file changes within a window and processes them as a single
     batch, preventing sustained indexing load from rapid file operations
-    (e.g., Granola/Omi processors moving multiple files).
+    (e.g., bulk imports or external tools moving multiple files).
     """
 
     _BATCH_DELAY = 5.0  # seconds - wait for activity to settle before processing
