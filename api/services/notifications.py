@@ -6,7 +6,7 @@ Sends alerts via email when sync operations fail or other important events occur
 Configure LIFEOS_ALERT_EMAIL in .env to receive notifications.
 
 Failure tracking:
-- Processors (Granola, Omi, Calendar) record failures via record_failure()
+- Background services (e.g., Calendar indexer) record failures via record_failure()
 - Nightly sync checks get_recent_failures() and includes them in the batch email
 - Failures older than 24 hours are automatically cleaned up
 """
@@ -33,7 +33,7 @@ def record_failure(source: str, error: str, severity: str = "warning") -> None:
     Record a processor failure for inclusion in the nightly batch email.
 
     Args:
-        source: Name of the failing processor (e.g., "Granola processor", "Omi processor")
+        source: Name of the failing service (e.g., "Calendar indexer")
         error: Error message
         severity: "critical" for immediate alert, "warning" for nightly batch (default)
     """

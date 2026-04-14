@@ -194,20 +194,6 @@ class Settings(BaseSettings):
         description="Path to Photos Library"
     )
 
-    # Current colleagues for Granola meeting note processing (comma-separated)
-    current_colleagues_raw: str = Field(
-        default="",
-        alias="LIFEOS_CURRENT_COLLEAGUES",
-        description="Colleague first names for 1-1 meeting detection (comma-separated)"
-    )
-
-    @property
-    def current_colleagues(self) -> list[str]:
-        """Parse comma-separated colleagues into list."""
-        if not self.current_colleagues_raw:
-            return []
-        return [x.strip() for x in self.current_colleagues_raw.split(",") if x.strip()]
-
     @property
     def work_email_domains(self) -> list[str]:
         """All configured work email domains."""

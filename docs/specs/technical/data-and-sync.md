@@ -37,7 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
-| Granola | Folder watcher | Meeting transcripts, attendees |
+| Granola | Vault file watcher (notes placed by external classifier) | Meeting transcripts, attendees |
 
 ### Example Data Volume
 
@@ -115,8 +115,6 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 15:00          Calendar sync
 
 24/7           File watcher (real-time vault changes → ChromaDB + BM25)
-24/7           Granola processor (every 5 min, Granola/ → vault)
-24/7           Omi processor (every 5 min, Omi/Events/ → vault)
 ```
 
 ### Phase Dependencies
@@ -141,8 +139,6 @@ The 6-phase structure ensures correct data flow:
 | Unified Sync | Daily 3:00 AM ET | All sources | All stores |
 | Calendar Indexer | 8 AM, 12 PM, 3 PM ET | Google Calendar | ChromaDB (`lifeos_calendar`) |
 | Vault File Watcher | Continuous | Vault filesystem | ChromaDB, BM25 |
-| Granola Processor | Every 5 minutes | `Granola/` folder | Vault (classified) |
-| Omi Processor | Every 5 minutes | `Omi/Events/` folder | Vault (classified) |
 
 ### Failure Notifications
 
@@ -159,7 +155,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | ChromaDB | `data/chromadb/` | Vector embeddings | Nightly reindex, File watcher |
 | ChromaDB (Slack) | `lifeos_slack` collection | Slack message vectors | Nightly Slack sync |
 | BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex, File watcher |
-| Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, Granola, Omi, GDoc Sync |
+| Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, external classifier, GDoc Sync |
 | PersonEntity | `data/crm.db` (person_entities table) | Resolved identities | People v2 sync, iMessage sync |
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
 | Interactions | `data/interactions.db` | Interactions per person | People v2 sync, Slack sync |

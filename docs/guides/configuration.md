@@ -78,12 +78,6 @@ Environment variables and configuration files for LifeOS.
 | `LIFEOS_PERSONAL_ARCHIVE_PATH` | Archive folder prefix | `Personal/zArchive/` |
 | `LIFEOS_RELATIONSHIP_FOLDER` | Relationship folder name | `Relationship` |
 
-### Colleagues
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LIFEOS_CURRENT_COLLEAGUES` | Colleague first names (comma-separated) | `Alice,Bob,Charlie` |
-
 ### Multi-Account Sync
 
 | Variable | Description | Default |
