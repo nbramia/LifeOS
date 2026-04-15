@@ -21,10 +21,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
-import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,134 +39,20 @@ logger = logging.getLogger(__name__)
 
 # Background services (initialized on startup)
 _calendar_indexer = None
-_people_v2_sync_thread = None
-_people_v2_stop_event = threading.Event()
 _telegram_listener = None
 _reminder_scheduler = None
 _job_queue = None
 
-
-def _health_check_loop(stop_event: threading.Event, schedule_times: list[tuple[int, int]] = None, timezone: str = ""):
-    """
-    Background thread for health checks and failure notifications.
-
-    Runs at scheduled times to check sync health and processor status.
-    Default schedule: 2:30 AM (pre-sync) and 7:00 AM (post-sync).
-
-    NOTE: All sync operations run via launchd at 3:00 AM (scripts/run_all_syncs.py).
-    This loop only monitors health and sends alerts.
-
-    Args:
-        stop_event: Event to signal thread shutdown
-        schedule_times: List of (hour, minute) tuples for when to run health checks
-        timezone: Timezone for scheduling
-    """
-    if schedule_times is None:
-        schedule_times = [(2, 30), (7, 0)]  # 2:30 AM pre-sync, 7:00 AM post-sync
-    timezone = timezone or settings.timezone
-
-    tz = ZoneInfo(timezone)
-
-    while not stop_event.is_set():
-        now = datetime.now(tz)
-
-        # Calculate next run time from all scheduled times
-        candidates = []
-        for hour, minute in schedule_times:
-            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if now >= candidate:
-                candidate += timedelta(days=1)
-            candidates.append(candidate)
-        next_run = min(candidates)
-
-        # Sleep until next run (check every 60 seconds for stop signal)
-        while datetime.now(tz) < next_run and not stop_event.is_set():
-            stop_event.wait(timeout=60)
-
-        if stop_event.is_set():
-            break
-
-        check_time = datetime.now(tz).strftime("%H:%M")
-        logger.info(f"Health check ({check_time}): Starting...")
-
-        # Track failures for notification
-        failures = []
-
-        # Collect processor failures from the last 24 hours
-        # (file watcher, indexer, etc.)
-        try:
-            from api.services.notifications import get_recent_failures, clear_failures
-            processor_failures = get_recent_failures(hours=24)
-            for ts, source, error in processor_failures:
-                failures.append((f"{source} ({ts.strftime('%H:%M')})", error))
-            if processor_failures:
-                clear_failures()  # Clear after collecting
-                logger.info(f"Collected {len(processor_failures)} processor failures from last 24h")
-        except Exception as e:
-            logger.error(f"Failed to collect processor failures: {e}")
-
-        # Check sync health from the unified daily sync
-        try:
-            from api.services.sync_health import get_stale_syncs, get_failed_syncs
-            stale = get_stale_syncs()
-            failed = get_failed_syncs(hours=24)
-
-            for sync in stale:
-                failures.append((f"{sync.source} (stale)", f"Last sync: {sync.hours_since_sync:.1f}h ago"))
-            for sync in failed:
-                failures.append((f"{sync['source']} (failed)", sync.get('error_message', 'Unknown error')[:100]))
-        except Exception as e:
-            logger.error(f"Failed to check sync health: {e}")
-
-        # Collect service degradation events (fallback usage)
-        try:
-            from api.services.service_health import get_service_health
-            registry = get_service_health()
-            events = registry.get_degradation_events(hours=24)
-
-            # Report if there were frequent degradations (>5 in 24h)
-            if len(events) >= 5:
-                # Group by service for summary
-                by_service = {}
-                for event in events:
-                    by_service[event.service] = by_service.get(event.service, 0) + 1
-
-                for service, count in by_service.items():
-                    failures.append((f"{service} (degraded)", f"{count} fallback events in 24h"))
-
-            # Also report critical issues
-            for service, error in registry.get_critical_issues():
-                failures.append((f"{service} (CRITICAL)", error[:100]))
-
-            # Clear events after including in report
-            if events:
-                registry.clear_degradation_events()
-                logger.info(f"Collected {len(events)} degradation events from last 24h")
-        except Exception as e:
-            logger.error(f"Failed to collect service health: {e}")
-
-        # Send notification if any failures occurred
-        if failures:
-            logger.warning(f"Health check: {len(failures)} issue(s), sending alert...")
-            try:
-                from api.services.notifications import send_alert
-                failure_lines = [f"- {name}: {error}" for name, error in failures]
-                send_alert(
-                    subject=f"LifeOS: {len(failures)} sync issue(s)",
-                    body="The following issues were detected in the last 24 hours:\n\n" + "\n".join(failure_lines),
-                )
-            except Exception as e:
-                logger.error(f"Failed to send failure notification: {e}")
-        else:
-            logger.info("Health check: All systems healthy")
-
-        logger.info("Health check: Complete")
+# Health monitoring (previously _health_check_loop) is now an out-of-band
+# watcher in nbramia/local-processing that polls /health/raw-state. Moving it
+# out-of-process means a LifeOS outage produces an alert instead of silencing
+# the alerts themselves.
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _people_v2_sync_thread, _telegram_listener, _reminder_scheduler, _job_queue
+    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _job_queue
 
     # Startup: Recover any incomplete merge operations
     try:
@@ -191,21 +75,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start Calendar indexer: {e}")
 
-    # Startup: Initialize health check scheduler (2:30 AM and 7:00 AM Eastern)
-    # Unified sync runs via launchd at 3:00 AM
-    try:
-        _people_v2_stop_event.clear()
-        _people_v2_sync_thread = threading.Thread(
-            target=_health_check_loop,
-            args=(_people_v2_stop_event,),
-            kwargs={"schedule_times": [(2, 30), (7, 0)], "timezone": settings.timezone},
-            daemon=True,
-            name="HealthCheckThread"
-        )
-        _people_v2_sync_thread.start()
-        logger.info("Health check scheduler started (2:30 AM + 7:00 AM Eastern)")
-    except Exception as e:
-        logger.error(f"Failed to start health check scheduler: {e}")
+    # Health monitoring (previously an in-process 2:30/7:00 scheduler) now runs
+    # out-of-band in nbramia/local-processing via the lifeos_health watcher.
 
     # Startup: Start Telegram bot listener
     try:
@@ -246,11 +117,6 @@ async def lifespan(app: FastAPI):
     if _calendar_indexer:
         _calendar_indexer.stop_scheduler()
         logger.info("Calendar indexer stopped")
-
-    if _people_v2_sync_thread and _people_v2_sync_thread.is_alive():
-        _people_v2_stop_event.set()
-        _people_v2_sync_thread.join(timeout=5)
-        logger.info("Nightly sync scheduler stopped")
 
     if _telegram_listener:
         _telegram_listener.stop()
@@ -361,6 +227,71 @@ async def health_check():
         "status": "healthy" if all_healthy else "degraded",
         "service": "lifeos",
         "checks": checks,
+    }
+
+
+@app.get("/health/raw-state")
+async def health_raw_state(clear: bool = False):
+    """
+    Raw health state for out-of-band monitors (the lifeos_health watcher in
+    nbramia/local-processing).
+
+    Returns the same data the removed `_health_check_loop` used to aggregate:
+    processor failures, stale/failed syncs, service degradation events, and
+    critical service issues — all from the last 24h.
+
+    If `clear=true`, atomically clears the transient in-memory counters
+    (processor failures + degradation events) after reading. Intended for the
+    monitor to call only after it has successfully delivered an alert, so the
+    same incidents aren't reported twice. Safe to call without `clear` for
+    read-only polls.
+    """
+    from api.services.notifications import get_recent_failures, clear_failures
+    from api.services.sync_health import get_stale_syncs, get_failed_syncs
+    from api.services.service_health import get_service_health
+
+    processor_failures = get_recent_failures(hours=24)
+    stale = get_stale_syncs()
+    failed = get_failed_syncs(hours=24)
+    registry = get_service_health()
+    degradation_events = registry.get_degradation_events(hours=24)
+    critical_issues = registry.get_critical_issues()
+
+    cleared = {"processor_failures": 0, "degradation_events": 0}
+    if clear:
+        cleared["processor_failures"] = clear_failures()
+        cleared["degradation_events"] = registry.clear_degradation_events()
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "processor_failures": [
+            {"timestamp": ts.isoformat(), "source": src, "error": err}
+            for ts, src, err in processor_failures
+        ],
+        "stale_syncs": [
+            {
+                "source": s.source,
+                "hours_since_sync": s.hours_since_sync,
+                "last_sync": s.last_sync.isoformat() if s.last_sync else None,
+                "expected_frequency": s.expected_frequency,
+            }
+            for s in stale
+        ],
+        "failed_syncs": failed,
+        "degradation_events": [
+            {
+                "timestamp": e.timestamp.isoformat(),
+                "service": e.service,
+                "operation": e.operation,
+                "fallback": e.fallback_used,
+                "original_error": e.original_error,
+            }
+            for e in degradation_events
+        ],
+        "critical_issues": [
+            {"service": svc, "error": err} for svc, err in critical_issues
+        ],
+        "cleared": cleared,
     }
 
 
