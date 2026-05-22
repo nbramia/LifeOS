@@ -5,7 +5,6 @@ Tests markdown parsing and document chunking strategies.
 """
 import pytest
 from pathlib import Path
-from unittest.mock import patch
 
 from api.services.chunker import (
     count_tokens,
@@ -288,6 +287,40 @@ More content.
         # Empty section should be skipped
         contents = [c["content"] for c in chunks]
         assert all(c.strip() for c in contents)
+
+    def test_chunk_resplits_oversize_section(self):
+        """A section whose body exceeds max_chunk_size must be re-split.
+
+        Regression: a single H2 section with tens of thousands of tokens
+        used to be emitted as one giant chunk, triggering >100 GB embedding
+        allocations that crashed the nightly vault reindex.
+        """
+        from api.services.chunker import count_tokens
+
+        # ~6000-token section under a single H2 header (well above the
+        # 500-token target).
+        body = "alpha beta gamma delta epsilon zeta " * 1000
+        content = f"## Long Transcript\n\n{body}\n"
+
+        chunks = chunk_by_headers(content, max_chunk_size=500, chunk_overlap=50)
+
+        # Must produce multiple chunks (not a single giant one).
+        assert len(chunks) > 1
+        # And every chunk must be at or below a generous token ceiling.
+        # We allow some slop (chunk_by_tokens approximates words->tokens).
+        assert all(count_tokens(c["content"]) <= 1500 for c in chunks), (
+            f"Oversize chunk(s): max={max(count_tokens(c['content']) for c in chunks)}"
+        )
+
+    def test_chunk_no_headers_long_content_is_split(self):
+        """Headerless content longer than max_chunk_size must still be split."""
+        from api.services.chunker import count_tokens
+
+        body = "alpha beta gamma delta epsilon " * 1000  # ~5000 tokens
+        chunks = chunk_by_headers(body, max_chunk_size=500, chunk_overlap=50)
+
+        assert len(chunks) > 1
+        assert all(count_tokens(c["content"]) <= 1500 for c in chunks)
 
 
 # =============================================================================

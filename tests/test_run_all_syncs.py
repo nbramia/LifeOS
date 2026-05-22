@@ -212,8 +212,9 @@ class TestLLMMemoryGating:
 
     def test_llm_stopped_when_memory_insufficient(self):
         """LLM is stopped when GPU memory is below threshold."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
         result, _, stop_mock, start_mock = _run_llm_test(
-            llm_running=True, gpu_memory_mb=2000,
+            llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
         stop_mock.assert_called_once()
@@ -221,8 +222,9 @@ class TestLLMMemoryGating:
 
     def test_llm_not_stopped_when_memory_sufficient(self):
         """LLM stays running when GPU memory is above threshold."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
         result, _, stop_mock, start_mock = _run_llm_test(
-            llm_running=True, gpu_memory_mb=10_000,
+            llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB + 10_000,
         )
 
         stop_mock.assert_not_called()
@@ -230,8 +232,9 @@ class TestLLMMemoryGating:
 
     def test_llm_not_stopped_when_not_running(self):
         """No action taken when LLM is not running."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
         result, _, stop_mock, start_mock = _run_llm_test(
-            llm_running=False, gpu_memory_mb=2000,
+            llm_running=False, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
         stop_mock.assert_not_called()
@@ -239,8 +242,9 @@ class TestLLMMemoryGating:
 
     def test_llm_restarted_after_last_embedding_source(self):
         """LLM is restarted after the last embedding source, not the first."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
         result, run_sync_mock, stop_mock, start_mock = _run_llm_test(
-            llm_running=True, gpu_memory_mb=2000,
+            llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
         # Both embedding sources should have been synced
@@ -262,7 +266,10 @@ class TestLLMMemoryGating:
 
     def test_internal_keys_not_in_results(self):
         """Internal _llm_* keys are not leaked in the result dict."""
-        result, _, _, _ = _run_llm_test(llm_running=True, gpu_memory_mb=2000)
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
+        result, _, _, _ = _run_llm_test(
+            llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
+        )
 
         assert "_llm_stopped" not in result.get("results", {})
         assert "_llm_was_running" not in result.get("results", {})
@@ -272,9 +279,10 @@ class TestLLMMemoryGating:
         # This tests the try/finally safety net by ensuring the module globals
         # are properly tracked and cleaned up
         from scripts import run_all_syncs as module
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
 
         result, _, stop_mock, start_mock = _run_llm_test(
-            llm_running=True, gpu_memory_mb=2000,
+            llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
         # After run_all_syncs returns, the module-level globals should be reset
@@ -354,6 +362,47 @@ class TestSystemRAMPreFlight:
 
         called_sources = [c.args[0] for c in run_sync_mock.call_args_list]
         assert "vault_reindex" in called_sources
+
+
+class TestTimeoutBytesDecoding:
+    """Tests for graceful handling of TimeoutExpired with bytes stdout/stderr.
+
+    Regression: ``subprocess.run(..., text=True)`` decodes the streams only
+    when the process exits cleanly. On TimeoutExpired the partial buffers
+    are still raw bytes, so passing them straight to ``re.search`` crashed
+    the entire run with ``cannot use a string pattern on a bytes-like object``
+    — taking down every sync after the first timeout.
+    """
+
+    def test_timeout_handler_decodes_bytes_stdout(self):
+        """run_sync survives a TimeoutExpired whose stdout/stderr are bytes."""
+        import subprocess
+        from scripts.run_all_syncs import run_sync, SYNC_SCRIPTS
+
+        # Pick any real source key so SYNC_SCRIPTS lookup succeeds.
+        source = next(iter(SYNC_SCRIPTS))
+
+        # Simulate the exact CPython quirk: TimeoutExpired carries raw bytes
+        # even when subprocess.run() was called with text=True.
+        timeout_exc = subprocess.TimeoutExpired(
+            cmd=["fake"],
+            timeout=60,
+            output=b"Processed 100 files\nCreated 50 entries\n",
+            stderr=b"INFO: doing work\n",
+        )
+
+        with (
+            patch("scripts.run_all_syncs.subprocess.run", side_effect=timeout_exc),
+            patch("scripts.run_all_syncs.record_sync_start", return_value=999),
+            patch("scripts.run_all_syncs.record_sync_complete"),
+            patch("scripts.run_all_syncs.record_sync_error"),
+            patch("scripts.run_all_syncs.log_error_to_markdown"),
+        ):
+            # Must NOT raise TypeError from regex-on-bytes; returns (False, stats).
+            success, stats = run_sync(source, dry_run=False)
+
+        assert success is False
+        assert "timed out" in stats["error"].lower()
 
 
 class TestGetAvailableSystemRAM:

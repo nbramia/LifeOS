@@ -13,7 +13,6 @@ Contextual chunking (P9.1):
 """
 import re
 from pathlib import Path
-from typing import Optional
 import frontmatter
 import tiktoken
 
@@ -90,14 +89,25 @@ def parse_markdown(content: str) -> list[dict]:
     return sections
 
 
-def chunk_by_headers(content: str) -> list[dict]:
+def chunk_by_headers(
+    content: str,
+    max_chunk_size: int = 500,
+    chunk_overlap: int = 50,
+) -> list[dict]:
     """
     Chunk content by H2 headers (Granola-style).
+
+    Each H2 section becomes its own chunk, but if a single section exceeds
+    ``max_chunk_size`` tokens it's re-split via :func:`chunk_by_tokens`.
+    Without this guard a very long unbroken section (e.g. a Granola note with
+    no H2 separators, or a single H2 that contains the entire transcript)
+    produces a single oversize chunk that explodes embedding-model memory at
+    O(seq_len^2) attention cost.
 
     Each H2 section becomes its own chunk.
     Action items are extracted as separate chunks if present.
     """
-    chunks = []
+    chunks: list[dict] = []
     sections = parse_markdown(content)
 
     for i, section in enumerate(sections):
@@ -105,20 +115,37 @@ def chunk_by_headers(content: str) -> list[dict]:
         if not chunk_content:
             continue
 
-        chunk = {
-            "content": chunk_content,
-            "header": section["header"],
-            "chunk_index": len(chunks)
-        }
-        chunks.append(chunk)
+        if count_tokens(chunk_content) <= max_chunk_size:
+            chunks.append({
+                "content": chunk_content,
+                "header": section["header"],
+                "chunk_index": len(chunks),
+            })
+        else:
+            for sub in chunk_by_tokens(chunk_content, max_chunk_size, chunk_overlap):
+                chunks.append({
+                    "content": sub["content"],
+                    "header": section["header"],
+                    "chunk_index": len(chunks),
+                })
 
-    # If no chunks created, return whole content as single chunk
+    # If no chunks created, split the whole content rather than emitting
+    # one oversize chunk (which would OOM at embedding time).
     if not chunks:
-        chunks.append({
-            "content": content.strip(),
-            "header": "",
-            "chunk_index": 0
-        })
+        body = content.strip()
+        if count_tokens(body) <= max_chunk_size:
+            chunks.append({
+                "content": body,
+                "header": "",
+                "chunk_index": 0,
+            })
+        else:
+            for sub in chunk_by_tokens(body, max_chunk_size, chunk_overlap):
+                chunks.append({
+                    "content": sub["content"],
+                    "header": "",
+                    "chunk_index": len(chunks),
+                })
 
     return chunks
 
@@ -289,7 +316,6 @@ def generate_chunk_context(
     """
     file_name = file_path.name
     folder = file_path.parent.name
-    note_type = metadata.get("note_type", "note")
 
     # Build context based on document type
     if metadata.get("granola_id"):

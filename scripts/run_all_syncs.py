@@ -32,6 +32,8 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -58,8 +60,16 @@ from config.settings import settings
 EMBEDDING_SOURCES = {"vault_reindex", "crm_vectorstore"}
 
 # Minimum free GPU memory (MB) required to run embeddings alongside the LLM.
-# gte-Qwen2-1.5B needs ~3 GB; add headroom for PyTorch allocator overhead.
-_EMBEDDING_MEMORY_THRESHOLD_MB = 6_000
+# Modern sentence-transformer embedding models can peak at 15-22 GB transient
+# allocations during forward pass on long sequences, well beyond the model's
+# resident weights (3-4 GB). If less than this is free, we free the LLM
+# rather than risk a HIP/CUDA OOM that falls back to CPU (~10x slower, OOM-risky).
+#
+# Override with LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB if your embedding model
+# / batch size has a different working-set ceiling.
+_EMBEDDING_MEMORY_THRESHOLD_MB = int(
+    __import__("os").environ.get("LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB", "28000")
+)
 
 # Minimum free system RAM (MB) required to run embedding phases.
 # Model loading temporarily needs ~4 GB system RAM even when targeting GPU.
@@ -68,16 +78,76 @@ _EMBEDDING_MEMORY_THRESHOLD_MB = 6_000
 _EMBEDDING_RAM_THRESHOLD_MB = 4_000
 
 
+def _ollama_host() -> str:
+    """Return the configured ollama host, falling back to the standard default."""
+    return getattr(settings, "ollama_host", None) or "http://localhost:11434"
+
+
+def _ollama_loaded_models() -> list[str]:
+    """Return names of models currently loaded in ollama VRAM, or [] on error."""
+    try:
+        req = urllib.request.Request(f"{_ollama_host()}/api/ps")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        return [m["name"] for m in data.get("models", []) if m.get("size_vram", 0) > 0]
+    except Exception:
+        return []
+
+
+def _ollama_unload_all() -> list[str]:
+    """Unload all loaded ollama models from VRAM. Returns list of unloaded model names."""
+    logger = logging.getLogger(__name__)
+    unloaded: list[str] = []
+    for model in _ollama_loaded_models():
+        try:
+            payload = json.dumps({"model": model, "keep_alive": 0}).encode()
+            req = urllib.request.Request(
+                f"{_ollama_host()}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30):
+                pass
+            logger.info(f"Unloaded ollama model from VRAM: {model}")
+            unloaded.append(model)
+        except Exception as e:
+            logger.warning(f"Failed to unload ollama model {model}: {e}")
+    return unloaded
+
+
+def _ollama_warm(model: str) -> bool:
+    """Send a tiny request to reload `model` into VRAM. Returns True on success."""
+    logger = logging.getLogger(__name__)
+    try:
+        payload = json.dumps({"model": model, "prompt": "", "keep_alive": -1}).encode()
+        req = urllib.request.Request(
+            f"{_ollama_host()}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120):
+            pass
+        logger.info(f"Re-warmed ollama model: {model}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to warm ollama model {model}: {e}")
+        return False
+
+
 def _is_llm_running() -> bool:
-    """Check if lifeos-llm systemd service is active."""
+    """Check if any GPU-resident LLM is active (lifeos-llm.service or ollama-loaded model)."""
     try:
         result = subprocess.run(
             ["systemctl", "is-active", "--quiet", "lifeos-llm.service"],
             timeout=5,
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True
     except Exception:
-        return False
+        pass
+    return bool(_ollama_loaded_models())
 
 
 def _get_available_gpu_memory_mb() -> int | None:
@@ -110,47 +180,90 @@ def _get_available_system_ram_mb() -> int | None:
     return None
 
 
+# Track ollama models we unloaded so _start_llm can re-warm them
+_ollama_models_unloaded: list[str] = []
+# Track whether we stopped lifeos-llm.service so _start_llm only starts what we stopped
+_lifeos_llm_was_stopped_by_us: bool = False
+
+
 def _stop_llm_for_embeddings() -> bool:
-    """Stop LLM service to free GPU memory. Returns True if stopped."""
+    """Free GPU memory for embeddings by stopping lifeos-llm.service (if active)
+    and unloading any models currently held in ollama VRAM.
+
+    Returns True if at least one freed something.
+    """
+    global _ollama_models_unloaded, _lifeos_llm_was_stopped_by_us
     logger = logging.getLogger(__name__)
+    freed_anything = False
+
+    # Try lifeos-llm.service (legacy path, may be disabled/inactive)
     try:
-        result = subprocess.run(
-            ["sudo", "systemctl", "stop", "lifeos-llm.service"],
-            capture_output=True, text=True, timeout=30,
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "lifeos-llm.service"],
+            timeout=5,
         )
-        if result.returncode == 0:
-            logger.info("Stopped lifeos-llm to free GPU memory for embeddings")
-            # Wait for VRAM to actually be freed
-            for _ in range(10):
-                time.sleep(2)
-                available = _get_available_gpu_memory_mb()
-                if available is not None and available >= _EMBEDDING_MEMORY_THRESHOLD_MB:
-                    logger.info(f"GPU memory freed: {available} MB available")
-                    return True
-            logger.warning("LLM stopped but GPU memory not fully freed within timeout")
-            return True
-        else:
-            logger.warning(f"Failed to stop lifeos-llm: {result.stderr[:200]}")
-            return False
+        if active.returncode == 0:
+            result = subprocess.run(
+                ["sudo", "systemctl", "stop", "lifeos-llm.service"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("Stopped lifeos-llm to free GPU memory for embeddings")
+                _lifeos_llm_was_stopped_by_us = True
+                freed_anything = True
+            else:
+                logger.warning(f"Failed to stop lifeos-llm: {result.stderr[:200]}")
     except Exception as e:
-        logger.warning(f"Could not stop lifeos-llm: {e}")
+        logger.warning(f"Could not check/stop lifeos-llm: {e}")
+
+    # Unload any ollama-loaded models (the real VRAM hog under OLLAMA_KEEP_ALIVE=-1)
+    unloaded = _ollama_unload_all()
+    if unloaded:
+        _ollama_models_unloaded = unloaded
+        freed_anything = True
+
+    if not freed_anything:
         return False
+
+    # Wait for VRAM to actually be freed
+    for _ in range(10):
+        time.sleep(2)
+        available = _get_available_gpu_memory_mb()
+        if available is not None and available >= _EMBEDDING_MEMORY_THRESHOLD_MB:
+            logger.info(f"GPU memory freed: {available} MB available")
+            return True
+    logger.warning("LLM stopped/unloaded but GPU memory not fully freed within timeout")
+    return True
 
 
 def _start_llm() -> None:
-    """Start LLM service back up."""
+    """Restore LLM state after embedding phases — restart lifeos-llm if WE stopped it,
+    and re-warm any ollama models WE unloaded.
+    """
+    global _ollama_models_unloaded, _lifeos_llm_was_stopped_by_us
     logger = logging.getLogger(__name__)
-    try:
-        result = subprocess.run(
-            ["sudo", "systemctl", "start", "lifeos-llm.service"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logger.info("Restarted lifeos-llm after embedding phases")
-        else:
-            logger.warning(f"Failed to start lifeos-llm: {result.stderr[:200]}")
-    except Exception as e:
-        logger.warning(f"Could not start lifeos-llm: {e}")
+
+    if _lifeos_llm_was_stopped_by_us:
+        try:
+            result = subprocess.run(
+                ["sudo", "systemctl", "start", "lifeos-llm.service"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("Restarted lifeos-llm after embedding phases")
+            else:
+                logger.warning(f"Failed to start lifeos-llm: {result.stderr[:200]}")
+        except Exception as e:
+            logger.warning(f"Could not start lifeos-llm: {e}")
+        finally:
+            _lifeos_llm_was_stopped_by_us = False
+
+    # Re-warm exactly the ollama models we unloaded. We don't use
+    # settings.ollama_model because the actually-loaded model may differ
+    # (e.g. a heavier summarizer model running alongside a smaller router).
+    for model in _ollama_models_unloaded:
+        _ollama_warm(model)
+    _ollama_models_unloaded = []
 
 
 # Track current sync run for SIGTERM cleanup
@@ -683,12 +796,22 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     except subprocess.TimeoutExpired as e:
         timeout_minutes = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT) // 60
 
-        # Capture partial output from the killed process
-        partial_stdout = e.stdout or ""
-        _ = e.stderr or ""  # available if needed for debugging
+        # Capture partial output from the killed process.
+        # NOTE: TimeoutExpired.stdout/.stderr are bytes even when subprocess.run
+        # was called with text=True (CPython quirk), so decode defensively.
+        def _decode(buf):
+            if buf is None:
+                return ""
+            if isinstance(buf, bytes):
+                return buf.decode("utf-8", errors="replace")
+            return buf
+
+        partial_stdout = _decode(e.stdout)
+        partial_stderr = _decode(e.stderr)
+        combined_partial = partial_stdout + "\n" + partial_stderr
 
         # Parse what was accomplished before timeout
-        stats = _parse_sync_output(partial_stdout)
+        stats = _parse_sync_output(combined_partial)
 
         # Build error message with partial progress info
         error_msg = f"Sync timed out after {timeout_minutes} minutes"
@@ -696,9 +819,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             error_msg += f" (partial progress: {stats.get('processed', 0)} processed, {stats.get('created', 0)} created)"
 
         logger.error(f"Sync timeout for {source}")
-        if partial_stdout:
-            # Log last 50 lines of output to see progress
-            last_lines = "\n".join(partial_stdout.strip().split("\n")[-50:])
+        if combined_partial.strip():
+            # Log last 50 lines of output to see progress (most scripts use
+            # Python logging which goes to stderr, so check both streams)
+            last_lines = "\n".join(combined_partial.strip().split("\n")[-50:])
             logger.info(f"Partial output before timeout:\n{last_lines}")
 
         record_sync_complete(
@@ -718,8 +842,8 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
 
         # Include partial output in markdown log for visibility
         full_error_msg = error_msg
-        if partial_stdout:
-            full_error_msg += f"\n\nLast output before timeout:\n{partial_stdout[-2000:]}"
+        if combined_partial.strip():
+            full_error_msg += f"\n\nLast output before timeout:\n{combined_partial[-2000:]}"
 
         record_sync_error(source, full_error_msg[:1000], error_type="timeout")
         log_error_to_markdown(source, full_error_msg, "timeout")
@@ -1141,11 +1265,13 @@ def main():
     if args.status:
         summary = get_sync_summary()
         print("\nSync Health Summary:")
-        print(f"  Total sources: {summary['total_sources']}")
+        print(f"  Total sources: {summary['total_sources']} ({summary.get('enabled_sources', summary['total_sources'])} enabled)")
         print(f"  Healthy: {summary['healthy']}")
         print(f"  Stale: {summary['stale']} {summary['stale_sources']}")
         print(f"  Failed: {summary['failed']} {summary['failed_sources']}")
         print(f"  Never run: {summary['never_run']} {summary['never_run_sources']}")
+        if summary.get('disabled', 0):
+            print(f"  Disabled (expected): {summary['disabled']} {summary.get('disabled_sources', [])}")
         print(f"  All healthy: {summary['all_healthy']}")
         return 0 if summary['all_healthy'] else 1
 
