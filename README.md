@@ -6,7 +6,7 @@ LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calenda
 
 LifeOS is also able to take action in response to requests you send through Telegram: not just creating tasks and reminders, but reading/editing files on your computer and autonomously managing Claude Code to accomplish discrete tasks.
 
-Everything runs locally. Your data never leaves your machine — a local LLM handles orchestration and synthesis by default (Claude API is available as an optional backend). A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
+All of your data is indexed and stored locally — your vault, messages, photos, financial summaries, and the like never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic; set `LIFEOS_LLM_BACKEND=local` to route everything through a local llama-server instead. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
 
 ---
 
@@ -65,16 +65,16 @@ macOS is only required if you want native Apple integrations (iMessage, Contacts
 
 ### LLM Options
 
-LifeOS uses a local LLM by default for orchestration and synthesis — no API key needed. The model size is configurable based on your hardware:
+Orchestration and synthesis can run against the Claude API (default) or a local OpenAI-compatible llama-server. Pick what matches your hardware and privacy posture:
 
-| Hardware | Recommended Model | Config |
-|----------|------------------|--------|
-| 8 GB RAM | Small model (e.g., 7B params) | `LIFEOS_LLM_BACKEND=local` |
-| 16–32 GB RAM | Medium model (e.g., 14–32B params) | `LIFEOS_LLM_BACKEND=local` |
-| 64 GB+ VRAM | Large model (e.g., 70–120B params) | `LIFEOS_LLM_BACKEND=local` |
-| No GPU / prefer cloud | Claude API | `LIFEOS_LLM_BACKEND=anthropic` + API key |
+| Hardware / preference | Config | Notes |
+|----------------------|--------|-------|
+| No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model: `claude-haiku-4-5`. Override via `LIFEOS_ANTHROPIC_MODEL`. Query text + retrieved context is sent to Anthropic. |
+| 8 GB RAM | `LIFEOS_LLM_BACKEND=local` + small llama-server model (~7B params) | Set `LIFEOS_LOCAL_LLM_URL` if not on localhost:8080. |
+| 16–32 GB RAM | `LIFEOS_LLM_BACKEND=local` + medium model (~14–32B params) | |
+| 64 GB+ VRAM | `LIFEOS_LLM_BACKEND=local` + large model (70–120B params) | |
 
-Set `LIFEOS_LLM_BACKEND=anthropic` and provide an `ANTHROPIC_API_KEY` in `.env` to use the Claude API instead of a local model. See the [Configuration Guide](docs/guides/configuration.md) for details.
+To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_URL` at a running llama-server. See the [Configuration Guide](docs/guides/configuration.md) for details.
 
 ---
 
@@ -88,23 +88,15 @@ python3 -m venv ~/.venvs/lifeos
 source ~/.venvs/lifeos/bin/activate
 pip install -r requirements.txt
 
-# 2. Install Ollama (for query routing)
-# Linux:
-curl -fsSL https://ollama.com/install.sh | sh
-# macOS:
-brew install ollama
-
-ollama serve &
-ollama pull qwen2.5:7b-instruct
-
-# 3. Configure
+# 2. Configure
 cp .env.example .env
-# Edit .env with your settings (LIFEOS_VAULT_PATH at minimum)
+# Edit .env. Required: LIFEOS_VAULT_PATH and ANTHROPIC_API_KEY
+# (or LIFEOS_LLM_BACKEND=local with a running llama-server on LIFEOS_LOCAL_LLM_URL).
 
-# 4. Start services
+# 3. Start services
 ./scripts/server.sh start
 
-# 5. Open http://localhost:8000
+# 4. Open http://localhost:8000
 ```
 
 For persistent services on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units.
@@ -123,25 +115,26 @@ Different query types are handled by different pipelines:
 
 ```mermaid
 flowchart LR
-    Q["User Query"] --> Router["Router\n(local Ollama)"]
+    Q["User Query"] --> Intent["Intent Classifier\n(Claude Haiku)"]
 
-    Router -->|"General"| Direct["Direct Answer\n(local LLM)"]
-    Router -->|"Web"| Web["Web Search\n(local LLM)"]
-    Router -->|"Personal"| Hybrid["Hybrid Search\n(local)"]
-    Router -->|"Compound"| Both["Web + Personal"]
+    Intent -->|"code"| Code["Claude Code\n(subprocess)"]
+    Intent -->|"ambiguous"| Clarify["Ask user"]
+    Intent -->|"everything else"| Agent["Agent Loop\n(orchestrator LLM)"]
 
-    Hybrid --> Syn["Synthesis\n(local LLM)"]
-    Both --> Syn
-    Direct --> Response["Response"]
-    Web --> Response
-    Syn --> Response
+    Agent --> Tools["Up to 5 rounds of tool calls\n(search_vault, search_email,\nsearch_web, manage_tasks, …)"]
+    Tools --> Agent
+    Agent --> Response["Response"]
+    Code --> Response
+    Clarify --> Response
 ```
 
+The orchestrator LLM defaults to Claude Haiku via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`). Set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server instead.
+
 **Query types:**
-- **General knowledge**: "What's the capital of France?" → LLM answers directly
-- **Web search**: "What's the weather in NYC?" → Uses web_search tool
-- **Personal data**: "What did I discuss with John last week?" → Searches your data
-- **Compound**: "Look up the trash schedule and remind me the night before" → Multiple actions
+- **General knowledge**: "What's the capital of France?" → orchestrator answers directly without calling tools
+- **Web search**: "What's the weather in NYC?" → orchestrator calls `search_web`
+- **Personal data**: "What did I discuss with John last week?" → orchestrator calls `search_vault` / `search_email` / `search_calendar`
+- **Compound**: "Look up the trash schedule and remind me the night before" → orchestrator chains `search_web` + `manage_reminders`
 
 ### CRM UI
 
@@ -255,9 +248,9 @@ flowchart LR
         Vault["Vault\nFilesystem"]
     end
 
-    subgraph Fallback["Local (With Fallback)"]
+    subgraph Fallback["With Fallback"]
         direction TB
-        Ollama["Ollama\n:11434"] -->|fallback| Haiku["Anthropic\nHaiku"]
+        Intent["Intent classifier\n(Claude Haiku)"] -->|fallback| Patterns["Regex\npatterns"]
         BM25["BM25"] -->|fallback| VecOnly["Vector-only"]
     end
 
@@ -265,7 +258,7 @@ flowchart LR
         direction TB
         GCal["Google\nCalendar"]
         Gmail["Google\nGmail"]
-        LLM["LLM Backend\n(local or Claude)"]
+        LLM["LLM Backend\n(Claude API or local llama-server)"]
     end
 
     style Local fill:#ffcccc
@@ -275,7 +268,7 @@ flowchart LR
 
 **Severity levels:**
 - **CRITICAL**: Sent immediately (ChromaDB down, embedding failed, vault inaccessible)
-- **WARNING**: Batched nightly (Ollama unavailable, backup failed)
+- **WARNING**: Batched nightly (LLM API errors, backup failed, repeated degradation events)
 - **INFO**: Log only (Telegram retry, config defaults used)
 
 </details>
@@ -287,11 +280,11 @@ flowchart LR
 | Component | Technology |
 |-----------|------------|
 | Backend | FastAPI (port 8000) |
-| LLM (orchestration + synthesis) | Local model via llama.cpp, or Claude API |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), or local llama.cpp server (`LIFEOS_LLM_BACKEND=local`) |
 | Embeddings | sentence-transformers (gte-Qwen2-1.5B-instruct) |
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
-| Query Router | Ollama + Qwen 2.5 |
+| Intent classifier | Claude Haiku (Anthropic API), with a regex-pattern fallback |
 | Frontend | Vanilla HTML/JS (no build step) |
 | Job Queue | SQLite (background reindex, sync) |
 | Reminders | SQLite + cron scheduler |

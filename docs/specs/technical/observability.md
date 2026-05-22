@@ -25,7 +25,7 @@ Every chat request is automatically traced with per-stage timing. Traces are sto
 |------|----------|--------|
 | `intent_classify` | chat.py | — |
 | `query_expand` | chat.py | — |
-| `model_select` | chat.py | — |
+| `model_select` | chat.py | — (records a recommended tier in the trace; the agent loop currently uses the configured `LIFEOS_ANTHROPIC_MODEL` regardless) |
 | `memory_inject` | agent_loop.py | — |
 | `claude_api_round_{n}` | agent_loop.py | — |
 | `tool_{name}` | agent_loop.py | — |

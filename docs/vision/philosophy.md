@@ -40,7 +40,7 @@ LifeOS handles the most sensitive data a person has: emails, therapy notes, fina
 
 ### Local-First, Always
 
-All data processing, indexing, and storage happens locally. LLM calls (local model for synthesis, Ollama for routing) send minimal context and receive only generated text. When using the Anthropic backend, discrete query payloads are sent to Claude for synthesis. The system must function fully if the network is unavailable — only the Anthropic backend requires connectivity.
+All data ingestion, indexing, and storage happen locally and remain on the machine. The orchestrator LLM is configurable: the default (`LIFEOS_LLM_BACKEND=anthropic`) sends discrete query payloads — the user's query plus the snippets of context the agent decided to retrieve — to the Claude API; `LIFEOS_LLM_BACKEND=local` keeps every LLM call on a local llama-server. Either way, indexes, raw data, and historical content stay on disk and are never wholesale uploaded.
 
 ### Intelligence Over Organization
 

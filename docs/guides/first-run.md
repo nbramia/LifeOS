@@ -158,7 +158,7 @@ Run this checklist to ensure everything is working:
 |-------|---------|----------|
 | Server health | `curl localhost:8000/health/full \| jq` | All services "healthy" |
 | ChromaDB | `curl localhost:8001/api/v1/heartbeat` | `{"nanosecond heartbeat":...}` |
-| Ollama | `curl localhost:11434/api/tags \| jq` | Lists models |
+| Local LLM (only if `LIFEOS_LLM_BACKEND=local`) | `curl $LIFEOS_LOCAL_LLM_URL/v1/models \| jq` | Lists the loaded model |
 | Search works | Search via UI | Returns results |
 | Index populated | `curl localhost:8000/api/search -d '{"query":"test"}'` | Non-empty results |
 | Tasks API | `curl localhost:8000/api/tasks` | `{"tasks":[],"total":0}` |
@@ -186,7 +186,7 @@ Run this checklist to ensure everything is working:
 | Issue | Solution |
 |-------|----------|
 | Search returns no results | Run reindex: `curl -X POST localhost:8000/api/admin/reindex/sync` |
-| Slow first query | Ollama loading model - wait 30s |
+| Slow first query | If using `LIFEOS_LLM_BACKEND=local`, llama-server loads the model on first request — wait ~30s. If using the Anthropic backend, first call is uncached — subsequent calls within ~5 min hit Anthropic's prompt cache. |
 | MCP tools not working | Check server is running and MCP added correctly |
 
 See [Troubleshooting](troubleshooting.md) for more.

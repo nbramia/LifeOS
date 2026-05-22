@@ -1430,7 +1430,7 @@ They CAN'T find "{person}'s dog is named Max" anywhere else.
 - Fall back gracefully if local LLM unavailable
 
 **Configuration:**
-Controlled by `LIFEOS_LLM_BACKEND` setting (`local` or `anthropic`). The local backend uses llama-server on port 8080 via `llm_client.py`. Ollama is still used separately for query routing.
+Controlled by `LIFEOS_LLM_BACKEND` setting (`local` or `anthropic`, default `anthropic`). The local backend uses llama-server on `LIFEOS_LOCAL_LLM_URL` (default `http://localhost:8080`) via `llm_client.py`. Intent classification on the live chat path uses Claude Haiku via the Anthropic API regardless of backend (see `api/services/chat_helpers.py::_classify_via_haiku`).
 
 **Acceptance Criteria:**
 ```
