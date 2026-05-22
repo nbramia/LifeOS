@@ -186,15 +186,21 @@ class TestSyncHealthQueries:
 
     def test_get_stale_syncs(self, temp_db):
         """Test getting stale syncs."""
+        from api.services.sync_health import _is_source_disabled
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             # Fresh sync for gmail
             run_id = record_sync_start("gmail")
             record_sync_complete(run_id, SyncStatus.SUCCESS)
 
-            # No sync for others - they should be stale
+            # No sync for others - non-disabled sources should be stale
             stale = get_stale_syncs()
 
-            assert len(stale) >= len(SYNC_SOURCES) - 1
+            # Count expected: never-run sources minus disabled (which are not flagged)
+            expected_stale = sum(
+                1 for s in SYNC_SOURCES.keys()
+                if s != "gmail" and not _is_source_disabled(s)
+            )
+            assert len(stale) >= expected_stale
             assert "gmail" not in [s.source for s in stale]
 
     def test_get_failed_syncs(self, temp_db):
@@ -214,19 +220,21 @@ class TestSyncHealthSummary:
     """Tests for sync health summary."""
 
     def test_get_sync_summary_all_healthy(self, temp_db):
-        """Test summary when all sources are healthy."""
+        """Test summary when all enabled sources are healthy."""
+        from api.services.sync_health import _is_source_disabled
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
-            # Sync all sources
+            # Sync all sources (disabled ones still get a row but the summary excludes them)
             for source in SYNC_SOURCES.keys():
                 run_id = record_sync_start(source)
                 record_sync_complete(run_id, SyncStatus.SUCCESS)
 
             summary = get_sync_summary()
+            expected_healthy = sum(1 for s in SYNC_SOURCES.keys() if not _is_source_disabled(s))
 
             assert summary["all_healthy"] is True
             assert summary["stale"] == 0
             assert summary["failed"] == 0
-            assert summary["healthy"] == len(SYNC_SOURCES)
+            assert summary["healthy"] == expected_healthy
 
     def test_get_sync_summary_with_issues(self, temp_db):
         """Test summary when some sources have issues."""
@@ -235,8 +243,8 @@ class TestSyncHealthSummary:
             run_id = record_sync_start("gmail_personal")
             record_sync_complete(run_id, SyncStatus.SUCCESS)
 
-            # One failure
-            run_id = record_sync_start("phone")
+            # One failure — use imessage (never platform-disabled in the disabled list)
+            run_id = record_sync_start("imessage")
             record_sync_complete(run_id, SyncStatus.FAILED)
 
             # Rest are never run (stale)
@@ -246,7 +254,7 @@ class TestSyncHealthSummary:
             assert summary["all_healthy"] is False
             assert summary["healthy"] == 1
             assert summary["failed"] == 1
-            assert "phone" in summary["failed_sources"]
+            assert "imessage" in summary["failed_sources"]
             assert len(summary["never_run_sources"]) > 0
 
     def test_check_sync_health_healthy(self, temp_db):

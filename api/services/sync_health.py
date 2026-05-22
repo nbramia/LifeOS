@@ -17,8 +17,66 @@ logger = logging.getLogger(__name__)
 # Sync health database path
 SYNC_HEALTH_DB_PATH = Path(__file__).parent.parent.parent / "data" / "sync_health.db"
 
-# Maximum age before a sync is considered stale (24 hours)
+# Daily-cadence freshness threshold (24h). Other frequencies derive from this.
 SYNC_STALE_HOURS = 24
+
+# Maximum age before a sync is considered stale, by frequency. Weekly and
+# monthly sources are expected to be silent most days, so flagging them
+# every day under the 24h daily threshold produces false positives.
+STALE_HOURS_BY_FREQUENCY = {
+    "daily": SYNC_STALE_HOURS,
+    "weekly": 8 * 24,    # 7d + 1d grace
+    "monthly": 35 * 24,  # 31d + 4d grace
+    "unknown": SYNC_STALE_HOURS,
+}
+
+
+def _is_source_disabled(source: str) -> bool:
+    """Return True if the source is intentionally disabled in current settings.
+
+    Disabled sources should never be flagged as stale, since they aren't
+    expected to run. Examples: work2 accounts when work_email_domain_2 is unset,
+    phone on Linux (macOS-only via FDA cron).
+    """
+    try:
+        from config.settings import settings
+    except Exception:
+        return False
+
+    # Phone is macOS-only (runs via separate FDA cron); on Linux it never runs.
+    if source == "phone":
+        import sys
+        if sys.platform != "darwin":
+            return True
+
+    if source == "gmail_work2":
+        if not getattr(settings, "sync_work2_gmail", False):
+            return True
+        if not getattr(settings, "work_email_domain_2", ""):
+            return True
+
+    if source == "calendar_work2":
+        if not getattr(settings, "sync_work2_calendar", False):
+            return True
+        if not getattr(settings, "work_email_domain_2", ""):
+            return True
+
+    if source == "gmail_work":
+        if not getattr(settings, "sync_work_gmail", False):
+            return True
+        if not getattr(settings, "work_email_domain", ""):
+            return True
+
+    if source == "calendar_work":
+        if not getattr(settings, "sync_work_calendar", False):
+            return True
+        if not getattr(settings, "work_email_domain", ""):
+            return True
+
+    if source in ("slack", "link_slack") and not getattr(settings, "sync_slack", False):
+        return True
+
+    return False
 
 # =============================================================================
 # All data sources that should sync regularly
@@ -259,6 +317,7 @@ class SyncHealth:
     is_stale: bool
     hours_since_sync: Optional[float]
     expected_frequency: str
+    is_disabled: bool = False
 
 
 def get_sync_health_db() -> sqlite3.Connection:
@@ -472,11 +531,18 @@ def get_sync_health(source: str) -> SyncHealth:
     hours_since = None
     is_stale = True
 
-    if row:
+    frequency = source_info.get("frequency", "unknown")
+    disabled = _is_source_disabled(source)
+    stale_threshold = STALE_HOURS_BY_FREQUENCY.get(frequency, SYNC_STALE_HOURS)
+
+    if disabled:
+        # Don't flag a deliberately disabled source as stale — it isn't expected to run.
+        is_stale = False
+    elif row:
         if row["completed_at"]:
             last_sync = datetime.fromisoformat(row["completed_at"].replace("Z", "+00:00"))
             hours_since = (datetime.now(timezone.utc) - last_sync).total_seconds() / 3600
-            is_stale = hours_since > SYNC_STALE_HOURS
+            is_stale = hours_since > stale_threshold
         last_status = SyncStatus(row["status"])
         last_error = row["error_message"]
 
@@ -488,7 +554,8 @@ def get_sync_health(source: str) -> SyncHealth:
         last_error=last_error,
         is_stale=is_stale,
         hours_since_sync=hours_since,
-        expected_frequency=source_info.get("frequency", "unknown"),
+        expected_frequency=frequency,
+        is_disabled=disabled,
     )
 
 
@@ -551,24 +618,33 @@ def get_recent_errors(source: Optional[str] = None, limit: int = 50) -> list[dic
 
 
 def get_sync_summary() -> dict:
-    """Get summary of sync health across all sources."""
-    all_health = get_all_sync_health()
+    """Get summary of sync health across all sources.
 
-    healthy = [h for h in all_health if not h.is_stale and h.last_status == SyncStatus.SUCCESS]
-    stale = [h for h in all_health if h.is_stale]
-    failed = [h for h in all_health if h.last_status == SyncStatus.FAILED]
-    never_run = [h for h in all_health if h.last_sync is None]
+    Disabled sources (work2 without config, phone on Linux, etc.) are
+    excluded from staleness/never-run buckets — they aren't expected to run.
+    """
+    all_health = get_all_sync_health()
+    enabled = [h for h in all_health if not h.is_disabled]
+
+    healthy = [h for h in enabled if not h.is_stale and h.last_status == SyncStatus.SUCCESS]
+    stale = [h for h in enabled if h.is_stale and h.last_sync is not None]
+    failed = [h for h in enabled if h.last_status == SyncStatus.FAILED]
+    never_run = [h for h in enabled if h.last_sync is None]
+    disabled = [h for h in all_health if h.is_disabled]
 
     return {
         "total_sources": len(SYNC_SOURCES),
+        "enabled_sources": len(enabled),
         "healthy": len(healthy),
         "stale": len(stale),
         "failed": len(failed),
         "never_run": len(never_run),
+        "disabled": len(disabled),
         "stale_sources": [h.source for h in stale],
         "failed_sources": [h.source for h in failed],
         "never_run_sources": [h.source for h in never_run],
-        "all_healthy": len(stale) == 0 and len(failed) == 0,
+        "disabled_sources": [h.source for h in disabled],
+        "all_healthy": len(stale) == 0 and len(failed) == 0 and len(never_run) == 0,
     }
 
 
