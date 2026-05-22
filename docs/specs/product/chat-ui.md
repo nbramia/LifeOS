@@ -67,7 +67,7 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 
 ## Query Routing
 
-The local LLM (Qwen 2.5 via Ollama) routes queries to appropriate data sources.
+The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable via `LIFEOS_LLM_BACKEND` / `LIFEOS_ANTHROPIC_MODEL`) chooses which tools to call. A lightweight intent classifier runs first to short-circuit two special cases — Claude Code tasks and ambiguous task/reminder phrasing — and everything else flows through the agentic loop where the model picks tools per query.
 
 | Source | Content | Example Queries |
 |--------|---------|-----------------|

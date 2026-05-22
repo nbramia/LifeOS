@@ -23,8 +23,8 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | Backend | FastAPI (port 8000) |
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
-| Query Router | Ollama + Qwen 2.5 (local) |
-| LLM (orchestration + synthesis) | Local model via OpenAI-compatible API, or Claude API (`LIFEOS_LLM_BACKEND`) |
+| Intent classifier | Claude Haiku via Anthropic API (default); pattern-matching fallback when the API is unavailable |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default), or a local OpenAI-compatible llama-server (`LIFEOS_LLM_BACKEND=local`). Model set by `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5` |
 | LLM Client | `api/services/llm_client.py` — unified wrapper with Anthropic↔OpenAI tool format translation |
 | Embeddings | sentence-transformers (GPU via ROCm/CUDA) |
 | Frontend | Vanilla HTML/JS (no build step) |
@@ -378,7 +378,7 @@ curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 | Severity | When Sent | Examples |
 |----------|-----------|----------|
 | **CRITICAL** | Immediately (rate-limited) | ChromaDB down, embedding model failed, vault inaccessible |
-| **WARNING** | Batched nightly (7 AM ET) | Ollama unavailable, backup failed, >5 degradation events |
+| **WARNING** | Batched nightly (7 AM ET) | LLM API errors, backup failed, >5 degradation events |
 | **INFO** | Log only | Telegram retry, config defaults used |
 
 Set `LIFEOS_ALERT_EMAIL` in `.env` for alerts. Telegram backup via `telegram_bot_token` + `telegram_chat_id`.

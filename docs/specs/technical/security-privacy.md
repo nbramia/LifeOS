@@ -32,12 +32,15 @@ LifeOS is single-user, self-hosted on Linux (or macOS). The threat model is fund
 
 ### What Leaves the Machine
 
+Whether chat traffic leaves the machine depends on `LIFEOS_LLM_BACKEND`. The default is `anthropic`, which routes the live chat path (intent classification + agentic orchestration) through the Claude API. Setting it to `local` keeps everything on a local llama-server.
+
 | Data | Destination | Purpose | Frequency |
 |------|-------------|---------|-----------|
-| Query text + search result snippets | Local LLM (default) or Claude API | Chat synthesis | Per user query |
-| Query text | Ollama (local process) | Query routing/classification | Per user query |
+| Query text (≤64 tokens of classification output) | Anthropic API (default) — Claude Haiku | Intent classification (`code` vs. ambiguous vs. agentic) | Per user query, unless `LIFEOS_LLM_BACKEND=local` |
+| Query text + retrieved tool results | Anthropic API (default) or local llama-server | Agentic orchestration & synthesis | Per user query and per tool round |
+| Email/note snippets for specialist tasks (web-search synthesis, fact extraction, relationship insights) | Anthropic API — pinned to `claude-sonnet-4-20250514` via `get_anthropic_llm()` | Quality-sensitive sub-calls | Per tool invocation, regardless of backend setting |
 | OAuth authentication flows | Google, Slack | Token refresh | Periodic |
-| Reminder messages | Telegram Bot API | Notification delivery | Per reminder |
+| Reminder messages, sync summaries | Telegram Bot API | Notification delivery | Per reminder / nightly |
 
 ## Credential Storage
 

@@ -70,9 +70,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 15 tools and up to 5 rounds to fetch data and synthesize an answer.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 18 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list.
 
-**Agentic loop tools (15):**
+**Agentic loop tools (18):**
 
 | Tool | Description |
 |------|-------------|
@@ -89,6 +89,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
 | `manage_reminders` | Create or list reminders (action: create/list) |
 | `create_email_draft` | Gmail draft |
+| `create_calendar_event` | Create a Google Calendar event |
+| `update_calendar_event` | Update a Google Calendar event |
+| `delete_calendar_event` | Delete a Google Calendar event |
 | `save_memory` | Save a memory for future reference |
 | `search_memories` | Search previously saved memories |
 
