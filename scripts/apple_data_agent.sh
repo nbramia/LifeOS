@@ -34,6 +34,47 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "${LOG_FILE}"
 }
 
+# Retry a command up to N times with explicit delays. The Mac Mini reaches
+# the Linux server over whatever network you've configured (LAN, mesh VPN,
+# tunnel) — without retry, a brief hiccup at cron time meant the exports
+# sat on the Mac Mini until the next day's cron.
+#
+# Usage:  retry_with_backoff <label> <delays_csv> <command...>
+# Returns the exit status of the last attempt.
+retry_with_backoff() {
+    local label=$1
+    local delays_csv=$2
+    shift 2
+
+    local -a delays
+    IFS=',' read -r -a delays <<< "${delays_csv}"
+    local max_attempts=$(( ${#delays[@]} + 1 ))
+
+    local attempt=1
+    while (( attempt <= max_attempts )); do
+        if "$@"; then
+            if (( attempt > 1 )); then
+                log "${label}: succeeded on attempt ${attempt}/${max_attempts}"
+            fi
+            return 0
+        fi
+        local rc=$?
+        if (( attempt < max_attempts )); then
+            local delay=${delays[$((attempt - 1))]}
+            log "${label}: attempt ${attempt}/${max_attempts} failed (exit ${rc}); retrying in ${delay}s..."
+            sleep "${delay}"
+        else
+            log "${label}: all ${max_attempts} attempts failed (final exit ${rc})"
+            return ${rc}
+        fi
+        attempt=$((attempt + 1))
+    done
+}
+
+# Retry delays in seconds: brief network hiccups usually resolve in <2 min.
+# Total wall time on full failure ≈ 30 + 90 + 180 = 5 min before giving up.
+RETRY_DELAYS="30,90,180"
+
 # Only run on macOS
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "This script only runs on macOS (Apple Data Agent)."
@@ -91,20 +132,29 @@ log "Step 2: Syncing to Linux server..."
 EXPORT_DIR="${LIFEOS_DIR}/data/apple-exports/"
 IMPORT_DIR="${LINUX_USER}@${LINUX_SERVER}:${LINUX_LIFEOS}/data/apple-imports/"
 
-# Create remote directory if needed
-ssh -o ConnectTimeout=10 "${LINUX_USER}@${LINUX_SERVER}" \
-    "mkdir -p ${LINUX_LIFEOS}/data/apple-imports" 2>> "${LOG_FILE}" || {
-    log "ERROR: Cannot connect to Linux server at ${LINUX_SERVER}"
+# Create remote directory if needed — retry on transient SSH failures
+# (e.g., the link to the server just came back, or remote sshd is briefly busy).
+ensure_remote_dir() {
+    ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+        "${LINUX_USER}@${LINUX_SERVER}" \
+        "mkdir -p ${LINUX_LIFEOS}/data/apple-imports" 2>> "${LOG_FILE}"
+}
+if ! retry_with_backoff "SSH mkdir" "${RETRY_DELAYS}" ensure_remote_dir; then
+    log "ERROR: Cannot connect to Linux server at ${LINUX_SERVER} after retries"
     log "Exports saved locally at ${EXPORT_DIR} — will retry next run"
     exit 1
-}
+fi
 
-# Rsync with compression
-if rsync -avz --timeout=60 \
-    "${EXPORT_DIR}" "${IMPORT_DIR}" >> "${LOG_FILE}" 2>&1; then
+# Rsync with compression — retry on transient failures (network, timeout).
+run_rsync() {
+    rsync -avz --timeout=60 \
+        -e "ssh -o ConnectTimeout=10 -o ServerAliveInterval=15" \
+        "${EXPORT_DIR}" "${IMPORT_DIR}" >> "${LOG_FILE}" 2>&1
+}
+if retry_with_backoff "Rsync" "${RETRY_DELAYS}" run_rsync; then
     log "Rsync: OK"
 else
-    log "Rsync: FAILED (exports saved locally)"
+    log "Rsync: FAILED after retries (exports saved locally)"
     exit 1
 fi
 
@@ -113,7 +163,12 @@ fi
 # -------------------------------------------------------------------
 log "Step 3: Triggering import on Linux server..."
 
-ssh -o ConnectTimeout=10 "${LINUX_USER}@${LINUX_SERVER}" \
+# Fire-and-forget — server-side script handles its own logging. We don't
+# retry here because by this point rsync already succeeded, so the data
+# is on the server; the next nightly cron will pick it up if the trigger
+# misses.
+ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    "${LINUX_USER}@${LINUX_SERVER}" \
     "cd ${LINUX_LIFEOS} && ~/.venvs/lifeos/bin/python scripts/apple_data_import.py --execute" \
     >> "${LOG_FILE}" 2>&1 &
 
