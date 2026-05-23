@@ -44,6 +44,7 @@ class TestCodeIntent:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("message", [
+        # Questions about code are not actions on code
         "how do I write a for loop in Python",
         "what does this function do",
         "explain the code in server.py",
@@ -51,13 +52,24 @@ class TestCodeIntent:
         "tell me about server.py",
         "why does the test fail",
         "describe the architecture",
+        # Non-code phrases that previously over-matched code-action verbs
+        "restart the dishwasher",
+        "restart my conversation",
+        "restart the workout",
+        "browse to the kitchen",
+        "navigate to the meeting room",
+        "check the service hours of the restaurant",
+        "check the status of my order",
+        "commit to a decision",
+        "commit to the plan",
     ])
-    async def test_code_questions_not_classified_as_code(self, message):
-        """Questions about code are not actions on code — should pass through to the agent."""
+    async def test_non_code_phrases_not_classified_as_code(self, message):
+        """Questions about code AND non-code phrases that share verbs (e.g.
+        "restart the dishwasher") must not be routed to Claude Code."""
         from api.services.chat_helpers import classify_action_intent
         result = await classify_action_intent(message, [])
         assert result is None or result.category != "code", (
-            f"Expected non-code for question: {message}, got {result.category if result else None}"
+            f"Expected non-code for: {message}, got {result.category if result else None}"
         )
 
 
