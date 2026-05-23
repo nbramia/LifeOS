@@ -15,6 +15,31 @@ set -e
 PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 cd "$PROJECT_ROOT"
 
+# Detect what's being pushed so we can skip tests on docs-only pushes.
+# git feeds pre-push hooks lines of "local_ref local_sha remote_ref remote_sha" on stdin.
+CHANGED_FILES=""
+ZERO_SHA="0000000000000000000000000000000000000000"
+while read local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    # Deletion push (local_sha is zeros) — nothing to diff.
+    [ "$local_sha" = "$ZERO_SHA" ] && continue
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        # New branch: diff against origin/main if available, else last 10 commits.
+        MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "${local_sha}~10")
+        DIFF=$(git diff --name-only "$MERGE_BASE" "$local_sha" 2>/dev/null || true)
+    else
+        DIFF=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)
+    fi
+    CHANGED_FILES="$CHANGED_FILES"$'\n'"$DIFF"
+done
+CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
+
+# If we have a non-empty change list and every file is docs, skip the test suite.
+if [ -n "$CHANGED_FILES" ] && ! echo "$CHANGED_FILES" | grep -qvE '\.(md|txt|rst)$|^docs/'; then
+    echo "Pre-push: docs-only push, skipping unit tests"
+    exit 0
+fi
+
 LOG="/tmp/lifeos-prepush-tests.log"
 
 # Activate virtual environment
@@ -24,7 +49,16 @@ fi
 
 echo -n "Running unit tests... "
 
-if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header > "$LOG" 2>&1; then
+# Parallelize across all cores via pytest-xdist (-n auto).
+# --ff orders previously-failed tests first on full runs; --lf restricts
+# to only previously-failed tests when a failed-tests cache exists, so
+# fix-and-push iterations are fast. A fresh checkout (no cache) runs all.
+PYTEST_OPTS=(-n auto --ff)
+if [ -f ".pytest_cache/v/cache/lastfailed" ]; then
+    PYTEST_OPTS+=(--lf)
+fi
+
+if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header "${PYTEST_OPTS[@]}" > "$LOG" 2>&1; then
     SUMMARY=$(tail -1 "$LOG")
     echo "passed ($SUMMARY)"
     exit 0
