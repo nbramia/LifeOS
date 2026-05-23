@@ -41,6 +41,50 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _mtime_trust_cutoff() -> datetime | None:
+    """Parse `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` (YYYY-MM-DD) into a UTC datetime.
+
+    Returns None if the env var is unset or unparseable. When None, undated
+    notes get UNDATED_SENTINEL — never the filesystem mtime — to avoid
+    polluting the timeline with bulk-migration / restore-from-backup mtimes
+    on installations that don't opt in.
+    """
+    raw = os.environ.get("LIFEOS_VAULT_MTIME_TRUSTED_AFTER", "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        logger.warning(
+            "LIFEOS_VAULT_MTIME_TRUSTED_AFTER=%r is not a valid YYYY-MM-DD date; "
+            "ignoring (undated notes will get UNDATED_SENTINEL)",
+            raw,
+        )
+        return None
+
+
+_MTIME_TRUST_CUTOFF = _mtime_trust_cutoff()
+
+
+def _resolve_undated_note_date(path) -> datetime:
+    """Return the best-effort date for an undated note's interactions.
+
+    Uses the file's mtime when it is strictly later than
+    `LIFEOS_VAULT_MTIME_TRUSTED_AFTER`; otherwise falls back to
+    UNDATED_SENTINEL. See the env-var docstring on `_mtime_trust_cutoff`
+    for the rationale (bulk migrations cluster mtimes).
+    """
+    if _MTIME_TRUST_CUTOFF is None:
+        return UNDATED_SENTINEL
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except Exception:
+        return UNDATED_SENTINEL
+    if mtime > _MTIME_TRUST_CUTOFF:
+        return mtime
+    return UNDATED_SENTINEL
+
+
 class VaultEventHandler(FileSystemEventHandler):
     """Handle file system events in the vault with global batch debouncing.
 
@@ -345,10 +389,24 @@ class IndexerService:
                     # Dated note: use extracted date
                     note_date = datetime.strptime(note_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 else:
-                    # Undated note: use sentinel date so it still appears in counts
-                    # and can be shown in an "Undated" section of timeline
-                    note_date = UNDATED_SENTINEL
-                    logger.debug(f"Undated note (using sentinel date): {path.name}")
+                    # Undated note: fall back to filesystem mtime so the
+                    # interaction lands on the timeline at a meaningful date
+                    # (when the user last touched the note) rather than
+                    # 1970-01-01.
+                    #
+                    # Caveat: a bulk migration / restore-from-backup can give
+                    # thousands of files the same recent mtime even though
+                    # the underlying notes are years old. Gate mtime use
+                    # behind `LIFEOS_VAULT_MTIME_TRUSTED_AFTER=YYYY-MM-DD`:
+                    # only mtimes strictly later than that cutoff are used,
+                    # everything else falls back to UNDATED_SENTINEL. If the
+                    # env var is unset, mtime is never trusted (legacy
+                    # behavior, safe default).
+                    note_date = _resolve_undated_note_date(path)
+                    if note_date == UNDATED_SENTINEL:
+                        logger.debug(f"Undated note (sentinel): {path.name}")
+                    else:
+                        logger.debug(f"Undated note (mtime {note_date.date()}): {path.name}")
 
                 affected_person_ids = self._sync_people_to_v2(path, all_people, note_date, is_granola)
 
