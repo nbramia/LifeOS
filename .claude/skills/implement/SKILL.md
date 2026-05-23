@@ -1,7 +1,7 @@
 ---
 name: implement
 description: Full implementation lifecycle with adversarial review using subagents
-argument-hint: <task-description or #issue-number>
+argument-hint: <task-description or #issue-number> [instructions]
 ---
 
 # Implement
@@ -24,10 +24,24 @@ This skill runs five phases. You **MUST** use task tracking (TaskCreate/TaskUpda
 3. **Break down dynamically.** When entering a phase, expand it into granular sub-tasks. When unexpected work surfaces (failing test, unanticipated dependency, new requirement), add new tasks immediately.
 4. **Keep the list truthful.** Delete irrelevant tasks. Update descriptions if scope changes. The list must reflect current reality.
 
-**Entry point — determine where to start:**
-1. If `$ARGUMENTS` is a number or starts with `#`, it is a GitHub issue. Fetch the issue with `gh issue view <number> --comments` to get the full description and acceptance criteria. Then proceed to Phase 1.
-2. Run `gh pr list --head <current-branch> --json number,title --jq '.[0]'`. If a PR exists, verify it relates to the current task (check title/description alignment). If it does, record the PR number and **skip to Phase 4**. If it appears unrelated, ignore it and proceed to Phase 1.
-3. Otherwise, treat `$ARGUMENTS` as a freeform task description.
+**Entry point — identify the target:**
+1. If the leading token of `$ARGUMENTS` is a number or starts with `#`, it is a GitHub issue. Fetch the issue with `gh issue view <number> --comments` to get the full description and acceptance criteria.
+2. Otherwise, run `gh pr list --head <current-branch> --json number,title --jq '.[0]'`. If a PR exists, verify it relates to the current task (check title/description alignment). If it does, record the PR number and treat the target as that PR. If it appears unrelated, ignore it.
+3. Otherwise, treat the leading portion of `$ARGUMENTS` as a freeform task description.
+
+**Trailing instructions — scope the lifecycle:**
+
+Any text after the leading token controls which phases run. Parse it before bootstrapping tasks so the task list reflects only the phases you will execute.
+
+| Instructions | Effect |
+|--------------|--------|
+| *(none)* | Full lifecycle (default): Phase 1 → 2 → 3 → 4 → 5 |
+| `quick` or `no-review` | Skip Phase 4 entirely — Phase 1 → 2 → 3 → 5 |
+| `no-plan` | Skip Phase 1 — go straight to Phase 2 |
+| `review-only` | Run Phase 4 only on the target PR (target MUST be a PR number) |
+| Any other text | Interpret intent. Do more rather than less — the full lifecycle is always safe. |
+
+Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the target is an existing PR and no instructions are given, skip to Phase 4.
 
 ---
 
@@ -82,47 +96,27 @@ This skill runs five phases. You **MUST** use task tracking (TaskCreate/TaskUpda
 
 ### Phase 4: Review/Address Loop
 
-Runs up to **3 rounds**. Each round: Reviewer subagent -> Referee (you) -> Addresser subagent.
+**Default: 1 round.** Spawn a reviewer subagent, referee findings, address them, then **self-verify** the fixes from the main context. Spawn a Round-2 reviewer subagent **only if** self-verification surfaces something concrete.
 
-#### Before Round 1 — Prepare Injection Context
-
-These steps gather everything needed to construct subagent prompts. Do them once; re-fetch the diff each round.
-
-1. **Read the review skill:** Use the Read tool on `.claude/skills/review-pr/SKILL.md`. Store the full content. Strip the YAML frontmatter block (lines between `---` markers) and strip lines that contain shell escape sequences (lines starting with `- ` followed by a label and a bang-backtick pattern that inject data at skill load time — you will replace them with actual data in the prompt).
-2. **Read the address skill:** Use the Read tool on `.claude/skills/address-review/SKILL.md`. Strip frontmatter and shell escape lines the same way. Also strip Step 6 (the "Re-request Review" step) — the orchestrator controls the review loop, so re-requesting review from within the addresser subagent would trigger unwanted notifications.
-3. **Fetch PR data:** Run `gh pr view <number>` and `gh pr diff <number>`. Store both outputs. You will re-fetch the diff before each subsequent round since it changes after addressing.
+Subagent spawns are not free — each costs context and wall time. Reading the diff yourself is the cheaper verification path for most PRs. **Hard limit: 3 rounds total.**
 
 #### Step A: Spawn Reviewer Subagent
 
-Use the **Task tool** with these exact parameters:
+Use the **Skill tool** to invoke the existing `review-pr` skill as a subagent. Do NOT pre-load the skill content into the prompt — the subagent will load the methodology itself.
 
 - `subagent_type`: `"general-purpose"`
 - `description`: `"Review PR #<number> round <N>"`
-- `prompt`: Construct by concatenating the blocks below. Copy the actual data into the prompt — the subagent has no access to the PR or skill files otherwise.
-
-**Prompt template for reviewer:**
+- Use the **Task tool** with a short directive that instructs the subagent to invoke the `review-pr` skill with the PR number:
 
 ```
-You are an adversarial code reviewer. Your job is to find real problems — bugs, security issues, spec violations, missing tests. Do not nitpick style unless it violates project conventions.
+You are an adversarial code reviewer for PR #<number>, round <N>.
 
-## PR Metadata
-<paste output of: gh pr view <number>>
+Run the review-pr skill on this PR:
+  Skill tool → skill: "review-pr", args: "<number>"
 
-## PR Diff
-<paste output of: gh pr diff <number>>
+If round <N> > 1, also fetch `gh pr view <number> --comments` first so you can see previous referee decisions and avoid repeating addressed/rejected findings. Focus on: new issues introduced by fixes, issues missed in prior rounds, and whether previously-addressed findings were actually fixed correctly.
 
-## PR Comments
-<If N > 1, paste the PR comments from: gh pr view <number> --comments. This gives the reviewer access to previous referee decisions and addresser summaries for verification. If N == 1, omit this section.>
-
-## Review Methodology
-<paste the stripped contents of review-pr/SKILL.md here — this gives the reviewer the full review methodology including specialist agent spawning, severity categories, verification steps, and anti-patterns>
-
-## Round Context
-Round <N> of 3.
-<If N > 1, include: "Previous round referee decisions: <paste the referee decision table from the prior round>. Do NOT repeat findings that were already addressed or explicitly rejected with justification. Focus on: new issues introduced by fixes, issues missed in prior rounds, and whether previously-addressed findings were actually fixed correctly.">
-
-## Output Format
-Return findings in exactly this structure:
+Return findings in this structure:
 
 ### Action Required
 - **[Category]** Description with specific file:line references
@@ -136,10 +130,10 @@ Return findings in exactly this structure:
 ### Summary
 <1-2 sentence overall assessment: merge-ready, needs changes, or needs discussion>
 
-If a category has no findings, omit it entirely.
+Omit any category that has no findings.
 ```
 
-The reviewer subagent will also post its findings to GitHub using `gh pr review`. This is fine — let it. The GitHub comment provides an audit trail.
+The reviewer subagent will post its findings to GitHub via `gh pr review` as part of the skill. That's the audit trail — let it happen.
 
 #### Step B: Referee Evaluation (You — Main Context)
 
@@ -183,28 +177,20 @@ EOF
 
 #### Step D: Spawn Addresser Subagent
 
-Use the **Task tool** with these exact parameters:
+Use the **Task tool** with a short directive that invokes the existing `address-review` skill. Do NOT pre-load the skill content.
 
 - `subagent_type`: `"general-purpose"`
 - `description`: `"Address review PR #<number> round <N>"`
-- `prompt`: Construct by concatenating the blocks below.
-
-**Prompt template for addresser:**
+- `prompt`:
 
 ```
-You are addressing filtered review feedback on PR #<number>. A referee has validated these findings — they are real issues. Address them all, but independently verify that each suggested fix is correct before applying it.
+You are addressing filtered review feedback on PR #<number>, round <N>. A referee has validated these findings — they are real issues. Address them all, but independently verify each suggested fix is correct before applying it.
 
-## PR Number
-<number>
+Run the address-review skill on this PR:
+  Skill tool → skill: "address-review", args: "<number>"
 
-## Branch
-<branch-name from gh pr view --json headRefName>
-
-## Findings to Address
+## Findings to Address (referee-filtered)
 <paste the filtered action plan from Step B — only Accepted and Downgraded findings, with the referee's severity and reasoning>
-
-## Address Methodology
-<paste the stripped contents of address-review/SKILL.md here — this gives the addresser the full methodology for verifying findings, the Apply/Partially-apply/Reject/Escalate framework, testing requirements, and commit conventions>
 
 ## Key Rules
 - Run the full test suite after ALL changes. Every test must pass. No exceptions.
@@ -212,9 +198,8 @@ You are addressing filtered review feedback on PR #<number>. A referee has valid
 - Keep fix commits separate when they address unrelated findings.
 - Push to the PR branch when done.
 - Do NOT re-request review or add reviewers — the orchestrator controls the review loop.
-- Post your summary to the PR as a comment using: gh pr comment <number> --body "<summary>"
+- Post your summary to the PR as a comment via: gh pr comment <number> --body "<summary>"
 
-## Output Format
 Return a summary table:
 
 | # | Finding | Action | Details |
@@ -226,15 +211,23 @@ Return a summary table:
 **Commits:** <list of fix commit messages>
 ```
 
-#### Step E: Evaluate Continuation
+#### Step E: Self-Verify, Then Decide Continuation
 
-After the addresser subagent returns:
+After the addresser subagent returns, **verify the fixes from your own context** before deciding whether to spawn another reviewer subagent.
 
 1. **Post the addresser's summary** as a PR comment (if the addresser didn't already).
-2. **Decide whether to continue:**
-   - **Stop** if: this was round 3, OR zero findings were accepted by the referee in this round.
-   - **Continue** if: Any findings were accepted and addressed — run a verification round to confirm fixes are clean and no regressions were introduced. Re-fetch `gh pr diff <number>` and return to Step A.
-3. **Escalate** if round 3 ends with unresolved Action Required items:
+2. **Self-verify** by re-fetching the diff and reading the touched files yourself:
+   ```bash
+   gh pr diff <number> --name-only
+   ```
+   Read each touched file. Cross-check against the addresser's summary and the round's filtered action plan. You are looking for **concrete** evidence that a Round-N+1 reviewer would help:
+   - A new file appeared in the diff that the original reviewer never saw.
+   - An addresser commit changed code that doesn't trace back to any forwarded finding.
+   - A forwarded finding looks unfixed or partially fixed (the change doesn't actually resolve the issue).
+3. **Decide:**
+   - **Stop and go to Phase 5** if: self-verification found nothing concerning, OR this was round 3.
+   - **Spawn Round N+1 reviewer (Step A)** only if self-verification surfaced one of the concrete triggers above. If you spawn Round 2 and it finds nothing, stop — do not spawn Round 3 speculatively.
+4. **Escalate** if round 3 ends with unresolved Action Required items:
 
 ```
 gh pr comment <number> --body "$(cat <<'EOF'
