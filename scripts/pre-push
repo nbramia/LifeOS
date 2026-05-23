@@ -24,7 +24,16 @@ fi
 
 echo -n "Running unit tests... "
 
-if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header > "$LOG" 2>&1; then
+# Parallelize across all cores via pytest-xdist (-n auto).
+# --ff orders previously-failed tests first on full runs; --lf restricts
+# to only previously-failed tests when a failed-tests cache exists, so
+# fix-and-push iterations are fast. A fresh checkout (no cache) runs all.
+PYTEST_OPTS=(-n auto --ff)
+if [ -f ".pytest_cache/v/cache/lastfailed" ]; then
+    PYTEST_OPTS+=(--lf)
+fi
+
+if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header "${PYTEST_OPTS[@]}" > "$LOG" 2>&1; then
     SUMMARY=$(tail -1 "$LOG")
     echo "passed ($SUMMARY)"
     exit 0
