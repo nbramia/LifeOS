@@ -1063,15 +1063,16 @@ async def ask_stream(request: AskStreamRequest):
 
             # The agent loop uses the orchestrator model configured by
             # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
-            # `model_tier` is retained as a label for the routing event below;
-            # the agent loop itself ignores it.
-            model_tier = getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            # The perf-trace field is still named `model_tier` because the column
+            # in perf_traces.db is `model_tier` — but the value is now a model id
+            # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
+            orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
             _trace = _current_trace.get()
             if _trace:
-                _trace.model_tier = model_tier
+                _trace.model_tier = orchestrator_model
             print(f"\n{'='*60}")
             print(f"QUERY: {request.question}")
-            print(f"MODEL: {model_tier}")
+            print(f"MODEL: {orchestrator_model}")
             print(f"CONVERSATION: {conversation_id}")
             print(f"{'='*60}")
 
@@ -1087,7 +1088,7 @@ async def ask_stream(request: AskStreamRequest):
                     for att in request.attachments
                 ]
 
-            yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': f'Agentic loop ({model_tier})', 'latency_ms': 0})}\n\n"
+            yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': f'Agentic loop ({orchestrator_model})', 'latency_ms': 0})}\n\n"
 
             # Consume the async generator from the agent loop
             agent_result = None
@@ -1095,7 +1096,7 @@ async def ask_stream(request: AskStreamRequest):
                 question=effective_question,
                 conversation_history=conversation_history,
                 attachments=attachments_for_api,
-                model_tier=model_tier,
+                model_tier=orchestrator_model,
                 max_tool_rounds=5,
             ):
                 if event["type"] == "text":
@@ -1151,7 +1152,7 @@ async def ask_stream(request: AskStreamRequest):
             # Save assistant response
             routing_metadata = {
                 "sources": [tc["tool"] for tc in agent_result.tool_calls_log],
-                "reasoning": f"agentic ({model_tier})",
+                "reasoning": f"agentic ({orchestrator_model})",
                 "tool_rounds": len(agent_result.tool_calls_log),
             }
             store.add_message(
