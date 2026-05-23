@@ -137,8 +137,21 @@ def _ollama_warm(model: str) -> bool:
 
 
 def _is_llm_running() -> bool:
-    """Check if any GPU-resident LLM is holding VRAM that embeddings would need."""
-    return bool(_ollama_loaded_models())
+    """Detect any GPU-resident process that would compete with embeddings.
+
+    Source-agnostic: any process holding most of the VRAM counts — whether it's
+    ollama, llama-server (lifeos-llm.service), or another model. If VRAM
+    detection is unavailable, returns False (nothing we can free).
+
+    Note: `_stop_llm_for_embeddings` can only unload ollama-held models. If a
+    non-ollama LLM (e.g. llama-server) is pinning VRAM, the orchestrator's
+    post-stop check will see VRAM is still pinned and the embedding sources
+    will fall back to CPU (existing behavior).
+    """
+    available = _get_available_gpu_memory_mb()
+    if available is None:
+        return False
+    return available < _EMBEDDING_MEMORY_THRESHOLD_MB
 
 
 def _get_available_gpu_memory_mb() -> int | None:
@@ -206,9 +219,9 @@ def _start_llm() -> None:
     """Restore LLM state after embedding phases — re-warm any ollama models we unloaded."""
     global _ollama_models_unloaded
 
-    # Re-warm exactly the ollama models we unloaded. We don't use
-    # settings.ollama_model because the actually-loaded model may differ
-    # (e.g. a heavier summarizer model running alongside a smaller router).
+    # Re-warm exactly the ollama models we unloaded — we restore whatever
+    # was actually pinned in VRAM before the sync, not whatever
+    # settings.ollama_model currently points to.
     for model in _ollama_models_unloaded:
         _ollama_warm(model)
     _ollama_models_unloaded = []
