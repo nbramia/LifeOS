@@ -62,6 +62,20 @@ class TestCodeIntent:
         "check the status of my order",
         "commit to a decision",
         "commit to the plan",
+        # Polite / deliberative question forms — the user is asking, not commanding
+        "Do I need to run the tests",
+        "Do you think I should commit my changes",
+        "Should I delete the cache",
+        "Should you commit the changes now",
+        "Could you run the tests",
+        "Can you run the tests",
+        "Can I delete the old logs",
+        "Would you mind committing my changes",
+        "Will you push the branch",
+        "Is it possible to delete the cache",
+        "Are there any tests to run",
+        "Have I committed my changes",
+        "Has the build finished",
     ])
     async def test_non_code_phrases_not_classified_as_code(self, message):
         """Questions about code AND non-code phrases that share verbs (e.g.

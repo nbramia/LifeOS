@@ -681,7 +681,13 @@ _CODE_QUESTION_PREFIXES = re.compile(
     r"why\s+(?:does|is|do)|when\s+(?:does|is|do)|where\s+(?:does|is)|"
     r"explain|describe|what'?s\s+the\s+difference|"
     r"can\s+you\s+(?:explain|tell\s+me|show\s+me\s+how)|"
-    r"tell\s+me\s+(?:about|how|why|what))"
+    r"tell\s+me\s+(?:about|how|why|what)|"
+    # Polite / deliberative question forms — the user is asking, not commanding.
+    r"do\s+(?:i|you)\s+|should\s+(?:i|you)\s+|"
+    r"could\s+you\s+|can\s+you\s+|can\s+i\s+|"
+    r"would\s+you\s+|will\s+you\s+|"
+    r"is\s+it\s+|are\s+there\s+|"
+    r"have\s+i\s+|has\s+\S+\s+)"
 )
 
 # "remind me ..." / "remember to ..." reminder-creation verbs.
