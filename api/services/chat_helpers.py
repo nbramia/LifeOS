@@ -5,7 +5,6 @@ Pure functions extracted from chat.py to reduce complexity and improve
 testability. These handle query parsing, date extraction, and message formatting.
 """
 import dataclasses
-import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -626,160 +625,132 @@ def extract_reminder_topic(query: str) -> Optional[str]:
     return None
 
 
-_INTENT_CLASSIFICATION_PROMPT = """Classify the user's intent. Return ONLY a JSON object.
+# Verbs that mean "do something on the filesystem / terminal / browser".
+# Each branch is anchored on the verb; the noun after the optional article +
+# optional adjective(s) is the actual signal that this is a code-action.
+# Up to 3 adjectives between article and noun keeps phrases like
+# "create a Python script", "delete all .pyc files", "delete the old logs"
+# in the positive set.
+_CODE_NOUN_OBJECTS = (
+    r"file|files|folder|directory|script|tests?|"
+    r"function|class|module|component|page|fixture|migration|"
+    r"logs?|cache|branch|stash|server|service"
+)
+_ARTICLE_AND_ADJECTIVES = r"(?:(?:a|an|the|all|my|some|new|this|that)\s+)?(?:\S+\s+){0,3}"
 
-Possible intents:
-- compose: drafting/sending an email
-- task_create: adding a to-do or task
-- task_list: listing/showing tasks
-- task_complete: marking a task as done
-- task_edit: changing a task's details
-- task_delete: removing a task
-- reminder_create: setting a timed reminder/notification
-- reminder_list: listing reminders
-- reminder_edit: changing a reminder
-- reminder_delete: removing a reminder
-- task_and_reminder: user wants BOTH a task and a reminder (e.g., "both", "do both", "task and reminder")
-- code: user wants an ACTION that requires terminal commands, file operations, code changes, browser automation, or system tasks. Examples: create/edit/delete files, run scripts, install software, change settings, fix bugs, update code, browse websites, check system status. This is for DOING things, not asking questions about code.
-- none: question, search, or anything that isn't an action above
+_CODE_ACTION_VERBS = re.compile(
+    r"(?i)\b("
+    r"create\s+" + _ARTICLE_AND_ADJECTIVES + r"(?:" + _CODE_NOUN_OBJECTS + r")\b"
+    r"|edit\s+" + _ARTICLE_AND_ADJECTIVES + r"\S+\.\w+"
+    r"|update\s+" + _ARTICLE_AND_ADJECTIVES + r"(?:code|css|html|config|file|tests?|\S+\.\w+|dashboard)\b"
+    r"|fix\s+" + _ARTICLE_AND_ADJECTIVES + r"(?:bug|issue|tests?|error|build|server|"
+    r"crash|leak|race|deadlock)\b"
+    r"|debug\s+(?:the\s+|my\s+)?\S+"
+    r"|implement\s+(?:a|an|the)\s+"
+    r"|refactor\s+(?:the\s+|my\s+)?"
+    r"|run\s+(?:the\s+)?(?:tests?|build|server|script|npm|pip|"
+    r"\S+\.py|\S+\.sh|make|pytest|cargo)\b"
+    r"|install\s+\S+"
+    r"|upgrade\s+\S+"
+    r"|delete\s+" + _ARTICLE_AND_ADJECTIVES + r"(?:files?|logs?|cache|"
+    r"branch|stash|\S+\.\w+)\b"
+    r"|remove\s+" + _ARTICLE_AND_ADJECTIVES + r"(?:files?|\S+\.\w+)\b"
+    r"|rename\s+\S+"
+    r"|commit\s+(?:my\s+|the\s+|all\s+)?"
+    r"|push\s+(?:my\s+|the\s+)?(?:branch|changes|to)\b"
+    r"|pull\s+(?:from\s+|the\s+)?(?:main|master|origin)\b"
+    r"|merge\s+(?:into\s+|the\s+)?"
+    r"|browse\s+to\s+"
+    r"|navigate\s+to\s+"
+    r"|check\s+(?:the\s+)?(?:disk\s+usage|memory|cpu|"
+    r"process|log|status|service|server)\b"
+    r"|start\s+(?:the\s+|my\s+)?(?:server|service|container|docker)\b"
+    r"|stop\s+(?:the\s+|my\s+)?(?:server|service|container|docker)\b"
+    r"|restart\s+(?:the\s+|my\s+)?\S+"
+    r"|kill\s+(?:the\s+|process|all)\s+"
+    r")"
+)
 
-Key distinctions:
-- A "task" is a to-do item on a list. A "reminder" is a timed notification that pings the user.
-- "code" is for actions requiring filesystem/terminal/browser access - NOT for questions about code or programming help. "How do I write a for loop?" is none. "Create a Python script that does X" is code. "Fix the bug in my server" is code. "What does this function do?" is none.
+# Questions about code (not actions on it).
+_CODE_QUESTION_PREFIXES = re.compile(
+    r"(?i)^\s*(?:how\s+(?:do|does|can)|what\s+(?:is|are|does|do)|"
+    r"why\s+(?:does|is|do)|when\s+(?:does|is|do)|where\s+(?:does|is)|"
+    r"explain|describe|what'?s\s+the\s+difference|"
+    r"can\s+you\s+(?:explain|tell\s+me|show\s+me\s+how)|"
+    r"tell\s+me\s+(?:about|how|why|what))"
+)
 
-{context}
+# "remind me ..." / "remember to ..." reminder-creation verbs.
+_REMINDER_VERBS = re.compile(
+    r"(?i)\b(remind\s+me|remember\s+to|don'?t\s+forget|"
+    r"add\s+\S.*\s+to\s+my\s+(?:list|to-?do))"
+)
 
-User message: {query}
+# Explicit temporal markers that disambiguate "reminder" from "task".
+# If a reminder verb is paired with one of these, the user clearly wants
+# a timed notification (not a to-do).
+_TEMPORAL_MARKERS = re.compile(
+    r"(?i)\b("
+    r"at\s+\d|\d+\s*(?:am|pm)|in\s+(?:an?\s+)?(?:hour|minute|day|week|month)s?|"
+    r"tomorrow|tonight|today|this\s+(?:morning|afternoon|evening|week|weekend)|"
+    r"next\s+(?:week|month|year|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|day|hour|minute)|"
+    r"on\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"every\s+(?:hour|day|week|month|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday|morning|afternoon|evening)|"
+    r"daily|weekly|monthly|nightly"
+    r")\b"
+)
 
-Return JSON: {{"intent": "<intent>", "confidence": <0.0-1.0>}}"""
+
+def _is_code_intent(query: str) -> bool:
+    """Return True if the query asks for an action on the filesystem, terminal,
+    or browser (i.e. needs Claude Code), as opposed to a question about code.
+    """
+    if _CODE_QUESTION_PREFIXES.match(query):
+        return False
+    return bool(_CODE_ACTION_VERBS.search(query))
+
+
+def _is_ambiguous_task_reminder(query: str) -> bool:
+    """Return True if the query reads as a reminder-or-task but doesn't carry
+    an explicit temporal marker. The agent loop has separate `manage_tasks` and
+    `manage_reminders` tools — when the user's intent could go either way, we
+    short-circuit to a clarification question rather than let the agent guess.
+    """
+    if not _REMINDER_VERBS.search(query):
+        return False
+    if _TEMPORAL_MARKERS.search(query):
+        return False
+    return True
 
 
 async def classify_action_intent(query: str, conversation_history: list = None) -> Optional[ActionIntent]:
+    """Pre-agent intent dispatch — return one of two outcomes that change the
+    code path downstream in :func:`api.routes.chat.ask_stream`:
+
+    - ``ActionIntent("code", None)`` — query needs Claude Code (terminal,
+      filesystem, browser). ``ask_stream`` emits a ``code_intent`` SSE event
+      and returns, so the Telegram bot can spawn a Claude Code subprocess.
+    - ``ActionIntent("ambiguous_task_reminder", None)`` — query reads as
+      "task or timed reminder?" without an explicit time. ``ask_stream``
+      short-circuits to a clarification prompt rather than letting the
+      agent loop guess between ``manage_tasks`` and ``manage_reminders``.
+
+    Every other intent — compose, task lookup/edit/delete, dated reminders,
+    general questions — returns ``None`` so the agent loop's own tools
+    (create_email_draft, manage_tasks, manage_reminders, create_calendar_event,
+    search_*, …) handle it.
+
+    Pure pattern-matching: no LLM call on the hot path. ``conversation_history``
+    is accepted for API stability but currently unused — the only follow-up
+    cases ("both", "the second one") are handled by the pending-selection
+    machinery elsewhere in ``ask_stream``.
     """
-    Classify action intent using Haiku (primary) with pattern matching fallback.
-
-    Uses conversation history to understand follow-ups like "Both" or "the second one".
-
-    Args:
-        query: User query text
-        conversation_history: Recent conversation messages for context
-
-    Returns:
-        ActionIntent with category and optional sub_type, or None if no match
-    """
-    # Build conversation context for follow-up understanding
-    context = ""
-    if conversation_history:
-        recent = conversation_history[-4:]
-        parts = []
-        for msg in recent:
-            role = getattr(msg, "role", "user")
-            content = getattr(msg, "content", str(msg))[:300]
-            parts.append(f"{role}: {content}")
-        if parts:
-            context = "Recent conversation:\n" + "\n".join(parts)
-
-    prompt = _INTENT_CLASSIFICATION_PROMPT.format(query=query, context=context)
-
-    # Primary: Haiku (fast, cheap, reliable)
-    intent_str = await _classify_via_haiku(prompt)
-    if intent_str:
-        result = _parse_intent_response(intent_str)
-        if result:
-            return result
-
-    # Fallback: pattern matching when Haiku is unavailable
-    logger.warning("Haiku unavailable for intent classification, using pattern fallback")
-    from api.services.service_health import record_degradation
-    record_degradation("haiku", "intent_classification", "pattern_matching", "Haiku unavailable")
-    return _classify_action_intent_patterns(query)
-
-
-async def _classify_via_haiku(prompt: str) -> Optional[str]:
-    """Primary classifier: call the configured Anthropic model (Haiku by default)
-    via the synthesizer. Falls back to None on failure so the caller can use
-    pattern matching.
-    """
-    try:
-        from api.services.synthesizer import get_synthesizer
-        synthesizer = get_synthesizer()
-        response = await synthesizer.get_response(prompt, max_tokens=64)
-        return response
-    except Exception as e:
-        logger.debug(f"Haiku intent classification failed: {e}")
-        return None
-
-
-def _parse_intent_response(response: str) -> Optional[ActionIntent]:
-    """Parse the LLM's JSON response into an ActionIntent."""
-    try:
-        json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
-        if not json_match:
-            return None
-        data = json.loads(json_match.group())
-        intent = data.get("intent", "none")
-        confidence = data.get("confidence", 0.5)
-
-        if confidence < 0.3 or intent == "none":
-            return None
-
-        # Map LLM intent string to ActionIntent
-        mapping = {
-            "compose": ("compose", None),
-            "task_create": ("task", TaskIntentType.CREATE.value),
-            "task_list": ("task", TaskIntentType.LIST.value),
-            "task_complete": ("task", TaskIntentType.COMPLETE.value),
-            "task_edit": ("task", TaskIntentType.EDIT.value),
-            "task_delete": ("task", TaskIntentType.DELETE.value),
-            "reminder_create": ("reminder", ReminderIntentType.CREATE.value),
-            "reminder_list": ("reminder", ReminderIntentType.LIST.value),
-            "reminder_edit": ("reminder", ReminderIntentType.EDIT.value),
-            "reminder_delete": ("reminder", ReminderIntentType.DELETE.value),
-            "task_and_reminder": ("task_and_reminder", None),
-            "code": ("code", None),
-        }
-
-        if intent in mapping:
-            category, sub_type = mapping[intent]
-            return ActionIntent(category, sub_type)
-
-        return None
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.debug(f"Failed to parse intent response: {e}")
-        return None
-
-
-def _classify_action_intent_patterns(query: str) -> Optional[ActionIntent]:
-    """Pattern-based fallback when LLMs are unavailable."""
-    q = query.lower()
-
-    # Compose
-    for p in ["draft an email", "draft email", "compose email", "write an email", "send an email", "email to "]:
-        if p in q:
-            return ActionIntent("compose", None)
-
-    # Task
-    if any(p in q for p in ["delete the task", "remove the task", "remove the to-do"]):
-        return ActionIntent("task", TaskIntentType.DELETE.value)
-    if re.search(r"mark .* as done", q) or any(p in q for p in ["complete the task", "check off"]):
-        return ActionIntent("task", TaskIntentType.COMPLETE.value)
-    if any(p in q for p in ["update the task", "change the task", "edit the task"]):
-        return ActionIntent("task", TaskIntentType.EDIT.value)
-    if any(p in q for p in ["list my tasks", "show my tasks", "my tasks", "open tasks", "show tasks"]):
-        return ActionIntent("task", TaskIntentType.LIST.value)
-    if any(p in q for p in ["add a to-do", "add a todo", "create a task", "new task", "add a task"]):
-        return ActionIntent("task", TaskIntentType.CREATE.value)
-
-    # Reminder
-    if detect_reminder_delete_intent(query):
-        return ActionIntent("reminder", ReminderIntentType.DELETE.value)
-    if detect_reminder_edit_intent(query):
-        return ActionIntent("reminder", ReminderIntentType.EDIT.value)
-    if detect_reminder_list_intent(query):
-        return ActionIntent("reminder", ReminderIntentType.LIST.value)
-    if detect_reminder_intent(query):
-        return ActionIntent("reminder", ReminderIntentType.CREATE.value)
-
+    if _is_code_intent(query):
+        return ActionIntent("code", None)
+    if _is_ambiguous_task_reminder(query):
+        return ActionIntent("ambiguous_task_reminder", None)
     return None
 
 

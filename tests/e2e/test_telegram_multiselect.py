@@ -5,7 +5,7 @@ Tests the "which one?" prompts that present numbered lists and
 handle user's numeric responses to select items.
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
 pytestmark = pytest.mark.unit
@@ -176,23 +176,6 @@ class TestReminderDisambiguation:
         for part in expected_parts:
             assert part.lower() in prompt.lower()
 
-    @pytest.mark.asyncio
-    async def test_delete_disambiguation_stores_pending_selection(self):
-        """Test that ambiguous delete stores pending selection in routing."""
-        from api.services.chat_helpers import classify_action_intent
-
-        # Mock the classification to return reminder_delete
-        mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("delete the meeting reminder", [])
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "delete"
 
 
 class TestTaskDisambiguation:
