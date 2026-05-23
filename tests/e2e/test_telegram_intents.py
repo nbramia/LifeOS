@@ -1,275 +1,182 @@
 """
-E2E tests for intent classification.
+E2E tests for the pre-agent intent classifier.
 
-Tests that user messages are correctly classified into action intents.
-Uses mocked LLM responses to test the full classification pipeline.
+After PR #89/#87, `classify_action_intent` returns only two categories
+that change the downstream code path in `ask_stream`:
+  - `code` — query needs Claude Code (terminal/filesystem/browser)
+  - `ambiguous_task_reminder` — query reads as "task or reminder?" with
+    no temporal marker, so we short-circuit to a clarification prompt
+
+Everything else returns `None` and falls through to the agent loop, which
+has dedicated tools (create_email_draft, manage_tasks, manage_reminders,
+create_calendar_event, search_*, …) and routes the query itself. The tests
+here verify exactly that contract — no LLM is called on the hot path.
 """
 import pytest
-from unittest.mock import patch, AsyncMock
 
 pytestmark = pytest.mark.unit
 
 
-class TestIntentClassification:
-    """Tests for classify_action_intent function."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("message,expected_category,expected_subtype", [
-        # Reminder intents
-        ("remind me to call mom at 5pm", "reminder", "create"),
-        ("set a reminder for tomorrow morning", "reminder", "create"),
-        ("ping me about the meeting at 3", "reminder", "create"),
-        ("show my reminders", "reminder", "list"),
-        ("list all reminders", "reminder", "list"),
-        ("delete the dentist reminder", "reminder", "delete"),
-        ("remove that reminder", "reminder", "delete"),
-        ("change the reminder to 6pm", "reminder", "edit"),
-        ("update the meeting reminder", "reminder", "edit"),
-        # Task intents
-        ("add task review PR", "task", "create"),
-        ("add a to-do to call dentist", "task", "create"),
-        ("create task for quarterly report", "task", "create"),
-        ("what tasks do I have", "task", "list"),
-        ("show my tasks", "task", "list"),
-        ("list my to-dos", "task", "list"),
-        ("mark the report task as done", "task", "complete"),
-        ("complete the review task", "task", "complete"),
-        ("delete the old task", "task", "delete"),
-        ("remove the dentist task", "task", "delete"),
-        # Compose intents
-        ("draft an email to John", "compose", None),
-        ("write an email about the meeting", "compose", None),
-        ("compose a message to the team", "compose", None),
-        # Code intents
-        ("create a file called test.py", "code", None),
-        ("fix the bug in server.py", "code", None),
-        ("update the CSS for the dashboard", "code", None),
-        ("run the tests", "code", None),
-        ("delete the old logs", "code", None),
-    ])
-    async def test_intent_classification_with_mocked_llm(
-        self, message, expected_category, expected_subtype
-    ):
-        """Test that messages are classified to correct intents via LLM."""
-        from api.services.chat_helpers import classify_action_intent
-
-        # Mock Ollama to return the expected classification
-        mock_response = f'{{"intent": "{expected_category}_{expected_subtype or "create"}", "confidence": 0.9}}'
-        if expected_category == "code":
-            mock_response = '{"intent": "code", "confidence": 0.9}'
-        elif expected_category == "compose":
-            mock_response = '{"intent": "compose", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            assert result is not None, f"Expected intent for: {message}"
-            assert result.category == expected_category, (
-                f"Expected {expected_category}, got {result.category} for: {message}"
-            )
-            if expected_subtype:
-                assert result.sub_type == expected_subtype, (
-                    f"Expected {expected_subtype}, got {result.sub_type} for: {message}"
-                )
+class TestCodeIntent:
+    """`classify_action_intent` returns `code` for filesystem/terminal/browser actions."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("message", [
-        "what's the weather",
-        "who is the president",
-        "tell me about John Smith",
-        "what's on my calendar tomorrow",
-        "how do I write a for loop",
-        "what does this function do",
-    ])
-    async def test_non_action_messages_return_none(self, message):
-        """Test that non-action messages return None (no action intent)."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "none", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-            assert result is None, f"Expected None for non-action: {message}"
-
-
-class TestPatternFallback:
-    """Tests for pattern-based fallback when LLMs are unavailable."""
-
-    @pytest.mark.asyncio
-    async def test_fallback_used_when_haiku_down(self):
-        """Pattern matching should be used when the Haiku classifier fails."""
-        from api.services.chat_helpers import classify_action_intent
-
-        # Simulate Haiku failing — classify_action_intent should fall back to patterns
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            result = await classify_action_intent("remind me to call mom", [])
-            assert result is not None
-            assert result.category == "reminder"
-
-    @pytest.mark.parametrize("message,expected_category", [
-        ("remind me to call mom", "reminder"),
-        ("add a task to review PR", "task"),
-        ("draft an email to John", "compose"),
-        ("show my reminders", "reminder"),
-        ("list my tasks", "task"),
-        ("delete the reminder", "reminder"),
-    ])
-    def test_pattern_matching_directly(self, message, expected_category):
-        """Test the pattern matching fallback directly."""
-        from api.services.chat_helpers import _classify_action_intent_patterns
-
-        result = _classify_action_intent_patterns(message)
-        assert result is not None, f"Expected pattern match for: {message}"
-        assert result.category == expected_category
-
-
-class TestCompoundIntents:
-    """Tests for task_and_reminder compound intent."""
-
-    @pytest.mark.asyncio
-    async def test_task_and_reminder_classification(self):
-        """Test that 'both' response is classified as task_and_reminder."""
-        from api.services.chat_helpers import classify_action_intent
-        from unittest.mock import MagicMock
-
-        # Simulate conversation where user was asked "task or reminder?"
-        # and responded "both"
-        mock_history = [
-            MagicMock(
-                role="user",
-                content="add a todo to submit taxes and remind me Friday",
-            ),
-            MagicMock(
-                role="assistant",
-                content="Should I add this as a to-do or set a timed reminder?",
-            ),
-        ]
-
-        mock_response = '{"intent": "task_and_reminder", "confidence": 0.95}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("both", mock_history)
-            assert result is not None
-            assert result.category == "task_and_reminder"
-
-    @pytest.mark.asyncio
-    async def test_explicit_task_and_reminder_request(self):
-        """Test explicit 'task and reminder' in single message."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "task_and_reminder", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(
-                "add a task to submit taxes and remind me about it Friday",
-                [],
-            )
-            assert result is not None
-            assert result.category == "task_and_reminder"
-
-
-class TestCodeIntentClassification:
-    """Tests for code intent detection and auto-routing."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("message", [
+        "fix the bug in server.py",
         "create a Python script that does X",
-        "fix the bug in my server",
-        "update the code to handle edge cases",
-        "run npm install",
-        "check disk usage",
-        "browse to google.com and search for X",
+        "update the CSS for the dashboard",
+        "run the tests",
         "delete all .pyc files",
+        "browse to google.com and search for X",
+        "check disk usage",
+        "implement a retry helper",
+        "refactor the orchestrator",
+        "run npm install",
+        "commit my changes",
+        "delete the old logs",
+        "create a file called test.py",
     ])
-    async def test_code_intent_detected(self, message):
-        """Test that code-related actions are detected."""
+    async def test_code_action_detected(self, message):
         from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "code", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-            assert result is not None
-            assert result.category == "code"
+        result = await classify_action_intent(message, [])
+        assert result is not None, f"Expected code intent for: {message}"
+        assert result.category == "code", f"Got {result.category} for: {message}"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("message", [
+        # Questions about code are not actions on code
         "how do I write a for loop in Python",
         "what does this function do",
         "explain the code in server.py",
         "what's the difference between let and const",
+        "tell me about server.py",
+        "why does the test fail",
+        "describe the architecture",
+        # Non-code phrases that previously over-matched code-action verbs
+        "restart the dishwasher",
+        "restart my conversation",
+        "restart the workout",
+        "browse to the kitchen",
+        "navigate to the meeting room",
+        "check the service hours of the restaurant",
+        "check the status of my order",
+        "commit to a decision",
+        "commit to the plan",
+        # Polite / deliberative question forms — the user is asking, not commanding
+        "Do I need to run the tests",
+        "Do you think I should commit my changes",
+        "Should I delete the cache",
+        "Should you commit the changes now",
+        "Could you run the tests",
+        "Can you run the tests",
+        "Can I delete the old logs",
+        "Would you mind committing my changes",
+        "Will you push the branch",
+        "Is it possible to delete the cache",
+        "Are there any tests to run",
+        "Have I committed my changes",
+        "Has the build finished",
     ])
-    async def test_code_questions_not_classified_as_code(self, message):
-        """Test that questions ABOUT code are not classified as code actions."""
+    async def test_non_code_phrases_not_classified_as_code(self, message):
+        """Questions about code AND non-code phrases that share verbs (e.g.
+        "restart the dishwasher") must not be routed to Claude Code."""
         from api.services.chat_helpers import classify_action_intent
-
-        # Questions about code should return "none" not "code"
-        mock_response = '{"intent": "none", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-            # Should be None (no action) or not "code"
-            if result is not None:
-                assert result.category != "code", (
-                    f"Code question incorrectly classified as code action: {message}"
-                )
+        result = await classify_action_intent(message, [])
+        assert result is None or result.category != "code", (
+            f"Expected non-code for: {message}, got {result.category if result else None}"
+        )
 
 
-class TestLowConfidenceHandling:
-    """Tests for handling low-confidence classifications."""
+class TestAmbiguousTaskReminder:
+    """`classify_action_intent` returns `ambiguous_task_reminder` only when the
+    user uses reminder-creation language without a temporal marker."""
 
     @pytest.mark.asyncio
-    async def test_low_confidence_returns_none(self):
-        """Test that low confidence scores return None from parsing."""
-        from api.services.chat_helpers import _parse_intent_response
-
-        # Return a valid intent but with very low confidence
-        mock_response = '{"intent": "task_create", "confidence": 0.2}'
-
-        result = _parse_intent_response(mock_response)
-        # Confidence threshold is 0.3, so this should return None
-        assert result is None
+    @pytest.mark.parametrize("message", [
+        "remind me to call mom",
+        "remember to call mom",
+        "don't forget the meeting",
+        "add submit taxes to my list",
+    ])
+    async def test_ambiguous_detected(self, message):
+        from api.services.chat_helpers import classify_action_intent
+        result = await classify_action_intent(message, [])
+        assert result is not None, f"Expected ambiguous intent for: {message}"
+        assert result.category == "ambiguous_task_reminder", (
+            f"Got {result.category} for: {message}"
+        )
 
     @pytest.mark.asyncio
-    async def test_medium_confidence_accepted(self):
-        """Test that medium confidence scores are accepted."""
+    @pytest.mark.parametrize("message", [
+        "remind me at 3pm to call mom",
+        "remind me tomorrow to call mom",
+        "remind me in an hour to call mom",
+        "remind me to call mom every morning",
+        "remind me at 9am tomorrow to take meds",
+    ])
+    async def test_temporal_marker_disambiguates(self, message):
+        """If the user includes a clear time, the agent loop handles it as a reminder."""
         from api.services.chat_helpers import classify_action_intent
+        result = await classify_action_intent(message, [])
+        assert result is None, (
+            f"Expected None (agent handles dated reminders) for: {message}, "
+            f"got {result.category if result else None}"
+        )
 
-        mock_response = '{"intent": "task_create", "confidence": 0.5}'
 
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("add a task to review", [])
-            assert result is not None
-            assert result.category == "task"
+class TestEverythingElseFallsThrough:
+    """`classify_action_intent` returns None for the categories the agent handles."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("message", [
+        # Tasks — agent uses manage_tasks
+        "add a task to review the PR",
+        "what tasks do I have",
+        "mark the PR review as done",
+        "delete the old task",
+        # Reminders with explicit time — agent uses manage_reminders
+        "set a reminder for tomorrow at 3pm",
+        "show my reminders",
+        # Compose — agent uses create_email_draft
+        "draft an email to John",
+        "compose a message to the team",
+        # Calendar — agent uses search_calendar / create_calendar_event
+        "what's on my calendar tomorrow",
+        "schedule a meeting with Alice next week",
+        # General questions — agent uses search_*
+        "what's the weather",
+        "who is the president",
+        "what did I discuss with John last week",
+    ])
+    async def test_agent_handled_intents_return_none(self, message):
+        from api.services.chat_helpers import classify_action_intent
+        result = await classify_action_intent(message, [])
+        assert result is None, (
+            f"Expected None (agent handles) for: {message}, "
+            f"got {result.category if result else None}"
+        )
+
+
+class TestNoLLMCallOnHotPath:
+    """The classifier must not call an LLM — that's the whole point of this change."""
+
+    @pytest.mark.asyncio
+    async def test_classify_action_intent_does_not_call_synthesizer(self, monkeypatch):
+        # If something tries to use the synthesizer for classification, fail loudly.
+        sentinel = []
+
+        def boom(*args, **kwargs):
+            sentinel.append(("get_synthesizer", args, kwargs))
+            raise RuntimeError("classify_action_intent should not call the synthesizer")
+
+        monkeypatch.setattr("api.services.synthesizer.get_synthesizer", boom)
+        from api.services.chat_helpers import classify_action_intent
+        # Exercise several messages — none should invoke the synthesizer
+        for msg in [
+            "fix the bug in server.py",
+            "remind me to call mom",
+            "remind me at 3pm to call mom",
+            "what's the weather",
+        ]:
+            await classify_action_intent(msg, [])
+        assert sentinel == [], f"Synthesizer was called {len(sentinel)} times"

@@ -5,7 +5,7 @@ Tests the approval workflow, clarification handling, cost cap termination,
 and auto-routing of code intents.
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 import time
 
 pytestmark = pytest.mark.unit
@@ -176,24 +176,18 @@ class TestCostCapTermination:
 
 
 class TestCodeIntentAutoRouting:
-    """Tests for automatic routing of code intents to Claude Code."""
+    """Tests for automatic routing of code intents to Claude Code.
+
+    `classify_action_intent` is pure pattern-matching after issue #87, so no
+    LLM mocking is needed here.
+    """
 
     @pytest.mark.asyncio
     async def test_code_intent_detected_via_chat(self):
-        """Test that code intent in chat triggers Claude Code."""
         from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "code", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("fix the bug in server.py", [])
-
-            assert result is not None
-            assert result.category == "code"
+        result = await classify_action_intent("fix the bug in server.py", [])
+        assert result is not None
+        assert result.category == "code"
 
     @pytest.mark.parametrize("message,should_be_code", [
         ("create a file called test.py", True),
@@ -205,27 +199,13 @@ class TestCodeIntentAutoRouting:
     ])
     @pytest.mark.asyncio
     async def test_code_vs_question_distinction(self, message, should_be_code):
-        """Test distinction between code actions and code questions."""
         from api.services.chat_helpers import classify_action_intent
-
+        result = await classify_action_intent(message, [])
         if should_be_code:
-            mock_response = '{"intent": "code", "confidence": 0.9}'
+            assert result is not None
+            assert result.category == "code"
         else:
-            mock_response = '{"intent": "none", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            if should_be_code:
-                assert result is not None
-                assert result.category == "code"
-            else:
-                if result is not None:
-                    assert result.category != "code"
+            assert result is None or result.category != "code"
 
 
 class TestPlanModeHeuristics:

@@ -5,7 +5,7 @@ Tests the complete flow from user message -> intent classification ->
 reminder store operations -> response formatting, including timezone handling.
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -35,48 +35,7 @@ class TestReminderCreation:
 
             yield store
 
-    @pytest.mark.asyncio
-    async def test_reminder_create_intent_classified(self):
-        """Test that reminder creation message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
 
-        mock_response = '{"intent": "reminder_create", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("remind me to call mom at 5pm", [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "create"
-
-    @pytest.mark.parametrize("message", [
-        "remind me to call mom",
-        "set a reminder for the meeting",
-        "ping me about the dentist tomorrow",
-        "alert me at 3pm about the call",
-        "don't let me forget to buy milk",
-    ])
-    @pytest.mark.asyncio
-    async def test_various_reminder_phrases(self, message):
-        """Test various ways users create reminders."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "reminder_create", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "create"
 
 
 class TestTimezoneHandling:
@@ -177,118 +136,18 @@ class TestReminderList:
 
             yield store
 
-    @pytest.mark.asyncio
-    async def test_reminder_list_intent_classified(self):
-        """Test that reminder list message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "reminder_list", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("show my reminders", [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "list"
 
 
 class TestReminderEdit:
     """Tests for reminder editing via chat."""
 
-    @pytest.mark.asyncio
-    async def test_reminder_edit_intent_classified(self):
-        """Test that reminder edit message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
 
-        mock_response = '{"intent": "reminder_edit", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(
-                "change the meeting reminder to 4pm",
-                [],
-            )
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "edit"
-
-    @pytest.mark.parametrize("message", [
-        "change the reminder to 6pm",
-        "update the meeting reminder",
-        "reschedule the dentist reminder to tomorrow",
-        "move the call reminder to next week",
-    ])
-    @pytest.mark.asyncio
-    async def test_various_edit_phrases(self, message):
-        """Test various ways users edit reminders."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "reminder_edit", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "edit"
 
 
 class TestReminderDelete:
     """Tests for reminder deletion via chat."""
 
-    @pytest.mark.asyncio
-    async def test_reminder_delete_intent_classified(self):
-        """Test that reminder delete message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
 
-        mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("delete the dentist reminder", [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "delete"
-
-    @pytest.mark.parametrize("message", [
-        "delete the reminder",
-        "remove the meeting reminder",
-        "cancel the dentist reminder",
-        "turn off that reminder",
-    ])
-    @pytest.mark.asyncio
-    async def test_various_delete_phrases(self, message):
-        """Test various ways users delete reminders."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            assert result is not None
-            assert result.category == "reminder"
-            assert result.sub_type == "delete"
 
 
 class TestReminderDisambiguationFlow:

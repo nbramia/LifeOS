@@ -5,7 +5,7 @@ Tests the complete flow from user message -> intent classification ->
 task manager operations -> response formatting.
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 
 pytestmark = pytest.mark.unit
 
@@ -35,23 +35,6 @@ class TestTaskCreation:
 
             yield manager
 
-    @pytest.mark.asyncio
-    async def test_task_create_intent_classified(self):
-        """Test that task creation message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "task_create", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("add a task to review the PR", [])
-
-            assert result is not None
-            assert result.category == "task"
-            assert result.sub_type == "create"
 
     @pytest.mark.asyncio
     async def test_extract_task_params(self):
@@ -113,23 +96,6 @@ class TestTaskList:
 
             yield manager
 
-    @pytest.mark.asyncio
-    async def test_task_list_intent_classified(self):
-        """Test that task list message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "task_list", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("what tasks do I have", [])
-
-            assert result is not None
-            assert result.category == "task"
-            assert result.sub_type == "list"
 
     def test_task_list_formatting(self, mock_task_manager_with_tasks):
         """Test that task list is properly formatted."""
@@ -156,69 +122,12 @@ class TestTaskList:
 class TestTaskComplete:
     """Tests for task completion via chat."""
 
-    @pytest.mark.asyncio
-    async def test_task_complete_intent_classified(self):
-        """Test that task complete message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
 
-        mock_response = '{"intent": "task_complete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("mark the PR review as done", [])
-
-            assert result is not None
-            assert result.category == "task"
-            assert result.sub_type == "complete"
-
-    @pytest.mark.parametrize("message", [
-        "mark the task as done",
-        "complete the PR review task",
-        "check off the dentist task",
-        "I finished the report task",
-    ])
-    @pytest.mark.asyncio
-    async def test_various_complete_phrases(self, message):
-        """Test various ways users say they completed a task."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "task_complete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(message, [])
-
-            assert result is not None
-            assert result.category == "task"
-            assert result.sub_type == "complete"
 
 
 class TestTaskDelete:
     """Tests for task deletion via chat."""
 
-    @pytest.mark.asyncio
-    async def test_task_delete_intent_classified(self):
-        """Test that task delete message is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
-
-        mock_response = '{"intent": "task_delete", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("delete the old task", [])
-
-            assert result is not None
-            assert result.category == "task"
-            assert result.sub_type == "delete"
 
 
 class TestTaskAndReminderCompound:
@@ -246,54 +155,7 @@ class TestTaskAndReminderCompound:
 
             yield task_manager, reminder
 
-    @pytest.mark.asyncio
-    async def test_task_and_reminder_intent(self):
-        """Test that compound intent is correctly classified."""
-        from api.services.chat_helpers import classify_action_intent
 
-        mock_response = '{"intent": "task_and_reminder", "confidence": 0.9}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent(
-                "add a task to submit taxes and remind me Friday",
-                [],
-            )
-
-            assert result is not None
-            assert result.category == "task_and_reminder"
-
-    @pytest.mark.asyncio
-    async def test_both_followup_classified(self):
-        """Test that 'both' response after ambiguous prompt works."""
-        from api.services.chat_helpers import classify_action_intent
-
-        # Simulate conversation history
-        mock_history = [
-            MagicMock(
-                role="user",
-                content="add submit taxes to my list",
-            ),
-            MagicMock(
-                role="assistant",
-                content="Should I add this as a to-do or set a timed reminder?",
-            ),
-        ]
-
-        mock_response = '{"intent": "task_and_reminder", "confidence": 0.95}'
-
-        with patch(
-            "api.services.chat_helpers._classify_via_haiku",
-            new_callable=AsyncMock,
-            return_value=mock_response,
-        ):
-            result = await classify_action_intent("both", mock_history)
-
-            assert result is not None
-            assert result.category == "task_and_reminder"
 
     def test_compound_response_formatting(self, mock_stores):
         """Test that compound creation response shows both items."""
