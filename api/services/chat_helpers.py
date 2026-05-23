@@ -695,26 +695,15 @@ async def classify_action_intent(query: str, conversation_history: list = None) 
     return _classify_action_intent_patterns(query)
 
 
-async def _classify_via_ollama(prompt: str) -> Optional[str]:
-    """Try classifying intent via local Ollama (fast, free)."""
-    try:
-        from api.services.ollama_client import OllamaClient
-        client = OllamaClient()
-        if not client.is_available():
-            return None
-        response = await client.generate(prompt)
-        return response
-    except Exception as e:
-        logger.debug(f"Ollama intent classification failed: {e}")
-        return None
-
-
 async def _classify_via_haiku(prompt: str) -> Optional[str]:
-    """Fallback: classify intent via Claude Haiku."""
+    """Primary classifier: call the configured Anthropic model (Haiku by default)
+    via the synthesizer. Falls back to None on failure so the caller can use
+    pattern matching.
+    """
     try:
         from api.services.synthesizer import get_synthesizer
         synthesizer = get_synthesizer()
-        response = await synthesizer.get_response(prompt, max_tokens=64, model_tier="haiku")
+        response = await synthesizer.get_response(prompt, max_tokens=64)
         return response
     except Exception as e:
         logger.debug(f"Haiku intent classification failed: {e}")

@@ -17,7 +17,6 @@ class TestPendingSelectionContext:
     def test_context_tracks_pending_selection(self):
         """Test that pending selection is extracted from conversation history."""
         from api.services.conversation_context import (
-            ConversationContext,
             extract_context_from_history,
         )
 
@@ -44,7 +43,6 @@ class TestPendingSelectionContext:
     def test_context_without_pending_selection(self):
         """Test that context without pending selection returns False."""
         from api.services.conversation_context import (
-            ConversationContext,
             extract_context_from_history,
         )
 
@@ -158,7 +156,7 @@ class TestReminderDisambiguation:
         """Test formatting of numbered reminder list."""
         # Import and test the prompt formatter if it exists
         # Otherwise test the expected output format
-        reminders = [
+        _reminders = [  # noqa: F841 — kept as documentation of expected fixture shape
             MagicMock(id="rem-1", name="Meeting at 3pm"),
             MagicMock(id="rem-2", name="Call dentist"),
         ]
@@ -187,7 +185,7 @@ class TestReminderDisambiguation:
         mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -202,7 +200,7 @@ class TestTaskDisambiguation:
 
     def test_task_selection_format(self):
         """Test formatting of numbered task list."""
-        tasks = [
+        _tasks = [  # noqa: F841 — kept as documentation of expected fixture shape
             MagicMock(id="task-1", description="Review PR #123"),
             MagicMock(id="task-2", description="Review PR #456"),
         ]

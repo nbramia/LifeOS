@@ -17,14 +17,14 @@ class TestExtractSearchKeywords:
 
     def test_extracts_proper_nouns(self):
         """Should extract capitalized names."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("I have a meeting with Kevin later")
         assert "Kevin" in keywords
 
     def test_extracts_multiple_names(self):
         """Should extract multiple proper nouns."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("Meeting notes with Kevin and Sarah")
         assert "Kevin" in keywords
@@ -32,7 +32,7 @@ class TestExtractSearchKeywords:
 
     def test_filters_stop_words(self):
         """Should remove common stop words."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("what is the budget for the project")
         assert "budget" in keywords
@@ -43,7 +43,7 @@ class TestExtractSearchKeywords:
 
     def test_filters_temporal_words(self):
         """Should filter temporal words like 'later', 'today'."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("meeting later today about budget")
         # 'later', 'today' should be filtered
@@ -54,7 +54,7 @@ class TestExtractSearchKeywords:
 
     def test_preserves_order(self):
         """Should return keywords in order of appearance."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("Kevin budget Bob planning")
         # Should be in order: Kevin, budget, Bob, planning
@@ -62,7 +62,7 @@ class TestExtractSearchKeywords:
 
     def test_deduplicates_keywords(self):
         """Should deduplicate case-insensitively."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("Budget review for budget planning")
         lower_keywords = [k.lower() for k in keywords]
@@ -70,7 +70,7 @@ class TestExtractSearchKeywords:
 
     def test_limits_to_five_keywords(self):
         """Should return maximum 5 keywords."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords(
             "Kevin Sarah budget planning strategy roadmap timeline goals objectives"
@@ -79,14 +79,14 @@ class TestExtractSearchKeywords:
 
     def test_handles_empty_query(self):
         """Should handle empty query gracefully."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("")
         assert keywords == []
 
     def test_handles_only_stop_words(self):
         """Should return empty list if only stop words."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         keywords = extract_search_keywords("what is the")
         # May have some short words filtered out
@@ -94,7 +94,7 @@ class TestExtractSearchKeywords:
 
     def test_filters_common_query_words(self):
         """Should filter common query words like 'show', 'find', 'tell'."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         # Use lowercase to avoid proper noun detection
         keywords = extract_search_keywords("please tell me about the budget document")
@@ -105,7 +105,7 @@ class TestExtractSearchKeywords:
 
     def test_keeps_meaningful_short_words(self):
         """Should keep meaningful words even if they're short."""
-        from api.routes.chat import extract_search_keywords
+        from api.services.chat_helpers import extract_search_keywords
 
         # 'API' is capitalized so treated as proper noun
         keywords = extract_search_keywords("API integration with AWS")

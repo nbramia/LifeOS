@@ -7,16 +7,14 @@ P2.1/P2.2 Acceptance Criteria:
 - Empty requests return 400 errors
 """
 import pytest
-
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
-import json
-import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
 
 from api.main import app
+
+# These tests use TestClient which initializes the app (slow)
+pytestmark = pytest.mark.slow
 
 
 class TestAskStreamEndpoint:
@@ -233,7 +231,7 @@ class TestComposeIntentDetection:
 
     def test_detects_draft_email(self):
         """Should detect 'draft an email' requests."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert detect_compose_intent("draft an email to John about the meeting")
         assert detect_compose_intent("Draft email to Sarah")
@@ -241,21 +239,21 @@ class TestComposeIntentDetection:
 
     def test_detects_compose_email(self):
         """Should detect 'compose' requests."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert detect_compose_intent("compose an email to Kevin")
         assert detect_compose_intent("compose email about the project")
 
     def test_detects_write_email(self):
         """Should detect 'write' requests."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert detect_compose_intent("write an email to the team")
         assert detect_compose_intent("write email about budget")
 
     def test_detects_email_to_pattern(self):
         """Should detect 'email to' pattern."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert detect_compose_intent("email to john@example.com about the project")
         assert detect_compose_intent("write to Sarah about the deadline")
@@ -263,7 +261,7 @@ class TestComposeIntentDetection:
 
     def test_does_not_detect_search_queries(self):
         """Should NOT detect search/retrieve queries as compose intent."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert not detect_compose_intent("find my email about the meeting")
         assert not detect_compose_intent("search emails from John")
@@ -272,7 +270,7 @@ class TestComposeIntentDetection:
 
     def test_does_not_detect_unrelated_queries(self):
         """Should NOT detect unrelated queries."""
-        from api.routes.chat import detect_compose_intent
+        from api.services.chat_helpers import detect_compose_intent
 
         assert not detect_compose_intent("what's on my calendar")
         assert not detect_compose_intent("tell me about Kevin")

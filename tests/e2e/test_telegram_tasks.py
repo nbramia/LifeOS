@@ -6,7 +6,6 @@ task manager operations -> response formatting.
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from datetime import datetime
 
 pytestmark = pytest.mark.unit
 
@@ -44,7 +43,7 @@ class TestTaskCreation:
         mock_response = '{"intent": "task_create", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -69,7 +68,7 @@ class TestTaskCreation:
         task = mock_task_manager.create.return_value
 
         # Expected response format
-        response = f"Done! Added to your task list:\n\n"
+        response = "Done! Added to your task list:\n\n"
         response += f"**{task.description}**\n"
         response += f"Context: {task.context}"
         if task.tags:
@@ -122,7 +121,7 @@ class TestTaskList:
         mock_response = '{"intent": "task_list", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -165,7 +164,7 @@ class TestTaskComplete:
         mock_response = '{"intent": "task_complete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -189,7 +188,7 @@ class TestTaskComplete:
         mock_response = '{"intent": "task_complete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -211,7 +210,7 @@ class TestTaskDelete:
         mock_response = '{"intent": "task_delete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -255,7 +254,7 @@ class TestTaskAndReminderCompound:
         mock_response = '{"intent": "task_and_reminder", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -287,7 +286,7 @@ class TestTaskAndReminderCompound:
         mock_response = '{"intent": "task_and_reminder", "confidence": 0.95}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -302,10 +301,10 @@ class TestTaskAndReminderCompound:
 
         task = task_manager.create.return_value
 
-        response = f"Done! I've created both:\n\n"
+        response = "Done! I've created both:\n\n"
         response += f"**Task:** {task.description}\n"
         response += f"**Context:** {task.context}\n"
-        response += f"\n**Reminder** set to ping you about it."
+        response += "\n**Reminder** set to ping you about it."
 
         assert "Submit taxes" in response
         assert "Task" in response
@@ -319,7 +318,7 @@ class TestAmbiguousTaskReminder:
     async def test_ambiguous_prompt_shown(self):
         """Test that ambiguous input triggers clarification prompt."""
         # Messages that could be either task or reminder
-        ambiguous_messages = [
+        _ambiguous_messages = [  # noqa: F841 — kept as documentation of expected fixture shape
             "add submit taxes to my list",
             "remember to call mom",
             "don't forget the meeting",

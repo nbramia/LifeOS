@@ -24,7 +24,7 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
 | Intent classifier | Claude Haiku via Anthropic API (default); pattern-matching fallback when the API is unavailable |
-| LLM (orchestration + synthesis) | Claude via Anthropic API (default), or a local OpenAI-compatible llama-server (`LIFEOS_LLM_BACKEND=local`). Model set by `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5` |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default), or a local OpenAI-compatible llama-server (`LIFEOS_LLM_BACKEND=local`). Model set by `LIFEOS_ANTHROPIC_MODEL` (defaults to `claude-haiku-4-5`); this is the single knob — there is no per-query model tiering |
 | LLM Client | `api/services/llm_client.py` — unified wrapper with Anthropic↔OpenAI tool format translation |
 | Embeddings | sentence-transformers (GPU via ROCm/CUDA) |
 | Frontend | Vanilla HTML/JS (no build step) |

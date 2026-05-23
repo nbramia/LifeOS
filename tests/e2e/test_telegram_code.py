@@ -121,7 +121,7 @@ class TestClarificationFlow:
         assert session.status != "awaiting_approval"
 
         # Therefore "no" should be passed through as an answer
-        text = "no"
+        _text = "no"  # noqa: F841 — documentation of the expected input
         # This should call respond_to_clarification(text), not reject_plan()
 
     def test_any_text_valid_as_clarification(self, mock_orchestrator_clarification):
@@ -186,7 +186,7 @@ class TestCodeIntentAutoRouting:
         mock_response = '{"intent": "code", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -214,7 +214,7 @@ class TestCodeIntentAutoRouting:
             mock_response = '{"intent": "none", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):

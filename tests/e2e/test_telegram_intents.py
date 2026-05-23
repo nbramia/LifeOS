@@ -61,7 +61,7 @@ class TestIntentClassification:
             mock_response = '{"intent": "compose", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -92,7 +92,7 @@ class TestIntentClassification:
         mock_response = '{"intent": "none", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -104,25 +104,19 @@ class TestPatternFallback:
     """Tests for pattern-based fallback when LLMs are unavailable."""
 
     @pytest.mark.asyncio
-    async def test_fallback_used_when_llms_down(self):
-        """Pattern matching should be used when both Ollama and Haiku fail."""
+    async def test_fallback_used_when_haiku_down(self):
+        """Pattern matching should be used when the Haiku classifier fails."""
         from api.services.chat_helpers import classify_action_intent
 
-        # Simulate both LLMs failing
+        # Simulate Haiku failing — classify_action_intent should fall back to patterns
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=None,
         ):
-            with patch(
-                "api.services.chat_helpers._classify_via_haiku",
-                new_callable=AsyncMock,
-                return_value=None,
-            ):
-                # Should fall back to pattern matching
-                result = await classify_action_intent("remind me to call mom", [])
-                assert result is not None
-                assert result.category == "reminder"
+            result = await classify_action_intent("remind me to call mom", [])
+            assert result is not None
+            assert result.category == "reminder"
 
     @pytest.mark.parametrize("message,expected_category", [
         ("remind me to call mom", "reminder"),
@@ -166,7 +160,7 @@ class TestCompoundIntents:
         mock_response = '{"intent": "task_and_reminder", "confidence": 0.95}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -182,7 +176,7 @@ class TestCompoundIntents:
         mock_response = '{"intent": "task_and_reminder", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -214,7 +208,7 @@ class TestCodeIntentClassification:
         mock_response = '{"intent": "code", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -237,7 +231,7 @@ class TestCodeIntentClassification:
         mock_response = '{"intent": "none", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -272,7 +266,7 @@ class TestLowConfidenceHandling:
         mock_response = '{"intent": "task_create", "confidence": 0.5}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):

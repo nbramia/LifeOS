@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 from api.services.ollama_client import OllamaClient, OllamaError
-from api.services.model_selector import classify_query_complexity
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +73,6 @@ class RoutingResult:
     reasoning: str
     confidence: float
     latency_ms: int
-    recommended_model: str = "sonnet"  # "haiku", "sonnet", or "opus"
-    complexity_score: float = 0.5  # 0.0-1.0
     extracted_person_name: Optional[str] = None
     # v3: Orchestration intelligence
     fetch_depth: str = "normal"  # "shallow", "normal", "deep"
@@ -376,28 +373,14 @@ class QueryRouter:
         if not self.ollama_client.is_available():
             logger.info("Ollama unavailable, using keyword fallback")
             result = self._keyword_fallback(query)
-            result.latency_ms = int((time.time() - start_time) * 1000)
-            # Add model selection
-            complexity = classify_query_complexity(query, source_count=len(result.sources))
-            result.recommended_model = complexity.recommended_model
-            result.complexity_score = complexity.complexity_score
         else:
             # Try LLM routing
             try:
                 result = await self._llm_route(query)
-                result.latency_ms = int((time.time() - start_time) * 1000)
-                # Add model selection
-                complexity = classify_query_complexity(query, source_count=len(result.sources))
-                result.recommended_model = complexity.recommended_model
-                result.complexity_score = complexity.complexity_score
             except OllamaError as e:
                 logger.warning(f"Ollama error, using fallback: {e}")
                 result = self._keyword_fallback(query)
-                result.latency_ms = int((time.time() - start_time) * 1000)
-                # Add model selection
-                complexity = classify_query_complexity(query, source_count=len(result.sources))
-                result.recommended_model = complexity.recommended_model
-                result.complexity_score = complexity.complexity_score
+        result.latency_ms = int((time.time() - start_time) * 1000)
 
         # v3: Enrich with CRM context for people queries
         if "people" in result.sources:
@@ -457,7 +440,7 @@ class QueryRouter:
             valid_sources = [s for s in sources if s in VALID_SOURCES]
             if not valid_sources:
                 # LLM returned invalid sources, use keyword fallback
-                logger.warning(f"LLM returned no valid sources, using keyword fallback")
+                logger.warning("LLM returned no valid sources, using keyword fallback")
                 return self._keyword_fallback(query)
 
             # Extract person name from LLM response
