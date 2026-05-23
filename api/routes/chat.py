@@ -5,7 +5,6 @@ import json
 import asyncio
 import logging
 import re
-import base64
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -21,26 +20,11 @@ from api.services.calendar import CalendarService
 from api.services.drive import DriveService
 from api.services.gmail import GmailService
 from api.services.usage_store import get_usage_store
-from api.services.briefings import get_briefings_service
 from api.services.chat_helpers import (
-    extract_search_keywords,
     expand_followup_query,
-    detect_compose_intent,
-    detect_reminder_intent,
-    extract_date_context,
-    extract_message_date_range,
-    extract_message_search_terms,
     format_messages_for_synthesis as _format_messages_for_synthesis,
     format_raw_qa_section as _format_raw_qa_section,
-    ReminderIntentType,
-    classify_reminder_intent,
-    detect_reminder_edit_intent,
-    detect_reminder_list_intent,
-    detect_reminder_delete_intent,
-    extract_reminder_topic,
     classify_action_intent,
-
-    ActionIntent,
 )
 from api.services.time_parser import (
     get_smart_default_time,
@@ -1056,7 +1040,6 @@ async def ask_stream(request: AskStreamRequest):
             # Agentic synthesis path: Claude decides what to fetch
             # =============================================================
             from api.services.agent_loop import run_agent_loop
-            from api.services.model_selector import classify_query_complexity
 
             # Expand follow-up queries with conversation context
             with trace_span("query_expand"):
@@ -1078,17 +1061,17 @@ async def ask_stream(request: AskStreamRequest):
                                 effective_question = expanded
                                 print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
-            # Select model tier
-            with trace_span("model_select"):
-                complexity = classify_query_complexity(effective_question)
-                model_tier = complexity.recommended_model
-            # Update trace with selected model tier
+            # The agent loop uses the orchestrator model configured by
+            # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
+            # `model_tier` is retained as a label for the routing event below;
+            # the agent loop itself ignores it.
+            model_tier = getattr(settings, "anthropic_model", "claude-haiku-4-5")
             _trace = _current_trace.get()
             if _trace:
                 _trace.model_tier = model_tier
             print(f"\n{'='*60}")
             print(f"QUERY: {request.question}")
-            print(f"MODEL: {model_tier} ({complexity.reasoning})")
+            print(f"MODEL: {model_tier}")
             print(f"CONVERSATION: {conversation_id}")
             print(f"{'='*60}")
 

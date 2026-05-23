@@ -25,7 +25,6 @@ def reset_lightweight_singletons() -> None:
 
     Safe to call after every test. Resets:
     - ServiceHealthRegistry
-    - ModelSelector
     - ConversationStore
     - HybridSearch
     - BM25Index
@@ -33,7 +32,6 @@ def reset_lightweight_singletons() -> None:
     Does NOT reset embedding service (causes slow model reload).
     """
     from api.services.service_health import reset_service_health
-    from api.services.model_selector import reset_model_selector
     from api.services.conversation_store import reset_conversation_store
     from api.services.hybrid_search import reset_hybrid_search
     from api.services.bm25_index import reset_bm25_index
@@ -41,7 +39,6 @@ def reset_lightweight_singletons() -> None:
     from api.services.llm_client import reset_local_llm
 
     reset_service_health()
-    reset_model_selector()
     reset_conversation_store()
     reset_hybrid_search()
     reset_bm25_index()

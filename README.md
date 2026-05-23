@@ -76,6 +76,8 @@ Orchestration and synthesis can run against the Claude API (default) or a local 
 
 To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_URL` at a running llama-server. See the [Configuration Guide](docs/guides/configuration.md) for details.
 
+`LIFEOS_ANTHROPIC_MODEL` is the single orchestrator-model knob: every chat round, every intent-classification call, and every per-tool synthesis hop uses it. There is no per-query model tiering today — if you want a heavier model for harder questions, set it here and it applies to all traffic.
+
 ---
 
 ## Quick Start

@@ -137,16 +137,7 @@ def _ollama_warm(model: str) -> bool:
 
 
 def _is_llm_running() -> bool:
-    """Check if any GPU-resident LLM is active (lifeos-llm.service or ollama-loaded model)."""
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "lifeos-llm.service"],
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return True
-    except Exception:
-        pass
+    """Check if any GPU-resident LLM is holding VRAM that embeddings would need."""
     return bool(_ollama_loaded_models())
 
 
@@ -182,48 +173,23 @@ def _get_available_system_ram_mb() -> int | None:
 
 # Track ollama models we unloaded so _start_llm can re-warm them
 _ollama_models_unloaded: list[str] = []
-# Track whether we stopped lifeos-llm.service so _start_llm only starts what we stopped
-_lifeos_llm_was_stopped_by_us: bool = False
 
 
 def _stop_llm_for_embeddings() -> bool:
-    """Free GPU memory for embeddings by stopping lifeos-llm.service (if active)
-    and unloading any models currently held in ollama VRAM.
+    """Free GPU memory for embeddings by unloading any ollama-held models.
 
-    Returns True if at least one freed something.
+    Returns True if at least one model was unloaded.
     """
-    global _ollama_models_unloaded, _lifeos_llm_was_stopped_by_us
+    global _ollama_models_unloaded
     logger = logging.getLogger(__name__)
-    freed_anything = False
 
-    # Try lifeos-llm.service (legacy path, may be disabled/inactive)
-    try:
-        active = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "lifeos-llm.service"],
-            timeout=5,
-        )
-        if active.returncode == 0:
-            result = subprocess.run(
-                ["sudo", "systemctl", "stop", "lifeos-llm.service"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode == 0:
-                logger.info("Stopped lifeos-llm to free GPU memory for embeddings")
-                _lifeos_llm_was_stopped_by_us = True
-                freed_anything = True
-            else:
-                logger.warning(f"Failed to stop lifeos-llm: {result.stderr[:200]}")
-    except Exception as e:
-        logger.warning(f"Could not check/stop lifeos-llm: {e}")
-
-    # Unload any ollama-loaded models (the real VRAM hog under OLLAMA_KEEP_ALIVE=-1)
+    # Unload any ollama-loaded models. With OLLAMA_KEEP_ALIVE=-1 set
+    # service-wide, these otherwise stay pinned in VRAM and prevent
+    # embeddings from allocating their working set.
     unloaded = _ollama_unload_all()
-    if unloaded:
-        _ollama_models_unloaded = unloaded
-        freed_anything = True
-
-    if not freed_anything:
+    if not unloaded:
         return False
+    _ollama_models_unloaded = unloaded
 
     # Wait for VRAM to actually be freed
     for _ in range(10):
@@ -232,31 +198,13 @@ def _stop_llm_for_embeddings() -> bool:
         if available is not None and available >= _EMBEDDING_MEMORY_THRESHOLD_MB:
             logger.info(f"GPU memory freed: {available} MB available")
             return True
-    logger.warning("LLM stopped/unloaded but GPU memory not fully freed within timeout")
+    logger.warning("Ollama models unloaded but GPU memory not fully freed within timeout")
     return True
 
 
 def _start_llm() -> None:
-    """Restore LLM state after embedding phases — restart lifeos-llm if WE stopped it,
-    and re-warm any ollama models WE unloaded.
-    """
-    global _ollama_models_unloaded, _lifeos_llm_was_stopped_by_us
-    logger = logging.getLogger(__name__)
-
-    if _lifeos_llm_was_stopped_by_us:
-        try:
-            result = subprocess.run(
-                ["sudo", "systemctl", "start", "lifeos-llm.service"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode == 0:
-                logger.info("Restarted lifeos-llm after embedding phases")
-            else:
-                logger.warning(f"Failed to start lifeos-llm: {result.stderr[:200]}")
-        except Exception as e:
-            logger.warning(f"Could not start lifeos-llm: {e}")
-        finally:
-            _lifeos_llm_was_stopped_by_us = False
+    """Restore LLM state after embedding phases — re-warm any ollama models we unloaded."""
+    global _ollama_models_unloaded
 
     # Re-warm exactly the ollama models we unloaded. We don't use
     # settings.ollama_model because the actually-loaded model may differ

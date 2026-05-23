@@ -6,7 +6,7 @@ reminder store operations -> response formatting, including timezone handling.
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 pytestmark = pytest.mark.unit
@@ -43,7 +43,7 @@ class TestReminderCreation:
         mock_response = '{"intent": "reminder_create", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -68,7 +68,7 @@ class TestReminderCreation:
         mock_response = '{"intent": "reminder_create", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -185,7 +185,7 @@ class TestReminderList:
         mock_response = '{"intent": "reminder_list", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -207,7 +207,7 @@ class TestReminderEdit:
         mock_response = '{"intent": "reminder_edit", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -234,7 +234,7 @@ class TestReminderEdit:
         mock_response = '{"intent": "reminder_edit", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -256,7 +256,7 @@ class TestReminderDelete:
         mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -280,7 +280,7 @@ class TestReminderDelete:
         mock_response = '{"intent": "reminder_delete", "confidence": 0.9}'
 
         with patch(
-            "api.services.chat_helpers._classify_via_ollama",
+            "api.services.chat_helpers._classify_via_haiku",
             new_callable=AsyncMock,
             return_value=mock_response,
         ):
@@ -296,7 +296,7 @@ class TestReminderDisambiguationFlow:
 
     def test_disambiguation_prompt_format(self):
         """Test the format of disambiguation prompts."""
-        reminders = [
+        _reminders = [  # noqa: F841 — kept as documentation of expected fixture shape
             MagicMock(id="rem-1", name="Meeting at 3pm"),
             MagicMock(id="rem-2", name="Meeting tomorrow"),
         ]
