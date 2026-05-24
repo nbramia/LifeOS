@@ -43,35 +43,49 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
     stats = {'updated': 0, 'total_interactions': 0}
 
     if person_ids is None:
-        # Full refresh - get counts for all people in one query
+        # Full refresh — read all per-(person_id, source) counts, then collapse
+        # legacy (pre-merge) person_ids onto their canonical entity.id BEFORE
+        # applying. Without this, the loop processes the same canonical entity
+        # multiple times: get_by_id() follows the merge map and returns the
+        # canonical, then _apply_counts_to_entity / _update_timestamps overwrite
+        # with the *legacy* ID's (much smaller, much older) data — silently
+        # corrupting both stats and last_seen on every canonical with merged
+        # IDs that still carry stale interactions in the table.
         cursor = conn.execute("""
             SELECT person_id, source_type, COUNT(*) as cnt
             FROM interactions
             GROUP BY person_id, source_type
         """)
 
-        # Build per-person counts
-        person_counts: dict[str, dict[str, int]] = {}
+        canonical_counts: dict[str, dict[str, int]] = {}
+        # Map canonical_id -> set of raw person_ids that resolve to it
+        # (used by _update_timestamps to query MAX across all variants).
+        canonical_ids: dict[str, set[str]] = {}
+
         for row in cursor:
             pid, source_type, count = row
-            if pid not in person_counts:
-                person_counts[pid] = {}
-            person_counts[pid][source_type] = count
+            entity = store.get_by_id(pid)
+            if not entity:
+                continue
+            canon = entity.id
+            bucket = canonical_counts.setdefault(canon, {})
+            bucket[source_type] = bucket.get(source_type, 0) + count
+            canonical_ids.setdefault(canon, set()).add(pid)
             stats['total_interactions'] += count
 
-        # Update people with interactions
-        for person_id, counts in person_counts.items():
-            entity = store.get_by_id(person_id)
+        # Update each canonical entity exactly once, with aggregated counts.
+        for canon, counts in canonical_counts.items():
+            entity = store.get_by_id(canon)
             if entity:
                 _apply_counts_to_entity(entity, counts)
-                _update_timestamps(entity, person_id, conn)
+                _update_timestamps(entity, list(canonical_ids[canon]), conn)
                 store.update(entity)
                 stats['updated'] += 1
 
-        # Zero out people with no interactions (they may have had interactions deleted)
-        # They may still have source_entity timestamps worth updating
+        # Zero out people with no interactions (they may have had interactions
+        # deleted). They may still have source_entity timestamps worth updating.
         for entity in store.get_all():
-            if entity.id not in person_counts:
+            if entity.id not in canonical_counts:
                 modified = False
                 if entity.email_count or entity.meeting_count or entity.message_count or entity.mention_count or entity.photo_count:
                     entity.email_count = 0
@@ -80,29 +94,41 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
                     entity.mention_count = 0
                     entity.photo_count = 0
                     modified = True
-                if _update_timestamps(entity, entity.id, conn):
+                if _update_timestamps(entity, [entity.id], conn):
                     modified = True
                 if modified:
                     store.update(entity)
                     stats['updated'] += 1
 
     else:
-        # Targeted refresh - only specified people
-        for person_id in person_ids:
-            cursor = conn.execute("""
+        # Targeted refresh — for each input, resolve to canonical and expand
+        # to the canonical + every known legacy ID that merges into it. This
+        # makes the refresh correct regardless of whether callers pass the
+        # canonical or a legacy ID, and regardless of whether interactions
+        # have been repointed yet.
+        canon_to_variants: dict[str, set[str]] = {}
+        for pid in person_ids:
+            entity = store.get_by_id(pid)
+            if not entity:
+                continue
+            variants = {entity.id, pid} | store.get_legacy_ids(entity.id)
+            canon_to_variants.setdefault(entity.id, set()).update(variants)
+
+        for canon, variants in canon_to_variants.items():
+            placeholders = ','.join(['?'] * len(variants))
+            cursor = conn.execute(f"""
                 SELECT source_type, COUNT(*) as cnt
                 FROM interactions
-                WHERE person_id = ?
+                WHERE person_id IN ({placeholders})
                 GROUP BY source_type
-            """, (person_id,))
-
+            """, tuple(variants))
             counts = {row[0]: row[1] for row in cursor}
             stats['total_interactions'] += sum(counts.values())
 
-            entity = store.get_by_id(person_id)
+            entity = store.get_by_id(canon)
             if entity:
                 _apply_counts_to_entity(entity, counts)
-                _update_timestamps(entity, person_id, conn)
+                _update_timestamps(entity, list(variants), conn)
                 store.update(entity)
                 stats['updated'] += 1
 
@@ -117,18 +143,33 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
     return stats
 
 
-def _update_timestamps(entity, person_id: str, int_conn) -> bool:
+def _update_timestamps(entity, person_ids, int_conn) -> bool:
     """
     Update first_seen/last_seen from interactions and source_entities.
 
+    Args:
+        entity: PersonEntity to update.
+        person_ids: Either a single person_id (str) or a list of person_ids
+            covering the canonical entity plus any legacy IDs that merge to it.
+            Querying across all of them keeps stats correct when stale
+            interactions still carry legacy IDs (repoint_stale_ids hasn't
+            caught up).
+        int_conn: Open connection to interactions.db.
+
     Returns True if entity was modified.
     """
-    # Get timestamp range from interactions
-    cursor = int_conn.execute("""
+    if isinstance(person_ids, str):
+        person_ids = [person_ids]
+    if not person_ids:
+        return False
+    placeholders = ','.join(['?'] * len(person_ids))
+
+    # Get timestamp range from interactions across ALL person_id variants
+    cursor = int_conn.execute(f"""
         SELECT MIN(timestamp), MAX(timestamp)
         FROM interactions
-        WHERE person_id = ?
-    """, (person_id,))
+        WHERE person_id IN ({placeholders})
+    """, tuple(person_ids))
     row = cursor.fetchone()
     interaction_first = None
     interaction_last = None
@@ -137,17 +178,19 @@ def _update_timestamps(entity, person_id: str, int_conn) -> bool:
     if row and row[1]:
         interaction_last = datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc)
 
-    # Get timestamp range from source_entities
+    # Get timestamp range from source_entities across the same variants
+    # (source_entities.canonical_person_id may also still carry legacy IDs
+    # if a merge happened without backfilling that column).
     crm_db = Path("data/crm.db")
     source_first = None
     source_last = None
     if crm_db.exists():
         crm_conn = sqlite3.connect(str(crm_db))
-        crm_cursor = crm_conn.execute("""
+        crm_cursor = crm_conn.execute(f"""
             SELECT MIN(observed_at), MAX(observed_at)
             FROM source_entities
-            WHERE canonical_person_id = ?
-        """, (person_id,))
+            WHERE canonical_person_id IN ({placeholders})
+        """, tuple(person_ids))
         se_row = crm_cursor.fetchone()
         crm_conn.close()
         if se_row and se_row[0]:
@@ -232,15 +275,32 @@ def verify_person_stats(fix: bool = False) -> dict:
     store = get_person_entity_store()
     conn = sqlite3.connect(get_interaction_db_path())
 
+    # Group raw interaction person_ids by their canonical entity, so the
+    # comparison mirrors what refresh_person_stats writes. Without this,
+    # canonicals with merged legacy IDs would appear as "discrepancies" and
+    # fix=True would overwrite correct aggregated counts with canonical-only
+    # under-counts.
+    raw_ids: set[str] = set()
+    cursor = conn.execute("SELECT DISTINCT person_id FROM interactions")
+    for (pid,) in cursor:
+        raw_ids.add(pid)
+    canonical_to_raws: dict[str, set[str]] = {}
+    for pid in raw_ids:
+        entity = store.get_by_id(pid)
+        if entity:
+            canonical_to_raws.setdefault(entity.id, set()).add(pid)
+
     discrepancies = {}
 
     for entity in store.get_all():
-        cursor = conn.execute("""
+        variant_ids = list(canonical_to_raws.get(entity.id, {entity.id}))
+        placeholders = ','.join(['?'] * len(variant_ids))
+        cursor = conn.execute(f"""
             SELECT source_type, COUNT(*) as cnt
             FROM interactions
-            WHERE person_id = ?
+            WHERE person_id IN ({placeholders})
             GROUP BY source_type
-        """, (entity.id,))
+        """, tuple(variant_ids))
 
         counts = {row[0]: row[1] for row in cursor}
 

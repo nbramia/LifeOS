@@ -80,6 +80,7 @@ class TestRefreshUpdatesLastSeen:
 
         mock_store = MagicMock()
         mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
         mock_store.get_all.return_value = [entity]
 
         with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
@@ -117,6 +118,7 @@ class TestRefreshUpdatesLastSeen:
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
         mock_store = MagicMock()
         mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
 
         with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
@@ -143,6 +145,7 @@ class TestRefreshUpdatesLastSeen:
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
         mock_store = MagicMock()
         mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
 
         with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
@@ -169,6 +172,7 @@ class TestRefreshUpdatesLastSeen:
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
         mock_store = MagicMock()
         mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
 
         with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
@@ -178,6 +182,83 @@ class TestRefreshUpdatesLastSeen:
 
         # 2 phone + 1 imessage = 3 messages
         assert entity.message_count == 3
+
+
+class TestMergedLegacyIds:
+    """Regression: full refresh used to corrupt canonicals that had legacy
+    (pre-merge) person_ids still attached to interaction rows. The loop would
+    process the canonical first (correct counts), then process the legacy ID,
+    resolve it via get_by_id() to the *same canonical*, and overwrite with the
+    legacy ID's under-counts and older last_seen. Fix: aggregate by canonical
+    before applying."""
+
+    def test_full_refresh_aggregates_legacy_into_canonical(self, tmp_path):
+        canonical_id = "canonical-001"
+        legacy_id = "legacy-002"
+        now = datetime.now(timezone.utc)
+        legacy_time = now - timedelta(days=400)
+        canonical_time = now - timedelta(days=1)
+
+        int_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(int_db, [
+            # 5 emails on the canonical, recent
+            *[(f"c{i}", canonical_id, canonical_time.isoformat(), "gmail",
+               "e", "", None, f"src-c{i}", now.isoformat()) for i in range(5)],
+            # 2 emails on the legacy id, old
+            *[(f"l{i}", legacy_id, legacy_time.isoformat(), "gmail",
+               "e", "", None, f"src-l{i}", now.isoformat()) for i in range(2)],
+        ])
+
+        # Canonical entity. get_by_id follows the merge map: both
+        # canonical_id and legacy_id return the SAME entity.
+        entity = PersonEntity(id=canonical_id, canonical_name="Merged Person")
+
+        mock_store = MagicMock()
+        mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
+        mock_store.get_all.return_value = [entity]
+
+        with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
+             patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.Path") as mock_path:
+            mock_path.return_value.exists.return_value = False
+            refresh_person_stats(person_ids=None, save=False)
+
+        # Counts must be SUM (7), not REPLACED with the legacy under-count (2).
+        assert entity.email_count == 7
+        # last_seen must be the recent canonical timestamp, not the 400-day-old
+        # legacy timestamp.
+        assert abs((entity.last_seen - canonical_time).total_seconds()) < 2
+
+    def test_targeted_refresh_handles_legacy_id(self, tmp_path):
+        """Targeted refresh called with a legacy ID should update the canonical
+        with the union of counts, not just the legacy subset."""
+        canonical_id = "canonical-003"
+        legacy_id = "legacy-004"
+        now = datetime.now(timezone.utc)
+
+        int_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(int_db, [
+            ("c1", canonical_id, now.isoformat(), "gmail", "e", "", None, "src-c1", now.isoformat()),
+            ("c2", canonical_id, now.isoformat(), "gmail", "e", "", None, "src-c2", now.isoformat()),
+            ("l1", legacy_id, now.isoformat(), "gmail", "e", "", None, "src-l1", now.isoformat()),
+        ])
+
+        entity = PersonEntity(id=canonical_id, canonical_name="Merged Person")
+        mock_store = MagicMock()
+        mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = {legacy_id}
+
+        with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
+             patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.Path") as mock_path:
+            mock_path.return_value.exists.return_value = False
+            # Caller passes only the legacy id; the store's reverse merge
+            # lookup expands to the canonical + every sibling legacy ID,
+            # so counts should reflect ALL interactions for the canonical.
+            refresh_person_stats([legacy_id], save=False)
+
+        assert entity.email_count == 3
 
 
 class TestApplyCountsToEntity:

@@ -10,14 +10,12 @@ NOTE: These tests require direct database access and will be skipped if
 the server is running (database locked). Stop the server to run these tests.
 """
 import os
-import re
-import random
 import sqlite3
 import pytest
 from pathlib import Path
 
 from api.services.person_entity import get_person_entity_store
-from api.services.interaction_store import get_interaction_store, get_interaction_db_path
+from api.services.interaction_store import get_interaction_db_path
 
 
 # All classes in this file require database access
@@ -313,13 +311,18 @@ class TestR6InteractionCounts:
         mismatches = []
 
         for person in sorted_people:
-            # Get actual counts from database
-            cursor = conn.execute("""
+            # Stored counts aggregate canonical + every legacy ID that merges
+            # to this person, so the "actual" comparison must query across the
+            # same variant set. Otherwise canonicals with legacy interactions
+            # show as over-counted mismatches even when stats are correct.
+            variant_ids = list({person.id} | store.get_legacy_ids(person.id))
+            placeholders = ','.join(['?'] * len(variant_ids))
+            cursor = conn.execute(f"""
                 SELECT source_type, COUNT(*)
                 FROM interactions
-                WHERE person_id = ?
+                WHERE person_id IN ({placeholders})
                 GROUP BY source_type
-            """, (person.id,))
+            """, tuple(variant_ids))
 
             actual_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
