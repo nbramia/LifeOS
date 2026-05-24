@@ -605,7 +605,9 @@ SYNC_SCRIPTS = {
 DEFAULT_SYNC_TIMEOUT = 3600  # 60 minutes
 
 SYNC_TIMEOUTS = {
-    "vault_reindex": 7200,           # 2 hours - typically 30-90min, bounded for safety
+    "vault_reindex": 14400,          # 4 hours - incremental is typically 10-30min, but a
+                                     #            `--force` full reindex of a ~6K-file vault
+                                     #            plus per-file summary calls fits in ~3-4h
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
     "google_sheets": 300,            # 5 minutes - normally takes ~1s, hangs on expired OAuth
