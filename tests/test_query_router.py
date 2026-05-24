@@ -4,25 +4,25 @@ Tests for Local LLM Query Router (P3.5).
 Tests the OllamaClient and QueryRouter services.
 """
 import pytest
+from unittest.mock import patch, MagicMock, AsyncMock
+import httpx
 
 # Most tests in this file are fast unit tests (mocked Ollama)
 pytestmark = pytest.mark.unit
-import json
-from unittest.mock import patch, MagicMock, AsyncMock
-import httpx
 
 
 class TestOllamaClient:
     """Test the Ollama client for local LLM inference."""
 
     def test_client_initialization(self):
-        """Client should initialize with correct settings."""
+        """Client should initialize with the configured defaults."""
         from api.services.ollama_client import OllamaClient
+        from config.settings import settings
 
         client = OllamaClient()
-        assert client.host == "http://localhost:11434"
-        assert client.model == "qwen2.5:7b-instruct"
-        assert client.timeout == 45
+        assert client.host == settings.ollama_host
+        assert client.model == settings.ollama_model
+        assert client.timeout == settings.ollama_timeout
 
     def test_client_custom_settings(self):
         """Client should accept custom settings."""
