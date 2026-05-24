@@ -805,6 +805,19 @@ class PersonEntityStore:
             person_id = self._merged_ids[person_id]
         return person_id
 
+    def get_legacy_ids(self, canonical_id: str) -> set[str]:
+        """
+        All known legacy (pre-merge) person_ids that resolve to this canonical.
+
+        Used by stats / sync code that needs to query interaction rows for the
+        canonical entity but might still find rows tagged with legacy IDs that
+        haven't been repointed yet. Does NOT include the canonical itself —
+        callers typically union it in.
+        """
+        canon = self.get_canonical_id(canonical_id)
+        return {legacy for legacy, primary in self._merged_ids.items()
+                if self.get_canonical_id(primary) == canon}
+
     def _load_merged_ids(self) -> None:
         """Load the merged IDs mapping for durability."""
         if self.MERGED_IDS_PATH.exists():
