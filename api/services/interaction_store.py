@@ -369,12 +369,18 @@ class InteractionStore:
 
         conn = self._get_connection()
         try:
+            # If the existing row carries the 1970 UNDATED_SENTINEL timestamp
+            # but we now have a real date (from the indexer's mtime fallback or
+            # a newly-extractable filename date), upgrade the timestamp in place.
+            # All other columns stay frozen to avoid stomping legitimate edits.
             cursor = conn.execute(
                 """
                 INSERT INTO interactions
                 (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_type, source_id) DO NOTHING
+                ON CONFLICT(source_type, source_id) DO UPDATE SET
+                    timestamp = excluded.timestamp
+                WHERE interactions.timestamp = ? AND excluded.timestamp != ?
             """,
                 (
                     interaction.id,
@@ -386,6 +392,8 @@ class InteractionStore:
                     interaction.source_link,
                     interaction.source_id,
                     interaction.created_at.isoformat(),
+                    UNDATED_SENTINEL.isoformat(),
+                    UNDATED_SENTINEL.isoformat(),
                 ),
             )
             if cursor.rowcount == 0 and interaction.source_id is not None:
