@@ -286,6 +286,21 @@ class TestCreate:
         assert task.line_number > 0
         assert Path(task.source_file).exists()
 
+    def test_create_prepends_above_existing_tasks(self, task_manager):
+        """Newer tasks land on a lower line number than older ones in the same file."""
+        first = task_manager.create("Older", context="PrependTest")
+        second = task_manager.create("Newer", context="PrependTest")
+
+        first_refreshed = task_manager.get(first.id)
+        assert second.line_number < first_refreshed.line_number
+
+        # Order in the file: newest on top, oldest on bottom
+        file_path = task_manager.tasks_dir / "PrependTest.md"
+        lines = file_path.read_text().splitlines()
+        newer_idx = next(i for i, line in enumerate(lines) if "Newer" in line)
+        older_idx = next(i for i, line in enumerate(lines) if "Older" in line)
+        assert newer_idx < older_idx
+
 
 class TestGet:
     """Tests for get method."""
@@ -443,22 +458,23 @@ class TestDelete:
 
     def test_delete_adjusts_line_numbers(self, task_manager):
         """Test that delete adjusts line numbers for tasks below deleted line."""
+        # Tasks are prepended on create, so after these calls the file order is
+        # [task3, task2, task1] top-to-bottom. Deleting task3 (top) should
+        # shift task2 and task1 up by one line.
         task1 = task_manager.create("First task", context="LineAdjust")
         task2 = task_manager.create("Second task", context="LineAdjust")
         task3 = task_manager.create("Third task", context="LineAdjust")
 
+        line1_before = task1.line_number
         line2_before = task2.line_number
-        line3_before = task3.line_number
 
-        # Delete first task
-        task_manager.delete(task1.id)
+        task_manager.delete(task3.id)
 
-        # Check that task2 and task3 line numbers decreased
+        task1_after = task_manager.get(task1.id)
         task2_after = task_manager.get(task2.id)
-        task3_after = task_manager.get(task3.id)
 
+        assert task1_after.line_number == line1_before - 1
         assert task2_after.line_number == line2_before - 1
-        assert task3_after.line_number == line3_before - 1
 
     def test_delete_nonexistent_task(self, task_manager):
         """Test deleting a non-existent task."""
@@ -967,23 +983,23 @@ class TestContextChange:
 
     def test_context_change_adjusts_line_numbers(self, task_manager):
         """Test that context change adjusts line numbers in old file."""
-        task1 = task_manager.create("Stay here", context="ContextA")
+        # With prepend-on-create the order in the file is [task3, task2, task1].
+        # Moving task2 (middle line) out should leave task3 (above it) unchanged
+        # and shift task1 (below it) up by one line.
+        task1 = task_manager.create("Bottom task", context="ContextA")
         task2 = task_manager.create("Move me", context="ContextA")
-        task3 = task_manager.create("Also stay", context="ContextA")
+        task3 = task_manager.create("Top task", context="ContextA")
 
         line1_before = task1.line_number
         line3_before = task3.line_number
 
-        # Move task2 to different context
         task_manager.update(task2.id, context="ContextB")
 
-        # task1 should keep same line number
-        # task3 should have line number decreased
         task1_after = task_manager.get(task1.id)
         task3_after = task_manager.get(task3.id)
 
-        assert task1_after.line_number == line1_before
-        assert task3_after.line_number == line3_before - 1
+        assert task3_after.line_number == line3_before
+        assert task1_after.line_number == line1_before - 1
 
 
 # =============================================================================

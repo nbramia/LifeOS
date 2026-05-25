@@ -136,7 +136,7 @@ class TaskManager:
         tags: Optional[list[str]] = None,
         reminder_id: Optional[str] = None,
     ) -> Task:
-        """Create a new task, append to context file, update index."""
+        """Create a new task at the top of its context file, update index."""
         with self._lock:
             task = Task(
                 id=uuid.uuid4().hex[:8],
@@ -151,11 +151,16 @@ class TaskManager:
             )
             file_path = self._get_context_file(context)
             line = _format_task_line(task)
-            _append_to_file(file_path, line)
+            insert_at = _insert_task_at_top(file_path, line)
 
-            # Record source info
+            # Bump line numbers for existing tasks in the same file that
+            # sit at or below the insertion point (pushed down by 1).
+            for t in self._tasks.values():
+                if t.source_file == str(file_path) and t.line_number >= insert_at:
+                    t.line_number += 1
+
             task.source_file = str(file_path)
-            task.line_number = _count_lines(file_path)
+            task.line_number = insert_at
 
             self._tasks[task.id] = task
             self._save_index()
@@ -502,6 +507,30 @@ def _append_to_file(path: Path, line: str):
         content += "\n"
     content += line + "\n"
     path.write_text(content, encoding="utf-8")
+
+
+def _insert_task_at_top(path: Path, line: str) -> int:
+    """Insert a task line above the existing first task. Returns its 1-indexed line number.
+
+    If the file has no tasks yet, appends after the header block.
+    """
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = content.splitlines()
+
+    first_task_idx = None  # 0-indexed
+    for i, existing in enumerate(lines):
+        if _parse_task_line(existing, "", i + 1) is not None:
+            first_task_idx = i
+            break
+
+    if first_task_idx is None:
+        # No tasks yet — append at end
+        _append_to_file(path, line)
+        return len(path.read_text(encoding="utf-8").splitlines())
+
+    new_lines = lines[:first_task_idx] + [line] + lines[first_task_idx:]
+    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return first_task_idx + 1
 
 
 def _replace_line_in_file(path: Path, line_num: int, new_line: str):
