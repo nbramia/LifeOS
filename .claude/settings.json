@@ -8,6 +8,33 @@
             "type": "command",
             "command": "rm -f page-*.png screenshot-*.png && rm -rf .playwright-mcp/",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash -c '\"$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)/scripts/session-exit-diag.sh\"'",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c '\"$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)/scripts/create-worktree.sh\"'",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c '\"$(cd \"$(git rev-parse --git-common-dir)/..\" && pwd)/scripts/remove-worktree.sh\"'",
+            "timeout": 30
           }
         ]
       }
