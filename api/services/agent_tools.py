@@ -229,9 +229,12 @@ TOOL_DEFINITIONS = [
             "Manage Obsidian tasks. Actions: 'create' (new task), 'list' (filter tasks), "
             "'complete' (mark task done), 'update' (edit any field on an existing task, "
             "including tags), 'tags' (list every distinct tag across all tasks with "
-            "usage counts). Before adding a new tag to a task, call action='tags' first "
-            "and reuse an existing tag if one fits — match case-insensitively. Only "
-            "invent a new tag when none of the existing tags apply."
+            "usage counts — the same list is already in the system prompt; call this "
+            "action only if the user explicitly asks 'what tags do I have', or to "
+            "double-check a stale cache). When assigning tags, reuse an existing tag "
+            "from the system prompt list when it clearly matches the user's intent; "
+            "otherwise follow the user's wording and create a new tag — don't collapse "
+            "a distinct user-named tag onto a vaguely similar existing one."
         ),
         "input_schema": {
             "type": "object",
