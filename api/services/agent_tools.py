@@ -226,15 +226,18 @@ TOOL_DEFINITIONS = [
     {
         "name": "manage_tasks",
         "description": (
-            "Manage Obsidian tasks. Actions: 'create' (new task), 'list' (filter tasks), "
-            "'complete' (mark task done), 'update' (edit any field on an existing task, "
-            "including tags), 'tags' (list every distinct tag across all tasks with "
-            "usage counts — the same list is already in the system prompt; call this "
-            "action only if the user explicitly asks 'what tags do I have', or to "
-            "double-check a stale cache). When assigning tags, reuse an existing tag "
-            "from the system prompt list when it clearly matches the user's intent; "
-            "otherwise follow the user's wording and create a new tag — don't collapse "
-            "a distinct user-named tag onto a vaguely similar existing one."
+            "Manage Obsidian tasks. Actions: 'create' (new task — always lands in "
+            "Inbox; do not pass a context), 'list' (filter tasks; supports the "
+            "context filter for already-categorized tasks), 'complete' (mark task "
+            "done), 'update' (edit any field on an existing task, including tags or "
+            "moving the task to a different context), 'tags' (list every distinct "
+            "tag across all tasks with usage counts — the same list is already in "
+            "the system prompt; call this action only if the user explicitly asks "
+            "'what tags do I have', or to double-check a stale cache). When "
+            "assigning tags, reuse an existing tag from the system prompt list when "
+            "it clearly matches the user's intent; otherwise follow the user's "
+            "wording and create a new tag — don't collapse a distinct user-named "
+            "tag onto a vaguely similar existing one."
         ),
         "input_schema": {
             "type": "object",
@@ -254,7 +257,11 @@ TOOL_DEFINITIONS = [
                 },
                 "context": {
                     "type": "string",
-                    "description": "Context/category (e.g. 'Work', 'Personal', 'Inbox'). Default for create: 'Inbox'.",
+                    "description": (
+                        "Context/category (e.g. 'Work', 'Personal', 'Inbox'). Used as "
+                        "a filter for 'list' and as the target context for 'update'. "
+                        "Ignored on 'create' — new tasks always land in Inbox."
+                    ),
                 },
                 "priority": {
                     "type": "string",
@@ -915,13 +922,12 @@ def _task_create(inp: dict) -> str:
     tm = get_task_manager()
     task = tm.create(
         description=inp["description"],
-        context=inp.get("context", "Inbox"),
         priority=inp.get("priority", ""),
         due_date=inp.get("due_date"),
         tags=inp.get("tags"),
     )
     due = f", due {task.due_date}" if task.due_date else ""
-    return f"Task created: \"{task.description}\" (id: {task.id}, context: {task.context}{due})"
+    return f"Task created: \"{task.description}\" (id: {task.id}{due})"
 
 
 def _task_list(inp: dict) -> str:

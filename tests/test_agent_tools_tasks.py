@@ -75,6 +75,19 @@ class TestManageTasksTags:
         assert "#urgent (1)" in lines
 
 
+class TestManageTasksCreate:
+    def test_create_lands_in_inbox_even_if_context_provided(self, tm):
+        # The chat assistant might still try to pass a context — we ignore it.
+        _tool_manage_tasks({
+            "action": "create",
+            "description": "Build a financial model",
+            "context": "Work",
+        })
+        tasks = tm.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0].context == "Inbox"
+
+
 class TestUnknownAction:
     def test_unknown_action(self, tm):
         out = _tool_manage_tasks({"action": "nope"})
