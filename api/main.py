@@ -42,6 +42,7 @@ _calendar_indexer = None
 _telegram_listener = None
 _reminder_scheduler = None
 _job_queue = None
+_task_watcher = None
 
 # Health monitoring (previously _health_check_loop) is now an out-of-band
 # watcher in nbramia/local-processing that polls /health/raw-state. Moving it
@@ -52,7 +53,7 @@ _job_queue = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _job_queue
+    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _job_queue, _task_watcher
 
     # Startup: Recover any incomplete merge operations
     try:
@@ -103,6 +104,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start job queue worker: {e}")
 
+    # Startup: Watch LifeOS/Tasks/ for external edits (e.g. via Obsidian) so
+    # the task index and auto-generated Dashboard stay in sync.
+    try:
+        from api.services.task_manager import get_task_manager
+        from api.services.task_watcher import TaskWatcher
+        tm = get_task_manager()
+        # Pull tasks from disk once at startup in case files changed while we were down
+        tm.rebuild_index()
+        _task_watcher = TaskWatcher(tasks_dir=tm.tasks_dir)
+        _task_watcher.start()
+    except Exception as e:
+        logger.error(f"Failed to start task file watcher: {e}")
+
     # Hint for new users who haven't set their person ID yet
     if not settings.my_person_id and settings.user_name and settings.user_name != "User":
         logger.info(
@@ -135,6 +149,10 @@ async def lifespan(app: FastAPI):
     if _reminder_scheduler:
         _reminder_scheduler.stop()
         logger.info("Reminder scheduler stopped")
+
+    if _task_watcher:
+        _task_watcher.stop()
+        logger.info("Task file watcher stopped")
 
     if _job_queue:
         _job_queue.stop_worker()
