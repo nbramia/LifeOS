@@ -452,16 +452,16 @@ class TaskManager:
             "sort by due",
             "```",
             "",
-            "## In Progress",
+            "## Urgent",
             "```tasks",
-            "status.name includes In Progress",
+            "status.name includes Urgent",
             "path includes LifeOS/Tasks",
             "sort by created reverse",
             "```",
             "",
-            "## Blocked",
+            "## In Progress",
             "```tasks",
-            "status.name includes Blocked",
+            "status.name includes In Progress",
             "path includes LifeOS/Tasks",
             "sort by created reverse",
             "```",
@@ -474,24 +474,9 @@ class TaskManager:
             "sort by created",
             "```",
             "",
-            "## By Priority",
+            "## By Tag",
             "",
         ]
-
-        for label, priority in (("High", "high"), ("Medium", "medium"),
-                                 ("Low", "low"), ("No priority", "none")):
-            lines += [
-                f"### {label}",
-                "```tasks",
-                "not done",
-                "path includes LifeOS/Tasks",
-                f"priority is {priority}",
-                "sort by created reverse",
-                "```",
-                "",
-            ]
-
-        lines += ["## By Tag", ""]
 
         for tag in sorted(tag_counts.keys(), key=lambda x: (-tag_counts[x], x.lower())):
             lines += [
@@ -525,11 +510,10 @@ class TaskManager:
             "sort by created reverse",
             "```",
             "",
-            "## Recently Completed",
+            "## Completed",
             "```tasks",
             "done",
             "path includes LifeOS/Tasks",
-            "done after 7 days ago",
             "sort by done reverse",
             "```",
             "",

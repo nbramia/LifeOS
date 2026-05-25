@@ -25,15 +25,21 @@ class TestDashboardStructure:
         text = _dashboard_text(tm)
         for heading in (
             "## Due This Week",
+            "## Urgent",
             "## In Progress",
-            "## Blocked",
             "## Stale — open 30+ days",
-            "## By Priority",
             "## By Tag",
             "## All Open",
-            "## Recently Completed",
+            "## Completed",
         ):
             assert heading in text, f"Missing section: {heading}"
+
+    def test_removed_sections_are_gone(self, tm):
+        text = _dashboard_text(tm)
+        assert "## Blocked" not in text
+        assert "## By Priority" not in text
+        # The renamed section uses 'Completed' (not 'Recently Completed')
+        assert "## Recently Completed" not in text
 
     def test_all_open_sorts_by_created_reverse(self, tm):
         text = _dashboard_text(tm)
@@ -42,10 +48,30 @@ class TestDashboardStructure:
         block = text[block_start:block_start + 400]
         assert "sort by created reverse" in block
 
-    def test_priority_sections_present(self, tm):
+    def test_due_this_week_sorts_by_due_ascending(self, tm):
         text = _dashboard_text(tm)
-        for sub in ("### High", "### Medium", "### Low", "### No priority"):
-            assert sub in text
+        start = text.index("## Due This Week")
+        end = text.index("##", start + 5)
+        block = text[start:end]
+        # 'sort by due' (no 'reverse') = soonest first
+        assert "sort by due" in block
+        assert "sort by due reverse" not in block
+
+    def test_completed_sorts_by_done_reverse(self, tm):
+        text = _dashboard_text(tm)
+        start = text.index("## Completed")
+        block = text[start:]
+        # Most-recently-completed first
+        assert "sort by done reverse" in block
+        # No artificial 7-day window — show all completed tasks
+        assert "done after" not in block
+
+    def test_urgent_section_uses_status_filter(self, tm):
+        text = _dashboard_text(tm)
+        start = text.index("## Urgent")
+        end = text.index("##", start + 5)
+        block = text[start:end]
+        assert "status.name includes Urgent" in block
 
     def test_auto_generated_marker(self, tm):
         text = _dashboard_text(tm)
