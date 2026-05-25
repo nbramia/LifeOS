@@ -244,6 +244,20 @@ class TaskManager:
 
         return results
 
+    def list_tags(self) -> list[dict]:
+        """Return distinct tags across all tasks with usage counts, sorted by count desc then name."""
+        counts: dict[str, int] = {}
+        for task in self._tasks.values():
+            for tag in task.tags:
+                normalized = tag.lstrip("#")
+                if not normalized:
+                    continue
+                counts[normalized] = counts.get(normalized, 0) + 1
+        return [
+            {"tag": tag, "count": count}
+            for tag, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+        ]
+
     # ------------------------------------------------------------------
     # Reindex
     # ------------------------------------------------------------------

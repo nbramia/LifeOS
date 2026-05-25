@@ -128,6 +128,22 @@ async def list_tasks(
     )
 
 
+class TagUsage(BaseModel):
+    tag: str
+    count: int
+
+
+class TagListResponse(BaseModel):
+    tags: list[TagUsage]
+
+
+@router.get("/tags", response_model=TagListResponse)
+async def list_tags():
+    """List all distinct tags across all tasks (any status) with usage counts."""
+    manager = get_task_manager()
+    return TagListResponse(tags=[TagUsage(**t) for t in manager.list_tags()])
+
+
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_task(task_id: str):
     """Get a specific task by ID."""

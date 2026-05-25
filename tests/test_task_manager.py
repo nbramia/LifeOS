@@ -8,7 +8,6 @@ import json
 import pytest
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
 
 from api.services.task_manager import (
     Task,
@@ -260,7 +259,7 @@ class TestCreate:
 
     def test_create_appends_to_file(self, task_manager):
         """Test that create appends task to markdown file."""
-        task = task_manager.create("File test", context="TestContext")
+        task_manager.create("File test", context="TestContext")
 
         file_path = task_manager.tasks_dir / "TestContext.md"
         assert file_path.exists()
@@ -271,7 +270,7 @@ class TestCreate:
 
     def test_create_updates_index(self, task_manager):
         """Test that create updates the index file."""
-        task = task_manager.create("Index test")
+        task_manager.create("Index test")
 
         assert task_manager.index_path.exists()
         data = json.loads(task_manager.index_path.read_text())
@@ -396,7 +395,6 @@ class TestUpdate:
     def test_update_rewrites_line_in_file(self, task_manager):
         """Test that update rewrites the line in the file."""
         task = task_manager.create("Update file test", context="UpdateTest")
-        original_line_num = task.line_number
 
         task_manager.update(task.id, description="Updated description")
 
@@ -557,6 +555,38 @@ class TestListTasks:
         for task in tasks:
             assert task.status == "todo"
             assert task.context == "Work"
+
+
+class TestListTags:
+    """Tests for list_tags()."""
+
+    def test_list_tags_empty(self, task_manager):
+        assert task_manager.list_tags() == []
+
+    def test_list_tags_returns_counts_sorted(self, task_manager):
+        task_manager.create("a", tags=["work", "urgent"])
+        task_manager.create("b", tags=["work"])
+        task_manager.create("c", tags=["urgent"])
+        task_manager.create("d", tags=["personal"])
+
+        result = task_manager.list_tags()
+        as_dict = {row["tag"]: row["count"] for row in result}
+        assert as_dict == {"work": 2, "urgent": 2, "personal": 1}
+        # Sorted by count desc, then alphabetically (case-insensitive)
+        assert [row["tag"] for row in result] == ["urgent", "work", "personal"]
+
+    def test_list_tags_strips_hash_prefix(self, task_manager):
+        task_manager.create("a", tags=["#work"])
+        task_manager.create("b", tags=["work"])
+        result = task_manager.list_tags()
+        assert result == [{"tag": "work", "count": 2}]
+
+    def test_list_tags_spans_all_statuses(self, task_manager):
+        t1 = task_manager.create("a", tags=["done-tag"])
+        task_manager.update(t1.id, status="done")
+        task_manager.create("b", tags=["todo-tag"])
+        tags = {row["tag"] for row in task_manager.list_tags()}
+        assert tags == {"done-tag", "todo-tag"}
 
 
 # =============================================================================
@@ -1004,7 +1034,7 @@ class TestReindexFile:
 
         # Manually delete task from file
         lines = file_path.read_text().splitlines()
-        filtered_lines = [l for l in lines if "Delete from file" not in l]
+        filtered_lines = [line for line in lines if "Delete from file" not in line]
         file_path.write_text("\n".join(filtered_lines) + "\n")
 
         # Reindex
@@ -1100,14 +1130,14 @@ class TestPersistence:
         """Test that markdown files persist correctly."""
         # Create manager and add task
         manager1 = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
-        task = manager1.create("File persistence test", context="FileTest")
+        manager1.create("File persistence test", context="FileTest")
 
         # Read file directly
         file_path = manager1.tasks_dir / "FileTest.md"
         original_content = file_path.read_text()
 
-        # Create new manager instance
-        manager2 = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+        # Create new manager instance — second instance reads the same vault
+        TaskManager(vault_path=tmp_vault, index_path=tmp_index)
 
         # Verify file unchanged
         new_content = file_path.read_text()
@@ -1226,7 +1256,7 @@ class TestEdgeCases:
 
     def test_context_file_creation_with_special_chars(self, task_manager):
         """Test that context files handle special characters."""
-        task = task_manager.create("Test", context="Context-With-Dashes")
+        task_manager.create("Test", context="Context-With-Dashes")
         file_path = task_manager.tasks_dir / "Context-With-Dashes.md"
 
         assert file_path.exists()

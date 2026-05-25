@@ -4,7 +4,7 @@ Tests for the Tasks API routes.
 Tests CRUD endpoints with mocked TaskManager.
 """
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 pytestmark = pytest.mark.unit
 
@@ -160,6 +160,28 @@ class TestTasksAPI:
         mock_task_manager.complete.return_value = None
         response = client.put("/api/tasks/nonexistent/complete")
         assert response.status_code == 404
+
+    # --- TAGS ---
+
+    def test_list_tags(self, client, mock_task_manager):
+        mock_task_manager.list_tags.return_value = [
+            {"tag": "work", "count": 3},
+            {"tag": "urgent", "count": 1},
+        ]
+        response = client.get("/api/tasks/tags")
+        assert response.status_code == 200
+        assert response.json() == {
+            "tags": [
+                {"tag": "work", "count": 3},
+                {"tag": "urgent", "count": 1},
+            ]
+        }
+
+    def test_list_tags_empty(self, client, mock_task_manager):
+        mock_task_manager.list_tags.return_value = []
+        response = client.get("/api/tasks/tags")
+        assert response.status_code == 200
+        assert response.json() == {"tags": []}
 
     # --- DELETE ---
 
