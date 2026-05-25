@@ -16,7 +16,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -94,7 +94,7 @@ class TaskManager:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
 
         self._load_index()
-        self._ensure_dashboard()
+        self._write_dashboard()
 
     # ------------------------------------------------------------------
     # Index persistence
@@ -164,6 +164,7 @@ class TaskManager:
 
             self._tasks[task.id] = task
             self._save_index()
+            self._write_dashboard()
             logger.info(f"Created task {task.id}: {description}")
             return task
 
@@ -202,6 +203,7 @@ class TaskManager:
                 _replace_line_in_file(Path(task.source_file), task.line_number, new_line)
 
             self._save_index()
+            self._write_dashboard()
             return task
 
     def delete(self, task_id: str) -> bool:
@@ -220,6 +222,7 @@ class TaskManager:
 
             del self._tasks[task_id]
             self._save_index()
+            self._write_dashboard()
             logger.info(f"Deleted task {task_id}")
             return True
 
@@ -270,6 +273,11 @@ class TaskManager:
     def reindex_file(self, file_path: str):
         """Parse a single task file and update index entries for it."""
         path = Path(file_path)
+        # Dashboard.md is auto-generated; never index it as a task source.
+        # (Also prevents a watcher feedback loop when we regenerate it below.)
+        if path.name == "Dashboard.md":
+            return
+
         if not path.exists():
             # File was deleted — remove tasks from index
             with self._lock:
@@ -278,6 +286,7 @@ class TaskManager:
                     del self._tasks[tid]
                 if to_remove:
                     self._save_index()
+                    self._write_dashboard()
             return
 
         with self._lock:
@@ -299,6 +308,7 @@ class TaskManager:
                     self._tasks[task.id] = task
 
             self._save_index()
+            self._write_dashboard()
 
     def rebuild_index(self):
         """Full re-parse of all LifeOS/Tasks/*.md files."""
@@ -321,6 +331,7 @@ class TaskManager:
                     self._tasks[task.id] = task
 
         self._save_index()
+        self._write_dashboard()
         logger.info(f"Rebuilt task index: {len(self._tasks)} tasks")
 
     # ------------------------------------------------------------------
@@ -356,54 +367,175 @@ class TaskManager:
         task.line_number = _count_lines(new_path)
         task.context = new_context
 
-    def _ensure_dashboard(self):
-        """Create Dashboard.md if missing."""
-        dashboard = self.tasks_dir / "Dashboard.md"
-        if dashboard.exists():
+    def _write_dashboard(self):
+        """Regenerate Dashboard.md from current task state.
+
+        The dashboard is fully auto-generated. Manual edits are overwritten
+        the next time any task changes.
+        """
+        try:
+            content = self._build_dashboard_content()
+        except Exception as e:
+            logger.warning(f"Dashboard generation failed: {e}")
             return
-        content = """---
-type: dashboard
----
-# Task Dashboard
-
-## All Open
-```tasks
-not done
-path includes LifeOS/Tasks
-sort by due
-group by filename
-```
-
-## Due This Week
-```tasks
-not done
-path includes LifeOS/Tasks
-due before next week
-sort by due
-```
-
-## In Progress
-```tasks
-status.name includes In Progress
-path includes LifeOS/Tasks
-```
-
-## Blocked
-```tasks
-status.name includes Blocked
-path includes LifeOS/Tasks
-```
-
-## Recently Completed
-```tasks
-done
-path includes LifeOS/Tasks
-done after 7 days ago
-sort by done reverse
-```
-"""
+        dashboard = self.tasks_dir / "Dashboard.md"
+        try:
+            if dashboard.exists() and dashboard.read_text(encoding="utf-8") == content:
+                return  # No-op write avoids triggering watchers
+        except Exception:
+            pass
         dashboard.write_text(content, encoding="utf-8")
-        logger.info("Created Tasks Dashboard.md")
+
+    def _build_dashboard_content(self) -> str:
+        tasks = list(self._tasks.values())
+        open_tasks = [t for t in tasks if t.status not in ("done", "cancelled")]
+
+        today = date.today()
+        today_iso = today.isoformat()
+        in_seven_iso = (today + timedelta(days=7)).isoformat()
+        in_progress_count = sum(1 for t in tasks if t.status == "in_progress")
+        overdue_count = sum(1 for t in open_tasks if t.due_date and t.due_date < today_iso)
+        due_this_week_count = sum(
+            1 for t in open_tasks
+            if t.due_date and today_iso <= t.due_date <= in_seven_iso
+        )
+        done_last_7_count = sum(
+            1 for t in tasks
+            if t.status == "done" and t.done_date
+            and 0 <= (today - date.fromisoformat(t.done_date)).days <= 7
+        )
+
+        # Tags with at least one open task
+        tag_counts: dict[str, int] = {}
+        untagged_open = 0
+        for t in open_tasks:
+            normalized = [tg.lstrip("#") for tg in t.tags if tg.lstrip("#")]
+            if normalized:
+                for tag in normalized:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            else:
+                untagged_open += 1
+
+        lines: list[str] = [
+            "---",
+            "type: dashboard",
+            "---",
+            "<!-- AUTO-GENERATED by LifeOS task manager. Manual edits are overwritten on the next task change. -->",
+            "# Task Dashboard",
+            "",
+            f"> **{len(open_tasks)} open** · {due_this_week_count} due this week · "
+            f"{overdue_count} overdue · {in_progress_count} in progress · "
+            f"{done_last_7_count} done in last 7 days",
+            f"> _Updated {datetime.now().strftime('%Y-%m-%d %H:%M')}_",
+            "",
+        ]
+
+        if overdue_count:
+            lines += [
+                "## Overdue",
+                "```tasks",
+                "not done",
+                "path includes LifeOS/Tasks",
+                "due before today",
+                "sort by due",
+                "```",
+                "",
+            ]
+
+        lines += [
+            "## Due This Week",
+            "```tasks",
+            "not done",
+            "path includes LifeOS/Tasks",
+            "due after yesterday",
+            "due before in 8 days",
+            "sort by due",
+            "```",
+            "",
+            "## In Progress",
+            "```tasks",
+            "status.name includes In Progress",
+            "path includes LifeOS/Tasks",
+            "sort by created reverse",
+            "```",
+            "",
+            "## Blocked",
+            "```tasks",
+            "status.name includes Blocked",
+            "path includes LifeOS/Tasks",
+            "sort by created reverse",
+            "```",
+            "",
+            "## Stale — open 30+ days",
+            "```tasks",
+            "not done",
+            "path includes LifeOS/Tasks",
+            "created before 30 days ago",
+            "sort by created",
+            "```",
+            "",
+            "## By Priority",
+            "",
+        ]
+
+        for label, priority in (("High", "high"), ("Medium", "medium"),
+                                 ("Low", "low"), ("No priority", "none")):
+            lines += [
+                f"### {label}",
+                "```tasks",
+                "not done",
+                "path includes LifeOS/Tasks",
+                f"priority is {priority}",
+                "sort by created reverse",
+                "```",
+                "",
+            ]
+
+        lines += ["## By Tag", ""]
+
+        for tag in sorted(tag_counts.keys(), key=lambda x: (-tag_counts[x], x.lower())):
+            lines += [
+                f"### #{tag}",
+                "```tasks",
+                "not done",
+                "path includes LifeOS/Tasks",
+                f"tag includes #{tag}",
+                "sort by created reverse",
+                "```",
+                "",
+            ]
+
+        if untagged_open:
+            lines += [
+                "### No tag",
+                "```tasks",
+                "not done",
+                "path includes LifeOS/Tasks",
+                "no tags",
+                "sort by created reverse",
+                "```",
+                "",
+            ]
+
+        lines += [
+            "## All Open",
+            "```tasks",
+            "not done",
+            "path includes LifeOS/Tasks",
+            "sort by created reverse",
+            "```",
+            "",
+            "## Recently Completed",
+            "```tasks",
+            "done",
+            "path includes LifeOS/Tasks",
+            "done after 7 days ago",
+            "sort by done reverse",
+            "```",
+            "",
+        ]
+
+        return "\n".join(lines)
 
 
 # ======================================================================
