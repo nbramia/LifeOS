@@ -57,6 +57,13 @@ BLOCKED_TAG = "agent-blocked"
 FAILED_TAG = "agent-failed"
 BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 
+# Task statuses that the worker will pick up for execution. `todo` is the
+# everyday-task default; `urgent` (Obsidian Tasks `[!]`) is for high-priority
+# items the operator wants run ahead of the queue — both should trigger the
+# agent if tagged `#agent`. The list API only accepts a single status per
+# request, so we fan out and dedupe.
+AGENT_PICKUP_STATUSES = ("todo", "urgent")
+
 
 class Worker:
     """Single-process poll loop. One instance per process."""
@@ -628,17 +635,30 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _list_agent_tasks(self) -> list[dict[str, Any]]:
-        """Fetch open `#agent` tasks from the API."""
-        try:
-            resp = self._http.get(
-                f"{self.api_base}/api/tasks",
-                params={"status": "todo", "tag": AGENT_TAG},
-            )
-            resp.raise_for_status()
-            return resp.json().get("tasks", [])
-        except Exception as exc:
-            logger.warning("failed to list agent tasks: %s", exc)
-            return []
+        """Fetch open `#agent` tasks from the API.
+
+        The list endpoint only filters on a single status string, so we fan
+        out across `AGENT_PICKUP_STATUSES` (`todo` + `urgent` by default) and
+        dedupe by task id. A task that appears under both statuses in quick
+        succession is still claimed once.
+        """
+        seen: set[str] = set()
+        all_tasks: list[dict[str, Any]] = []
+        for status in AGENT_PICKUP_STATUSES:
+            try:
+                resp = self._http.get(
+                    f"{self.api_base}/api/tasks",
+                    params={"status": status, "tag": AGENT_TAG},
+                )
+                resp.raise_for_status()
+                for task in resp.json().get("tasks", []):
+                    tid = task.get("id")
+                    if tid and tid not in seen:
+                        seen.add(tid)
+                        all_tasks.append(task)
+            except Exception as exc:
+                logger.warning("failed to list agent tasks (status=%s): %s", status, exc)
+        return all_tasks
 
     def _swap_tag(self, task_id: str, from_tag: str, to_tag: str) -> bool:
         try:
