@@ -44,10 +44,29 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.interaction_store import build_obsidian_link
 from config.settings import settings
 
 
 logger = logging.getLogger(__name__)
+
+# Inline-summary cap. Telegram allows ~4096 chars; we leave headroom for
+# the worker's header (icon + title + token/cost line) and any footer
+# (init-failed MCPs). Above this we spill the body to a vault note and
+# put just a 1-line preview + obsidian:// link in the Telegram message.
+_INLINE_SUMMARY_MAX_CHARS = 2000
+
+
+def _worker_label(routing: str | None) -> str:
+    """Telegram-message prefix that names the route — operator wants to
+    know at a glance whether a result came from local Gemma or cloud
+    Claude. Defaults to the generic "Agent worker" when the routing
+    isn't known yet (e.g., startup recovery messages)."""
+    if routing == ROUTE_LOCAL:
+        return "Local agent worker"
+    if routing == ROUTE_CLAUDE:
+        return "Cloud agent worker"
+    return "Agent worker"
 
 
 AGENT_TAG = "agent"
@@ -207,7 +226,7 @@ class Worker:
             self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             self._notify(
-                f"⚠️ Agent worker: task left in {session.status!r} from a prior "
+                f"⚠️ {_worker_label(session.routing)}: task left in {session.status!r} from a prior "
                 f"run could not be safely resumed — tag rolled back to "
                 f"#{AGENT_TAG} for retry. Transcript: "
                 f"data/agent_transcripts/{sid}.jsonl"
@@ -561,8 +580,10 @@ class Worker:
             self.transcript_store.append(q["session_id"], "clarification_timed_out", {
                 "question_id": q["id"],
             })
+            stale_session = self.session_store.get_by_session_id(q["session_id"])
+            label = _worker_label(stale_session.routing if stale_session else None)
             self._notify(
-                f"⏰ Agent worker: task is still waiting on your reply.\n\n"
+                f"⏰ {label}: task is still waiting on your reply.\n\n"
                 f"Question: {q['question'][:300]}\n\n"
                 f"(Task remains at #{BLOCKED_TAG}. Reply to the original "
                 f"question to unblock, or re-tag with #{AGENT_TAG} to retry.)"
@@ -624,7 +645,7 @@ class Worker:
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
                 self._notify(
-                    f"⚠️ Agent worker: error while resuming sleeping task "
+                    f"⚠️ {_worker_label(session.routing)}: error while resuming sleeping task "
                     f"'{task.get('description', session.task_id)}': {exc}"
                 )
                 continue
@@ -892,7 +913,7 @@ class Worker:
                 self.session_store.update_status(task_id, STATUS_BLOCKED)
                 self.transcript_store.append(sid, "managed_not_configured", {})
                 self._notify(
-                    f"⏸ Agent worker: task '{title}' routed to Claude but "
+                    f"⏸ {_worker_label(ROUTE_CLAUDE)}: task '{title}' routed to Claude but "
                     f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY, "
                     f"LIFEOS_AGENT_PRESET_ID, and LIFEOS_AGENT_ENVIRONMENT_ID "
                     f"in .env (see docs/guides/agent-worker-setup.md for the "
@@ -932,10 +953,11 @@ class Worker:
             self._notify(self._completion_summary(session, task, outcome))
             return
 
+        label = _worker_label(session.routing)
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
             self._notify(
-                f"⚠️ Agent worker: task '{title}' hit its budget ({outcome.reason}). "
+                f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
                 f"Transcript: data/agent_transcripts/{sid}.jsonl"
             )
             return
@@ -943,7 +965,7 @@ class Worker:
         if outcome.status == STATUS_FAILED:
             self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
             self._notify(
-                f"⚠️ Agent worker: task '{title}' failed: {outcome.reason}. "
+                f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "
                 f"Transcript: data/agent_transcripts/{sid}.jsonl"
             )
             return
@@ -963,6 +985,7 @@ class Worker:
         active_s = int(refreshed.total_active_seconds or 0)
         expected = refreshed.expected_output or "text"
         title = task.get("description", session.task_id)
+        label = _worker_label(refreshed.routing or session.routing)
 
         # Body: prefer the agent's final text. When it's empty (the agent
         # used a tool and idled without summarizing — sometimes happens with
@@ -970,15 +993,34 @@ class Worker:
         # operator can inspect what the agent actually did instead of seeing
         # a blank message. The transcript captures every tool call.
         final_text = (outcome.final_text or "").strip()
-        if final_text:
-            result_blurb = final_text
-            if len(result_blurb) > 600:
-                result_blurb = result_blurb[:600] + "…"
-        else:
+        if not final_text:
             result_blurb = (
                 f"(agent idled without a final text reply — check transcript at "
                 f"data/agent_transcripts/{session.session_id}.jsonl for tool-use detail)"
             )
+        elif len(final_text) <= _INLINE_SUMMARY_MAX_CHARS:
+            result_blurb = final_text
+        else:
+            # Spill the full body to a vault note and link to it instead of
+            # truncating mid-answer. The agent's system prompts now ask the
+            # agent itself to create artifacts for long outputs, but the
+            # operator-facing UX shouldn't depend on the agent following
+            # that guidance: any over-length response gets spilled here.
+            spillover = self._spill_to_vault(session, task, final_text)
+            if spillover is None:
+                # Vault not configured or write failed — preserve the old
+                # behavior so the operator still gets *something* readable.
+                result_blurb = final_text[:_INLINE_SUMMARY_MAX_CHARS] + "…"
+            else:
+                rel_path, obsidian_url = spillover
+                preview = final_text.split("\n\n", 1)[0].strip()
+                if len(preview) > 400:
+                    preview = preview[:400].rsplit(" ", 1)[0] + "…"
+                result_blurb = (
+                    f"{preview}\n\n"
+                    f"Full answer saved to vault: {rel_path}\n"
+                    f"Open: {obsidian_url}"
+                )
 
         # Footer: when some MCP servers failed to initialize during the session,
         # list them so the operator can fix or remove the broken connectors from
@@ -989,17 +1031,71 @@ class Worker:
             footer = f"\n\nNote: {len(init_failed)} MCP server(s) unavailable this session: {', '.join(init_failed)}"
 
         return (
-            f"✅ Agent worker: completed '{title}' "
+            f"✅ {label}: completed '{title}' "
             f"({expected}) — {tokens:,} tokens, ${refreshed.total_dollars:.2f}, "
             f"{active_s}s active.\n\n{result_blurb}{footer}"
         )
+
+    def _spill_to_vault(
+        self, session: Session, task: dict[str, Any], final_text: str,
+    ) -> tuple[str, str] | None:
+        """Write the agent's full response to a vault Markdown file and
+        return (vault-relative path, obsidian:// URL). Returns None when
+        the vault path is unset or the write fails — caller falls back to
+        a truncated inline summary so the operator never loses content
+        entirely.
+
+        File layout: `<vault>/Inbox/Agent Output/<YYYY-MM-DD>-<slug>.md`.
+        Inbox is the standard landing folder for Obsidian setups and
+        keeps these next to other unsorted captures.
+        """
+        from datetime import datetime
+        import re
+
+        vault_root = settings.vault_path
+        if not vault_root:
+            return None
+        try:
+            vault_root = vault_root.expanduser() if hasattr(vault_root, "expanduser") else vault_root
+        except Exception:
+            return None
+
+        title = (task.get("description") or session.task_id).strip()
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:60] or session.task_id
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        filename = f"{today}-{slug}.md"
+        folder = "Inbox/Agent Output"
+
+        try:
+            target_dir = vault_root / folder
+            target_dir.mkdir(parents=True, exist_ok=True)
+            file_path = target_dir / filename
+            # Frontmatter gives Obsidian / Dataview something to query on
+            # without changing how the body renders.
+            frontmatter = (
+                "---\n"
+                f"task: {title}\n"
+                f"session_id: {session.session_id}\n"
+                f"routing: {session.routing or 'unknown'}\n"
+                f"created: {today}\n"
+                "source: agent-worker\n"
+                "---\n\n"
+            )
+            file_path.write_text(frontmatter + final_text, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("vault spillover write failed for %s: %s", session.task_id, exc)
+            return None
+
+        rel_path = f"{folder}/{filename}"
+        obsidian_url = build_obsidian_link(str(file_path), str(vault_root))
+        return (rel_path, obsidian_url)
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:
         title = task.get("description", session.task_id)
         self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
         self.session_store.update_status(session.task_id, STATUS_FAILED)
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
-        self._notify(f"⚠️ Agent worker: task '{title}' failed: {reason}")
+        self._notify(f"⚠️ {_worker_label(session.routing)}: task '{title}' failed: {reason}")
 
     def _mark_blocked(self, session: Session, task: dict[str, Any], question: str) -> None:
         title = task.get("description", session.task_id)
@@ -1027,7 +1123,7 @@ class Worker:
         # Issue F: send the question with reply-threading enabled so the user's
         # reply lands in pending_questions.answer and the worker resumes.
         body = (
-            f"⏸ Agent worker: task '{title}' needs your input.\n\n"
+            f"⏸ {_worker_label(session.routing)}: task '{title}' needs your input.\n\n"
             f"{question}\n\n"
             "Reply to this message to answer."
         )

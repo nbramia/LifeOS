@@ -99,6 +99,53 @@ def _make_executor(session_store, transcript_dir, llm):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+def test_executor_reseeds_with_original_task_when_resuming_after_blocked_clarification(
+    tmp_path: Path, fake_session,
+):
+    """Repro of the live bug: preflight blocks for ambiguity → executor
+    never runs → worker resumes by appending only the user's answer →
+    executor saw a 1-message history that wasn't the task ("Web Searches")
+    and acted on it as if it were the task. After the fix, executor
+    detects the missing system role, clears, re-seeds with system +
+    original task, and re-appends the answer in the right order."""
+    store, session = fake_session
+    sid = session.session_id
+
+    # Worker has pre-injected the operator's Telegram reply, but seeding
+    # never happened. Conversation has exactly one orphan user message.
+    store.append_message(sid, "user", "(user answered via Telegram) Web Searches")
+
+    llm = _ScriptedLLM([
+        _FakeResponse(text="Done with task using web search.", usage=_FakeUsage(40, 20)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(
+        session,
+        {"id": "t1", "description": "Summarize professional background of Julia Barnes"},
+    )
+
+    assert outcome.status == STATUS_COMPLETED
+    # First (and only) LLM call must see: system, then user-task, then user-answer.
+    first_call = llm.calls[0]
+    system_text = first_call["system"]
+    msgs = first_call["messages"]
+    assert system_text and "<role>" in system_text, "system prompt was missing"
+    # Build a flat sequence of (role, text-substring) to assert order.
+    roles_and_text = [(m["role"], m["content"] if isinstance(m["content"], str) else "") for m in msgs]
+    # Drop tool_result-shaped messages — only care about textual ones here.
+    text_only = [(r, t) for r, t in roles_and_text if t]
+    assert text_only[0][0] == "user"
+    assert "Julia Barnes" in text_only[0][1] and "Task:" in text_only[0][1]
+    # The user's answer comes AFTER the task message, not before.
+    answer_idx = next(i for i, (r, t) in enumerate(text_only) if "Web Searches" in t)
+    task_idx = next(i for i, (r, t) in enumerate(text_only) if "Julia Barnes" in t)
+    assert task_idx < answer_idx, (
+        "user answer must come after the seeded task message — out of "
+        f"order would re-introduce the live bug. Got: {text_only}"
+    )
+
+
+@pytest.mark.unit
 def test_executor_completes_when_model_returns_text_only(tmp_path: Path, fake_session):
     store, session = fake_session
     llm = _ScriptedLLM([

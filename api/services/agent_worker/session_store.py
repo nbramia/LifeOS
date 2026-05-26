@@ -528,6 +528,21 @@ class SessionStore:
             ).fetchall()
         return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
 
+    def clear_messages(self, session_id: str) -> None:
+        """Remove all stored messages for a session.
+
+        Used by the local executor when resuming a session that was blocked
+        at preflight before being seeded — the worker pre-injected the
+        operator's clarification answer, but no system / task message
+        exists. The executor clears, re-seeds with system+task, then
+        re-appends the answer so the conversation arrives in the right
+        order.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,),
+            )
+
     # ------------------------------------------------------------------
     # Sleeps (yield / wake)
     # ------------------------------------------------------------------

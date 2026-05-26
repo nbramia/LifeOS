@@ -174,6 +174,22 @@ def test_preflight_prompt_infers_claude_from_capability_phrases():
 
 
 @pytest.mark.unit
+def test_preflight_prompt_says_method_questions_are_not_ambiguity():
+    """Repro of the live bug: preflight was flagging "summarize Julia's
+    background" as ambiguous because the agent could use either local
+    docs or web search. The prompt now tells the classifier that
+    method-of-execution choices are NEVER ambiguity — the agent picks
+    one and adapts. Without this guidance Haiku over-blocks."""
+    prompt = pf.build_preflight_prompt(title="anything", tags=["agent"])
+    lowered = prompt.lower()
+    assert "method-of-execution" in lowered or "method of execution" in lowered
+    # The classifier must be told these aren't ambiguity (NOT / NEVER).
+    assert "not ambiguity" in lowered or "never ambiguity" in lowered
+    # And the prefer-null guidance must be in there too
+    assert "leave null" in lowered or "prefer null" in lowered
+
+
+@pytest.mark.unit
 def test_preflight_prompt_includes_ordered_precedence():
     """Routing precedence must be clearly ordered (tags first, explicit cues
     second, capability inference third, ask as final fallback)."""
