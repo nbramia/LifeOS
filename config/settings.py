@@ -161,6 +161,17 @@ class Settings(BaseSettings):
                     "attach to every Claude-routed session (e.g. "
                     "'gmail,google-calendar,google-drive,superhuman,zapier')."
     )
+    agent_extra_mcp_servers: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_EXTRA_MCP_SERVERS",
+        description="JSON array of additional MCP servers to attach to every "
+                    "Claude-routed session, in addition to the LifeOS MCP. "
+                    "Each entry is {name, url, headers?}. Headers are optional "
+                    "— for Vault-stored MCPs (Ramp, Granola, Asana, Slack, ...) "
+                    "Anthropic uses the Vault's OAuth creds. Example: "
+                    "'[{\"name\":\"slack\",\"url\":\"https://mcp.slack.com/mcp\"}]'. "
+                    "Empty string disables."
+    )
     mcp_http_url: str = Field(
         default="",
         alias="LIFEOS_MCP_HTTP_URL",

@@ -23,8 +23,20 @@ poll → can_start_task(default_budget)?
      → session row + transcript "claim" event
      → no-op dispatcher (replaced in Issues C/D)
      → mark task complete
+     → atomic swap #agent-running → #agent-completed
      → transcript "noop_complete" + Telegram notify
 ```
+
+## Terminal tags
+
+| Tag | When |
+|-----|------|
+| `#agent-completed` | Executor returned `STATUS_COMPLETED`; task `status=done` |
+| `#agent-failed` | Executor returned `STATUS_FAILED` (incl. preflight sanity check) |
+| `#agent-budget-exceeded` | Executor returned `STATUS_BUDGET_EXCEEDED` (token / wall / dollar cap hit) |
+| `#agent-blocked` | Awaiting Telegram clarification, or Managed Agents not configured |
+
+To re-run a terminal task, the operator must swap the tag back to `#agent` (Obsidian: edit the line; API: `POST /api/tasks/{id}/swap-tag?from=agent-failed&to=agent`).
 
 On startup, `resume_pending()` scans non-terminal sessions and either marks them complete or rolls the tag back to `#agent` for retry. This makes the worker SIGKILL-safe.
 

@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_TAG = "agent"
 RUNNING_TAG = "agent-running"
+COMPLETED_TAG = "agent-completed"
 BLOCKED_TAG = "agent-blocked"
 FAILED_TAG = "agent-failed"
 BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
@@ -729,6 +730,27 @@ class Worker:
                 "url": settings.mcp_http_url,
                 "headers": {"Authorization": f"Bearer {settings.mcp_bearer_token}"},
             })
+        # Extra MCP servers (custom integrations the operator has configured in
+        # their Anthropic Vault — Ramp, Slack, Granola, etc.). Parsed as JSON;
+        # bad JSON is logged and ignored so a typo can't take down the worker.
+        extra_raw = (settings.agent_extra_mcp_servers or "").strip()
+        if extra_raw:
+            import json as _json
+            try:
+                extras = _json.loads(extra_raw)
+                if not isinstance(extras, list):
+                    raise ValueError("must be a JSON array")
+                for entry in extras:
+                    if not isinstance(entry, dict) or "name" not in entry or "url" not in entry:
+                        logger.warning("ignoring malformed LIFEOS_AGENT_EXTRA_MCP_SERVERS entry: %r", entry)
+                        continue
+                    mcp_servers.append({
+                        "name": entry["name"],
+                        "url": entry["url"],
+                        "headers": entry.get("headers", {}),
+                    })
+            except Exception as exc:
+                logger.warning("LIFEOS_AGENT_EXTRA_MCP_SERVERS parse failed (%s); ignoring", exc)
         connectors = [c.strip() for c in (settings.agent_connectors or "").split(",") if c.strip()]
         self._managed_executor = ManagedExecutor(
             session_store=self.session_store,
@@ -874,6 +896,11 @@ class Worker:
 
         if outcome.status == STATUS_COMPLETED:
             self._complete_task(session.task_id)  # mark `done` in the vault
+            # Swap the tag so the task surfaces as #agent-completed for symmetry
+            # with the failed / budget-exceeded / blocked terminal tags. Failure
+            # of the swap is non-critical — _swap_tag logs and the task is
+            # already marked done in the vault.
+            self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
             self._notify(self._completion_summary(session, task, outcome))
             return
 

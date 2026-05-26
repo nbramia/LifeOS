@@ -30,6 +30,7 @@ from api.services.agent_worker.worker import (
     AGENT_TAG,
     BLOCKED_TAG,
     BUDGET_EXCEEDED_TAG,
+    COMPLETED_TAG,
     FAILED_TAG,
     RUNNING_TAG,
     Worker,
@@ -158,6 +159,10 @@ def test_dispatch_local_completes_and_marks_task_done(tmp_path: Path):
     assert w.tick() == 1
     assert api.tasks["t1"]["status"] == "done"
     assert executor.calls == [("t1", "hello there")]
+    # Tag swaps: agent → agent-running (on claim) → agent-completed (on success).
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
     sent = w._sent_telegram  # type: ignore[attr-defined]
     assert sent and "completed 'hello there'" in sent[0]
     assert "hi back" in sent[0]
@@ -237,17 +242,19 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path):
+def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monkeypatch):
     """Without Managed Agents credentials configured the worker parks Claude-
     routed tasks at #agent-blocked. Same UX as ambiguity / sanity / ask."""
+    # Force vault_id empty regardless of operator's actual .env so the test
+    # exercises the not-configured branch deterministically.
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_vault_id", "", raising=False)
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="claude")
     w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
-    # Sanity check: settings.agent_vault_id is empty in the test env, so
-    # _get_managed_executor returns None and the worker takes the not-configured branch.
     w.tick()
 
     assert executor.calls == []
@@ -316,7 +323,57 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     w.tick()
     assert managed.poll_calls == 2
     assert api.tasks["t1"]["status"] == "done"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     assert any("here's the summary" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_managed_executor_includes_extra_mcp_servers(tmp_path: Path, monkeypatch):
+    """LIFEOS_AGENT_EXTRA_MCP_SERVERS (JSON array) gets parsed and appended to
+    mcp_servers alongside the default LifeOS MCP entry."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
+    monkeypatch.setattr(_settings, "agent_vault_id", "vlt_test", raising=False)
+    monkeypatch.setattr(_settings, "mcp_http_url", "https://mcp.example.com/mcp", raising=False)
+    monkeypatch.setattr(_settings, "mcp_bearer_token", "tok", raising=False)
+    monkeypatch.setattr(_settings, "agent_extra_mcp_servers",
+                        '[{"name":"slack","url":"https://mcp.slack.com/mcp"},'
+                        '{"name":"ramp","url":"https://ramp.example/mcp","headers":{"X-API-Key":"k"}}]',
+                        raising=False)
+
+    api = FakeApi(tasks=[])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    me = w._get_managed_executor()
+    assert me is not None
+    names = [s["name"] for s in me.mcp_servers]
+    assert names == ["lifeos", "slack", "ramp"]
+    # Headers carried through verbatim where provided; empty dict where omitted.
+    by_name = {s["name"]: s for s in me.mcp_servers}
+    assert by_name["slack"]["headers"] == {}
+    assert by_name["ramp"]["headers"] == {"X-API-Key": "k"}
+
+
+@pytest.mark.unit
+def test_managed_executor_ignores_malformed_extra_mcp_servers(tmp_path: Path, monkeypatch, caplog):
+    """Malformed JSON / missing fields are logged and skipped — never raise."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
+    monkeypatch.setattr(_settings, "agent_vault_id", "vlt_test", raising=False)
+    monkeypatch.setattr(_settings, "mcp_http_url", "https://mcp.example.com/mcp", raising=False)
+    monkeypatch.setattr(_settings, "mcp_bearer_token", "tok", raising=False)
+    monkeypatch.setattr(_settings, "agent_extra_mcp_servers",
+                        'not valid json[', raising=False)
+
+    api = FakeApi(tasks=[])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    me = w._get_managed_executor()
+    # Only LifeOS — the malformed extras were dropped, not raised.
+    assert [s["name"] for s in me.mcp_servers] == ["lifeos"]
 
 
 @pytest.mark.unit

@@ -9,7 +9,7 @@ User=__USER__
 WorkingDirectory=__LLAMA_CPP_DIR__
 Environment=ROCBLAS_USE_HIPBLASLT=1
 ExecStart=__LLAMA_CPP_DIR__/build/bin/llama-server \
-    -hf __LLM_MODEL__ \
+    __LLM_SOURCE_ARGS__ \
     -ngl 99 \
     -fa on \
     --jinja \
