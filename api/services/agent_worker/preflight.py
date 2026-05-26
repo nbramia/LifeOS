@@ -121,7 +121,7 @@ Rules:
        ask the operator which model).
 - expected_output: classify what the agent will produce.
     "text" = a written answer; "file" = creates/edits a file; "external_action" = sends an email, posts a message, schedules a meeting; "structured" = returns structured data the caller will parse.
-- ambiguity: set to non-null only if the title is genuinely underspecified for an autonomous agent (e.g., "reply to John" with no email/context). One question, not multiple.
+- ambiguity: leave null in nearly all cases. The agent is autonomous and is expected to make reasonable assumptions, try one approach, and fall back to another if the first didn't work. Only set non-null when the title would *prevent* the agent from acting at all — e.g., "reply to John" with no John in scope, or "send the contract to her" with no antecedent for "her". Method-of-execution questions ("should I use web search or local data?", "which calendar?", "what format?") are NOT ambiguity — the agent picks one and adapts. 
 - sane: set to false ONLY for empty/garbage titles or obviously destructive shapes (e.g., "rm -rf /", "delete all my data"). Mundane tasks are sane.
 
 Tag list and title follow. Return ONLY the JSON.

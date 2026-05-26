@@ -464,6 +464,130 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_completion_label_says_local_for_local_routing(tmp_path: Path):
+    """Operator wants to know at a glance whether a result came from local
+    Gemma or cloud Claude — the worker label is route-aware."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "task", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="done",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    assert "Local agent worker" in sent[0]
+    assert "Cloud agent worker" not in sent[0]
+
+
+@pytest.mark.unit
+def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
+    """A short final_text is delivered inline — no spillover to vault."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    # Just under the 2000-char inline cap
+    short_text = "Here is the answer. " * 50  # 1000 chars
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text=short_text,
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    assert short_text.strip() in sent[0]
+    assert "Full answer saved to vault" not in sent[0]
+    assert "obsidian://" not in sent[0]
+
+
+@pytest.mark.unit
+def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
+    """When final_text is >2000 chars, the worker writes the full body
+    to the vault and replaces the inline blob with a short preview +
+    obsidian:// link. The operator should never see a mid-paragraph
+    truncation again."""
+    from config.settings import settings as _settings
+    vault = tmp_path / "MyVault"
+    monkeypatch.setattr(_settings, "vault_path", vault, raising=False)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "Big report on Julia",
+         "status": "todo", "tags": ["agent", "cloud"]},
+    ])
+    long_text = (
+        "Julia Barnes is the CEO of The Movement Cooperative.\n\n"
+        + ("Paragraph body content that goes on and on. " * 80)  # ~3200 chars
+    )
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text=long_text,
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=executor)  # used for unrelated paths
+    # Force the local path so we can drive the completion through _StubExecutor.
+    # Use routing="local" on the preflight so the worker takes the local branch
+    # while still exercising the cap logic.
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent, "expected a Telegram notification"
+    msg = sent[0]
+    # The inline preview is short (≤400 chars after first paragraph break)
+    assert "Julia Barnes is the CEO" in msg
+    # Spillover markers present
+    assert "Full answer saved to vault" in msg
+    assert "obsidian://" in msg
+    # The full body is NOT inlined verbatim
+    assert long_text not in msg
+    # The vault file exists with the expected structure
+    out_dir = vault / "Inbox" / "Agent Output"
+    md_files = list(out_dir.glob("*.md"))
+    assert len(md_files) == 1, f"expected one spillover file; got {md_files}"
+    body = md_files[0].read_text(encoding="utf-8")
+    # Frontmatter then the full text
+    assert body.startswith("---\n")
+    assert "task: Big report on Julia" in body
+    assert "Paragraph body content that goes on and on." in body
+
+
+@pytest.mark.unit
+def test_completion_falls_back_to_truncation_when_vault_unset(tmp_path: Path, monkeypatch):
+    """If `LIFEOS_VAULT_PATH` is unset (fresh install), the worker can't
+    spill — it falls back to truncating the inline text so the operator
+    still sees something instead of a write error."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "vault_path", None, raising=False)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "report", "status": "todo",
+         "tags": ["agent", "local"]},
+    ])
+    long_text = "X" * 3000
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text=long_text,
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    msg = sent[0]
+    # Truncated, with the ellipsis sentinel
+    assert "…" in msg or "..." in msg
+    # No vault references
+    assert "vault" not in msg.lower()
+    assert "obsidian://" not in msg
+
+
+@pytest.mark.unit
 def test_managed_executor_constructed_with_full_credentials(tmp_path: Path, monkeypatch):
     """When API key + agent_preset_id + agent_environment_id + agent_vault_id
     are all set, the worker constructs a ManagedExecutor with each ID flowing

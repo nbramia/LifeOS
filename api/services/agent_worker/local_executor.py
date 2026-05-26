@@ -274,8 +274,12 @@ class LocalExecutor:
     def execute(self, session, task: dict) -> ExecutorOutcome:
         """Run the agent loop for one session.
 
-        - If `messages` table is empty for this session, seed the conversation
-          with a system message and a user turn built from the task.
+        - If the conversation has never been seeded with a system prompt
+          (e.g., preflight blocked for ambiguity before the executor ran,
+          and the worker is now resuming after a Telegram clarification
+          reply), seed it now and keep any pre-existing messages (the
+          injected user answer) at the end so the agent sees both the
+          original task and the operator's clarification.
         - Loops until the model produces a final answer, the budget is hit,
           a tool yields (sleep), or an error.
         """
@@ -283,8 +287,22 @@ class LocalExecutor:
         budget = session.budget or {}
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
-        if not self.session_store.get_messages(sid):
+        existing = self.session_store.get_messages(sid)
+        has_system = any(m.get("role") == "system" for m in existing)
+        if not has_system:
+            # First execution OR a resume from a preflight-blocked session
+            # that never seeded. The worker may have pre-injected a user
+            # "answer" message; seed cleanly with system+task first, then
+            # re-append the answer so the model sees both the original
+            # task and the operator's clarification in the right order.
+            preexisting = list(existing)
+            self.session_store.clear_messages(sid)
             self._seed_conversation(session, task, budget)
+            for m in preexisting:
+                role = m.get("role")
+                content = m.get("content", "")
+                if role in ("user", "assistant"):
+                    self.session_store.append_message(sid, role, content)
 
         while True:
             # Wall-clock budget check — uses cumulative active seconds, not
