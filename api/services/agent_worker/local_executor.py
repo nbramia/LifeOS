@@ -215,6 +215,7 @@ class LocalExecutor:
                 return self._finalize_completed(session, response.text)
 
             yielded_seconds: int | None = None
+            yielded_for_children = False
             tool_results: list[dict] = []
             for call in truncated_calls:
                 name = call["name"]
@@ -238,26 +239,38 @@ class LocalExecutor:
                     "is_error": result.is_error,
                 })
                 if result.yield_seconds is not None:
-                    yielded_seconds = result.yield_seconds
+                    if result.yield_seconds < 0:
+                        # Sentinel for lifeos_agent_yield_until — yield without
+                        # a timer; the worker resumes on child terminal events.
+                        yielded_for_children = True
+                    else:
+                        yielded_seconds = result.yield_seconds
                     # Stop dispatching further tools this turn — we're going to yield.
                     break
 
             # If the agent yielded mid-turn, we may have fewer tool_results
             # than persisted tool_use blocks. Pad with synthetic results so
             # the next turn satisfies Anthropic's 1:1 invariant.
-            if yielded_seconds is not None and len(tool_results) < len(truncated_calls):
+            if (yielded_seconds is not None or yielded_for_children) and len(tool_results) < len(truncated_calls):
                 already_handled = {tr["tool_use_id"] for tr in tool_results}
                 for call in truncated_calls:
                     if call["id"] not in already_handled:
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": call["id"],
-                            "content": "skipped — sibling tool requested a sleep yield first",
+                            "content": "skipped — sibling tool requested a yield first",
                             "is_error": False,
                         })
 
             # Persist the tool_results as a user-role turn (Anthropic convention).
             self.session_store.append_message(sid, "user", tool_results)
+
+            if yielded_for_children:
+                # Status + yield_waiting_for is already set by the
+                # lifeos_agent_yield_until handler — just end the loop. Worker
+                # main loop will resume when children terminate.
+                self.transcript_store.append(sid, "yielded_for_children", {})
+                return ExecutorOutcome(status=STATUS_YIELDED)
 
             if yielded_seconds is not None:
                 return self._finalize_sleeping(session, yielded_seconds)
