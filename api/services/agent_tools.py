@@ -14,7 +14,9 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-EASTERN = ZoneInfo("America/New_York")
+# The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
+# America/New_York). Used to format message timestamps in tool output.
+LOCAL_TZ = ZoneInfo(settings.timezone)
 
 # ---------------------------------------------------------------------------
 # Tool definitions (Anthropic schema)
@@ -667,7 +669,7 @@ async def _tool_search_email(inp: dict) -> str:
         date_str = ""
         if m.date:
             try:
-                date_str = m.date.astimezone(EASTERN).strftime("%Y-%m-%d %I:%M %p ET")
+                date_str = m.date.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p %Z")
             except Exception:
                 date_str = str(m.date)[:16]
         acct = f"[{m.source_account}]" if m.source_account else ""

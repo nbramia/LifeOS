@@ -5,18 +5,22 @@ Fetches and indexes calendar events from Google Calendar.
 """
 import logging
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
 
 from api.services.google_auth import get_google_auth, GoogleAccount
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Local timezone
-LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+# The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
+# America/New_York). All event formatting goes through this — calendar
+# events arrive from Google with their own tzinfo and we convert to the
+# operator's local zone for human-readable strings.
+LOCAL_TZ = ZoneInfo(settings.timezone)
 
 
 @dataclass

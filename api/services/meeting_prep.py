@@ -7,18 +7,21 @@ with relevant notes, past meetings, and attendee information from the vault.
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from api.services.calendar import get_calendar_service, CalendarEvent, format_event_time
+from api.services.calendar import get_calendar_service, CalendarEvent
 from api.services.google_auth import get_configured_accounts
 from api.services.hybrid_search import get_hybrid_search
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Local timezone for date handling
-LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+# The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
+# America/New_York). Used to anchor relative date parsing — "today" /
+# "tomorrow" / "this week" must be interpreted in the operator's zone.
+LOCAL_TZ = ZoneInfo(settings.timezone)
 
 
 @dataclass

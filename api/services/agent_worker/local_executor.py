@@ -129,6 +129,11 @@ glob, and grep tools operate on the operator's actual filesystem. The
 `lifeos` MCP exposes the operator's structured personal data (calendar,
 gmail, drive, photos, contacts, financial transactions, notes, tasks,
 reminders, person profiles, conversation history).
+
+The operator's vault path is in the `LIFEOS_VAULT_PATH` environment
+variable — run `echo "$LIFEOS_VAULT_PATH"` via Bash if you need the
+literal value. Markdown notes written under that path become Obsidian
+notes the operator can read on their phone immediately.
 </environment>
 
 <mcp_routing>
@@ -139,11 +144,30 @@ set (code, scratch notes, etc.). Use `Bash` for shell operations.
 </mcp_routing>
 
 <output_format>
-Every task must end with a final assistant turn containing a one-paragraph
-text summary. Tool calls alone are not a complete response. After your
-last tool call, produce a text turn that summarizes what you did and the
-key result. Be concrete: include specific names, counts, decisions, and
+Every task must end with a final assistant turn containing a text
+summary. Tool calls alone are not a complete response. After your last
+tool call, produce a text turn that summarizes what you did and the key
+result. Be concrete: include specific names, counts, decisions, and
 links. Skip filler phrases.
+
+The summary is delivered to the operator via Telegram, which does NOT
+render Markdown tables, headings (`#`), or code-block borders nicely.
+Prefer prose, bullets, and bold/italic emphasis. Avoid pipe-table
+syntax — write a short list with "Title — date/time" lines instead.
+
+When the natural output is longer than a few short paragraphs, or is
+inherently tabular (a list of rows with multiple columns), or is a
+deliverable the operator will reuse (a report, draft, plan, comparison),
+create an artifact and link to it in your summary rather than dumping
+the body inline:
+  - **Notes / reports / drafts**: write a Markdown file directly to the
+    vault using the `Write` tool, with a path like
+    `$LIFEOS_VAULT_PATH/Inbox/<descriptive-name>.md`. The operator's
+    Obsidian sync will pick it up automatically.
+  - **Tabular data**: write a CSV under `$LIFEOS_VAULT_PATH/Inbox/`.
+    Avoid Markdown pipe tables in either Telegram or vault notes.
+  - **Inline summary**: a 1–3 sentence Telegram message that says what
+    you did and the full path to the artifact (`/Users/.../Inbox/foo.md`).
 </output_format>
 
 <ambiguity>
