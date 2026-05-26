@@ -1624,63 +1624,194 @@ class LifeOSMCPServer:
         return json.dumps(data, indent=2)
 
 
-def send_response(response: dict, request_id: str | int):
-    """Send JSON-RPC response to stdout."""
-    result = {"jsonrpc": "2.0", "id": request_id, "result": response}
-    print(json.dumps(result), flush=True)
+def _ok(request_id, result: dict) -> dict:
+    """Build a JSON-RPC success response."""
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def send_error(message: str, request_id: str | int, code: int = -32000):
-    """Send JSON-RPC error to stdout."""
-    error = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
-    print(json.dumps(error), flush=True)
+def _err(request_id, message: str, code: int = -32000) -> dict:
+    """Build a JSON-RPC error response."""
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
+    """Handle a single JSON-RPC request.
+
+    Returns the response dict, or None for notifications (requests with no id).
+    Used by both the stdio and HTTP transports so behavior stays identical.
+    """
+    method = request.get("method")
+    request_id = request.get("id")
+    is_notification = request_id is None
+
+    try:
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "lifeos", "version": "1.0.0"},
+            }
+            return None if is_notification else _ok(request_id, result)
+
+        if method == "notifications/initialized":
+            return None
+
+        if method == "tools/list":
+            return None if is_notification else _ok(request_id, {"tools": server.tools})
+
+        if method == "tools/call":
+            params = request.get("params", {})
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            data = server._call_api(tool_name, arguments)
+            formatted = server._format_response(tool_name, data)
+            result = {"content": [{"type": "text", "text": formatted}]}
+            return None if is_notification else _ok(request_id, result)
+
+        # Unknown method
+        if is_notification:
+            return None
+        return _err(request_id, f"Method not found: {method}", code=-32601)
+
+    except Exception as e:
+        logger.error(f"Error handling {method}: {e}")
+        if is_notification:
+            return None
+        return _err(request_id, str(e))
+
+
+def run_stdio(server: "LifeOSMCPServer") -> None:
+    """Run the stdio transport (line-delimited JSON-RPC on stdin/stdout)."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            continue
+        response = dispatch(server, request)
+        if response is not None:
+            print(json.dumps(response), flush=True)
+
+
+def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
+    """Build a FastAPI app exposing the MCP server over HTTP.
+
+    A non-empty `bearer_token` is required — the HTTP transport is intended for
+    public exposure (e.g., behind a Cloudflare Tunnel for Anthropic Managed
+    Agents), so unauthenticated mode is not allowed. Local Claude Code keeps
+    using the stdio transport, which has no bearer check.
+    """
+    if not bearer_token:
+        raise ValueError(
+            "HTTP transport requires a bearer token "
+            "(set LIFEOS_MCP_BEARER_TOKEN in the environment)"
+        )
+
+    import hmac
+
+    from fastapi import FastAPI, HTTPException, Request, Response
+    from fastapi.responses import JSONResponse
+
+    app = FastAPI(title="LifeOS MCP", docs_url=None, redoc_url=None, openapi_url=None)
+
+    def _check_auth(request: Request) -> None:
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        if not hmac.compare_digest(token, bearer_token):
+            raise HTTPException(status_code=401, detail="invalid bearer token")
+
+    def _parse_error_response() -> JSONResponse:
+        """JSON-RPC -32700 Parse error per the spec — id is null when unparseable."""
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }
+        return JSONResponse(envelope, status_code=400)
+
+    async def _handle(request: Request) -> Response:
+        _check_auth(request)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _parse_error_response()
+
+        if isinstance(body, list):
+            responses = [r for r in (dispatch(server, req) for req in body) if r is not None]
+            if not responses:
+                return Response(status_code=202)
+            return JSONResponse(responses)
+
+        response = dispatch(server, body)
+        if response is None:
+            return Response(status_code=202)
+        return JSONResponse(response)
+
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request) -> Response:
+        return await _handle(request)
+
+    @app.post("/")
+    async def mcp_root(request: Request) -> Response:
+        return await _handle(request)
+
+    return app
+
+
+def run_http(server: "LifeOSMCPServer", host: str, port: int, bearer_token: str) -> None:
+    """Run the HTTP transport via uvicorn."""
+    import uvicorn  # local import — only needed for HTTP mode
+
+    app = build_http_app(server, bearer_token=bearer_token)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 def main():
-    """Main MCP server loop."""
+    """Entrypoint: parse --transport flag and run the chosen transport."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LifeOS MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default=os.environ.get("LIFEOS_MCP_TRANSPORT", "stdio"),
+        help="Transport to expose (default: stdio, suitable for Claude Code)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("LIFEOS_MCP_HTTP_HOST", "127.0.0.1"),
+        help="HTTP bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("LIFEOS_MCP_HTTP_PORT", "8765")),
+        help="HTTP bind port (default: 8765)",
+    )
+    args = parser.parse_args()
+
     server = LifeOSMCPServer()
 
-    for line in sys.stdin:
-        try:
-            request = json.loads(line.strip())
-            method = request.get("method")
-            request_id = request.get("id")
+    if args.transport == "stdio":
+        run_stdio(server)
+        return
 
-            if method == "initialize":
-                send_response({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "lifeos", "version": "1.0.0"}
-                }, request_id)
+    bearer_token = os.environ.get("LIFEOS_MCP_BEARER_TOKEN", "")
+    if not bearer_token:
+        logger.error(
+            "HTTP transport requires LIFEOS_MCP_BEARER_TOKEN. "
+            "Generate one with: openssl rand -hex 32"
+        )
+        sys.exit(2)
 
-            elif method == "notifications/initialized":
-                pass  # No response needed
-
-            elif method == "tools/list":
-                send_response({"tools": server.tools}, request_id)
-
-            elif method == "tools/call":
-                params = request.get("params", {})
-                tool_name = params.get("name")
-                arguments = params.get("arguments", {})
-
-                result = server._call_api(tool_name, arguments)
-                formatted = server._format_response(tool_name, result)
-
-                send_response({
-                    "content": [{"type": "text", "text": formatted}]
-                }, request_id)
-
-            else:
-                if request_id is not None:
-                    send_error(f"Unknown method: {method}", request_id)
-
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-        except Exception as e:
-            logger.error(f"Error handling request: {e}")
-            if 'request_id' in dir() and request_id is not None:
-                send_error(str(e), request_id)
+    logger.info(f"LifeOS MCP HTTP transport listening on {args.host}:{args.port}")
+    run_http(server, host=args.host, port=args.port, bearer_token=bearer_token)
 
 
 if __name__ == "__main__":

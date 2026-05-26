@@ -48,8 +48,9 @@ _read_env() {
     echo "$default"
 }
 
-LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-ggml-org/gpt-oss-120b-GGUF}")
+LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-unsloth/gemma-4-26B-A4B-it-GGUF}")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
+MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
@@ -71,6 +72,11 @@ echo "  Venv:       $VENV_DIR"
 echo "  llama.cpp:  $LLAMA_DIR"
 echo "  LLM Model:  $LLM_MODEL"
 echo "  LLM Auto:   $LLM_AUTOSTART (restart policy: $LLM_RESTART_POLICY)"
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    echo "  MCP HTTP:   enabled (token configured)"
+else
+    echo "  MCP HTTP:   disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
+fi
 echo ""
 
 # Install unit files with variable substitution
@@ -119,6 +125,20 @@ echo "  lifeos-watchdog.timer: $(systemctl is-active lifeos-watchdog.timer)"
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 
+# MCP HTTP transport is only enabled when a bearer token is configured.
+# The systemd unit reads the live .env at runtime; we check the token here
+# purely to decide whether to enable/start the unit at install time. Without
+# a token, exposing the MCP server over HTTP would let any caller hit the
+# agent worker's tool surface — see docs/guides/agent-worker-setup.md.
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    systemctl enable --now lifeos-mcp-http.service
+    echo "  lifeos-mcp-http: $(systemctl is-active lifeos-mcp-http.service)"
+else
+    systemctl disable lifeos-mcp-http.service 2>/dev/null || true
+    systemctl stop lifeos-mcp-http.service 2>/dev/null || true
+    echo "  lifeos-mcp-http: disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
+fi
+
 # Install logrotate config with substitution
 LOGROTATE_SRC="$PROJECT_DIR/config/logrotate-lifeos.conf"
 if [ -f "$LOGROTATE_SRC" ]; then
@@ -133,7 +153,7 @@ echo ""
 echo "Installing sudoers rule for passwordless systemctl..."
 SUDOERS_FILE="/etc/sudoers.d/lifeos"
 TMP_SUDOERS=$(mktemp)
-echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service" > "$TMP_SUDOERS"
+echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service, /usr/bin/systemctl start lifeos-mcp-http, /usr/bin/systemctl stop lifeos-mcp-http, /usr/bin/systemctl restart lifeos-mcp-http, /usr/bin/systemctl start lifeos-mcp-http.service, /usr/bin/systemctl stop lifeos-mcp-http.service, /usr/bin/systemctl restart lifeos-mcp-http.service" > "$TMP_SUDOERS"
 if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
     mv "$TMP_SUDOERS" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
