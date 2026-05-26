@@ -98,11 +98,6 @@ class ManagedAgentsDriver:
     DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
     DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
     DEFAULT_ANTHROPIC_BETA = "managed-agents-2026-04-01"
-    # Query-param key for the event-stream cursor on GET /sessions/{id}. Doc
-    # terminology has varied between SDK previews ("after" vs "since"); kept
-    # as a class constant so future API renames are a one-line change.
-    EVENT_CURSOR_PARAM = "after"
-
     def __init__(
         self,
         api_key: str,
@@ -280,25 +275,34 @@ class ManagedAgentsDriver:
         session_id: str,
         after_id: str | None = None,
     ) -> list[dict]:
-        """Fetch all new session events since `after_id` (or all if None).
+        """Fetch session events, optionally filtered to those after `after_id`.
 
-        `GET /v1/sessions/{id}/events?after=<cursor>` returns
-        `{"data": [{"id", "type", "payload"|"content"|"error", ...}, ...],
-          "first_id", "last_id", "has_more"}`. Loops while `has_more=True`
-        so the caller never silently loses the tail of a paginated batch —
-        without this, a session that produced more events than the API page
-        size between polls would have its terminal `agent.message` dropped
-        and the Telegram completion summary would be wrong.
+        Anthropic's `GET /v1/sessions/{id}/events` endpoint does NOT accept an
+        event-id cursor — confirmed live by a 400 error message listing valid
+        params as `created_at[gt|gte|lt|lte], limit, order, page, types[]`.
+        The docs' canonical pattern for "give me events newer than X" is to
+        list all events and dedupe client-side by id (see the reconnect
+        example at /docs/en/managed-agents/events-and-streaming).
 
-        Returns the raw event list (concatenated across pages); callers
-        (e.g. `get_session_state`) handle the cursor advance and synthesis.
+        We follow that pattern: fetch all pages with `order=asc` so events
+        arrive in chronological order, then filter to ids strictly greater
+        than `after_id`. Event IDs are ULIDs (`sevt_…`) which sort
+        lexicographically by time, so a string compare gives the right
+        ordering without parsing.
+
+        Trade-off: each poll re-fetches the full event history. Anthropic's
+        per-org rate limit is 600 read/min so this is fine at LifeOS's
+        scale; if a session ever produces enough events that the re-fetch
+        becomes expensive, switch to `created_at[gt]` with the persisted
+        timestamp of the last seen event.
         """
         all_events: list[dict] = []
-        cursor = after_id
+        seen_event_ids: set[str] = set()
+        page_num = 1
         for _ in range(self._MAX_EVENTS_PAGES):
-            params: dict[str, str] = {}
-            if cursor:
-                params[self.EVENT_CURSOR_PARAM] = cursor
+            params: dict[str, str] = {"order": "asc"}
+            if page_num > 1:
+                params["page"] = str(page_num)
             resp = self._client.get(
                 f"{self.base_url}/sessions/{session_id}/events",
                 headers=self._headers(),
@@ -307,26 +311,34 @@ class ManagedAgentsDriver:
             if resp.status_code == 404:
                 # Session deleted mid-poll. Caller's status fetch already
                 # turned this into "cancelled"; return what we have.
-                return all_events
+                return [e for e in all_events if not after_id or e.get("id", "") > after_id]
             self._raise_for_status_with_body(resp)
             data = resp.json()
             page = data.get("data", []) or []
-            all_events.extend(page)
+            # Dedup within this list call — paginated responses occasionally
+            # repeat boundary events. Doesn't address cross-poll dedupe; the
+            # caller's after_id filter below handles that.
+            for ev in page:
+                eid = ev.get("id")
+                if eid and eid not in seen_event_ids:
+                    seen_event_ids.add(eid)
+                    all_events.append(ev)
             if not data.get("has_more"):
-                return all_events
+                break
             if not page:
-                # Defensive: has_more=True but empty page would loop forever.
                 logger.warning("list_events: has_more=true with empty page; stopping")
-                return all_events
-            cursor = page[-1].get("id")
-            if not cursor:
-                logger.warning("list_events: has_more=true but last event has no id; stopping")
-                return all_events
-        logger.warning(
-            "list_events: hit pagination cap (%d pages) for session %s",
-            self._MAX_EVENTS_PAGES, session_id,
-        )
-        return all_events
+                break
+            page_num += 1
+        else:
+            logger.warning(
+                "list_events: hit pagination cap (%d pages) for session %s",
+                self._MAX_EVENTS_PAGES, session_id,
+            )
+        if not after_id:
+            return all_events
+        # Client-side cursor: ULID lex-sort = chronological. Strict > so we
+        # don't reprocess the last-seen event on the next poll.
+        return [e for e in all_events if e.get("id", "") > after_id]
 
     def post_user_message(self, session_id: str, content: str) -> None:
         """Post a user turn to a running session.

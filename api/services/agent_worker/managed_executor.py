@@ -109,6 +109,11 @@ class ManagedExecutor:
         sid = session.session_id
         budget = session.budget or {}
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        # Drop any cursor state from a prior session on this task_id. Without
+        # this, the new session's first poll would carry a stale last_event_id
+        # belonging to a now-defunct remote session and the events endpoint
+        # would 400 on every subsequent poll.
+        self.session_store.reset_managed_cursor(session.task_id)
         self.transcript_store.append(sid, "managed_start",
                                      {"agent_id": self.agent_id, "environment_id": self.environment_id})
 

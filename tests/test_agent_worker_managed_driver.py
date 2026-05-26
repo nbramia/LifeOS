@@ -252,20 +252,32 @@ def test_get_session_state_idle_status_is_terminal():
 
 
 @pytest.mark.unit
-def test_get_session_state_uses_after_cursor_on_events_endpoint():
-    """The cursor (since_event_id) goes to the /events query, not /sessions/{id}."""
-    captured = {"status_params": None, "events_params": None}
+def test_get_session_state_filters_events_by_id_client_side():
+    """The events endpoint doesn't accept an event-id cursor (verified live —
+    the API returns a 400 listing valid params as created_at[gt|gte|lt|lte],
+    limit, order, page, types[]). Per the docs' reconnect pattern, we list
+    all events with order=asc and filter client-side by id > since_event_id."""
+    captured = {"events_params": None, "status_params": None}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/events"):
             captured["events_params"] = dict(request.url.params)
-            return httpx.Response(200, json={"data": []})
+            # Return events with ULID-like ids — strictly sortable by id.
+            return httpx.Response(200, json={"data": [
+                {"id": "sevt_001", "type": "x"},
+                {"id": "sevt_007", "type": "y"},  # this one is at the cursor
+                {"id": "sevt_009", "type": "z"},  # only this should survive
+            ]})
         captured["status_params"] = dict(request.url.params)
         return httpx.Response(200, json={"status": "running", "usage": {}})
 
-    _build_driver(handler).get_session_state("sess_abc", since_event_id="evt_7")
-    assert captured["events_params"]["after"] == "evt_7"
-    # Status endpoint never gets the cursor — it's an events-only concept
+    state = _build_driver(handler).get_session_state("sess_abc", since_event_id="sevt_007")
+    # The /events call uses `order=asc` and NO `after` param (which the API rejects).
+    assert captured["events_params"].get("order") == "asc"
+    assert "after" not in captured["events_params"]
+    # Client-side filter: only events strictly greater than the cursor id.
+    assert [e["id"] for e in state.new_events] == ["sevt_009"]
+    # Status endpoint never gets the cursor — it's an events-only concept.
     assert captured["status_params"] == {}
 
 
@@ -385,30 +397,34 @@ def test_get_session_state_prefers_failed_when_raw_idle_and_event_error():
 def test_list_events_paginates_through_has_more():
     """list_events must follow `has_more=true` and concatenate pages, otherwise
     a session that produced more events than the API page size between polls
-    would lose the tail (including the terminal agent.message)."""
+    would lose the tail (including the terminal agent.message). Pagination
+    uses the `page=` query param (the only id-based cursor Anthropic accepts
+    is rejected; see test_get_session_state_filters_events_by_id_client_side)."""
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(dict(request.url.params))
-        cursor = request.url.params.get("after")
-        if cursor is None:
+        page = request.url.params.get("page")
+        if page is None:
             return httpx.Response(200, json={
-                "data": [{"id": "evt_1", "type": "x"}, {"id": "evt_2", "type": "y"}],
+                "data": [{"id": "sevt_001", "type": "x"}, {"id": "sevt_002", "type": "y"}],
                 "has_more": True,
             })
-        if cursor == "evt_2":
+        if page == "2":
             return httpx.Response(200, json={
-                "data": [{"id": "evt_3", "type": "z"}, {"id": "evt_4", "type": "agent.message",
-                                                         "content": [{"type": "text", "text": "done"}]}],
+                "data": [{"id": "sevt_003", "type": "z"},
+                         {"id": "sevt_004", "type": "agent.message",
+                          "content": [{"type": "text", "text": "done"}]}],
                 "has_more": False,
             })
-        raise AssertionError(f"unexpected cursor: {cursor}")
+        raise AssertionError(f"unexpected page: {page}")
 
     events = _build_driver(handler).list_events("sess")
-    assert [e["id"] for e in events] == ["evt_1", "evt_2", "evt_3", "evt_4"]
-    # First call: no cursor; second call: cursor = last id of first page.
-    assert calls[0] == {}
-    assert calls[1] == {"after": "evt_2"}
+    assert [e["id"] for e in events] == ["sevt_001", "sevt_002", "sevt_003", "sevt_004"]
+    # First call: page=1 implicit (no page param); second: page=2.
+    # Both calls also include order=asc.
+    assert calls[0] == {"order": "asc"}
+    assert calls[1] == {"order": "asc", "page": "2"}
 
 
 @pytest.mark.unit
