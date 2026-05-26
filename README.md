@@ -42,6 +42,30 @@ You can also interface with it for general queries in the same way you'd interac
 
 ---
 
+## Hand Off Tasks to an Autonomous Agent
+
+LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them end-to-end while you're doing something else. Add a line to your task list and walk away — the agent runs it, completes it, marks the task done in your vault, and pings you on Telegram with the result.
+
+```
+- [ ] TODO Summarize my unread emails from the partnership channel and reply with the top 3 by importance #agent
+- [ ] TODO Find every meeting where we discussed the Q3 launch and list attendees #agent #local
+- [ ] TODO Draft a follow-up to last week's intro with Acme. Budget $0.25 #agent
+```
+
+What you get:
+
+- **Hands-free completion.** Tag a task and forget it. Telegram tells you when it's done, what it did, and what it cost.
+- **Choose your model.** `#local` routes to your self-hosted Gemma — free, private, fast on workstation-class GPUs. `#cloud` routes to Anthropic's Claude on Managed Agents — slower per-token but pairs with Gmail / Calendar / Drive / Slack / Asana / Ramp connectors out of the box. No tag and the agent infers from the title: tasks that obviously need cloud connectors ("draft an email", "check my calendar") route to Claude; everything else can run locally.
+- **Budgets you can put in the title.** "max $0.50", "5 min", "10k tokens" — parsed in natural language by a tiny preflight pass. Daily and per-task caps enforced from outside the agent loop, so the model can't override them. There's a global daily $-ceiling backstop.
+- **Asks for help when stuck.** Genuinely ambiguous tasks ("reply to Alex") get pushed to Telegram with one targeted question. Reply with Telegram's reply feature and the agent resumes. If you don't answer within 72 hours (configurable), the task is parked and you get a heads-up.
+- **Spawns its own teammates.** Agents can spawn child sessions (`lifeos_agent_spawn`), message them, and yield until they finish — preferred over polling, because yielding ends the session cleanly (no idle billing on cloud) and resumes automatically when children complete. Useful for fan-out research, multi-step pipelines, "go do X and Y in parallel" workflows.
+- **Full audit trail.** Every tool call, every model turn, every cost delta lands in `data/agent_transcripts/<session_id>.jsonl`. Telegram completion summaries point at it if anything looks off.
+- **Restart-safe.** The worker is signal-clean. Crash mid-task and the next start rolls non-terminal sessions back to `#agent` for retry, or resumes any cloud sessions that are still running on Anthropic's side.
+
+Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference: [Product](docs/specs/product/agent-worker.md) · [Technical](docs/specs/technical/agent-worker.md).
+
+---
+
 ## Quick Links
 
 | Getting Started | Guides | Reference |
@@ -49,8 +73,9 @@ You can also interface with it for general queries in the same way you'd interac
 | [Installation](docs/guides/installation.md) | [Google OAuth](docs/guides/google-oauth.md) | [API Reference](docs/specs/product/api-reference.md) |
 | [Configuration](docs/guides/configuration.md) | [Slack Integration](docs/guides/slack-integration.md) | [Scripts](docs/guides/scripts.md) |
 | [First Run](docs/guides/first-run.md) | [Task Management](docs/specs/product/task-management.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
-|  | [Reminders](docs/guides/reminders.md) | |
+|  | [Reminders](docs/guides/reminders.md) | [Agent Worker](docs/specs/product/agent-worker.md) |
 |  | [Launchd Setup](docs/guides/launchd-setup.md) (macOS) | |
+|  | [Agent Worker Setup](docs/guides/agent-worker-setup.md) | |
 
 ---
 
@@ -302,12 +327,15 @@ flowchart LR
 - [API Reference](docs/specs/product/api-reference.md) - API endpoints and MCP tools
 - [Data & Sync](docs/specs/technical/data-and-sync.md) - Sync pipeline and data sources
 - [Search & Indexing](docs/specs/technical/search-indexing.md) - Hybrid search internals
+- [Agent Worker — Technical](docs/specs/technical/agent-worker.md) - Autonomous worker for #agent tasks
 - [Frontend](docs/specs/technical/frontend.md) - UI components
 
 ### Product
 - [Chat UI](docs/specs/product/chat-ui.md)
 - [CRM UI](docs/specs/product/crm-ui.md)
 - [MCP Tools](docs/specs/product/mcp-tools.md)
+- [Agent Worker](docs/specs/product/agent-worker.md) - Hands-free task completion via `#agent`
+- [Task Management](docs/specs/product/task-management.md) - Obsidian Tasks integration
 
 ### Architecture Decisions
 - [ADR Index](docs/adr/) - Why we chose Python/FastAPI, ChromaDB, hybrid search, and more

@@ -502,3 +502,4 @@ See `mcp_server.py` for implementation details:
 
 - [API Reference](api-reference.md) -- Full API endpoint contracts
 - [Chat UI](chat-ui.md) -- Chat interface that uses the same tools
+- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for inter-agent coordination (spawn / send / check / yield_until / kill / transcript_read / sessions_list / user_ask)
