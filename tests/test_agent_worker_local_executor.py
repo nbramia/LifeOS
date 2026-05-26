@@ -163,6 +163,110 @@ def test_executor_completes_when_model_returns_text_only(tmp_path: Path, fake_se
 
 
 @pytest.mark.unit
+def test_executor_truncates_oversize_tool_results_in_context(tmp_path: Path, fake_session):
+    """Live bug repro: an unbounded `grep -r` returned 32k chars of noise
+    and was appended verbatim to conversation history, which then pushed
+    the next LLM call past Gemma's 32k context window — llama-server
+    dropped the connection mid-request. The fix caps any single tool
+    result the model sees at MAX_TOOL_RESULT_CHARS; the full output
+    still lives in the transcript for operator audit."""
+    from api.services.agent_worker.local_executor import MAX_TOOL_RESULT_CHARS
+    from api.services.agent_worker.tools import ToolResult
+
+    store, session = fake_session
+
+    # First response: agent calls a tool that returns a huge string.
+    # Second response: agent finalizes.
+    big = "Julia mention. " * 5000  # ~75 KB
+    llm = _ScriptedLLM([
+        _FakeResponse(
+            text="",
+            usage=_FakeUsage(40, 10),
+            tool_calls=[{"id": "c1", "name": "Bash",
+                         "input": {"command": "grep -r 'Julia' ."}}],
+        ),
+        _FakeResponse(text="Done.", usage=_FakeUsage(30, 15)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    # Patch the tool registry to return our oversized payload.
+    executor.tools.dispatch = lambda name, args: ToolResult(output=big, is_error=False)  # type: ignore[assignment]
+
+    outcome = executor.execute(session, {"id": "t1", "description": "search"})
+    assert outcome.status == STATUS_COMPLETED
+
+    # The second LLM call sees the tool_result, which must be capped.
+    second_msgs = llm.calls[1]["messages"]
+    tool_result_msg = next(
+        m for m in second_msgs
+        if isinstance(m["content"], list) and m["content"]
+        and isinstance(m["content"][0], dict)
+        and m["content"][0].get("type") == "tool_result"
+    )
+    tool_content = tool_result_msg["content"][0]["content"]
+    assert len(tool_content) <= MAX_TOOL_RESULT_CHARS + 500, (
+        f"tool result still {len(tool_content)} chars — truncation missed"
+    )
+    assert "truncated" in tool_content.lower()
+    # Original size is referenced so the agent knows what was dropped.
+    assert str(len(big)) in tool_content
+
+
+@pytest.mark.unit
+def test_executor_retries_transient_llm_disconnect(tmp_path: Path, fake_session):
+    """llama-server can drop the connection under memory pressure
+    ("Server disconnected without sending a response"). One retry after
+    a short backoff usually recovers — we should not fail the whole
+    session on the first transient error."""
+    store, session = fake_session
+
+    attempts = {"n": 0}
+    class _FlakyLLM:
+        calls: list = []
+        def create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
+            self.calls.append({})
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise httpx_remote_error("Server disconnected without sending a response.")
+            return _FakeResponse(text="Recovered.", usage=_FakeUsage(40, 10))
+
+    executor = _make_executor(store, tmp_path / "transcripts", _FlakyLLM())
+    outcome = executor.execute(session, {"id": "t1", "description": "ask"})
+    assert outcome.status == STATUS_COMPLETED, outcome
+    assert outcome.final_text == "Recovered."
+    assert attempts["n"] == 2, "expected exactly one retry"
+
+
+@pytest.mark.unit
+def test_executor_does_not_retry_non_transient_llm_error(tmp_path: Path, fake_session):
+    """A schema / validation error from the LLM should fail fast, not
+    burn the retry budget — retry is for connection-shaped drops only."""
+    store, session = fake_session
+
+    attempts = {"n": 0}
+    class _StructuralErrorLLM:
+        def create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
+            attempts["n"] += 1
+            raise ValueError("invalid tool schema — model returned bad json")
+
+    executor = _make_executor(store, tmp_path / "transcripts", _StructuralErrorLLM())
+    outcome = executor.execute(session, {"id": "t1", "description": "ask"})
+    assert outcome.status == STATUS_FAILED
+    assert attempts["n"] == 1, "should NOT have retried a structural error"
+
+
+def httpx_remote_error(msg: str) -> Exception:
+    """Construct an httpx-flavored remote-protocol error. We don't import
+    httpx at module top-level because the test should work in environments
+    where the LLM client wraps a different HTTP library."""
+    try:
+        import httpx
+        return httpx.RemoteProtocolError(msg)
+    except ImportError:
+        # Fallback that still has the right substring match.
+        return ConnectionError(msg)
+
+
+@pytest.mark.unit
 def test_executor_runs_tool_then_completes(tmp_path: Path, fake_session):
     store, session = fake_session
     # First response: agent calls Bash. Second response: agent finalizes.

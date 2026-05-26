@@ -47,6 +47,45 @@ MAX_TOOL_CALLS_PER_TURN = 16
 # budget; this is just the per-request ask so we don't burn cap in one go.
 PER_TURN_MAX_TOKENS = 4096
 
+# Per-tool-result char cap. Anything beyond this gets truncated with a
+# pointer telling the agent to refine its query. Gemma's context window
+# is 32k tokens; without this, a single `grep -r` or large file Read
+# would push the session's conversation past that limit within a few
+# turns and the llama-server connection would drop mid-call.
+# 6000 chars ≈ 1500 tokens — enough to capture useful results, small
+# enough to keep ~20 tool calls in context simultaneously.
+MAX_TOOL_RESULT_CHARS = 6000
+
+# Retry budget for LLM calls. llama-server can transiently drop the
+# connection under memory pressure ("Server disconnected without sending
+# a response"); a single retry after a short backoff usually recovers.
+LLM_RETRY_ATTEMPTS = 2
+LLM_RETRY_BACKOFF_SECONDS = 1.5
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """Connection-shaped errors from llama-server are worth retrying;
+    schema / validation errors are not. We match on the exception class
+    name and message substring so the test surface stays free of the
+    httpx import (the LLM client wraps httpx but doesn't re-export its
+    exception types)."""
+    msg = str(exc).lower()
+    if any(s in msg for s in (
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
+        "remote end closed",
+        "timed out",
+        "read timeout",
+        "connection refused",
+    )):
+        return True
+    cls = type(exc).__name__
+    return cls in {
+        "ConnectError", "ReadError", "WriteError", "RemoteProtocolError",
+        "ConnectTimeout", "ReadTimeout", "PoolTimeout", "NetworkError",
+    }
+
 
 def _normalize_tool_calls(raw_calls) -> list[dict]:
     """Normalize tool_calls into Anthropic-shape dicts.
@@ -171,10 +210,12 @@ the body inline:
 </output_format>
 
 <ambiguity>
-Do not ask clarifying questions during execution. If a task is genuinely
-ambiguous, make a reasonable assumption, do the work, and note the
-assumption in your final summary. If you cannot complete the task safely,
-say so plainly in your final response.
+Do not ask clarifying questions during execution unless required in
+order to complete the task. If possible, make a reasonable assumption,
+make an attempt, and if it doesn't work, try something else. Be
+persistent — your goal is to make the experience delightful for the
+user. Just note the assumptions made in your final summary. If you
+cannot complete the task safely, say so plainly in your final response.
 </ambiguity>
 
 <inter_agent>
@@ -372,10 +413,24 @@ class LocalExecutor:
                         "output_chars": len(result.output),
                     },
                 )
+                # Cap the result the model sees. The full output is still
+                # recorded in the transcript above (`output_chars` plus
+                # whatever subsequent code paths log) — only the in-context
+                # copy is truncated, so the operator can still audit what
+                # the tool actually returned.
+                content = result.output
+                if len(content) > MAX_TOOL_RESULT_CHARS:
+                    content = (
+                        content[:MAX_TOOL_RESULT_CHARS]
+                        + f"\n\n[…truncated to {MAX_TOOL_RESULT_CHARS} chars; "
+                        f"original was {len(result.output)} chars. "
+                        "Refine your query / read a narrower range if you "
+                        "need more.]"
+                    )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": result.output,
+                    "content": content,
                     "is_error": result.is_error,
                 })
                 if result.yield_seconds is not None:
@@ -447,12 +502,34 @@ class LocalExecutor:
             else:
                 messages_for_llm.append(entry)
 
-        return self.llm.create(
-            messages=messages_for_llm,
-            system=system_text or None,
-            max_tokens=PER_TURN_MAX_TOKENS,
-            tools=self.tools.definitions(),
-        )
+        # Retry transient connection drops. llama-server occasionally
+        # disconnects mid-request under memory pressure ("Server
+        # disconnected without sending a response"); systemd restarts it,
+        # and a single retry after a short backoff usually succeeds.
+        # Don't retry on structural errors (4xx-equivalents) — only on
+        # connection-shaped exceptions.
+        last_exc: Exception | None = None
+        for attempt in range(LLM_RETRY_ATTEMPTS):
+            try:
+                return self.llm.create(
+                    messages=messages_for_llm,
+                    system=system_text or None,
+                    max_tokens=PER_TURN_MAX_TOKENS,
+                    tools=self.tools.definitions(),
+                )
+            except Exception as exc:
+                if not _is_transient_llm_error(exc) or attempt == LLM_RETRY_ATTEMPTS - 1:
+                    raise
+                last_exc = exc
+                logger.warning(
+                    "local LLM call attempt %d/%d failed transiently (%s); "
+                    "retrying after %.1fs",
+                    attempt + 1, LLM_RETRY_ATTEMPTS, type(exc).__name__,
+                    LLM_RETRY_BACKOFF_SECONDS,
+                )
+                time.sleep(LLM_RETRY_BACKOFF_SECONDS)
+        # Unreachable — the loop either returns or raises.
+        raise last_exc  # type: ignore[misc]
 
     def _persist_assistant_turn(self, session_id: str, response, normalized_calls: list[dict]) -> None:
         """Persist the assistant turn using the *truncated* normalized call list
