@@ -267,23 +267,32 @@ STANDARD_HANDLERS: dict[str, Callable[[dict], ToolResult]] = {
 # ---------------------------------------------------------------------------
 
 class ToolRegistry:
-    """Collects standard tools + LifeOS MCP tools into a unified dispatcher.
+    """Standard tools + inter-agent tools + LifeOS MCP tools, unified.
 
     The LifeOS MCP tools come from instantiating `LifeOSMCPServer` (a
     self-contained class with `.tools` and `._call_api()`). Doing so is cheap
     and avoids duplicating the curated endpoint catalog.
+
+    Inter-agent tools (`lifeos_agent_*`) need a caller's session_id + store
+    handles. When `inter_agent_context` is provided, those tools are surfaced
+    alongside the standard ones; otherwise they're omitted so the registry
+    stays usable in stand-alone contexts (preflight, test fixtures).
     """
 
-    def __init__(self, lifeos_mcp_server=None):
+    def __init__(self, lifeos_mcp_server=None, inter_agent_context=None):
         if lifeos_mcp_server is None:
             # Lazy import — keeps the test surface light when MCP isn't needed.
             from mcp_server import LifeOSMCPServer
             lifeos_mcp_server = LifeOSMCPServer()
         self._mcp = lifeos_mcp_server
         self._mcp_tool_names: set[str] = {t["name"] for t in self._mcp.tools}
+        self._inter_ctx = inter_agent_context
 
     def definitions(self) -> list[dict[str, Any]]:
         """Anthropic-format tool definitions for the agent's system message."""
+        if self._inter_ctx is not None:
+            from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
+            return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp.tools)
         return STANDARD_TOOLS + list(self._mcp.tools)
 
     def dispatch(self, name: str, arguments: dict) -> ToolResult:
@@ -297,6 +306,20 @@ class ToolRegistry:
                 output=f"sleeping {seconds}s — {reason}" if reason else f"sleeping {seconds}s",
                 yield_seconds=seconds,
             )
+
+        # Inter-agent tools (when wired): dispatch via inter_agent module.
+        if self._inter_ctx is not None:
+            from api.services.agent_worker import inter_agent
+            if inter_agent.is_inter_agent_tool(name):
+                payload = inter_agent.dispatch(self._inter_ctx, name, arguments or {})
+                import json as _json
+                # `yield_until` is the special case: it ends the executor turn.
+                yield_signal = name == "lifeos_agent_yield_until" and payload.get("ok")
+                return ToolResult(
+                    _json.dumps(payload),
+                    is_error=not payload.get("ok", False),
+                    yield_seconds=-1 if yield_signal else None,  # sentinel: "yield, no wake timer"
+                )
 
         handler = STANDARD_HANDLERS.get(name)
         if handler is not None:

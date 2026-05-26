@@ -168,6 +168,27 @@ class Settings(BaseSettings):
                     "(e.g. 'https://mcp.example.com/mcp'). Required for "
                     "Managed Agents to reach LifeOS data."
     )
+    # Inter-agent caps (Issue E). Spawn / lineage / concurrency limits.
+    agent_max_spawn_depth: int = Field(
+        default=3,
+        alias="LIFEOS_AGENT_MAX_SPAWN_DEPTH",
+        description="Max depth of the spawn tree (parent → child → grandchild)."
+    )
+    agent_max_descendants_per_root: int = Field(
+        default=50,
+        alias="LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT",
+        description="Total descendants allowed under any single root session."
+    )
+    agent_max_concurrent_local: int = Field(
+        default=1,
+        alias="LIFEOS_AGENT_MAX_CONCURRENT_LOCAL",
+        description="Max concurrent local Gemma sessions (VRAM bound)."
+    )
+    agent_max_concurrent_managed: int = Field(
+        default=10,
+        alias="LIFEOS_AGENT_MAX_CONCURRENT_MANAGED",
+        description="Max concurrent Managed Agents sessions."
+    )
     local_llm_autostart: bool = Field(
         default=False,
         alias="LIFEOS_LOCAL_LLM_AUTOSTART",

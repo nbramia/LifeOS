@@ -458,6 +458,43 @@ class LifeOSMCPServer:
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
         self._load_openapi_spec()
+        self._register_inter_agent_tools()
+
+    def _register_inter_agent_tools(self) -> None:
+        """Expose the `lifeos_agent_*` family to remote agents over MCP.
+
+        Each tool takes a required `caller_session_id` argument so the
+        worker knows which session is acting (the local executor injects
+        this automatically; remote managed agents pass it explicitly via
+        the system prompt instruction). No sandboxing per the project's
+        no-sandbox design — operators trust their own agents.
+        """
+        try:
+            from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
+        except Exception as e:  # pragma: no cover — keep MCP server bootable without agent worker
+            logger.warning(f"inter-agent tools not registered: {e}")
+            return
+        for schema in INTER_AGENT_TOOL_SCHEMAS:
+            tool = dict(schema)
+            # Inject caller_session_id into the published input schema. The
+            # tool definitions don't include it (the local registry sets it
+            # automatically) but remote callers must pass it explicitly.
+            input_schema = dict(tool["input_schema"])
+            props = dict(input_schema.get("properties", {}))
+            props["caller_session_id"] = {
+                "type": "string",
+                "description": "Your own session_id — included in your system prompt.",
+            }
+            input_schema["properties"] = props
+            required = list(input_schema.get("required", []))
+            if "caller_session_id" not in required:
+                required = ["caller_session_id"] + required
+            input_schema["required"] = required
+            tool["input_schema"] = input_schema
+            # MCP schema field name in this server is "inputSchema" — match
+            # what _build_tools_from_spec produces.
+            tool["inputSchema"] = tool.pop("input_schema")
+            self.tools.append(tool)
 
     def _load_openapi_spec(self):
         """Load OpenAPI spec from LifeOS API."""
@@ -969,6 +1006,41 @@ class LifeOSMCPServer:
             logger.warning(f"Failed to fetch email body for {message_id}: {e}")
             return None
 
+    def _handle_inter_agent(self, tool_name: str, arguments: dict) -> dict:
+        """Dispatch a lifeos_agent_* call through the worker's session store.
+
+        The remote caller passes `caller_session_id` explicitly (per the
+        system prompt). We build a fresh InterAgentContext per call and run
+        the tool — no shared mutable state.
+        """
+        caller_session_id = (arguments.pop("caller_session_id", None) or "").strip()
+        if not caller_session_id:
+            return {"error": "caller_session_id is required for inter-agent tools"}
+        try:
+            from api.services.agent_worker.inter_agent import (
+                Caps,
+                InterAgentContext,
+                dispatch as inter_dispatch,
+            )
+            from api.services.agent_worker.session_store import SessionStore
+            from api.services.agent_worker.transcript_store import TranscriptStore
+            from config.settings import settings as _settings
+        except Exception as e:
+            return {"error": f"inter-agent stack unavailable: {e}"}
+
+        ctx = InterAgentContext(
+            session_store=SessionStore(),
+            transcript_store=TranscriptStore(),
+            caller_session_id=caller_session_id,
+            caps=Caps(
+                max_spawn_depth=_settings.agent_max_spawn_depth,
+                max_descendants_per_root=_settings.agent_max_descendants_per_root,
+                max_concurrent_local=_settings.agent_max_concurrent_local,
+                max_concurrent_managed=_settings.agent_max_concurrent_managed,
+            ),
+        )
+        return inter_dispatch(ctx, tool_name, arguments)
+
     def _handle_sync_trigger(self, arguments: dict) -> dict:
         """Route sync trigger to the correct endpoint based on source param."""
         source = arguments.get("source", "").lower().strip()
@@ -1008,6 +1080,13 @@ class LifeOSMCPServer:
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
+
+        # Inter-agent tools dispatch through the agent worker's session store
+        # (no HTTP round-trip). The caller_session_id arg identifies which
+        # session is acting — local executor injects it automatically; remote
+        # managed agents pass it explicitly per the system prompt.
+        if tool_name.startswith("lifeos_agent_"):
+            return self._handle_inter_agent(tool_name, dict(arguments))
 
         # Find the endpoint config
         endpoint_config = None
