@@ -67,12 +67,15 @@ class InterAgentContext:
 
     Distributed by the local executor (in-process) or the worker (when
     receiving a managed-side MCP call) so the tool functions can operate
-    without knowing how they were called.
+    without knowing how they were called. `managed_driver` is optional —
+    when present, `kill` and other tools can reach remote managed sessions;
+    when absent, managed targets are killed in the DB only.
     """
     session_store: SessionStore
     transcript_store: TranscriptStore
     caller_session_id: str
     caps: Caps
+    managed_driver: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +225,20 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
             code="cap_descendants",
         )
 
-    # Cap: concurrency per routing.
+    # Cap: concurrency per routing. The caller doesn't count toward its own
+    # cap — the expected pattern is "parent calls spawn, then yield_until";
+    # the parent's session is non-terminal at spawn time but will yield
+    # immediately after.
+    caller_excluded = 1 if caller.routing == model else 0
     if model == "local":
-        active = ctx.session_store.count_active_by_routing("local")
+        active = ctx.session_store.count_active_by_routing("local") - caller_excluded
         if active >= ctx.caps.max_concurrent_local:
             return _err(
                 f"{active} local sessions already running (cap {ctx.caps.max_concurrent_local})",
                 code="cap_concurrency_local",
             )
     else:
-        active = ctx.session_store.count_active_by_routing("claude")
+        active = ctx.session_store.count_active_by_routing("claude") - caller_excluded
         if active >= ctx.caps.max_concurrent_managed:
             return _err(
                 f"{active} managed sessions already running (cap {ctx.caps.max_concurrent_managed})",
@@ -258,7 +265,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
 
     # Create the session. We use a synthetic task_id since spawned sessions
     # don't have a backing #agent task in the user's task list.
-    child_task_id = f"spawn_{new_session_id()[5:]}"  # `sess_<hex>` → `spawn_<hex>`
+    child_task_id = f"spawn_{new_session_id().removeprefix('sess_')}"
     child_session_id = new_session_id()
     ctx.session_store.create(
         task_id=child_task_id,
@@ -271,8 +278,11 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         root_session_id=root,
         spawn_depth=new_depth,
     )
-    # Seed the conversation with the spawn prompt as the initial user turn.
-    ctx.session_store.append_message(child_session_id, "user", prompt)
+    # The prompt becomes the child's task description (used by the executor's
+    # _seed_conversation) so the system prompt + inter-agent guidance run as
+    # normal. We also stash the prompt in pending_messages as a fallback for
+    # the worker's task lookup (children have no API-backed task).
+    ctx.session_store.enqueue_message(child_session_id, caller.session_id, prompt)
     ctx.transcript_store.append(child_session_id, "spawn", {
         "parent_session_id": caller.session_id,
         "root_session_id": root,
@@ -303,6 +313,19 @@ def send(ctx: InterAgentContext, args: dict) -> dict:
         return _err(f"session {target_id} not found", code="not_found")
     if target.status in TERMINAL_STATUSES:
         return _err(f"session {target_id} is terminal ({target.status})", code="terminal")
+
+    # Same-root lineage check — agents can't inject messages into unrelated
+    # sessions. Matches the security model of `kill` and `yield_until`.
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
+    caller_root = caller.root_session_id or caller.session_id
+    target_root = target.root_session_id or target.session_id
+    if target_root != caller_root:
+        return _err(
+            f"session {target_id} is not in your lineage",
+            code="forbidden",
+        )
 
     # Always queue. For an actively-running local session, the executor picks
     # up pending messages at the start of each turn. For a yielded session,
@@ -382,9 +405,25 @@ def kill(ctx: InterAgentContext, args: dict) -> dict:
     if target.status in TERMINAL_STATUSES:
         return _ok({"killed": False, "reason": f"already {target.status}"})
 
+    # Managed children: kill the remote session too so it stops accruing
+    # tokens / session-hour overhead. Without a driver we can only flip the
+    # local DB status; the worker's next managed poll will then see the
+    # local FAILED status and treat the session as terminal even if the
+    # remote still reports running.
+    if target.managed_agent_session_id and ctx.managed_driver is not None:
+        try:
+            ctx.managed_driver.kill_session(
+                target.managed_agent_session_id,
+                reason=args.get("reason", ""),
+            )
+        except Exception as exc:
+            logger.warning("kill_session %s failed: %s",
+                           target.managed_agent_session_id, exc)
+
     ctx.session_store.update_status(target.task_id, STATUS_FAILED)
     ctx.transcript_store.append(target_id, "killed", {
         "by": caller.session_id, "reason": args.get("reason", ""),
+        "managed_remote": target.managed_agent_session_id,
     })
     return _ok({"killed": True})
 

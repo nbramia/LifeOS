@@ -77,10 +77,13 @@ def test_spawn_creates_child_inheriting_lineage(ctx, store, parent):
     assert child.spawn_depth == 1
     assert child.routing == "local"
     assert child.status == STATUS_CLAIMED
-    # The first message is the prompt as a user turn.
-    messages = store.get_messages(child_id)
-    assert messages and messages[0]["role"] == "user"
-    assert "find the answer" in messages[0]["content"]
+    # The prompt is queued as a pending message — the worker's spawned-
+    # dispatcher drains it and uses it as the task description so the
+    # executor's _seed_conversation produces a proper system + user turn.
+    pending = store.drain_pending_messages(child_id)
+    assert len(pending) == 1
+    assert pending[0]["content"] == "find the answer"
+    assert pending[0]["sender_id"] == parent.session_id
 
 
 @pytest.mark.unit
@@ -347,6 +350,84 @@ def test_sessions_list_filters_by_parent(ctx, store, parent):
 # ---------------------------------------------------------------------------
 # Dispatch helpers
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_kill_calls_managed_driver_for_remote_session(store, transcript, parent):
+    """Killing a managed descendant should attempt the remote kill via the driver."""
+    target = store.create(
+        task_id="m_target", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+    )
+    store.set_managed_session_id("m_target", "remote_xyz")
+    target = store.get_by_session_id(target.session_id)
+
+    calls = []
+    class _FakeDriver:
+        def kill_session(self, sid, reason=""):
+            calls.append((sid, reason))
+
+    ctx_with_driver = InterAgentContext(
+        store, transcript, parent.session_id, Caps(), managed_driver=_FakeDriver(),
+    )
+    result = dispatch(ctx_with_driver, "lifeos_agent_kill", {
+        "session_id": target.session_id, "reason": "no longer needed",
+    })
+    assert result["ok"]
+    assert calls and calls[0] == ("remote_xyz", "no longer needed")
+
+
+@pytest.mark.unit
+def test_kill_remote_failure_doesnt_block_local_kill(store, transcript, parent):
+    target = store.create(
+        task_id="m_t", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+    )
+    store.set_managed_session_id("m_t", "remote_abc")
+
+    class _BoomDriver:
+        def kill_session(self, sid, reason=""):
+            raise RuntimeError("network down")
+
+    ctx_with_driver = InterAgentContext(
+        store, transcript, parent.session_id, Caps(), managed_driver=_BoomDriver(),
+    )
+    result = dispatch(ctx_with_driver, "lifeos_agent_kill", {
+        "session_id": target.session_id,
+    })
+    # Local DB still marked failed even though remote kill raised.
+    assert result["ok"]
+    assert store.get_by_session_id(target.session_id).status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_send_rejects_foreign_lineage(store, transcript, parent):
+    """An agent can't inject messages into sessions outside its lineage."""
+    foreign = store.create(task_id="x", status=STATUS_RUNNING, routing="local")
+    ctx = InterAgentContext(store, transcript, parent.session_id, Caps())
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": foreign.session_id, "message": "psst",
+    })
+    assert not result["ok"]
+    assert result["error"] == "forbidden"
+
+
+@pytest.mark.unit
+def test_spawn_excludes_caller_from_concurrency_cap(store, transcript):
+    """The parent shouldn't count against its own routing cap — the expected
+    pattern is `spawn` followed immediately by `yield_until`."""
+    local_parent = store.create(
+        task_id="p_local", status=STATUS_RUNNING, routing="local",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 10.0},
+        expected_output="text",
+    )
+    ctx = InterAgentContext(
+        store, transcript, local_parent.session_id, Caps(max_concurrent_local=1),
+    )
+    # No other local sessions besides the caller; the spawn should succeed
+    # because the caller is excluded from the count.
+    result = dispatch(ctx, "lifeos_agent_spawn", {"prompt": "x", "model": "local"})
+    assert result["ok"], f"spawn should have succeeded; got {result}"
+
 
 @pytest.mark.unit
 def test_dispatch_unknown_tool_errors(ctx):

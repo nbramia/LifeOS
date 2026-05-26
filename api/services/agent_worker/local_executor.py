@@ -108,21 +108,43 @@ class ExecutorOutcome:
     wake_at: int | None = None   # set when status == STATUS_YIELDED (sleep)
 
 
-def _system_prompt(session_id: str, expected_output: str, budget) -> str:
-    """System message for the executor agent."""
+def _system_prompt(session_id: str, expected_output: str, budget, parent_session_id: str | None = None) -> str:
+    """System message for the executor agent.
+
+    Includes the inter-agent discovery guidance required by issue #103 §5 so
+    agents know they can spawn peers, message them, check status, and yield
+    until specific children complete (preferred over polling).
+    """
+    parent_clause = (
+        f" Your parent session is {parent_session_id}."
+        if parent_session_id else " You have no parent (top-level session)."
+    )
     return (
         "You are an autonomous agent running inside LifeOS, handling a single "
         "task from the user's task manager. You have access to file, shell, "
         "and LifeOS data tools. Work concisely and stop when the task is "
         "complete — your final assistant turn (with no tool calls) is the "
         f"answer the user will see.\n\n"
-        f"Your session_id is {session_id}. Your expected output shape is "
-        f"`{expected_output}`. Your budget is wall={budget.get('wall_seconds')}s, "
-        f"max_tokens={budget.get('max_tokens')}, max_dollars=${budget.get('max_dollars')}.\n\n"
-        "If you need to wait for external state to change, call the `sleep` "
-        "tool rather than busy-looping. If you cannot complete the task "
-        "safely or have hit an ambiguity you cannot resolve from context, "
-        "say so plainly in your final response — do not invent answers."
+        f"Your session_id is {session_id}.{parent_clause} Your expected output "
+        f"shape is `{expected_output}`. Your budget is "
+        f"wall={budget.get('wall_seconds')}s, "
+        f"max_tokens={budget.get('max_tokens')}, "
+        f"max_dollars=${budget.get('max_dollars')}.\n\n"
+        "## Inter-agent coordination\n"
+        "Transcripts of other agent sessions are available via "
+        "`lifeos_agent_transcript_read`. List active and recent sessions "
+        "with `lifeos_agent_sessions_list`. You can spawn child agents "
+        "(Claude or local) with `lifeos_agent_spawn`, message them with "
+        "`lifeos_agent_send`, and check their status with `lifeos_agent_check`. "
+        "If you have nothing else to do until specific children finish, call "
+        "`lifeos_agent_yield_until(children=[...])` — this is preferred over "
+        "polling, since it ends your session (no idle billing) and you'll be "
+        "automatically resumed with their results when they're done.\n\n"
+        "If you need to wait for external state to change with no children to "
+        "wait on, call the `sleep` tool rather than busy-looping. If you "
+        "cannot complete the task safely or have hit an ambiguity you cannot "
+        "resolve from context, say so plainly in your final response — do "
+        "not invent answers."
     )
 
 
@@ -191,6 +213,21 @@ class LocalExecutor:
                 return self._finalize_budget_exceeded(session, "max_tokens")
             if budget.get("max_dollars") is not None and (updated.total_dollars or 0) >= budget["max_dollars"]:
                 return self._finalize_budget_exceeded(session, "max_dollars")
+
+            # Lineage budget — for sessions with descendants, the *root* budget
+            # caps the total spend across the family. When breached we cascade-
+            # kill the entire lineage so a runaway sub-tree can't keep burning
+            # tokens after the root's budget is exhausted.
+            root_id = updated.root_session_id or updated.session_id
+            if root_id != updated.session_id:
+                root = self.session_store.get_by_session_id(root_id)
+                if root and root.budget:
+                    root_cap = (root.budget or {}).get("max_dollars")
+                    if root_cap is not None:
+                        lineage_spend = self.session_store.lineage_total_dollars(root_id)
+                        if lineage_spend >= float(root_cap):
+                            self._cascade_kill_lineage(root_id, reason="lineage_max_dollars")
+                            return self._finalize_budget_exceeded(session, "lineage_max_dollars")
 
             turn_start = time.time()
             try:
@@ -281,7 +318,10 @@ class LocalExecutor:
 
     def _seed_conversation(self, session, task: dict, budget: dict) -> None:
         sid = session.session_id
-        system = _system_prompt(sid, session.expected_output or "text", budget)
+        system = _system_prompt(
+            sid, session.expected_output or "text", budget,
+            parent_session_id=session.parent_session_id,
+        )
         # We store the system message as a "system" role row so future calls
         # can rebuild the conversation; the LLM client API takes system
         # separately so we strip it when calling.
@@ -342,6 +382,26 @@ class LocalExecutor:
     # ------------------------------------------------------------------
     # Finalizers
     # ------------------------------------------------------------------
+
+    def _cascade_kill_lineage(self, root_session_id: str, reason: str) -> None:
+        """Mark all non-terminal descendants of `root_session_id` as FAILED.
+
+        Called when the root's lineage-aggregate budget is exhausted so a
+        runaway sub-tree can't keep spending after the root has hit its cap.
+        Managed-driven children are also killed remotely if a driver is
+        available (the parent local executor doesn't have one — that's
+        handled by Worker._cascade_kill_managed_children when triggered from
+        the worker side; here we just flip DB status).
+        """
+        from api.services.agent_worker.session_store import STATUS_FAILED, TERMINAL_STATUSES
+        for descendant in self.session_store.list_descendants(root_session_id):
+            if descendant.status in TERMINAL_STATUSES:
+                continue
+            self.session_store.update_status(descendant.task_id, STATUS_FAILED)
+            self.transcript_store.append(
+                descendant.session_id, "cascade_killed",
+                {"root": root_session_id, "reason": reason},
+            )
 
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_COMPLETED)

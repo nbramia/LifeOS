@@ -214,14 +214,21 @@ class Worker:
         return handled
 
     def _resume_yielded_for_children(self) -> None:
-        """Resume yielded sessions whose listed children have all terminated."""
+        """Resume yielded sessions whose listed children have all terminated.
+
+        Local sessions get the children's outputs injected as a new user turn
+        and re-enter the executor loop. Managed yield-and-resume is not yet
+        supported (session was killed remotely; re-creation with full history
+        transfer is a follow-up PR) — for now those land in FAILED with a
+        clear reason so the operator can re-tag.
+        """
+        from api.services.agent_worker.session_store import TERMINAL_STATUSES as _TS
         yielded = self.session_store.list_yielded_waiting_on_children()
         for session in yielded:
             children = session.yield_waiting_for or []
             if not children:
                 continue
             child_sessions = self.session_store.list_by_session_ids(children)
-            from api.services.agent_worker.session_store import TERMINAL_STATUSES as _TS
             all_done = (
                 len(child_sessions) == len(children)
                 and all(c.status in _TS for c in child_sessions)
@@ -229,49 +236,63 @@ class Worker:
             if not all_done:
                 continue
 
-            # Build a synthetic user message summarizing children's outcomes,
-            # append it to the session's conversation, and resume execution.
+            task = self._fetch_task(session.task_id) or {
+                "id": session.task_id, "description": session.task_id,
+            }
+
+            # Managed yield-resume isn't supported yet — short-circuit with a
+            # clear failure rather than scrambling the local message history
+            # for nothing.
+            if session.routing != "local":
+                self.transcript_store.append(
+                    session.session_id, "managed_yield_resume_unsupported", {},
+                )
+                self._mark_failed(
+                    session, task,
+                    "managed yield-and-resume not yet supported (children "
+                    "finished but parent cannot resume)",
+                )
+                continue
+
+            # Build the resume turn, then commit state updates only after we
+            # know the executor returned cleanly. This keeps the session
+            # restartable if the executor crashes mid-resume.
             summary_lines = ["Children completed:"]
             for c in child_sessions:
                 tokens = (c.total_input_tokens or 0) + (c.total_output_tokens or 0)
                 summary_lines.append(
                     f"- {c.session_id} [{c.status}] — {tokens} tokens, ${c.total_dollars:.2f}"
                 )
-            self.session_store.append_message(
-                session.session_id, "user", "\n".join(summary_lines)
-            )
+            resume_message = "\n".join(summary_lines)
+
+            executor = self._get_local_executor(caller_session_id=session.session_id)
+            try:
+                # Append the resume message first so the executor sees it on
+                # the next turn; clear yield_waiting_for *after* the executor
+                # returns so a crash leaves the session retryable (still
+                # yielded with the same children list).
+                self.session_store.append_message(session.session_id, "user", resume_message)
+                outcome = executor.execute(session, task)
+            except Exception as exc:
+                logger.exception("resume after children crashed for %s: %s",
+                                 session.task_id, exc)
+                # Leave yield_waiting_for set so the next tick re-attempts.
+                self._mark_failed(session, task, f"resume crashed: {exc}")
+                continue
             self.session_store.set_yield_waiting_for(session.task_id, None)
             self.transcript_store.append(session.session_id, "resume_after_children", {
                 "children": children,
             })
-
-            # For local: re-invoke executor. For managed: not supported in
-            # this MVP; mark blocked so operator can intervene.
-            task = self._fetch_task(session.task_id) or {
-                "id": session.task_id, "description": session.task_id,
-            }
-            if session.routing == "local":
-                executor = self._get_local_executor(caller_session_id=session.session_id)
-                try:
-                    outcome = executor.execute(session, task)
-                except Exception as exc:
-                    logger.exception("resume after children crashed for %s: %s",
-                                     session.task_id, exc)
-                    self._mark_failed(session, task, f"resume crashed: {exc}")
-                    continue
-                self._handle_outcome(session, task, outcome)
-            else:
-                # Managed-session resume after yield isn't implemented in this
-                # PR — operator can re-tag the task to retry. Log and notify.
-                self.transcript_store.append(session.session_id, "managed_yield_resume_unsupported", {})
-                self._mark_failed(
-                    session, task,
-                    "managed yield-and-resume not yet supported (children finished but parent cannot resume)",
-                )
+            self._handle_outcome(session, task, outcome)
 
     def _dispatch_spawned_sessions(self) -> None:
         """Pick up sessions created via lifeos_agent_spawn that have no #agent
-        task backing — they show up with status=claimed and an explicit routing."""
+        task backing — they show up with status=claimed and an explicit routing.
+
+        Synchronous in this MVP: a long-running local child blocks the tick
+        loop. Acceptable while local concurrency cap = 1; a future PR could
+        move to a worker pool.
+        """
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
             # Skip top-level claimed sessions (those came from the tick claim
@@ -279,12 +300,11 @@ class Worker:
             # a parent_session_id set.
             if not session.parent_session_id:
                 continue
-            task = {
-                "id": session.task_id,
-                "description": (self.session_store.get_messages(session.session_id) or [{}])[0].get("content", "")
-                if isinstance((self.session_store.get_messages(session.session_id) or [{}])[0].get("content"), str)
-                else session.task_id,
-            }
+            # The first pending message is the prompt from the parent — drain
+            # it so the executor's seeded user turn picks it up.
+            pending = self.session_store.drain_pending_messages(session.session_id)
+            description = pending[0]["content"] if pending else session.session_id
+            task = {"id": session.task_id, "description": description}
             if session.routing == "local":
                 executor = self._get_local_executor(caller_session_id=session.session_id)
                 try:
