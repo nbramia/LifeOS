@@ -94,10 +94,24 @@ Reply with a single JSON object, no prose, matching this exact schema:
 Rules:
 - Default budget if the title doesn't specify one: wall_seconds={default_wall}, max_tokens={default_tokens}, max_dollars={default_dollars}.
 - Parse natural-language budget hints from the title: "5 min" / "30s" / "1h" → wall_seconds; "max $0.50" → max_dollars; "10k tokens" / "50000 tokens" → max_tokens. Be reasonable about unit conversions.
-- Routing precedence:
+- Routing precedence (apply in order; first match wins):
     1) If the tag list contains "local" → routing="local"; routing_reason="#local tag present".
-    2) Otherwise, look at the title for explicit cues — "with local agent", "using gemma", etc. → "local"; "use claude", "with opus", "with claude opus" → "claude".
-    3) If neither, set routing="ask" (the worker will ask the user which model).
+    2) If the tag list contains "cloud" → routing="claude"; routing_reason="#cloud tag present".
+    3) Otherwise, look at the title for explicit model cues:
+       - "with local agent", "using gemma" → "local"
+       - "use claude", "with opus", "with claude opus", "with sonnet" → "claude"
+    4) Otherwise, infer from capability cues in the title — tasks that
+       require third-party cloud connectors should route to claude even
+       without an explicit cue. Trigger on mentions of:
+       - email actions: "gmail", "email", "inbox", "draft a reply",
+         "send an email", "superhuman"
+       - calendar actions: "calendar", "gcal", "schedule a meeting",
+         "events today", "free time", "book"
+       - drive / docs: "drive", "google doc", "spreadsheet", "shared doc"
+       - workplace systems: "slack", "asana", "ramp", "granola"
+       In each case set routing="claude"; routing_reason="implies <capability>".
+    5) If none of the above match, set routing="ask" (the worker will
+       ask the operator which model).
 - expected_output: classify what the agent will produce.
     "text" = a written answer; "file" = creates/edits a file; "external_action" = sends an email, posts a message, schedules a meeting; "structured" = returns structured data the caller will parse.
 - ambiguity: set to non-null only if the title is genuinely underspecified for an autonomous agent (e.g., "reply to John" with no email/context). One question, not multiple.

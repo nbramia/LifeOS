@@ -42,27 +42,29 @@ logger = logging.getLogger(__name__)
 def _user_message_for(task: dict, session_id: str, expected_output: str, budget: dict) -> str:
     """The initial user turn sent to a managed session.
 
-    Includes the task description, expected output shape, and the budget the
-    agent has to work within. The system prompt + persona + tools all live
-    in the agent preset (configured once in the Anthropic console), so this
-    message is purely task-specific.
+    Purely task-specific. Persona, ambiguity policy, and output-format
+    requirements all live in the agent preset (Anthropic console). The
+    `session_id` parameter is accepted for back-compat but not injected
+    into the message body — it's already in the session metadata and the
+    model can't act on it.
+
+    Budget is framed as a *soft* target: Anthropic doesn't enforce it
+    server-side, the worker kills the session externally on breach.
+    Saying "soft" prevents the model from over-regulating its own pacing.
     """
+    del session_id  # already in session metadata; not needed in the user message
     title = (task.get("description") or "").strip()
     context = task.get("context")
     max_dollars = budget.get("max_dollars")
-    dollars_str = f"${max_dollars}" if max_dollars is not None else "unset"
+    dollars_str = f"~${max_dollars}" if max_dollars is not None else "unset"
     parts = [f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
     parts.append(
-        f"Constraints: expected_output={expected_output}, "
-        f"wall={budget.get('wall_seconds')}s, "
-        f"max_tokens={budget.get('max_tokens')}, "
-        f"max_dollars={dollars_str}. "
-        "If genuinely ambiguous, make a reasonable assumption, complete the task, "
-        "and note the assumption in your final reply."
+        f"expected_output={expected_output}; "
+        f"soft budget ~{budget.get('wall_seconds')}s wall / "
+        f"~{budget.get('max_tokens')} tokens / {dollars_str}."
     )
-    parts.append(f"lifeos_session_id={session_id}")
     return "\n\n".join(parts)
 
 

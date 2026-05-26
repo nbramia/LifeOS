@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from api.services.agent_worker.local_executor import (
+    _SYSTEM_PROMPT_STATIC,
     LocalExecutor,
+    _system_prompt,
 )
 from api.services.agent_worker.pricing import cost_for
 from api.services.agent_worker.session_store import (
@@ -316,3 +318,103 @@ def test_pricing_unknown_model_falls_through_to_opus_rate():
     unknown = cost_for("typoed-model", 1000, 1000)
     opus = cost_for("claude-opus-4-7", 1000, 1000)
     assert unknown == pytest.approx(opus)
+
+
+# ---------------------------------------------------------------------------
+# System-prompt structure (issue #119 — Anthropic 4.6/4.7 best practices)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_system_prompt_uses_xml_section_tags():
+    """Anthropic recommends XML tags for system-prompt sections (literal
+    instruction-following in 4.7). Verify each major section is wrapped."""
+    for tag in ("<role>", "<environment>", "<mcp_routing>", "<output_format>",
+                "<ambiguity>", "<inter_agent>", "<sleep>", "<this_task>"):
+        assert tag in _system_prompt(
+            session_id="sess_x",
+            expected_output="text",
+            budget={"wall_seconds": 3600, "max_tokens": 5000, "max_dollars": 5.0},
+        ), f"missing XML section tag: {tag}"
+
+
+@pytest.mark.unit
+def test_system_prompt_requires_final_text_turn_after_tool_use():
+    """Issue #117 / #119: explicit requirement that the agent produces a
+    text summary turn after any tool use. Catches the 'idled without
+    agent.message' regression at the prompt level."""
+    prompt = _system_prompt(
+        session_id="sess_x",
+        expected_output="text",
+        budget={"wall_seconds": 3600, "max_tokens": 5000, "max_dollars": 5.0},
+    )
+    # Look for the canonical phrasing that triggers the behavior.
+    assert "Every task must end with a final assistant turn" in prompt
+    assert "Tool calls alone are not a complete response" in prompt
+
+
+@pytest.mark.unit
+def test_system_prompt_uses_positive_framing_for_ambiguity():
+    """Anthropic best practice: 'Tell Claude what to do instead of what
+    not to do'. The old prompt used 'do not invent answers' (negative)."""
+    prompt = _system_prompt(
+        session_id="sess_x",
+        expected_output="text",
+        budget={"wall_seconds": 3600, "max_tokens": 5000, "max_dollars": 5.0},
+    )
+    assert "do not invent" not in prompt.lower()
+    # Positive phrasing present (collapse whitespace so multi-line phrasing
+    # in the prompt doesn't trip the substring check):
+    import re
+    collapsed = re.sub(r"\s+", " ", prompt)
+    assert "make a reasonable assumption" in collapsed
+    assert "note the assumption" in collapsed
+
+
+@pytest.mark.unit
+def test_system_prompt_does_not_inject_session_id_into_body():
+    """session_id is a worker artifact, not actionable by the model.
+    Keeping it out of the prompt body maximizes prompt-cache hits."""
+    prompt = _system_prompt(
+        session_id="sess_abc123",
+        expected_output="text",
+        budget={"wall_seconds": 3600, "max_tokens": 5000, "max_dollars": 5.0},
+    )
+    assert "sess_abc123" not in prompt
+    assert "session_id" not in prompt
+
+
+@pytest.mark.unit
+def test_system_prompt_static_portion_is_cache_friendly():
+    """The static portion must not vary across sessions, only the trailing
+    `<this_task>` section. Two calls with different session args should
+    share the static prefix verbatim."""
+    a = _system_prompt(
+        session_id="sess_a", expected_output="text",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.5},
+    )
+    b = _system_prompt(
+        session_id="sess_b", expected_output="file",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 5.0},
+    )
+    # Both share the static prefix exactly.
+    assert a.startswith(_SYSTEM_PROMPT_STATIC)
+    assert b.startswith(_SYSTEM_PROMPT_STATIC)
+    # And differ only in the trailing per-task block.
+    assert a[:len(_SYSTEM_PROMPT_STATIC)] == b[:len(_SYSTEM_PROMPT_STATIC)]
+
+
+@pytest.mark.unit
+def test_system_prompt_carries_soft_budget_in_this_task_section():
+    """Dynamic per-task content goes in <this_task>. Budget is framed as
+    a soft target (worker enforces externally; model can't count cost)."""
+    prompt = _system_prompt(
+        session_id="sess_x", expected_output="text",
+        budget={"wall_seconds": 90, "max_tokens": 5000, "max_dollars": 0.25},
+    )
+    # <this_task> wraps the dynamic part
+    assert "<this_task>" in prompt
+    assert "expected_output=text" in prompt
+    assert "soft budget" in prompt
+    assert "~90s" in prompt
+    assert "~5000 tokens" in prompt
+    assert "~$0.25" in prompt
