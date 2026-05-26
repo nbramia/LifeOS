@@ -106,6 +106,15 @@ CREATE TABLE IF NOT EXISTS sleeps (
     wake_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sleeps_wake ON sleeps(wake_at);
+
+-- Cursor + bookkeeping for Managed Agents sessions. One row per task_id with
+-- the last event id we've ingested + the cumulative session-hour dollars
+-- already booked into the sessions row's total_dollars. Issue D.
+CREATE TABLE IF NOT EXISTS managed_cursor (
+    task_id                          TEXT PRIMARY KEY,
+    last_event_id                    TEXT,
+    accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0
+);
 """
 
 
@@ -220,6 +229,18 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
+    def list_active_managed(self) -> list[Session]:
+        """Sessions with a remote Managed Agents id that haven't terminated."""
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM sessions "
+                f"WHERE managed_agent_session_id IS NOT NULL "
+                f"AND status NOT IN ({placeholders})",
+                tuple(TERMINAL_STATUSES),
+            ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
     def list_non_terminal(self) -> list[Session]:
         """Return sessions that the worker may still need to act on after restart."""
         placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
@@ -273,6 +294,65 @@ class SessionStore:
                 WHERE task_id = ?
                 """,
                 (tokens_in, tokens_out, dollars, _now(), task_id),
+            )
+
+    def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
+        """Attach a remote Managed Agents session_id to a local session."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET managed_agent_session_id = ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (managed_id, _now(), task_id),
+            )
+
+    def add_session_hour_overhead(self, task_id: str, dollars: float) -> None:
+        """Add Managed Agents session-hour overhead to the dollar counter."""
+        if dollars <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET total_dollars = total_dollars + ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (float(dollars), _now(), task_id),
+            )
+
+    # Managed Agents cursor (defined in _SCHEMA so no schema-on-write needed).
+    def set_managed_last_event_id(self, task_id: str, event_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, last_event_id) VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET last_event_id = excluded.last_event_id",
+                (task_id, event_id),
+            )
+
+    def get_managed_last_event_id(self, task_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_event_id FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return row["last_event_id"] if row else None
+
+    def get_accrued_session_hour_dollars(self, task_id: str) -> float:
+        """Dollars already booked into total_dollars for session-hour overhead.
+
+        Used by the managed executor to compute the incremental session-hour
+        delta to add on each poll, avoiding double-counting.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT accrued_session_hour_dollars FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def set_accrued_session_hour_dollars(self, task_id: str, dollars: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, accrued_session_hour_dollars) "
+                "VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET accrued_session_hour_dollars = excluded.accrued_session_hour_dollars",
+                (task_id, float(dollars)),
             )
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:

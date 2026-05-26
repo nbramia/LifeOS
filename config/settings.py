@@ -141,6 +141,33 @@ class Settings(BaseSettings):
         description="Anthropic model used for the Haiku preflight call that "
                     "classifies #agent tasks (budget, routing, ambiguity, sanity)."
     )
+    agent_managed_model: str = Field(
+        default="claude-opus-4-7",
+        alias="LIFEOS_AGENT_MANAGED_MODEL",
+        description="Anthropic model the Managed Agents executor uses for "
+                    "Claude-routed #agent tasks."
+    )
+    agent_vault_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_VAULT_ID",
+        description="Managed Agents Vault id holding OAuth credentials for "
+                    "Gmail / Calendar / Drive / Superhuman / Zapier. Created "
+                    "in the Anthropic console; see docs/guides/agent-worker-setup.md."
+    )
+    agent_connectors: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_CONNECTORS",
+        description="Comma-separated list of Managed Agents Connector slugs to "
+                    "attach to every Claude-routed session (e.g. "
+                    "'gmail,google-calendar,google-drive,superhuman,zapier')."
+    )
+    mcp_http_url: str = Field(
+        default="",
+        alias="LIFEOS_MCP_HTTP_URL",
+        description="Public hostname for the LifeOS MCP HTTP transport "
+                    "(e.g. 'https://mcp.example.com/mcp'). Required for "
+                    "Managed Agents to reach LifeOS data."
+    )
     local_llm_autostart: bool = Field(
         default=False,
         alias="LIFEOS_LOCAL_LLM_AUTOSTART",

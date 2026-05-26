@@ -20,6 +20,7 @@ from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_RUNNING,
     STATUS_YIELDED,
     SessionStore,
 )
@@ -226,15 +227,17 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_claude_routing_defers_to_issue_d_with_blocked_tag(tmp_path: Path):
-    """Claude-routed tasks land in #agent-blocked (same as other parked
-    states) until Issue D installs the managed-agents driver."""
+def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path):
+    """Without Managed Agents credentials configured the worker parks Claude-
+    routed tasks at #agent-blocked. Same UX as ambiguity / sanity / ask."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="claude")
     w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    # Sanity check: settings.agent_vault_id is empty in the test env, so
+    # _get_managed_executor returns None and the worker takes the not-configured branch.
     w.tick()
 
     assert executor.calls == []
@@ -243,6 +246,67 @@ def test_claude_routing_defers_to_issue_d_with_blocked_tag(tmp_path: Path):
     assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     sent = w._sent_telegram  # type: ignore[attr-defined]
     assert any("Managed Agents" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
+    """When Managed Agents is configured, the worker delegates to the
+    managed executor: `start` on first tick (status=RUNNING) and `poll` on
+    subsequent ticks until terminal."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize my inbox", "status": "todo", "tags": ["agent"]},
+    ])
+
+    class _StubManagedExecutor:
+        def __init__(self):
+            self.start_calls = 0
+            self.poll_calls = 0
+
+        def start(self, session, task):
+            self.start_calls += 1
+            # Simulate driver attaching a remote id.
+            store_for_session.set_managed_session_id(session.task_id, "sess_remote_42")
+            return ExecutorOutcome(status=STATUS_RUNNING)
+
+        def poll(self, session):
+            self.poll_calls += 1
+            if self.poll_calls < 2:
+                return ExecutorOutcome(status=STATUS_RUNNING)
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="here's the summary")
+
+    transport = httpx.MockTransport(api.handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    store_for_session = SessionStore(db_path=tmp_path / "sessions.db")
+    sent: list[str] = []
+    managed = _StubManagedExecutor()
+    w = Worker(
+        api_base="http://api",
+        session_store=store_for_session,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        http_client=client,
+        preflight_caller=_golden_preflight(routing="claude"),
+        local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="")),
+        managed_executor=managed,
+    )
+
+    # Tick 1: claim → preflight → managed.start. Task still #agent-running.
+    w.tick()
+    assert managed.start_calls == 1
+    assert managed.poll_calls == 0
+    assert RUNNING_TAG in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "todo"
+    # Tick 2: managed.poll → still running.
+    w.tick()
+    assert managed.poll_calls == 1
+    assert RUNNING_TAG in api.tasks["t1"]["tags"]
+    # Tick 3: managed.poll → completed → tag swap + Telegram + mark done.
+    w.tick()
+    assert managed.poll_calls == 2
+    assert api.tasks["t1"]["status"] == "done"
+    assert any("here's the summary" in s for s in sent)
 
 
 @pytest.mark.unit

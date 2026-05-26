@@ -37,6 +37,7 @@ from api.services.agent_worker.session_store import (
     STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_RUNNING,
     STATUS_YIELDED,
     Session,
     SessionStore,
@@ -68,8 +69,9 @@ class Worker:
         poll_seconds: float | None = None,
         telegram_send=None,  # injectable for tests
         http_client: httpx.Client | None = None,
-        preflight_caller=None,  # injectable; defaults to Anthropic Haiku
-        local_executor=None,    # injectable LocalExecutor for tests
+        preflight_caller=None,    # injectable; defaults to Anthropic Haiku
+        local_executor=None,      # injectable LocalExecutor for tests
+        managed_executor=None,    # injectable ManagedExecutor for tests
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -94,6 +96,7 @@ class Worker:
         self._http = http_client or httpx.Client(timeout=10.0)
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
+        self._managed_executor = managed_executor  # lazily instantiated on first claude task
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -187,6 +190,8 @@ class Worker:
 
         # First, resume any sleeping sessions whose wake time has arrived.
         self._wake_sleeping_sessions()
+        # Then poll any in-flight Managed Agents sessions for new events.
+        self._poll_managed_sessions()
 
         candidates = self._list_agent_tasks()
         handled = 0
@@ -202,6 +207,36 @@ class Worker:
             self._dispatch(task)
             handled += 1
         return handled
+
+    def _poll_managed_sessions(self) -> None:
+        """Advance all in-flight Managed Agents sessions one polling step."""
+        active = self.session_store.list_active_managed()
+        if not active:
+            return
+        managed = self._get_managed_executor()
+        if managed is None:
+            return  # operator removed credentials between starts; sessions are stuck
+        for session in active:
+            task = self._fetch_task(session.task_id) or {
+                "id": session.task_id,
+                "description": session.task_id,
+            }
+            pre_dollars = session.total_dollars or 0.0
+            try:
+                outcome = managed.poll(session)
+            except Exception as exc:
+                logger.exception("managed.poll crashed for %s: %s", session.task_id, exc)
+                self._mark_failed(session, task, f"managed poll crashed: {exc}")
+                continue
+            # Push the per-poll dollar delta into the daily ledger so the
+            # global cap reflects in-flight managed cost, not just claim-time
+            # estimates.
+            refreshed = self.session_store.get(session.task_id)
+            delta_dollars = max(0.0, (refreshed.total_dollars or 0.0) - pre_dollars) if refreshed else 0.0
+            if delta_dollars > 0:
+                self.spend_tracker.record(delta_dollars)
+            if outcome.status != STATUS_RUNNING:
+                self._handle_outcome(session, task, outcome)
 
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""
@@ -317,6 +352,44 @@ class Worker:
             )
         return self._local_executor
 
+    def _get_managed_executor(self):
+        """Return the cached ManagedExecutor, lazily constructed.
+
+        Returns None if Managed Agents isn't configured (no api_key or vault_id) —
+        the dispatcher then parks the task at #agent-blocked with an operator-
+        facing explanation.
+        """
+        if self._managed_executor is not None:
+            return self._managed_executor
+        api_key = settings.anthropic_api_key
+        vault_id = settings.agent_vault_id
+        if not api_key or not vault_id:
+            return None
+        from api.services.agent_worker.managed_driver import ManagedAgentsDriver
+        from api.services.agent_worker.managed_executor import ManagedExecutor
+        driver = ManagedAgentsDriver(
+            api_key=api_key,
+            vault_id=vault_id,
+        )
+        # Default MCP server list: operator's LifeOS MCP endpoint if configured.
+        mcp_servers: list[dict[str, Any]] = []
+        if settings.mcp_http_url and settings.mcp_bearer_token:
+            mcp_servers.append({
+                "name": "lifeos",
+                "url": settings.mcp_http_url,
+                "headers": {"Authorization": f"Bearer {settings.mcp_bearer_token}"},
+            })
+        connectors = [c.strip() for c in (settings.agent_connectors or "").split(",") if c.strip()]
+        self._managed_executor = ManagedExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+            driver=driver,
+            model=settings.agent_managed_model,
+            mcp_servers=mcp_servers,
+            connectors=connectors,
+        )
+        return self._managed_executor
+
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
@@ -411,20 +484,31 @@ class Worker:
             self._handle_outcome(session, task, outcome)
             return
 
-        # Claude route: deferred to Issue D. Park at #agent-blocked rather
-        # than re-tagging to #agent — same blocked semantics as ambiguity /
-        # sanity / routing-ask, and the operator can drop the block tag when
-        # Issue D is installed to retry.
+        # Claude route: hand off to Managed Agents.
         if pre.routing == ROUTE_CLAUDE:
-            self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
-            self.session_store.update_status(task_id, STATUS_BLOCKED)
-            self.transcript_store.append(sid, "claude_routing_deferred", {})
-            self._notify(
-                f"⏸ Agent worker: task '{title}' routed to Claude but the "
-                f"Managed Agents driver isn't installed yet (Issue D). Task "
-                f"parked at #{BLOCKED_TAG} — retag with #{AGENT_TAG} once "
-                f"Issue D ships."
-            )
+            managed = self._get_managed_executor()
+            if managed is None:
+                # Operator hasn't configured Managed Agents (no API key or vault).
+                self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                self.session_store.update_status(task_id, STATUS_BLOCKED)
+                self.transcript_store.append(sid, "managed_not_configured", {})
+                self._notify(
+                    f"⏸ Agent worker: task '{title}' routed to Claude but "
+                    f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY "
+                    f"and LIFEOS_AGENT_VAULT_ID in .env, then retag with "
+                    f"#{AGENT_TAG}."
+                )
+                return
+            try:
+                outcome = managed.start(session, task)
+            except Exception as exc:
+                logger.exception("managed.start crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"managed start crashed: {exc}")
+                return
+            # Don't finalize on START — the session is running remotely.
+            # `_poll_managed_sessions` in the next tick will pick it up.
+            if outcome.status == STATUS_FAILED:
+                self._handle_outcome(session, task, outcome)
             return
 
         # Should not reach here — routing was validated in preflight.

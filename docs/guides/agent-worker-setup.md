@@ -132,6 +132,40 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ---
 
+## Step 4b — Provision the Managed Agents Vault (Claude path, Issue D)
+
+`#agent` tasks (without `#local`) route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. Anthropic stores OAuth credentials for cloud connectors (Gmail, Calendar, Drive, Superhuman, Zapier) in a **Vault** that's separate from Claude.ai — existing Claude.ai OAuth doesn't transfer.
+
+> **Beta caveat:** Managed Agents launched April 2026 and the request/response schemas are still evolving. If a request fails with a 4xx, check the [Anthropic console](https://platform.claude.com) for the current schema and update `api/services/agent_worker/managed_driver.py` accordingly.
+
+One-time setup:
+
+1. **Create a Vault** in the Anthropic console (Settings → Vaults → New Vault). Copy the Vault ID.
+2. **Authenticate connectors** you want available to agents. From the Vault page, click "Add Connector" and OAuth into each of: Gmail, Google Calendar, Google Drive, Superhuman Mail, Zapier. (Slack, Asana out of scope for v1.)
+3. **Add the LifeOS MCP server** as a Vault connector. Use the Cloudflare Tunnel hostname from Step 4 and the bearer token from Step 2, e.g.:
+   ```
+   Name: lifeos
+   URL: https://mcp.example.com/mcp
+   Header: Authorization = Bearer <token>
+   ```
+4. **Write the IDs to `.env`:**
+   ```bash
+   LIFEOS_AGENT_VAULT_ID=vlt_<your_vault_id>
+   LIFEOS_MCP_HTTP_URL=https://mcp.example.com/mcp
+   LIFEOS_AGENT_CONNECTORS=gmail,google-calendar,google-drive,superhuman,zapier
+   ANTHROPIC_API_KEY=sk-ant-...   # already required for the Haiku preflight
+   ```
+5. **Restart the worker:**
+   ```bash
+   sudo systemctl restart lifeos-agent-worker
+   ```
+
+Without `LIFEOS_AGENT_VAULT_ID`, Claude-routed tasks park at `#agent-blocked` with an explanatory Telegram notification — the worker does not attempt to call the API without credentials.
+
+The Vault holds **only OAuth refresh tokens**. Live data (Obsidian, photos, monarch, calendar index, etc.) is read live from LifeOS MCP on every agent call — nothing is snapshotted into Anthropic's side.
+
+---
+
 ## Step 5 — Enable the agent worker (Issue B)
 
 Issue B installs `lifeos-agent-worker.service`, which polls `/api/tasks` for `#agent`-tagged tasks. It's **off by default** so a fresh clone doesn't start consuming tasks before later issues add real execution.
@@ -200,6 +234,7 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 | `llama-server` crashes on Gemma | Insufficient VRAM, or stale cached model | Check `nvidia-smi`/`rocm-smi`; re-download with `llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF` once and confirm |
 | Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
 | Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
+| Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: managed-agents-2026-04-01" https://platform.claude.com/v1/managed-agents/sessions/<remote_id>`. The worker's next poll will see the cancelled status and finalize. |
 
 ---
 
