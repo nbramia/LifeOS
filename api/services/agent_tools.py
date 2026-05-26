@@ -225,26 +225,43 @@ TOOL_DEFINITIONS = [
     # -- Actions (consolidated) --
     {
         "name": "manage_tasks",
-        "description": "Manage Obsidian tasks: create, list, or complete.",
+        "description": (
+            "Manage Obsidian tasks. Actions: 'create' (new task — always lands in "
+            "Inbox; do not pass a context), 'list' (filter tasks; supports the "
+            "context filter for already-categorized tasks), 'complete' (mark task "
+            "done), 'update' (edit any field on an existing task, including tags or "
+            "moving the task to a different context), 'tags' (list every distinct "
+            "tag across all tasks with usage counts — the same list is already in "
+            "the system prompt; call this action only if the user explicitly asks "
+            "'what tags do I have', or to double-check a stale cache). When "
+            "assigning tags, reuse an existing tag from the system prompt list when "
+            "it clearly matches the user's intent; otherwise follow the user's "
+            "wording and create a new tag — don't collapse a distinct user-named "
+            "tag onto a vaguely similar existing one."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "complete"],
+                    "enum": ["create", "list", "complete", "update", "tags"],
                     "description": "Action to perform.",
                 },
                 "description": {
                     "type": "string",
-                    "description": "Task description (for create).",
+                    "description": "Task description (for create, or to rename on update).",
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Task ID (for complete).",
+                    "description": "Task ID (required for complete and update).",
                 },
                 "context": {
                     "type": "string",
-                    "description": "Context/category (e.g. 'Work', 'Personal', 'Inbox'). Default: 'Inbox'.",
+                    "description": (
+                        "Context/category (e.g. 'Work', 'Personal', 'Inbox'). Used as "
+                        "a filter for 'list' and as the target context for 'update'. "
+                        "Ignored on 'create' — new tasks always land in Inbox."
+                    ),
                 },
                 "priority": {
                     "type": "string",
@@ -258,11 +275,19 @@ TOOL_DEFINITIONS = [
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Tags for the task. Optional.",
+                    "description": (
+                        "Full set of tags for the task (for create or update). On update, "
+                        "this REPLACES the existing tag list — to add a tag to a task, "
+                        "first 'list' or fetch the task, then send the union of existing "
+                        "+ new tags. Strip leading '#'."
+                    ),
                 },
                 "status": {
                     "type": "string",
-                    "description": "Filter by status (for list): 'todo', 'done', 'in_progress', etc.",
+                    "description": (
+                        "Filter by status (for list): 'todo', 'done', 'in_progress', etc. "
+                        "Also accepted on update to change status."
+                    ),
                 },
                 "query": {
                     "type": "string",
@@ -897,13 +922,12 @@ def _task_create(inp: dict) -> str:
     tm = get_task_manager()
     task = tm.create(
         description=inp["description"],
-        context=inp.get("context", "Inbox"),
         priority=inp.get("priority", ""),
         due_date=inp.get("due_date"),
         tags=inp.get("tags"),
     )
     due = f", due {task.due_date}" if task.due_date else ""
-    return f"Task created: \"{task.description}\" (id: {task.id}, context: {task.context}{due})"
+    return f"Task created: \"{task.description}\" (id: {task.id}{due})"
 
 
 def _task_list(inp: dict) -> str:
@@ -933,6 +957,33 @@ def _task_complete(inp: dict) -> str:
     return f"Task completed: \"{task.description}\""
 
 
+_UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags")
+
+
+def _task_update(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    task_id = inp.get("task_id")
+    if not task_id:
+        return "Error: 'task_id' is required for update."
+    tm = get_task_manager()
+    updates = {k: inp[k] for k in _UPDATABLE_FIELDS if k in inp and inp[k] is not None}
+    if not updates:
+        return "Error: no updatable fields provided (description, status, context, priority, due_date, tags)."
+    task = tm.update(task_id, **updates)
+    if not task:
+        return f"Error: Task '{task_id}' not found."
+    changed = ", ".join(f"{k}={updates[k]!r}" for k in updates)
+    return f"Task updated: \"{task.description}\" (id: {task.id}; changed: {changed})"
+
+
+def _task_tags(_inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    rows = get_task_manager().list_tags()
+    if not rows:
+        return "No tags defined yet."
+    return "\n".join(f"#{row['tag']} ({row['count']})" for row in rows)
+
+
 def _tool_manage_tasks(inp: dict):
     action = inp["action"]
     if action == "create":
@@ -941,6 +992,10 @@ def _tool_manage_tasks(inp: dict):
         return _task_list(inp)
     elif action == "complete":
         return _task_complete(inp)
+    elif action == "update":
+        return _task_update(inp)
+    elif action == "tags":
+        return _task_tags(inp)
     return f"Error: Unknown manage_tasks action '{action}'"
 
 
@@ -1227,6 +1282,8 @@ TOOL_STATUS_MESSAGES = {
     "manage_tasks.create": "Creating task...",
     "manage_tasks.list": "Loading tasks...",
     "manage_tasks.complete": "Completing task...",
+    "manage_tasks.update": "Updating task...",
+    "manage_tasks.tags": "Loading tag list...",
     "manage_reminders": "Managing reminders...",
     "manage_reminders.create": "Setting reminder...",
     "manage_reminders.list": "Loading reminders...",

@@ -5,11 +5,14 @@ Returns a list of content blocks for the Anthropic `system` parameter.
 The static block carries cache_control so it's cached across rounds and
 requests within a 5-minute window.
 """
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import get_configured_accounts
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 _STATIC_PROMPT_TEMPLATE = """\
 You are LifeOS, {name}'s personal knowledge assistant.
@@ -129,17 +132,43 @@ _STATIC_PROMPT = _STATIC_PROMPT_TEMPLATE.format(
 )
 
 
+def _existing_tags_block() -> str | None:
+    """Build a dynamic block listing existing task tags so the assistant can reuse them.
+
+    Returns None if there are no tags or the task manager isn't reachable.
+    """
+    try:
+        from api.services.task_manager import get_task_manager
+        rows = get_task_manager().list_tags()
+    except Exception as e:
+        logger.debug(f"Skipping task tags in system prompt: {e}")
+        return None
+    if not rows:
+        return None
+    lines = ", ".join(f"{row['tag']} ({row['count']})" for row in rows)
+    return (
+        "Existing task tags (with usage counts): "
+        f"{lines}.\n"
+        "When the user asks to tag a task, prefer an existing tag if it clearly "
+        "matches the user's intent semantically — including casing and hyphenation. "
+        "Only create a new tag when none of the existing tags fits. If the user "
+        "explicitly names a tag that differs from any existing one (e.g. asks for "
+        "'the ai tag' when only 'ai-agent-tag' exists), follow the user's wording "
+        "rather than collapsing to a similar existing tag."
+    )
+
+
 def build_system_prompt() -> list[dict]:
     """Build the system prompt for the agentic loop.
 
     Returns a list of content blocks for the Anthropic ``system`` parameter.
-    The first block is static and cached; the second is the current datetime.
+    The first block is static and cached; the rest are dynamic per-request.
     """
     tz = ZoneInfo(settings.timezone)
     now = datetime.now(tz)
     current_dt = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
 
-    return [
+    blocks: list[dict] = [
         {
             "type": "text",
             "text": _STATIC_PROMPT,
@@ -150,3 +179,9 @@ def build_system_prompt() -> list[dict]:
             "text": f"Current date/time: {current_dt}\nTimezone: {settings.timezone}",
         },
     ]
+
+    tags_block = _existing_tags_block()
+    if tags_block:
+        blocks.append({"type": "text", "text": tags_block})
+
+    return blocks

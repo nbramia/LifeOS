@@ -4,7 +4,7 @@ Tests for the Tasks API routes.
 Tests CRUD endpoints with mocked TaskManager.
 """
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 pytestmark = pytest.mark.unit
 
@@ -51,14 +51,26 @@ class TestTasksAPI:
     def test_create_task(self, client, mock_task_manager):
         response = client.post("/api/tasks", json={
             "description": "Pull 1099 from Schwab",
-            "context": "Finance",
             "tags": ["tax", "schwab"],
         })
         assert response.status_code == 200
         data = response.json()
         assert data["description"] == "Pull 1099 from Schwab"
         assert data["id"] == "abc12345"
-        assert data["context"] == "Finance"
+        # context comes from the fixture's sample_task; the API itself no
+        # longer accepts a context on create — everything lands in Inbox.
+        _, kwargs = mock_task_manager.create.call_args
+        assert "context" not in kwargs
+
+    def test_create_task_ignores_context_input(self, client, mock_task_manager):
+        """Stray 'context' in the request body is dropped, not forwarded."""
+        response = client.post("/api/tasks", json={
+            "description": "Quick task",
+            "context": "Work",  # silently dropped by Pydantic
+        })
+        assert response.status_code == 200
+        _, kwargs = mock_task_manager.create.call_args
+        assert "context" not in kwargs
 
     def test_create_task_minimal(self, client, mock_task_manager):
         response = client.post("/api/tasks", json={
@@ -160,6 +172,28 @@ class TestTasksAPI:
         mock_task_manager.complete.return_value = None
         response = client.put("/api/tasks/nonexistent/complete")
         assert response.status_code == 404
+
+    # --- TAGS ---
+
+    def test_list_tags(self, client, mock_task_manager):
+        mock_task_manager.list_tags.return_value = [
+            {"tag": "work", "count": 3},
+            {"tag": "urgent", "count": 1},
+        ]
+        response = client.get("/api/tasks/tags")
+        assert response.status_code == 200
+        assert response.json() == {
+            "tags": [
+                {"tag": "work", "count": 3},
+                {"tag": "urgent", "count": 1},
+            ]
+        }
+
+    def test_list_tags_empty(self, client, mock_task_manager):
+        mock_task_manager.list_tags.return_value = []
+        response = client.get("/api/tasks/tags")
+        assert response.status_code == 200
+        assert response.json() == {"tags": []}
 
     # --- DELETE ---
 

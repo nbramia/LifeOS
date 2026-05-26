@@ -8,7 +8,6 @@ import json
 import pytest
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
 
 from api.services.task_manager import (
     Task,
@@ -260,7 +259,7 @@ class TestCreate:
 
     def test_create_appends_to_file(self, task_manager):
         """Test that create appends task to markdown file."""
-        task = task_manager.create("File test", context="TestContext")
+        task_manager.create("File test", context="TestContext")
 
         file_path = task_manager.tasks_dir / "TestContext.md"
         assert file_path.exists()
@@ -271,7 +270,7 @@ class TestCreate:
 
     def test_create_updates_index(self, task_manager):
         """Test that create updates the index file."""
-        task = task_manager.create("Index test")
+        task_manager.create("Index test")
 
         assert task_manager.index_path.exists()
         data = json.loads(task_manager.index_path.read_text())
@@ -286,6 +285,21 @@ class TestCreate:
         assert task.source_file
         assert task.line_number > 0
         assert Path(task.source_file).exists()
+
+    def test_create_prepends_above_existing_tasks(self, task_manager):
+        """Newer tasks land on a lower line number than older ones in the same file."""
+        first = task_manager.create("Older", context="PrependTest")
+        second = task_manager.create("Newer", context="PrependTest")
+
+        first_refreshed = task_manager.get(first.id)
+        assert second.line_number < first_refreshed.line_number
+
+        # Order in the file: newest on top, oldest on bottom
+        file_path = task_manager.tasks_dir / "PrependTest.md"
+        lines = file_path.read_text().splitlines()
+        newer_idx = next(i for i, line in enumerate(lines) if "Newer" in line)
+        older_idx = next(i for i, line in enumerate(lines) if "Older" in line)
+        assert newer_idx < older_idx
 
 
 class TestGet:
@@ -396,7 +410,6 @@ class TestUpdate:
     def test_update_rewrites_line_in_file(self, task_manager):
         """Test that update rewrites the line in the file."""
         task = task_manager.create("Update file test", context="UpdateTest")
-        original_line_num = task.line_number
 
         task_manager.update(task.id, description="Updated description")
 
@@ -445,22 +458,23 @@ class TestDelete:
 
     def test_delete_adjusts_line_numbers(self, task_manager):
         """Test that delete adjusts line numbers for tasks below deleted line."""
+        # Tasks are prepended on create, so after these calls the file order is
+        # [task3, task2, task1] top-to-bottom. Deleting task3 (top) should
+        # shift task2 and task1 up by one line.
         task1 = task_manager.create("First task", context="LineAdjust")
         task2 = task_manager.create("Second task", context="LineAdjust")
         task3 = task_manager.create("Third task", context="LineAdjust")
 
+        line1_before = task1.line_number
         line2_before = task2.line_number
-        line3_before = task3.line_number
 
-        # Delete first task
-        task_manager.delete(task1.id)
+        task_manager.delete(task3.id)
 
-        # Check that task2 and task3 line numbers decreased
+        task1_after = task_manager.get(task1.id)
         task2_after = task_manager.get(task2.id)
-        task3_after = task_manager.get(task3.id)
 
+        assert task1_after.line_number == line1_before - 1
         assert task2_after.line_number == line2_before - 1
-        assert task3_after.line_number == line3_before - 1
 
     def test_delete_nonexistent_task(self, task_manager):
         """Test deleting a non-existent task."""
@@ -557,6 +571,38 @@ class TestListTasks:
         for task in tasks:
             assert task.status == "todo"
             assert task.context == "Work"
+
+
+class TestListTags:
+    """Tests for list_tags()."""
+
+    def test_list_tags_empty(self, task_manager):
+        assert task_manager.list_tags() == []
+
+    def test_list_tags_returns_counts_sorted(self, task_manager):
+        task_manager.create("a", tags=["work", "urgent"])
+        task_manager.create("b", tags=["work"])
+        task_manager.create("c", tags=["urgent"])
+        task_manager.create("d", tags=["personal"])
+
+        result = task_manager.list_tags()
+        as_dict = {row["tag"]: row["count"] for row in result}
+        assert as_dict == {"work": 2, "urgent": 2, "personal": 1}
+        # Sorted by count desc, then alphabetically (case-insensitive)
+        assert [row["tag"] for row in result] == ["urgent", "work", "personal"]
+
+    def test_list_tags_strips_hash_prefix(self, task_manager):
+        task_manager.create("a", tags=["#work"])
+        task_manager.create("b", tags=["work"])
+        result = task_manager.list_tags()
+        assert result == [{"tag": "work", "count": 2}]
+
+    def test_list_tags_spans_all_statuses(self, task_manager):
+        t1 = task_manager.create("a", tags=["done-tag"])
+        task_manager.update(t1.id, status="done")
+        task_manager.create("b", tags=["todo-tag"])
+        tags = {row["tag"] for row in task_manager.list_tags()}
+        assert tags == {"done-tag", "todo-tag"}
 
 
 # =============================================================================
@@ -937,23 +983,23 @@ class TestContextChange:
 
     def test_context_change_adjusts_line_numbers(self, task_manager):
         """Test that context change adjusts line numbers in old file."""
-        task1 = task_manager.create("Stay here", context="ContextA")
+        # With prepend-on-create the order in the file is [task3, task2, task1].
+        # Moving task2 (middle line) out should leave task3 (above it) unchanged
+        # and shift task1 (below it) up by one line.
+        task1 = task_manager.create("Bottom task", context="ContextA")
         task2 = task_manager.create("Move me", context="ContextA")
-        task3 = task_manager.create("Also stay", context="ContextA")
+        task3 = task_manager.create("Top task", context="ContextA")
 
         line1_before = task1.line_number
         line3_before = task3.line_number
 
-        # Move task2 to different context
         task_manager.update(task2.id, context="ContextB")
 
-        # task1 should keep same line number
-        # task3 should have line number decreased
         task1_after = task_manager.get(task1.id)
         task3_after = task_manager.get(task3.id)
 
-        assert task1_after.line_number == line1_before
-        assert task3_after.line_number == line3_before - 1
+        assert task3_after.line_number == line3_before
+        assert task1_after.line_number == line1_before - 1
 
 
 # =============================================================================
@@ -1004,7 +1050,7 @@ class TestReindexFile:
 
         # Manually delete task from file
         lines = file_path.read_text().splitlines()
-        filtered_lines = [l for l in lines if "Delete from file" not in l]
+        filtered_lines = [line for line in lines if "Delete from file" not in line]
         file_path.write_text("\n".join(filtered_lines) + "\n")
 
         # Reindex
@@ -1100,14 +1146,14 @@ class TestPersistence:
         """Test that markdown files persist correctly."""
         # Create manager and add task
         manager1 = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
-        task = manager1.create("File persistence test", context="FileTest")
+        manager1.create("File persistence test", context="FileTest")
 
         # Read file directly
         file_path = manager1.tasks_dir / "FileTest.md"
         original_content = file_path.read_text()
 
-        # Create new manager instance
-        manager2 = TaskManager(vault_path=tmp_vault, index_path=tmp_index)
+        # Create new manager instance — second instance reads the same vault
+        TaskManager(vault_path=tmp_vault, index_path=tmp_index)
 
         # Verify file unchanged
         new_content = file_path.read_text()
@@ -1226,7 +1272,7 @@ class TestEdgeCases:
 
     def test_context_file_creation_with_special_chars(self, task_manager):
         """Test that context files handle special characters."""
-        task = task_manager.create("Test", context="Context-With-Dashes")
+        task_manager.create("Test", context="Context-With-Dashes")
         file_path = task_manager.tasks_dir / "Context-With-Dashes.md"
 
         assert file_path.exists()

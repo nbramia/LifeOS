@@ -22,7 +22,6 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 class CreateTaskRequest(BaseModel):
     description: str = Field(..., min_length=1, description="Task description")
-    context: str = Field(default="Inbox", description="Task context/category (default: Inbox)")
     priority: Optional[str] = Field(default="", description="Priority: high, medium, low, or empty")
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
     tags: Optional[list[str]] = Field(default=None, description="List of tags (e.g., ['work', 'urgent'])")
@@ -83,11 +82,10 @@ class TaskListResponse(BaseModel):
 
 @router.post("", response_model=TaskResponse)
 async def create_task(request: CreateTaskRequest):
-    """Create a new task."""
+    """Create a new task. All new tasks land in Inbox; move them later via update."""
     manager = get_task_manager()
     task = manager.create(
         description=request.description,
-        context=request.context,
         priority=request.priority or "",
         due_date=request.due_date,
         tags=request.tags,
@@ -126,6 +124,22 @@ async def list_tasks(
         tasks=[TaskResponse.from_task(t) for t in tasks],
         total=len(tasks),
     )
+
+
+class TagUsage(BaseModel):
+    tag: str
+    count: int
+
+
+class TagListResponse(BaseModel):
+    tags: list[TagUsage]
+
+
+@router.get("/tags", response_model=TagListResponse)
+async def list_tags():
+    """List all distinct tags across all tasks (any status) with usage counts."""
+    manager = get_task_manager()
+    return TagListResponse(tags=[TagUsage(**t) for t in manager.list_tags()])
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
