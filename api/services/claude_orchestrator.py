@@ -148,6 +148,15 @@ Note: Monthly financial summaries are also synced to the vault at Personal/Finan
 
 Action tools:
 - lifeos_task_create/list/update/complete/delete: Manage Obsidian tasks.
+  When the user asks for a task to be done autonomously by an "agent" (or
+  by "the cloud agent" / "the local agent"), pass tags=["agent"] to route
+  it to the external agent worker. Optional sub-tags steer routing:
+  ["agent", "local"] forces local Gemma; ["agent", "cloud"] forces cloud
+  Claude. Never use "agent-running", "agent-completed", "agent-failed",
+  "agent-blocked", or "agent-budget-exceeded" — those are state tags the
+  worker SETS during execution. Setting them at creation hides the task
+  from the worker. The worker polls for tag="agent" only.
+  Use status="urgent" if the user signals urgency; "todo" is the default.
 - lifeos_reminder_create/list/delete: Manage scheduled Telegram reminders.
 - lifeos_gmail_draft: Create a draft email in Gmail (not sent, user reviews first).
 - lifeos_calendar_create: Create a Google Calendar event. Invite emails sent to attendees. [CLARIFY] with user before creating.
