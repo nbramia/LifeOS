@@ -43,12 +43,13 @@ from api.services.agent_worker.pricing import (
 logger = logging.getLogger(__name__)
 
 
-# Terminal session statuses synthesized by `ManagedAgentsDriver.get_session_state`
-# from the event stream. The Managed Agents docs only document event types
-# explicitly (session.status_idle = success, session.error = failure). We map
-# those to a stable status string here so the executor can compare against a
-# fixed set regardless of how the API evolves.
+# Terminal session statuses returned by `GET /v1/sessions/{id}`. The Managed
+# Agents API reports `"idle"` when the agent has finished and has nothing more
+# to do — that's the canonical success terminal. We keep `"completed"` in the
+# set too as a synthesized alias (from `session.status_idle` events when the
+# session.status field hasn't transitioned yet — observed in live testing).
 TERMINAL_REMOTE_STATUSES = frozenset({
+    "idle",
     "completed",
     "failed",
     "cancelled",
@@ -160,7 +161,7 @@ class ManagedAgentsDriver:
             headers=self._headers(),
             json=body,
         )
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp)
         data = resp.json()
         sid = data.get("id") or data.get("session_id")
         if not sid:
@@ -176,22 +177,24 @@ class ManagedAgentsDriver:
         session_id: str,
         since_event_id: str | None = None,
     ) -> ManagedSessionState:
-        """Poll a session's current state + any events since `since_event_id`.
+        """Poll a session's current state — status + cumulative usage + new events.
 
-        Aggregates events into a stable status string. Per the Managed Agents
-        event docs, terminal signals come via events:
-          - `session.status_idle` → agent finished; status="completed"
-          - `session.error` → fatal; status="failed"
-        The status field on the response is forwarded directly when it falls
-        in `TERMINAL_REMOTE_STATUSES`; otherwise we synthesize from events.
+        Live API responses (confirmed 2026-05-26) split the data across two endpoints:
+          - `GET /v1/sessions/{id}` returns `{status, usage, ...}` but NOT events.
+            The `status` field reports `"running"` until the agent finishes, then
+            transitions to `"idle"` (Anthropic's terminal-success value).
+          - `GET /v1/sessions/{id}/events` returns `{data: [...], first_id,
+            last_id, has_more}` — the canonical event stream. `agent.message`,
+            `session.error`, `session.status_idle`, etc. all live here.
+
+        This method calls both and merges. `since_event_id` is the cursor against
+        the events endpoint. The status response also carries a 404 → cancelled
+        signal (DELETEd sessions return 404 on subsequent polls).
         """
-        params: dict[str, str] = {}
-        if since_event_id:
-            params[self.EVENT_CURSOR_PARAM] = since_event_id
+        # 1. Session status + usage
         resp = self._client.get(
             f"{self.base_url}/sessions/{session_id}",
             headers=self._headers(),
-            params=params,
         )
         # Treat 404 as "cancelled" — that's how a DELETEd session appears on
         # subsequent polls.
@@ -201,20 +204,27 @@ class ManagedAgentsDriver:
                 status="cancelled",
                 error_reason="session not found (likely deleted)",
             )
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp)
         data = resp.json()
-
-        events = data.get("events", []) or []
         usage = data.get("usage", {}) or {}
+        raw_status = str(data.get("status", "running")).lower()
+
+        # 2. New events since cursor (separate endpoint)
+        events = self.list_events(session_id, after_id=since_event_id)
         last_event_id: str | None = None
         if events:
             last_event_id = events[-1].get("id")
 
-        # Synthesize a terminal status from events when the response doesn't
-        # provide a definitive one.
-        raw_status = str(data.get("status", "running")).lower()
+        # Synthesize a terminal status from events when the status field hasn't
+        # transitioned yet. `idle` (raw) wins on its own; otherwise we look at
+        # events for status_idle / session.error.
         synthesized = _synthesize_status_from_events(events)
-        status = synthesized if synthesized else raw_status
+        if raw_status in TERMINAL_REMOTE_STATUSES:
+            status = raw_status
+        elif synthesized:
+            status = synthesized
+        else:
+            status = raw_status
 
         # Concatenate text content from agent.message events as `final_text`.
         # The most recent agent.message before an idle event is "the answer".
@@ -233,6 +243,34 @@ class ManagedAgentsDriver:
             final_text=final_text,
             error_reason=error_reason,
         )
+
+    def list_events(
+        self,
+        session_id: str,
+        after_id: str | None = None,
+    ) -> list[dict]:
+        """Fetch new session events since `after_id` (or all if None).
+
+        `GET /v1/sessions/{id}/events?after=<cursor>` returns
+        `{"data": [{"id", "type", "payload"|"content"|"error", ...}, ...]}`.
+        Returns the raw event list; callers (e.g. `get_session_state`) handle
+        the cursor advance and synthesis logic.
+        """
+        params: dict[str, str] = {}
+        if after_id:
+            params[self.EVENT_CURSOR_PARAM] = after_id
+        resp = self._client.get(
+            f"{self.base_url}/sessions/{session_id}/events",
+            headers=self._headers(),
+            params=params,
+        )
+        if resp.status_code == 404:
+            # Session deleted mid-poll. Caller's status fetch already turned
+            # this into "cancelled"; return empty events so we don't crash.
+            return []
+        self._raise_for_status_with_body(resp)
+        data = resp.json()
+        return data.get("data", []) or []
 
     def post_user_message(self, session_id: str, content: str) -> None:
         """Post a user turn to a running session.
@@ -253,6 +291,28 @@ class ManagedAgentsDriver:
             headers=self._headers(),
             json=body,
         )
+        self._raise_for_status_with_body(resp)
+
+    @staticmethod
+    def _raise_for_status_with_body(resp: httpx.Response) -> None:
+        """Like `resp.raise_for_status()` but logs the response body for 4xx
+        errors before raising. The default httpx behavior hides the body, which
+        makes beta-API schema mismatches opaque to operators.
+
+        Safe to log: response bodies for 4xx errors carry the API's validation
+        message (e.g. "MCP server host(s) blocked by environment network policy").
+        API keys live in REQUEST headers, not in response bodies.
+        """
+        if resp.is_success:
+            return
+        if 400 <= resp.status_code < 500:
+            # Truncate to avoid unbounded log volume from a misbehaving API.
+            body_preview = (resp.text or "")[:2048]
+            logger.warning(
+                "Managed Agents %s %s → %d: %s",
+                resp.request.method, resp.request.url.path,
+                resp.status_code, body_preview,
+            )
         resp.raise_for_status()
 
     def kill_session(self, session_id: str, reason: str = "") -> None:

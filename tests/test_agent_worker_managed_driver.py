@@ -32,6 +32,27 @@ def _build_driver(handler):
     )
 
 
+def _make_session_handler(*, status_body=None, events=None, status_code=200, events_code=200):
+    """Build a handler that routes GET /sessions/{id} to a status response and
+    GET /sessions/{id}/events to an events response. POST routes return 200 OK.
+
+    Mirrors the live API surface where state lives at two endpoints. Helper
+    keeps each test focused on what it's actually asserting.
+    """
+    status_body = status_body if status_body is not None else {"status": "running", "usage": {}}
+    events = events if events is not None else []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/events"):
+            return httpx.Response(events_code, json={"data": events, "has_more": False})
+        if request.method == "GET":
+            return httpx.Response(status_code, json=status_body)
+        return httpx.Response(200, json={"ok": True})
+
+    return handler
+
+
 # ---------------------------------------------------------------------------
 # Auth + headers
 # ---------------------------------------------------------------------------
@@ -185,21 +206,29 @@ def test_create_session_posts_initial_message_when_provided():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_get_session_state_parses_basic_response():
+def test_get_session_state_calls_both_endpoints_and_merges():
+    """Status comes from GET /sessions/{id}; events come from GET /sessions/{id}/events.
+    Driver fans out to both and merges into one ManagedSessionState."""
+    calls = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "GET"
-        assert request.url.path.endswith("/sessions/sess_abc")
-        return httpx.Response(200, json={
-            "id": "sess_abc",
-            "status": "running",
-            "events": [
-                {"id": "evt_1", "type": "agent.message", "content": [{"type": "text", "text": "hi"}]},
+        calls.append(request.url.path)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"data": [
+                {"id": "evt_1", "type": "agent.message",
+                 "content": [{"type": "text", "text": "hi"}]},
                 {"id": "evt_2", "type": "agent.tool_use", "payload": {"name": "Bash"}},
-            ],
+            ]})
+        return httpx.Response(200, json={
+            "id": "sess_abc", "status": "running",
             "usage": {"input_tokens": 100, "output_tokens": 40},
         })
 
     state = _build_driver(handler).get_session_state("sess_abc")
+    # Both endpoints hit
+    assert any(p.endswith("/sessions/sess_abc") for p in calls)
+    assert any(p.endswith("/sessions/sess_abc/events") for p in calls)
+    # Status from /sessions/{id}, events from /sessions/{id}/events — merged
     assert state.session_id == "sess_abc"
     assert state.status == "running"
     assert state.last_event_id == "evt_2"
@@ -209,31 +238,48 @@ def test_get_session_state_parses_basic_response():
 
 
 @pytest.mark.unit
-def test_get_session_state_uses_after_cursor():
-    captured = {}
+def test_get_session_state_idle_status_is_terminal():
+    """The Managed Agents API reports `status=idle` when the agent is done.
+    Driver forwards that verbatim (no synthesis needed) — it's already in
+    TERMINAL_REMOTE_STATUSES."""
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {"input_tokens": 3, "output_tokens": 42}},
+        events=[],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.status == "idle"
+
+
+@pytest.mark.unit
+def test_get_session_state_uses_after_cursor_on_events_endpoint():
+    """The cursor (since_event_id) goes to the /events query, not /sessions/{id}."""
+    captured = {"status_params": None, "events_params": None}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(request.url.params)
-        return httpx.Response(200, json={"status": "running", "events": [], "usage": {}})
+        if request.url.path.endswith("/events"):
+            captured["events_params"] = dict(request.url.params)
+            return httpx.Response(200, json={"data": []})
+        captured["status_params"] = dict(request.url.params)
+        return httpx.Response(200, json={"status": "running", "usage": {}})
 
     _build_driver(handler).get_session_state("sess_abc", since_event_id="evt_7")
-    assert captured["params"]["after"] == "evt_7"
+    assert captured["events_params"]["after"] == "evt_7"
+    # Status endpoint never gets the cursor — it's an events-only concept
+    assert captured["status_params"] == {}
 
 
 @pytest.mark.unit
 def test_get_session_state_synthesizes_completed_from_idle_event():
-    """When raw status doesn't say "completed", but an idle event arrived, we synthesize."""
-    def handler(request):
-        return httpx.Response(200, json={
-            "status": "running",  # API hasn't transitioned status yet
-            "events": [
-                {"id": "evt_1", "type": "agent.message",
-                 "content": [{"type": "text", "text": "all done!"}]},
-                {"id": "evt_2", "type": "session.status_idle"},
-            ],
-            "usage": {"input_tokens": 50, "output_tokens": 80},
-        })
-
+    """When status field hasn't transitioned yet but an idle event arrived,
+    we synthesize completed."""
+    handler = _make_session_handler(
+        status_body={"status": "running", "usage": {"input_tokens": 50, "output_tokens": 80}},
+        events=[
+            {"id": "evt_1", "type": "agent.message",
+             "content": [{"type": "text", "text": "all done!"}]},
+            {"id": "evt_2", "type": "session.status_idle"},
+        ],
+    )
     state = _build_driver(handler).get_session_state("sess")
     assert state.status == "completed"
     assert state.final_text == "all done!"
@@ -242,16 +288,13 @@ def test_get_session_state_synthesizes_completed_from_idle_event():
 
 @pytest.mark.unit
 def test_get_session_state_synthesizes_failed_from_error_event():
-    def handler(request):
-        return httpx.Response(200, json={
-            "status": "running",
-            "events": [
-                {"id": "evt_1", "type": "session.error",
-                 "payload": {"message": "MCP server unreachable"}},
-            ],
-            "usage": {},
-        })
-
+    handler = _make_session_handler(
+        status_body={"status": "running", "usage": {}},
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "payload": {"message": "MCP server unreachable"}},
+        ],
+    )
     state = _build_driver(handler).get_session_state("sess")
     assert state.status == "failed"
     assert state.error_reason == "MCP server unreachable"
@@ -262,32 +305,24 @@ def test_get_session_state_prefers_failed_when_idle_and_error_in_same_batch():
     """If both `session.status_idle` and `session.error` arrive in one poll
     batch, error wins — operator needs the actionable signal. Order in the
     batch doesn't matter."""
-    def handler_idle_first(request):
-        return httpx.Response(200, json={
-            "status": "running",
-            "events": [
-                {"id": "evt_1", "type": "session.status_idle"},
-                {"id": "evt_2", "type": "session.error",
-                 "payload": {"message": "post-idle cascade failure"}},
-            ],
-            "usage": {},
-        })
-
+    handler_idle_first = _make_session_handler(
+        events=[
+            {"id": "evt_1", "type": "session.status_idle"},
+            {"id": "evt_2", "type": "session.error",
+             "payload": {"message": "post-idle cascade failure"}},
+        ],
+    )
     state = _build_driver(handler_idle_first).get_session_state("sess")
     assert state.status == "failed"
     assert state.error_reason == "post-idle cascade failure"
 
-    def handler_error_first(request):
-        return httpx.Response(200, json={
-            "status": "running",
-            "events": [
-                {"id": "evt_1", "type": "session.error",
-                 "payload": {"message": "pre-idle failure"}},
-                {"id": "evt_2", "type": "session.status_idle"},
-            ],
-            "usage": {},
-        })
-
+    handler_error_first = _make_session_handler(
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "payload": {"message": "pre-idle failure"}},
+            {"id": "evt_2", "type": "session.status_idle"},
+        ],
+    )
     state = _build_driver(handler_error_first).get_session_state("sess")
     assert state.status == "failed"
     assert state.error_reason == "pre-idle failure"
@@ -295,21 +330,18 @@ def test_get_session_state_prefers_failed_when_idle_and_error_in_same_batch():
 
 @pytest.mark.unit
 def test_get_session_state_concatenates_text_blocks_from_latest_message():
-    def handler(request):
-        return httpx.Response(200, json={
-            "status": "completed",
-            "events": [
-                {"id": "evt_1", "type": "agent.message",
-                 "content": [{"type": "text", "text": "draft 1"}]},
-                {"id": "evt_2", "type": "agent.message",
-                 "content": [
-                     {"type": "text", "text": "final "},
-                     {"type": "text", "text": "answer"},
-                 ]},
-            ],
-            "usage": {},
-        })
-
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {}},
+        events=[
+            {"id": "evt_1", "type": "agent.message",
+             "content": [{"type": "text", "text": "draft 1"}]},
+            {"id": "evt_2", "type": "agent.message",
+             "content": [
+                 {"type": "text", "text": "final "},
+                 {"type": "text", "text": "answer"},
+             ]},
+        ],
+    )
     state = _build_driver(handler).get_session_state("sess")
     assert state.final_text == "final answer"
 
@@ -326,10 +358,20 @@ def test_get_session_state_treats_404_as_cancelled():
 
 
 @pytest.mark.unit
-def test_get_session_state_no_events_no_final_text():
+def test_list_events_returns_empty_on_404():
+    """Race: session deleted between status fetch and events fetch.
+    list_events returns [] so the caller doesn't crash; the caller's
+    parallel 404 on /sessions/{id} already produced the "cancelled" state."""
     def handler(request):
-        return httpx.Response(200, json={"status": "running", "events": [], "usage": {}})
+        return httpx.Response(404, text="not found")
 
+    events = _build_driver(handler).list_events("sess_gone", after_id="evt_x")
+    assert events == []
+
+
+@pytest.mark.unit
+def test_get_session_state_no_events_no_final_text():
+    handler = _make_session_handler(events=[])
     state = _build_driver(handler).get_session_state("sess")
     assert state.final_text is None
     assert state.error_reason is None
@@ -368,6 +410,28 @@ def test_post_user_message_raises_on_http_error():
 
     with pytest.raises(httpx.HTTPStatusError):
         _build_driver(handler).post_user_message("sess", "x")
+
+
+@pytest.mark.unit
+def test_4xx_response_body_is_logged_before_raising(caplog):
+    """Operators need to see the API's validation message ("MCP server host(s)
+    blocked by environment network policy", etc.). Default httpx behavior hides
+    the body. We log it at WARNING with the response status and path."""
+    def handler(request):
+        return httpx.Response(400, json={
+            "error": {"message": "MCP server host(s) blocked by environment network policy"},
+        })
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            _build_driver(handler).create_session(
+                agent_id="agent_x", environment_id="env_y",
+            )
+
+    # Body keyword appears in the warning log
+    assert any("MCP server host(s) blocked" in record.getMessage() for record in caplog.records)
+    assert any("400" in record.getMessage() for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------
