@@ -943,13 +943,35 @@ class Worker:
         active_s = int(refreshed.total_active_seconds or 0)
         expected = refreshed.expected_output or "text"
         title = task.get("description", session.task_id)
-        result_blurb = (outcome.final_text or "(no text response)").strip()
-        if len(result_blurb) > 600:
-            result_blurb = result_blurb[:600] + "…"
+
+        # Body: prefer the agent's final text. When it's empty (the agent
+        # used a tool and idled without summarizing — sometimes happens with
+        # Sonnet on tight-budget tasks), surface a transcript pointer so the
+        # operator can inspect what the agent actually did instead of seeing
+        # a blank message. The transcript captures every tool call.
+        final_text = (outcome.final_text or "").strip()
+        if final_text:
+            result_blurb = final_text
+            if len(result_blurb) > 600:
+                result_blurb = result_blurb[:600] + "…"
+        else:
+            result_blurb = (
+                f"(agent idled without a final text reply — check transcript at "
+                f"data/agent_transcripts/{session.session_id}.jsonl for tool-use detail)"
+            )
+
+        # Footer: when some MCP servers failed to initialize during the session,
+        # list them so the operator can fix or remove the broken connectors from
+        # the agent preset. Only populated by the managed (cloud) path.
+        init_failed = getattr(outcome, "init_failed_mcps", None) or []
+        footer = ""
+        if init_failed:
+            footer = f"\n\nNote: {len(init_failed)} MCP server(s) unavailable this session: {', '.join(init_failed)}"
+
         return (
             f"✅ Agent worker: completed '{title}' "
             f"({expected}) — {tokens:,} tokens, ${refreshed.total_dollars:.2f}, "
-            f"{active_s}s active.\n\n{result_blurb}"
+            f"{active_s}s active.\n\n{result_blurb}{footer}"
         )
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:

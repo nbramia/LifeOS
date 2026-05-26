@@ -302,6 +302,69 @@ def test_get_session_state_synthesizes_failed_from_error_event():
 
 
 @pytest.mark.unit
+def test_get_session_state_completes_when_only_mcp_init_errors_with_idle():
+    """MCP init errors (`mcp_authentication_failed_error`,
+    `mcp_connection_failed_error`) are informational — they fire when a connector
+    is unreachable at session-start. The agent works around the missing MCP and
+    finishes cleanly using the others. Session must NOT be marked failed."""
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {"input_tokens": 3, "output_tokens": 89}},
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "error": {"type": "mcp_connection_failed_error",
+                       "mcp_server_name": "gmail",
+                       "message": "server URL not found"}},
+            {"id": "evt_2", "type": "session.error",
+             "error": {"type": "mcp_authentication_failed_error",
+                       "mcp_server_name": "gcal",
+                       "message": "no credential stored"}},
+            {"id": "evt_3", "type": "agent.mcp_tool_use"},
+            {"id": "evt_4", "type": "session.status_idle"},
+        ],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.status == "idle"  # raw status forwarded, not overridden by errors
+    assert state.init_failed_mcps == ["gmail", "gcal"]
+
+
+@pytest.mark.unit
+def test_get_session_state_still_fails_on_non_init_session_error():
+    """Non-MCP-init errors (runtime tool crashes, lifecycle failures, etc.)
+    still trigger terminal-failed. Cascading-failure detection from the prior
+    fix is preserved for the cases that actually need it."""
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {}},
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "error": {"type": "tool_dispatch_error",
+                       "message": "the agent's bash tool crashed"}},
+            {"id": "evt_2", "type": "session.status_idle"},
+        ],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.status == "failed"
+    # tool_dispatch_error is NOT an init failure type — not classified as such.
+    assert state.init_failed_mcps == []
+
+
+@pytest.mark.unit
+def test_get_session_state_dedupes_init_failed_mcp_names():
+    """Same MCP firing two init errors (e.g., retry exhausted) only shows once."""
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {}},
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "error": {"type": "mcp_connection_failed_error", "mcp_server_name": "gmail"}},
+            {"id": "evt_2", "type": "session.error",
+             "error": {"type": "mcp_connection_failed_error", "mcp_server_name": "gmail"}},
+            {"id": "evt_3", "type": "session.status_idle"},
+        ],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.init_failed_mcps == ["gmail"]
+
+
+@pytest.mark.unit
 def test_get_session_state_prefers_failed_when_raw_idle_and_event_error():
     """Regression guard: when the status endpoint reports raw `"idle"` and the
     events endpoint contains a `session.error`, the error must win. Otherwise

@@ -21,7 +21,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from api.services.agent_worker.pricing import cost_for
 from api.services.agent_worker.session_store import (
@@ -106,6 +106,10 @@ class ExecutorOutcome:
     final_text: str = ""
     reason: str = ""
     wake_at: int | None = None   # set when status == STATUS_YIELDED (sleep)
+    # Managed-agents-only: MCP servers that failed to initialize during the
+    # remote session. Worker uses this to append a footer to the completion
+    # summary so the operator knows which connectors are broken.
+    init_failed_mcps: list[str] = field(default_factory=list)
 
 
 def _system_prompt(session_id: str, expected_output: str, budget, parent_session_id: str | None = None) -> str:

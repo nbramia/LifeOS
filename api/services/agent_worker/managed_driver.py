@@ -68,6 +68,23 @@ class ManagedSessionState:
     total_output_tokens: int = 0
     final_text: str | None = None
     error_reason: str | None = None
+    # MCP servers that failed to initialize during this session — informational,
+    # not necessarily fatal. The agent may still complete the task using the
+    # MCPs that did succeed. Surfaced to the operator in the completion summary
+    # so they can fix or remove the broken connectors.
+    init_failed_mcps: list[str] = field(default_factory=list)
+
+
+# `session.error.error.type` values for MCP server initialization failures —
+# the connector failed at handshake time (server unreachable, OAuth missing,
+# URL doesn't match a Vault credential, etc.). These don't indicate a failed
+# agent run; the agent works around the missing tool. Filtered out of the
+# terminal-failed synthesis so an idle session with init errors lands at
+# `#agent-completed` instead of `#agent-failed`.
+_MCP_INIT_FAILURE_TYPES = frozenset({
+    "mcp_authentication_failed_error",
+    "mcp_connection_failed_error",
+})
 
 
 class ManagedAgentsDriver:
@@ -215,11 +232,11 @@ class ManagedAgentsDriver:
         if events:
             last_event_id = events[-1].get("id")
 
-        # Resolve final status. A `session.error` in the batch must win over
-        # a raw `idle`, otherwise the session reports completed and the
-        # cascading failure is silently lost. `_synthesize_status_from_events`
-        # returns "failed" if ANY error event is present, else "completed"
-        # if any idle event, else None.
+        # Resolve final status. A non-init `session.error` (runtime / cascade
+        # failure) wins over raw `idle` so cascading failures aren't lost as
+        # silent successes. MCP init failures are excluded from the failed
+        # synthesis — see `_synthesize_status_from_events` and
+        # `_MCP_INIT_FAILURE_TYPES`.
         synthesized = _synthesize_status_from_events(events)
         if synthesized == "failed":
             status = "failed"
@@ -237,6 +254,9 @@ class ManagedAgentsDriver:
         # Surface error message from session.error events.
         error_reason = _extract_error_reason(events)
 
+        # Names of MCPs that failed to initialize — informational footer.
+        init_failed_mcps = _extract_init_failed_mcps(events)
+
         return ManagedSessionState(
             session_id=session_id,
             status=status,
@@ -246,6 +266,7 @@ class ManagedAgentsDriver:
             total_output_tokens=int(usage.get("output_tokens", 0)),
             final_text=final_text,
             error_reason=error_reason,
+            init_failed_mcps=init_failed_mcps,
         )
 
     # Hard cap on pagination loop in `list_events` — protects against a
@@ -379,24 +400,57 @@ class ManagedAgentsDriver:
 def _synthesize_status_from_events(events: list[dict]) -> str | None:
     """Map event-stream signals to a terminal status string, or None.
 
-    Scans the full batch before deciding so we prefer `"failed"` when both
-    `session.error` and `session.status_idle` appear together — error is the
-    actionable signal for operators. Returning `"completed"` on first idle
-    (the prior behavior) silently swallowed cascading errors.
+    `session.error` events are split into two classes:
+      - MCP init failures (`mcp_authentication_failed_error`,
+        `mcp_connection_failed_error`) — informational. The agent works
+        around the missing tool; the session can still complete cleanly.
+        These DO NOT trigger terminal-failed.
+      - Other errors (tool dispatch crashes, lifecycle failures, etc.) —
+        treated as terminal-failed because the agent couldn't recover.
+
+    Precedence: non-init `session.error` (failed) > `session.status_idle`
+    (completed). This preserves the cascading-failure detection while not
+    over-failing sessions whose only error noise is broken connectors.
     """
     has_idle = False
-    has_error = False
+    has_runtime_error = False
     for ev in events:
         et = ev.get("type", "")
         if et == "session.status_idle":
             has_idle = True
         elif et == "session.error":
-            has_error = True
-    if has_error:
+            err_type = (ev.get("error") or {}).get("type") or ev.get("error_type", "")
+            if err_type not in _MCP_INIT_FAILURE_TYPES:
+                has_runtime_error = True
+    if has_runtime_error:
         return "failed"
     if has_idle:
         return "completed"
     return None
+
+
+def _extract_init_failed_mcps(events: list[dict]) -> list[str]:
+    """Return the names of MCP servers that failed to initialize.
+
+    Used to surface the failed connectors in the completion summary so the
+    operator can fix or remove them from the agent preset. Init failures
+    don't fail the session per `_synthesize_status_from_events`, so the
+    operator's only signal is this list in the Telegram message.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for ev in events:
+        if ev.get("type") != "session.error":
+            continue
+        err = ev.get("error") or {}
+        err_type = err.get("type") or ev.get("error_type", "")
+        if err_type not in _MCP_INIT_FAILURE_TYPES:
+            continue
+        name = err.get("mcp_server_name") or ev.get("mcp_server_name") or ""
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
 
 
 def _extract_final_text(events: list[dict]) -> str | None:
