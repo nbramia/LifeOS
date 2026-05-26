@@ -271,9 +271,16 @@ class ManagedExecutor:
             # poll().
             final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+            # Persist the body alongside its length. The final text is also
+            # sent to Telegram, but the transcript is the only durable record
+            # an operator can grep later to audit what an agent actually said.
+            # For cloud sessions the agent.message event is also in the
+            # transcript verbatim, but it's wrapped in a managed_event_… line
+            # — keeping the parsed text here is materially easier to grep.
             self.transcript_store.append(
                 session.session_id, "managed_completed",
                 {"final_chars": len(final_text),
+                 "final_text": final_text,
                  "remote_status": state.status,
                  "init_failed_mcps": list(state.init_failed_mcps)},
             )
