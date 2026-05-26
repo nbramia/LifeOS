@@ -50,9 +50,11 @@ class FakeApi:
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/api/tasks":
             tag = request.url.params.get("tag")
+            status = request.url.params.get("status")
             matched = [
                 t for t in self.tasks.values()
-                if t.get("status") == "todo" and (tag in t.get("tags", []) if tag else True)
+                if (status is None or t.get("status") == status)
+                and (tag in t.get("tags", []) if tag else True)
             ]
             return httpx.Response(200, json={"tasks": matched, "total": len(matched)})
 
@@ -146,6 +148,63 @@ class _StubExecutor:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_worker_picks_up_urgent_status_tasks_too(tmp_path: Path):
+    """The Obsidian Tasks plugin distinguishes between `todo` (`[ ]`) and
+    `urgent` (`[!]`) statuses. Both should be eligible for #agent pickup —
+    the urgent status signals high-priority work the operator wants run
+    sooner, not 'skip the agent.'"""
+    api = FakeApi(tasks=[
+        {"id": "t-todo",   "description": "ordinary task",  "status": "todo",   "tags": ["agent", "local"]},
+        {"id": "t-urgent", "description": "urgent task",    "status": "urgent", "tags": ["agent", "local"]},
+        {"id": "t-other",  "description": "irrelevant",     "status": "todo",   "tags": ["other"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    # One tick should claim and dispatch both #agent tasks (todo + urgent).
+    handled = w.tick()
+    assert handled == 2
+    claimed_ids = {tid for tid, _ in executor.calls}
+    assert claimed_ids == {"t-todo", "t-urgent"}
+    # Both end at agent-completed
+    assert COMPLETED_TAG in api.tasks["t-todo"]["tags"]
+    assert COMPLETED_TAG in api.tasks["t-urgent"]["tags"]
+    # The non-#agent task is untouched
+    assert api.tasks["t-other"]["tags"] == ["other"]
+
+
+@pytest.mark.unit
+def test_worker_dedups_when_task_appears_under_both_statuses(tmp_path: Path):
+    """If a task somehow appears in both status='todo' and status='urgent'
+    response sets between fan-out calls (or if a later status query returns
+    a row already seen), the worker must claim it only once."""
+    # Construct a FakeApi that returns the same task for both status queries
+    # to simulate the edge case.
+    class _DupeApi(FakeApi):
+        def handler(self, request):
+            if request.method == "GET" and request.url.path == "/api/tasks":
+                tag = request.url.params.get("tag")
+                # Return the same task under any status query
+                matched = [
+                    t for t in self.tasks.values()
+                    if (tag in t.get("tags", []) if tag else True)
+                ]
+                return httpx.Response(200, json={"tasks": matched, "total": len(matched)})
+            return super().handler(request)
+
+    api = _DupeApi(tasks=[
+        {"id": "t1", "description": "dup", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    assert w.tick() == 1
+    assert len(executor.calls) == 1
+
 
 @pytest.mark.unit
 def test_dispatch_local_completes_and_marks_task_done(tmp_path: Path):
