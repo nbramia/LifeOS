@@ -372,6 +372,18 @@ class SessionStore:
                 (managed_id, _now(), task_id),
             )
 
+    def reset_managed_cursor(self, task_id: str) -> None:
+        """Drop any managed-cursor state for a task before a fresh session.
+
+        Without this, deleting a session row and re-claiming the same task_id
+        (e.g., operator re-arming a task after manual cleanup) would leak the
+        prior session's `last_event_id` into the new session's poll cursor —
+        triggering a 400 on the events endpoint because the new session has
+        never seen that id.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM managed_cursor WHERE task_id = ?", (task_id,))
+
     def add_session_hour_overhead(self, task_id: str, dollars: float) -> None:
         """Add Managed Agents session-hour overhead to the dollar counter."""
         if dollars <= 0:
