@@ -102,14 +102,21 @@ Rules:
        - "use claude", "with opus", "with claude opus", "with sonnet" → "claude"
     4) Otherwise, infer from capability cues in the title — tasks that
        require third-party cloud connectors should route to claude even
-       without an explicit cue. Trigger on mentions of:
-       - email actions: "gmail", "email", "inbox", "draft a reply",
-         "send an email", "superhuman"
-       - calendar actions: "calendar", "gcal", "schedule a meeting",
-         "events today", "free time", "book"
-       - drive / docs: "drive", "google doc", "spreadsheet", "shared doc"
-       - workplace systems: "slack", "asana", "ramp", "granola"
+       without an explicit cue. Use semantic judgment, not bare keyword
+       matching. Trigger only when the title clearly implies an action
+       against one of these systems:
+       - email actions: "search my gmail", "draft a reply", "send an
+         email", "check my inbox", "summarize my superhuman threads"
+       - calendar actions: "events today", "my calendar", "schedule a
+         meeting", "find free time on my calendar", "book a meeting"
+       - drive / docs: "google drive", "shared drive", "my drive", "a
+         google doc", "find a spreadsheet"
+       - workplace systems: "slack", "asana", "ramp", "granola" (these
+         only appear in workplace contexts; the bare word is usually safe)
        In each case set routing="claude"; routing_reason="implies <capability>".
+       Do NOT trigger on bare nouns where the meaning is ambiguous —
+       e.g., "drive home" (vehicle), "book recommendation" (literature),
+       "email signature design" (general design task).
     5) If none of the above match, set routing="ask" (the worker will
        ask the operator which model).
 - expected_output: classify what the agent will produce.

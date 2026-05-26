@@ -151,9 +151,10 @@ def test_preflight_prompt_recognizes_cloud_tag_as_mirror_of_local():
     """`#cloud` tag should route to claude — symmetric with `#local` → local.
     The rule lives in the prompt text Haiku consumes."""
     prompt = pf.build_preflight_prompt(title="anything", tags=["agent", "cloud"])
+    # Strong assertions: the literal rule text Haiku reads.
     assert 'tag list contains "cloud"' in prompt
-    assert '#cloud tag present' in prompt or '"#cloud tag present"' in prompt or 'cloud' in prompt
-    # Both directions should be documented in the rules
+    assert '#cloud tag present' in prompt
+    # Both directions documented in the rules
     assert '"local"' in prompt
     assert '"cloud"' in prompt
 
