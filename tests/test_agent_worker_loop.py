@@ -245,10 +245,12 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
 def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monkeypatch):
     """Without Managed Agents credentials configured the worker parks Claude-
     routed tasks at #agent-blocked. Same UX as ambiguity / sanity / ask."""
-    # Force vault_id empty regardless of operator's actual .env so the test
-    # exercises the not-configured branch deterministically.
+    # Force agent_preset_id + agent_environment_id empty regardless of the
+    # operator's actual .env so the test exercises the not-configured branch
+    # deterministically.
     from config.settings import settings as _settings
-    monkeypatch.setattr(_settings, "agent_vault_id", "", raising=False)
+    monkeypatch.setattr(_settings, "agent_preset_id", "", raising=False)
+    monkeypatch.setattr(_settings, "agent_environment_id", "", raising=False)
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent"]},
     ])
@@ -329,18 +331,16 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_managed_executor_includes_extra_mcp_servers(tmp_path: Path, monkeypatch):
-    """LIFEOS_AGENT_EXTRA_MCP_SERVERS (JSON array) gets parsed and appended to
-    mcp_servers alongside the default LifeOS MCP entry."""
+def test_managed_executor_constructed_when_preset_and_environment_set(tmp_path: Path, monkeypatch):
+    """When agent_preset_id + agent_environment_id are set (along with the API
+    key), the worker constructs a ManagedExecutor pointing at those IDs. MCP
+    servers and connectors are NOT passed at session-create — they live in the
+    agent preset."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
+    monkeypatch.setattr(_settings, "agent_preset_id", "agent_test", raising=False)
+    monkeypatch.setattr(_settings, "agent_environment_id", "env_test", raising=False)
     monkeypatch.setattr(_settings, "agent_vault_id", "vlt_test", raising=False)
-    monkeypatch.setattr(_settings, "mcp_http_url", "https://mcp.example.com/mcp", raising=False)
-    monkeypatch.setattr(_settings, "mcp_bearer_token", "tok", raising=False)
-    monkeypatch.setattr(_settings, "agent_extra_mcp_servers",
-                        '[{"name":"slack","url":"https://mcp.slack.com/mcp"},'
-                        '{"name":"ramp","url":"https://ramp.example/mcp","headers":{"X-API-Key":"k"}}]',
-                        raising=False)
 
     api = FakeApi(tasks=[])
     w = _make_worker(tmp_path, api,
@@ -348,32 +348,57 @@ def test_managed_executor_includes_extra_mcp_servers(tmp_path: Path, monkeypatch
                      local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
     me = w._get_managed_executor()
     assert me is not None
-    names = [s["name"] for s in me.mcp_servers]
-    assert names == ["lifeos", "slack", "ramp"]
-    # Headers carried through verbatim where provided; empty dict where omitted.
-    by_name = {s["name"]: s for s in me.mcp_servers}
-    assert by_name["slack"]["headers"] == {}
-    assert by_name["ramp"]["headers"] == {"X-API-Key": "k"}
+    assert me.agent_id == "agent_test"
+    assert me.environment_id == "env_test"
+    assert me.vault_ids == ["vlt_test"]
 
 
 @pytest.mark.unit
-def test_managed_executor_ignores_malformed_extra_mcp_servers(tmp_path: Path, monkeypatch, caplog):
-    """Malformed JSON / missing fields are logged and skipped — never raise."""
+def test_managed_executor_returns_none_when_preset_missing(tmp_path: Path, monkeypatch):
+    """Missing agent_preset_id → not configured → None (worker parks at #agent-blocked)."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
-    monkeypatch.setattr(_settings, "agent_vault_id", "vlt_test", raising=False)
-    monkeypatch.setattr(_settings, "mcp_http_url", "https://mcp.example.com/mcp", raising=False)
-    monkeypatch.setattr(_settings, "mcp_bearer_token", "tok", raising=False)
-    monkeypatch.setattr(_settings, "agent_extra_mcp_servers",
-                        'not valid json[', raising=False)
+    monkeypatch.setattr(_settings, "agent_preset_id", "", raising=False)
+    monkeypatch.setattr(_settings, "agent_environment_id", "env_test", raising=False)
+
+    api = FakeApi(tasks=[])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    assert w._get_managed_executor() is None
+
+
+@pytest.mark.unit
+def test_managed_executor_returns_none_when_environment_missing(tmp_path: Path, monkeypatch):
+    """Missing agent_environment_id → not configured → None."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
+    monkeypatch.setattr(_settings, "agent_preset_id", "agent_test", raising=False)
+    monkeypatch.setattr(_settings, "agent_environment_id", "", raising=False)
+
+    api = FakeApi(tasks=[])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    assert w._get_managed_executor() is None
+
+
+@pytest.mark.unit
+def test_managed_executor_omits_vault_ids_when_vault_unset(tmp_path: Path, monkeypatch):
+    """Vault is optional — agents with no OAuth-protected MCPs work without it."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
+    monkeypatch.setattr(_settings, "agent_preset_id", "agent_test", raising=False)
+    monkeypatch.setattr(_settings, "agent_environment_id", "env_test", raising=False)
+    monkeypatch.setattr(_settings, "agent_vault_id", "", raising=False)
 
     api = FakeApi(tasks=[])
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(),
                      local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
     me = w._get_managed_executor()
-    # Only LifeOS — the malformed extras were dropped, not raised.
-    assert [s["name"] for s in me.mcp_servers] == ["lifeos"]
+    assert me is not None
+    assert me.vault_ids == []
 
 
 @pytest.mark.unit

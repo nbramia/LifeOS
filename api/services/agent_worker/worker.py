@@ -706,59 +706,39 @@ class Worker:
     def _get_managed_executor(self):
         """Return the cached ManagedExecutor, lazily constructed.
 
-        Returns None if Managed Agents isn't configured (no api_key or vault_id) —
-        the dispatcher then parks the task at #agent-blocked with an operator-
-        facing explanation.
+        Returns None if Managed Agents isn't configured — the dispatcher then
+        parks the task at #agent-blocked with an operator-facing explanation.
+
+        Required settings (all must be set):
+          - `anthropic_api_key` — for the control-plane auth header
+          - `agent_preset_id` — `agent_…` ID created in the Anthropic console.
+            Holds the model, system prompt, MCP servers, and tools.
+          - `agent_environment_id` — `env_…` ID for where tool calls execute
+            (cloud container by default; self-hosted sandbox in #111).
+        Optional:
+          - `agent_vault_id` — `vlt_…` ID supplying OAuth credentials for
+            MCP servers declared in the agent preset. Without it, OAuth-
+            protected MCPs (Gmail, Slack, etc.) reject the agent's calls.
         """
         if self._managed_executor is not None:
             return self._managed_executor
         api_key = settings.anthropic_api_key
-        vault_id = settings.agent_vault_id
-        if not api_key or not vault_id:
+        agent_id = settings.agent_preset_id
+        environment_id = settings.agent_environment_id
+        if not api_key or not agent_id or not environment_id:
             return None
         from api.services.agent_worker.managed_driver import ManagedAgentsDriver
         from api.services.agent_worker.managed_executor import ManagedExecutor
-        driver = ManagedAgentsDriver(
-            api_key=api_key,
-            vault_id=vault_id,
-        )
-        # Default MCP server list: operator's LifeOS MCP endpoint if configured.
-        mcp_servers: list[dict[str, Any]] = []
-        if settings.mcp_http_url and settings.mcp_bearer_token:
-            mcp_servers.append({
-                "name": "lifeos",
-                "url": settings.mcp_http_url,
-                "headers": {"Authorization": f"Bearer {settings.mcp_bearer_token}"},
-            })
-        # Extra MCP servers (custom integrations the operator has configured in
-        # their Anthropic Vault — Ramp, Slack, Granola, etc.). Parsed as JSON;
-        # bad JSON is logged and ignored so a typo can't take down the worker.
-        extra_raw = (settings.agent_extra_mcp_servers or "").strip()
-        if extra_raw:
-            import json as _json
-            try:
-                extras = _json.loads(extra_raw)
-                if not isinstance(extras, list):
-                    raise ValueError("must be a JSON array")
-                for entry in extras:
-                    if not isinstance(entry, dict) or "name" not in entry or "url" not in entry:
-                        logger.warning("ignoring malformed LIFEOS_AGENT_EXTRA_MCP_SERVERS entry: %r", entry)
-                        continue
-                    mcp_servers.append({
-                        "name": entry["name"],
-                        "url": entry["url"],
-                        "headers": entry.get("headers", {}),
-                    })
-            except Exception as exc:
-                logger.warning("LIFEOS_AGENT_EXTRA_MCP_SERVERS parse failed (%s); ignoring", exc)
-        connectors = [c.strip() for c in (settings.agent_connectors or "").split(",") if c.strip()]
+        driver = ManagedAgentsDriver(api_key=api_key)
+        vault_ids = [settings.agent_vault_id] if settings.agent_vault_id else []
         self._managed_executor = ManagedExecutor(
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             driver=driver,
+            agent_id=agent_id,
+            environment_id=environment_id,
+            vault_ids=vault_ids,
             model=settings.agent_managed_model,
-            mcp_servers=mcp_servers,
-            connectors=connectors,
         )
         return self._managed_executor
 

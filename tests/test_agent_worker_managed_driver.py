@@ -1,9 +1,12 @@
 """Tests for ManagedAgentsDriver — HTTP request shape + parsing.
 
 These don't hit the real Managed Agents API; we wire `httpx.MockTransport`
-that asserts the request shape and returns canned responses, so the test
-verifies our client matches the documented schema. **Operator should still
-smoke-test against a real account** because the API is in beta.
+that asserts the request shape and returns canned responses. Verifies the
+client matches the documented schema at
+https://platform.claude.com/docs/en/managed-agents.
+
+**Operator should still smoke-test against a real account** because the API
+is in beta and the schema may shift.
 """
 from __future__ import annotations
 
@@ -19,16 +22,19 @@ from api.services.agent_worker.managed_driver import (
 from api.services.agent_worker.pricing import MANAGED_SESSION_HOUR_OVERHEAD
 
 
-def _build_driver(handler, *, vault_id="vlt_test"):
+def _build_driver(handler):
     transport = httpx.MockTransport(handler)
     client = httpx.Client(transport=transport, base_url="http://test")
     return ManagedAgentsDriver(
         api_key="sk-test",
-        base_url="http://test/v1/managed-agents",
+        base_url="http://test/v1",
         http_client=client,
-        vault_id=vault_id,
     )
 
+
+# ---------------------------------------------------------------------------
+# Auth + headers
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_driver_requires_api_key():
@@ -37,39 +43,92 @@ def test_driver_requires_api_key():
 
 
 @pytest.mark.unit
+def test_create_session_sends_required_headers():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"id": "sess_x"})
+
+    _build_driver(handler).create_session(
+        agent_id="agent_x", environment_id="env_y",
+    )
+    h = captured["headers"]
+    assert h["x-api-key"] == "sk-test"
+    assert h["anthropic-version"] == "2023-06-01"
+    assert h["anthropic-beta"] == "managed-agents-2026-04-01"
+    assert h["content-type"] == "application/json"
+
+
+@pytest.mark.unit
+def test_default_base_url_points_at_api_anthropic():
+    d = ManagedAgentsDriver(api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"id": "x"}))))
+    assert d.base_url == "https://api.anthropic.com/v1"
+
+
+# ---------------------------------------------------------------------------
+# create_session
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
 def test_create_session_request_shape_and_returns_id():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
-        captured["headers"] = dict(request.headers)
         captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"session_id": "sess_remote_xyz"})
+        return httpx.Response(200, json={"id": "sess_abc"})
 
-    driver = _build_driver(handler)
-    sid = driver.create_session(
-        system_prompt="be useful",
-        user_message="say hi",
-        model="claude-opus-4-7",
-        mcp_servers=[{"name": "lifeos", "url": "http://mcp"}],
-        connectors=["gmail"],
-        max_tokens=1000,
-        max_dollars=2.0,
-        max_wall_seconds=300,
+    sid = _build_driver(handler).create_session(
+        agent_id="agent_19QrftoZ",
+        environment_id="env_42",
+        vault_ids=["vlt_xyz"],
+        metadata={"lifeos_session_id": "sess_local"},
+        title="run smoke task",
     )
-    assert sid == "sess_remote_xyz"
+    assert sid == "sess_abc"
     assert captured["url"].endswith("/sessions")
-    assert captured["headers"]["x-api-key"] == "sk-test"
     body = captured["body"]
-    assert body["model"] == "claude-opus-4-7"
-    assert body["system_prompt"] == "be useful"
-    assert body["initial_message"] == "say hi"
-    assert body["vault_id"] == "vlt_test"
-    assert body["mcp_servers"] == [{"name": "lifeos", "url": "http://mcp"}]
-    assert body["connectors"] == ["gmail"]
-    assert body["max_tokens"] == 1000
-    assert body["max_dollars"] == 2.0
-    assert body["max_wall_seconds"] == 300
+    assert body["agent"] == "agent_19QrftoZ"
+    assert body["environment_id"] == "env_42"
+    assert body["vault_ids"] == ["vlt_xyz"]
+    assert body["metadata"] == {"lifeos_session_id": "sess_local"}
+    assert body["title"] == "run smoke task"
+    # The new schema has NO inline system_prompt / mcp_servers / connectors / budget;
+    # all of those live on the agent preset now.
+    assert "system_prompt" not in body
+    assert "mcp_servers" not in body
+    assert "connectors" not in body
+    assert "max_tokens" not in body
+
+
+@pytest.mark.unit
+def test_create_session_omits_optional_fields_when_empty():
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "sess"})
+
+    _build_driver(handler).create_session(
+        agent_id="agent_x", environment_id="env_y",
+    )
+    body = captured["body"]
+    assert "vault_ids" not in body
+    assert "metadata" not in body
+    assert "title" not in body
+
+
+@pytest.mark.unit
+def test_create_session_accepts_session_id_alias_too():
+    """The API returns `id`, but some SDK variants return `session_id`. Accept both."""
+    def handler(request):
+        return httpx.Response(200, json={"session_id": "sess_aliased"})
+
+    sid = _build_driver(handler).create_session(
+        agent_id="agent_x", environment_id="env_y",
+    )
+    assert sid == "sess_aliased"
 
 
 @pytest.mark.unit
@@ -77,10 +136,9 @@ def test_create_session_raises_when_id_missing():
     def handler(request):
         return httpx.Response(200, json={"foo": "bar"})
 
-    driver = _build_driver(handler)
     with pytest.raises(RuntimeError, match="missing session id"):
-        driver.create_session(
-            system_prompt="x", user_message="y", model="claude-opus-4-7",
+        _build_driver(handler).create_session(
+            agent_id="agent_x", environment_id="env_y",
         )
 
 
@@ -89,113 +147,224 @@ def test_create_session_raises_on_http_error():
     def handler(request):
         return httpx.Response(500, text="server error")
 
-    driver = _build_driver(handler)
     with pytest.raises(httpx.HTTPStatusError):
-        driver.create_session(system_prompt="x", user_message="y", model="m")
+        _build_driver(handler).create_session(
+            agent_id="agent_x", environment_id="env_y",
+        )
 
 
 @pytest.mark.unit
-def test_get_session_state_parses_full_response():
+def test_create_session_posts_initial_message_when_provided():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url), json.loads(request.content)))
+        if str(request.url).endswith("/sessions"):
+            return httpx.Response(200, json={"id": "sess_z"})
+        return httpx.Response(200, json={"ok": True})
+
+    sid = _build_driver(handler).create_session(
+        agent_id="agent_x", environment_id="env_y",
+        initial_message="please do the thing",
+    )
+    assert sid == "sess_z"
+    assert len(calls) == 2
+    # First call = create
+    assert calls[0][1].endswith("/sessions")
+    # Second call = events with user.message
+    method, url, body = calls[1]
+    assert method == "POST"
+    assert url.endswith("/sessions/sess_z/events")
+    assert body == {
+        "events": [{"type": "user.message", "content": [{"type": "text", "text": "please do the thing"}]}],
+    }
+
+
+# ---------------------------------------------------------------------------
+# get_session_state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_get_session_state_parses_basic_response():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         assert request.url.path.endswith("/sessions/sess_abc")
         return httpx.Response(200, json={
-            "session_id": "sess_abc",
+            "id": "sess_abc",
             "status": "running",
             "events": [
-                {"id": "evt_1", "type": "agent.message", "payload": {"text": "hi"}},
-                {"id": "evt_2", "type": "tool.call", "payload": {"tool": "Bash"}},
+                {"id": "evt_1", "type": "agent.message", "content": [{"type": "text", "text": "hi"}]},
+                {"id": "evt_2", "type": "agent.tool_use", "payload": {"name": "Bash"}},
             ],
             "usage": {"input_tokens": 100, "output_tokens": 40},
-            "final_text": None,
-            "error": None,
         })
 
-    driver = _build_driver(handler)
-    state = driver.get_session_state("sess_abc")
+    state = _build_driver(handler).get_session_state("sess_abc")
     assert state.session_id == "sess_abc"
     assert state.status == "running"
     assert state.last_event_id == "evt_2"
     assert len(state.new_events) == 2
     assert state.total_input_tokens == 100
     assert state.total_output_tokens == 40
-    assert state.final_text is None
-    assert state.error_reason is None
 
 
 @pytest.mark.unit
-def test_get_session_state_uses_since_cursor():
+def test_get_session_state_uses_after_cursor():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["params"] = dict(request.url.params)
-        return httpx.Response(200, json={
-            "status": "running", "events": [], "usage": {}, "final_text": None, "error": None,
-        })
+        return httpx.Response(200, json={"status": "running", "events": [], "usage": {}})
 
-    driver = _build_driver(handler)
-    driver.get_session_state("sess_abc", since_event_id="evt_7")
-    assert captured["params"]["since"] == "evt_7"
+    _build_driver(handler).get_session_state("sess_abc", since_event_id="evt_7")
+    assert captured["params"]["after"] == "evt_7"
 
 
 @pytest.mark.unit
-def test_get_session_state_parses_terminal_with_final_text_and_error():
+def test_get_session_state_synthesizes_completed_from_idle_event():
+    """When raw status doesn't say "completed", but an idle event arrived, we synthesize."""
     def handler(request):
         return httpx.Response(200, json={
-            "status": "completed", "events": [], "usage": {"input_tokens": 50, "output_tokens": 80},
-            "final_text": "done!", "error": None,
+            "status": "running",  # API hasn't transitioned status yet
+            "events": [
+                {"id": "evt_1", "type": "agent.message",
+                 "content": [{"type": "text", "text": "all done!"}]},
+                {"id": "evt_2", "type": "session.status_idle"},
+            ],
+            "usage": {"input_tokens": 50, "output_tokens": 80},
         })
 
     state = _build_driver(handler).get_session_state("sess")
     assert state.status == "completed"
-    assert state.final_text == "done!"
+    assert state.final_text == "all done!"
     assert state.total_output_tokens == 80
 
 
 @pytest.mark.unit
-def test_get_session_state_failed_carries_error_message():
+def test_get_session_state_synthesizes_failed_from_error_event():
     def handler(request):
         return httpx.Response(200, json={
-            "status": "failed", "events": [], "usage": {},
-            "final_text": None, "error": {"message": "remote tool crashed"},
+            "status": "running",
+            "events": [
+                {"id": "evt_1", "type": "session.error",
+                 "payload": {"message": "MCP server unreachable"}},
+            ],
+            "usage": {},
         })
 
     state = _build_driver(handler).get_session_state("sess")
     assert state.status == "failed"
-    assert state.error_reason == "remote tool crashed"
+    assert state.error_reason == "MCP server unreachable"
 
+
+@pytest.mark.unit
+def test_get_session_state_concatenates_text_blocks_from_latest_message():
+    def handler(request):
+        return httpx.Response(200, json={
+            "status": "completed",
+            "events": [
+                {"id": "evt_1", "type": "agent.message",
+                 "content": [{"type": "text", "text": "draft 1"}]},
+                {"id": "evt_2", "type": "agent.message",
+                 "content": [
+                     {"type": "text", "text": "final "},
+                     {"type": "text", "text": "answer"},
+                 ]},
+            ],
+            "usage": {},
+        })
+
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.final_text == "final answer"
+
+
+@pytest.mark.unit
+def test_get_session_state_treats_404_as_cancelled():
+    """A session that was DELETEd returns 404 on subsequent polls — we map to cancelled."""
+    def handler(request):
+        return httpx.Response(404, text="not found")
+
+    state = _build_driver(handler).get_session_state("sess_gone")
+    assert state.status == "cancelled"
+    assert "not found" in (state.error_reason or "")
+
+
+@pytest.mark.unit
+def test_get_session_state_no_events_no_final_text():
+    def handler(request):
+        return httpx.Response(200, json={"status": "running", "events": [], "usage": {}})
+
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.final_text is None
+    assert state.error_reason is None
+    assert state.last_event_id is None
+
+
+# ---------------------------------------------------------------------------
+# post_user_message
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_post_user_message_request_shape():
     captured = {}
 
     def handler(request):
+        captured["url"] = str(request.url)
         captured["method"] = request.method
         captured["body"] = json.loads(request.content)
         return httpx.Response(200, json={"ok": True})
 
-    _build_driver(handler).post_user_message("sess", "and here is the answer")
+    _build_driver(handler).post_user_message("sess_abc", "and here is the answer")
     assert captured["method"] == "POST"
-    assert captured["body"] == {"role": "user", "content": "and here is the answer"}
+    assert captured["url"].endswith("/sessions/sess_abc/events")
+    assert captured["body"] == {
+        "events": [{
+            "type": "user.message",
+            "content": [{"type": "text", "text": "and here is the answer"}],
+        }],
+    }
 
 
 @pytest.mark.unit
-def test_kill_session_uses_delete_and_swallows_errors():
+def test_post_user_message_raises_on_http_error():
+    def handler(request):
+        return httpx.Response(400, text="bad")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _build_driver(handler).post_user_message("sess", "x")
+
+
+# ---------------------------------------------------------------------------
+# kill_session
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_kill_session_uses_delete_on_sessions_path():
     captured = {}
 
     def handler(request):
         captured["method"] = request.method
+        captured["url"] = str(request.url)
         return httpx.Response(204)
 
     _build_driver(handler).kill_session("sess", reason="budget")
     assert captured["method"] == "DELETE"
+    assert captured["url"].endswith("/sessions/sess")
 
-    # And the error path is swallowed (logged, not raised).
+
+@pytest.mark.unit
+def test_kill_session_swallows_errors():
+    """kill_session is best-effort; raising would mask the original failure that triggered it."""
     def boom(request):
-        return httpx.Response(500)
+        raise httpx.ConnectError("network down")
 
-    _build_driver(boom).kill_session("sess")  # must not raise
+    # Must not raise.
+    _build_driver(boom).kill_session("sess")
 
+
+# ---------------------------------------------------------------------------
+# Cost helper
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_managed_session_cost_includes_overhead():

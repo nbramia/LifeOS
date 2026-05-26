@@ -151,26 +151,45 @@ class Settings(BaseSettings):
         default="",
         alias="LIFEOS_AGENT_VAULT_ID",
         description="Managed Agents Vault id holding OAuth credentials for "
-                    "Gmail / Calendar / Drive / Superhuman / Zapier. Created "
-                    "in the Anthropic console; see docs/guides/agent-worker-setup.md."
+                    "MCP servers declared in the agent preset (Gmail / Calendar "
+                    "/ Drive / Superhuman / custom MCPs). Created in the "
+                    "Anthropic console; see docs/guides/agent-worker-setup.md. "
+                    "Passed as the sole entry in `vault_ids` on session create."
     )
+    agent_preset_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_PRESET_ID",
+        description="Managed Agents Agent preset id (e.g. 'agent_…'). Created "
+                    "once in the Anthropic console; the preset holds the model, "
+                    "system prompt, MCP servers, and tools for every Claude-"
+                    "routed session. See docs/guides/agent-worker-setup.md for "
+                    "the YAML pattern."
+    )
+    agent_environment_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ENVIRONMENT_ID",
+        description="Managed Agents Environment id (e.g. 'env_…'). Created in "
+                    "the Anthropic console; controls where tool calls execute "
+                    "(cloud container by default, self-hosted sandbox in #111)."
+    )
+    # Deprecated: kept so existing .env files don't error on parse. Both fields
+    # were used by the pre-refactor driver to build per-session MCP / connector
+    # lists. The real Managed Agents API expects those to live in the agent
+    # preset (configured in the console), not in the session-create body.
     agent_connectors: str = Field(
         default="",
         alias="LIFEOS_AGENT_CONNECTORS",
-        description="Comma-separated list of Managed Agents Connector slugs to "
-                    "attach to every Claude-routed session (e.g. "
-                    "'gmail,google-calendar,google-drive,superhuman,zapier')."
+        description="Deprecated. MCP servers and connectors now live in the "
+                    "agent preset (LIFEOS_AGENT_PRESET_ID), not in session "
+                    "creation. This field is parsed but unused; safe to remove "
+                    "from your .env."
     )
     agent_extra_mcp_servers: str = Field(
         default="",
         alias="LIFEOS_AGENT_EXTRA_MCP_SERVERS",
-        description="JSON array of additional MCP servers to attach to every "
-                    "Claude-routed session, in addition to the LifeOS MCP. "
-                    "Each entry is {name, url, headers?}. Headers are optional "
-                    "— for Vault-stored MCPs (Ramp, Granola, Asana, Slack, ...) "
-                    "Anthropic uses the Vault's OAuth creds. Example: "
-                    "'[{\"name\":\"slack\",\"url\":\"https://mcp.slack.com/mcp\"}]'. "
-                    "Empty string disables."
+        description="Deprecated. MCP servers now live in the agent preset "
+                    "(LIFEOS_AGENT_PRESET_ID), not in session creation. This "
+                    "field is parsed but unused; safe to remove from your .env."
     )
     mcp_http_url: str = Field(
         default="",
