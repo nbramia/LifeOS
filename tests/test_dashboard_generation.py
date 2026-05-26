@@ -73,6 +73,23 @@ class TestDashboardStructure:
         block = text[start:end]
         assert "status.name includes Urgent" in block
 
+    def test_section_order(self, tm):
+        """Urgent/In Progress sit above Due This Week; Stale is second-to-last."""
+        text = _dashboard_text(tm)
+        ordered = [
+            "## Urgent",
+            "## In Progress",
+            "## Due This Week",
+            "## By Tag",
+            "## All Open",
+            "## Stale — open 30+ days",
+            "## Completed",
+        ]
+        positions = [text.index(h) for h in ordered]
+        assert positions == sorted(positions), (
+            f"Sections out of order: {list(zip(ordered, positions))}"
+        )
+
     def test_auto_generated_marker(self, tm):
         text = _dashboard_text(tm)
         assert "AUTO-GENERATED" in text
