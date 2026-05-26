@@ -411,15 +411,19 @@ class Worker:
             self._handle_outcome(session, task, outcome)
             return
 
-        # Claude route: deferred to Issue D. Roll the tag back and notify.
+        # Claude route: deferred to Issue D. Park at #agent-blocked rather
+        # than re-tagging to #agent — same blocked semantics as ambiguity /
+        # sanity / routing-ask, and the operator can drop the block tag when
+        # Issue D is installed to retry.
         if pre.routing == ROUTE_CLAUDE:
-            self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
+            self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
             self.session_store.update_status(task_id, STATUS_BLOCKED)
             self.transcript_store.append(sid, "claude_routing_deferred", {})
             self._notify(
-                f"⏸ Agent worker: task '{title}' routed to Claude but Managed "
-                f"Agents driver isn't installed yet (Issue D). Task left at "
-                f"#{AGENT_TAG} for when D ships."
+                f"⏸ Agent worker: task '{title}' routed to Claude but the "
+                f"Managed Agents driver isn't installed yet (Issue D). Task "
+                f"parked at #{BLOCKED_TAG} — retag with #{AGENT_TAG} once "
+                f"Issue D ships."
             )
             return
 
@@ -465,7 +469,9 @@ class Worker:
     def _completion_summary(self, session: Session, task: dict[str, Any], outcome) -> str:
         refreshed = self.session_store.get(session.task_id) or session
         tokens = (refreshed.total_input_tokens or 0) + (refreshed.total_output_tokens or 0)
-        wall = int(time.time()) - int(refreshed.started_at)
+        # Use active seconds (excludes sleeps) so the figure reflects real
+        # work, not wall time since the session was first created.
+        active_s = int(refreshed.total_active_seconds or 0)
         expected = refreshed.expected_output or "text"
         title = task.get("description", session.task_id)
         result_blurb = (outcome.final_text or "(no text response)").strip()
@@ -474,7 +480,7 @@ class Worker:
         return (
             f"✅ Agent worker: completed '{title}' "
             f"({expected}) — {tokens:,} tokens, ${refreshed.total_dollars:.2f}, "
-            f"{wall}s wall.\n\n{result_blurb}"
+            f"{active_s}s active.\n\n{result_blurb}"
         )
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:

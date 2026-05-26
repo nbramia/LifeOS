@@ -174,6 +174,19 @@ curl -X POST http://localhost:8000/api/tasks \
 
 To pause new claims without stopping the worker, set `LIFEOS_AGENT_DAILY_CAP_DOLLARS=0` and restart — the worker keeps polling but refuses to claim anything new.
 
+### Security model
+
+By design, the local executor (Issue C) runs `Bash`, `Read`, `Write`, `Edit`, and `WebFetch` with **no sandbox** — the agent has the same filesystem and shell access as the operator. This is intentional (see [AGENTS.md § Design Principles](../../AGENTS.md)) and means an agent task can:
+
+- Read or modify any file the operator can read or modify
+- Execute arbitrary shell commands (including `rm`, `curl`, etc.)
+- Fetch any URL the host can reach (SSRF surface — an internal HTTP service accessible from the host is reachable to the agent)
+
+The Haiku preflight sanity-check is the only guard against destructive-shaped tasks. Operators should:
+- Audit `#agent`-tagged tasks before they reach the worker (look at your task list)
+- Keep the daily $-cap set so even a runaway loop can't burn unlimited budget
+- Treat agent-touchable secrets the same as operator-touchable secrets
+
 ---
 
 ## Troubleshooting

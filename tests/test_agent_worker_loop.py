@@ -17,6 +17,7 @@ import pytest
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
+    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_YIELDED,
@@ -213,7 +214,7 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
         {"id": "t1", "description": "long task", "status": "todo", "tags": ["agent", "local"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(
-        status="budget_exceeded", reason="budget exceeded (max_tokens)",
+        status=STATUS_BUDGET_EXCEEDED, reason="budget exceeded (max_tokens)",
     ))
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="local"),
@@ -225,7 +226,9 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_claude_routing_defers_to_issue_d_and_rolls_tag_back(tmp_path: Path):
+def test_claude_routing_defers_to_issue_d_with_blocked_tag(tmp_path: Path):
+    """Claude-routed tasks land in #agent-blocked (same as other parked
+    states) until Issue D installs the managed-agents driver."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent"]},
     ])
@@ -234,9 +237,9 @@ def test_claude_routing_defers_to_issue_d_and_rolls_tag_back(tmp_path: Path):
     w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
     w.tick()
 
-    # Claude path isn't built yet — tag rolls back to #agent for retry once Issue D ships.
     assert executor.calls == []
-    assert AGENT_TAG in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert AGENT_TAG not in api.tasks["t1"]["tags"]
     assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     sent = w._sent_telegram  # type: ignore[attr-defined]
     assert any("Managed Agents" in s for s in sent)

@@ -219,6 +219,85 @@ def test_executor_records_local_spend_is_zero_dollars(tmp_path: Path, fake_sessi
 
 
 @pytest.mark.unit
+def test_executor_normalizes_openai_tool_calls(tmp_path: Path, fake_session):
+    """LocalLLMClient emits OpenAI-format tool_calls; the executor must convert.
+
+    Without normalization, the dispatcher receives `name=""` and routes to
+    "unknown tool", breaking the agent loop on every real tool call.
+    """
+    store, session = fake_session
+    openai_shape_call = {
+        "id": "call_abc",
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "arguments": '{"command": "echo normalized"}',
+        },
+    }
+    llm = _ScriptedLLM([
+        _FakeResponse(text="", usage=_FakeUsage(20, 10), tool_calls=[openai_shape_call]),
+        _FakeResponse(text="ok", usage=_FakeUsage(5, 5)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(session, {"id": "t1", "description": "x"})
+    assert outcome.status == STATUS_COMPLETED
+    # The dispatcher should have received the right tool name + args.
+    second_msgs = llm.calls[1]["messages"]
+    tool_result = next(
+        b for m in second_msgs if isinstance(m["content"], list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    )
+    assert "normalized" in tool_result["content"]
+
+
+@pytest.mark.unit
+def test_executor_tracks_active_seconds_not_wall(tmp_path: Path, fake_session):
+    """A completed turn should bump total_active_seconds — used for wall budget."""
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(10, 5)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    executor.execute(session, {"id": "t1", "description": "x"})
+    refreshed = store.get("t1")
+    assert refreshed.total_active_seconds > 0
+
+
+@pytest.mark.unit
+def test_executor_truncates_persisted_tool_use_to_match_dispatch(tmp_path: Path):
+    """If MAX_TOOL_CALLS_PER_TURN truncates dispatch, the persisted assistant
+    turn must drop the surplus tool_use blocks so the next turn has 1:1
+    tool_use ↔ tool_result counts."""
+    from api.services.agent_worker.local_executor import MAX_TOOL_CALLS_PER_TURN
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    store.create(task_id="t1", routing="local",
+                 budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 5.0},
+                 expected_output="text")
+    session = store.get("t1")
+    too_many = [
+        {"id": f"c{i}", "name": "Bash", "input": {"command": "true"}}
+        for i in range(MAX_TOOL_CALLS_PER_TURN + 5)
+    ]
+    llm = _ScriptedLLM([
+        _FakeResponse(text="", usage=_FakeUsage(5, 5), tool_calls=too_many),
+        _FakeResponse(text="ok", usage=_FakeUsage(5, 5)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    executor.execute(session, {"id": "t1", "description": "x"})
+    # Second LLM call's messages must have matching tool_use / tool_result counts.
+    second_msgs = llm.calls[1]["messages"]
+    assistant_msg = next(m for m in second_msgs if m["role"] == "assistant")
+    user_msg = next(m for m in second_msgs if m["role"] == "user"
+                    and isinstance(m["content"], list)
+                    and m["content"] and isinstance(m["content"][0], dict)
+                    and m["content"][0].get("type") == "tool_result")
+    use_count = sum(1 for b in assistant_msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use")
+    result_count = len(user_msg["content"])
+    assert use_count == result_count == MAX_TOOL_CALLS_PER_TURN
+
+
+@pytest.mark.unit
 def test_pricing_table_local_is_free():
     assert cost_for("local", 1_000_000, 1_000_000) == pytest.approx(0.0)
 

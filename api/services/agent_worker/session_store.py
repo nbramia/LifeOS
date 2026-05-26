@@ -56,6 +56,7 @@ class Session:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_dollars: float = 0.0
+    total_active_seconds: float = 0.0
 
 
 _SCHEMA = """
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_input_tokens        INTEGER NOT NULL DEFAULT 0,
     total_output_tokens       INTEGER NOT NULL DEFAULT 0,
     total_dollars             REAL    NOT NULL DEFAULT 0.0,
+    total_active_seconds      REAL    NOT NULL DEFAULT 0.0,
     expected_output           TEXT,
     parent_session_id         TEXT,
     managed_agent_session_id  TEXT
@@ -273,6 +275,23 @@ class SessionStore:
                 (tokens_in, tokens_out, dollars, _now(), task_id),
             )
 
+    def record_active_seconds(self, task_id: str, seconds: float) -> None:
+        """Add to a session's cumulative active-execution seconds.
+
+        Active seconds exclude sleep time — this is the duration of LLM calls
+        + tool dispatch, used by the wall-clock budget check. A session that
+        spends 8 hours sleeping but only 5 minutes actually running has
+        total_active_seconds ≈ 300, not 28800.
+        """
+        if seconds <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET total_active_seconds = total_active_seconds + ?, "
+                "last_activity_at = ? WHERE task_id = ?",
+                (float(seconds), _now(), task_id),
+            )
+
     # ------------------------------------------------------------------
     # Messages (local-path conversation log)
     # ------------------------------------------------------------------
@@ -281,28 +300,37 @@ class SessionStore:
         self,
         session_id: str,
         role: str,
-        content: dict | list,
+        content: dict | list | str,
         tokens_in: int = 0,
         tokens_out: int = 0,
     ) -> int:
-        """Append one message; return its 0-based turn_index."""
+        """Append one message; return its 0-based turn_index.
+
+        Uses a single INSERT that computes the next turn_index inside the
+        statement, so concurrent appends from sibling worker processes
+        (Issue E) can't pick the same index — SQLite serializes the write.
+        """
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_index "
-                "FROM messages WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            turn_index = int(row["next_index"])
             conn.execute(
                 """
                 INSERT INTO messages (
                     session_id, turn_index, role, content_json,
                     tokens_in, tokens_out, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                )
+                SELECT ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ?, ?, ?
+                FROM messages WHERE session_id = ?
                 """,
-                (session_id, turn_index, role, json.dumps(content), tokens_in, tokens_out, _now()),
+                (
+                    session_id, role, json.dumps(content),
+                    tokens_in, tokens_out, _now(),
+                    session_id,
+                ),
             )
-        return turn_index
+            row = conn.execute(
+                "SELECT MAX(turn_index) AS i FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["i"])
 
     def get_messages(self, session_id: str) -> list[dict]:
         """Return all messages in order as {role, content} dicts ready for the LLM."""
@@ -352,6 +380,11 @@ class SessionStore:
             total_input_tokens=row["total_input_tokens"],
             total_output_tokens=row["total_output_tokens"],
             total_dollars=row["total_dollars"],
+            total_active_seconds=(
+                row["total_active_seconds"]
+                if "total_active_seconds" in row.keys()
+                else 0.0
+            ),
             expected_output=row["expected_output"],
             parent_session_id=row["parent_session_id"],
             managed_agent_session_id=row["managed_agent_session_id"],

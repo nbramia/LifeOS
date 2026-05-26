@@ -48,6 +48,57 @@ MAX_TOOL_CALLS_PER_TURN = 16
 PER_TURN_MAX_TOKENS = 4096
 
 
+def _normalize_tool_calls(raw_calls) -> list[dict]:
+    """Normalize tool_calls into Anthropic-shape dicts.
+
+    `LocalLLMClient` returns raw OpenAI-format calls
+    (`{"id": ..., "type": "function", "function": {"name": ..., "arguments": "<json>"}}`).
+    `AnthropicLLMClient` returns Anthropic-shape `_ToolUseBlock` instances
+    or dicts with `name`/`input`. The executor wants a single shape so the
+    dispatcher and persistence layer stay simple. This function detects the
+    shape and produces `{"id", "name", "input"}` dicts in all cases.
+    """
+    if not raw_calls:
+        return []
+    normalized: list[dict] = []
+    for call in raw_calls:
+        # Anthropic-shape: object/dict with a `.name` and `.input`.
+        anth_name = getattr(call, "name", None)
+        anth_input = getattr(call, "input", None)
+        if anth_name and anth_input is not None:
+            normalized.append({
+                "id": getattr(call, "id", "") or f"call_{uuid.uuid4().hex[:12]}",
+                "name": anth_name,
+                "input": anth_input or {},
+            })
+            continue
+        if isinstance(call, dict):
+            if "function" in call and isinstance(call["function"], dict):
+                # OpenAI-shape — `arguments` is a JSON string.
+                func = call["function"]
+                args_raw = func.get("arguments", "{}")
+                if isinstance(args_raw, str):
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {}
+                else:
+                    args = args_raw or {}
+                normalized.append({
+                    "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": func.get("name", ""),
+                    "input": args,
+                })
+            elif "name" in call:
+                # Anthropic-shape dict.
+                normalized.append({
+                    "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": call["name"],
+                    "input": call.get("input") or {},
+                })
+    return normalized
+
+
 @dataclass
 class ExecutorOutcome:
     """What happened during a single `execute(session)` invocation."""
@@ -123,49 +174,53 @@ class LocalExecutor:
         """
         sid = session.session_id
         budget = session.budget or {}
-        wall_deadline = self._wall_deadline(session, budget)
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
         if not self.session_store.get_messages(sid):
             self._seed_conversation(session, task, budget)
 
         while True:
-            # Wall-clock budget check.
-            if wall_deadline and time.time() > wall_deadline:
-                return self._finalize_budget_exceeded(session, "wall_seconds")
-
-            # Token budget check.
+            # Wall-clock budget check — uses cumulative active seconds, not
+            # wall-from-start (so sleeps don't eat into the run budget).
             updated = self.session_store.get(session.task_id)
+            if budget.get("wall_seconds"):
+                if (updated.total_active_seconds or 0) >= budget["wall_seconds"]:
+                    return self._finalize_budget_exceeded(session, "wall_seconds")
             tokens_used = (updated.total_input_tokens or 0) + (updated.total_output_tokens or 0)
             if budget.get("max_tokens") and tokens_used >= budget["max_tokens"]:
                 return self._finalize_budget_exceeded(session, "max_tokens")
-            # Dollar budget (local is $0 but the path is exercised for parity).
             if budget.get("max_dollars") is not None and (updated.total_dollars or 0) >= budget["max_dollars"]:
                 return self._finalize_budget_exceeded(session, "max_dollars")
 
+            turn_start = time.time()
             try:
                 response = self._call_llm(sid)
             except Exception as exc:
                 logger.exception("local executor LLM call failed: %s", exc)
+                # Charge the time we spent trying so the budget reflects real
+                # work even on failure.
+                self.session_store.record_active_seconds(session.task_id, time.time() - turn_start)
                 return self._finalize_failed(session, f"LLM call failed: {exc}")
 
-            self._persist_assistant_turn(sid, response)
-            self._record_spend(session, response)
+            # Normalize tool_calls to a single shape (OpenAI ↔ Anthropic).
+            normalized_calls = _normalize_tool_calls(response.tool_calls)
+            truncated_calls = normalized_calls[:MAX_TOOL_CALLS_PER_TURN]
 
-            tool_calls = response.tool_calls or []
-            if not tool_calls:
+            self._persist_assistant_turn(sid, response, truncated_calls)
+            self._record_spend(session, response)
+            self.session_store.record_active_seconds(session.task_id, time.time() - turn_start)
+
+            if not truncated_calls:
                 # Final answer — no more tool calls expected.
                 return self._finalize_completed(session, response.text)
 
             yielded_seconds: int | None = None
             tool_results: list[dict] = []
-            for i, call in enumerate(tool_calls[:MAX_TOOL_CALLS_PER_TURN]):
-                name = getattr(call, "name", None) or call.get("name", "")
-                args = getattr(call, "input", None) or call.get("input", {})
-                call_id = (getattr(call, "id", None)
-                           or call.get("id")
-                           or f"call_{uuid.uuid4().hex[:12]}")
-                result: ToolResult = self.tools.dispatch(name, args or {})
+            for call in truncated_calls:
+                name = call["name"]
+                args = call["input"]
+                call_id = call["id"]
+                result: ToolResult = self.tools.dispatch(name, args)
                 self.transcript_store.append(
                     sid,
                     "tool_call",
@@ -186,6 +241,20 @@ class LocalExecutor:
                     yielded_seconds = result.yield_seconds
                     # Stop dispatching further tools this turn — we're going to yield.
                     break
+
+            # If the agent yielded mid-turn, we may have fewer tool_results
+            # than persisted tool_use blocks. Pad with synthetic results so
+            # the next turn satisfies Anthropic's 1:1 invariant.
+            if yielded_seconds is not None and len(tool_results) < len(truncated_calls):
+                already_handled = {tr["tool_use_id"] for tr in tool_results}
+                for call in truncated_calls:
+                    if call["id"] not in already_handled:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": call["id"],
+                            "content": "skipped — sibling tool requested a sleep yield first",
+                            "is_error": False,
+                        })
 
             # Persist the tool_results as a user-role turn (Anthropic convention).
             self.session_store.append_message(sid, "user", tool_results)
@@ -226,22 +295,19 @@ class LocalExecutor:
             tools=self.tools.definitions(),
         )
 
-    def _persist_assistant_turn(self, session_id: str, response) -> None:
-        # Build an Anthropic-style content list mixing text + tool_use blocks.
+    def _persist_assistant_turn(self, session_id: str, response, normalized_calls: list[dict]) -> None:
+        """Persist the assistant turn using the *truncated* normalized call list
+        so tool_use and tool_result block counts stay 1:1 in later turns.
+        """
         content_blocks: list[dict] = []
         if response.text:
             content_blocks.append({"type": "text", "text": response.text})
-        for call in (response.tool_calls or []):
-            name = getattr(call, "name", None) or call.get("name", "")
-            args = getattr(call, "input", None) or call.get("input", {})
-            call_id = (getattr(call, "id", None)
-                       or call.get("id")
-                       or f"call_{uuid.uuid4().hex[:12]}")
+        for call in normalized_calls:
             content_blocks.append({
                 "type": "tool_use",
-                "id": call_id,
-                "name": name,
-                "input": args,
+                "id": call["id"],
+                "name": call["name"],
+                "input": call["input"],
             })
         usage = getattr(response, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) if usage else 0
@@ -263,12 +329,6 @@ class LocalExecutor:
     # ------------------------------------------------------------------
     # Finalizers
     # ------------------------------------------------------------------
-
-    def _wall_deadline(self, session, budget: dict) -> float | None:
-        wall = budget.get("wall_seconds")
-        if not wall:
-            return None
-        return float(session.started_at) + float(wall)
 
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_COMPLETED)
