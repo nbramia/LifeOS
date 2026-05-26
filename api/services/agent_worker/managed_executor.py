@@ -60,12 +60,24 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     parts = [f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    # Inject the operator's local date. The cloud model has its own
+    # training cutoff and Anthropic does not inject "today" into managed
+    # sessions; without this, day-relative reasoning on calendar / tasks
+    # picks an arbitrary date inside the cutoff window.
     parts.append(
+        f"today={_today()}; "
         f"expected_output={expected_output}; "
         f"soft budget ~{budget.get('wall_seconds')}s wall / "
         f"~{budget.get('max_tokens')} tokens / {dollars_str}."
     )
     return "\n\n".join(parts)
+
+
+def _today() -> str:
+    """Local today as YYYY-MM-DD (weekday). Module-level for test override."""
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d (%A)")
 
 
 class ManagedExecutor:

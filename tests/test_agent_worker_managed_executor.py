@@ -109,6 +109,13 @@ def test_start_creates_remote_session_with_agent_and_environment_ids(stores):
     assert "expected_output=text" in cw["initial_message"]
     assert "soft budget" in cw["initial_message"]
     assert "~$5.0" in cw["initial_message"]
+    # Today's date is injected for day-relative reasoning. Anthropic does
+    # not inject "today" into managed sessions, and the model has a fixed
+    # training cutoff — without this, calendar/due-date interpretation
+    # picks an arbitrary date inside the cutoff window.
+    import re
+    assert re.search(r"today=\d{4}-\d{2}-\d{2} \([A-Z][a-z]+day\)", cw["initial_message"]), \
+        cw["initial_message"][-300:]
     # Ambiguity policy NOT duplicated here — it lives in the agent preset's
     # system prompt (Anthropic console). User message stays task-specific.
     assert "ambiguous" not in cw["initial_message"]

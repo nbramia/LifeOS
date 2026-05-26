@@ -187,13 +187,26 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     max_tokens = budget.get("max_tokens")
     max_dollars = budget.get("max_dollars")
     dollars_str = f"~${max_dollars}" if max_dollars is not None else "unset"
+    # The local LLM has a fixed training cutoff; without today's date it
+    # hallucinates plausible-looking but wrong dates when interpreting
+    # calendar / task / due-date data. Inject the operator's local date
+    # so day-relative reasoning works.
+    today = _today()
     return (
         _SYSTEM_PROMPT_STATIC
         + "\n\n<this_task>\n"
+        + f"today={today}; "
         + f"expected_output={expected_output}; "
         + f"soft budget ~{wall}s wall / ~{max_tokens} tokens / {dollars_str}.\n"
         + "</this_task>"
     )
+
+
+def _today() -> str:
+    """Local today as YYYY-MM-DD (weekday). Module-level for test override."""
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d (%A)")
 
 
 def _user_message_for(task: dict) -> str:

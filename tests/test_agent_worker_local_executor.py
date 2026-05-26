@@ -418,3 +418,19 @@ def test_system_prompt_carries_soft_budget_in_this_task_section():
     assert "~90s" in prompt
     assert "~5000 tokens" in prompt
     assert "~$0.25" in prompt
+
+
+@pytest.mark.unit
+def test_system_prompt_includes_today_for_day_relative_reasoning():
+    """The local model has a fixed training cutoff. Without today's date
+    it hallucinates plausible-looking but wrong dates when the task
+    involves calendar / due-date reasoning. End-to-end test caught
+    Gemma using 2025-05-14 on a 2026-05-26 calendar lookup."""
+    import re
+    prompt = _system_prompt(
+        session_id="sess_x", expected_output="text",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.5},
+    )
+    # today=YYYY-MM-DD (Weekday) inside <this_task>
+    m = re.search(r"today=(\d{4}-\d{2}-\d{2}) \([A-Z][a-z]+day\)", prompt)
+    assert m is not None, f"expected today=YYYY-MM-DD (Weekday); got: {prompt[-300:]}"

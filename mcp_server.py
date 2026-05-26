@@ -1174,9 +1174,19 @@ class LifeOSMCPServer:
                 return "No events found."
             text = f"Found {len(events)} events:\n\n"
             for e in events[:10]:
-                text += f"- **{e.get('summary', 'Untitled')}**\n"
-                text += f"  When: {e.get('start', 'No time')}\n"
-                if attendees := e.get('attendees'):
+                title = e.get("title") or e.get("summary") or "Untitled"
+                text += f"- **{title}**\n"
+                # Prefer the human-formatted strings when present; fall back
+                # to raw ISO timestamps so consumers always get something.
+                start = e.get("start_formatted") or e.get("start_time") or e.get("start") or "No time"
+                end = e.get("end_formatted") or e.get("end_time") or e.get("end")
+                if end and end != start:
+                    text += f"  When: {start} – {end}\n"
+                else:
+                    text += f"  When: {start}\n"
+                if location := e.get("location"):
+                    text += f"  Where: {location}\n"
+                if attendees := e.get("attendees"):
                     text += f"  With: {', '.join(attendees[:3])}\n"
             return text
 
