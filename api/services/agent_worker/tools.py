@@ -16,6 +16,7 @@ called out in `AGENTS.md` and the setup guide.
 """
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -312,11 +313,15 @@ class ToolRegistry:
             from api.services.agent_worker import inter_agent
             if inter_agent.is_inter_agent_tool(name):
                 payload = inter_agent.dispatch(self._inter_ctx, name, arguments or {})
-                import json as _json
-                # `yield_until` is the special case: it ends the executor turn.
-                yield_signal = name == "lifeos_agent_yield_until" and payload.get("ok")
+                # `yield_until` and `lifeos_agent_user_ask` both end the executor
+                # turn — the first waits for child completion, the second for
+                # a Telegram reply.
+                yield_signal = (
+                    name in ("lifeos_agent_yield_until", "lifeos_agent_user_ask")
+                    and payload.get("ok")
+                )
                 return ToolResult(
-                    _json.dumps(payload),
+                    json.dumps(payload),
                     is_error=not payload.get("ok", False),
                     yield_seconds=-1 if yield_signal else None,  # sentinel: "yield, no wake timer"
                 )

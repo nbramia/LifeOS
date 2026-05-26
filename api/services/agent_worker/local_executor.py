@@ -303,10 +303,13 @@ class LocalExecutor:
             self.session_store.append_message(sid, "user", tool_results)
 
             if yielded_for_children:
-                # Status + yield_waiting_for is already set by the
-                # lifeos_agent_yield_until handler — just end the loop. Worker
-                # main loop will resume when children terminate.
-                self.transcript_store.append(sid, "yielded_for_children", {})
+                # Status is already set by the calling tool — either
+                # lifeos_agent_yield_until (children case) or
+                # lifeos_agent_user_ask (Telegram clarification case). Distinguish
+                # in the transcript by whether yield_waiting_for is populated.
+                refreshed = self.session_store.get(session.task_id)
+                kind = "yielded_for_children" if refreshed.yield_waiting_for else "yielded_for_user"
+                self.transcript_store.append(sid, kind, {})
                 return ExecutorOutcome(status=STATUS_YIELDED)
 
             if yielded_seconds is not None:

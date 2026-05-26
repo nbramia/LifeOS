@@ -89,6 +89,14 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
+    # Capturing sender for clarification questions — records the text and
+    # returns a deterministic message_id so reply-threading can be tested.
+    sent_with_ids: list[tuple[int, str]] = []
+    def _fake_send_with_id(text):
+        sent.append(text)
+        msg_id = len(sent_with_ids) + 1000
+        sent_with_ids.append((msg_id, text))
+        return msg_id
     w = Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
@@ -96,11 +104,13 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        telegram_send_with_id=_fake_send_with_id,
         http_client=client,
         preflight_caller=preflight_caller,
         local_executor=local_executor,
     )
     w._sent_telegram = sent  # type: ignore[attr-defined]
+    w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
     return w
 
 
