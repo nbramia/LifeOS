@@ -215,11 +215,15 @@ class ManagedAgentsDriver:
         if events:
             last_event_id = events[-1].get("id")
 
-        # Synthesize a terminal status from events when the status field hasn't
-        # transitioned yet. `idle` (raw) wins on its own; otherwise we look at
-        # events for status_idle / session.error.
+        # Resolve final status. A `session.error` in the batch must win over
+        # a raw `idle`, otherwise the session reports completed and the
+        # cascading failure is silently lost. `_synthesize_status_from_events`
+        # returns "failed" if ANY error event is present, else "completed"
+        # if any idle event, else None.
         synthesized = _synthesize_status_from_events(events)
-        if raw_status in TERMINAL_REMOTE_STATUSES:
+        if synthesized == "failed":
+            status = "failed"
+        elif raw_status in TERMINAL_REMOTE_STATUSES:
             status = raw_status
         elif synthesized:
             status = synthesized
@@ -244,33 +248,64 @@ class ManagedAgentsDriver:
             error_reason=error_reason,
         )
 
+    # Hard cap on pagination loop in `list_events` — protects against a
+    # misbehaving API or runaway session producing millions of events. 1000
+    # pages × the API's page size is far more than any real session will
+    # ever generate; if we hit this we'd rather drop and warn than hang.
+    _MAX_EVENTS_PAGES = 1000
+
     def list_events(
         self,
         session_id: str,
         after_id: str | None = None,
     ) -> list[dict]:
-        """Fetch new session events since `after_id` (or all if None).
+        """Fetch all new session events since `after_id` (or all if None).
 
         `GET /v1/sessions/{id}/events?after=<cursor>` returns
-        `{"data": [{"id", "type", "payload"|"content"|"error", ...}, ...]}`.
-        Returns the raw event list; callers (e.g. `get_session_state`) handle
-        the cursor advance and synthesis logic.
+        `{"data": [{"id", "type", "payload"|"content"|"error", ...}, ...],
+          "first_id", "last_id", "has_more"}`. Loops while `has_more=True`
+        so the caller never silently loses the tail of a paginated batch —
+        without this, a session that produced more events than the API page
+        size between polls would have its terminal `agent.message` dropped
+        and the Telegram completion summary would be wrong.
+
+        Returns the raw event list (concatenated across pages); callers
+        (e.g. `get_session_state`) handle the cursor advance and synthesis.
         """
-        params: dict[str, str] = {}
-        if after_id:
-            params[self.EVENT_CURSOR_PARAM] = after_id
-        resp = self._client.get(
-            f"{self.base_url}/sessions/{session_id}/events",
-            headers=self._headers(),
-            params=params,
+        all_events: list[dict] = []
+        cursor = after_id
+        for _ in range(self._MAX_EVENTS_PAGES):
+            params: dict[str, str] = {}
+            if cursor:
+                params[self.EVENT_CURSOR_PARAM] = cursor
+            resp = self._client.get(
+                f"{self.base_url}/sessions/{session_id}/events",
+                headers=self._headers(),
+                params=params,
+            )
+            if resp.status_code == 404:
+                # Session deleted mid-poll. Caller's status fetch already
+                # turned this into "cancelled"; return what we have.
+                return all_events
+            self._raise_for_status_with_body(resp)
+            data = resp.json()
+            page = data.get("data", []) or []
+            all_events.extend(page)
+            if not data.get("has_more"):
+                return all_events
+            if not page:
+                # Defensive: has_more=True but empty page would loop forever.
+                logger.warning("list_events: has_more=true with empty page; stopping")
+                return all_events
+            cursor = page[-1].get("id")
+            if not cursor:
+                logger.warning("list_events: has_more=true but last event has no id; stopping")
+                return all_events
+        logger.warning(
+            "list_events: hit pagination cap (%d pages) for session %s",
+            self._MAX_EVENTS_PAGES, session_id,
         )
-        if resp.status_code == 404:
-            # Session deleted mid-poll. Caller's status fetch already turned
-            # this into "cancelled"; return empty events so we don't crash.
-            return []
-        self._raise_for_status_with_body(resp)
-        data = resp.json()
-        return data.get("data", []) or []
+        return all_events
 
     def post_user_message(self, session_id: str, content: str) -> None:
         """Post a user turn to a running session.
@@ -308,10 +343,14 @@ class ManagedAgentsDriver:
         if 400 <= resp.status_code < 500:
             # Truncate to avoid unbounded log volume from a misbehaving API.
             body_preview = (resp.text or "")[:2048]
+            # `resp.request` is set by real transports including MockTransport,
+            # but defensively guard against hand-constructed Response objects.
+            req = getattr(resp, "request", None)
+            method = getattr(req, "method", "?") if req is not None else "?"
+            path = getattr(getattr(req, "url", None), "path", "?") if req is not None else "?"
             logger.warning(
                 "Managed Agents %s %s → %d: %s",
-                resp.request.method, resp.request.url.path,
-                resp.status_code, body_preview,
+                method, path, resp.status_code, body_preview,
             )
         resp.raise_for_status()
 
@@ -320,12 +359,15 @@ class ManagedAgentsDriver:
 
         Best-effort: errors are logged but never raised, because callers use
         this for cleanup paths where re-raising would mask the original cause.
+        4xx response bodies are still surfaced via the standard helper before
+        the exception is swallowed.
         """
         try:
-            self._client.delete(
+            resp = self._client.delete(
                 f"{self.base_url}/sessions/{session_id}",
                 headers=self._headers(),
             )
+            self._raise_for_status_with_body(resp)
         except Exception as exc:
             logger.warning("kill_session %s failed: %s (reason=%s)", session_id, exc, reason)
 

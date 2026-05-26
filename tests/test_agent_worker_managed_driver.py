@@ -11,6 +11,7 @@ is in beta and the schema may shift.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -301,6 +302,65 @@ def test_get_session_state_synthesizes_failed_from_error_event():
 
 
 @pytest.mark.unit
+def test_get_session_state_prefers_failed_when_raw_idle_and_event_error():
+    """Regression guard: when the status endpoint reports raw `"idle"` and the
+    events endpoint contains a `session.error`, the error must win. Otherwise
+    a cascading failure resolves to STATUS_COMPLETED and the reason is lost."""
+    handler = _make_session_handler(
+        status_body={"status": "idle", "usage": {}},
+        events=[
+            {"id": "evt_1", "type": "session.error",
+             "payload": {"message": "mcp init blew up after idle"}},
+        ],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.status == "failed"
+    assert state.error_reason == "mcp init blew up after idle"
+
+
+@pytest.mark.unit
+def test_list_events_paginates_through_has_more():
+    """list_events must follow `has_more=true` and concatenate pages, otherwise
+    a session that produced more events than the API page size between polls
+    would lose the tail (including the terminal agent.message)."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(dict(request.url.params))
+        cursor = request.url.params.get("after")
+        if cursor is None:
+            return httpx.Response(200, json={
+                "data": [{"id": "evt_1", "type": "x"}, {"id": "evt_2", "type": "y"}],
+                "has_more": True,
+            })
+        if cursor == "evt_2":
+            return httpx.Response(200, json={
+                "data": [{"id": "evt_3", "type": "z"}, {"id": "evt_4", "type": "agent.message",
+                                                         "content": [{"type": "text", "text": "done"}]}],
+                "has_more": False,
+            })
+        raise AssertionError(f"unexpected cursor: {cursor}")
+
+    events = _build_driver(handler).list_events("sess")
+    assert [e["id"] for e in events] == ["evt_1", "evt_2", "evt_3", "evt_4"]
+    # First call: no cursor; second call: cursor = last id of first page.
+    assert calls[0] == {}
+    assert calls[1] == {"after": "evt_2"}
+
+
+@pytest.mark.unit
+def test_list_events_stops_on_empty_page_with_has_more_to_prevent_infinite_loop():
+    """Defensive: a misbehaving API that returns `has_more=true` with an empty
+    `data` array must not loop forever."""
+    def handler(request):
+        return httpx.Response(200, json={"data": [], "has_more": True})
+
+    # Should return [] and log a warning, not loop indefinitely.
+    events = _build_driver(handler).list_events("sess")
+    assert events == []
+
+
+@pytest.mark.unit
 def test_get_session_state_prefers_failed_when_idle_and_error_in_same_batch():
     """If both `session.status_idle` and `session.error` arrive in one poll
     batch, error wins — operator needs the actionable signal. Order in the
@@ -422,7 +482,6 @@ def test_4xx_response_body_is_logged_before_raising(caplog):
             "error": {"message": "MCP server host(s) blocked by environment network policy"},
         })
 
-    import logging
     with caplog.at_level(logging.WARNING):
         with pytest.raises(httpx.HTTPStatusError):
             _build_driver(handler).create_session(

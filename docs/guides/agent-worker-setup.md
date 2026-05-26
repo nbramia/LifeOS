@@ -170,7 +170,9 @@ curl -X POST "https://api.anthropic.com/v1/vaults/$VAULT_ID/credentials" \
 
 Workspace → Environments → New → Cloud.
 
-> **Set `networking.type` to `unrestricted` at creation time.** The console UI defaults to `limited` mode with `allow_mcp_servers: false`, which blocks every MCP host and yields `400 MCP server host(s) blocked by environment network policy` on every session create. If you already created the environment with the default and want to fix it without recreating, `POST` (not PATCH — that returns 405) the config update:
+> **Set `networking.type` to `unrestricted` at creation time.** The console UI defaults to `limited` mode with `allow_mcp_servers: false`, which blocks every MCP host and yields `400 MCP server host(s) blocked by environment network policy` on every session create. If you already created the environment with the default and want to fix it without recreating, `POST` (not PATCH — that returns 405) the config update.
+>
+> **Caveat:** the body below sends a complete `config` object that replaces the existing config wholesale. If you've also set `init_script`, package lists, or env vars, GET the current config first and merge before POSTing. For a fresh environment with only `networking` set, this single command is fine:
 > ```bash
 > curl -X POST "https://api.anthropic.com/v1/environments/$ENV_ID" \
 >   -H "x-api-key: $ANTHROPIC_API_KEY" \
