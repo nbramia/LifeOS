@@ -70,9 +70,29 @@ class Settings(BaseSettings):
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
     local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
     local_llm_model: str = Field(
-        default="ggml-org/gpt-oss-120b-GGUF",
+        default="unsloth/gemma-4-26B-A4B-it-GGUF",
         alias="LIFEOS_LLM_MODEL",
         description="HuggingFace GGUF model ID for llama-server"
+    )
+
+    # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
+    mcp_http_port: int = Field(
+        default=8765,
+        alias="LIFEOS_MCP_HTTP_PORT",
+        description="Port for the MCP HTTP transport (lifeos-mcp-http systemd unit)"
+    )
+    mcp_http_host: str = Field(
+        default="127.0.0.1",
+        alias="LIFEOS_MCP_HTTP_HOST",
+        description="Bind address for the MCP HTTP transport. Default 127.0.0.1 so only "
+                    "the local Cloudflare Tunnel daemon can reach it; the tunnel handles "
+                    "public exposure."
+    )
+    mcp_bearer_token: str = Field(
+        default="",
+        alias="LIFEOS_MCP_BEARER_TOKEN",
+        description="Bearer token required by the MCP HTTP transport. Generate with "
+                    "`openssl rand -hex 32`. Empty disables the HTTP transport."
     )
     local_llm_autostart: bool = Field(
         default=False,
