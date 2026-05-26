@@ -135,6 +135,12 @@ class Settings(BaseSettings):
         description="How long an #agent-blocked task waits for a Telegram reply "
                     "before being abandoned. Used by Issue F."
     )
+    agent_preflight_model: str = Field(
+        default="claude-haiku-4-5",
+        alias="LIFEOS_AGENT_PREFLIGHT_MODEL",
+        description="Anthropic model used for the Haiku preflight call that "
+                    "classifies #agent tasks (budget, routing, ambiguity, sanity)."
+    )
     local_llm_autostart: bool = Field(
         default=False,
         alias="LIFEOS_LOCAL_LLM_AUTOSTART",

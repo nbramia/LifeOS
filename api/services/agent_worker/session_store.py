@@ -81,6 +81,29 @@ CREATE TABLE IF NOT EXISTS daily_spend (
     date           TEXT PRIMARY KEY,
     total_dollars  REAL NOT NULL DEFAULT 0.0
 );
+
+-- Conversation log for local-path sessions. Managed sessions store messages
+-- in the JSONL transcript instead (their authoritative state lives on the
+-- Anthropic side).
+CREATE TABLE IF NOT EXISTS messages (
+    session_id    TEXT NOT NULL,
+    turn_index    INTEGER NOT NULL,
+    role          TEXT NOT NULL,
+    content_json  TEXT NOT NULL,
+    tokens_in     INTEGER NOT NULL DEFAULT 0,
+    tokens_out    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, turn_index)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+-- Sleep wake-ups. A session with a row here is "yielded": the worker's main
+-- loop scans this table and resumes the session when wake_at <= now().
+CREATE TABLE IF NOT EXISTS sleeps (
+    session_id    TEXT PRIMARY KEY,
+    wake_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sleeps_wake ON sleeps(wake_at);
 """
 
 
@@ -204,6 +227,117 @@ class SessionStore:
                 tuple(TERMINAL_STATUSES),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
+
+    def set_routing_and_budget(
+        self,
+        task_id: str,
+        routing: str | None,
+        budget: dict | None,
+        expected_output: str | None = None,
+    ) -> None:
+        """Update routing decision and budget after the preflight call."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET routing = ?, budget_json = ?, expected_output = ?, last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    routing,
+                    json.dumps(budget) if budget else None,
+                    expected_output,
+                    _now(),
+                    task_id,
+                ),
+            )
+
+    def record_spend(
+        self,
+        task_id: str,
+        tokens_in: int,
+        tokens_out: int,
+        dollars: float,
+    ) -> None:
+        """Add to a session's cumulative token + dollar counters."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET total_input_tokens  = total_input_tokens  + ?,
+                    total_output_tokens = total_output_tokens + ?,
+                    total_dollars       = total_dollars       + ?,
+                    last_activity_at    = ?
+                WHERE task_id = ?
+                """,
+                (tokens_in, tokens_out, dollars, _now(), task_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Messages (local-path conversation log)
+    # ------------------------------------------------------------------
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: dict | list,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> int:
+        """Append one message; return its 0-based turn_index."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_index "
+                "FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            turn_index = int(row["next_index"])
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    session_id, turn_index, role, content_json,
+                    tokens_in, tokens_out, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, turn_index, role, json.dumps(content), tokens_in, tokens_out, _now()),
+            )
+        return turn_index
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        """Return all messages in order as {role, content} dicts ready for the LLM."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content_json FROM messages "
+                "WHERE session_id = ? ORDER BY turn_index ASC",
+                (session_id,),
+            ).fetchall()
+        return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
+
+    # ------------------------------------------------------------------
+    # Sleeps (yield / wake)
+    # ------------------------------------------------------------------
+
+    def add_sleep(self, session_id: str, wake_at: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sleeps (session_id, wake_at) VALUES (?, ?)",
+                (session_id, int(wake_at)),
+            )
+
+    def remove_sleep(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sleeps WHERE session_id = ?", (session_id,))
+
+    def due_sleeps(self, now_ts: int | None = None) -> list[str]:
+        """Return session_ids whose wake time has arrived."""
+        ts = now_ts if now_ts is not None else _now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id FROM sleeps WHERE wake_at <= ? ORDER BY wake_at ASC",
+                (ts,),
+            ).fetchall()
+        return [r["session_id"] for r in rows]
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> Session:
