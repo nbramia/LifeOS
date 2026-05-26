@@ -6,11 +6,15 @@ https://www.anthropic.com/pricing as of 2026-05. Update when models change.
 For the local backend, both rates are 0 — compute is "free" (operator paid
 upfront for the hardware). Time and tokens are still tracked for budget
 enforcement, but they don't contribute to the dollar budget or the daily cap.
-
-Managed Agents (Issue D) adds a flat session-hour overhead alongside tokens;
-that lives in `managed_driver.py`, not here.
 """
 from __future__ import annotations
+
+
+# Anthropic Managed Agents charge a flat per-session-hour overhead on top of
+# standard token rates (per https://platform.claude.com/docs/en/managed-agents/overview,
+# announced April 2026). Long-idle sessions accrue this even when nothing is
+# happening, which motivates the yield-and-resume pattern in Issue E.
+MANAGED_SESSION_HOUR_OVERHEAD: float = 0.08
 
 
 # Dollars per token. Keys match the model id strings used by the routers.

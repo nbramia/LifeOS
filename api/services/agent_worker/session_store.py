@@ -220,6 +220,18 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
+    def list_active_managed(self) -> list[Session]:
+        """Sessions with a remote Managed Agents id that haven't terminated."""
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM sessions "
+                f"WHERE managed_agent_session_id IS NOT NULL "
+                f"AND status NOT IN ({placeholders})",
+                tuple(TERMINAL_STATUSES),
+            ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
     def list_non_terminal(self) -> list[Session]:
         """Return sessions that the worker may still need to act on after restart."""
         placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
@@ -274,6 +286,54 @@ class SessionStore:
                 """,
                 (tokens_in, tokens_out, dollars, _now(), task_id),
             )
+
+    def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
+        """Attach a remote Managed Agents session_id to a local session."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET managed_agent_session_id = ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (managed_id, _now(), task_id),
+            )
+
+    def add_session_hour_overhead(self, task_id: str, dollars: float) -> None:
+        """Add Managed Agents session-hour overhead to the dollar counter."""
+        if dollars <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET total_dollars = total_dollars + ?, last_activity_at = ? "
+                "WHERE task_id = ?",
+                (float(dollars), _now(), task_id),
+            )
+
+    # Lightweight key/value cursor for managed sessions; stored alongside the
+    # session row to avoid a second table. The schema already has unused space
+    # for this — we piggyback on `expected_output` for the per-row pattern but
+    # the cursor is logically separate, so use a tiny dedicated table.
+    def set_managed_last_event_id(self, task_id: str, event_id: str) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS managed_cursor ("
+                "task_id TEXT PRIMARY KEY, last_event_id TEXT NOT NULL);"
+            )
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, last_event_id) VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET last_event_id = excluded.last_event_id",
+                (task_id, event_id),
+            )
+
+    def get_managed_last_event_id(self, task_id: str) -> str | None:
+        with self._connect() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT last_event_id FROM managed_cursor WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # Table doesn't exist yet — no cursor recorded.
+                return None
+        return row["last_event_id"] if row else None
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:
         """Add to a session's cumulative active-execution seconds.
