@@ -252,9 +252,17 @@ class ManagedExecutor:
             # poll().
             final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
-            self.transcript_store.append(session.session_id, "managed_completed",
-                                         {"final_chars": len(final_text), "remote_status": state.status})
-            return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
+            self.transcript_store.append(
+                session.session_id, "managed_completed",
+                {"final_chars": len(final_text),
+                 "remote_status": state.status,
+                 "init_failed_mcps": list(state.init_failed_mcps)},
+            )
+            return ExecutorOutcome(
+                status=STATUS_COMPLETED,
+                final_text=final_text,
+                init_failed_mcps=list(state.init_failed_mcps),
+            )
 
         if state.status == "budget_exceeded":
             self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)

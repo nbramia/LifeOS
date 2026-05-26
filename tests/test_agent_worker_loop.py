@@ -331,6 +331,80 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_path: Path):
+    """When the agent idles without producing an `agent.message` (sometimes
+    happens after a tool call on tight budgets), Telegram surfaces a
+    transcript pointer instead of an empty body so the operator can inspect
+    what actually happened."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    # final_text="" simulates the empty-text path.
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent, "expected a completion notification"
+    msg = sent[0]
+    # Pointer to transcript path
+    assert "data/agent_transcripts/" in msg
+    assert ".jsonl" in msg
+    # No literal "(no text response)" — that placeholder is deprecated in favor
+    # of the transcript pointer.
+    assert "(no text response)" not in msg
+
+
+@pytest.mark.unit
+def test_completion_summary_includes_init_failed_mcps_footer(tmp_path: Path):
+    """When the managed executor reports MCPs that failed to initialize,
+    the completion summary appends a "Note: N MCP server(s) unavailable"
+    footer so the operator can fix or remove the broken connectors."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize my calendar", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        final_text="Two events today: standup at 10am and review at 3pm.",
+        init_failed_mcps=["gmail", "gcal"],
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    msg = sent[0]
+    # Real reply is preserved
+    assert "Two events today" in msg
+    # Footer is appended
+    assert "Note:" in msg
+    assert "2 MCP server(s) unavailable" in msg
+    assert "gmail" in msg
+    assert "gcal" in msg
+
+
+@pytest.mark.unit
+def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
+    """No footer noise when all MCPs initialized cleanly."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "answer the question", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="42.", init_failed_mcps=[],
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    assert "Note:" not in sent[0]
+    assert "MCP server(s) unavailable" not in sent[0]
+
+
+@pytest.mark.unit
 def test_managed_executor_constructed_with_full_credentials(tmp_path: Path, monkeypatch):
     """When API key + agent_preset_id + agent_environment_id + agent_vault_id
     are all set, the worker constructs a ManagedExecutor with each ID flowing

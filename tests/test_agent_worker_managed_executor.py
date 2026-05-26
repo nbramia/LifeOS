@@ -234,6 +234,30 @@ def test_poll_finalizes_completed(stores):
 
 
 @pytest.mark.unit
+def test_poll_propagates_init_failed_mcps_to_outcome(stores):
+    """Managed executor must surface init_failed_mcps from the driver state
+    through to the ExecutorOutcome so the worker's completion summary can
+    include the footer."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="idle",
+            last_event_id="evt_done",
+            new_events=[{"id": "evt_done", "type": "session.status_idle"}],
+            total_input_tokens=10, total_output_tokens=20,
+            final_text="ok",
+            init_failed_mcps=["gmail", "gcal"],
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.init_failed_mcps == ["gmail", "gcal"]
+
+
+@pytest.mark.unit
 def test_poll_finalizes_idle_status_as_completed(stores):
     """The Managed Agents API reports successful terminal as `"idle"` (not
     `"completed"`). Executor must treat both as STATUS_COMPLETED."""
