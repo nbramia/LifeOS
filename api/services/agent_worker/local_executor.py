@@ -469,8 +469,12 @@ class LocalExecutor:
 
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+        # Persist the body, not just the length. The final text is also sent
+        # to Telegram, but the transcript is the only durable record an
+        # operator can grep later to see what an agent actually said.
         self.transcript_store.append(
-            session.session_id, "completed", {"final_chars": len(final_text or "")}
+            session.session_id, "completed",
+            {"final_chars": len(final_text or ""), "final_text": final_text or ""},
         )
         return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text or "")
 

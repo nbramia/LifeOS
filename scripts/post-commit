@@ -36,14 +36,32 @@ if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
     fi
 fi
 
-# Only restart server if api/ or config/ files were changed
-CHANGED=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
+# Restart the API server if api/ or config/ files changed. server.sh
+# restarts lifeos-api, which cascades to lifeos-agent-worker via
+# `Requires=lifeos-api.service` in its unit file.
+CHANGED_API=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
 
-if [ -n "$CHANGED" ]; then
+if [ -n "$CHANGED_API" ]; then
     if [ -x "./scripts/server.sh" ]; then
         nohup ./scripts/server.sh restart > /tmp/lifeos-server-restart.log 2>&1 &
         echo "Server restart triggered (log: /tmp/lifeos-server-restart.log)"
     fi
-else
+fi
+
+# Restart lifeos-mcp-http when mcp_server.py changes. The HTTP MCP service
+# runs `mcp_server.py` as its own process — it shares no in-memory state
+# with lifeos-api, so it does NOT cascade from the api restart. Cloud
+# agents connect to this service exclusively. The sudoers allowlist
+# installed by setup-systemd.sh permits passwordless restart.
+CHANGED_MCP=$(git diff-tree --no-commit-id --name-only -r HEAD -- mcp_server.py)
+
+if [ -n "$CHANGED_MCP" ]; then
+    if systemctl list-unit-files lifeos-mcp-http.service &>/dev/null; then
+        nohup sudo systemctl restart lifeos-mcp-http >> /tmp/lifeos-server-restart.log 2>&1 &
+        echo "MCP HTTP service restart triggered (mcp_server.py changed)"
+    fi
+fi
+
+if [ -z "$CHANGED_API" ] && [ -z "$CHANGED_MCP" ]; then
     echo "No server restart needed"
 fi
