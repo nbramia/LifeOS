@@ -359,17 +359,17 @@ Return a JSON object with these fields:
 - "schedule_type": "once" for one-time, "cron" for recurring
 - "schedule_value": For "once" use ISO datetime (e.g., "2026-02-07T18:00:00-05:00"). For "cron" use cron expression (e.g., "0 18 * * *" for daily at 6pm)
 - "message_content": The reminder message to send (include any URLs mentioned)
-- "timezone": The timezone mentioned or implied (default to "America/New_York" for ET/Eastern)
+- "timezone": The IANA timezone mentioned or implied. Default to "{settings.timezone}" when none is given.
 
 IMPORTANT:
 - If no specific time is mentioned, use the time hint provided above
 - If the time hint shows tomorrow at 9am, use that as the schedule_value
-- Daily at 6pm ET = "0 18 * * *"
+- Daily at 6pm = "0 18 * * *"
 - Every weekday at 9am = "0 9 * * 1-5"
 - Convert times to 24-hour format for cron. 6pm = 18, 9am = 9, etc.
 
 Return ONLY valid JSON, no other text. Example:
-{{"name": "Library Book Reminder", "schedule_type": "once", "schedule_value": "2026-02-09T09:00:00-05:00", "message_content": "Return the library book", "timezone": "America/New_York"}}"""
+{{"name": "Library Book Reminder", "schedule_type": "once", "schedule_value": "2026-02-09T09:00:00-05:00", "message_content": "Return the library book", "timezone": "{settings.timezone}"}}"""
 
     try:
         synthesizer = get_synthesizer()
