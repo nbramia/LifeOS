@@ -312,7 +312,14 @@ class ToolRegistry:
         if self._inter_ctx is not None:
             from api.services.agent_worker import inter_agent
             if inter_agent.is_inter_agent_tool(name):
-                payload = inter_agent.dispatch(self._inter_ctx, name, arguments or {})
+                # The local executor knows the caller's session_id via
+                # context — ignore whatever the agent passed for that
+                # field and use the authoritative value. The schema
+                # declares caller_session_id required (so cloud agents
+                # over MCP HTTP can supply it); for local we override.
+                args = dict(arguments or {})
+                args["caller_session_id"] = self._inter_ctx.caller_session_id
+                payload = inter_agent.dispatch(self._inter_ctx, name, args)
                 # `yield_until` and `lifeos_agent_user_ask` both end the executor
                 # turn — the first waits for child completion, the second for
                 # a Telegram reply.

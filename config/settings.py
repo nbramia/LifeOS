@@ -135,6 +135,14 @@ class Settings(BaseSettings):
         description="How long an #agent-blocked task waits for a Telegram reply "
                     "before being abandoned. Used by Issue F."
     )
+    agent_output_dir: str = Field(
+        default="LifeOS/Tasks/Agent Output",
+        alias="LIFEOS_AGENT_OUTPUT_DIR",
+        description="Vault-relative directory where agent-created artifacts "
+                    "(Markdown notes, CSVs) land. The local executor writes "
+                    "here directly; the worker's spillover for long outputs "
+                    "also writes here. Path is joined under LIFEOS_VAULT_PATH."
+    )
     agent_preflight_model: str = Field(
         default="claude-haiku-4-5",
         alias="LIFEOS_AGENT_PREFLIGHT_MODEL",

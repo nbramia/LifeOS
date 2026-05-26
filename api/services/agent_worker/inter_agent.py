@@ -102,104 +102,98 @@ def _err(message: str, code: str = "error") -> dict:
 # Tool definitions (Anthropic format) — shared by local and managed agents.
 # ---------------------------------------------------------------------------
 
+# Every inter-agent tool requires `caller_session_id` — the calling agent's
+# own session id, which it should pass from the `lifeos_session_id` field
+# in its task brief / user message. The MCP HTTP layer (cloud path) can't
+# infer this server-side because the request crosses a process boundary;
+# the local dispatcher does inject it from context, overriding whatever
+# the agent passes. Declaring it required in the schema teaches the cloud
+# agent to include it.
+_CALLER_PROP = {
+    "type": "string",
+    "description": "Your own session_id, copied verbatim from the "
+                   "`lifeos_session_id=` field in your task brief.",
+}
+
+
+def _with_caller(props: dict, required: list[str]) -> dict:
+    """Inject `caller_session_id` into a tool schema."""
+    new_props = {"caller_session_id": _CALLER_PROP, **props}
+    return {
+        "type": "object",
+        "properties": new_props,
+        "required": ["caller_session_id"] + list(required),
+    }
+
+
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lifeos_agent_spawn",
         "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "Task description for the child agent"},
-                "model": {"type": "string", "enum": ["claude", "local"], "description": "Which executor to run the child on"},
-                "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
-                "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
-                "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
-                "expected_output": {"type": "string", "enum": ["text", "file", "external_action", "structured"]},
-            },
-            "required": ["prompt", "model"],
-        },
+        "input_schema": _with_caller({
+            "prompt": {"type": "string", "description": "Task description for the child agent"},
+            "model": {"type": "string", "enum": ["claude", "local"], "description": "Which executor to run the child on"},
+            "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
+            "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
+            "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
+            "expected_output": {"type": "string", "enum": ["text", "file", "external_action", "structured"]},
+        }, required=["prompt", "model"]),
     },
     {
         "name": "lifeos_agent_send",
         "description": "Append a user-role message to another agent session. For sessions that are yielded or sleeping, the message is queued and delivered on resume.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "message": {"type": "string"},
-            },
-            "required": ["session_id", "message"],
-        },
+        "input_schema": _with_caller({
+            "session_id": {"type": "string"},
+            "message": {"type": "string"},
+        }, required=["session_id", "message"]),
     },
     {
         "name": "lifeos_agent_check",
         "description": "Non-blocking status of an agent session: current status, tokens/dollars used, last activity. Use for short-polling; prefer `lifeos_agent_yield_until` for waits >1 minute.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"session_id": {"type": "string"}},
-            "required": ["session_id"],
-        },
+        "input_schema": _with_caller({
+            "session_id": {"type": "string"},
+        }, required=["session_id"]),
     },
     {
         "name": "lifeos_agent_yield_until",
         "description": "Pause yourself until all listed children reach a terminal state. Your current session ends; when the condition is met, a fresh resumed session is created with the children's outputs injected as a new user turn. This is the preferred wait primitive — no idle billing.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "children": {"type": "array", "items": {"type": "string"}, "description": "session_ids to wait on"},
-                "reason": {"type": "string", "description": "Why you're yielding (one short sentence)"},
-            },
-            "required": ["children"],
-        },
+        "input_schema": _with_caller({
+            "children": {"type": "array", "items": {"type": "string"}, "description": "session_ids to wait on"},
+            "reason": {"type": "string", "description": "Why you're yielding (one short sentence)"},
+        }, required=["children"]),
     },
     {
         "name": "lifeos_agent_kill",
         "description": "Terminate a descendant session. Only allowed on sessions whose lineage descends from yours.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "reason": {"type": "string"},
-            },
-            "required": ["session_id"],
-        },
+        "input_schema": _with_caller({
+            "session_id": {"type": "string"},
+            "reason": {"type": "string"},
+        }, required=["session_id"]),
     },
     {
         "name": "lifeos_agent_transcript_read",
         "description": "Read the event log (JSONL transcript) of any agent session — your own, a child's, or any sibling/peer.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "since_turn": {"type": "integer", "description": "Optional: skip events before this index"},
-            },
-            "required": ["session_id"],
-        },
+        "input_schema": _with_caller({
+            "session_id": {"type": "string"},
+            "since_turn": {"type": "integer", "description": "Optional: skip events before this index"},
+        }, required=["session_id"]),
     },
     {
         "name": "lifeos_agent_sessions_list",
         "description": "List recent agent sessions, optionally filtered by status / routing / parent.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string"},
-                "routing": {"type": "string", "enum": ["claude", "local"]},
-                "parent_session_id": {"type": "string"},
-                "limit": {"type": "integer"},
-            },
-            "required": [],
-        },
+        "input_schema": _with_caller({
+            "status": {"type": "string"},
+            "routing": {"type": "string", "enum": ["claude", "local"]},
+            "parent_session_id": {"type": "string"},
+            "limit": {"type": "integer"},
+        }, required=[]),
     },
     {
         "name": "lifeos_agent_user_ask",
         "description": "Ask the operator a clarifying question via Telegram and pause until they reply. Your session ends; the worker resumes it (with the user's answer injected as a new user turn) once the reply arrives. Use sparingly — only when you genuinely cannot proceed without operator input.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "The question to ask the operator. Keep it short and specific."},
-            },
-            "required": ["question"],
-        },
+        "input_schema": _with_caller({
+            "question": {"type": "string", "description": "The question to ask the operator. Keep it short and specific."},
+        }, required=["question"]),
     },
 ]
 
