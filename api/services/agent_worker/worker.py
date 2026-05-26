@@ -109,28 +109,19 @@ class Worker:
         )
         self.poll_seconds = poll_seconds if poll_seconds is not None else settings.agent_worker_poll_seconds
         self._stop = False
-        # Telegram is optional — operator may not have configured it. The
-        # worker should still run end-to-end without crashing on a missing bot.
-        if telegram_send is None:
-            def _noop_telegram(text, chat_id=None):
-                return False
-            try:
-                from api.services.telegram import send_message
-                telegram_send = send_message
-            except Exception:  # pragma: no cover — defensive
-                telegram_send = _noop_telegram
-        self._telegram_send = telegram_send
-        # Default the "with id" sender to the real Telegram module; tests
-        # inject a fake that returns a deterministic message_id (or None).
-        if telegram_send_with_id is None:
-            def _noop_with_id(text):
-                return None
-            try:
-                from api.services.telegram import send_message_capture_id
-                telegram_send_with_id = send_message_capture_id
-            except Exception:
-                telegram_send_with_id = _noop_with_id
-        self._telegram_send_with_id = telegram_send_with_id
+        # Telegram senders default to no-ops. Tests get isolation for free
+        # (no risk of a test ever hitting the operator's real chat), and
+        # production wiring is explicit in `main()`. The previous default
+        # — auto-importing the real Telegram module — leaked a test stub
+        # message to a real operator chat once; never again.
+        def _noop_telegram(text, chat_id=None):
+            return False
+        def _noop_with_id(text):
+            return None
+        self._telegram_send = telegram_send if telegram_send is not None else _noop_telegram
+        self._telegram_send_with_id = (
+            telegram_send_with_id if telegram_send_with_id is not None else _noop_with_id
+        )
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
@@ -437,13 +428,23 @@ class Worker:
                 self._handle_outcome(session, task, outcome)
 
     def _process_clarification_answers(self) -> None:
-        """Resume blocked sessions whose Telegram clarifications arrived.
+        """Resume sessions whose Telegram replies arrived.
 
         The Telegram listener (api/services/telegram.py) deposits user
         replies into `pending_questions.answer`. Each tick we drain any
-        answered+unprocessed questions, inject the answer as a user turn
-        into the conversation, swap the task tag back to `#agent-running`,
-        and re-invoke the appropriate executor.
+        answered+unprocessed rows. Two kinds:
+
+        * kind="clarification" — agent asked a question mid-task, session
+          is BLOCKED. Inject the answer as a user turn, swap the task tag
+          back to `#agent-running`, and re-invoke the executor.
+
+        * kind="followup" — task already completed, operator replied on
+          the completion message to continue the thread (e.g., "now turn
+          this into a .md"). Reopen the COMPLETED session: append the
+          reply as a new user turn, swap `#agent-completed` →
+          `#agent-running`, and re-run the executor. The agent retains
+          full prior context because the conversation history is
+          preserved.
 
         Special case for routing-ask: when the session's routing is "ask",
         the answer tells us which model to use. We parse "local"/"claude"
@@ -461,6 +462,11 @@ class Worker:
                 continue
 
             answer = q["answer"] or ""
+            kind = q.get("kind") or "clarification"
+
+            if kind == "followup":
+                self._resume_as_followup(q, session, answer)
+                continue
 
             # Routing-ask resolution: if session.routing == "ask", the answer
             # should contain "local" or "claude". Update the session's routing
@@ -552,6 +558,87 @@ class Worker:
                     session, task,
                     "managed clarification resume not yet supported",
                 )
+
+    def _resume_as_followup(self, q: dict, session: Session, answer: str) -> None:
+        """Operator replied to a completion message — reopen the COMPLETED
+        session as a follow-up turn. The conversation history is preserved
+        so the agent retains full context ("turn this into a .md" works
+        because "this" is still in the assistant's prior turn).
+        """
+        sid = session.session_id
+        task_id = session.task_id
+
+        self._swap_tag(task_id, COMPLETED_TAG, RUNNING_TAG)
+        self._set_task_status(task_id, "in_progress")
+        self.session_store.update_status(task_id, STATUS_RUNNING)
+        self.transcript_store.append(sid, "followup_received", {
+            "question_id": q["id"], "answer_chars": len(answer),
+        })
+
+        task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
+
+        if session.routing == ROUTE_LOCAL:
+            self.session_store.append_message(
+                sid, "user", f"(user replied on Telegram) {answer}",
+            )
+            executor = self._get_local_executor(caller_session_id=sid)
+            try:
+                outcome = executor.execute(session, task)
+            except Exception as exc:
+                logger.exception("followup local resume crashed for %s: %s", task_id, exc)
+                self._mark_failed(session, task, f"followup resume crashed: {exc}")
+                self.session_store.mark_question_processed(q["id"])
+                return
+            self.session_store.mark_question_processed(q["id"])
+            self._handle_outcome(session, task, outcome)
+            return
+
+        if session.routing == ROUTE_CLAUDE:
+            managed = self._get_managed_executor()
+            if managed is None or managed.driver is None:
+                self._mark_failed(
+                    session, task,
+                    "followup arrived but Managed Agents isn't configured",
+                )
+                self.session_store.mark_question_processed(q["id"])
+                return
+            # Post the operator's reply as a new user turn on the existing
+            # managed session. If Anthropic has already GC'd that session
+            # (or it was killed), `post_user_message` 404s; we tell the
+            # operator their thread can't be resumed cleanly.
+            remote_id = session.managed_agent_session_id
+            if not remote_id:
+                self._mark_failed(
+                    session, task,
+                    "followup arrived but no managed session id on record",
+                )
+                self.session_store.mark_question_processed(q["id"])
+                return
+            try:
+                managed.driver.post_user_message(remote_id, answer)
+            except Exception as exc:
+                # The remote session may have been cleaned up — surface a
+                # clear message so the operator can re-create the task if
+                # they want a fresh thread.
+                logger.warning(
+                    "followup post_user_message failed for %s: %s",
+                    remote_id, exc,
+                )
+                self._mark_failed(
+                    session, task,
+                    f"followup couldn't be delivered to the existing managed "
+                    f"session (it may have been cleaned up): {type(exc).__name__}",
+                )
+                self.session_store.mark_question_processed(q["id"])
+                return
+            # The next _poll_managed_sessions tick picks it up and we'll
+            # send a fresh completion notification when it finishes.
+            self.session_store.mark_question_processed(q["id"])
+            return
+
+        # Unknown routing — shouldn't happen post-preflight.
+        self._mark_failed(session, task, f"followup with unknown routing: {session.routing}")
+        self.session_store.mark_question_processed(q["id"])
 
     @staticmethod
     def _parse_routing_answer(answer: str) -> str | None:
@@ -979,7 +1066,28 @@ class Worker:
             # of the swap is non-critical — _swap_tag logs and the task is
             # already marked done in the vault.
             self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
-            self._notify(self._completion_summary(session, task, outcome))
+            # Send via the with-id sender so we can match a future Telegram
+            # reply to this completion message and resume the task as a
+            # follow-up turn (e.g., "now turn this into a .md in my vault").
+            # When the with-id sender returns None (bot not configured, or
+            # a test stub that doesn't capture ids) fall back to the plain
+            # _notify path so the operator at least sees the result.
+            body = self._completion_summary(session, task, outcome)
+            sent_id = self._telegram_send_with_id(body)
+            if sent_id is None:
+                self._notify(body)
+            else:
+                try:
+                    self.session_store.register_completion_followup(
+                        session_id=sid,
+                        task_id=session.task_id,
+                        sent_message_id=sent_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "register_completion_followup failed for %s: %s",
+                        session.task_id, exc,
+                    )
             return
 
         label = _worker_label(session.routing)
@@ -1025,10 +1133,24 @@ class Worker:
         # a blank message. The transcript captures every tool call.
         final_text = (outcome.final_text or "").strip()
         if not final_text:
-            result_blurb = (
-                f"(agent idled without a final text reply — check transcript at "
-                f"`data/agent_transcripts/{session.session_id}.jsonl` for tool-use detail)"
-            )
+            # The agent did work but never produced a final assistant
+            # message. Common with Sonnet on tasks that end with a tool
+            # call (e.g., drafting an email via lifeos_gmail_draft and
+            # not bothering to summarize after). Surface whatever the
+            # last meaningful tool produced so the operator sees the
+            # actual result (the draft, the calendar event, etc.) rather
+            # than just a transcript pointer.
+            recovered = self._recover_result_from_transcript(session.session_id)
+            if recovered:
+                result_blurb = (
+                    f"(no final text from the agent — surfacing the last "
+                    f"tool result instead)\n\n{recovered}"
+                )
+            else:
+                result_blurb = (
+                    f"(agent idled without a final text reply — check transcript at "
+                    f"`data/agent_transcripts/{session.session_id}.jsonl` for tool-use detail)"
+                )
         elif len(final_text) <= _INLINE_SUMMARY_MAX_CHARS:
             result_blurb = final_text
         else:
@@ -1070,6 +1192,81 @@ class Worker:
             f"({expected}) — {tokens:,} tokens, ${refreshed.total_dollars:.2f}, "
             f"{active_s}s active.\n\n{result_blurb}{footer}"
         )
+
+    def _recover_result_from_transcript(self, session_id: str) -> str:
+        """When the agent's `final_text` is empty, scan the transcript for
+        the last successful tool result and use it as the operator-facing
+        body. Caps the recovered text to fit the inline-summary budget
+        (anything bigger gets ellipsized — the full content is in the
+        transcript). Returns empty string when nothing usable exists.
+
+        Looks at both shapes:
+        - Local executor: `tool_call` events with `is_error=False` and a
+          non-trivial `output_chars`. The full output isn't recorded in
+          the transcript itself; the agent didn't summarize and the
+          transcript only captured metadata, so we report what tool was
+          called.
+        - Managed executor: `managed_event_agent.mcp_tool_result` and
+          `managed_event_agent.tool_result` events carry the actual
+          textual content in `payload.content[*].text`. Those are the
+          interesting ones — when the cloud agent drafts an email, the
+          email body lands here.
+        """
+        import json as _json
+
+        try:
+            path = self.transcript_store.dir / f"{session_id}.jsonl"
+            if not path.exists():
+                return ""
+            tool_results: list[tuple[str, str]] = []  # (tool_name, text)
+            tool_calls: list[str] = []  # local-executor tool names
+
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+                    kind = d.get("kind", "")
+                    payload = d.get("payload", {}) or {}
+
+                    if kind == "tool_call" and not payload.get("is_error"):
+                        # Local-executor shape — metadata only, no body
+                        tool_calls.append(str(payload.get("tool", "tool")))
+
+                    if kind in (
+                        "managed_event_agent.mcp_tool_result",
+                        "managed_event_agent.tool_result",
+                    ) and not payload.get("is_error"):
+                        # Managed-executor shape — body is in content[*].text
+                        for c in payload.get("content", []) or []:
+                            text = c.get("text") if isinstance(c, dict) else None
+                            if text:
+                                tool_name = (
+                                    payload.get("mcp_tool_use_id")
+                                    or payload.get("name")
+                                    or "tool"
+                                )
+                                tool_results.append((tool_name, text))
+
+            if tool_results:
+                # Most recent result wins.
+                _, text = tool_results[-1]
+                cap = _INLINE_SUMMARY_MAX_CHARS - 200
+                if len(text) > cap:
+                    text = text[:cap].rsplit(" ", 1)[0] + "…"
+                return text
+
+            if tool_calls:
+                # Local executor doesn't capture body in transcript; at
+                # least name the work that happened so the operator
+                # knows it wasn't a no-op.
+                last = tool_calls[-1]
+                return f"(last tool called: `{last}` — see transcript for arguments)"
+        except Exception as exc:
+            logger.warning("recover_result_from_transcript failed for %s: %s",
+                          session_id, exc)
+        return ""
 
     def _spill_to_vault(
         self, session: Session, task: dict[str, Any], final_text: str,
@@ -1184,7 +1381,22 @@ def main() -> None:
         level=os.environ.get("LIFEOS_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    worker = Worker()
+    # Wire up real Telegram senders in production. Worker() defaults to
+    # no-op senders so tests can't accidentally hit a real chat — see
+    # comment in __init__. If telegram.py isn't importable or the bot
+    # isn't configured, the no-op fallbacks let the worker still run.
+    telegram_send = None
+    telegram_send_with_id = None
+    try:
+        from api.services.telegram import send_message, send_message_capture_id
+        telegram_send = send_message
+        telegram_send_with_id = send_message_capture_id
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("Telegram module not importable; running with no-op senders: %s", exc)
+    worker = Worker(
+        telegram_send=telegram_send,
+        telegram_send_with_id=telegram_send_with_id,
+    )
 
     def _handle_signal(signum, _frame):
         logger.info("received signal %s; stopping after current tick", signum)

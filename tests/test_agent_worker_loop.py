@@ -368,6 +368,12 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     client = httpx.Client(transport=transport, base_url="http://api")
     store_for_session = SessionStore(db_path=tmp_path / "sessions.db")
     sent: list[str] = []
+    sent_ids: list[tuple[int, str]] = []
+    def _fake_with_id(text):
+        sent.append(text)
+        msg_id = len(sent_ids) + 2000
+        sent_ids.append((msg_id, text))
+        return msg_id
     managed = _StubManagedExecutor()
     w = Worker(
         api_base="http://api",
@@ -376,6 +382,7 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        telegram_send_with_id=_fake_with_id,
         http_client=client,
         preflight_caller=_golden_preflight(routing="claude"),
         local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="")),
@@ -477,6 +484,125 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
     assert sent
     assert "Note:" not in sent[0]
     assert "MCP server(s) unavailable" not in sent[0]
+
+
+@pytest.mark.unit
+def test_followup_reply_reopens_completed_session_and_reruns_with_new_turn(tmp_path: Path):
+    """Live bug repro: the operator replied to a completion message
+    ("turn this into a .md in my vault") and the response had no context.
+    Now the worker registers each completion message's Telegram msg_id,
+    and a reply matching that msg_id reopens the COMPLETED session,
+    appends the reply as a new user turn (history preserved so "this"
+    still refers to the prior assistant turn), and re-runs the executor."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "summarize X", "status": "todo",
+         "tags": ["agent", "local"]},
+    ])
+    # Two executor invocations — first completes, second handles the followup.
+    class _TwoStepExecutor:
+        outcomes = [
+            ExecutorOutcome(status=STATUS_COMPLETED, final_text="Here's the summary."),
+            ExecutorOutcome(status=STATUS_COMPLETED, final_text="Saved to vault as `summary.md`."),
+        ]
+        calls: list = []
+        def execute(self, session, task):
+            self.calls.append((session.task_id, task.get("description")))
+            return self.outcomes[len(self.calls) - 1]
+
+    executor = _TwoStepExecutor()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+
+    # Tick 1: first completion fires. The worker captures the Telegram
+    # msg_id via _telegram_send_with_id and registers a followup row.
+    w.tick()
+    assert len(executor.calls) == 1
+    sent_ids = w._sent_with_ids  # type: ignore[attr-defined]
+    assert sent_ids, "first completion should have captured a msg_id"
+    completion_msg_id = sent_ids[0][0]
+    assert "Here's the summary" in sent_ids[0][1]
+    # Task ended at #agent-completed / done.
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "done"
+
+    # Operator replies to the completion in Telegram → deposit_answer.
+    deposited = w.session_store.deposit_answer(completion_msg_id, "turn this into a .md in my vault")
+    assert deposited
+
+    # Tick 2: worker drains followup answers, reopens the session, and
+    # re-runs the executor. The reply is now in the conversation history.
+    w.tick()
+    assert len(executor.calls) == 2, "executor should re-run on followup"
+    # Task ended at #agent-completed again with the second completion.
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] == "done"
+    # Two completion messages captured.
+    assert len(sent_ids) == 2
+    assert "Saved to vault" in sent_ids[1][1]
+
+    # And the reply turn is in the session's conversation history.
+    session = w.session_store.get("t1")
+    msgs = w.session_store.get_messages(session.session_id)
+    user_turns = [m for m in msgs if m["role"] == "user"]
+    assert any(
+        isinstance(m["content"], str) and "turn this into a .md" in m["content"]
+        for m in user_turns
+    ), "follow-up reply should appear as a user turn in the conversation history"
+
+
+@pytest.mark.unit
+def test_empty_final_text_surfaces_last_tool_result_from_transcript(tmp_path: Path):
+    """Live bug repro (cloud session that drafted an email then idled
+    without producing an agent.message): the operator saw only the
+    transcript-pointer placeholder. Now the worker scans the transcript
+    for the last meaningful tool result and surfaces it inline so the
+    operator sees what the agent actually did."""
+    from api.services.agent_worker.transcript_store import TranscriptStore as _TS
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "draft email", "status": "todo",
+         "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+
+    # Pre-seed the transcript that the recovery helper will scan. The
+    # session_id matches the one the worker will assign on claim.
+    # Because the executor stub doesn't actually run a full session, we
+    # seed via the transcript store directly. To make this work we need
+    # the session_id ahead of time — claim it manually so we know it.
+    # Simpler: write a transcript by predicted session_id after tick().
+    # The cleaner approach is to use a stub managed transcript shape.
+
+    # Drive the tick so the worker generates a session + transcript path.
+    # Inject a managed-shape tool_result BEFORE the tick by pre-creating
+    # the session.
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    ts = _TS(transcripts_dir=tmp_path / "transcripts")
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_use", {"name": "lifeos_gmail_draft"})
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_result", {
+        "is_error": False,
+        "content": [{"type": "text", "text": "Draft created — to: kevin@example.com, subject: 'Apologies for the delay'"}],
+    })
+
+    # Now drive tick — task is already claimed, so the worker will find
+    # the session, run the (stub) executor, get empty final_text, and
+    # use _recover_result_from_transcript.
+    # Need to also flip the task to #agent-running for the dispatch path
+    # to work. Simpler: just call _completion_summary directly.
+    msg = w._completion_summary(sess, {"id": "t1", "description": "draft email"},
+                                executor.outcome)
+    assert "Draft created" in msg, msg
+    assert "no final text" in msg.lower()
+    assert "transcript at" not in msg.lower(), (
+        "should NOT fall back to transcript-pointer when a tool result was recovered"
+    )
 
 
 @pytest.mark.unit

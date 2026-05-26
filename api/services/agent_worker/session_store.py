@@ -100,11 +100,21 @@ CREATE TABLE IF NOT EXISTS pending_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_msgs_session ON pending_messages(session_id, delivered);
 
--- Open clarification questions sent to the operator via Telegram (Issue F).
+-- Open clarification questions sent to the operator via Telegram (Issue F)
+-- AND completion-message follow-ups (operator replies to a finished task's
+-- Telegram message to continue the thread, like "now turn this into a .md").
 -- The listener hook in telegram.py matches incoming reply_to_message ids
 -- against `sent_message_id` and deposits the answer. Worker.tick scans for
 -- answered+unprocessed rows to resume sessions, and for timed-out rows to
 -- send a follow-up nudge.
+--
+-- `kind` distinguishes the two flows:
+--   "clarification" — agent asked a question mid-task, session is BLOCKED,
+--                     the answer unblocks and resumes the executor.
+--   "followup"      — task already completed, operator replies on the
+--                     completion message to continue. Resume reopens the
+--                     COMPLETED session and appends the reply as a new
+--                     user turn so the agent retains full context.
 CREATE TABLE IF NOT EXISTS pending_questions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id        TEXT NOT NULL,
@@ -115,7 +125,8 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     answer            TEXT,
     answered_at       INTEGER,
     processed         INTEGER NOT NULL DEFAULT 0,
-    timed_out         INTEGER NOT NULL DEFAULT 0
+    timed_out         INTEGER NOT NULL DEFAULT 0,
+    kind              TEXT NOT NULL DEFAULT 'clarification'
 );
 CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
 CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
@@ -204,6 +215,14 @@ class SessionStore:
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
             if "final_text" not in cols:
                 conn.execute("ALTER TABLE managed_cursor ADD COLUMN final_text TEXT")
+            # Idempotent migration for `pending_questions.kind` — distinguishes
+            # mid-task clarifications from completion-message follow-ups.
+            pq_cols = {row["name"] for row in conn.execute("PRAGMA table_info(pending_questions)")}
+            if "kind" not in pq_cols:
+                conn.execute(
+                    "ALTER TABLE pending_questions ADD COLUMN kind TEXT "
+                    "NOT NULL DEFAULT 'clarification'"
+                )
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -710,17 +729,40 @@ class SessionStore:
         task_id: str,
         question: str,
         sent_message_id: int,
+        kind: str = "clarification",
     ) -> int:
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO pending_questions (
-                    session_id, task_id, question, sent_message_id, sent_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    session_id, task_id, question, sent_message_id, sent_at, kind
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, task_id, question, int(sent_message_id), _now()),
+                (session_id, task_id, question, int(sent_message_id), _now(), kind),
             )
         return cur.lastrowid
+
+    def register_completion_followup(
+        self,
+        session_id: str,
+        task_id: str,
+        sent_message_id: int,
+    ) -> int:
+        """Register a completion-message Telegram msg_id so an operator
+        reply to that message reopens the session as a follow-up turn.
+
+        The row goes into `pending_questions` with kind='followup' and
+        an empty `question` body — `deposit_answer` matches on
+        `sent_message_id` regardless of kind, and the worker tick
+        branches on `kind` when processing.
+        """
+        return self.create_pending_question(
+            session_id=session_id,
+            task_id=task_id,
+            question="",
+            sent_message_id=sent_message_id,
+            kind="followup",
+        )
 
     def deposit_answer(self, sent_message_id: int, answer: str) -> bool:
         """Record an answer for an open question, keyed by Telegram message_id.
