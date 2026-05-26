@@ -234,6 +234,29 @@ def test_poll_finalizes_completed(stores):
 
 
 @pytest.mark.unit
+def test_poll_finalizes_idle_status_as_completed(stores):
+    """The Managed Agents API reports successful terminal as `"idle"` (not
+    `"completed"`). Executor must treat both as STATUS_COMPLETED."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="idle",  # ← live API uses this verbatim
+            last_event_id="evt_done",
+            new_events=[{"id": "evt_done", "type": "session.status_idle"}],
+            total_input_tokens=3, total_output_tokens=42,
+            final_text="42 tasks.",
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.final_text == "42 tasks."
+    assert store.get("t1").status == STATUS_COMPLETED
+
+
+@pytest.mark.unit
 def test_poll_carries_final_text_forward_across_cursor_batches(stores):
     """`get_session_state` uses an event cursor, so consecutive polls only
     return events since the last seen id. If the final `agent.message` lands

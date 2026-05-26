@@ -144,18 +144,45 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ### 1. Create the Vault
 
-Workspace → Vaults → New Vault. Copy the `vlt_…` ID. Add OAuth credentials for whichever first-party connectors you want the agent to use (Gmail, Google Calendar, Google Drive, Superhuman) and any custom MCPs (Slack, Ramp, Granola, Asana, etc.). Each Vault entry stores the credential against the MCP server's URL — that exact URL must match what you put in the agent preset.
+Workspace → Vaults → New Vault. Copy the `vlt_…` ID. Add credentials for whichever first-party connectors you want the agent to use (Gmail, Google Calendar, Google Drive, Superhuman) and any custom MCPs (Slack, Ramp, Granola, Asana, etc.).
 
-Also add the LifeOS MCP as a custom Vault MCP entry:
-```
-Name: lifeos
-URL: https://<your-mcp-hostname>/mcp
-Header: Authorization = Bearer <LIFEOS_MCP_BEARER_TOKEN from Step 2>
+> **URL byte-match is required.** Each Vault credential stores against an `mcp_server_url`. When the agent connects to an MCP at runtime, Anthropic matches the agent preset's `mcp_servers.url` against the Vault entry's `mcp_server_url` byte-for-byte (no trailing slash, exact subdomain, exact path). If the URLs differ at all, you'll see `MCP server '<name>' initialize failed: no credential is stored for this server URL` in the session-error stream. Copy URLs by paste rather than re-typing.
+
+The LifeOS MCP needs a `static_bearer` credential. The console UI may default to OAuth flow; if you don't see a "static bearer" option, add it via the API:
+
+```bash
+curl -X POST "https://api.anthropic.com/v1/vaults/$VAULT_ID/credentials" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "anthropic-beta: managed-agents-2026-04-01" \
+  -H "content-type: application/json" \
+  -d "{
+    \"display_name\": \"LifeOS MCP\",
+    \"auth\": {
+      \"type\": \"static_bearer\",
+      \"mcp_server_url\": \"https://<your-mcp-hostname>/mcp\",
+      \"token\": \"<LIFEOS_MCP_BEARER_TOKEN from Step 2>\"
+    }
+  }"
 ```
 
 ### 2. Create the cloud Environment
 
-Workspace → Environments → New → Cloud (default network policy is fine). Copy the `env_…` ID.
+Workspace → Environments → New → Cloud.
+
+> **Set `networking.type` to `unrestricted` at creation time.** The console UI defaults to `limited` mode with `allow_mcp_servers: false`, which blocks every MCP host and yields `400 MCP server host(s) blocked by environment network policy` on every session create. If you already created the environment with the default and want to fix it without recreating, `POST` (not PATCH — that returns 405) the config update.
+>
+> **Caveat:** the body below sends a complete `config` object that replaces the existing config wholesale. If you've also set `init_script`, package lists, or env vars, GET the current config first and merge before POSTing. For a fresh environment with only `networking` set, this single command is fine:
+> ```bash
+> curl -X POST "https://api.anthropic.com/v1/environments/$ENV_ID" \
+>   -H "x-api-key: $ANTHROPIC_API_KEY" \
+>   -H "anthropic-version: 2023-06-01" \
+>   -H "anthropic-beta: managed-agents-2026-04-01" \
+>   -H "content-type: application/json" \
+>   -d '{"config":{"type":"cloud","networking":{"type":"unrestricted"}}}'
+> ```
+
+Copy the `env_…` ID.
 
 ### 3. Create the Agent preset
 

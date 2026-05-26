@@ -241,7 +241,11 @@ class ManagedExecutor:
         # Session-hour overhead has already been booked incrementally in
         # poll(), so finalize doesn't need to add anything more — just record
         # the terminal status.
-        if state.status == "completed":
+        # The Managed Agents API reports a successful terminal as `"idle"`
+        # (live-confirmed 2026-05-26). `"completed"` is kept here as a
+        # synthesized alias for forward-compat in case the API later transitions
+        # status fields between the two.
+        if state.status in ("idle", "completed"):
             # `state.final_text` reflects only events in *this* poll batch. If
             # the agent.message arrived in a prior batch and only the idle
             # event arrived now, fall back to the cached value persisted by
@@ -249,7 +253,7 @@ class ManagedExecutor:
             final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(session.session_id, "managed_completed",
-                                         {"final_chars": len(final_text)})
+                                         {"final_chars": len(final_text), "remote_status": state.status})
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
 
         if state.status == "budget_exceeded":
