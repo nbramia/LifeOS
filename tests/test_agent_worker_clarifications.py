@@ -8,7 +8,7 @@ End-to-end:
   3. Worker tick scans answered+unprocessed, injects the answer as a user
      turn, swaps tag back to #agent-running, resumes the local executor.
 
-Also covers `lifeos_user_ask` (agent-initiated clarification) and the
+Also covers `lifeos_agent_user_ask` (agent-initiated clarification) and the
 3-day timeout path.
 """
 from __future__ import annotations
@@ -190,6 +190,108 @@ def test_unmatched_reply_does_not_deposit(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_stale_answered_question_doesnt_redeposit(tmp_path: Path):
+    """Second reply to an already-answered question falls through to chat."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    sess = store.create(
+        task_id="t", status=STATUS_BLOCKED, routing="local",
+        budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+    )
+    store.create_pending_question(
+        session_id=sess.session_id, task_id="t",
+        question="?", sent_message_id=7,
+    )
+    assert store.deposit_answer(7, "first") is True
+    # Second attempt against the same message_id finds nothing open.
+    assert store.deposit_answer(7, "second") is False
+    q = store.get_question_by_message_id(7)
+    assert q["answer"] == "first"
+
+
+@pytest.mark.unit
+def test_routing_ask_local_reply_routes_to_local_executor(tmp_path: Path):
+    """Routing-ask resume: user reply 'local' must run the local executor."""
+
+    def routing_ask_preflight():
+        import json
+        def _caller(prompt):
+            return json.dumps({
+                "budget": {"wall_seconds": 3600, "max_tokens": 1000, "max_dollars": 5.0},
+                "routing": "ask", "routing_reason": "no model hint",
+                "expected_output": "text",
+                "ambiguity": None, "sane": True, "sane_reason": "",
+            })
+        return _caller
+
+    api = FakeApi([{"id": "t1", "description": "research dolphins", "status": "todo", "tags": ["agent"]}])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"))
+    w = _make_worker(tmp_path, api, preflight_caller=routing_ask_preflight(), local_executor=executor)
+    w.tick()
+
+    # Task is blocked, routing=ask.
+    blocked = w.session_store.list_sessions(status=STATUS_BLOCKED)[0]
+    assert blocked.routing == "ask"
+
+    # User replies "local".
+    msg_id, _ = w._sent_with_ids[0]
+    w.session_store.deposit_answer(msg_id, "use local please")
+
+    # Resume tick — routing gets resolved to "local" and executor runs.
+    w.tick()
+    assert executor.calls, "local executor should have been invoked"
+    refreshed = w.session_store.get(blocked.task_id)
+    assert refreshed.routing == "local"
+
+
+@pytest.mark.unit
+def test_routing_ask_unparseable_reply_reasks(tmp_path: Path):
+    """If the user's reply doesn't contain local/claude, ask again."""
+    def routing_ask_preflight():
+        import json
+        def _caller(prompt):
+            return json.dumps({
+                "budget": {"wall_seconds": 3600, "max_tokens": 1000, "max_dollars": 5.0},
+                "routing": "ask", "routing_reason": "x",
+                "expected_output": "text",
+                "ambiguity": None, "sane": True, "sane_reason": "",
+            })
+        return _caller
+
+    api = FakeApi([{"id": "t1", "description": "x", "status": "todo", "tags": ["agent"]}])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api, preflight_caller=routing_ask_preflight(), local_executor=executor)
+    w.tick()
+
+    msg_id, _ = w._sent_with_ids[0]
+    w.session_store.deposit_answer(msg_id, "yeah whatever you like")
+
+    w.tick()
+    # Executor not invoked — we re-asked.
+    assert executor.calls == []
+    # A second Telegram message was sent (the re-ask).
+    assert len(w._sent_with_ids) >= 2
+    second_text = w._sent_with_ids[1][1].lower()
+    assert "local" in second_text and "claude" in second_text
+
+
+@pytest.mark.unit
+def test_routing_answer_parser_combined_replies():
+    """Best-effort parse of combined ambiguity+routing replies."""
+    from api.services.agent_worker.worker import Worker
+    parse = Worker._parse_routing_answer
+    assert parse("local") == "local"
+    assert parse("CLAUDE please") == "claude"
+    assert parse("use opus") == "claude"
+    assert parse("gemma is fine") == "local"
+    # Combined: ambiguity answer first, model second.
+    assert parse("1. John Doe 2. local") == "local"
+    assert parse("It's John Doe, and let's use claude") == "claude"
+    # Neither keyword → None.
+    assert parse("yes do it") is None
+    assert parse("") is None
+
+
+@pytest.mark.unit
 def test_timeout_marks_question_and_nudges(tmp_path: Path):
     """A question older than the timeout gets `timed_out=1` + a follow-up nudge."""
     api = FakeApi([{"id": "t1", "description": "x", "status": "todo", "tags": ["agent-blocked"]}])
@@ -219,8 +321,8 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_lifeos_user_ask_blocks_and_records_question(tmp_path: Path):
-    """An agent calling `lifeos_user_ask` should park the session and record
+def test_lifeos_agent_user_ask_blocks_and_records_question(tmp_path: Path):
+    """An agent calling `lifeos_agent_user_ask` should park the session and record
     a pending_question that the user can reply-thread to."""
     api = FakeApi([])
     store = SessionStore(db_path=tmp_path / "sessions.db")
@@ -257,7 +359,7 @@ def test_lifeos_user_ask_blocks_and_records_question(tmp_path: Path):
         caps=Caps(),
         worker_handle=w,
     )
-    result = dispatch(ctx, "lifeos_user_ask", {"question": "Should I delete the file?"})
+    result = dispatch(ctx, "lifeos_agent_user_ask", {"question": "Should I delete the file?"})
     assert result["ok"]
     assert result["blocked"]
     assert store.get("active_t").status == STATUS_BLOCKED
@@ -269,7 +371,7 @@ def test_lifeos_user_ask_blocks_and_records_question(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_lifeos_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
+def test_lifeos_agent_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
     """If the worker can't send (no Telegram config), the tool returns an error
     rather than blocking the session in an unrecoverable state."""
     api = FakeApi([])
@@ -302,7 +404,7 @@ def test_lifeos_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
         caps=Caps(),
         worker_handle=w,
     )
-    result = dispatch(ctx, "lifeos_user_ask", {"question": "anyone home?"})
+    result = dispatch(ctx, "lifeos_agent_user_ask", {"question": "anyone home?"})
     assert not result["ok"]
     assert result["error"] == "telegram_unavailable"
     # Session NOT blocked (operator-facing failure mode).

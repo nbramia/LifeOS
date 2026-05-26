@@ -72,7 +72,7 @@ class InterAgentContext:
     when present, `kill` and other tools can reach remote managed sessions;
     when absent, managed targets are killed in the DB only.
 
-    `worker_handle` is optional; when present, `lifeos_user_ask` can route
+    `worker_handle` is optional; when present, `lifeos_agent_user_ask` can route
     a clarifying question through the worker's Telegram pipeline.
     """
     session_store: SessionStore
@@ -191,7 +191,7 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "lifeos_user_ask",
+        "name": "lifeos_agent_user_ask",
         "description": "Ask the operator a clarifying question via Telegram and pause until they reply. Your session ends; the worker resumes it (with the user's answer injected as a new user turn) once the reply arrives. Use sparingly — only when you genuinely cannot proceed without operator input.",
         "input_schema": {
             "type": "object",
@@ -497,7 +497,7 @@ def user_ask(ctx: InterAgentContext, args: dict) -> dict:
         return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
     if ctx.worker_handle is None:
         return _err(
-            "lifeos_user_ask is only available inside a running session",
+            "lifeos_agent_user_ask is only available inside a running session",
             code="no_worker",
         )
 
@@ -528,7 +528,7 @@ DISPATCH_TABLE = {
     "lifeos_agent_kill": kill,
     "lifeos_agent_transcript_read": transcript_read,
     "lifeos_agent_sessions_list": sessions_list,
-    "lifeos_user_ask": user_ask,
+    "lifeos_agent_user_ask": user_ask,
 }
 
 

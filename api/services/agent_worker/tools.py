@@ -313,11 +313,11 @@ class ToolRegistry:
             from api.services.agent_worker import inter_agent
             if inter_agent.is_inter_agent_tool(name):
                 payload = inter_agent.dispatch(self._inter_ctx, name, arguments or {})
-                # `yield_until` and `lifeos_user_ask` both end the executor
+                # `yield_until` and `lifeos_agent_user_ask` both end the executor
                 # turn — the first waits for child completion, the second for
                 # a Telegram reply.
                 yield_signal = (
-                    name in ("lifeos_agent_yield_until", "lifeos_user_ask")
+                    name in ("lifeos_agent_yield_until", "lifeos_agent_user_ask")
                     and payload.get("ok")
                 )
                 return ToolResult(
