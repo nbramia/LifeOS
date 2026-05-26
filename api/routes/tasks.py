@@ -6,7 +6,7 @@ CRUD endpoints for tasks stored in Obsidian-compatible markdown.
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services.task_manager import get_task_manager, Task
@@ -140,6 +140,31 @@ async def list_tags():
     """List all distinct tags across all tasks (any status) with usage counts."""
     manager = get_task_manager()
     return TagListResponse(tags=[TagUsage(**t) for t in manager.list_tags()])
+
+
+class SwapTagResponse(BaseModel):
+    swapped: bool
+    reason: Optional[str] = None
+
+
+@router.post("/{task_id}/swap-tag", response_model=SwapTagResponse)
+async def swap_tag(
+    task_id: str,
+    from_tag: str = Query(..., alias="from", description="Tag to remove (with or without '#')"),
+    to_tag: str = Query(..., alias="to", description="Tag to add in its place"),
+):
+    """Atomically replace one tag with another on a task.
+
+    Used by the external agent worker to claim `#agent` tasks. Returns
+    `{swapped: false}` (with a `reason`) when the task does not exist or
+    `from` is not currently among the task's tags — both indicate the worker
+    should move on to the next candidate rather than retry.
+    """
+    manager = get_task_manager()
+    if manager.get(task_id) is None:
+        return SwapTagResponse(swapped=False, reason="task not found")
+    ok = manager.swap_tag(task_id, from_tag, to_tag)
+    return SwapTagResponse(swapped=ok, reason=None if ok else f"tag '{from_tag}' not present")
 
 
 @router.get("/{task_id}", response_model=TaskResponse)

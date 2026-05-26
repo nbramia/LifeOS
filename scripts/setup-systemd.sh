@@ -51,11 +51,17 @@ _read_env() {
 LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-unsloth/gemma-4-26B-A4B-it-GGUF}")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
+AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) LLM_AUTOSTART="true" ;;
     *)          LLM_AUTOSTART="false" ;;
+esac
+
+case "$(echo "$AGENT_WORKER_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
+    *)          AGENT_WORKER_AUTOSTART="false" ;;
 esac
 
 if [ "$LLM_AUTOSTART" = "true" ]; then
@@ -77,6 +83,7 @@ if [ -n "$MCP_BEARER_TOKEN" ]; then
 else
     echo "  MCP HTTP:   disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
+echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
 echo ""
 
 # Install unit files with variable substitution
@@ -139,6 +146,19 @@ else
     echo "  lifeos-mcp-http: disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
 
+# Agent worker is opt-in via LIFEOS_AGENT_WORKER_AUTOSTART. Off by default
+# so fresh clones don't start polling the task list with no preflight call
+# wired up. Issue B installs the no-op dispatcher; later issues add real
+# execution.
+if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
+    systemctl enable --now lifeos-agent-worker.service
+    echo "  lifeos-agent-worker: $(systemctl is-active lifeos-agent-worker.service)"
+else
+    systemctl disable lifeos-agent-worker.service 2>/dev/null || true
+    systemctl stop lifeos-agent-worker.service 2>/dev/null || true
+    echo "  lifeos-agent-worker: disabled (set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable)"
+fi
+
 # Install logrotate config with substitution
 LOGROTATE_SRC="$PROJECT_DIR/config/logrotate-lifeos.conf"
 if [ -f "$LOGROTATE_SRC" ]; then
@@ -153,7 +173,7 @@ echo ""
 echo "Installing sudoers rule for passwordless systemctl..."
 SUDOERS_FILE="/etc/sudoers.d/lifeos"
 TMP_SUDOERS=$(mktemp)
-echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service, /usr/bin/systemctl start lifeos-mcp-http, /usr/bin/systemctl stop lifeos-mcp-http, /usr/bin/systemctl restart lifeos-mcp-http, /usr/bin/systemctl start lifeos-mcp-http.service, /usr/bin/systemctl stop lifeos-mcp-http.service, /usr/bin/systemctl restart lifeos-mcp-http.service" > "$TMP_SUDOERS"
+echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service, /usr/bin/systemctl start lifeos-mcp-http, /usr/bin/systemctl stop lifeos-mcp-http, /usr/bin/systemctl restart lifeos-mcp-http, /usr/bin/systemctl start lifeos-mcp-http.service, /usr/bin/systemctl stop lifeos-mcp-http.service, /usr/bin/systemctl restart lifeos-mcp-http.service, /usr/bin/systemctl start lifeos-agent-worker, /usr/bin/systemctl stop lifeos-agent-worker, /usr/bin/systemctl restart lifeos-agent-worker, /usr/bin/systemctl start lifeos-agent-worker.service, /usr/bin/systemctl stop lifeos-agent-worker.service, /usr/bin/systemctl restart lifeos-agent-worker.service" > "$TMP_SUDOERS"
 if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
     mv "$TMP_SUDOERS" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"

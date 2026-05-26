@@ -132,6 +132,50 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ---
 
+## Step 5 — Enable the agent worker (Issue B)
+
+Issue B installs `lifeos-agent-worker.service`, which polls `/api/tasks` for `#agent`-tagged tasks. It's **off by default** so a fresh clone doesn't start consuming tasks before later issues add real execution.
+
+To enable:
+
+```bash
+# .env
+LIFEOS_AGENT_WORKER_AUTOSTART=true
+
+# Optional knobs (defaults shown)
+# LIFEOS_AGENT_WORKER_POLL_SECONDS=60
+# LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS=5.00
+# LIFEOS_AGENT_DAILY_CAP_DOLLARS=100.00
+```
+
+```bash
+sudo ./scripts/setup-systemd.sh
+sudo systemctl status lifeos-agent-worker
+tail -f logs/agent-worker.log
+```
+
+At Issue B's scope, claiming a task does nothing except mark it complete with a placeholder Telegram notification ("no-op completion"). Real execution arrives in Issue C (#101) for the local Gemma path and Issue D (#102) for the Claude managed-agents path.
+
+To smoke-test the claim path:
+
+```bash
+# Create a task with the #agent tag
+curl -X POST http://localhost:8000/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"scaffolding smoke test","tags":["agent"]}'
+
+# Within ~60s, the worker should:
+#   1. swap #agent → #agent-running on the task
+#   2. record a session row in data/agent_sessions.db
+#   3. append events to data/agent_transcripts/<session_id>.jsonl
+#   4. mark the task complete
+#   5. send a Telegram notification (if TELEGRAM_BOT_TOKEN is configured)
+```
+
+To pause new claims without stopping the worker, set `LIFEOS_AGENT_DAILY_CAP_DOLLARS=0` and restart — the worker keeps polling but refuses to claim anything new.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -141,6 +185,8 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 | 502/504 from the tunnel | The MCP HTTP service isn't running on the configured port | `systemctl status lifeos-mcp-http` and `curl http://127.0.0.1:8765/mcp` |
 | Gemma loads but responses look garbled | Chat template mismatch | Add `--chat-template gemma3` to `lifeos-llm.service` `ExecStart` |
 | `llama-server` crashes on Gemma | Insufficient VRAM, or stale cached model | Check `nvidia-smi`/`rocm-smi`; re-download with `llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF` once and confirm |
+| Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
+| Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
 
 ---
 

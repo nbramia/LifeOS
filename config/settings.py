@@ -94,6 +94,47 @@ class Settings(BaseSettings):
         description="Bearer token required by the MCP HTTP transport. Generate with "
                     "`openssl rand -hex 32`. Empty disables the HTTP transport."
     )
+
+    # Agent Worker — external worker that picks up #agent-tagged tasks.
+    # See docs/guides/agent-worker-setup.md and epic #98 for the full design.
+    agent_worker_poll_seconds: float = Field(
+        default=60.0,
+        alias="LIFEOS_AGENT_WORKER_POLL_SECONDS",
+        description="How often the agent worker polls for new #agent tasks."
+    )
+    agent_worker_autostart: bool = Field(
+        default=False,
+        alias="LIFEOS_AGENT_WORKER_AUTOSTART",
+        description="Enable systemd auto-start on boot for the agent worker. "
+                    "Off by default — opt-in via setup-systemd.sh."
+    )
+    agent_default_budget_dollars: float = Field(
+        default=5.0,
+        alias="LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS",
+        description="Default per-task dollar budget when the task title doesn't specify one."
+    )
+    agent_default_wall_seconds: int = Field(
+        default=14400,
+        alias="LIFEOS_AGENT_DEFAULT_WALL_SECONDS",
+        description="Default per-task wall-clock budget (seconds); 14400 = 4h."
+    )
+    agent_default_max_tokens: int = Field(
+        default=500_000,
+        alias="LIFEOS_AGENT_DEFAULT_MAX_TOKENS",
+        description="Default per-task token budget (input + output combined)."
+    )
+    agent_daily_cap_dollars: float = Field(
+        default=100.0,
+        alias="LIFEOS_AGENT_DAILY_CAP_DOLLARS",
+        description="Global daily cap across all agent tasks. New tasks are not "
+                    "claimed once today's cumulative spend would exceed this."
+    )
+    agent_clarification_timeout_hours: int = Field(
+        default=72,
+        alias="LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS",
+        description="How long an #agent-blocked task waits for a Telegram reply "
+                    "before being abandoned. Used by Issue F."
+    )
     local_llm_autostart: bool = Field(
         default=False,
         alias="LIFEOS_LOCAL_LLM_AUTOSTART",

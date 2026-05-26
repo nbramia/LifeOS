@@ -1,0 +1,18 @@
+[Unit]
+Description=LifeOS Agent Worker
+After=network.target lifeos-api.service
+Requires=lifeos-api.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=__LIFEOS_DIR__/.env
+ExecStart=__VENV__/bin/python -m api.services.agent_worker.worker
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:__LIFEOS_DIR__/logs/agent-worker.log
+StandardError=append:__LIFEOS_DIR__/logs/agent-worker.log
+
+[Install]
+WantedBy=multi-user.target

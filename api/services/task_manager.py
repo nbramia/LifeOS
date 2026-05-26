@@ -206,6 +206,42 @@ class TaskManager:
             self._write_dashboard()
             return task
 
+    def swap_tag(self, task_id: str, from_tag: str, to_tag: str) -> bool:
+        """Atomically replace `from_tag` with `to_tag` on a task.
+
+        Returns True if the swap happened, False if either the task is gone
+        or `from_tag` is not present (already claimed / re-tagged).
+
+        Tags are compared with the leading `#` stripped, case-insensitively, to
+        match the rest of the codebase. The stored representation follows the
+        existing convention (no `#` prefix in `Task.tags`).
+        """
+        from_norm = from_tag.lstrip("#").lower()
+        to_norm = to_tag.lstrip("#")  # preserve operator-provided case
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return False
+
+            try:
+                idx = next(
+                    i for i, t in enumerate(task.tags)
+                    if t.lstrip("#").lower() == from_norm
+                )
+            except StopIteration:
+                return False
+
+            new_tags = list(task.tags)
+            new_tags[idx] = to_norm
+            task.tags = new_tags
+
+            new_line = _format_task_line(task)
+            _replace_line_in_file(Path(task.source_file), task.line_number, new_line)
+            self._save_index()
+            self._write_dashboard()
+            logger.info(f"swap_tag {task_id}: {from_norm} → {to_norm}")
+            return True
+
     def delete(self, task_id: str) -> bool:
         """Remove a task from its file and index."""
         with self._lock:
