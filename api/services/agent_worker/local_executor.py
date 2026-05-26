@@ -112,43 +112,87 @@ class ExecutorOutcome:
     init_failed_mcps: list[str] = field(default_factory=list)
 
 
+# Static portion of the system prompt — never changes between sessions. Kept
+# as a module-level constant so prompt caches can hit on it; the dynamic
+# per-session bits (expected output, soft budget) are appended at call time
+# and live in a small trailing section so cache invalidation is minimized.
+_SYSTEM_PROMPT_STATIC = """\
+<role>
+You are an autonomous task executor running inside LifeOS, the operator's
+personal-assistant system. You receive a single task from the operator's
+task list and complete it end to end without further input from them.
+</role>
+
+<environment>
+You run locally on the operator's machine. Your bash, read, write, edit,
+glob, and grep tools operate on the operator's actual filesystem. The
+`lifeos` MCP exposes the operator's structured personal data (calendar,
+gmail, drive, photos, contacts, financial transactions, notes, tasks,
+reminders, person profiles, conversation history).
+</environment>
+
+<mcp_routing>
+Default to the `lifeos` MCP for any personal-data query. It is faster and
+more accurate than scraping the filesystem directly. Use the standard
+`Read` / `Write` / `Edit` tools only for files outside the indexed data
+set (code, scratch notes, etc.). Use `Bash` for shell operations.
+</mcp_routing>
+
+<output_format>
+Every task must end with a final assistant turn containing a one-paragraph
+text summary. Tool calls alone are not a complete response. After your
+last tool call, produce a text turn that summarizes what you did and the
+key result. Be concrete: include specific names, counts, decisions, and
+links. Skip filler phrases.
+</output_format>
+
+<ambiguity>
+Do not ask clarifying questions during execution. If a task is genuinely
+ambiguous, make a reasonable assumption, do the work, and note the
+assumption in your final summary. If you cannot complete the task safely,
+say so plainly in your final response.
+</ambiguity>
+
+<inter_agent>
+Other agent sessions are visible via `lifeos_agent_transcript_read` and
+`lifeos_agent_sessions_list`. Spawn child agents with `lifeos_agent_spawn`,
+message them with `lifeos_agent_send`, check status with
+`lifeos_agent_check`. When you have nothing to do until specific children
+finish, call `lifeos_agent_yield_until(children=[...])` — this ends your
+session cleanly (no idle billing) and resumes you when the children are
+done. Prefer `yield_until` over polling.
+</inter_agent>
+
+<sleep>
+When you need to wait for external state to change with no child sessions
+to await, call the `sleep` tool rather than busy-looping.
+</sleep>"""
+
+
 def _system_prompt(session_id: str, expected_output: str, budget, parent_session_id: str | None = None) -> str:
     """System message for the executor agent.
 
-    Includes the inter-agent discovery guidance required by issue #103 §5 so
-    agents know they can spawn peers, message them, check status, and yield
-    until specific children complete (preferred over polling).
+    Structured per Anthropic's prompt-engineering best practices (XML
+    section tags, positive framing, explicit final-summary requirement).
+    Static content lives in `_SYSTEM_PROMPT_STATIC` to maximize prompt-
+    cache hits; only the small dynamic trailer changes per session.
+
+    `session_id` and `parent_session_id` are accepted for backwards
+    compatibility with the issue #103 §5 inter-agent flow but no longer
+    injected into the prompt body — the model can't act on either, and
+    both are tracked in `lifeos_agent_sessions_list` / transcripts.
     """
-    parent_clause = (
-        f" Your parent session is {parent_session_id}."
-        if parent_session_id else " You have no parent (top-level session)."
-    )
+    del session_id, parent_session_id  # logging-only artifacts, not for the model
+    wall = budget.get("wall_seconds")
+    max_tokens = budget.get("max_tokens")
+    max_dollars = budget.get("max_dollars")
+    dollars_str = f"~${max_dollars}" if max_dollars is not None else "unset"
     return (
-        "You are an autonomous agent running inside LifeOS, handling a single "
-        "task from the user's task manager. You have access to file, shell, "
-        "and LifeOS data tools. Work concisely and stop when the task is "
-        "complete — your final assistant turn (with no tool calls) is the "
-        f"answer the user will see.\n\n"
-        f"Your session_id is {session_id}.{parent_clause} Your expected output "
-        f"shape is `{expected_output}`. Your budget is "
-        f"wall={budget.get('wall_seconds')}s, "
-        f"max_tokens={budget.get('max_tokens')}, "
-        f"max_dollars=${budget.get('max_dollars')}.\n\n"
-        "## Inter-agent coordination\n"
-        "Transcripts of other agent sessions are available via "
-        "`lifeos_agent_transcript_read`. List active and recent sessions "
-        "with `lifeos_agent_sessions_list`. You can spawn child agents "
-        "(Claude or local) with `lifeos_agent_spawn`, message them with "
-        "`lifeos_agent_send`, and check their status with `lifeos_agent_check`. "
-        "If you have nothing else to do until specific children finish, call "
-        "`lifeos_agent_yield_until(children=[...])` — this is preferred over "
-        "polling, since it ends your session (no idle billing) and you'll be "
-        "automatically resumed with their results when they're done.\n\n"
-        "If you need to wait for external state to change with no children to "
-        "wait on, call the `sleep` tool rather than busy-looping. If you "
-        "cannot complete the task safely or have hit an ambiguity you cannot "
-        "resolve from context, say so plainly in your final response — do "
-        "not invent answers."
+        _SYSTEM_PROMPT_STATIC
+        + "\n\n<this_task>\n"
+        + f"expected_output={expected_output}; "
+        + f"soft budget ~{wall}s wall / ~{max_tokens} tokens / {dollars_str}.\n"
+        + "</this_task>"
     )
 
 

@@ -140,3 +140,47 @@ def test_preflight_budget_partial_uses_defaults():
     # max_tokens / max_dollars come from defaults — strictly positive
     assert result.budget.max_tokens > 0
     assert result.budget.max_dollars > 0
+
+
+# ---------------------------------------------------------------------------
+# Prompt-content tests — verify routing rules visible to Haiku (issue #119)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_preflight_prompt_recognizes_cloud_tag_as_mirror_of_local():
+    """`#cloud` tag should route to claude — symmetric with `#local` → local.
+    The rule lives in the prompt text Haiku consumes."""
+    prompt = pf.build_preflight_prompt(title="anything", tags=["agent", "cloud"])
+    # Strong assertions: the literal rule text Haiku reads.
+    assert 'tag list contains "cloud"' in prompt
+    assert '#cloud tag present' in prompt
+    # Both directions documented in the rules
+    assert '"local"' in prompt
+    assert '"cloud"' in prompt
+
+
+@pytest.mark.unit
+def test_preflight_prompt_infers_claude_from_capability_phrases():
+    """Capability-implying phrases (gmail/calendar/drive/slack/etc.) should
+    cue claude routing without an explicit 'use claude' phrase. Live testing
+    today saw 3 tasks go to `ask` because of strict literal matching; this
+    rule fixes that."""
+    prompt = pf.build_preflight_prompt(title="search my gmail for ...", tags=["agent"])
+    # The capability-inference rule must mention each major surface
+    for keyword in ("gmail", "calendar", "drive", "slack"):
+        assert keyword in prompt.lower(), f"missing capability inference for: {keyword}"
+    # And explicitly state the routing decision
+    assert "claude" in prompt.lower()
+
+
+@pytest.mark.unit
+def test_preflight_prompt_includes_ordered_precedence():
+    """Routing precedence must be clearly ordered (tags first, explicit cues
+    second, capability inference third, ask as final fallback)."""
+    prompt = pf.build_preflight_prompt(title="x", tags=["agent"])
+    assert "precedence" in prompt.lower() or "apply in order" in prompt.lower() or "first match wins" in prompt.lower()
+    # All four ladder steps present
+    assert "#local" in prompt or "tag list contains \"local\"" in prompt
+    assert "use claude" in prompt
+    assert "capability" in prompt.lower() or "infer from capability" in prompt.lower()
+    assert "ask" in prompt.lower()
