@@ -65,15 +65,25 @@ class SpendTracker:
         Reasoning: budgets are inclusive — the cap is a ceiling the worker is
         willing to *reach*, not exceed. A task with estimate exactly equal to
         the remaining budget is allowed.
+
+        Special case: `daily_cap_dollars <= 0` is the operator's "pause"
+        signal. We refuse all claims unconditionally in that case so a fresh
+        clone setting `LIFEOS_AGENT_DAILY_CAP_DOLLARS=0` actually pauses
+        instead of allowing zero-dollar tasks through.
         """
         if estimated_dollars < 0:
             raise ValueError("estimated_dollars must be non-negative")
+        if self.daily_cap_dollars <= 0:
+            return False
         return self.today_total(today) + estimated_dollars <= self.daily_cap_dollars
 
     def record(self, dollars: float, today: date_cls | None = None) -> float:
         """Add `dollars` to today's bucket. Returns the new total."""
         if dollars < 0:
             raise ValueError("dollars must be non-negative")
+        if dollars == 0:
+            # No-op: don't create a daily_spend row just to accumulate zero.
+            return self.today_total(today)
         key = self._today_key(today)
         with self._connect() as conn:
             # UPSERT: insert or accumulate atomically.

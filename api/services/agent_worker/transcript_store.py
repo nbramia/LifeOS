@@ -25,8 +25,9 @@ class TranscriptStore:
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, session_id: str) -> Path:
-        # Defense in depth: refuse path-traversal-ish session ids.
-        if "/" in session_id or ".." in session_id:
+        # Defense in depth: refuse path-traversal-ish session ids. Reject all
+        # separators (Unix `/`, Windows `\`), `..` segments, and absolute paths.
+        if not session_id or "/" in session_id or "\\" in session_id or ".." in session_id:
             raise ValueError(f"invalid session_id: {session_id!r}")
         return self.dir / f"{session_id}.jsonl"
 

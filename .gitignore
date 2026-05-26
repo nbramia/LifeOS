@@ -135,5 +135,8 @@ scripts/clear-caches.sh
 !.claude/settings.json
 !.claude/skills/
 
-# Duplicate of CLAUDE.md
-AGENTS.md
+# Per-subdirectory AGENTS.md files (api/, docs/, etc.) are project docs and
+# are tracked. This rule only ignores ad-hoc AGENTS.md files that some Claude
+# Code tooling may write at the repo root — the tracked root-level AGENTS.md
+# overrides this since gitignore doesn't apply to files already in the index.
+/AGENTS.md

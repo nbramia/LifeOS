@@ -89,6 +89,9 @@ class Worker:
             "agent worker starting (api=%s, poll=%ss, daily_cap=$%s)",
             self.api_base, self.poll_seconds, self.spend_tracker.daily_cap_dollars,
         )
+        # Recover any sessions left non-terminal by a previous crash before
+        # starting fresh poll cycles (issue #100 acceptance: restart-resumable).
+        self.resume_pending()
         while not self._stop:
             try:
                 self.tick()
@@ -105,14 +108,62 @@ class Worker:
             self._http.close()
 
     # ------------------------------------------------------------------
+    # Startup recovery
+    # ------------------------------------------------------------------
+
+    def resume_pending(self) -> int:
+        """Finalize any non-terminal sessions left behind by a previous crash.
+
+        At Issue B scope, the no-op dispatcher's only side effect is marking
+        the task complete via the API. So recovery is straightforward: for
+        each non-terminal session, retry the `complete` call and update the
+        session to a terminal state. Later issues will replace this with a
+        proper per-routing resume (managed-agent re-attach, local-loop
+        re-drive, etc.).
+        """
+        pending = self.session_store.list_non_terminal()
+        if not pending:
+            return 0
+        logger.info("resuming %d non-terminal session(s) from previous run", len(pending))
+        recovered = 0
+        for session in pending:
+            sid = session.session_id
+            self.transcript_store.append(sid, "resume_attempt", {"prior_status": session.status})
+            if self._complete_task(session.task_id):
+                self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+                self.transcript_store.append(sid, "resume_completed", {})
+                self._notify(
+                    f"✅ Agent worker (scaffolding): recovered orphaned task "
+                    f"after restart (session {sid})"
+                )
+                recovered += 1
+            else:
+                # Roll the tag back so the task can be re-claimed next cycle.
+                self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
+                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                self.transcript_store.append(sid, "resume_failed", {})
+                self._notify(
+                    f"⚠️ Agent worker (scaffolding): could not finalize orphaned "
+                    f"task on resume — tag rolled back to #{AGENT_TAG} for retry"
+                )
+        return recovered
+
+    # ------------------------------------------------------------------
     # One iteration
     # ------------------------------------------------------------------
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
-        if not self.spend_tracker.can_start_task(0.0):
-            # Cap is zero or already exceeded — pause new claims this cycle.
-            logger.info("daily spend cap reached; skipping poll cycle")
+        # Use the configured per-task default budget as the "can I afford to
+        # start the cheapest task right now?" estimate. Calling with 0.0 would
+        # let claims through even at cap=0 — see SpendTracker.can_start_task
+        # for the pause semantics.
+        estimate = settings.agent_default_budget_dollars
+        if not self.spend_tracker.can_start_task(estimate):
+            logger.info(
+                "daily spend cap reached or paused (cap=$%s, today=$%.2f); skipping poll",
+                self.spend_tracker.daily_cap_dollars, self.spend_tracker.today_total(),
+            )
             return 0
 
         candidates = self._list_agent_tasks()
@@ -192,10 +243,16 @@ class Worker:
             return True
         except Exception as exc:
             # Already-claimed by a sibling worker, or DB hiccup. Try to un-do
-            # the tag swap so the task remains pickable; if that also fails the
-            # operator will see `#agent-running` and can manually re-tag.
+            # the tag swap so the task remains pickable.
             logger.error("session create failed for %s: %s", task_id, exc)
-            self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
+            if not self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG):
+                # Rollback failed — task is stuck at #agent-running. Notify so
+                # the operator can intervene before this silently strands work.
+                self._notify(
+                    f"⚠️ Agent worker: failed to claim task {task_id} and could "
+                    f"not roll back tag. Task stuck at #{RUNNING_TAG} — please "
+                    f"re-tag manually if you want it retried."
+                )
             return False
 
     def _dispatch_noop(self, task: dict[str, Any]) -> None:
@@ -220,9 +277,20 @@ class Worker:
             self.transcript_store.append(sid, "noop_complete", {"title": title})
             self._notify(f"✅ Agent worker (scaffolding): no-op completed task '{title}'")
         else:
+            # Completion API failed. Roll the tag back to #agent so the task is
+            # re-pickable next cycle (rather than stranded at #agent-running).
+            rolled_back = self._swap_tag(task_id, RUNNING_TAG, AGENT_TAG)
             self.session_store.update_status(task_id, STATUS_FAILED)
-            self.transcript_store.append(sid, "complete_failed", {"title": title})
-            self._notify(f"⚠️ Agent worker (scaffolding): failed to mark task '{title}' complete")
+            self.transcript_store.append(
+                sid,
+                "complete_failed",
+                {"title": title, "tag_rolled_back": rolled_back},
+            )
+            msg = (
+                f"⚠️ Agent worker (scaffolding): failed to mark task '{title}' complete; "
+                f"{'re-tagged for retry' if rolled_back else 'tag still at #agent-running — please re-tag manually'}"
+            )
+            self._notify(msg)
 
     def _notify(self, text: str) -> None:
         try:

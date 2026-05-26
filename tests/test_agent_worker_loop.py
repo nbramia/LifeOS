@@ -145,7 +145,7 @@ def test_worker_loses_race_when_swap_tag_fails(worker: Worker, fake_api: FakeApi
 
 @pytest.mark.unit
 def test_worker_pauses_at_daily_cap(tmp_path: Path, fake_api: FakeApi):
-    """Cap of 0 means no new claims even though tasks are available."""
+    """Cap of 0 should pause new claims with no other state needed."""
     transport = httpx.MockTransport(fake_api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     w = Worker(
@@ -157,9 +157,104 @@ def test_worker_pauses_at_daily_cap(tmp_path: Path, fake_api: FakeApi):
         telegram_send=lambda *a, **kw: True,
         http_client=client,
     )
-    # Force the cap to be effectively breached: any positive estimate fails.
-    w.spend_tracker.record(0.01)
 
     handled = w.tick()
     assert handled == 0
     assert w.session_store.get("task-1") is None
+
+
+@pytest.mark.unit
+def test_worker_rolls_back_tag_on_complete_failure(tmp_path: Path):
+    """If POST /complete fails, the worker should roll #agent-running → #agent so the next tick can retry."""
+    calls = {"complete_calls": 0}
+
+    class FailingApi(FakeApi):
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT" and request.url.path.endswith("/complete"):
+                calls["complete_calls"] += 1
+                return httpx.Response(503)
+            return super().handler(request)
+
+    api = FailingApi(tasks=[{"id": "task-1", "description": "x", "status": "todo", "tags": ["agent"]}])
+    transport = httpx.MockTransport(api.handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    w = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda *a, **kw: True,
+        http_client=client,
+    )
+
+    w.tick()
+    # Tag should be rolled back to #agent (so a future tick can re-attempt).
+    assert "agent" in api.tasks["task-1"]["tags"]
+    assert "agent-running" not in api.tasks["task-1"]["tags"]
+    # Session is marked failed so we don't try to re-resume on startup forever.
+    from api.services.agent_worker.session_store import STATUS_FAILED
+    assert w.session_store.get("task-1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_resume_pending_completes_orphaned_session(tmp_path: Path):
+    """On restart, a session left in STATUS_RUNNING should be finalized."""
+    api = FakeApi(tasks=[{"id": "task-1", "description": "x", "status": "todo", "tags": ["agent-running"]}])
+    transport = httpx.MockTransport(api.handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    # Simulate a crash mid-dispatch: session row exists with STATUS_RUNNING.
+    from api.services.agent_worker.session_store import STATUS_RUNNING
+    store.create(task_id="task-1", status=STATUS_RUNNING)
+
+    sent: list[str] = []
+    w = Worker(
+        api_base="http://api",
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        http_client=client,
+    )
+    recovered = w.resume_pending()
+    assert recovered == 1
+    assert api.tasks["task-1"]["status"] == "done"
+    assert w.session_store.get("task-1").status == STATUS_COMPLETED
+    assert any("recovered orphaned task" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_resume_pending_rolls_tag_back_when_completion_fails(tmp_path: Path):
+    """If completion still fails on resume, we mark FAILED and roll the tag back."""
+
+    class FailingApi(FakeApi):
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT" and request.url.path.endswith("/complete"):
+                return httpx.Response(503)
+            return super().handler(request)
+
+    api = FailingApi(tasks=[{"id": "task-1", "description": "x", "status": "todo", "tags": ["agent-running"]}])
+    transport = httpx.MockTransport(api.handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    from api.services.agent_worker.session_store import STATUS_FAILED, STATUS_RUNNING
+    store.create(task_id="task-1", status=STATUS_RUNNING)
+
+    sent: list[str] = []
+    w = Worker(
+        api_base="http://api",
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        http_client=client,
+    )
+    recovered = w.resume_pending()
+    assert recovered == 0
+    assert w.session_store.get("task-1").status == STATUS_FAILED
+    assert "agent" in api.tasks["task-1"]["tags"]
+    assert "agent-running" not in api.tasks["task-1"]["tags"]
+    assert any("could not finalize" in s for s in sent)

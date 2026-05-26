@@ -48,9 +48,10 @@ def test_session_store_get_missing_returns_none(tmp_path: Path):
 
 @pytest.mark.unit
 def test_session_store_rejects_duplicate_task_id(tmp_path: Path):
+    import sqlite3
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(task_id="t1")
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.IntegrityError):
         store.create(task_id="t1")
 
 
@@ -154,9 +155,24 @@ def test_spend_tracker_can_start_at_exact_boundary(tmp_path: Path):
 
 @pytest.mark.unit
 def test_spend_tracker_zero_cap_denies_any_claim(tmp_path: Path):
+    """LIFEOS_AGENT_DAILY_CAP_DOLLARS=0 is the operator's pause signal."""
     tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=0.0)
-    assert tr.can_start_task(0.0)  # zero estimate at zero cap is allowed
+    assert not tr.can_start_task(0.0)
     assert not tr.can_start_task(0.01)
+
+
+@pytest.mark.unit
+def test_spend_tracker_negative_cap_treated_as_paused(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=-1.0)
+    assert not tr.can_start_task(1.0)
+
+
+@pytest.mark.unit
+def test_spend_tracker_record_zero_is_noop(tmp_path: Path):
+    """record(0) should not create a daily_spend row or change totals."""
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0)
+    assert tr.record(0.0) == 0.0
+    assert tr.today_total() == 0.0
 
 
 @pytest.mark.unit
