@@ -160,7 +160,8 @@ def test_unknown_method_returns_jsonrpc_error(client: TestClient, bearer_token: 
 
 
 @pytest.mark.unit
-def test_malformed_json_returns_400(client: TestClient, bearer_token: str):
+def test_malformed_json_returns_parse_error_envelope(client: TestClient, bearer_token: str):
+    """Per JSON-RPC 2.0 spec, malformed JSON → -32700 with id null."""
     resp = client.post(
         "/mcp",
         content=b"not json",
@@ -170,6 +171,55 @@ def test_malformed_json_returns_400(client: TestClient, bearer_token: str):
         },
     )
     assert resp.status_code == 400
+    body = resp.json()
+    assert body["jsonrpc"] == "2.0"
+    assert body["id"] is None
+    assert body["error"]["code"] == -32700
+    assert body["error"]["message"] == "Parse error"
+
+
+@pytest.mark.unit
+def test_bearer_with_extra_whitespace_accepted(client: TestClient, bearer_token: str):
+    """Operator copy-paste pitfall: extra spaces around the token shouldn't 401."""
+    resp = client.post(
+        "/mcp",
+        json=_initialize_request(),
+        headers={"Authorization": f"Bearer   {bearer_token}  "},
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.unit
+def test_batch_of_notifications_returns_202(client: TestClient, bearer_token: str):
+    """A batch where every entry is a notification has no responses → 202."""
+    resp = client.post(
+        "/mcp",
+        json=[
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        ],
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 202
+    assert resp.content == b""
+
+
+@pytest.mark.unit
+def test_batch_mixed_returns_only_non_notification_responses(client: TestClient, bearer_token: str):
+    """A mixed batch returns responses only for the entries that had an id."""
+    resp = client.post(
+        "/mcp",
+        json=[
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 42, "method": "tools/list"},
+        ],
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert len(body) == 1
+    assert body[0]["id"] == 42
 
 
 @pytest.mark.unit

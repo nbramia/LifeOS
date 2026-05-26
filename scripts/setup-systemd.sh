@@ -126,8 +126,10 @@ systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 
 # MCP HTTP transport is only enabled when a bearer token is configured.
-# Without a token, exposing the MCP server over HTTP would let any caller hit
-# the agent worker's tool surface — see docs/guides/agent-worker-setup.md.
+# The systemd unit reads the live .env at runtime; we check the token here
+# purely to decide whether to enable/start the unit at install time. Without
+# a token, exposing the MCP server over HTTP would let any caller hit the
+# agent worker's tool surface — see docs/guides/agent-worker-setup.md.
 if [ -n "$MCP_BEARER_TOKEN" ]; then
     systemctl enable --now lifeos-mcp-http.service
     echo "  lifeos-mcp-http: $(systemctl is-active lifeos-mcp-http.service)"

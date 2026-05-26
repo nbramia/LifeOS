@@ -1720,17 +1720,27 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
     def _check_auth(request: Request) -> None:
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
+        token = token.strip()
         if scheme.lower() != "bearer" or not token:
             raise HTTPException(status_code=401, detail="missing bearer token")
         if not hmac.compare_digest(token, bearer_token):
             raise HTTPException(status_code=401, detail="invalid bearer token")
+
+    def _parse_error_response() -> JSONResponse:
+        """JSON-RPC -32700 Parse error per the spec — id is null when unparseable."""
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        }
+        return JSONResponse(envelope, status_code=400)
 
     async def _handle(request: Request) -> Response:
         _check_auth(request)
         try:
             body = await request.json()
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="invalid JSON body")
+            return _parse_error_response()
 
         if isinstance(body, list):
             responses = [r for r in (dispatch(server, req) for req in body) if r is not None]
