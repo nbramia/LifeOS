@@ -189,6 +189,11 @@ tool call, produce a text turn that summarizes what you did and the key
 result. Be concrete: include specific names, counts, decisions, and
 links. Skip filler phrases.
 
+Critically: your final turn must report results, not intentions. Never
+end with "I'll do X next" or "let me now Y" — those are promises, not
+completions. If you genuinely need more turns, take them now; only end
+the session when the task is actually done.
+
 The summary is delivered to the operator via Telegram, which does NOT
 render Markdown tables, headings (`#`), or code-block borders nicely.
 Prefer prose, bullets, and bold/italic emphasis. Avoid pipe-table
@@ -198,15 +203,16 @@ When the natural output is longer than a few short paragraphs, or is
 inherently tabular (a list of rows with multiple columns), or is a
 deliverable the operator will reuse (a report, draft, plan, comparison),
 create an artifact and link to it in your summary rather than dumping
-the body inline:
-  - **Notes / reports / drafts**: write a Markdown file directly to the
-    vault using the `Write` tool, with a path like
-    `$LIFEOS_VAULT_PATH/Inbox/<descriptive-name>.md`. The operator's
-    Obsidian sync will pick it up automatically.
-  - **Tabular data**: write a CSV under `$LIFEOS_VAULT_PATH/Inbox/`.
+the body inline. Vault artifacts go in the `output_dir` path provided
+in this_task — same location the worker's spillover uses, so everything
+the operator's agents produce lands in one consistent folder.
+  - **Notes / reports / drafts**: write a Markdown file with `Write` to
+    `<output_dir>/<YYYY-MM-DD>-<descriptive-slug>.md`. Obsidian picks
+    it up automatically.
+  - **Tabular data**: write a CSV under the same `<output_dir>`.
     Avoid Markdown pipe tables in either Telegram or vault notes.
   - **Inline summary**: a 1–3 sentence Telegram message that says what
-    you did and the full path to the artifact (`/Users/.../Inbox/foo.md`).
+    you did and the full path to the artifact.
 </output_format>
 
 <ambiguity>
@@ -247,7 +253,7 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     injected into the prompt body — the model can't act on either, and
     both are tracked in `lifeos_agent_sessions_list` / transcripts.
     """
-    del session_id, parent_session_id  # logging-only artifacts, not for the model
+    del parent_session_id  # logging-only, not for the model
     wall = budget.get("wall_seconds")
     max_tokens = budget.get("max_tokens")
     max_dollars = budget.get("max_dollars")
@@ -257,10 +263,13 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     # calendar / task / due-date data. Inject the operator's local date
     # so day-relative reasoning works.
     today = _today()
+    output_dir = _output_dir()
     return (
         _SYSTEM_PROMPT_STATIC
         + "\n\n<this_task>\n"
         + f"today={today}; "
+        + f"lifeos_session_id={session_id}; "
+        + f"output_dir={output_dir}; "
         + f"expected_output={expected_output}; "
         + f"soft budget ~{wall}s wall / ~{max_tokens} tokens / {dollars_str}.\n"
         + "</this_task>"
@@ -272,6 +281,22 @@ def _today() -> str:
     from datetime import datetime
     now = datetime.now().astimezone()
     return now.strftime("%Y-%m-%d (%A)")
+
+
+def _output_dir() -> str:
+    """Resolved absolute path where the agent should write artifacts. Joins
+    `LIFEOS_VAULT_PATH` with `LIFEOS_AGENT_OUTPUT_DIR` so the local agent
+    and the worker's spillover land in the same folder."""
+    from pathlib import Path
+    from config.settings import settings as _settings
+    vault = _settings.vault_path
+    if not vault:
+        return _settings.agent_output_dir  # vault-relative only
+    try:
+        vault = vault.expanduser() if hasattr(vault, "expanduser") else Path(vault)
+    except Exception:
+        vault = Path(str(vault))
+    return str(Path(vault) / _settings.agent_output_dir)
 
 
 def _user_message_for(task: dict) -> str:

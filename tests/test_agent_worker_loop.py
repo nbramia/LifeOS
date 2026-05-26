@@ -775,8 +775,10 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     assert "obsidian://" in msg
     # The full body is NOT inlined verbatim
     assert long_text not in msg
-    # The vault file exists with the expected structure
-    out_dir = vault / "Inbox" / "Agent Output"
+    # The vault file exists in the configured agent-output dir
+    # (LIFEOS_AGENT_OUTPUT_DIR; defaults to "LifeOS/Tasks/Agent Output").
+    from config.settings import settings as _settings
+    out_dir = vault / _settings.agent_output_dir
     md_files = list(out_dir.glob("*.md"))
     assert len(md_files) == 1, f"expected one spillover file; got {md_files}"
     body = md_files[0].read_text(encoding="utf-8")

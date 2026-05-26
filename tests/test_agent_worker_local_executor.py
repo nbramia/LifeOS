@@ -522,16 +522,23 @@ def test_system_prompt_uses_positive_framing_for_ambiguity():
 
 
 @pytest.mark.unit
-def test_system_prompt_does_not_inject_session_id_into_body():
-    """session_id is a worker artifact, not actionable by the model.
-    Keeping it out of the prompt body maximizes prompt-cache hits."""
+def test_system_prompt_injects_session_id_into_dynamic_block_only():
+    """The agent needs its own session_id to pass as `caller_session_id`
+    when calling inter-agent tools (the dispatcher requires it; MCP HTTP
+    can't infer it server-side). The id lands in the dynamic <this_task>
+    trailer, not the cached static block — so cache invalidation stays
+    confined to per-session changes already happening there (today, budget)."""
     prompt = _system_prompt(
         session_id="sess_abc123",
         expected_output="text",
         budget={"wall_seconds": 3600, "max_tokens": 5000, "max_dollars": 5.0},
     )
-    assert "sess_abc123" not in prompt
-    assert "session_id" not in prompt
+    # session id appears in the dynamic <this_task> section
+    assert "lifeos_session_id=sess_abc123" in prompt
+    # but the static portion stays cache-clean: no session_id leakage
+    static, _, dynamic = prompt.partition("<this_task>")
+    assert "sess_abc123" not in static
+    assert "lifeos_session_id" not in static
 
 
 @pytest.mark.unit

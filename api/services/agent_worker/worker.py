@@ -1277,9 +1277,10 @@ class Worker:
         a truncated inline summary so the operator never loses content
         entirely.
 
-        File layout: `<vault>/Inbox/Agent Output/<YYYY-MM-DD>-<slug>.md`.
-        Inbox is the standard landing folder for Obsidian setups and
-        keeps these next to other unsorted captures.
+        File layout: `<vault>/<LIFEOS_AGENT_OUTPUT_DIR>/<YYYY-MM-DD>-<slug>.md`.
+        The output dir is operator-configurable via `LIFEOS_AGENT_OUTPUT_DIR`
+        (default `LifeOS/Tasks/Agent Output`) so spillover and the local
+        executor's direct vault writes land in the same place.
         """
         from datetime import datetime
         import re
@@ -1296,7 +1297,7 @@ class Worker:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:60] or session.task_id
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         filename = f"{today}-{slug}.md"
-        folder = "Inbox/Agent Output"
+        folder = settings.agent_output_dir
 
         try:
             target_dir = vault_root / folder

@@ -119,9 +119,11 @@ def test_start_creates_remote_session_with_agent_and_environment_ids(stores):
     # Ambiguity policy NOT duplicated here — it lives in the agent preset's
     # system prompt (Anthropic console). User message stays task-specific.
     assert "ambiguous" not in cw["initial_message"]
-    # session_id NOT in the user message — already in session metadata.
-    assert session.session_id not in cw["initial_message"]
-    assert "lifeos_session_id" not in cw["initial_message"]
+    # session_id IS injected as `lifeos_session_id=…` so the cloud agent
+    # can pass it as `caller_session_id` on inter-agent tool calls. The
+    # MCP HTTP layer can't infer the caller server-side (cross-process),
+    # so the agent must supply it explicitly.
+    assert f"lifeos_session_id={session.session_id}" in cw["initial_message"]
     # NO inline system_prompt / model / mcp_servers / connectors
     assert "system_prompt" not in cw
     assert "model" not in cw
