@@ -84,12 +84,17 @@ def test_start_creates_remote_session_and_attaches_id(stores):
 
 @pytest.mark.unit
 def test_start_handles_create_failure(stores):
+    """create_session failure path masks the exception args (which may contain
+    request details / API key) and surfaces only the exception type name."""
     store, session, transcript = stores
     driver = _FakeDriver(create_raises=RuntimeError("403"))
     executor = ManagedExecutor(store, transcript, driver=driver)
     outcome = executor.start(session, {"id": "t1", "description": "x"})
     assert outcome.status == STATUS_FAILED
-    assert "403" in outcome.reason
+    # Exception args (which may contain headers/API key) are NOT surfaced —
+    # only the type name.
+    assert "RuntimeError" in outcome.reason
+    assert "403" not in outcome.reason
     assert store.get("t1").status == STATUS_FAILED
 
 
@@ -226,6 +231,82 @@ def test_poll_records_session_hour_overhead_on_completion(stores):
     # session ran for ~0 seconds in test, so overhead is ~$0 — but the path
     # exists. Verify total_dollars is a non-negative number (not None).
     assert store.get("t1").total_dollars >= 0
+
+
+@pytest.mark.unit
+def test_poll_kills_remote_session_on_token_budget_breach(stores):
+    store, session, transcript = stores
+    # Tighten the budget so the first poll exceeds it.
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 100, "max_dollars": 100.0},
+        expected_output="text",
+    )
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_x",
+            new_events=[],
+            total_input_tokens=120, total_output_tokens=0,  # exceeds 100-token cap
+        ),
+    ])
+    executor = ManagedExecutor(store, transcript, driver=driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "max_tokens" in outcome.reason
+    # Remote session was killed.
+    assert driver.kills, "expected driver.kill_session to be called"
+    assert driver.kills[0][0] == "sess_remote"
+
+
+@pytest.mark.unit
+def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
+    store, session, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 1_000_000, "max_dollars": 0.001},
+        expected_output="text",
+    )
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # 100 input tokens * Opus rate ($15/M) = $0.0015 — just over $0.001 cap.
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_x",
+            new_events=[],
+            total_input_tokens=100, total_output_tokens=0,
+        ),
+    ])
+    executor = ManagedExecutor(store, transcript, driver=driver, model="claude-opus-4-7")
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "max_dollars" in outcome.reason
+    assert driver.kills
+
+
+@pytest.mark.unit
+def test_cancelled_status_uses_distinct_telegram_reason(stores):
+    """`cancelled` and `failed` both map to STATUS_FAILED internally but the
+    reason text is distinct so the operator can tell them apart."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="cancelled",
+            last_event_id="evt_c", new_events=[],
+            total_input_tokens=0, total_output_tokens=0,
+            error_reason="operator pressed cancel",
+        ),
+    ])
+    executor = ManagedExecutor(store, transcript, driver=driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_FAILED
+    assert "cancelled" in outcome.reason
+    assert "operator pressed cancel" in outcome.reason
 
 
 @pytest.mark.unit

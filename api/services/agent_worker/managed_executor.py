@@ -39,14 +39,10 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 logger = logging.getLogger(__name__)
 
 
-# Status reported in `transcript`/`metadata` between create and the first
-# completed-event. Stored in `sessions.metadata` (not implemented for Issue D
-# scope) or kept implicit via the row's status field.
-META_LAST_EVENT_ID = "managed_last_event_id"
-
-
 def _system_prompt(session_id: str, expected_output: str, budget) -> str:
     """System prompt for managed agents — same shape as the local executor's."""
+    max_dollars = budget.get("max_dollars")
+    dollars_str = f"${max_dollars}" if max_dollars is not None else "unset"
     return (
         "You are an autonomous agent running inside LifeOS via Anthropic "
         "Managed Agents, handling a single task from the user's task manager. "
@@ -56,7 +52,7 @@ def _system_prompt(session_id: str, expected_output: str, budget) -> str:
         f"no tool calls) is the answer the user will see.\n\n"
         f"Your session_id is {session_id}. Your expected output shape is "
         f"`{expected_output}`. Your budget is wall={budget.get('wall_seconds')}s, "
-        f"max_tokens={budget.get('max_tokens')}, max_dollars=${budget.get('max_dollars')}.\n"
+        f"max_tokens={budget.get('max_tokens')}, max_dollars={dollars_str}.\n"
         "If you cannot complete the task safely or have hit an ambiguity you "
         "cannot resolve from context, say so plainly in your final response."
     )
@@ -68,7 +64,6 @@ def _user_message_for(task: dict) -> str:
     parts = [f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
-    parts.append("Please complete this task using the tools available.")
     return "\n\n".join(parts)
 
 
@@ -122,10 +117,12 @@ class ManagedExecutor:
                 metadata={"lifeos_session_id": sid, "task_id": session.task_id},
             )
         except Exception as exc:
-            logger.exception("managed create_session failed for %s: %s", sid, exc)
+            # Log without exc_info — httpx exceptions can attach the request
+            # object whose headers include the API key.
+            logger.error("managed create_session failed for %s: %s", sid, type(exc).__name__)
             self.session_store.update_status(session.task_id, STATUS_FAILED)
-            self.transcript_store.append(sid, "managed_create_failed", {"error": str(exc)})
-            return ExecutorOutcome(status=STATUS_FAILED, reason=f"create_session failed: {exc}")
+            self.transcript_store.append(sid, "managed_create_failed", {"error_type": type(exc).__name__})
+            return ExecutorOutcome(status=STATUS_FAILED, reason=f"create_session failed: {type(exc).__name__}")
 
         self.session_store.set_managed_session_id(session.task_id, remote_id)
         self.transcript_store.append(sid, "managed_created", {"remote_id": remote_id})
@@ -156,45 +153,81 @@ class ManagedExecutor:
             logger.warning("managed poll failed for %s: %s", remote_id, exc)
             return ExecutorOutcome(status=STATUS_RUNNING, reason=f"poll error: {exc}")
 
-        # Mirror events to transcript + update budget accounting.
+        # Mirror events to transcript.
         for event in state.new_events:
             self.transcript_store.append(sid, f"managed_event_{event.get('type', 'unknown')}", event)
 
-        # Compute incremental token spend (state has absolute totals).
+        # 1. Token spend delta — compare absolute remote totals to our row.
         delta_in = max(0, state.total_input_tokens - (session.total_input_tokens or 0))
         delta_out = max(0, state.total_output_tokens - (session.total_output_tokens or 0))
+        token_delta_dollars = cost_for(self.model, delta_in, delta_out)
         if delta_in or delta_out:
             self.session_store.record_spend(
-                session.task_id, delta_in, delta_out,
-                cost_for(self.model, delta_in, delta_out),
+                session.task_id, delta_in, delta_out, token_delta_dollars,
             )
 
-        # Session-hour overhead: charge for the time elapsed since session start
-        # (or last_activity_at — close enough for cost accounting).
-        wall_so_far = max(0, int(time.time()) - int(session.started_at))
-        hourly_dollars = (wall_so_far / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
-        # Replace any prior session-hour charge; we don't have a clean delta
-        # so just track the active portion in total_active_seconds.
-        self.session_store.record_active_seconds(session.task_id, wall_so_far - (session.total_active_seconds or 0))
+        # 2. Session-hour overhead delta — we only want to add what's accrued
+        # since the last poll. The driver doesn't tell us total wall time, so
+        # we derive it from `started_at` and book the *delta* over the
+        # already-accrued figure stored on the row.
+        wall_so_far = max(0.0, time.time() - float(session.started_at))
+        cumulative_hourly = (wall_so_far / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
+        prior_hourly = self.session_store.get_accrued_session_hour_dollars(session.task_id)
+        hourly_delta = max(0.0, cumulative_hourly - prior_hourly)
+        if hourly_delta > 0:
+            self.session_store.add_session_hour_overhead(session.task_id, hourly_delta)
+            self.session_store.set_accrued_session_hour_dollars(session.task_id, cumulative_hourly)
+
+        # 3. Mid-run budget breach: kill the remote session before it racks
+        # up more cost. The check uses the refreshed in-flight totals so the
+        # session-hour delta we just booked is included.
+        budget = session.budget or {}
+        refreshed = self.session_store.get(session.task_id)
+        breach = self._budget_breach(refreshed, budget)
+        if breach:
+            try:
+                self.driver.kill_session(remote_id, reason=f"budget_exceeded:{breach}")
+            except Exception as exc:  # pragma: no cover — best-effort kill
+                logger.warning("kill_session %s failed: %s", remote_id, exc)
+            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+            self.transcript_store.append(sid, "budget_exceeded", {"kind": breach, "source": "client"})
+            return ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({breach})")
 
         if state.last_event_id:
             self.session_store.set_managed_last_event_id(session.task_id, state.last_event_id)
 
         # Terminal handling.
         if state.status in TERMINAL_REMOTE_STATUSES:
-            return self._finalize_remote(session, state, hourly_dollars)
+            return self._finalize_remote(session, state)
 
         return ExecutorOutcome(status=STATUS_RUNNING)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _budget_breach(refreshed_session, budget: dict) -> str | None:
+        """Return the budget kind that was exceeded, or None."""
+        if not budget:
+            return None
+        if budget.get("max_tokens"):
+            used = (refreshed_session.total_input_tokens or 0) + (refreshed_session.total_output_tokens or 0)
+            if used >= budget["max_tokens"]:
+                return "max_tokens"
+        if budget.get("max_dollars") is not None:
+            if (refreshed_session.total_dollars or 0) >= budget["max_dollars"]:
+                return "max_dollars"
+        return None
 
     # ------------------------------------------------------------------
     # Finalize
     # ------------------------------------------------------------------
 
-    def _finalize_remote(self, session, state, hourly_dollars: float) -> ExecutorOutcome:
-        # Final cost reconciliation: charge any outstanding session-hour
-        # overhead by adding it to total_dollars one last time.
-        self.session_store.add_session_hour_overhead(session.task_id, hourly_dollars)
-
+    def _finalize_remote(self, session, state) -> ExecutorOutcome:
+        # Session-hour overhead has already been booked incrementally in
+        # poll(), so finalize doesn't need to add anything more — just record
+        # the terminal status.
         if state.status == "completed":
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(session.session_id, "managed_completed",
@@ -207,7 +240,13 @@ class ManagedExecutor:
             return ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED,
                                    reason=state.error_reason or "remote budget exceeded")
 
-        # cancelled or failed
+        if state.status == "cancelled":
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            reason = state.error_reason or "session cancelled remotely"
+            self.transcript_store.append(session.session_id, "managed_cancelled", {"reason": reason})
+            return ExecutorOutcome(status=STATUS_FAILED, reason=f"cancelled: {reason}")
+
+        # failed (or unknown terminal)
         self.session_store.update_status(session.task_id, STATUS_FAILED)
         reason = state.error_reason or f"remote status={state.status}"
         self.transcript_store.append(session.session_id, "managed_failed", {"reason": reason})

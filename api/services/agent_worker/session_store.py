@@ -106,6 +106,15 @@ CREATE TABLE IF NOT EXISTS sleeps (
     wake_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sleeps_wake ON sleeps(wake_at);
+
+-- Cursor + bookkeeping for Managed Agents sessions. One row per task_id with
+-- the last event id we've ingested + the cumulative session-hour dollars
+-- already booked into the sessions row's total_dollars. Issue D.
+CREATE TABLE IF NOT EXISTS managed_cursor (
+    task_id                          TEXT PRIMARY KEY,
+    last_event_id                    TEXT,
+    accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0
+);
 """
 
 
@@ -307,16 +316,9 @@ class SessionStore:
                 (float(dollars), _now(), task_id),
             )
 
-    # Lightweight key/value cursor for managed sessions; stored alongside the
-    # session row to avoid a second table. The schema already has unused space
-    # for this — we piggyback on `expected_output` for the per-row pattern but
-    # the cursor is logically separate, so use a tiny dedicated table.
+    # Managed Agents cursor (defined in _SCHEMA so no schema-on-write needed).
     def set_managed_last_event_id(self, task_id: str, event_id: str) -> None:
         with self._connect() as conn:
-            conn.executescript(
-                "CREATE TABLE IF NOT EXISTS managed_cursor ("
-                "task_id TEXT PRIMARY KEY, last_event_id TEXT NOT NULL);"
-            )
             conn.execute(
                 "INSERT INTO managed_cursor (task_id, last_event_id) VALUES (?, ?) "
                 "ON CONFLICT(task_id) DO UPDATE SET last_event_id = excluded.last_event_id",
@@ -325,15 +327,33 @@ class SessionStore:
 
     def get_managed_last_event_id(self, task_id: str) -> str | None:
         with self._connect() as conn:
-            try:
-                row = conn.execute(
-                    "SELECT last_event_id FROM managed_cursor WHERE task_id = ?",
-                    (task_id,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                # Table doesn't exist yet — no cursor recorded.
-                return None
+            row = conn.execute(
+                "SELECT last_event_id FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
         return row["last_event_id"] if row else None
+
+    def get_accrued_session_hour_dollars(self, task_id: str) -> float:
+        """Dollars already booked into total_dollars for session-hour overhead.
+
+        Used by the managed executor to compute the incremental session-hour
+        delta to add on each poll, avoiding double-counting.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT accrued_session_hour_dollars FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def set_accrued_session_hour_dollars(self, task_id: str, dollars: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, accrued_session_hour_dollars) "
+                "VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET accrued_session_hour_dollars = excluded.accrued_session_hour_dollars",
+                (task_id, float(dollars)),
+            )
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:
         """Add to a session's cumulative active-execution seconds.

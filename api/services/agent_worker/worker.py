@@ -221,12 +221,20 @@ class Worker:
                 "id": session.task_id,
                 "description": session.task_id,
             }
+            pre_dollars = session.total_dollars or 0.0
             try:
                 outcome = managed.poll(session)
             except Exception as exc:
                 logger.exception("managed.poll crashed for %s: %s", session.task_id, exc)
                 self._mark_failed(session, task, f"managed poll crashed: {exc}")
                 continue
+            # Push the per-poll dollar delta into the daily ledger so the
+            # global cap reflects in-flight managed cost, not just claim-time
+            # estimates.
+            refreshed = self.session_store.get(session.task_id)
+            delta_dollars = max(0.0, (refreshed.total_dollars or 0.0) - pre_dollars) if refreshed else 0.0
+            if delta_dollars > 0:
+                self.spend_tracker.record(delta_dollars)
             if outcome.status != STATUS_RUNNING:
                 self._handle_outcome(session, task, outcome)
 

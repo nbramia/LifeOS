@@ -234,6 +234,7 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 | `llama-server` crashes on Gemma | Insufficient VRAM, or stale cached model | Check `nvidia-smi`/`rocm-smi`; re-download with `llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF` once and confirm |
 | Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
 | Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
+| Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: managed-agents-2026-04-01" https://platform.claude.com/v1/managed-agents/sessions/<remote_id>`. The worker's next poll will see the cancelled status and finalize. |
 
 ---
 

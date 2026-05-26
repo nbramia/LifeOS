@@ -20,6 +20,7 @@ from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_RUNNING,
     STATUS_YIELDED,
     SessionStore,
 )
@@ -265,12 +266,12 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
             self.start_calls += 1
             # Simulate driver attaching a remote id.
             store_for_session.set_managed_session_id(session.task_id, "sess_remote_42")
-            return ExecutorOutcome(status="running")
+            return ExecutorOutcome(status=STATUS_RUNNING)
 
         def poll(self, session):
             self.poll_calls += 1
             if self.poll_calls < 2:
-                return ExecutorOutcome(status="running")
+                return ExecutorOutcome(status=STATUS_RUNNING)
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="here's the summary")
 
     transport = httpx.MockTransport(api.handler)
