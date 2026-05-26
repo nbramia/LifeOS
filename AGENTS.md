@@ -55,6 +55,9 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | What does the code structure look like? | [specs/technical/architecture.md](docs/specs/technical/architecture.md) |
 | How does hybrid search work internally? | [specs/technical/search-indexing.md](docs/specs/technical/search-indexing.md) |
 | How is perf traced and monitored? | [specs/technical/observability.md](docs/specs/technical/observability.md) |
+| What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
+| How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
+| How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
 | How do I set up the project? | [guides/installation.md](docs/guides/installation.md) |
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
@@ -201,6 +204,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `README.md` | Architecture overview with diagrams |
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
+| `api/services/agent_worker/` | Autonomous worker for `#agent`-tagged tasks (local Gemma or cloud Claude via Managed Agents) |
+| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (54 tools) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 | Script | Purpose |
