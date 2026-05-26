@@ -97,7 +97,7 @@ poll → spend tracker check (`can_start_task(default_budget)`)
      → dispatch spawned sessions (drain pending_messages)
      → process clarification answers (Telegram replies)
      → timeout stale clarifications (default 72h)
-     → list /api/tasks?status=todo&tag=agent
+     → list /api/tasks across AGENT_PICKUP_STATUSES (`todo` + `urgent`), tag=agent, dedupe by id
      → for each candidate:
          atomic swap #agent → #agent-running   (race-free via swap-tag API)
          create session row + transcript "claim" event

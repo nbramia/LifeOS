@@ -47,7 +47,9 @@ Cost for that task: usually under $0.10 on Claude Sonnet 4.6, free on local Gemm
 
 ## Task conventions
 
-The agent worker triggers on tasks that have the `#agent` tag. Optional sub-tags steer routing:
+The agent worker triggers on tasks that have the `#agent` tag and a pickup-eligible status — `todo` (`[ ]`) or `urgent` (`[!]`). Marking a `#agent` task as urgent in Obsidian doesn't skip the worker; it just signals high priority within your queue. Other statuses (`in_progress`, `done`, `cancelled`, `deferred`, `blocked`) are left alone.
+
+Optional sub-tags steer routing:
 
 | Tag | Effect |
 |-----|--------|
