@@ -68,6 +68,7 @@ class Worker:
         spend_tracker: SpendTracker | None = None,
         poll_seconds: float | None = None,
         telegram_send=None,  # injectable for tests
+        telegram_send_with_id=None,  # injectable; returns sent message_id (or None)
         http_client: httpx.Client | None = None,
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
@@ -92,6 +93,17 @@ class Worker:
             except Exception:  # pragma: no cover — defensive
                 telegram_send = _noop_telegram
         self._telegram_send = telegram_send
+        # Default the "with id" sender to the real Telegram module; tests
+        # inject a fake that returns a deterministic message_id (or None).
+        if telegram_send_with_id is None:
+            def _noop_with_id(text):
+                return None
+            try:
+                from api.services.telegram import send_message_capture_id
+                telegram_send_with_id = send_message_capture_id
+            except Exception:
+                telegram_send_with_id = _noop_with_id
+        self._telegram_send_with_id = telegram_send_with_id
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.Client(timeout=10.0)
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
@@ -197,6 +209,10 @@ class Worker:
         # Dispatch any newly-spawned sessions (no #agent task — created via
         # lifeos_agent_spawn). They show up with status=claimed and a routing.
         self._dispatch_spawned_sessions()
+        # Resume blocked sessions whose Telegram clarifications have arrived.
+        self._process_clarification_answers()
+        # Timeout long-unanswered clarifications.
+        self._timeout_stale_clarifications()
 
         candidates = self._list_agent_tasks()
         handled = 0
@@ -362,6 +378,113 @@ class Worker:
             if outcome.status != STATUS_RUNNING:
                 self._handle_outcome(session, task, outcome)
 
+    def _process_clarification_answers(self) -> None:
+        """Resume blocked sessions whose Telegram clarifications arrived.
+
+        The Telegram listener (api/services/telegram.py) deposits user
+        replies into `pending_questions.answer`. Each tick we drain any
+        answered+unprocessed questions, inject the answer as a user turn
+        into the conversation, swap the task tag back to `#agent-running`,
+        and re-invoke the appropriate executor.
+        """
+        answered = self.session_store.list_answered_unprocessed_questions()
+        for q in answered:
+            session_id = q["session_id"]
+            task_id = q["task_id"]
+            session = self.session_store.get_by_session_id(session_id)
+            if session is None:
+                # Stale — session was deleted? Mark processed so we don't loop.
+                self.session_store.mark_question_processed(q["id"])
+                continue
+
+            # Inject the answer as a user message.
+            self.session_store.append_message(
+                session_id, "user",
+                f"(user answered via Telegram) {q['answer']}",
+            )
+            self.transcript_store.append(session_id, "clarification_answered", {
+                "question_id": q["id"],
+                "answer_chars": len(q["answer"] or ""),
+            })
+            self.session_store.mark_question_processed(q["id"])
+            self._swap_tag(task_id, BLOCKED_TAG, RUNNING_TAG)
+            self.session_store.update_status(task_id, STATUS_RUNNING)
+
+            task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
+            if session.routing == "local":
+                executor = self._get_local_executor(caller_session_id=session_id)
+                try:
+                    outcome = executor.execute(session, task)
+                except Exception as exc:
+                    logger.exception(
+                        "clarification resume crashed for %s: %s", task_id, exc,
+                    )
+                    self._mark_failed(session, task, f"clarification resume crashed: {exc}")
+                    continue
+                self._handle_outcome(session, task, outcome)
+            else:
+                # Managed clarification resume isn't supported in this MVP for
+                # the same reason as managed yield-resume — needs session
+                # re-creation with history transfer.
+                self.transcript_store.append(
+                    session_id, "managed_clarification_resume_unsupported", {},
+                )
+                self._mark_failed(
+                    session, task,
+                    "managed clarification resume not yet supported",
+                )
+
+    def _timeout_stale_clarifications(self) -> None:
+        """Send a one-time nudge for clarifications older than the configured
+        timeout. The task stays at #agent-blocked permanently after that — the
+        operator can manually re-tag with #agent to retry.
+        """
+        timeout_seconds = settings.agent_clarification_timeout_hours * 3600
+        cutoff = int(time.time()) - timeout_seconds
+        stale = self.session_store.list_timed_out_questions(cutoff)
+        for q in stale:
+            self.session_store.mark_question_timed_out(q["id"])
+            self.transcript_store.append(q["session_id"], "clarification_timed_out", {
+                "question_id": q["id"],
+            })
+            self._notify(
+                f"⏰ Agent worker: task is still waiting on your reply.\n\n"
+                f"Question: {q['question'][:300]}\n\n"
+                f"(Task remains at #{BLOCKED_TAG}. Reply to the original "
+                f"question to unblock, or re-tag with #{AGENT_TAG} to retry.)"
+            )
+
+    def ask_user_via_telegram(
+        self,
+        session_id: str,
+        task_id: str,
+        question: str,
+    ) -> int | None:
+        """Send a clarification question via Telegram and record the
+        sent_message_id so the reply-thread hook can match it back.
+
+        Returns the Telegram message_id (or None if Telegram isn't configured
+        — caller should mark the session blocked anyway since we can't ask).
+        """
+        try:
+            sent_id = self._telegram_send_with_id(question)
+        except Exception as exc:
+            logger.warning(f"ask_user_via_telegram failed: {exc}")
+            return None
+        if sent_id is None:
+            return None
+        self.session_store.create_pending_question(
+            session_id=session_id,
+            task_id=task_id,
+            question=question,
+            sent_message_id=sent_id,
+        )
+        self.transcript_store.append(session_id, "clarification_sent", {
+            "sent_message_id": sent_id,
+            "question_chars": len(question),
+        })
+        return sent_id
+
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""
 
@@ -491,6 +614,7 @@ class Worker:
                     max_concurrent_local=settings.agent_max_concurrent_local,
                     max_concurrent_managed=settings.agent_max_concurrent_managed,
                 ),
+                worker_handle=self,
             )
         registry = ToolRegistry(inter_agent_context=ctx)
         return LocalExecutor(
@@ -726,12 +850,21 @@ class Worker:
         self._swap_tag(session.task_id, RUNNING_TAG, BLOCKED_TAG)
         self.session_store.update_status(session.task_id, STATUS_BLOCKED)
         self.transcript_store.append(session.session_id, "blocked", {"question": question})
-        # In Issue F this becomes a reply-threaded message and the reply
-        # resumes the task. For now it's one-way.
-        self._notify(
-            f"⏸ Agent worker: task '{title}' needs your input.\n\n{question}\n\n"
-            f"(Re-tag the task with #{AGENT_TAG} once you've added the answer in the task title or context.)"
+
+        # Issue F: send the question with reply-threading enabled so the user's
+        # reply lands in pending_questions.answer and the worker resumes.
+        body = (
+            f"⏸ Agent worker: task '{title}' needs your input.\n\n"
+            f"{question}\n\n"
+            "Reply to this message to answer."
         )
+        sent_id = self.ask_user_via_telegram(
+            session.session_id, session.task_id, body,
+        )
+        if sent_id is None:
+            # Telegram not configured — fall back to the legacy one-way
+            # message so the operator at least sees the question.
+            self._notify(body)
 
     def _notify(self, text: str) -> None:
         try:

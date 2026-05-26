@@ -112,6 +112,43 @@ class TypingIndicator:
                 pass
 
 
+def send_message_capture_id(text: str, chat_id: str = None) -> int | None:
+    """Send a message and return its Telegram `message_id` (or None on failure).
+
+    Used by the agent worker to track clarification questions so reply-
+    threaded answers can be matched back to the right pending question.
+    Falls back to plain text if Markdown parse fails. Returns the id from
+    the first sent chunk so reply-threading lands on the start of the
+    question.
+    """
+    if not settings.telegram_enabled:
+        return None
+    chat_id = chat_id or settings.telegram_chat_id
+    text = _clean_markdown_for_telegram(text)
+    first_id: int | None = None
+    for part in _split_message(text):
+        try:
+            resp = httpx.post(
+                _telegram_url("sendMessage"),
+                json={"chat_id": chat_id, "text": part, "parse_mode": "Markdown"},
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                resp = httpx.post(
+                    _telegram_url("sendMessage"),
+                    json={"chat_id": chat_id, "text": part},
+                    timeout=30.0,
+                )
+            if resp.status_code == 200 and first_id is None:
+                payload = resp.json()
+                first_id = (payload.get("result") or {}).get("message_id")
+            elif resp.status_code != 200:
+                logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
+    return first_id
+
+
 def send_message(text: str, chat_id: str = None) -> bool:
     """
     Send a message via Telegram (synchronous).
@@ -457,6 +494,21 @@ class TelegramBotListener:
             await asyncio.sleep(2)
             return []
 
+    def _maybe_deposit_agent_answer(self, reply_to_message_id: int, text: str) -> bool:
+        """If `reply_to_message_id` matches an open agent-worker clarification
+        question, record the answer and short-circuit the chat pipeline.
+
+        Importing the session store lazily keeps the chat-only deployment
+        path workable even when the agent worker package isn't initialized.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            return store.deposit_answer(reply_to_message_id, text)
+        except Exception as exc:
+            logger.warning(f"agent-worker deposit_answer failed: {exc}")
+            return False
+
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
         message = update.get("message")
@@ -481,6 +533,14 @@ class TelegramBotListener:
 
         if not text:
             return
+
+        # Agent-worker clarification hook (Issue F). If this message is a
+        # reply-thread to a previously-sent clarification question, deposit
+        # the answer and short-circuit — don't route to the chat pipeline.
+        reply_to = message.get("reply_to_message")
+        if reply_to and reply_to.get("message_id"):
+            if self._maybe_deposit_agent_answer(int(reply_to["message_id"]), text):
+                return
 
         logger.info(f"Telegram message: {text[:100]}")
 

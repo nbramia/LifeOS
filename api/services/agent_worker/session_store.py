@@ -100,6 +100,26 @@ CREATE TABLE IF NOT EXISTS pending_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_msgs_session ON pending_messages(session_id, delivered);
 
+-- Open clarification questions sent to the operator via Telegram (Issue F).
+-- The listener hook in telegram.py matches incoming reply_to_message ids
+-- against `sent_message_id` and deposits the answer. Worker.tick scans for
+-- answered+unprocessed rows to resume sessions, and for timed-out rows to
+-- send a follow-up nudge.
+CREATE TABLE IF NOT EXISTS pending_questions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    question          TEXT NOT NULL,
+    sent_message_id   INTEGER NOT NULL,
+    sent_at           INTEGER NOT NULL,
+    answer            TEXT,
+    answered_at       INTEGER,
+    processed         INTEGER NOT NULL DEFAULT 0,
+    timed_out         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
+CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
+
 CREATE TABLE IF NOT EXISTS daily_spend (
     date           TEXT PRIMARY KEY,
     total_dollars  REAL NOT NULL DEFAULT 0.0
@@ -610,6 +630,90 @@ class SessionStore:
             {"id": r["id"], "sender_id": r["sender_id"], "content": r["content"], "created_at": r["created_at"]}
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Pending clarification questions (Issue F)
+    # ------------------------------------------------------------------
+
+    def create_pending_question(
+        self,
+        session_id: str,
+        task_id: str,
+        question: str,
+        sent_message_id: int,
+    ) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pending_questions (
+                    session_id, task_id, question, sent_message_id, sent_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, task_id, question, int(sent_message_id), _now()),
+            )
+        return cur.lastrowid
+
+    def deposit_answer(self, sent_message_id: int, answer: str) -> bool:
+        """Record an answer for an open question, keyed by Telegram message_id.
+
+        Returns True if a matching open question was found and updated; False
+        otherwise (so the listener can fall through to the chat pipeline).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM pending_questions "
+                "WHERE sent_message_id = ? AND answered_at IS NULL AND timed_out = 0",
+                (int(sent_message_id),),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE pending_questions "
+                "SET answer = ?, answered_at = ? WHERE id = ?",
+                (answer, _now(), row["id"]),
+            )
+        return True
+
+    def get_question_by_message_id(self, sent_message_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions WHERE sent_message_id = ?",
+                (int(sent_message_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_answered_unprocessed_questions(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 0",
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_question_processed(self, question_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE pending_questions SET processed = 1 WHERE id = ?",
+                (int(question_id),),
+            )
+
+    def list_timed_out_questions(self, before_ts: int) -> list[dict]:
+        """Open questions sent before `before_ts` that haven't been answered
+        or already nudged."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND timed_out = 0 AND sent_at < ?",
+                (int(before_ts),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_question_timed_out(self, question_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE pending_questions SET timed_out = 1 WHERE id = ?",
+                (int(question_id),),
+            )
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> Session:

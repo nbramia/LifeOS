@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_CLAIMED,
     STATUS_FAILED,
     STATUS_YIELDED,
@@ -70,12 +71,16 @@ class InterAgentContext:
     without knowing how they were called. `managed_driver` is optional —
     when present, `kill` and other tools can reach remote managed sessions;
     when absent, managed targets are killed in the DB only.
+
+    `worker_handle` is optional; when present, `lifeos_user_ask` can route
+    a clarifying question through the worker's Telegram pipeline.
     """
     session_store: SessionStore
     transcript_store: TranscriptStore
     caller_session_id: str
     caps: Caps
     managed_driver: Any | None = None
+    worker_handle: Any | None = None  # Worker — circular import avoided
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +188,17 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "limit": {"type": "integer"},
             },
             "required": [],
+        },
+    },
+    {
+        "name": "lifeos_user_ask",
+        "description": "Ask the operator a clarifying question via Telegram and pause until they reply. Your session ends; the worker resumes it (with the user's answer injected as a new user turn) once the reply arrives. Use sparingly — only when you genuinely cannot proceed without operator input.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question to ask the operator. Keep it short and specific."},
+            },
+            "required": ["question"],
         },
     },
 ]
@@ -470,6 +486,40 @@ def sessions_list(ctx: InterAgentContext, args: dict) -> dict:
 # Public dispatcher — used by ToolRegistry and the MCP wrapper.
 # ---------------------------------------------------------------------------
 
+def user_ask(ctx: InterAgentContext, args: dict) -> dict:
+    """Agent-initiated Telegram clarification. Marks the caller blocked and
+    queues the question with the user via the worker."""
+    question = (args.get("question") or "").strip()
+    if not question:
+        return _err("question is required", code="invalid_arg")
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
+    if ctx.worker_handle is None:
+        return _err(
+            "lifeos_user_ask is only available inside a running session",
+            code="no_worker",
+        )
+
+    sent_id = ctx.worker_handle.ask_user_via_telegram(
+        session_id=caller.session_id,
+        task_id=caller.task_id,
+        question=question,
+    )
+    if sent_id is None:
+        return _err(
+            "could not send Telegram message — bot token may not be configured",
+            code="telegram_unavailable",
+        )
+
+    # Mark the caller blocked so the worker stops driving its loop.
+    ctx.session_store.update_status(caller.task_id, STATUS_BLOCKED)
+    ctx.transcript_store.append(caller.session_id, "user_ask", {
+        "sent_message_id": sent_id, "question_chars": len(question),
+    })
+    return _ok({"asked": True, "sent_message_id": sent_id, "blocked": True})
+
+
 DISPATCH_TABLE = {
     "lifeos_agent_spawn": spawn,
     "lifeos_agent_send": send,
@@ -478,6 +528,7 @@ DISPATCH_TABLE = {
     "lifeos_agent_kill": kill,
     "lifeos_agent_transcript_read": transcript_read,
     "lifeos_agent_sessions_list": sessions_list,
+    "lifeos_user_ask": user_ask,
 }
 
 
