@@ -56,6 +56,7 @@ class Session:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_dollars: float = 0.0
+    total_active_seconds: float = 0.0
 
 
 _SCHEMA = """
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_input_tokens        INTEGER NOT NULL DEFAULT 0,
     total_output_tokens       INTEGER NOT NULL DEFAULT 0,
     total_dollars             REAL    NOT NULL DEFAULT 0.0,
+    total_active_seconds      REAL    NOT NULL DEFAULT 0.0,
     expected_output           TEXT,
     parent_session_id         TEXT,
     managed_agent_session_id  TEXT
@@ -81,6 +83,29 @@ CREATE TABLE IF NOT EXISTS daily_spend (
     date           TEXT PRIMARY KEY,
     total_dollars  REAL NOT NULL DEFAULT 0.0
 );
+
+-- Conversation log for local-path sessions. Managed sessions store messages
+-- in the JSONL transcript instead (their authoritative state lives on the
+-- Anthropic side).
+CREATE TABLE IF NOT EXISTS messages (
+    session_id    TEXT NOT NULL,
+    turn_index    INTEGER NOT NULL,
+    role          TEXT NOT NULL,
+    content_json  TEXT NOT NULL,
+    tokens_in     INTEGER NOT NULL DEFAULT 0,
+    tokens_out    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, turn_index)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+-- Sleep wake-ups. A session with a row here is "yielded": the worker's main
+-- loop scans this table and resumes the session when wake_at <= now().
+CREATE TABLE IF NOT EXISTS sleeps (
+    session_id    TEXT PRIMARY KEY,
+    wake_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sleeps_wake ON sleeps(wake_at);
 """
 
 
@@ -205,6 +230,143 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
+    def set_routing_and_budget(
+        self,
+        task_id: str,
+        routing: str | None,
+        budget: dict | None,
+        expected_output: str | None = None,
+    ) -> None:
+        """Update routing decision and budget after the preflight call."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET routing = ?, budget_json = ?, expected_output = ?, last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    routing,
+                    json.dumps(budget) if budget else None,
+                    expected_output,
+                    _now(),
+                    task_id,
+                ),
+            )
+
+    def record_spend(
+        self,
+        task_id: str,
+        tokens_in: int,
+        tokens_out: int,
+        dollars: float,
+    ) -> None:
+        """Add to a session's cumulative token + dollar counters."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET total_input_tokens  = total_input_tokens  + ?,
+                    total_output_tokens = total_output_tokens + ?,
+                    total_dollars       = total_dollars       + ?,
+                    last_activity_at    = ?
+                WHERE task_id = ?
+                """,
+                (tokens_in, tokens_out, dollars, _now(), task_id),
+            )
+
+    def record_active_seconds(self, task_id: str, seconds: float) -> None:
+        """Add to a session's cumulative active-execution seconds.
+
+        Active seconds exclude sleep time — this is the duration of LLM calls
+        + tool dispatch, used by the wall-clock budget check. A session that
+        spends 8 hours sleeping but only 5 minutes actually running has
+        total_active_seconds ≈ 300, not 28800.
+        """
+        if seconds <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET total_active_seconds = total_active_seconds + ?, "
+                "last_activity_at = ? WHERE task_id = ?",
+                (float(seconds), _now(), task_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Messages (local-path conversation log)
+    # ------------------------------------------------------------------
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: dict | list | str,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> int:
+        """Append one message; return its 0-based turn_index.
+
+        Uses a single INSERT that computes the next turn_index inside the
+        statement, so concurrent appends from sibling worker processes
+        (Issue E) can't pick the same index — SQLite serializes the write.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    session_id, turn_index, role, content_json,
+                    tokens_in, tokens_out, created_at
+                )
+                SELECT ?, COALESCE(MAX(turn_index), -1) + 1, ?, ?, ?, ?, ?
+                FROM messages WHERE session_id = ?
+                """,
+                (
+                    session_id, role, json.dumps(content),
+                    tokens_in, tokens_out, _now(),
+                    session_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT MAX(turn_index) AS i FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["i"])
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        """Return all messages in order as {role, content} dicts ready for the LLM."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content_json FROM messages "
+                "WHERE session_id = ? ORDER BY turn_index ASC",
+                (session_id,),
+            ).fetchall()
+        return [{"role": r["role"], "content": json.loads(r["content_json"])} for r in rows]
+
+    # ------------------------------------------------------------------
+    # Sleeps (yield / wake)
+    # ------------------------------------------------------------------
+
+    def add_sleep(self, session_id: str, wake_at: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sleeps (session_id, wake_at) VALUES (?, ?)",
+                (session_id, int(wake_at)),
+            )
+
+    def remove_sleep(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sleeps WHERE session_id = ?", (session_id,))
+
+    def due_sleeps(self, now_ts: int | None = None) -> list[str]:
+        """Return session_ids whose wake time has arrived."""
+        ts = now_ts if now_ts is not None else _now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id FROM sleeps WHERE wake_at <= ? ORDER BY wake_at ASC",
+                (ts,),
+            ).fetchall()
+        return [r["session_id"] for r in rows]
+
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> Session:
         return Session(
@@ -218,6 +380,11 @@ class SessionStore:
             total_input_tokens=row["total_input_tokens"],
             total_output_tokens=row["total_output_tokens"],
             total_dollars=row["total_dollars"],
+            total_active_seconds=(
+                row["total_active_seconds"]
+                if "total_active_seconds" in row.keys()
+                else 0.0
+            ),
             expected_output=row["expected_output"],
             parent_session_id=row["parent_session_id"],
             managed_agent_session_id=row["managed_agent_session_id"],
