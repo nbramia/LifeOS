@@ -224,12 +224,16 @@ class Worker:
                 continue
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
             self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
+            # Rolling back to #agent — return the vault checkbox to "todo"
+            # so the operator sees the task as un-started rather than stuck
+            # in "in_progress".
+            self._set_task_status(session.task_id, "todo")
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             self._notify(
                 f"⚠️ {_worker_label(session.routing)}: task left in {session.status!r} from a prior "
                 f"run could not be safely resumed — tag rolled back to "
                 f"#{AGENT_TAG} for retry. Transcript: "
-                f"data/agent_transcripts/{sid}.jsonl"
+                f"`data/agent_transcripts/{sid}.jsonl`"
             )
             recovered += 1
         if recovered:
@@ -496,6 +500,7 @@ class Worker:
                 "answer_chars": len(answer),
             })
             self._swap_tag(task_id, BLOCKED_TAG, RUNNING_TAG)
+            self._set_task_status(task_id, "in_progress")
             self.session_store.update_status(task_id, STATUS_RUNNING)
 
             task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
@@ -702,6 +707,25 @@ class Worker:
             logger.warning("complete failed for %s: %s", task_id, exc)
             return False
 
+    def _set_task_status(self, task_id: str, status: str) -> bool:
+        """Update the vault checkbox status alongside an `#agent-*` tag swap.
+
+        The operator wants Obsidian's status (the `- [ ]` / `- [/]` / `- [?]`
+        checkbox symbol) to track execution state, not just the tag. This
+        is fire-and-forget — failure is logged but does not block the
+        transition; the tag itself remains the worker's source of truth.
+        """
+        try:
+            resp = self._http.put(
+                f"{self.api_base}/api/tasks/{task_id}",
+                json={"status": status},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning("set_task_status(%s, %s) failed: %s", task_id, status, exc)
+            return False
+
     # ------------------------------------------------------------------
     # Claim + dispatch
     # ------------------------------------------------------------------
@@ -713,6 +737,10 @@ class Worker:
         """
         if not self._swap_tag(task_id, AGENT_TAG, RUNNING_TAG):
             return False
+        # Sync vault status to in_progress so the operator can see at a
+        # glance which tasks are actively being worked on, not just by
+        # tag color.
+        self._set_task_status(task_id, "in_progress")
         try:
             session = self.session_store.create(
                 task_id=task_id,
@@ -910,6 +938,7 @@ class Worker:
             if managed is None:
                 # Operator hasn't configured Managed Agents (no API key or vault).
                 self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                self._set_task_status(task_id, "blocked")
                 self.session_store.update_status(task_id, STATUS_BLOCKED)
                 self.transcript_store.append(sid, "managed_not_configured", {})
                 self._notify(
@@ -956,17 +985,19 @@ class Worker:
         label = _worker_label(session.routing)
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
+            self._set_task_status(session.task_id, "cancelled")
             self._notify(
                 f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
-                f"Transcript: data/agent_transcripts/{sid}.jsonl"
+                f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
             )
             return
 
         if outcome.status == STATUS_FAILED:
             self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+            self._set_task_status(session.task_id, "cancelled")
             self._notify(
                 f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "
-                f"Transcript: data/agent_transcripts/{sid}.jsonl"
+                f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
             )
             return
 
@@ -996,7 +1027,7 @@ class Worker:
         if not final_text:
             result_blurb = (
                 f"(agent idled without a final text reply — check transcript at "
-                f"data/agent_transcripts/{session.session_id}.jsonl for tool-use detail)"
+                f"`data/agent_transcripts/{session.session_id}.jsonl` for tool-use detail)"
             )
         elif len(final_text) <= _INLINE_SUMMARY_MAX_CHARS:
             result_blurb = final_text
@@ -1016,10 +1047,14 @@ class Worker:
                 preview = final_text.split("\n\n", 1)[0].strip()
                 if len(preview) > 400:
                     preview = preview[:400].rsplit(" ", 1)[0] + "…"
+                # Wrap path + URL in Markdown link form so Telegram (which
+                # uses parse_mode=Markdown) doesn't interpret underscores in
+                # the path/URL as italic markers. Inline path also gets
+                # backticks so it renders as code and stays copy-pasteable.
                 result_blurb = (
                     f"{preview}\n\n"
-                    f"Full answer saved to vault: {rel_path}\n"
-                    f"Open: {obsidian_url}"
+                    f"Full answer saved to vault: `{rel_path}`\n"
+                    f"[Open in Obsidian]({obsidian_url})"
                 )
 
         # Footer: when some MCP servers failed to initialize during the session,
@@ -1093,6 +1128,7 @@ class Worker:
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:
         title = task.get("description", session.task_id)
         self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+        self._set_task_status(session.task_id, "cancelled")
         self.session_store.update_status(session.task_id, STATUS_FAILED)
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
         self._notify(f"⚠️ {_worker_label(session.routing)}: task '{title}' failed: {reason}")
@@ -1100,6 +1136,7 @@ class Worker:
     def _mark_blocked(self, session: Session, task: dict[str, Any], question: str) -> None:
         title = task.get("description", session.task_id)
         self._swap_tag(session.task_id, RUNNING_TAG, BLOCKED_TAG)
+        self._set_task_status(session.task_id, "blocked")
         self.session_store.update_status(session.task_id, STATUS_BLOCKED)
         self.transcript_store.append(session.session_id, "blocked", {"question": question})
 
