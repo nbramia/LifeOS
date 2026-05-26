@@ -22,6 +22,11 @@ from api.services.agent_worker.session_store import (
 from api.services.agent_worker.transcript_store import TranscriptStore
 
 
+AGENT_ID = "agent_test"
+ENV_ID = "env_test"
+VAULT_IDS = ["vlt_test"]
+
+
 class _FakeDriver:
     """Records calls and returns scripted state objects."""
 
@@ -49,6 +54,18 @@ class _FakeDriver:
         self.kills.append((session_id, reason))
 
 
+def _make_executor(store, transcript, driver, *, model="claude-sonnet-4-6"):
+    return ManagedExecutor(
+        session_store=store,
+        transcript_store=transcript,
+        driver=driver,
+        agent_id=AGENT_ID,
+        environment_id=ENV_ID,
+        vault_ids=VAULT_IDS,
+        model=model,
+    )
+
+
 @pytest.fixture
 def stores(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "sessions.db")
@@ -63,23 +80,57 @@ def stores(tmp_path: Path):
     return store, session, transcript
 
 
+# ---------------------------------------------------------------------------
+# start()
+# ---------------------------------------------------------------------------
+
 @pytest.mark.unit
-def test_start_creates_remote_session_and_attaches_id(stores):
+def test_start_creates_remote_session_with_agent_and_environment_ids(stores):
     store, session, transcript = stores
     driver = _FakeDriver(create_returns="sess_remote_42")
-    executor = ManagedExecutor(store, transcript, driver=driver, model="claude-opus-4-7")
+    executor = _make_executor(store, transcript, driver)
 
     outcome = executor.start(session, {"id": "t1", "description": "say hi"})
     assert outcome.status == STATUS_RUNNING
     refreshed = store.get("t1")
     assert refreshed.managed_agent_session_id == "sess_remote_42"
-    # System prompt + initial message routed through the driver
-    assert "expected output shape is `text`" in driver.created_with["system_prompt"]
-    assert "say hi" in driver.created_with["user_message"]
-    # Budget passed through
-    assert driver.created_with["max_wall_seconds"] == 3600
-    assert driver.created_with["max_tokens"] == 100_000
-    assert driver.created_with["max_dollars"] == 5.0
+
+    # Driver received agent_id + environment_id + vault_ids (no inline prompt/model/mcps)
+    cw = driver.created_with
+    assert cw["agent_id"] == AGENT_ID
+    assert cw["environment_id"] == ENV_ID
+    assert cw["vault_ids"] == VAULT_IDS
+    assert cw["metadata"]["lifeos_session_id"] == session.session_id
+    assert cw["metadata"]["task_id"] == "t1"
+    # Initial message carries task description + budget/context
+    assert "say hi" in cw["initial_message"]
+    assert "expected_output=text" in cw["initial_message"]
+    assert "max_dollars=$5.0" in cw["initial_message"]
+    # NO inline system_prompt / model / mcp_servers / connectors
+    assert "system_prompt" not in cw
+    assert "model" not in cw
+    assert "mcp_servers" not in cw
+    assert "connectors" not in cw
+
+
+@pytest.mark.unit
+def test_start_uses_first_100_chars_of_description_as_title(stores):
+    store, session, transcript = stores
+    driver = _FakeDriver(create_returns="sess_remote")
+    executor = _make_executor(store, transcript, driver)
+
+    long_title = "x" * 200
+    executor.start(session, {"id": "t1", "description": long_title})
+    assert driver.created_with["title"] == "x" * 100
+
+
+@pytest.mark.unit
+def test_start_omits_title_when_description_empty(stores):
+    store, session, transcript = stores
+    driver = _FakeDriver(create_returns="sess_remote")
+    executor = _make_executor(store, transcript, driver)
+    executor.start(session, {"id": "t1", "description": ""})
+    assert driver.created_with["title"] is None
 
 
 @pytest.mark.unit
@@ -88,7 +139,7 @@ def test_start_handles_create_failure(stores):
     request details / API key) and surfaces only the exception type name."""
     store, session, transcript = stores
     driver = _FakeDriver(create_raises=RuntimeError("403"))
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.start(session, {"id": "t1", "description": "x"})
     assert outcome.status == STATUS_FAILED
     # Exception args (which may contain headers/API key) are NOT surfaced —
@@ -97,6 +148,10 @@ def test_start_handles_create_failure(stores):
     assert "403" not in outcome.reason
     assert store.get("t1").status == STATUS_FAILED
 
+
+# ---------------------------------------------------------------------------
+# poll() — running state
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_poll_returns_running_when_remote_still_running(stores):
@@ -112,7 +167,7 @@ def test_poll_returns_running_when_remote_still_running(stores):
             total_input_tokens=10, total_output_tokens=5,
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
 
     outcome = executor.poll(session)
     assert outcome.status == STATUS_RUNNING
@@ -144,7 +199,7 @@ def test_poll_uses_since_cursor_on_subsequent_calls(stores):
             total_input_tokens=0, total_output_tokens=0,
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     executor.poll(session)
     # Reload session to pick up the cursor.
     session = store.get("t1")
@@ -152,6 +207,10 @@ def test_poll_uses_since_cursor_on_subsequent_calls(stores):
     # First call: since=None; second call: since=evt_1.
     assert driver.poll_calls == [("sess_remote", None), ("sess_remote", "evt_1")]
 
+
+# ---------------------------------------------------------------------------
+# poll() — terminal states
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_poll_finalizes_completed(stores):
@@ -162,16 +221,61 @@ def test_poll_finalizes_completed(stores):
         ManagedSessionState(
             session_id="sess_remote", status="completed",
             last_event_id="evt_done",
-            new_events=[{"id": "evt_done", "type": "session.completed", "payload": {}}],
+            new_events=[{"id": "evt_done", "type": "session.status_idle", "payload": {}}],
             total_input_tokens=200, total_output_tokens=100,
             final_text="The answer is 42.",
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
     assert outcome.status == STATUS_COMPLETED
     assert outcome.final_text == "The answer is 42."
     assert store.get("t1").status == STATUS_COMPLETED
+
+
+@pytest.mark.unit
+def test_poll_carries_final_text_forward_across_cursor_batches(stores):
+    """`get_session_state` uses an event cursor, so consecutive polls only
+    return events since the last seen id. If the final `agent.message` lands
+    in poll N-1 and `session.status_idle` lands alone in poll N, the latter's
+    response has no text — the executor must fall back to the cached text
+    from the earlier batch so the Telegram completion summary isn't empty."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        # Poll N-1: contains the agent's final message, but no idle event yet
+        # (the API hasn't transitioned the session status).
+        ManagedSessionState(
+            session_id="sess_remote", status="running",
+            last_event_id="evt_msg",
+            new_events=[{"id": "evt_msg", "type": "agent.message"}],
+            total_input_tokens=100, total_output_tokens=50,
+            final_text="The carried-forward answer.",
+        ),
+        # Poll N: cursor advanced past evt_msg, so this batch has only the
+        # idle event. final_text=None mirrors what `_extract_final_text`
+        # returns when no agent.message event is in the batch.
+        ManagedSessionState(
+            session_id="sess_remote", status="completed",
+            last_event_id="evt_idle",
+            new_events=[{"id": "evt_idle", "type": "session.status_idle"}],
+            total_input_tokens=100, total_output_tokens=50,
+            final_text=None,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+
+    # First poll: agent.message text gets cached.
+    out1 = executor.poll(session)
+    assert out1.status == STATUS_RUNNING
+    assert store.get_managed_final_text("t1") == "The carried-forward answer."
+
+    # Second poll: only idle event arrives. Executor must read cached text.
+    session = store.get("t1")  # refresh cursor
+    out2 = executor.poll(session)
+    assert out2.status == STATUS_COMPLETED
+    assert out2.final_text == "The carried-forward answer."
 
 
 @pytest.mark.unit
@@ -187,7 +291,7 @@ def test_poll_finalizes_budget_exceeded(stores):
             error_reason="hit max_tokens",
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
     assert outcome.status == STATUS_BUDGET_EXCEEDED
     assert "max_tokens" in outcome.reason
@@ -206,7 +310,7 @@ def test_poll_finalizes_failed_with_error_reason(stores):
             error_reason="tool dispatch crashed",
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
     assert outcome.status == STATUS_FAILED
     assert outcome.reason == "tool dispatch crashed"
@@ -226,12 +330,16 @@ def test_poll_records_session_hour_overhead_on_completion(stores):
             final_text="ok",
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     executor.poll(session)
     # session ran for ~0 seconds in test, so overhead is ~$0 — but the path
     # exists. Verify total_dollars is a non-negative number (not None).
     assert store.get("t1").total_dollars >= 0
 
+
+# ---------------------------------------------------------------------------
+# poll() — budget breach mid-flight
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_poll_kills_remote_session_on_token_budget_breach(stores):
@@ -252,7 +360,7 @@ def test_poll_kills_remote_session_on_token_budget_breach(stores):
             total_input_tokens=120, total_output_tokens=0,  # exceeds 100-token cap
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
     assert outcome.status == STATUS_BUDGET_EXCEEDED
     assert "max_tokens" in outcome.reason
@@ -280,12 +388,16 @@ def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
             total_input_tokens=100, total_output_tokens=0,
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver, model="claude-opus-4-7")
+    executor = _make_executor(store, transcript, driver, model="claude-opus-4-7")
     outcome = executor.poll(session)
     assert outcome.status == STATUS_BUDGET_EXCEEDED
     assert "max_dollars" in outcome.reason
     assert driver.kills
 
+
+# ---------------------------------------------------------------------------
+# poll() — error / cancellation edge cases
+# ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_cancelled_status_uses_distinct_telegram_reason(stores):
@@ -302,7 +414,7 @@ def test_cancelled_status_uses_distinct_telegram_reason(stores):
             error_reason="operator pressed cancel",
         ),
     ])
-    executor = ManagedExecutor(store, transcript, driver=driver)
+    executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
     assert outcome.status == STATUS_FAILED
     assert "cancelled" in outcome.reason
@@ -315,15 +427,13 @@ def test_poll_returns_running_on_transient_driver_error(stores):
     store.set_managed_session_id("t1", "sess_remote")
     session = store.get("t1")
 
+    import httpx
+
     class _CrashingDriver(_FakeDriver):
         def get_session_state(self, *a, **kw):
-            raise httpx_timeout()
+            raise httpx.TimeoutException("temporary network blip")
 
-    def httpx_timeout():
-        import httpx
-        return httpx.TimeoutException("temporary network blip")
-
-    executor = ManagedExecutor(store, transcript, driver=_CrashingDriver())
+    executor = _make_executor(store, transcript, _CrashingDriver())
     outcome = executor.poll(session)
     # Transient errors don't kill the session — worker retries next tick.
     assert outcome.status == STATUS_RUNNING

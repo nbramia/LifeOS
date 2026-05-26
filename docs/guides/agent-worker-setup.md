@@ -132,37 +132,89 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ---
 
-## Step 4b — Provision the Managed Agents Vault (Claude path, Issue D)
+## Step 4b — Provision the Managed Agents preset, environment, and vault (Claude path)
 
-`#agent` tasks (without `#local`) route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. Anthropic stores OAuth credentials for cloud connectors (Gmail, Calendar, Drive, Superhuman, Zapier) in a **Vault** that's separate from Claude.ai — existing Claude.ai OAuth doesn't transfer.
+`#agent` tasks (without `#local`) route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
 
-> **Beta caveat:** Managed Agents launched April 2026 and the request/response schemas are still evolving. If a request fails with a 4xx, check the [Anthropic console](https://platform.claude.com) for the current schema and update `api/services/agent_worker/managed_driver.py` accordingly.
+- **Agent preset** (`agent_…`) — model, system prompt, MCP servers, tools, skills. Sessions reference it by ID.
+- **Environment** (`env_…`) — where tool calls execute. Cloud container by default; self-hosted sandbox tracked in [#111](https://github.com/nbramia/LifeOS/issues/111).
+- **Vault** (`vlt_…`) — OAuth credentials for MCP servers, matched to the MCP URLs declared in the agent preset.
 
-One-time setup:
+> **Beta caveat:** Managed Agents launched April 2026 and the request/response schemas are still evolving. If a request fails with a 4xx, check the [Anthropic docs](https://platform.claude.com/docs/en/managed-agents) and update `api/services/agent_worker/managed_driver.py` accordingly.
 
-1. **Create a Vault** in the Anthropic console (Settings → Vaults → New Vault). Copy the Vault ID.
-2. **Authenticate connectors** you want available to agents. From the Vault page, click "Add Connector" and OAuth into each of: Gmail, Google Calendar, Google Drive, Superhuman Mail, Zapier. (Slack, Asana out of scope for v1.)
-3. **Add the LifeOS MCP server** as a Vault connector. Use the Cloudflare Tunnel hostname from Step 4 and the bearer token from Step 2, e.g.:
-   ```
-   Name: lifeos
-   URL: https://mcp.example.com/mcp
-   Header: Authorization = Bearer <token>
-   ```
-4. **Write the IDs to `.env`:**
-   ```bash
-   LIFEOS_AGENT_VAULT_ID=vlt_<your_vault_id>
-   LIFEOS_MCP_HTTP_URL=https://mcp.example.com/mcp
-   LIFEOS_AGENT_CONNECTORS=gmail,google-calendar,google-drive,superhuman,zapier
-   ANTHROPIC_API_KEY=sk-ant-...   # already required for the Haiku preflight
-   ```
-5. **Restart the worker:**
-   ```bash
-   sudo systemctl restart lifeos-agent-worker
-   ```
+### 1. Create the Vault
 
-Without `LIFEOS_AGENT_VAULT_ID`, Claude-routed tasks park at `#agent-blocked` with an explanatory Telegram notification — the worker does not attempt to call the API without credentials.
+Workspace → Vaults → New Vault. Copy the `vlt_…` ID. Add OAuth credentials for whichever first-party connectors you want the agent to use (Gmail, Google Calendar, Google Drive, Superhuman) and any custom MCPs (Slack, Ramp, Granola, Asana, etc.). Each Vault entry stores the credential against the MCP server's URL — that exact URL must match what you put in the agent preset.
 
-The Vault holds **only OAuth refresh tokens**. Live data (Obsidian, photos, monarch, calendar index, etc.) is read live from LifeOS MCP on every agent call — nothing is snapshotted into Anthropic's side.
+Also add the LifeOS MCP as a custom Vault MCP entry:
+```
+Name: lifeos
+URL: https://<your-mcp-hostname>/mcp
+Header: Authorization = Bearer <LIFEOS_MCP_BEARER_TOKEN from Step 2>
+```
+
+### 2. Create the cloud Environment
+
+Workspace → Environments → New → Cloud (default network policy is fine). Copy the `env_…` ID.
+
+### 3. Create the Agent preset
+
+Workspace → Agents → New. Paste the YAML below (replace the LifeOS hostname with yours, replace each MCP `url` with the value your Vault uses for that integration — they must match exactly):
+
+```yaml
+name: LifeOS Worker
+description: Autonomous executor for #agent-tagged tasks from LifeOS.
+model: claude-sonnet-4-6
+system: |
+  You are an autonomous task executor running outside the operator's LifeOS
+  personal-assistant system. You receive tasks via the task list (tagged
+  #agent) and must complete them end to end without further input.
+
+  Your `bash`/`read`/`write`/`edit`/`glob`/`grep` tools act on an ephemeral
+  cloud container — use them as scratch space. To touch the operator's
+  persistent data, use the connected MCP servers (LifeOS for personal data,
+  Gmail/Cal/Drive/Superhuman for cloud productivity, plus any work MCPs).
+
+  Reply with one paragraph (1–4 sentences) summarizing what you did and the
+  key result. Be concrete. No filler. If a task is ambiguous, make a
+  reasonable assumption, complete it, and note the assumption.
+
+mcp_servers:
+  - type: url
+    name: lifeos
+    url: https://<your-mcp-hostname>/mcp
+  # …add `type: url, name, url` entries for each Vault MCP you want available
+
+tools:
+  - type: agent_toolset_20260401
+  - type: mcp_toolset
+    mcp_server_name: lifeos
+  # …add a matching mcp_toolset entry for every mcp_servers entry above
+
+skills: []
+```
+
+Every `mcp_servers` entry must have a matching `mcp_toolset` in `tools` (and vice versa) — the API rejects the agent definition otherwise. Save and copy the returned `agent_…` ID.
+
+### 4. Write the IDs to `.env`
+
+```bash
+LIFEOS_AGENT_PRESET_ID=agent_<your_agent_id>
+LIFEOS_AGENT_ENVIRONMENT_ID=env_<your_environment_id>
+LIFEOS_AGENT_VAULT_ID=vlt_<your_vault_id>
+LIFEOS_AGENT_MANAGED_MODEL=claude-sonnet-4-6   # informational; actual model lives in the preset
+ANTHROPIC_API_KEY=sk-ant-...                    # already required for the Haiku preflight
+```
+
+### 5. Restart the worker
+
+```bash
+sudo systemctl restart lifeos-agent-worker
+```
+
+Without `LIFEOS_AGENT_PRESET_ID` or `LIFEOS_AGENT_ENVIRONMENT_ID`, Claude-routed tasks park at `#agent-blocked` with an explanatory Telegram notification — the worker does not call the API without both IDs configured.
+
+The Vault holds **only credentials**. Live data (Obsidian, photos, monarch, calendar index, etc.) is read live from LifeOS MCP and the other connected MCPs on every agent call — nothing is snapshotted to Anthropic's side.
 
 ---
 
@@ -232,9 +284,10 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 | 502/504 from the tunnel | The MCP HTTP service isn't running on the configured port | `systemctl status lifeos-mcp-http` and `curl http://127.0.0.1:8765/mcp` |
 | Gemma loads but responses look garbled | Chat template mismatch | Add `--chat-template gemma3` to `lifeos-llm.service` `ExecStart` |
 | `llama-server` crashes on Gemma | Insufficient VRAM, or stale cached model | Check `nvidia-smi`/`rocm-smi`; re-download with `llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF` once and confirm |
+| `llama-server` starts but `/v1/models` returns `503 Loading model` or `404`, log shows "sha256 mismatch" + "HEAD failed, status: 404" | Upstream HF model was updated; local cache fails llama.cpp's integrity check and the redownload 404s, leaving the server in router mode with no model loaded | Point at the local GGUF directly: set `LIFEOS_LLM_MODEL_PATH=/absolute/path/to/cached.gguf` (and `LIFEOS_LLM_MMPROJ_PATH` for vision models) in `.env`, then re-run `sudo ./scripts/setup-systemd.sh` |
 | Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
 | Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
-| Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: managed-agents-2026-04-01" https://platform.claude.com/v1/managed-agents/sessions/<remote_id>`. The worker's next poll will see the cancelled status and finalize. |
+| Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: managed-agents-2026-04-01" https://api.anthropic.com/v1/sessions/<remote_id>`. The worker's next poll sees a 404 (mapped to `cancelled`) and finalizes. |
 
 ---
 

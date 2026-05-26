@@ -39,62 +39,67 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 logger = logging.getLogger(__name__)
 
 
-def _system_prompt(session_id: str, expected_output: str, budget) -> str:
-    """System prompt for managed agents — same shape as the local executor's."""
-    max_dollars = budget.get("max_dollars")
-    dollars_str = f"${max_dollars}" if max_dollars is not None else "unset"
-    return (
-        "You are an autonomous agent running inside LifeOS via Anthropic "
-        "Managed Agents, handling a single task from the user's task manager. "
-        "You have access to LifeOS data via the attached MCP server, plus "
-        "the standard Managed Agents tools (file, shell, web). Work concisely "
-        "and stop when the task is complete — your final assistant turn (with "
-        f"no tool calls) is the answer the user will see.\n\n"
-        f"Your session_id is {session_id}. Your expected output shape is "
-        f"`{expected_output}`. Your budget is wall={budget.get('wall_seconds')}s, "
-        f"max_tokens={budget.get('max_tokens')}, max_dollars={dollars_str}.\n"
-        "If you cannot complete the task safely or have hit an ambiguity you "
-        "cannot resolve from context, say so plainly in your final response."
-    )
+def _user_message_for(task: dict, session_id: str, expected_output: str, budget: dict) -> str:
+    """The initial user turn sent to a managed session.
 
-
-def _user_message_for(task: dict) -> str:
+    Includes the task description, expected output shape, and the budget the
+    agent has to work within. The system prompt + persona + tools all live
+    in the agent preset (configured once in the Anthropic console), so this
+    message is purely task-specific.
+    """
     title = (task.get("description") or "").strip()
     context = task.get("context")
+    max_dollars = budget.get("max_dollars")
+    dollars_str = f"${max_dollars}" if max_dollars is not None else "unset"
     parts = [f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
+    parts.append(
+        f"Constraints: expected_output={expected_output}, "
+        f"wall={budget.get('wall_seconds')}s, "
+        f"max_tokens={budget.get('max_tokens')}, "
+        f"max_dollars={dollars_str}. "
+        "If genuinely ambiguous, make a reasonable assumption, complete the task, "
+        "and note the assumption in your final reply."
+    )
+    parts.append(f"lifeos_session_id={session_id}")
     return "\n\n".join(parts)
 
 
 class ManagedExecutor:
-    """Coordinates a Managed Agents session from create through terminal event."""
+    """Coordinates a Managed Agents session from create through terminal event.
+
+    All persona / tool / MCP / model config lives in the agent preset (created
+    once in the Anthropic console). The executor just glues a task description
+    to an agent_id + environment_id and polls for completion.
+    """
 
     def __init__(
         self,
         session_store: SessionStore,
         transcript_store: TranscriptStore,
         driver: ManagedAgentsDriver,
-        model: str = "claude-opus-4-7",
-        mcp_servers: list[dict] | None = None,
-        connectors: list[str] | None = None,
+        agent_id: str,
+        environment_id: str,
+        vault_ids: list[str] | None = None,
+        model: str = "claude-sonnet-4-6",
     ):
         self.session_store = session_store
         self.transcript_store = transcript_store
         self.driver = driver
+        self.agent_id = agent_id
+        self.environment_id = environment_id
+        self.vault_ids = list(vault_ids) if vault_ids else []
+        # `model` is informational only — the actual model is whatever the
+        # agent preset says. Kept for token-cost accounting (pricing.cost_for).
         self.model = model
-        # Operator-provided MCP servers (LifeOS HTTP endpoint, etc.) and
-        # connector slugs (gmail, google-calendar, etc.). Passed through to
-        # the Managed Agents API on session create.
-        self.mcp_servers = mcp_servers or []
-        self.connectors = connectors or []
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self, session, task: dict) -> ExecutorOutcome:
-        """Create the remote session and return immediately.
+        """Create the remote session and post the initial user message.
 
         On success: STATUS_RUNNING with `managed_agent_session_id` populated.
         On failure (network, API rejection, etc.): STATUS_FAILED.
@@ -102,19 +107,19 @@ class ManagedExecutor:
         sid = session.session_id
         budget = session.budget or {}
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
-        self.transcript_store.append(sid, "managed_start", {"model": self.model})
+        self.transcript_store.append(sid, "managed_start",
+                                     {"agent_id": self.agent_id, "environment_id": self.environment_id})
 
         try:
             remote_id = self.driver.create_session(
-                system_prompt=_system_prompt(sid, session.expected_output or "text", budget),
-                user_message=_user_message_for(task),
-                model=self.model,
-                mcp_servers=self.mcp_servers,
-                connectors=self.connectors,
-                max_tokens=budget.get("max_tokens"),
-                max_dollars=budget.get("max_dollars"),
-                max_wall_seconds=budget.get("wall_seconds"),
+                agent_id=self.agent_id,
+                environment_id=self.environment_id,
+                vault_ids=self.vault_ids,
+                initial_message=_user_message_for(
+                    task, sid, session.expected_output or "text", budget,
+                ),
                 metadata={"lifeos_session_id": sid, "task_id": session.task_id},
+                title=(task.get("description") or "")[:100] or None,
             )
         except Exception as exc:
             # Log without exc_info — httpx exceptions can attach the request
@@ -196,6 +201,14 @@ class ManagedExecutor:
         if state.last_event_id:
             self.session_store.set_managed_last_event_id(session.task_id, state.last_event_id)
 
+        # Cache the latest non-empty agent.message text. `get_session_state`
+        # advances a cursor, so a poll that returns only `session.status_idle`
+        # will have `final_text=None` even though the agent did produce text
+        # in an earlier batch. Persisting here guarantees the finalize step
+        # surfaces real output instead of an empty completion summary.
+        if state.final_text:
+            self.session_store.set_managed_final_text(session.task_id, state.final_text)
+
         # Terminal handling.
         if state.status in TERMINAL_REMOTE_STATUSES:
             return self._finalize_remote(session, state)
@@ -229,10 +242,15 @@ class ManagedExecutor:
         # poll(), so finalize doesn't need to add anything more — just record
         # the terminal status.
         if state.status == "completed":
+            # `state.final_text` reflects only events in *this* poll batch. If
+            # the agent.message arrived in a prior batch and only the idle
+            # event arrived now, fall back to the cached value persisted by
+            # poll().
+            final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(session.session_id, "managed_completed",
-                                         {"final_chars": len(state.final_text or "")})
-            return ExecutorOutcome(status=STATUS_COMPLETED, final_text=state.final_text or "")
+                                         {"final_chars": len(final_text)})
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
 
         if state.status == "budget_exceeded":
             self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)

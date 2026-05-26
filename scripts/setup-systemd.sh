@@ -8,7 +8,12 @@
 #   __LIFEOS_DIR__    → project directory (auto-detected)
 #   __VENV__          → venv path (default: ~/.venvs/lifeos)
 #   __LLAMA_CPP_DIR__ → llama.cpp directory (default: ~/llama.cpp)
-#   __LLM_MODEL__             → HuggingFace model ID (from .env or default)
+#   __LLM_SOURCE_ARGS__       → either `-hf <repo>` (default) or
+#                               `-m <gguf> --mmproj <mmproj>` when
+#                               LIFEOS_LLM_MODEL_PATH is set (local override
+#                               for when the HuggingFace cache is stale and
+#                               the upstream model has been updated — see
+#                               docs/guides/agent-worker-setup.md).
 #   __LLM_RESTART_POLICY__    → "on-failure" or "no" (from LIFEOS_LOCAL_LLM_AUTOSTART)
 
 set -euo pipefail
@@ -49,6 +54,8 @@ _read_env() {
 }
 
 LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-unsloth/gemma-4-26B-A4B-it-GGUF}")
+LLM_MODEL_PATH=$(_read_env "LIFEOS_LLM_MODEL_PATH" "")
+LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
@@ -70,13 +77,36 @@ else
     LLM_RESTART_POLICY="no"
 fi
 
+# Decide how llama-server gets pointed at the model. Default: `-hf <repo>`,
+# letting llama.cpp manage download + cache. Override: `-m <gguf>` (with
+# optional `--mmproj`) when LIFEOS_LLM_MODEL_PATH is set. The override is
+# needed when an unsloth/HF model has been updated upstream but the local
+# cache still has the old sha256 — `-hf` will then 404 on redownload and
+# fall through to router mode with no model loaded.
+if [ -n "$LLM_MODEL_PATH" ]; then
+    if [ ! -f "$LLM_MODEL_PATH" ]; then
+        echo "  WARNING: LIFEOS_LLM_MODEL_PATH=$LLM_MODEL_PATH does not exist"
+    fi
+    LLM_SOURCE_ARGS="-m $LLM_MODEL_PATH"
+    if [ -n "$LLM_MMPROJ_PATH" ]; then
+        if [ ! -f "$LLM_MMPROJ_PATH" ]; then
+            echo "  WARNING: LIFEOS_LLM_MMPROJ_PATH=$LLM_MMPROJ_PATH does not exist"
+        fi
+        LLM_SOURCE_ARGS="$LLM_SOURCE_ARGS --mmproj $LLM_MMPROJ_PATH"
+    fi
+    LLM_SOURCE_DISPLAY="$LLM_MODEL_PATH (local file)"
+else
+    LLM_SOURCE_ARGS="-hf $LLM_MODEL"
+    LLM_SOURCE_DISPLAY="$LLM_MODEL (HuggingFace)"
+fi
+
 echo "=== LifeOS systemd Setup ==="
 echo ""
 echo "  User:       $REAL_USER"
 echo "  Project:    $PROJECT_DIR"
 echo "  Venv:       $VENV_DIR"
 echo "  llama.cpp:  $LLAMA_DIR"
-echo "  LLM Model:  $LLM_MODEL"
+echo "  LLM Model:  $LLM_SOURCE_DISPLAY"
 echo "  LLM Auto:   $LLM_AUTOSTART (restart policy: $LLM_RESTART_POLICY)"
 if [ -n "$MCP_BEARER_TOKEN" ]; then
     echo "  MCP HTTP:   enabled (token configured)"
@@ -97,6 +127,7 @@ for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         -e "s|__VENV__|$VENV_DIR|g" \
         -e "s|__LLAMA_CPP_DIR__|$LLAMA_DIR|g" \
         -e "s|__LLM_MODEL__|$LLM_MODEL|g" \
+        -e "s|__LLM_SOURCE_ARGS__|$LLM_SOURCE_ARGS|g" \
         -e "s|__LLM_RESTART_POLICY__|$LLM_RESTART_POLICY|g" \
         "$unit" > "$SYSTEMD_DST/$name"
     echo "  Installed $name"

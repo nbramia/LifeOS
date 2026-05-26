@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_TAG = "agent"
 RUNNING_TAG = "agent-running"
+COMPLETED_TAG = "agent-completed"
 BLOCKED_TAG = "agent-blocked"
 FAILED_TAG = "agent-failed"
 BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
@@ -109,6 +110,33 @@ class Worker:
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
+        self._warn_deprecated_settings()
+
+    @staticmethod
+    def _warn_deprecated_settings() -> None:
+        """Log a single warning if deprecated env vars are still set.
+
+        `LIFEOS_AGENT_CONNECTORS` and `LIFEOS_AGENT_EXTRA_MCP_SERVERS` were
+        used by the pre-refactor driver to build per-session MCP / connector
+        lists. The current driver expects those to live on the agent preset
+        (configured in the Anthropic console) and ignores both fields. Operators
+        with stale .env files would otherwise silently lose configuration, so
+        surface a clear deprecation message at startup.
+        """
+        deprecated = []
+        if getattr(settings, "agent_connectors", "") or "":
+            deprecated.append("LIFEOS_AGENT_CONNECTORS")
+        if getattr(settings, "agent_extra_mcp_servers", "") or "":
+            deprecated.append("LIFEOS_AGENT_EXTRA_MCP_SERVERS")
+        if deprecated:
+            logger.warning(
+                "Deprecated env var(s) set and ignored: %s. MCP servers and "
+                "connectors now live on the Managed Agents preset "
+                "(LIFEOS_AGENT_PRESET_ID), not in session creation. Remove "
+                "these from .env to silence this warning. See "
+                "docs/guides/agent-worker-setup.md.",
+                ", ".join(deprecated),
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -705,38 +733,39 @@ class Worker:
     def _get_managed_executor(self):
         """Return the cached ManagedExecutor, lazily constructed.
 
-        Returns None if Managed Agents isn't configured (no api_key or vault_id) —
-        the dispatcher then parks the task at #agent-blocked with an operator-
-        facing explanation.
+        Returns None if Managed Agents isn't configured — the dispatcher then
+        parks the task at #agent-blocked with an operator-facing explanation.
+
+        Required settings (all must be set):
+          - `anthropic_api_key` — for the control-plane auth header
+          - `agent_preset_id` — `agent_…` ID created in the Anthropic console.
+            Holds the model, system prompt, MCP servers, and tools.
+          - `agent_environment_id` — `env_…` ID for where tool calls execute
+            (cloud container by default; self-hosted sandbox in #111).
+        Optional:
+          - `agent_vault_id` — `vlt_…` ID supplying OAuth credentials for
+            MCP servers declared in the agent preset. Without it, OAuth-
+            protected MCPs (Gmail, Slack, etc.) reject the agent's calls.
         """
         if self._managed_executor is not None:
             return self._managed_executor
         api_key = settings.anthropic_api_key
-        vault_id = settings.agent_vault_id
-        if not api_key or not vault_id:
+        agent_id = settings.agent_preset_id
+        environment_id = settings.agent_environment_id
+        if not api_key or not agent_id or not environment_id:
             return None
         from api.services.agent_worker.managed_driver import ManagedAgentsDriver
         from api.services.agent_worker.managed_executor import ManagedExecutor
-        driver = ManagedAgentsDriver(
-            api_key=api_key,
-            vault_id=vault_id,
-        )
-        # Default MCP server list: operator's LifeOS MCP endpoint if configured.
-        mcp_servers: list[dict[str, Any]] = []
-        if settings.mcp_http_url and settings.mcp_bearer_token:
-            mcp_servers.append({
-                "name": "lifeos",
-                "url": settings.mcp_http_url,
-                "headers": {"Authorization": f"Bearer {settings.mcp_bearer_token}"},
-            })
-        connectors = [c.strip() for c in (settings.agent_connectors or "").split(",") if c.strip()]
+        driver = ManagedAgentsDriver(api_key=api_key)
+        vault_ids = [settings.agent_vault_id] if settings.agent_vault_id else []
         self._managed_executor = ManagedExecutor(
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             driver=driver,
+            agent_id=agent_id,
+            environment_id=environment_id,
+            vault_ids=vault_ids,
             model=settings.agent_managed_model,
-            mcp_servers=mcp_servers,
-            connectors=connectors,
         )
         return self._managed_executor
 
@@ -844,9 +873,10 @@ class Worker:
                 self.transcript_store.append(sid, "managed_not_configured", {})
                 self._notify(
                     f"⏸ Agent worker: task '{title}' routed to Claude but "
-                    f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY "
-                    f"and LIFEOS_AGENT_VAULT_ID in .env, then retag with "
-                    f"#{AGENT_TAG}."
+                    f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY, "
+                    f"LIFEOS_AGENT_PRESET_ID, and LIFEOS_AGENT_ENVIRONMENT_ID "
+                    f"in .env (see docs/guides/agent-worker-setup.md for the "
+                    f"console flow), then retag with #{AGENT_TAG}."
                 )
                 return
             try:
@@ -874,6 +904,11 @@ class Worker:
 
         if outcome.status == STATUS_COMPLETED:
             self._complete_task(session.task_id)  # mark `done` in the vault
+            # Swap the tag so the task surfaces as #agent-completed for symmetry
+            # with the failed / budget-exceeded / blocked terminal tags. Failure
+            # of the swap is non-critical — _swap_tag logs and the task is
+            # already marked done in the vault.
+            self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
             self._notify(self._completion_summary(session, task, outcome))
             return
 
