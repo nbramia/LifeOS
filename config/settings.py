@@ -142,10 +142,12 @@ class Settings(BaseSettings):
                     "classifies #agent tasks (budget, routing, ambiguity, sanity)."
     )
     agent_managed_model: str = Field(
-        default="claude-opus-4-7",
+        default="claude-sonnet-4-6",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
         description="Anthropic model the Managed Agents executor uses for "
-                    "Claude-routed #agent tasks."
+                    "Claude-routed #agent tasks. Informational only — the "
+                    "actual model is whatever the agent preset says; this "
+                    "value is just used for client-side token-cost accounting."
     )
     agent_vault_id: str = Field(
         default="",

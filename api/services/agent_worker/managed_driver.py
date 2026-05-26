@@ -80,6 +80,10 @@ class ManagedAgentsDriver:
     DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
     DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
     DEFAULT_ANTHROPIC_BETA = "managed-agents-2026-04-01"
+    # Query-param key for the event-stream cursor on GET /sessions/{id}. Doc
+    # terminology has varied between SDK previews ("after" vs "since"); kept
+    # as a class constant so future API renames are a one-line change.
+    EVENT_CURSOR_PARAM = "after"
 
     def __init__(
         self,
@@ -183,10 +187,7 @@ class ManagedAgentsDriver:
         """
         params: dict[str, str] = {}
         if since_event_id:
-            # Doc terminology varies between SDKs ("after" vs "since"); the
-            # cursor field is stable across both because the API ignores
-            # unknown params.
-            params["after"] = since_event_id
+            params[self.EVENT_CURSOR_PARAM] = since_event_id
         resp = self._client.get(
             f"{self.base_url}/sessions/{session_id}",
             headers=self._headers(),
@@ -274,15 +275,26 @@ class ManagedAgentsDriver:
 # ---------------------------------------------------------------------------
 
 def _synthesize_status_from_events(events: list[dict]) -> str | None:
-    """Map event-stream signals to a terminal status string, or None."""
+    """Map event-stream signals to a terminal status string, or None.
+
+    Scans the full batch before deciding so we prefer `"failed"` when both
+    `session.error` and `session.status_idle` appear together — error is the
+    actionable signal for operators. Returning `"completed"` on first idle
+    (the prior behavior) silently swallowed cascading errors.
+    """
+    has_idle = False
     has_error = False
     for ev in events:
         et = ev.get("type", "")
         if et == "session.status_idle":
-            return "completed"
-        if et == "session.error":
+            has_idle = True
+        elif et == "session.error":
             has_error = True
-    return "failed" if has_error else None
+    if has_error:
+        return "failed"
+    if has_idle:
+        return "completed"
+    return None
 
 
 def _extract_final_text(events: list[dict]) -> str | None:

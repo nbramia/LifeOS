@@ -201,6 +201,14 @@ class ManagedExecutor:
         if state.last_event_id:
             self.session_store.set_managed_last_event_id(session.task_id, state.last_event_id)
 
+        # Cache the latest non-empty agent.message text. `get_session_state`
+        # advances a cursor, so a poll that returns only `session.status_idle`
+        # will have `final_text=None` even though the agent did produce text
+        # in an earlier batch. Persisting here guarantees the finalize step
+        # surfaces real output instead of an empty completion summary.
+        if state.final_text:
+            self.session_store.set_managed_final_text(session.task_id, state.final_text)
+
         # Terminal handling.
         if state.status in TERMINAL_REMOTE_STATUSES:
             return self._finalize_remote(session, state)
@@ -234,10 +242,15 @@ class ManagedExecutor:
         # poll(), so finalize doesn't need to add anything more — just record
         # the terminal status.
         if state.status == "completed":
+            # `state.final_text` reflects only events in *this* poll batch. If
+            # the agent.message arrived in a prior batch and only the idle
+            # event arrived now, fall back to the cached value persisted by
+            # poll().
+            final_text = state.final_text or self.session_store.get_managed_final_text(session.task_id) or ""
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(session.session_id, "managed_completed",
-                                         {"final_chars": len(state.final_text or "")})
-            return ExecutorOutcome(status=STATUS_COMPLETED, final_text=state.final_text or "")
+                                         {"final_chars": len(final_text)})
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
 
         if state.status == "budget_exceeded":
             self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)

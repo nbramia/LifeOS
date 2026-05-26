@@ -258,6 +258,42 @@ def test_get_session_state_synthesizes_failed_from_error_event():
 
 
 @pytest.mark.unit
+def test_get_session_state_prefers_failed_when_idle_and_error_in_same_batch():
+    """If both `session.status_idle` and `session.error` arrive in one poll
+    batch, error wins — operator needs the actionable signal. Order in the
+    batch doesn't matter."""
+    def handler_idle_first(request):
+        return httpx.Response(200, json={
+            "status": "running",
+            "events": [
+                {"id": "evt_1", "type": "session.status_idle"},
+                {"id": "evt_2", "type": "session.error",
+                 "payload": {"message": "post-idle cascade failure"}},
+            ],
+            "usage": {},
+        })
+
+    state = _build_driver(handler_idle_first).get_session_state("sess")
+    assert state.status == "failed"
+    assert state.error_reason == "post-idle cascade failure"
+
+    def handler_error_first(request):
+        return httpx.Response(200, json={
+            "status": "running",
+            "events": [
+                {"id": "evt_1", "type": "session.error",
+                 "payload": {"message": "pre-idle failure"}},
+                {"id": "evt_2", "type": "session.status_idle"},
+            ],
+            "usage": {},
+        })
+
+    state = _build_driver(handler_error_first).get_session_state("sess")
+    assert state.status == "failed"
+    assert state.error_reason == "pre-idle failure"
+
+
+@pytest.mark.unit
 def test_get_session_state_concatenates_text_blocks_from_latest_message():
     def handler(request):
         return httpx.Response(200, json={

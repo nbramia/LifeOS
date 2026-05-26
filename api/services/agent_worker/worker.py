@@ -110,6 +110,33 @@ class Worker:
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
+        self._warn_deprecated_settings()
+
+    @staticmethod
+    def _warn_deprecated_settings() -> None:
+        """Log a single warning if deprecated env vars are still set.
+
+        `LIFEOS_AGENT_CONNECTORS` and `LIFEOS_AGENT_EXTRA_MCP_SERVERS` were
+        used by the pre-refactor driver to build per-session MCP / connector
+        lists. The current driver expects those to live on the agent preset
+        (configured in the Anthropic console) and ignores both fields. Operators
+        with stale .env files would otherwise silently lose configuration, so
+        surface a clear deprecation message at startup.
+        """
+        deprecated = []
+        if getattr(settings, "agent_connectors", "") or "":
+            deprecated.append("LIFEOS_AGENT_CONNECTORS")
+        if getattr(settings, "agent_extra_mcp_servers", "") or "":
+            deprecated.append("LIFEOS_AGENT_EXTRA_MCP_SERVERS")
+        if deprecated:
+            logger.warning(
+                "Deprecated env var(s) set and ignored: %s. MCP servers and "
+                "connectors now live on the Managed Agents preset "
+                "(LIFEOS_AGENT_PRESET_ID), not in session creation. Remove "
+                "these from .env to silence this warning. See "
+                "docs/guides/agent-worker-setup.md.",
+                ", ".join(deprecated),
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -846,9 +873,10 @@ class Worker:
                 self.transcript_store.append(sid, "managed_not_configured", {})
                 self._notify(
                     f"⏸ Agent worker: task '{title}' routed to Claude but "
-                    f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY "
-                    f"and LIFEOS_AGENT_VAULT_ID in .env, then retag with "
-                    f"#{AGENT_TAG}."
+                    f"Managed Agents isn't configured. Set ANTHROPIC_API_KEY, "
+                    f"LIFEOS_AGENT_PRESET_ID, and LIFEOS_AGENT_ENVIRONMENT_ID "
+                    f"in .env (see docs/guides/agent-worker-setup.md for the "
+                    f"console flow), then retag with #{AGENT_TAG}."
                 )
                 return
             try:

@@ -234,6 +234,51 @@ def test_poll_finalizes_completed(stores):
 
 
 @pytest.mark.unit
+def test_poll_carries_final_text_forward_across_cursor_batches(stores):
+    """`get_session_state` uses an event cursor, so consecutive polls only
+    return events since the last seen id. If the final `agent.message` lands
+    in poll N-1 and `session.status_idle` lands alone in poll N, the latter's
+    response has no text — the executor must fall back to the cached text
+    from the earlier batch so the Telegram completion summary isn't empty."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        # Poll N-1: contains the agent's final message, but no idle event yet
+        # (the API hasn't transitioned the session status).
+        ManagedSessionState(
+            session_id="sess_remote", status="running",
+            last_event_id="evt_msg",
+            new_events=[{"id": "evt_msg", "type": "agent.message"}],
+            total_input_tokens=100, total_output_tokens=50,
+            final_text="The carried-forward answer.",
+        ),
+        # Poll N: cursor advanced past evt_msg, so this batch has only the
+        # idle event. final_text=None mirrors what `_extract_final_text`
+        # returns when no agent.message event is in the batch.
+        ManagedSessionState(
+            session_id="sess_remote", status="completed",
+            last_event_id="evt_idle",
+            new_events=[{"id": "evt_idle", "type": "session.status_idle"}],
+            total_input_tokens=100, total_output_tokens=50,
+            final_text=None,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+
+    # First poll: agent.message text gets cached.
+    out1 = executor.poll(session)
+    assert out1.status == STATUS_RUNNING
+    assert store.get_managed_final_text("t1") == "The carried-forward answer."
+
+    # Second poll: only idle event arrives. Executor must read cached text.
+    session = store.get("t1")  # refresh cursor
+    out2 = executor.poll(session)
+    assert out2.status == STATUS_COMPLETED
+    assert out2.final_text == "The carried-forward answer."
+
+
+@pytest.mark.unit
 def test_poll_finalizes_budget_exceeded(stores):
     store, session, transcript = stores
     store.set_managed_session_id("t1", "sess_remote")

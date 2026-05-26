@@ -151,10 +151,19 @@ CREATE INDEX IF NOT EXISTS idx_sleeps_wake ON sleeps(wake_at);
 -- Cursor + bookkeeping for Managed Agents sessions. One row per task_id with
 -- the last event id we've ingested + the cumulative session-hour dollars
 -- already booked into the sessions row's total_dollars. Issue D.
+--
+-- `final_text` caches the most recent agent.message text seen across polls.
+-- Required because `get_session_state` uses an event cursor: if the final
+-- agent.message arrives in poll N-1 and only `session.status_idle` arrives in
+-- poll N, the latter's response has no text to extract. The executor writes
+-- this on every poll where `state.final_text` is non-None, and reads it at
+-- finalize so the Telegram completion summary is never empty when the agent
+-- actually produced output.
 CREATE TABLE IF NOT EXISTS managed_cursor (
     task_id                          TEXT PRIMARY KEY,
     last_event_id                    TEXT,
-    accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0
+    accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0,
+    final_text                       TEXT
 );
 """
 
@@ -189,6 +198,12 @@ class SessionStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Idempotent migration for `managed_cursor.final_text` — added
+            # after the table was first introduced. SQLite has no "ADD COLUMN
+            # IF NOT EXISTS", so probe via PRAGMA first.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
+            if "final_text" not in cols:
+                conn.execute("ALTER TABLE managed_cursor ADD COLUMN final_text TEXT")
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -406,6 +421,33 @@ class SessionStore:
                 "ON CONFLICT(task_id) DO UPDATE SET accrued_session_hour_dollars = excluded.accrued_session_hour_dollars",
                 (task_id, float(dollars)),
             )
+
+    def set_managed_final_text(self, task_id: str, final_text: str) -> None:
+        """Cache the latest agent.message text seen on this managed session.
+
+        Called from the executor's poll loop whenever the driver returns a
+        non-None `final_text`. Because `get_session_state` advances a cursor
+        and only returns events since the last call, the terminal poll batch
+        may contain only `session.status_idle` with no text content — the
+        actual final answer lived in a previous batch. Persisting it here
+        guarantees the finalize step always has the agent's last message.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO managed_cursor (task_id, final_text) VALUES (?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET final_text = excluded.final_text",
+                (task_id, final_text),
+            )
+
+    def get_managed_final_text(self, task_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT final_text FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return row["final_text"]
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:
         """Add to a session's cumulative active-execution seconds.

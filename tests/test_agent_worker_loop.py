@@ -331,11 +331,11 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_managed_executor_constructed_when_preset_and_environment_set(tmp_path: Path, monkeypatch):
-    """When agent_preset_id + agent_environment_id are set (along with the API
-    key), the worker constructs a ManagedExecutor pointing at those IDs. MCP
-    servers and connectors are NOT passed at session-create — they live in the
-    agent preset."""
+def test_managed_executor_constructed_with_full_credentials(tmp_path: Path, monkeypatch):
+    """When API key + agent_preset_id + agent_environment_id + agent_vault_id
+    are all set, the worker constructs a ManagedExecutor with each ID flowing
+    through to the right field. MCP servers and connectors are NOT passed at
+    session-create — they live in the agent preset."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "anthropic_api_key", "sk-ant-test", raising=False)
     monkeypatch.setattr(_settings, "agent_preset_id", "agent_test", raising=False)
