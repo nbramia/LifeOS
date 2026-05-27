@@ -231,6 +231,8 @@ Both link and node layers live inside a single `<g class="viewport">` whose `tra
 
 Per-node `d3.drag` sets `fx`/`fy` on the bound datum so positions persist after drop. The drag handler's `mousedown` stops propagation, so node-drags don't also pan the canvas. Drag pins persist across snapshot ticks but are cleared on filter change (`releasePins()`) so the new visible set reflows.
 
+`renderGraph` keeps `_lastVisibleIdsKey` (the sorted-and-joined session-id set of the previous tick) and only fires `simulation.alpha(0.3).restart()` when that key changes. Same-set snapshot ticks therefore leave settled nodes alone — the periodic jitter that previously fell out of the every-2s SSE refresh is gone. Filter changes additionally reset the pan/zoom transform via `svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity)` so the operator's prior zoom doesn't strand the freshly-filtered set in empty space.
+
 Selection state is tracked in `selectedSessionId` and re-applied on every render plus on `openPanel`/`closePanel` via `applySelectionStyles()`. The helper computes the 1-hop neighbor set from the link layer's bound data and toggles `.selected` (5px white border, overrides `.pulsing`), `.related` (3px translucent white), and `.dimmed` (0.28 opacity) classes on nodes / labels / edges. Clicking the SVG background (target === svg root) calls `closePanel()`; clicking an already-selected node toggles it off.
 
 ### Transcript event rendering

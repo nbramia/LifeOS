@@ -52,7 +52,9 @@ The graph mirrors `/crm/graph`'s pointer model:
 - **Scroll-wheel / pinch** — zooms in and out (0.2× – 5×).
 - **Click a node** — opens its transcript in the side panel and highlights its parent/child relationships (selected node gets a thick white border, 1-hop neighbors get a thinner white border, everything else dims).
 - **Click the same node again, or click empty background** — deselects and closes the panel.
-- **Filter change** — releases any drag-pinned positions so the new visible set lays out from scratch.
+- **Filter change** — releases any drag-pinned positions and resets the pan/zoom transform so the new visible set lays out from scratch at the natural scale.
+
+Between filter operations the simulation **freezes after settling** (~6s). Snapshot ticks every 2s only re-energize the layout if the visible-id set actually changed — new session appeared or one dropped out. Same-set snapshots leave settled nodes alone, so the graph no longer jitters every couple seconds at rest.
 
 ---
 

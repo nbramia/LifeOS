@@ -781,6 +781,12 @@
   // visible-node count: 1 node centers, 2 nodes sit on a narrow band, many
   // nodes spread across most of the canvas.
   let visibleCount = 0;
+  // Sorted-and-joined visible session_id set from the previous render. Used
+  // to detect structural changes (filter operations, new sessions arriving,
+  // sessions terminating out of view) so the simulation only re-energizes
+  // when there's an actual reason to move nodes — never on a same-set
+  // snapshot tick, which would otherwise jitter every 2 seconds.
+  let _lastVisibleIdsKey = '';
   function recencyRailSpan() {
     if (visibleCount <= 1) return 0;
     return Math.min(0.84, 0.15 + 0.15 * Math.log2(visibleCount));
@@ -1070,15 +1076,20 @@
 
     sel.exit().remove();
 
-    // Feed the merged node array + links into the simulation. `alpha(0.3)`
-    // is enough to spread new nodes without throwing the whole layout
-    // around; existing nodes already have stable (x, y). visibleCount
-    // feeds `recencyRailSpan()` so the rail compresses to center when few
-    // nodes are visible.
+    // Feed the merged node array + links into the simulation. Only re-energize
+    // alpha when the visible *set* actually changed (new ids appeared or old
+    // ones disappeared) — otherwise the 2s snapshot tick would keep nudging
+    // settled nodes for no structural reason, manifesting as periodic jitter.
+    // visibleCount feeds `recencyRailSpan()` so the rail compresses to center
+    // when few nodes are visible.
     visibleCount = merged.length;
     simulation.nodes(merged);
     simulation.force('link').links(visibleLinks);
-    simulation.alpha(0.3).restart();
+    const visibleIdsKey = visible.map(s => s.session_id).sort().join('|');
+    if (visibleIdsKey !== _lastVisibleIdsKey) {
+      _lastVisibleIdsKey = visibleIdsKey;
+      simulation.alpha(0.3).restart();
+    }
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
     updateChips(visible);
@@ -1731,6 +1742,12 @@
   }
   function onFilterChange() {
     releasePins();
+    // Reset the pan/zoom transform so the new visible set lays out at the
+    // natural scale + position. Without this, an operator who had zoomed
+    // into a corner would see the freshly-filtered set still anchored
+    // there — usually empty space — even though the simulation correctly
+    // re-centered around the recency rail + center-y forces.
+    svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
     renderGraph(allSessions, allEdges);
   }
   filterTerminalEl.addEventListener('change', () => {
