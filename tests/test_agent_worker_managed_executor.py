@@ -30,12 +30,17 @@ VAULT_IDS = ["vlt_test"]
 class _FakeDriver:
     """Records calls and returns scripted state objects."""
 
-    def __init__(self, *, create_returns="sess_remote", state_responses=None, create_raises=None):
+    def __init__(self, *, create_returns="sess_remote", state_responses=None,
+                 create_raises=None, post_raises=None, update_raises=None):
         self.create_returns = create_returns
         self.state_responses = list(state_responses or [])
         self.create_raises = create_raises
+        self.post_raises = post_raises
+        self.update_raises = update_raises
         self.kills: list[tuple[str, str]] = []
         self.created_with: dict | None = None
+        self.posted_messages: list[tuple[str, str]] = []
+        self.updates: list[tuple[str, dict]] = []
         self.poll_calls: list[tuple[str, str | None]] = []
 
     def create_session(self, **kwargs):
@@ -43,6 +48,16 @@ class _FakeDriver:
         if self.create_raises:
             raise self.create_raises
         return self.create_returns
+
+    def post_user_message(self, session_id, content):
+        self.posted_messages.append((session_id, content))
+        if self.post_raises:
+            raise self.post_raises
+
+    def update_session(self, session_id, agent_payload):
+        self.updates.append((session_id, agent_payload))
+        if self.update_raises:
+            raise self.update_raises
 
     def get_session_state(self, session_id, since_event_id=None):
         self.poll_calls.append((session_id, since_event_id))
@@ -102,31 +117,32 @@ def test_start_creates_remote_session_with_agent_and_environment_ids(stores):
     assert cw["vault_ids"] == VAULT_IDS
     assert cw["metadata"]["lifeos_session_id"] == session.session_id
     assert cw["metadata"]["task_id"] == "t1"
-    # Initial message carries task description + soft budget. Budget is
+    # Per #139 §3 the initial message is NOT in the create_session kwargs —
+    # it's posted as a separate user.message AFTER an optional update_session.
+    assert "initial_message" not in cw
+    # The initial user message landed via post_user_message.
+    assert len(driver.posted_messages) == 1
+    posted_sid, posted_msg = driver.posted_messages[0]
+    assert posted_sid == "sess_remote_42"
+    # Posted message carries task description + soft budget. Budget is
     # framed as "soft" because Anthropic doesn't enforce it server-side;
     # the worker kills the session externally on breach.
-    assert "say hi" in cw["initial_message"]
-    assert "expected_output=text" in cw["initial_message"]
-    assert "soft budget" in cw["initial_message"]
-    assert "~$5.0" in cw["initial_message"]
-    # Today's date is injected for day-relative reasoning. Anthropic does
-    # not inject "today" into managed sessions, and the model has a fixed
-    # training cutoff — without this, calendar/due-date interpretation
-    # picks an arbitrary date inside the cutoff window.
+    assert "say hi" in posted_msg
+    assert "expected_output=text" in posted_msg
+    assert "soft budget" in posted_msg
+    assert "~$5.0" in posted_msg
+    # Today's date is injected for day-relative reasoning.
     import re
-    assert re.search(r"today=\d{4}-\d{2}-\d{2} \([A-Z][a-z]+day\)", cw["initial_message"]), \
-        cw["initial_message"][-300:]
-    # Ambiguity policy NOT duplicated here — it lives in the agent preset's
-    # system prompt (Anthropic console). User message stays task-specific.
-    assert "ambiguous" not in cw["initial_message"]
-    # session_id IS injected as `lifeos_session_id=…` so the cloud agent
-    # can pass it as `caller_session_id` on inter-agent tool calls. The
-    # MCP HTTP layer can't infer the caller server-side (cross-process),
-    # so the agent must supply it explicitly.
-    assert f"lifeos_session_id={session.session_id}" in cw["initial_message"]
-    # NO inline system_prompt / model / mcp_servers / connectors
+    assert re.search(r"today=\d{4}-\d{2}-\d{2} \([A-Z][a-z]+day\)", posted_msg), \
+        posted_msg[-300:]
+    # Ambiguity policy NOT duplicated here — it lives in the agent preset.
+    assert "ambiguous" not in posted_msg
+    assert f"lifeos_session_id={session.session_id}" in posted_msg
+    # NO inline system_prompt / model / mcp_servers / connectors / update call
+    # (no preset_class set on the session → no filter applied).
     assert "system_prompt" not in cw
     assert "model" not in cw
+    assert driver.updates == [], "no preset_class set → no update_session call"
     assert "mcp_servers" not in cw
     assert "connectors" not in cw
 
@@ -149,6 +165,99 @@ def test_start_omits_title_when_description_empty(stores):
     executor = _make_executor(store, transcript, driver)
     executor.start(session, {"id": "t1", "description": ""})
     assert driver.created_with["title"] is None
+
+
+@pytest.mark.unit
+def test_start_applies_tool_filter_when_preset_class_set(stores):
+    """When session.preset_class is set, the executor calls update_session
+    between create and the first user message — scoping cache_creation
+    to the class's filtered tool list (#139 §3)."""
+    store, _, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 5.0},
+        expected_output="text",
+        preset_class="research",
+    )
+    session = store.get("t1")
+    driver = _FakeDriver(create_returns="sess_remote")
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.start(session, {"id": "t1", "description": "look it up"})
+    assert outcome.status == STATUS_RUNNING
+    # update_session called once with the research-class filter.
+    assert len(driver.updates) == 1
+    upd_sid, upd_payload = driver.updates[0]
+    assert upd_sid == "sess_remote"
+    assert "tools" in upd_payload
+    assert "lifeos_drive_search" in upd_payload["tools"]  # research-class specialty
+    assert "lifeos_search" in upd_payload["tools"]        # cross-cutting
+    # The order matters: update_session must happen BEFORE the user message
+    # or cache_creation locks in on the unfiltered preset.
+    assert driver.posted_messages, "user message should still be posted"
+
+
+@pytest.mark.unit
+def test_start_skips_filter_for_fullstack_preset_class(stores):
+    """preset_class=fullstack means no filter — update_session is skipped."""
+    store, _, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 5.0},
+        expected_output="text",
+        preset_class="fullstack",
+    )
+    session = store.get("t1")
+    driver = _FakeDriver(create_returns="sess_remote")
+    executor = _make_executor(store, transcript, driver)
+    executor.start(session, {"id": "t1", "description": "anything"})
+    assert driver.updates == []
+
+
+@pytest.mark.unit
+def test_start_falls_back_to_full_preset_on_update_failure(stores):
+    """If update_session fails (4xx, schema mismatch), the session still
+    proceeds with the full preset — we don't want to abort a billable
+    session over a non-fatal filter issue."""
+    import httpx
+    store, _, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 5.0},
+        expected_output="text",
+        preset_class="research",
+    )
+    session = store.get("t1")
+    driver = _FakeDriver(
+        create_returns="sess_remote",
+        update_raises=httpx.HTTPStatusError(
+            "400", request=httpx.Request("POST", "http://x"),
+            response=httpx.Response(400),
+        ),
+    )
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.start(session, {"id": "t1", "description": "research X"})
+    # Session continues despite the filter failure.
+    assert outcome.status == STATUS_RUNNING
+    assert driver.posted_messages, "initial message still posted after filter failure"
+
+
+@pytest.mark.unit
+def test_start_marks_failed_when_post_user_message_fails(stores):
+    """If posting the initial user message fails, the session is marked
+    failed — we can't proceed without it."""
+    store, _, transcript = stores
+    driver = _FakeDriver(
+        create_returns="sess_remote",
+        post_raises=RuntimeError("network blip"),
+    )
+    session = store.get("t1")
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.start(session, {"id": "t1", "description": "x"})
+    assert outcome.status == STATUS_FAILED
+    assert "post_user_message failed" in outcome.reason
 
 
 @pytest.mark.unit

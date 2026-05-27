@@ -53,6 +53,11 @@ class Session:
     expected_output: str | None = None
     parent_session_id: str | None = None
     managed_agent_session_id: str | None = None
+    # Preset class for per-session tool filtering (#139 §3). When set,
+    # ManagedExecutor.start() calls driver.update_session() with the
+    # class's filtered tool list between create and the first user
+    # message — scoping cache_creation to the smaller tool set.
+    preset_class: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     # Prompt-cache buckets — kept separate from total_input_tokens because
@@ -88,7 +93,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     root_session_id           TEXT,
     spawn_depth               INTEGER NOT NULL DEFAULT 0,
     yield_waiting_for         TEXT,  -- JSON array of session_ids the agent is waiting on
-    managed_agent_session_id  TEXT
+    managed_agent_session_id  TEXT,
+    preset_class              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -256,6 +262,12 @@ class SessionStore:
                     "ALTER TABLE sessions ADD COLUMN total_cache_read_tokens "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            # Idempotent migration for the per-session preset_class column
+            # (#139 §3 worker wiring). Old rows stay NULL → fullstack.
+            if "preset_class" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN preset_class TEXT"
+                )
             # Idempotent migrations for the runaway detection counters on
             # managed_cursor (#139 Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
@@ -391,19 +403,22 @@ class SessionStore:
         routing: str | None,
         budget: dict | None,
         expected_output: str | None = None,
+        preset_class: str | None = None,
     ) -> None:
-        """Update routing decision and budget after the preflight call."""
+        """Update routing, budget, expected_output, and preset_class after preflight."""
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET routing = ?, budget_json = ?, expected_output = ?, last_activity_at = ?
+                SET routing = ?, budget_json = ?, expected_output = ?,
+                    preset_class = ?, last_activity_at = ?
                 WHERE task_id = ?
                 """,
                 (
                     routing,
                     json.dumps(budget) if budget else None,
                     expected_output,
+                    preset_class,
                     _now(),
                     task_id,
                 ),
@@ -977,6 +992,11 @@ class SessionStore:
             expected_output=row["expected_output"],
             parent_session_id=row["parent_session_id"],
             managed_agent_session_id=row["managed_agent_session_id"],
+            preset_class=(
+                row["preset_class"]
+                if "preset_class" in row.keys()
+                else None
+            ),
             root_session_id=(
                 row["root_session_id"] if "root_session_id" in row.keys() else None
             ),
