@@ -9,10 +9,8 @@ These tests verify that:
 Run with: pytest tests/test_mcp_server.py -v
 Requires: LifeOS API running on localhost:8000
 """
-import json
 import pytest
 import httpx
-import subprocess
 import sys
 from pathlib import Path
 
@@ -254,7 +252,6 @@ class TestAPIOpenAPISync:
         spec.loader.exec_module(module)
 
         server = module.LifeOSMCPServer()
-        schemas = openapi_spec.get("components", {}).get("schemas", {})
 
         # Check that lifeos_ask has question field
         ask_tool = next((t for t in server.tools if t["name"] == "lifeos_ask"), None)
@@ -267,3 +264,36 @@ class TestAPIOpenAPISync:
         if search_tool:
             props = search_tool["inputSchema"].get("properties", {})
             assert "query" in props, "lifeos_search missing 'query' property"
+
+
+# ---------------------------------------------------------------------------
+# Tool description sizing (#139 §1) — keep cache_creation cheap.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_curated_endpoint_descriptions_average_under_30_words():
+    """Every tool description ships into the MCP system prompt, contributing
+    to cache_creation cost on every fresh managed session. Keep the average
+    under 30 words; no single description over 30 words.
+
+    Run `python -c "from mcp_server import CURATED_ENDPOINTS; ..."` to
+    measure manually."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    descriptions = [
+        cfg["description"] for cfg in module.CURATED_ENDPOINTS.values()
+    ]
+    word_counts = [len(d.split()) for d in descriptions]
+    avg = sum(word_counts) / len(word_counts)
+    over_threshold = [
+        (cfg["name"], len(cfg["description"].split()))
+        for cfg in module.CURATED_ENDPOINTS.values()
+        if len(cfg["description"].split()) > 30
+    ]
+    assert avg <= 30, f"avg description word count too high: {avg:.1f}"
+    assert not over_threshold, (
+        f"tools with >30-word description: {over_threshold}. "
+        "Trim them — every word lands in cache_creation."
+    )
