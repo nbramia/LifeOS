@@ -375,7 +375,7 @@
   </div>
 </header>
 <div class="filters">
-  <label><input type="checkbox" id="filter-terminal" /> show terminal</label>
+  <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
   <label>route
     <select id="filter-route">
       <option value="all">all</option>
@@ -440,19 +440,33 @@
   const edges = new vis.DataSet([]);
   const network = new vis.Network(graphEl, { nodes, edges }, {
     physics: {
+      // Stabilize once on load; subsequent snapshot ticks update node attrs
+      // in place via DataSet.update so positions stay put.
       enabled: true,
-      stabilization: { iterations: 80 },
-      barnesHut: { gravitationalConstant: -2200, springLength: 110 },
+      stabilization: { iterations: 120, fit: true },
+      barnesHut: { gravitationalConstant: -2400, springLength: 130, damping: 0.6 },
+      timestep: 0.45,
     },
-    interaction: { hover: true, tooltipDelay: 200 },
-    edges: { arrows: 'to', color: { color: '#3a3a4a', highlight: '#6366f1' }, smooth: { type: 'cubicBezier' } },
+    interaction: { hover: true, tooltipDelay: 200, dragNodes: true },
+    edges: {
+      arrows: { to: { enabled: true, scaleFactor: 0.6 } },
+      color: { color: '#3a3a4a', highlight: '#6366f1' },
+      width: 1.5,
+      smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.45 },
+    },
     nodes: {
       shape: 'dot',
       size: 18,
       borderWidth: 2,
       color: { background: '#1a1a24', border: '#2a2a3a' },
-      font: { color: '#e8e8ed', size: 12, face: 'system-ui' },
+      font: { color: '#e8e8ed', size: 13, face: 'system-ui', strokeWidth: 0 },
     },
+  });
+
+  // Settle physics shortly after initial layout so subsequent updates don't
+  // re-stabilize the whole graph on every snapshot tick.
+  network.once('stabilizationIterationsDone', () => {
+    network.setOptions({ physics: { enabled: false } });
   });
 
   network.on('click', (params) => {
@@ -482,15 +496,40 @@
     return 'Claude';
   }
 
+  // Hex helper — lighten/darken/transparentize a color for terminal nodes
+  // so completed/failed sessions read as "done" without losing their status hue.
+  function hexWithAlpha(hex, alpha) {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.slice(0, 2), 16);
+    const g = parseInt(h.slice(2, 4), 16);
+    const b = parseInt(h.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  // Token-based sizing. Log scale so a 100k-token session is roughly 2x the
+  // size of a 1k-token session — not 100x. Capped at 56 so the canvas
+  // doesn't get dominated by one fat node.
+  function sizeForTokens(totalTokens) {
+    const t = Math.max(0, totalTokens || 0);
+    const grown = Math.log10(t + 10) * 6; // log10(10)=1 → +6; log10(100k)≈5 → +30
+    return Math.min(56, Math.max(14, 14 + grown));
+  }
+
   function nodeFor(s) {
     const color = STATUS_COLORS[s.status] || '#6b7280';
-    const isRunning = s.status === 'running';
+    const isTerminal = TERMINAL.has(s.status);
     const isBlocked = s.status === 'blocked';
     const isInferred = !!s.status_inferred;
-    const baseLabel = s.model_label || s.label || s.session_id.slice(0, 8);
+    const totalTokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
+    const size = sizeForTokens(totalTokens);
+    // Fill the node by status: full saturation while live, subdued when
+    // terminal. Both keep the same hue so you can still tell at a glance
+    // whether the session ended in success or failure.
+    const fill = isTerminal ? hexWithAlpha(color, 0.35) : hexWithAlpha(color, 0.85);
+    const border = color;
     return {
       id: s.session_id,
-      label: baseLabel,
+      label: s.model_label || routingLabel(s.routing) || s.session_id.slice(0, 8),
       title: [
         s.label,
         s.decoded_cwd ? `cwd: ${s.decoded_cwd}` : null,
@@ -502,29 +541,43 @@
         s.last_event_kind ? `last: ${s.last_event_kind}` : null,
       ].filter(Boolean).join('\n'),
       color: {
-        background: isRunning ? color : '#1a1a24',
-        border: color,
-        highlight: { background: color, border: color },
+        background: fill,
+        border: border,
+        highlight: { background: color, border: '#e8e8ed' },
       },
+      size: size,
       borderWidth: isBlocked ? 4 : 2,
       borderWidthSelected: isBlocked ? 4 : 3,
+      // Dashed border signals an inferred status (Claude Code only today).
       shapeProperties: isInferred ? { borderDashes: [4, 3] } : { borderDashes: false },
-      shadow: isRunning ? { enabled: true, color: color, size: 16, x: 0, y: 0 } : false,
+      shadow: !isTerminal ? { enabled: true, color: hexWithAlpha(color, 0.45), size: 14, x: 0, y: 0 } : false,
       font: { color: '#e8e8ed' },
     };
   }
 
+  // Incremental DataSet update. Avoids vis-network re-stabilizing the
+  // entire physics simulation every 2s — nodes stay put, only the attrs
+  // (color/size/title) tick.
   function renderGraph(sessions, snapshotEdges) {
     const visible = applyFilters(sessions);
     const visibleIds = new Set(visible.map(s => s.session_id));
-    const nextNodes = visible.map(nodeFor);
-    const nextEdges = snapshotEdges
-      .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
-      .map(e => ({ id: `${e.from}->${e.to}`, from: e.from, to: e.to }));
-    nodes.clear();
-    edges.clear();
-    nodes.add(nextNodes);
-    edges.add(nextEdges);
+
+    const nextNodesById = new Map(visible.map(s => [s.session_id, nodeFor(s)]));
+    const existingNodeIds = new Set(nodes.getIds());
+    const toRemove = [...existingNodeIds].filter(id => !nextNodesById.has(id));
+    if (toRemove.length) nodes.remove(toRemove);
+    nodes.update([...nextNodesById.values()]);
+
+    const nextEdgesById = new Map();
+    for (const e of snapshotEdges) {
+      if (!visibleIds.has(e.from) || !visibleIds.has(e.to)) continue;
+      const id = `${e.from}->${e.to}`;
+      nextEdgesById.set(id, { id, from: e.from, to: e.to });
+    }
+    const existingEdgeIds = new Set(edges.getIds());
+    const edgesToRemove = [...existingEdgeIds].filter(id => !nextEdgesById.has(id));
+    if (edgesToRemove.length) edges.remove(edgesToRemove);
+    edges.update([...nextEdgesById.values()]);
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
     updateChips(sessions);
@@ -547,14 +600,21 @@
     allSessions = snap.sessions || [];
     allEdges = snap.edges || [];
     renderGraph(allSessions, allEdges);
-    // Re-render panel header if the selected session updated.
+    // Update the panel meta in place if the selected session is still around.
+    // Replacing innerHTML on every tick would wipe the events container and
+    // detach the live SSE renderer — the previous bug where the side panel
+    // blinked into view and then went blank.
     if (selectedSessionId) {
       const s = allSessions.find(x => x.session_id === selectedSessionId);
-      if (s) renderPanelHeader(s);
+      if (s) updatePanelMeta(s);
     }
   }
 
   // --- Side panel ---
+  // Build the panel scaffold once per session selection. Subsequent snapshot
+  // ticks call updatePanelMeta() which only touches data-attributed spans —
+  // never the events container. This is what fixes the "click → blink → blank"
+  // bug where the SSE event list was getting destroyed every 2s.
   function renderPanelHeader(s) {
     const live = !TERMINAL.has(s.status);
     const safeStatus = escapeAttr(s.status);
@@ -568,16 +628,16 @@
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
-        <div class="label">${escapeHtml(s.label || s.session_id)}</div>
-        ${s.decoded_cwd ? `<div class="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${escapeHtml(s.decoded_cwd)}</div>` : ''}
-        <div class="meta">
-          ${live ? '<span class="live-dot" title="live"></span>' : ''}
-          <span class="badge status-${safeStatus}">${escapeHtml(s.status + inferredHint)}</span>
-          <span class="badge">${escapeHtml(sourceLabel)}</span>
-          <span class="badge">${escapeHtml(routingLabel(s.routing))}</span>
-          <span class="badge">$${(s.total_dollars || 0).toFixed(4)}</span>
-          <span class="badge">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
-          ${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}
+        <div class="label" data-field="label">${escapeHtml(s.label || s.session_id)}</div>
+        <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
+        <div class="meta" data-field="meta">
+          <span data-field="live-dot">${live ? '<span class="live-dot" title="live"></span>' : ''}</span>
+          <span class="badge status-${safeStatus}" data-field="status">${escapeHtml(s.status + inferredHint)}</span>
+          <span class="badge" data-field="source">${escapeHtml(sourceLabel)}</span>
+          <span class="badge" data-field="routing">${escapeHtml(routingLabel(s.routing))}</span>
+          <span class="badge" data-field="cost">$${(s.total_dollars || 0).toFixed(4)}</span>
+          <span class="badge" data-field="tokens">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
+          <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
         </div>
       </div>
       <div class="events" id="events"></div>
@@ -585,6 +645,59 @@
     document.getElementById('panel-close').onclick = closePanel;
     if (showKill) {
       document.getElementById('panel-kill').onclick = () => openKillModal(s);
+    }
+  }
+
+  // In-place metadata refresh — keeps the events container intact across
+  // snapshot ticks. Only updates fields by their data-field selectors.
+  function updatePanelMeta(s) {
+    if (!panelEl) return;
+    const setText = (sel, text) => {
+      const el = panelEl.querySelector(`[data-field="${sel}"]`);
+      if (el) el.textContent = text;
+    };
+    const setHtml = (sel, html) => {
+      const el = panelEl.querySelector(`[data-field="${sel}"]`);
+      if (el) el.innerHTML = html;
+    };
+    const inferredHint = s.status_inferred ? ' (inferred)' : '';
+    const isClaudeCode = (s.source === 'claude_code');
+    const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
+    setText('label', s.label || s.session_id);
+    setText('status', s.status + inferredHint);
+    setText('source', sourceLabel);
+    setText('routing', routingLabel(s.routing));
+    setText('cost', '$' + (s.total_dollars || 0).toFixed(4));
+    setText('tokens', `${s.total_input_tokens}↓ / ${s.total_output_tokens}↑`);
+    setText('cwd-hint', s.decoded_cwd || '');
+
+    // Status changed → swap the badge class so the color follows.
+    const statusBadge = panelEl.querySelector('[data-field="status"]');
+    if (statusBadge) {
+      statusBadge.className = `badge status-${escapeAttr(s.status)}`;
+    }
+
+    // Live dot + kill button visibility track terminal state.
+    const live = !TERMINAL.has(s.status);
+    setHtml('live-dot', live ? '<span class="live-dot" title="live"></span>' : '');
+    setHtml('depth', s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : '');
+
+    const killBtn = document.getElementById('panel-kill');
+    if (live && !killBtn) {
+      // Add the kill button if the session just transitioned to non-terminal
+      // (rare; usually the other direction).
+      const header = panelEl.querySelector('.panel-header');
+      if (header) {
+        const closeBtn = header.querySelector('#panel-close');
+        const btn = document.createElement('button');
+        btn.className = 'panel-kill';
+        btn.id = 'panel-kill';
+        btn.textContent = 'Kill';
+        btn.onclick = () => openKillModal(s);
+        header.insertBefore(btn, closeBtn);
+      }
+    } else if (!live && killBtn) {
+      killBtn.remove();
     }
   }
 
