@@ -379,6 +379,35 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 
 ---
 
+## Cost-aware iteration
+
+Iterating on cloud `#agent` prompts has a hidden tax: every fresh managed
+session pays ~$0.40 cache_creation up front on the 100k-token preset. A few
+suggestions to keep iteration cheap:
+
+- **Cluster runs within 5 minutes.** Anthropic's prompt cache has a 5-minute
+  TTL. Sessions dispatched within that window after a recent run hit
+  `cache_read` (12.5× cheaper than `cache_creation`) instead of paying the
+  full cache-cold cost. If you're iterating on a prompt shape, fire your
+  reruns back-to-back, not spread across the hour.
+- **Use `dry_run=true` to inspect routing without billing.** `lifeos_task_create`
+  accepts a `dry_run` flag on `#agent` tasks — it runs the cheap Haiku
+  preflight (~$0.001), returns the routing decision and cost estimate, and
+  does *not* dispatch a managed session. Use this when you're verifying tag
+  parsing or routing logic; only flip `dry_run=false` once the dispatch
+  shape looks right.
+- **Override the model-for-tests setting.** `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS`
+  in `.env` overrides `LIFEOS_AGENT_MANAGED_MODEL` for client-side cost
+  accounting. Set to `claude-haiku-4-5` while iterating so the dollar
+  figures the worker logs match what you'd be charged if the preset were
+  pointed at Haiku.
+- **Keep tests mocked.** A process-wide pytest guard fails any test that
+  reaches `api.anthropic.com` or `platform.claude.com`. Tests must use
+  `httpx.MockTransport`, `AsyncMock`, or a stub `caller`. A test that
+  legitimately needs a real call must carry `@pytest.mark.allow_anthropic_api`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
