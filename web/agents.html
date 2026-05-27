@@ -178,6 +178,7 @@
   .badge.status-running { color: var(--running); border-color: var(--running); }
   .badge.status-claimed { color: var(--claimed); border-color: var(--claimed); }
   .badge.status-yielded { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-inactive { color: var(--yielded); border-color: var(--yielded); }
   .badge.status-blocked { color: var(--blocked); border-color: var(--blocked); }
   .badge.status-completed { color: var(--completed); border-color: var(--completed); }
   .badge.status-failed,
@@ -454,6 +455,7 @@
       <option value="running">running</option>
       <option value="claimed">claimed</option>
       <option value="yielded">yielded</option>
+      <option value="inactive">inactive</option>
       <option value="blocked">blocked</option>
       <option value="completed">completed</option>
       <option value="failed">failed</option>
@@ -479,7 +481,8 @@
   const STATUS_COLORS = {
     running:   '#34d399',
     claimed:   '#60a5fa',
-    yielded:   '#fbbf24',
+    yielded:   '#fbbf24',  // agent worker — paused waiting on children
+    inactive:  '#fbbf24',  // claude code — paused, resumable
     blocked:   '#fb923c',
     completed: '#6b7280',
     failed:    '#f87171',
@@ -545,6 +548,22 @@
     network.setOptions({ physics: { enabled: false } });
   });
 
+  // Pulse the border of actively-writing nodes (recent activity in last 60s).
+  // Toggles borderWidth between a thin and thick value every ~700ms — pure
+  // DataSet.update on the targeted IDs so the rest of the canvas doesn't
+  // re-render.
+  let pulsePhase = 0;
+  setInterval(() => {
+    if (activelyWritingIds.size === 0) return;
+    pulsePhase = (pulsePhase + 1) % 2;
+    const next = pulsePhase === 0 ? 2 : 5;
+    const updates = [];
+    activelyWritingIds.forEach(id => updates.push({ id, borderWidth: next }));
+    if (updates.length) {
+      try { nodes.update(updates); } catch (_) {}
+    }
+  }, 700);
+
   network.on('click', (params) => {
     if (params.nodes && params.nodes.length > 0) {
       openPanel(params.nodes[0]);
@@ -591,6 +610,12 @@
     return Math.min(56, Math.max(14, 14 + grown));
   }
 
+  // Tracks the IDs of nodes currently considered 'actively writing' — fresh
+  // activity in the last 60s. We pulse their border via a setInterval to
+  // separate them visually from a session that's running-but-quiet within
+  // the broader 10-min running window.
+  const activelyWritingIds = new Set();
+
   function nodeFor(s) {
     const color = STATUS_COLORS[s.status] || '#6b7280';
     const isTerminal = TERMINAL.has(s.status);
@@ -598,6 +623,15 @@
     const isInferred = !!s.status_inferred;
     const isClaudeCode = (s.source === 'claude_code');
     const isSubagent = !!s.is_subagent;
+    // Recent-activity window: a node that was touched in the last 60s
+    // earns a pulsing border. Running-but-quiet nodes (within 10min but
+    // outside 60s) still read as `running` but don't blink.
+    const nowSec = Date.now() / 1000;
+    const isActivelyWriting = s.status === 'running'
+      && s.last_activity_at
+      && (nowSec - s.last_activity_at) < 60;
+    if (isActivelyWriting) activelyWritingIds.add(s.session_id);
+    else activelyWritingIds.delete(s.session_id);
     const totalTokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
     const size = sizeForTokens(totalTokens);
     const fill = isTerminal ? hexWithAlpha(color, 0.35) : hexWithAlpha(color, 0.85);
@@ -726,7 +760,7 @@
     // Resume button: only for terminal-state Claude Code sessions (not subagents).
     // Whether the backend will actually accept the click depends on
     // LIFEOS_CC_RESUME_ENABLED on the server; if disabled, click → toast error.
-    const showResume = isClaudeCode && !isSubagent && (TERMINAL.has(s.status) || s.status === 'yielded');
+    const showResume = isClaudeCode && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
     const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     panelEl.innerHTML = `
