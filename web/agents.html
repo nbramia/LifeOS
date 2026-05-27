@@ -122,8 +122,32 @@
   }
   main {
     display: grid;
-    grid-template-columns: 1fr 360px;
+    grid-template-columns: 1fr var(--panel-width, 360px);
     height: calc(100vh - 56px - 41px);
+  }
+  /* Drag handle on the left edge of the side panel — col-resize cursor,
+     pure CSS visual feedback on hover/active. Drag logic in JS persists
+     the width to localStorage so it survives reload. */
+  .panel-resizer {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 5px;
+    cursor: col-resize;
+    background: transparent;
+    transition: background 0.15s ease;
+    z-index: 10;
+  }
+  .panel-resizer:hover,
+  .panel-resizer.dragging {
+    background: var(--accent);
+  }
+  aside.panel { position: relative; }
+  .panel-content {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    height: 100%;
+    padding-left: 5px;  /* leave room for the resizer strip */
   }
   #graph {
     background: var(--bg-primary);
@@ -254,6 +278,19 @@
     max-height: 8rem;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Click anywhere on a feed item (except the kind label, which filters)
+     to expand it — full untruncated payload + white text. Click again to
+     collapse. The cursor signals affordance only on the content area. */
+  .event .payload { cursor: pointer; }
+  .event.expanded {
+    background: var(--bg-elev);
+  }
+  .event.expanded .payload {
+    color: var(--text-primary);
+    max-height: none;
+    overflow: visible;
+    text-overflow: clip;
   }
   .panel-close {
     background: none;
@@ -441,6 +478,20 @@
 </header>
 <div class="filters">
   <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
+  <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
+    <select id="filter-recency">
+      <option value="60">1 min</option>
+      <option value="1800" selected>30 min</option>
+      <option value="86400">24 h</option>
+      <option value="604800">1 wk</option>
+      <option value="all">all time</option>
+    </select>
+  </label>
+  <label title="Limit to sessions whose project working directory matches.">cwd
+    <select id="filter-cwd">
+      <option value="all">all</option>
+    </select>
+  </label>
   <label>route
     <select id="filter-route">
       <option value="all">all</option>
@@ -471,8 +522,11 @@
       <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
     </div>
   </section>
-  <aside class="panel" id="panel">
-    <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+  <aside class="panel" id="panel-outer">
+    <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
+    <div class="panel-content" id="panel">
+      <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+    </div>
   </aside>
 </main>
 
@@ -493,9 +547,15 @@
   const filterTerminalEl = document.getElementById('filter-terminal');
   const filterRouteEl = document.getElementById('filter-route');
   const filterStatusEl = document.getElementById('filter-status');
+  const filterRecencyEl = document.getElementById('filter-recency');
+  const filterCwdEl = document.getElementById('filter-cwd');
   const connStateEl = document.getElementById('connection-state');
   const emptyStateEl = document.getElementById('empty-state');
   const panelEl = document.getElementById('panel');
+  const panelOuterEl = document.getElementById('panel-outer');
+  const panelResizerEl = document.getElementById('panel-resizer');
+  // Operator chooses recency manually → don't auto-flip on include-finished toggle.
+  let recencyManuallySet = false;
 
   let allSessions = [];
   let allEdges = [];
@@ -570,12 +630,49 @@
     }
   });
 
+  // Strip the user's home directory prefix for display.
+  // /home/nathanramia/Code/LifeOS → /Code/LifeOS
+  function shortenCwd(p) {
+    if (!p) return p;
+    const m = p.match(/^\/(home|Users)\/[^/]+(\/.*)?$/);
+    if (m) return m[2] || '/';
+    return p;
+  }
+
+  // Re-populate the cwd dropdown with unique decoded_cwd values from the
+  // snapshot. Preserves operator selection if the chosen cwd still exists.
+  let _lastCwdOptionKey = '';
+  function updateCwdOptions(sessions) {
+    if (!filterCwdEl) return;
+    const cwds = [...new Set(sessions.map(s => s.decoded_cwd).filter(Boolean))].sort();
+    const key = cwds.join('|');
+    if (key === _lastCwdOptionKey) return;
+    _lastCwdOptionKey = key;
+    const current = filterCwdEl.value;
+    filterCwdEl.innerHTML = '<option value="all">all</option>'
+      + cwds.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(shortenCwd(c))}</option>`).join('');
+    if (current && (current === 'all' || cwds.includes(current))) {
+      filterCwdEl.value = current;
+    }
+    const wrap = filterCwdEl.closest('label');
+    if (wrap) wrap.style.display = cwds.length > 0 ? '' : 'none';
+  }
+
   function applyFilters(sessions) {
     const showTerm = filterTerminalEl.checked;
     const route = filterRouteEl.value;
     const status = filterStatusEl.value;
+    const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
+    const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
+    const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
+    const nowSec = Date.now() / 1000;
     return sessions.filter(s => {
       if (!showTerm && TERMINAL.has(s.status)) return false;
+      if (recencySec !== null && s.last_activity_at
+          && (nowSec - s.last_activity_at) > recencySec) {
+        return false;
+      }
+      if (cwdSel !== 'all' && s.decoded_cwd !== cwdSel) return false;
       if (route !== 'all') {
         const r = s.routing || 'local';
         if (r !== route) return false;
@@ -584,6 +681,12 @@
       return true;
     });
   }
+
+  function applyRecencyDefault() {
+    if (recencyManuallySet || !filterRecencyEl) return;
+    filterRecencyEl.value = filterTerminalEl.checked ? '604800' : '1800';
+  }
+  applyRecencyDefault();
 
   function routingLabel(routing) {
     if (!routing || routing === 'local') return 'Local';
@@ -709,7 +812,11 @@
     edges.update([...nextEdgesById.values()]);
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
-    updateChips(sessions);
+    // Chips and cwd dropdown reflect what's actually on screen. Earlier this
+    // passed the unfiltered `sessions` which left API spend pegged regardless
+    // of include-finished etc. (see issue #174).
+    updateChips(visible);
+    updateCwdOptions(allSessions);
   }
 
   function updateChips(sessions) {
@@ -1010,7 +1117,15 @@
     fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
       .then(r => r.json())
       .then(payload => {
-        (payload.events || []).forEach(ev => appendEvent(ev, false));
+        const events = payload.events || [];
+        // Default kind-filter to user_message when any exist — most of the
+        // time the operator just wants to skim the user prompts. If there
+        // are none (e.g. a freshly-spawned subagent), no filter is applied.
+        if (events.some(ev => (ev.kind || '') === 'user_message')) {
+          eventKindFilter = 'user_message';
+        }
+        events.forEach(ev => appendEvent(ev, false));
+        applyEventFilter();
         // Now open live SSE.
         const es = new EventSource(`/api/agents/sessions/${encodeURIComponent(sessionId)}/stream?backfill=0`);
         transcriptES = es;
@@ -1074,7 +1189,7 @@
     }
     div.innerHTML = `
       <div><span class="kind" role="button" tabindex="0" title="Click to filter to this event type">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
-      ${payload ? `<div class="payload">${escapeHtml(truncated)}</div>` : ''}
+      ${payload ? `<div class="payload" data-full="${escapeHtml(payload)}" title="Click to expand">${escapeHtml(truncated)}</div>` : ''}
     `;
     // Hide the event up front if a filter is active and doesn't match.
     if (eventKindFilter && kind !== eventKindFilter) {
@@ -1083,7 +1198,10 @@
     // Click on the kind label → toggle filter on this kind.
     const kindEl = div.querySelector('.kind');
     if (kindEl && kind) {
-      kindEl.addEventListener('click', () => toggleKindFilter(kind));
+      kindEl.addEventListener('click', e => {
+        e.stopPropagation();
+        toggleKindFilter(kind);
+      });
       kindEl.addEventListener('keydown', e => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
@@ -1091,7 +1209,20 @@
         }
       });
     }
+    // Click anywhere else on the event → toggle expanded (full text + white).
+    div.addEventListener('click', e => {
+      if (e.target.closest('.kind')) return;  // kind label owns its click
+      toggleEventExpanded(div, payload, truncated);
+    });
     container.prepend(div);
+  }
+
+  function toggleEventExpanded(eventEl, fullText, truncatedText) {
+    const payloadEl = eventEl.querySelector('.payload');
+    const expanded = eventEl.classList.toggle('expanded');
+    if (payloadEl) {
+      payloadEl.textContent = expanded ? fullText : truncatedText;
+    }
   }
 
   function toggleKindFilter(kind) {
@@ -1139,9 +1270,73 @@
   }
 
   // --- Filters ---
-  [filterTerminalEl, filterRouteEl, filterStatusEl].forEach(el =>
+  filterTerminalEl.addEventListener('change', () => {
+    applyRecencyDefault();
+    renderGraph(allSessions, allEdges);
+  });
+  if (filterRecencyEl) {
+    filterRecencyEl.addEventListener('change', () => {
+      recencyManuallySet = true;
+      renderGraph(allSessions, allEdges);
+    });
+  }
+  [filterRouteEl, filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', () => renderGraph(allSessions, allEdges))
   );
+
+  // --- Side panel resize ---
+  // Drag handle on the left edge of aside.panel resizes the panel width.
+  // Persists in localStorage so the operator's chosen width survives reload.
+  // CSS var `--panel-width` drives the grid layout; updating it shifts the
+  // graph column automatically. vis-network is canvas-based and auto-redraws.
+  (function setupPanelResizer() {
+    if (!panelResizerEl || !panelOuterEl) return;
+    const STORAGE_KEY = 'lifeos.agents.panelWidth';
+    const MIN_WIDTH = 280;
+    const MAX_RATIO = 0.7;
+    const setWidth = (px) => {
+      const max = Math.floor(window.innerWidth * MAX_RATIO);
+      const clamped = Math.max(MIN_WIDTH, Math.min(max, Math.round(px)));
+      document.documentElement.style.setProperty('--panel-width', clamped + 'px');
+      return clamped;
+    };
+    // Restore last width if present.
+    try {
+      const saved = parseInt(localStorage.getItem(STORAGE_KEY) || '', 10);
+      if (saved && !isNaN(saved)) setWidth(saved);
+    } catch (_) {}
+
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+    panelResizerEl.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startWidth = panelOuterEl.getBoundingClientRect().width;
+      panelResizerEl.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      // Dragging left increases panel width (delta = startX - clientX).
+      const newWidth = setWidth(startWidth + (startX - e.clientX));
+      // Keep the graph viewport sensibly fit while resizing.
+      try { network.redraw(); } catch (_) {}
+      // Persist as we drag — release is just a cleanup.
+      try { localStorage.setItem(STORAGE_KEY, String(newWidth)); } catch (_) {}
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      panelResizerEl.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      try { network.fit({ animation: { duration: 250, easingFunction: 'easeOutQuad' } }); }
+      catch (_) {}
+    });
+  })();
 
   // --- Initial load + stream ---
   fetch('/api/agents/snapshot')
