@@ -320,6 +320,7 @@ Per-source guarantees:
 
 ## Related Documents
 
+- [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Read-only adapter pattern this spec implements
 - [Agent Viz — Product](../product/agent-viz.md) — Consumer view: filters, chips, status semantics, operator controls
 - [Agent Worker — Technical](agent-worker.md) — Sessions, transcripts, kill primitives, inter-agent coordination
 - [Agent Worker — Product](../product/agent-worker.md) — `#agent` task lifecycle, Telegram interactions
