@@ -521,8 +521,20 @@ async def resume_claude_code_session(
     if target is None or not target.decoded_cwd:
         raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
-    # Render the template — {session_id} is the only supported substitution.
-    rendered = template.replace("{session_id}", bare)
+    # Template substitutions:
+    #   {session_id}     — bare uuid (no cc: prefix)
+    #   {cwd}            — decoded project working directory
+    #   {session_id_url} — URL-encoded session_id for use inside `warp://`,
+    #                      `vscode://` etc. query strings
+    #   {cwd_url}        — URL-encoded cwd for the same
+    import urllib.parse
+    rendered = (
+        template
+        .replace("{session_id_url}", urllib.parse.quote(bare, safe=""))
+        .replace("{cwd_url}", urllib.parse.quote(target.decoded_cwd, safe=""))
+        .replace("{session_id}", bare)
+        .replace("{cwd}", target.decoded_cwd)
+    )
     try:
         argv = shlex.split(rendered)
     except ValueError as exc:
