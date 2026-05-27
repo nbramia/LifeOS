@@ -58,7 +58,7 @@
 
         .cards {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
+            grid-template-columns: repeat(3, 1fr);
             gap: 1.5rem;
         }
 
@@ -147,10 +147,16 @@
                 <div class="card-title">CRM</div>
                 <div class="card-description">Manage relationships and view your network</div>
             </a>
+
+            <a href="/agents" class="card">
+                <div class="card-icon">🛠️</div>
+                <div class="card-title">Agents</div>
+                <div class="card-description">See what your agents are working on right now</div>
+            </a>
         </div>
 
         <p class="keyboard-hint">
-            Press <kbd>1</kbd> for Chat or <kbd>2</kbd> for CRM
+            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, or <kbd>3</kbd> for Agents
         </p>
     </div>
 
@@ -158,6 +164,7 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === '1') window.location.href = '/chat';
             if (e.key === '2') window.location.href = '/crm';
+            if (e.key === '3') window.location.href = '/agents';
         });
     </script>
 </body>

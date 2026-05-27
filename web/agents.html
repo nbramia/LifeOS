@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agents · LifeOS</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-card: #1a1a24;
+    --bg-elev: #20202c;
+    --text-primary: #e8e8ed;
+    --text-secondary: #8888a0;
+    --text-dim: #5a5a6e;
+    --accent: #6366f1;
+    --border: #2a2a3a;
+    --running: #34d399;
+    --running-glow: rgba(52, 211, 153, 0.45);
+    --claimed: #60a5fa;
+    --yielded: #fbbf24;
+    --blocked: #fb923c;
+    --completed: #6b7280;
+    --failed: #f87171;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    height: 56px;
+  }
+  header h1 {
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  header h1 a {
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+  header h1 .crumb {
+    color: var(--text-dim);
+    font-weight: 400;
+    margin: 0 0.5rem;
+  }
+  .chips {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .chip {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .chip strong { color: var(--text-primary); font-weight: 600; margin-right: 0.25rem; }
+  .chip.running strong { color: var(--running); }
+  .chip.blocked strong { color: var(--blocked); }
+  .chip.spend strong { color: var(--accent); }
+  .filters {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+  }
+  .filters label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
+  .filters select {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+  }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    height: calc(100vh - 56px - 41px);
+  }
+  #graph {
+    background: var(--bg-primary);
+    position: relative;
+    overflow: hidden;
+  }
+  #graph .empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    gap: 0.5rem;
+    pointer-events: none;
+  }
+  #graph .empty-state .icon { font-size: 2.5rem; opacity: 0.5; }
+  #graph .empty-state .label { font-size: 0.95rem; }
+  #graph .empty-state .hint { font-size: 0.8rem; color: var(--text-dim); }
+  aside.panel {
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-header {
+    padding: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-header .label {
+    font-size: 0.95rem;
+    font-weight: 600;
+    word-break: break-word;
+  }
+  .panel-header .meta {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    margin-top: 0.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+  }
+  .panel-header .meta .badge {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+  }
+  .badge.status-running { color: var(--running); border-color: var(--running); }
+  .badge.status-claimed { color: var(--claimed); border-color: var(--claimed); }
+  .badge.status-yielded { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-blocked { color: var(--blocked); border-color: var(--blocked); }
+  .badge.status-completed { color: var(--completed); border-color: var(--completed); }
+  .badge.status-failed,
+  .badge.status-budget_exceeded { color: var(--failed); border-color: var(--failed); }
+  .panel-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    padding: 2rem;
+    text-align: center;
+    font-size: 0.85rem;
+  }
+  .events {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+  }
+  .event {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.6rem;
+    margin-bottom: 0.4rem;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .event.kind-tool_call { border-left: 2px solid var(--accent); }
+  .event.kind-failed,
+  .event.kind-managed_failed,
+  .event.kind-child_failed_internal,
+  .event.kind-killed,
+  .event.kind-cascade_killed { border-left: 2px solid var(--failed); }
+  .event.kind-spawn,
+  .event.kind-spawned_child { border-left: 2px solid var(--claimed); }
+  .event.kind-final { border-left: 2px solid var(--running); }
+  .event .kind {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+  }
+  .event .ts {
+    color: var(--text-dim);
+    font-size: 0.68rem;
+    margin-left: 0.5rem;
+  }
+  .event .payload {
+    color: var(--text-secondary);
+    margin-top: 0.2rem;
+    word-break: break-word;
+    white-space: pre-wrap;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    max-height: 8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .panel-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 1.25rem;
+    line-height: 1;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    float: right;
+  }
+  .panel-close:hover { background: var(--bg-card); color: var(--text-primary); }
+  .live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--running);
+    box-shadow: 0 0 6px var(--running-glow);
+    margin-right: 0.4rem;
+    animation: pulse 1.4s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+  @media (max-width: 800px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-rows: 1fr auto;
+    }
+    aside.panel {
+      max-height: 50vh;
+      border-left: none;
+      border-top: 1px solid var(--border);
+    }
+    .chips { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">LifeOS</a><span class="crumb">›</span>Agents</h1>
+  <div class="chips" id="chips">
+    <span class="chip running">running <strong id="chip-running">0</strong></span>
+    <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
+    <span class="chip">recent <strong id="chip-recent">0</strong></span>
+    <span class="chip spend">spend <strong id="chip-spend">$0.00</strong></span>
+  </div>
+</header>
+<div class="filters">
+  <label><input type="checkbox" id="filter-terminal" /> show terminal</label>
+  <label>route
+    <select id="filter-route">
+      <option value="all">all</option>
+      <option value="local">local</option>
+      <option value="claude">claude</option>
+    </select>
+  </label>
+  <label>status
+    <select id="filter-status">
+      <option value="all">all</option>
+      <option value="running">running</option>
+      <option value="claimed">claimed</option>
+      <option value="yielded">yielded</option>
+      <option value="blocked">blocked</option>
+      <option value="completed">completed</option>
+      <option value="failed">failed</option>
+    </select>
+  </label>
+  <span style="margin-left:auto;color:var(--text-dim);font-size:0.75rem" id="connection-state">connecting…</span>
+</div>
+<main>
+  <section id="graph">
+    <div class="empty-state" id="empty-state">
+      <div class="icon">🛠️</div>
+      <div class="label">No agent sessions yet</div>
+      <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
+    </div>
+  </section>
+  <aside class="panel" id="panel">
+    <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+  </aside>
+</main>
+
+<script>
+(() => {
+  const STATUS_COLORS = {
+    running:   '#34d399',
+    claimed:   '#60a5fa',
+    yielded:   '#fbbf24',
+    blocked:   '#fb923c',
+    completed: '#6b7280',
+    failed:    '#f87171',
+    budget_exceeded: '#f87171',
+  };
+  const TERMINAL = new Set(['completed', 'failed', 'budget_exceeded']);
+
+  const filterTerminalEl = document.getElementById('filter-terminal');
+  const filterRouteEl = document.getElementById('filter-route');
+  const filterStatusEl = document.getElementById('filter-status');
+  const connStateEl = document.getElementById('connection-state');
+  const emptyStateEl = document.getElementById('empty-state');
+  const panelEl = document.getElementById('panel');
+
+  let allSessions = [];
+  let allEdges = [];
+  let selectedSessionId = null;
+  let transcriptES = null;
+
+  const graphEl = document.getElementById('graph');
+  const nodes = new vis.DataSet([]);
+  const edges = new vis.DataSet([]);
+  const network = new vis.Network(graphEl, { nodes, edges }, {
+    physics: {
+      enabled: true,
+      stabilization: { iterations: 80 },
+      barnesHut: { gravitationalConstant: -2200, springLength: 110 },
+    },
+    interaction: { hover: true, tooltipDelay: 200 },
+    edges: { arrows: 'to', color: { color: '#3a3a4a', highlight: '#6366f1' }, smooth: { type: 'cubicBezier' } },
+    nodes: {
+      shape: 'dot',
+      size: 18,
+      borderWidth: 2,
+      color: { background: '#1a1a24', border: '#2a2a3a' },
+      font: { color: '#e8e8ed', size: 12, face: 'system-ui' },
+    },
+  });
+
+  network.on('click', (params) => {
+    if (params.nodes && params.nodes.length > 0) {
+      openPanel(params.nodes[0]);
+    }
+  });
+
+  function applyFilters(sessions) {
+    const showTerm = filterTerminalEl.checked;
+    const route = filterRouteEl.value;
+    const status = filterStatusEl.value;
+    return sessions.filter(s => {
+      if (!showTerm && TERMINAL.has(s.status)) return false;
+      if (route !== 'all') {
+        const r = s.routing || 'local';
+        if (r !== route) return false;
+      }
+      if (status !== 'all' && s.status !== status) return false;
+      return true;
+    });
+  }
+
+  function routingLabel(routing) {
+    if (!routing || routing === 'local') return 'Local';
+    return 'Claude';
+  }
+
+  function nodeFor(s) {
+    const color = STATUS_COLORS[s.status] || '#6b7280';
+    const isRunning = s.status === 'running';
+    const isBlocked = s.status === 'blocked';
+    return {
+      id: s.session_id,
+      label: s.label || s.session_id.slice(0, 8),
+      title: [
+        s.label,
+        `status: ${s.status}`,
+        `routing: ${routingLabel(s.routing)}`,
+        `tokens: ${s.total_input_tokens} in / ${s.total_output_tokens} out`,
+        `cost: $${(s.total_dollars || 0).toFixed(4)}`,
+        `active: ${(s.total_active_seconds || 0).toFixed(1)}s`,
+        s.last_event_kind ? `last: ${s.last_event_kind}` : null,
+      ].filter(Boolean).join('\n'),
+      color: {
+        background: isRunning ? color : '#1a1a24',
+        border: color,
+        highlight: { background: color, border: color },
+      },
+      borderWidth: isBlocked ? 4 : 2,
+      shadow: isRunning ? { enabled: true, color: color, size: 16, x: 0, y: 0 } : false,
+      font: { color: '#e8e8ed' },
+    };
+  }
+
+  function renderGraph(sessions, snapshotEdges) {
+    const visible = applyFilters(sessions);
+    const visibleIds = new Set(visible.map(s => s.session_id));
+    const nextNodes = visible.map(nodeFor);
+    const nextEdges = snapshotEdges
+      .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
+      .map(e => ({ id: `${e.from}->${e.to}`, from: e.from, to: e.to }));
+    nodes.clear();
+    edges.clear();
+    nodes.add(nextNodes);
+    edges.add(nextEdges);
+
+    emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
+    updateChips(sessions);
+  }
+
+  function updateChips(sessions) {
+    const running = sessions.filter(s => s.status === 'running').length;
+    const blocked = sessions.filter(s => s.status === 'blocked').length;
+    const recent = sessions.filter(s => s.status === 'completed').length;
+    const spend = sessions.reduce((acc, s) => acc + (s.total_dollars || 0), 0);
+    document.getElementById('chip-running').textContent = running;
+    document.getElementById('chip-blocked').textContent = blocked;
+    document.getElementById('chip-recent').textContent = recent;
+    document.getElementById('chip-spend').textContent = '$' + spend.toFixed(2);
+  }
+
+  function applySnapshot(snap) {
+    allSessions = snap.sessions || [];
+    allEdges = snap.edges || [];
+    renderGraph(allSessions, allEdges);
+    // Re-render panel header if the selected session updated.
+    if (selectedSessionId) {
+      const s = allSessions.find(x => x.session_id === selectedSessionId);
+      if (s) renderPanelHeader(s);
+    }
+  }
+
+  // --- Side panel ---
+  function renderPanelHeader(s) {
+    const live = !TERMINAL.has(s.status);
+    panelEl.innerHTML = `
+      <div class="panel-header">
+        <button class="panel-close" aria-label="Close" id="panel-close">×</button>
+        <div class="label">${escapeHtml(s.label || s.session_id)}</div>
+        <div class="meta">
+          ${live ? '<span class="live-dot" title="live"></span>' : ''}
+          <span class="badge status-${s.status}">${s.status}</span>
+          <span class="badge">${routingLabel(s.routing)}</span>
+          <span class="badge">$${(s.total_dollars || 0).toFixed(4)}</span>
+          <span class="badge">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
+          ${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}
+        </div>
+      </div>
+      <div class="events" id="events"></div>
+    `;
+    document.getElementById('panel-close').onclick = closePanel;
+  }
+
+  function closePanel() {
+    selectedSessionId = null;
+    if (transcriptES) { transcriptES.close(); transcriptES = null; }
+    panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
+  }
+
+  function openPanel(sessionId) {
+    if (transcriptES) { transcriptES.close(); transcriptES = null; }
+    selectedSessionId = sessionId;
+    const s = allSessions.find(x => x.session_id === sessionId);
+    if (!s) return;
+    renderPanelHeader(s);
+
+    // Backfill then live tail.
+    fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
+      .then(r => r.json())
+      .then(payload => {
+        (payload.events || []).forEach(ev => appendEvent(ev, false));
+        // Now open live SSE.
+        const es = new EventSource(`/api/agents/sessions/${encodeURIComponent(sessionId)}/stream?backfill=0`);
+        transcriptES = es;
+        es.addEventListener('transcript_event', e => {
+          try { appendEvent(JSON.parse(e.data), true); } catch (_) {}
+        });
+        es.addEventListener('closed', () => { es.close(); });
+        es.onerror = () => {}; // browser auto-retries
+      })
+      .catch(err => {
+        const e = document.getElementById('events');
+        if (e) e.innerHTML = `<div class="event">Failed to load events: ${escapeHtml(String(err))}</div>`;
+      });
+  }
+
+  function appendEvent(ev, live) {
+    const container = document.getElementById('events');
+    if (!container) return;
+    const kind = String(ev.kind || '');
+    const ts = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : '';
+    const payload = ev.payload ? JSON.stringify(ev.payload, null, 0) : '';
+    const truncated = payload.length > 240 ? payload.slice(0, 240) + '…' : payload;
+    const div = document.createElement('div');
+    div.className = `event kind-${kind}`;
+    div.innerHTML = `
+      <div><span class="kind">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
+      ${payload ? `<div class="payload">${escapeHtml(truncated)}</div>` : ''}
+    `;
+    if (live) {
+      container.prepend(div);
+    } else {
+      container.appendChild(div);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // --- Filters ---
+  [filterTerminalEl, filterRouteEl, filterStatusEl].forEach(el =>
+    el.addEventListener('change', () => renderGraph(allSessions, allEdges))
+  );
+
+  // --- Initial load + stream ---
+  fetch('/api/agents/snapshot')
+    .then(r => r.json())
+    .then(applySnapshot)
+    .catch(err => { connStateEl.textContent = 'failed: ' + err; });
+
+  const snapshotES = new EventSource('/api/agents/stream');
+  snapshotES.onopen = () => { connStateEl.textContent = 'live'; };
+  snapshotES.onerror = () => { connStateEl.textContent = 'reconnecting…'; };
+  snapshotES.addEventListener('snapshot', e => {
+    try { applySnapshot(JSON.parse(e.data)); } catch (_) {}
+  });
+})();
+</script>
+</body>
+</html>
