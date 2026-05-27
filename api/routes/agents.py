@@ -182,21 +182,73 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
     }
 
 
+def _claude_code_enabled() -> bool:
+    try:
+        from config.settings import settings
+        return bool(getattr(settings, "claude_code_viz_enabled", True))
+    except Exception:  # noqa: BLE001 — degrade gracefully if settings fail to load
+        return False
+
+
+def _claude_code_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Discover + parse Claude Code sessions for the snapshot. Cached."""
+    if not _claude_code_enabled():
+        return [], []
+    try:
+        from config.settings import settings
+        from api.services.claude_code import session_ingest as cc
+
+        return cc.build_snapshot(
+            projects_dir=settings.claude_code_projects_dir,
+            lookback_days=int(getattr(settings, "claude_code_lookback_days", 7)),
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the LifeOS snapshot if cc ingest fails
+        logger.warning("claude_code snapshot failed: %s", exc)
+        return [], []
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
     sessions = session_store.list_sessions(limit=_SNAPSHOT_LIMIT)
     session_dicts = [_session_to_dict(s, transcript_store) for s in sessions]
+    # Tag LifeOS sessions with a source discriminator so the frontend can
+    # distinguish them from Claude Code sessions in the union below.
+    for sd in session_dicts:
+        sd.setdefault("source", "lifeos_agent")
+        sd.setdefault("model_label", _model_label_for_routing(sd.get("routing")))
     edges = [
         {"from": s.parent_session_id, "to": s.session_id, "type": "spawn"}
         for s in sessions
         if s.parent_session_id
     ]
+
+    cc_sessions, cc_edges = _claude_code_snapshot()
+    session_dicts.extend(cc_sessions)
+    edges.extend(cc_edges)
+
     return {
         "sessions": session_dicts,
         "edges": edges,
         "generated_at": int(time.time()),
     }
+
+
+def _model_label_for_routing(routing: str | None) -> str:
+    if (routing or "local") == "local":
+        return "Local"
+    try:
+        from config.settings import settings
+        m = (settings.agent_managed_model or "").lower()
+    except Exception:  # noqa: BLE001
+        m = ""
+    if "haiku" in m:
+        return "Haiku"
+    if "sonnet" in m:
+        return "Sonnet"
+    if "opus" in m:
+        return "Opus"
+    return "Claude"
 
 
 @router.get("/snapshot")
@@ -210,7 +262,25 @@ async def get_session_events(
     session_id: str,
     limit: int = Query(200, ge=1, le=2000),
 ) -> dict[str, Any]:
-    """Recent transcript events for one session (paginated tail)."""
+    """Recent transcript events for one session (paginated tail).
+
+    Dispatches by `cc:` prefix — Claude Code session ids are served by the
+    `claude_code` ingest service, everything else by the LifeOS transcript
+    store.
+    """
+    if session_id.startswith("cc:"):
+        if not _claude_code_enabled():
+            raise HTTPException(status_code=404, detail="claude_code viz disabled")
+        try:
+            from config.settings import settings
+            from api.services.claude_code import session_ingest as cc
+
+            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        tail = events[-limit:] if len(events) > limit else events
+        return {"session_id": session_id, "events": tail, "total": len(events)}
+
     transcript_store = _get_transcript_store()
     try:
         events = transcript_store.read(session_id)
@@ -365,6 +435,53 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                 pass
 
 
+async def _stream_claude_code_session(session_id: str, backfill: int):
+    """Per-session SSE generator for Claude Code (cc:-prefixed) sessions."""
+    from config.settings import settings
+    from api.services.claude_code import session_ingest as cc
+
+    yield ": ok\n\n"
+    try:
+        events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+    except Exception as exc:  # noqa: BLE001
+        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+        return
+    tail = events[-backfill:] if backfill and len(events) > backfill else events
+    for ev in tail:
+        yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
+
+    line_count = len(events)
+    # Track new-events time and heartbeat time separately so the
+    # idle-close check actually fires (heartbeats don't postpone close).
+    now0 = time.time()
+    last_new_event_at = now0
+    last_heartbeat_at = now0
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        except Exception:
+            events = []
+        if len(events) > line_count:
+            for ev in events[line_count:]:
+                yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
+            line_count = len(events)
+            last_new_event_at = time.time()
+            last_heartbeat_at = last_new_event_at
+        elif time.time() - last_heartbeat_at >= 15.0:
+            yield ": heartbeat\n\n"
+            last_heartbeat_at = time.time()
+        # Claude Code has no DB status — close after 5 minutes of no new
+        # transcript events so we don't hold connections forever. Heartbeats
+        # do NOT postpone this — only real new events do.
+        if time.time() - last_new_event_at > 300.0:
+            yield (
+                "event: closed\n"
+                f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"
+            )
+            return
+
+
 @router.get("/sessions/{session_id}/stream")
 async def stream_session_transcript(
     session_id: str,
@@ -373,7 +490,22 @@ async def stream_session_transcript(
     """Per-session SSE: backfill last N events, then live-tail the JSONL file.
 
     Closes cleanly when the session reaches a terminal status.
+    Dispatches by `cc:` prefix to the Claude Code ingest path.
     """
+    if session_id.startswith("cc:"):
+        if not _claude_code_enabled():
+            raise HTTPException(status_code=404, detail="claude_code viz disabled")
+        try:
+            from api.services.claude_code.session_ingest import validate_session_id
+            validate_session_id(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return StreamingResponse(
+            _stream_claude_code_session(session_id, backfill),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
     transcript_store = _get_transcript_store()
     session_store = _get_session_store()
 

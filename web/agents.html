@@ -370,6 +370,7 @@
     <span class="chip running">running <strong id="chip-running">0</strong></span>
     <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
+    <span class="chip" title="Claude Code terminal sessions visible">cc <strong id="chip-cc">0</strong></span>
     <span class="chip spend">spend <strong id="chip-spend">$0.00</strong></span>
   </div>
 </header>
@@ -380,6 +381,7 @@
       <option value="all">all</option>
       <option value="local">local</option>
       <option value="claude">claude</option>
+      <option value="claude_code">claude code</option>
     </select>
   </label>
   <label>status
@@ -476,6 +478,7 @@
 
   function routingLabel(routing) {
     if (!routing || routing === 'local') return 'Local';
+    if (routing === 'claude_code') return 'Claude Code';
     return 'Claude';
   }
 
@@ -483,12 +486,15 @@
     const color = STATUS_COLORS[s.status] || '#6b7280';
     const isRunning = s.status === 'running';
     const isBlocked = s.status === 'blocked';
+    const isInferred = !!s.status_inferred;
+    const baseLabel = s.model_label || s.label || s.session_id.slice(0, 8);
     return {
       id: s.session_id,
-      label: s.label || s.session_id.slice(0, 8),
+      label: baseLabel,
       title: [
         s.label,
-        `status: ${s.status}`,
+        s.decoded_cwd ? `cwd: ${s.decoded_cwd}` : null,
+        `status: ${s.status}${isInferred ? ' (inferred)' : ''}`,
         `routing: ${routingLabel(s.routing)}`,
         `tokens: ${s.total_input_tokens} in / ${s.total_output_tokens} out`,
         `cost: $${(s.total_dollars || 0).toFixed(4)}`,
@@ -501,6 +507,8 @@
         highlight: { background: color, border: color },
       },
       borderWidth: isBlocked ? 4 : 2,
+      borderWidthSelected: isBlocked ? 4 : 3,
+      shapeProperties: isInferred ? { borderDashes: [4, 3] } : { borderDashes: false },
       shadow: isRunning ? { enabled: true, color: color, size: 16, x: 0, y: 0 } : false,
       font: { color: '#e8e8ed' },
     };
@@ -526,10 +534,12 @@
     const running = sessions.filter(s => s.status === 'running').length;
     const blocked = sessions.filter(s => s.status === 'blocked').length;
     const recent = sessions.filter(s => s.status === 'completed').length;
+    const cc = sessions.filter(s => s.source === 'claude_code').length;
     const spend = sessions.reduce((acc, s) => acc + (s.total_dollars || 0), 0);
     document.getElementById('chip-running').textContent = running;
     document.getElementById('chip-blocked').textContent = blocked;
     document.getElementById('chip-recent').textContent = recent;
+    document.getElementById('chip-cc').textContent = cc;
     document.getElementById('chip-spend').textContent = '$' + spend.toFixed(2);
   }
 
@@ -548,15 +558,22 @@
   function renderPanelHeader(s) {
     const live = !TERMINAL.has(s.status);
     const safeStatus = escapeAttr(s.status);
-    const showKill = live;
+    const isClaudeCode = (s.source === 'claude_code');
+    // No kill button for Claude Code sessions — we don't have a safe primitive
+    // to terminate them from outside the terminal.
+    const showKill = live && !isClaudeCode;
+    const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
+    const inferredHint = s.status_inferred ? ' (inferred)' : '';
     panelEl.innerHTML = `
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
         <div class="label">${escapeHtml(s.label || s.session_id)}</div>
+        ${s.decoded_cwd ? `<div class="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${escapeHtml(s.decoded_cwd)}</div>` : ''}
         <div class="meta">
           ${live ? '<span class="live-dot" title="live"></span>' : ''}
-          <span class="badge status-${safeStatus}">${escapeHtml(s.status)}</span>
+          <span class="badge status-${safeStatus}">${escapeHtml(s.status + inferredHint)}</span>
+          <span class="badge">${escapeHtml(sourceLabel)}</span>
           <span class="badge">${escapeHtml(routingLabel(s.routing))}</span>
           <span class="badge">$${(s.total_dollars || 0).toFixed(4)}</span>
           <span class="badge">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
