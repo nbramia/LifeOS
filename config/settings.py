@@ -176,6 +176,30 @@ class Settings(BaseSettings):
                     "Set to 0 to disable confirmation (auto-dispatch all "
                     "managed tasks regardless of estimate)."
     )
+    claude_code_viz_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_CLAUDE_CODE_VIZ_ENABLED",
+        description="When true, the /agents page also surfaces local Claude "
+                    "Code CLI sessions discovered under "
+                    "$LIFEOS_CLAUDE_CODE_PROJECTS_DIR (default ~/.claude/projects). "
+                    "Read-only. Set false to scope the viz to LifeOS agent "
+                    "worker sessions only."
+    )
+    claude_code_projects_dir: str = Field(
+        default="~/.claude/projects",
+        alias="LIFEOS_CLAUDE_CODE_PROJECTS_DIR",
+        description="Filesystem root containing per-cwd Claude Code transcript "
+                    "directories. Each child dir is one working directory "
+                    "(slashes replaced by hyphens) and holds *.jsonl files, "
+                    "one per CLI session."
+    )
+    claude_code_lookback_days: int = Field(
+        default=7,
+        alias="LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS",
+        description="Only ingest Claude Code session jsonl files modified "
+                    "within this many days. Keeps the snapshot lean — older "
+                    "transcripts can still be opened on demand by direct id."
+    )
     agent_vault_id: str = Field(
         default="",
         alias="LIFEOS_AGENT_VAULT_ID",
