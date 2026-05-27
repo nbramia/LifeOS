@@ -5,9 +5,12 @@ import os
 import pytest
 from unittest.mock import patch
 
+from config.settings import settings
+
 pytestmark = pytest.mark.unit
 
 HOME = os.path.expanduser("~")
+VAULT_DIR = str(settings.vault_path)
 
 
 class TestResolveWorkingDirectory:
@@ -20,20 +23,20 @@ class TestResolveWorkingDirectory:
         return mod.resolve_working_directory(task)
 
     def test_vault_keywords(self):
-        assert self._resolve("edit my journal entry") == os.path.join(HOME, "Notes 2025")
-        assert self._resolve("add to the backlog") == os.path.join(HOME, "Notes 2025")
-        assert self._resolve("update my meeting notes") == os.path.join(HOME, "Notes 2025")
-        assert self._resolve("create a daily note") == os.path.join(HOME, "Notes 2025")
-        assert self._resolve("open the vault") == os.path.join(HOME, "Notes 2025")
-        assert self._resolve("find obsidian files") == os.path.join(HOME, "Notes 2025")
+        assert self._resolve("edit my journal entry") == VAULT_DIR
+        assert self._resolve("add to the backlog") == VAULT_DIR
+        assert self._resolve("update my meeting notes") == VAULT_DIR
+        assert self._resolve("create a daily note") == VAULT_DIR
+        assert self._resolve("open the vault") == VAULT_DIR
+        assert self._resolve("find obsidian files") == VAULT_DIR
 
     def test_vault_word_boundary(self):
         """'note' should not match 'notification' or 'denoted'."""
         result = self._resolve("send a notification to the team")
-        assert result != os.path.join(HOME, "Notes 2025")
+        assert result != VAULT_DIR
 
         result = self._resolve("this denoted something")
-        assert result != os.path.join(HOME, "Notes 2025")
+        assert result != VAULT_DIR
 
     def test_lifeos_keywords(self):
         assert self._resolve("fix the lifeos server") == os.path.join(HOME, "Code", "LifeOS")
@@ -63,7 +66,7 @@ class TestResolveWorkingDirectory:
         """Vault keywords should take priority over LifeOS keywords."""
         # "sync" is LifeOS, but "notes" is vault — vault should win since checked first
         result = self._resolve("sync my notes")
-        assert result == os.path.join(HOME, "Notes 2025")
+        assert result == VAULT_DIR
 
     @patch("api.services.directory_resolver.Path")
     def test_project_name_match(self, mock_path_cls):

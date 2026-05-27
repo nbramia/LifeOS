@@ -58,8 +58,14 @@ class TestCrmMappings:
         assert isinstance(mappings, dict)
 
     def test_has_domain_mappings(self):
-        """CRM mappings should have domain_mappings section."""
+        """CRM mappings should have domain_mappings section when configured."""
+        from pathlib import Path
+
         from config.crm_config import get_mappings
+
+        if not (Path("config") / "crm_mappings.yaml").exists():
+            pytest.skip("crm_mappings.yaml not configured (expected for open-source)")
+
         mappings = get_mappings()
         assert "domain_mappings" in mappings
 
