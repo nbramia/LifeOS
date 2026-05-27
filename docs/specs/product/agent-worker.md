@@ -179,6 +179,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 - [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Why local + cloud, how routing is decided, cost model
 - [Agent Worker — Technical](../technical/agent-worker.md) — Architecture, executors, prompts, state machine, restart resumability
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup (Gemma swap, MCP HTTP transport, Vault provisioning, agent preset)
+- [Claude Code Orchestration (product)](claude-code-orchestration.md) — The other autonomous-work system in LifeOS; triggered from Telegram `/code` rather than `#agent` tags
 - [Agent Viz](agent-viz.md) — Live `/agents` page showing in-flight and recently-finished worker sessions
 - [Task Management](task-management.md) — How `#agent` tasks live alongside regular tasks in the Obsidian Tasks plugin
 - [MCP Tools](mcp-tools.md) — The `lifeos_agent_*` family for inter-agent coordination
