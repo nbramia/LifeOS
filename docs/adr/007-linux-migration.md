@@ -1,9 +1,10 @@
 # ADR-007: Linux Migration and Local LLM Orchestration
 
 **Status:** Complete
-**Last Updated:** 2026-03-04
+**Last Updated:** 2026-05-27
 **Decision:** Accepted
 **Supersedes:** [ADR-005](005-external-venv-macos-tcc.md) — TCC rationale no longer applies; external venv practice retained by convention.
+**Amended by:** [ADR-009](009-llm-backend-toggle.md) — The local-first orchestrator default became an operator-configurable toggle.
 
 ## Context
 
