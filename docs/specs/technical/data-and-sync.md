@@ -515,3 +515,4 @@ The scraping system uses Claude in Chrome MCP for browser automation. It require
 - [Search & Indexing](search-indexing.md) -- Hybrid search pipeline
 - [ADR-002: ChromaDB](../../adr/002-chromadb-vector-store.md) -- Why ChromaDB was chosen
 - [ADR-003: Two-Tier Data Model](../../adr/003-two-tier-data-model.md) -- Why SourceEntity and PersonEntity are separate
+- [ADR-012: Embedding Pipeline](../../adr/012-embedding-pipeline.md) -- Embedding model, GPU/CPU fallback, pre-flight RAM gate around phase 4

@@ -82,3 +82,4 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 - [Data & Sync](data-and-sync.md) -- Data ingestion and vector store indexing
 - [Architecture](architecture.md) -- System architecture and code structure
 - [ADR-004: Hybrid Search](../../adr/004-hybrid-search.md) -- Why both vector and keyword search
+- [ADR-012: Embedding Pipeline](../../adr/012-embedding-pipeline.md) -- Encoder model choice, GPU/CPU fallback, OOM protection
