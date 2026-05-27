@@ -1066,9 +1066,12 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     vault = tmp_path / "MyVault"
     monkeypatch.setattr(_settings, "vault_path", vault, raising=False)
 
+    # Tag is "local" — not "cloud" — so the deterministic tag precedence
+    # (#139 §2) routes this task to the local executor. The test exercises
+    # the over-cap spillover via _StubExecutor on the local path.
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Big report on Julia",
-         "status": "todo", "tags": ["agent", "cloud"]},
+         "status": "todo", "tags": ["agent", "local"]},
     ])
     long_text = (
         "Julia Barnes is the CEO of The Movement Cooperative.\n\n"
@@ -1077,12 +1080,6 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text=long_text,
     ))
-    w = _make_worker(tmp_path, api,
-                     preflight_caller=_golden_preflight(routing="claude"),
-                     local_executor=executor)  # used for unrelated paths
-    # Force the local path so we can drive the completion through _StubExecutor.
-    # Use routing="local" on the preflight so the worker takes the local branch
-    # while still exercising the cap logic.
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="local"),
                      local_executor=executor)
