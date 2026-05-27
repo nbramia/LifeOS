@@ -349,6 +349,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
+- [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here
 - [Task Management](../product/task-management.md) — How `#agent` tasks sit alongside regular tasks
 - [MCP Tools](../product/mcp-tools.md) — Standard MCP catalog including `lifeos_agent_*` family
 - [API Reference](../product/api-reference.md) — Task endpoints the worker uses (`/api/tasks/{id}/swap-tag`, `/api/tasks/{id}/complete`)
