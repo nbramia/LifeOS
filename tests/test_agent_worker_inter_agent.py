@@ -259,6 +259,68 @@ def test_yield_until_rejects_empty_list(ctx):
     assert result["error"] == "invalid_arg"
 
 
+@pytest.mark.unit
+def test_yield_until_kills_remote_session_for_cloud_caller(store, transcript):
+    """Live bug: a cloud parent calling yield_until kept burning Anthropic
+    tokens AFTER the yield because the tool only updated local state.
+    Now the handler must call driver.kill_session() so the remote session
+    stops generating immediately."""
+    cloud_parent = store.create(
+        task_id="cloud_p", status=STATUS_RUNNING, routing="claude",
+    )
+    store.set_managed_session_id("cloud_p", "sesn_remote_xyz")
+    cloud_parent = store.get("cloud_p")
+
+    child = store.create(
+        task_id="c", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=cloud_parent.session_id,
+        root_session_id=cloud_parent.session_id,
+        spawn_depth=1,
+    )
+
+    killed: list[tuple[str, str]] = []
+    class _FakeDriver:
+        def kill_session(self, session_id, reason=""):
+            killed.append((session_id, reason))
+
+    ctx = InterAgentContext(
+        store, transcript, cloud_parent.session_id, Caps(),
+        managed_driver=_FakeDriver(),
+    )
+    result = dispatch(ctx, "lifeos_agent_yield_until", {
+        "children": [child.session_id], "reason": "waiting on child",
+    })
+    assert result["ok"]
+    # The remote session got killed; local state still records the yield.
+    assert killed == [("sesn_remote_xyz", "yield_until")]
+    assert store.get("cloud_p").status == STATUS_YIELDED
+
+
+@pytest.mark.unit
+def test_yield_until_local_caller_does_not_kill_remote(store, transcript):
+    """Local sessions have no remote handle — yield_until should not
+    attempt to kill anything (and should not crash when managed_driver
+    is None, which is the local-executor's default context shape)."""
+    local_parent = store.create(
+        task_id="local_p", status=STATUS_RUNNING, routing="local",
+    )
+    child = store.create(
+        task_id="c", status=STATUS_RUNNING, routing="local",
+        parent_session_id=local_parent.session_id,
+        root_session_id=local_parent.session_id,
+        spawn_depth=1,
+    )
+    ctx = InterAgentContext(
+        store, transcript, local_parent.session_id, Caps(),
+        managed_driver=None,
+    )
+    result = dispatch(ctx, "lifeos_agent_yield_until", {
+        "children": [child.session_id],
+    })
+    assert result["ok"]
+    assert store.get("local_p").status == STATUS_YIELDED
+
+
 # ---------------------------------------------------------------------------
 # kill
 # ---------------------------------------------------------------------------

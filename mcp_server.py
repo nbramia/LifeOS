@@ -1028,6 +1028,23 @@ class LifeOSMCPServer:
         except Exception as e:
             return {"error": f"inter-agent stack unavailable: {e}"}
 
+        # Wire a ManagedAgentsDriver into the context so `yield_until`
+        # from a cloud caller can kill the remote session immediately
+        # (otherwise Anthropic's session keeps generating post-yield).
+        # Best-effort: if credentials aren't set, leave the driver None
+        # and the handler logs a warning rather than failing.
+        managed_driver = None
+        try:
+            if _settings.anthropic_api_key:
+                from api.services.agent_worker.managed_driver import (
+                    ManagedAgentsDriver,
+                )
+                managed_driver = ManagedAgentsDriver(
+                    api_key=_settings.anthropic_api_key,
+                )
+        except Exception as exc:
+            logger.warning("inter-agent: managed_driver init failed: %s", exc)
+
         ctx = InterAgentContext(
             session_store=SessionStore(),
             transcript_store=TranscriptStore(),
@@ -1038,6 +1055,7 @@ class LifeOSMCPServer:
                 max_concurrent_local=_settings.agent_max_concurrent_local,
                 max_concurrent_managed=_settings.agent_max_concurrent_managed,
             ),
+            managed_driver=managed_driver,
         )
         return inter_dispatch(ctx, tool_name, arguments)
 

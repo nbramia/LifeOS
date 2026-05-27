@@ -42,6 +42,7 @@ from api.services.agent_worker.session_store import (
     Session,
     SessionStore,
 )
+from api.services.agent_worker.managed_executor import _sanitize_title as _managed_sanitize_title
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.interaction_store import build_obsidian_link
@@ -67,6 +68,37 @@ def _worker_label(routing: str | None) -> str:
     if routing == ROUTE_CLAUDE:
         return "Cloud agent worker"
     return "Agent worker"
+
+
+def _is_readable_tool_result(text: str) -> bool:
+    """Heuristic: is this tool result useful to dump inline as the
+    operator-facing completion body? Skip raw JSON dumps (list_threads,
+    gmail_search payloads) and oversized text — those become unreadable
+    walls of `{"threads":[…]}` in Telegram. Prefer text-shaped results
+    that the agent itself would have written (e.g. a drafted email,
+    a short calendar summary)."""
+    if not text:
+        return False
+    head = text.lstrip()[:5]
+    if head.startswith(("{", "[")):
+        return False  # JSON-shaped — agent should have summarized
+    if len(text) > 1500:
+        return False  # too big to inline; tool-call summary is friendlier
+    return True
+
+
+def _iter_transcript(path):
+    """Yield decoded JSON events from a session transcript, skipping
+    malformed lines. Used by recovery helpers to scan without raising."""
+    import json as _json
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                yield _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
 
 
 AGENT_TAG = "agent"
@@ -305,30 +337,24 @@ class Worker:
                 "id": session.task_id, "description": session.task_id,
             }
 
-            # Managed yield-resume isn't supported yet — short-circuit with a
-            # clear failure rather than scrambling the local message history
-            # for nothing.
-            if session.routing != "local":
+            # Build the resume turn — same shape for local and cloud, but
+            # cloud also pulls each child's final_text (from the managed_cursor
+            # cache populated during the children's runs) since the cloud
+            # parent's fresh session won't have access to the children's
+            # transcripts on its own.
+            resume_message = self._build_resume_message(session, task, child_sessions)
+
+            if session.routing == ROUTE_CLAUDE:
+                ok = self._resume_cloud_parent(session, task, child_sessions, resume_message)
+                if not ok:
+                    # _resume_cloud_parent already marked failed + logged.
+                    continue
+                self.session_store.set_yield_waiting_for(session.task_id, None)
                 self.transcript_store.append(
-                    session.session_id, "managed_yield_resume_unsupported", {},
-                )
-                self._mark_failed(
-                    session, task,
-                    "managed yield-and-resume not yet supported (children "
-                    "finished but parent cannot resume)",
+                    session.session_id, "resume_after_children_cloud",
+                    {"children": children},
                 )
                 continue
-
-            # Build the resume turn, then commit state updates only after we
-            # know the executor returned cleanly. This keeps the session
-            # restartable if the executor crashes mid-resume.
-            summary_lines = ["Children completed:"]
-            for c in child_sessions:
-                tokens = (c.total_input_tokens or 0) + (c.total_output_tokens or 0)
-                summary_lines.append(
-                    f"- {c.session_id} [{c.status}] — {tokens} tokens, ${c.total_dollars:.2f}"
-                )
-            resume_message = "\n".join(summary_lines)
 
             executor = self._get_local_executor(caller_session_id=session.session_id)
             try:
@@ -1276,24 +1302,168 @@ class Worker:
                                 )
                                 tool_results.append((tool_name, text))
 
-            if tool_results:
-                # Most recent result wins.
-                _, text = tool_results[-1]
-                cap = _INLINE_SUMMARY_MAX_CHARS - 200
-                if len(text) > cap:
-                    text = text[:cap].rsplit(" ", 1)[0] + "…"
-                return text
+            # Prefer the last result whose body is human-readable. A raw
+            # JSON dump from list_threads / gmail_search is worse than
+            # useless inline — operators got a 30KB threads payload as
+            # their "completion message" when the agent idled after one
+            # of those calls. Surface a tool-call summary instead.
+            for tool_name, text in reversed(tool_results):
+                if _is_readable_tool_result(text):
+                    cap = _INLINE_SUMMARY_MAX_CHARS - 200
+                    if len(text) > cap:
+                        text = text[:cap].rsplit(" ", 1)[0] + "…"
+                    return text
 
-            if tool_calls:
-                # Local executor doesn't capture body in transcript; at
-                # least name the work that happened so the operator
-                # knows it wasn't a no-op.
-                last = tool_calls[-1]
-                return f"(last tool called: `{last}` — see transcript for arguments)"
+            # All recent tool results were JSON / oversized. Fall through
+            # to a compact tool-call list so the operator at least knows
+            # what the agent did, with a transcript pointer for full audit.
+            managed_tool_names: list[str] = []
+            for d in _iter_transcript(self.transcript_store.dir / f"{session_id}.jsonl"):
+                kind = d.get("kind", "")
+                payload = d.get("payload", {}) or {}
+                if kind in ("managed_event_agent.mcp_tool_use",
+                            "managed_event_agent.tool_use"):
+                    managed_tool_names.append(
+                        str(payload.get("name") or payload.get("mcp_server_name") or "tool")
+                    )
+            names = managed_tool_names or tool_calls
+            if names:
+                # De-duplicate adjacent repeats but keep order.
+                summary = []
+                for n in names:
+                    if not summary or summary[-1] != n:
+                        summary.append(n)
+                joined = ", ".join(summary[-8:])
+                return (
+                    f"(agent did work but ended without a text reply. "
+                    f"Tools called: {joined}. See transcript for detail.)"
+                )
         except Exception as exc:
             logger.warning("recover_result_from_transcript failed for %s: %s",
                           session_id, exc)
         return ""
+
+    def _build_resume_message(
+        self,
+        session: Session,
+        task: dict[str, Any],
+        child_sessions: list[Session],
+    ) -> str:
+        """Compose the user turn injected when a parent resumes after its
+        yield_until children terminate. The local executor sees this as
+        the next user message in conversation history (which still
+        carries the parent's prior turns). The cloud parent gets a fresh
+        Anthropic session and only sees this message — so it must carry
+        the original task description plus each child's output.
+        """
+        parts: list[str] = []
+        original = (task.get("description") or "").strip()
+        if session.routing == ROUTE_CLAUDE and original:
+            # Cloud resume: fresh session — restate the original task so
+            # the agent has the goal. Local already has it in history.
+            parts.append(f"Resuming after spawned children finished.\n\nOriginal task: {original}")
+        else:
+            parts.append("Spawned children completed — incorporate their outputs.")
+        parts.append("")
+        parts.append("Children:")
+        for c in child_sessions:
+            tokens = (c.total_input_tokens or 0) + (c.total_output_tokens or 0)
+            header = f"- [{c.status}] {c.session_id} — {tokens} tokens, ${c.total_dollars:.4f}"
+            parts.append(header)
+            body = self._child_final_text(c)
+            if body:
+                # Cap each child body so the combined message stays
+                # well under any per-message limits.
+                if len(body) > 6000:
+                    body = body[:6000].rsplit(" ", 1)[0] + "…"
+                parts.append("  output:")
+                for line in body.splitlines():
+                    parts.append(f"  {line}")
+        return "\n".join(parts)
+
+    def _child_final_text(self, child: Session) -> str:
+        """Pull the child's final_text from the cache (cloud) or transcript
+        (local). Returns empty string if the child produced no final text."""
+        # Cloud children persist final_text via managed_cursor.final_text.
+        try:
+            cached = self.session_store.get_managed_final_text(child.task_id)
+        except Exception:
+            cached = None
+        if cached:
+            return cached
+        # Fallback: scan the transcript for a `completed` or `managed_completed`
+        # event with non-empty `final_text`.
+        path = self.transcript_store.dir / f"{child.session_id}.jsonl"
+        last_text = ""
+        for d in _iter_transcript(path):
+            kind = d.get("kind", "")
+            payload = d.get("payload", {}) or {}
+            if kind in ("completed", "managed_completed"):
+                ft = payload.get("final_text") or ""
+                if ft:
+                    last_text = ft
+        return last_text
+
+    def _resume_cloud_parent(
+        self,
+        session: Session,
+        task: dict[str, Any],
+        child_sessions: list[Session],
+        resume_message: str,
+    ) -> bool:
+        """Create a fresh Anthropic session for a yielded cloud parent.
+
+        The old session was killed when `yield_until` fired (see
+        inter_agent.yield_until). The new session inherits the same
+        agent_preset / environment / vault but starts with a clean
+        message history; we hand it the original task + children's
+        outputs as the initial user turn so it can aggregate.
+        Returns True on success, False after marking the session
+        failed (so the caller can `continue`).
+        """
+        managed = self._get_managed_executor()
+        if managed is None or managed.driver is None:
+            self._mark_failed(
+                session, task,
+                "cloud yield-resume requires Managed Agents configured",
+            )
+            return False
+        # Reset cursor + drop the old remote id so the new session starts
+        # fresh on Anthropic's side.
+        self.session_store.reset_managed_cursor(session.task_id)
+        try:
+            new_remote_id = managed.driver.create_session(
+                agent_id=managed.agent_id,
+                environment_id=managed.environment_id,
+                vault_ids=managed.vault_ids,
+                initial_message=resume_message,
+                metadata={
+                    "lifeos_session_id": session.session_id,
+                    "task_id": session.task_id,
+                    "resume_after_children": True,
+                },
+                title=_managed_sanitize_title(task.get("description") or ""),
+            )
+        except Exception as exc:
+            logger.error(
+                "cloud yield-resume create_session failed for %s: %s",
+                session.task_id, type(exc).__name__,
+            )
+            self.transcript_store.append(
+                session.session_id, "managed_resume_create_failed",
+                {"error_type": type(exc).__name__},
+            )
+            self._mark_failed(
+                session, task, f"cloud yield-resume create_session failed: {type(exc).__name__}",
+            )
+            return False
+        self.session_store.set_managed_session_id(session.task_id, new_remote_id)
+        self.session_store.update_status(session.task_id, STATUS_RUNNING)
+        self.transcript_store.append(session.session_id, "managed_resume_created", {
+            "remote_id": new_remote_id,
+            "child_count": len(child_sessions),
+        })
+        return True
 
     def _spill_to_vault(
         self, session: Session, task: dict[str, Any], final_text: str,

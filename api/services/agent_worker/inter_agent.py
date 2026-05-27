@@ -395,6 +395,47 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
     ctx.transcript_store.append(caller.session_id, "yield", {
         "children": children, "reason": args.get("reason", ""),
     })
+
+    # For cloud callers: kill the remote Anthropic session NOW. Without
+    # this the cloud agent keeps running on Anthropic's side after the
+    # tool returns — the tool result `{"yielded":true}` doesn't break
+    # the server's generation loop, so the agent will do "extra"
+    # post-yield work (which is what caused the 30KB threads-JSON dump
+    # to become a user-facing completion message in the multi-agent
+    # test of 2026-05-27). When children finish, the worker creates a
+    # *fresh* managed session for the resume — see
+    # `_resume_yielded_for_children` in worker.py.
+    if caller.routing == "claude" and caller.managed_agent_session_id:
+        if ctx.managed_driver is not None:
+            try:
+                ctx.managed_driver.kill_session(
+                    caller.managed_agent_session_id,
+                    reason="yield_until",
+                )
+                ctx.transcript_store.append(
+                    caller.session_id, "yield_killed_remote",
+                    {"remote_id": caller.managed_agent_session_id},
+                )
+            except Exception as exc:
+                # Non-fatal: the cloud agent may have already exited the
+                # turn naturally. Log and continue — the worker's resume
+                # path doesn't depend on the kill succeeding.
+                logger.warning(
+                    "yield_until kill_session failed for %s: %s",
+                    caller.managed_agent_session_id, exc,
+                )
+        else:
+            # Driver not wired into the context. Worker-side ticks will
+            # see this session as yielded; the next poll cycle of the
+            # remote session will eventually pick up the end_turn that
+            # Anthropic emits naturally — but until then the cloud agent
+            # may keep working post-yield.
+            logger.warning(
+                "yield_until: no managed_driver in context to kill remote "
+                "session %s — cloud agent may continue running post-yield",
+                caller.managed_agent_session_id,
+            )
+
     return _ok({"yielded": True, "waiting_on": children})
 
 

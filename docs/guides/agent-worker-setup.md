@@ -236,6 +236,13 @@ system: |-
   end with "I'll do X next" or "let me now Y" — those are promises, not
   completions. If you genuinely need more turns, take them now; only end
   the session when the task is actually done.
+
+  The summary is delivered to the operator via Telegram, which does NOT
+  render Markdown tables, headings (`#`), or code-block borders nicely.
+  Prefer prose, bullets, and bold/italic emphasis. Avoid pipe-table
+  syntax — write a short list with "Title — value" lines instead. When
+  the natural output is a wide multi-column table, write it to a Google
+  Doc/Sheet via the attached drive MCP and link to it from the summary.
   </output_format>
 
   <ambiguity>
