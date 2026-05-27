@@ -640,6 +640,45 @@ def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_resume_pending_does_not_telegram_for_spawned_children(tmp_path: Path):
+    """Live bug: after a worker restart, the startup-recovery path saw a
+    spawned child stuck in RUNNING, rolled it back, and pinged the
+    operator with the parent-internal child id. Per PR #132 invariant,
+    children's terminal state should never reach Telegram."""
+    from api.services.agent_worker.session_store import STATUS_RUNNING
+    api = FakeApi(tasks=[
+        {"id": "root_task", "description": "root", "status": "in_progress",
+         "tags": [RUNNING_TAG, "cloud"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=executor)
+    parent = w.session_store.create(
+        task_id="root_task", routing="claude", status=STATUS_RUNNING,
+        expected_output="text",
+    )
+    # Spawned child stuck in RUNNING — would-be subject of the recovery path.
+    w.session_store.create(
+        task_id="spawn_orphan", routing="claude", status=STATUS_RUNNING,
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    orphan = w.session_store.get("spawn_orphan")
+    n = w.resume_pending()
+    assert n == 2, "both sessions should be marked failed by recovery"
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    # Exactly one notification — for the root, not the spawned child.
+    assert len(sent) == 1, f"expected only the root's recovery notify; got {sent}"
+    # The child's session_id (which goes into the transcript path of the
+    # notify) must NOT appear — proves the spawned child stayed silent.
+    assert orphan.session_id not in sent[0]
+    # Notify is for a single session — the root's id should appear.
+    assert parent.session_id in sent[0]
+
+
+@pytest.mark.unit
 def test_spawned_child_failure_does_not_telegram_the_operator(tmp_path: Path):
     """Live bug: a spawned child session's `create_session` 4xx'd, and the
     worker fired a failure notification to operator Telegram with the

@@ -246,12 +246,20 @@ class Worker:
             if session.status == STATUS_BLOCKED:
                 continue
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            # Spawned children belong to a parent's lineage — they have no
+            # backing vault task (`spawn_xxx` task_id is synthetic), so
+            # tag/status updates are no-ops, and the operator-facing
+            # rollback notification should not fire (PR #132 invariant:
+            # children's terminal state stays parent-internal).
+            if session.parent_session_id:
+                recovered += 1
+                continue
             self._swap_tag(session.task_id, RUNNING_TAG, AGENT_TAG)
             # Rolling back to #agent — return the vault checkbox to "todo"
             # so the operator sees the task as un-started rather than stuck
             # in "in_progress".
             self._set_task_status(session.task_id, "todo")
-            self.session_store.update_status(session.task_id, STATUS_FAILED)
             self._notify(
                 f"⚠️ {_worker_label(session.routing)}: task left in {session.status!r} from a prior "
                 f"run could not be safely resumed — tag rolled back to "
