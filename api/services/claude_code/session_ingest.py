@@ -159,6 +159,21 @@ def _projects_dir(override: str | None = None) -> Path:
     return Path(os.path.expanduser(raw))
 
 
+def _resolve_projects_dir(projects_dir: str | Path | None) -> Path:
+    """Resolve a projects_dir value into a `Path` with `~` expanded.
+
+    Callers pass either an absolute `Path` (tests), a string that may
+    contain `~` (settings — `~/.claude/projects` is the default), or
+    `None` (fall back to env / default). Without this, the route handed
+    the literal `~/.claude/projects` string straight to `Path()`, which
+    does not expand `~` and silently returned zero sessions in
+    production.
+    """
+    if projects_dir is None:
+        return _projects_dir()
+    return Path(os.path.expanduser(str(projects_dir)))
+
+
 def discover_sessions(
     projects_dir: str | Path | None = None,
     lookback_days: int = 7,
@@ -175,7 +190,7 @@ def discover_sessions(
     Discovery is the expensive part of ingestion — callers should cache the
     result for ~30s rather than re-scanning every SSE tick.
     """
-    root = Path(projects_dir) if projects_dir else _projects_dir()
+    root = _resolve_projects_dir(projects_dir)
     if not root.exists() or not root.is_dir():
         return []
     cutoff = (now if now is not None else time.time()) - max(0, lookback_days) * 86_400
@@ -841,7 +856,7 @@ def read_normalized_events(
         bare = validate_session_id(bare)
     # Scan projects dir for the matching jsonl. Linear scan; for very large
     # projects directories consider an explicit map cache later.
-    root = Path(projects_dir) if projects_dir else _projects_dir()
+    root = _resolve_projects_dir(projects_dir)
     if not root.exists() or not root.is_dir():
         return []
     for proj in root.iterdir():
