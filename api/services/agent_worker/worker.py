@@ -977,7 +977,11 @@ class Worker:
             agent_id=agent_id,
             environment_id=environment_id,
             vault_ids=vault_ids,
-            model=settings.agent_managed_model,
+            # Dev iteration may set LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS to a
+            # cheaper model (e.g. Haiku) so the executor's client-side cost
+            # accounting matches the model the operator is actually charged
+            # for during prompt-engineering runs.
+            model=settings.agent_managed_model_for_tests or settings.agent_managed_model,
         )
         return self._managed_executor
 

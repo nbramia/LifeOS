@@ -401,7 +401,7 @@ FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
     },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
-        "description": "Create a task in LifeOS. Tasks are stored as Obsidian-compatible markdown in LifeOS/Tasks/{Context}.md. Supports contexts (Work, Personal, Finance, etc.), priority (high/medium/low), due dates, and tags.",
+        "description": "Create a task in LifeOS. Tasks are stored as Obsidian-compatible markdown in LifeOS/Tasks/{Context}.md. Supports contexts (Work, Personal, Finance, etc.), priority (high/medium/low), due dates, and tags. When dry_run=true is supplied with an #agent tag, returns the preflight routing decision and cost estimate without creating the task — used for prompt-engineering iteration.",
         "method": "POST",
         "path": "/api/tasks"
     },
@@ -905,7 +905,8 @@ class LifeOSMCPServer:
                     "priority": {"type": "string", "description": "Priority: high, medium, low"},
                     "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
-                    "reminder_id": {"type": "string", "description": "Linked reminder ID"}
+                    "reminder_id": {"type": "string", "description": "Linked reminder ID"},
+                    "dry_run": {"type": "boolean", "description": "When true with an #agent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
                 "required": ["description"]
             },
