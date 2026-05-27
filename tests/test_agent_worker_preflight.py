@@ -200,3 +200,99 @@ def test_preflight_prompt_includes_ordered_precedence():
     assert "use claude" in prompt
     assert "capability" in prompt.lower() or "infer from capability" in prompt.lower()
     assert "ask" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tag precedence (#139 §2)
+# ---------------------------------------------------------------------------
+
+def _stub_caller(routing="claude"):
+    """Build a fake caller returning a minimal preflight JSON."""
+    import json
+    def call(_prompt):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.50},
+            "routing": routing,
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    return call
+
+
+@pytest.mark.unit
+def test_cloud_haiku_tag_forces_haiku_routing():
+    """`#cloud-haiku` always picks Haiku, regardless of preflight's choice."""
+    result = pf.run_preflight("ambiguous task", tags=["agent", "cloud-haiku"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_HAIKU
+    assert "cloud-haiku" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_cloud_sonnet_tag_forces_sonnet_routing():
+    """`#cloud-sonnet` always picks Sonnet."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud-sonnet"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+    assert "cloud-sonnet" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_local_tag_overrides_to_local_model():
+    """`#local` forces local regardless of preflight's choice."""
+    result = pf.run_preflight("task", tags=["agent", "local"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.model == pf.MODEL_LOCAL
+
+
+@pytest.mark.unit
+def test_cloud_tag_keeps_preflight_routing_but_defaults_model_to_sonnet():
+    """`#cloud` says cloud but leaves the model open — defaults to Sonnet
+    when preflight didn't pick a specific model."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+
+
+@pytest.mark.unit
+def test_untagged_cloud_route_defaults_to_sonnet():
+    """No model-specifying tag, preflight returns `claude` → Sonnet default."""
+    result = pf.run_preflight("draft an email", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+
+
+@pytest.mark.unit
+def test_untagged_local_route_sets_model_to_local():
+    """Local routing without override gets MODEL_LOCAL."""
+    result = pf.run_preflight("quick lookup", tags=["agent"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.model == pf.MODEL_LOCAL
+
+
+@pytest.mark.unit
+def test_tag_precedence_haiku_wins_over_sonnet_tag():
+    """If both #cloud-haiku and #cloud-sonnet are present, the first match
+    in the precedence ladder wins (haiku checked before sonnet)."""
+    result = pf.run_preflight("anything",
+                              tags=["agent", "cloud-haiku", "cloud-sonnet"],
+                              caller=_stub_caller(routing="claude"))
+    # Per the ladder docstring: cloud-haiku is checked before cloud-sonnet.
+    assert result.model == pf.MODEL_HAIKU
+
+
+@pytest.mark.unit
+def test_tag_precedence_accepts_hash_prefix_form():
+    """Operators sometimes write the leading `#`; the parser must accept it."""
+    result = pf.run_preflight("anything", tags=["#agent", "#cloud-haiku"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.model == pf.MODEL_HAIKU

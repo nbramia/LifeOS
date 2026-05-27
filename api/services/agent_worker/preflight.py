@@ -34,6 +34,15 @@ ROUTE_ASK = "ask"
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 
+# Per-task model identifiers emitted by preflight. The cloud routing case
+# defaults to Sonnet for general work; Haiku is selected by tag override (or
+# in future by smart routing — see #139 §2 rubric). "local" maps to the
+# local Gemma backend. None means "no override, use settings.agent_managed_model".
+MODEL_LOCAL = "local"
+MODEL_HAIKU = "claude-haiku-4-5"
+MODEL_SONNET = "claude-sonnet-4-6"
+ALLOWED_MODELS = (MODEL_LOCAL, MODEL_HAIKU, MODEL_SONNET)
+
 
 @dataclass
 class PreflightBudget:
@@ -56,6 +65,13 @@ class PreflightResult:
     ambiguity: PreflightAmbiguity | None = None
     sane: bool = True
     sane_reason: str = ""
+    # Per-task model selection (#139 §2). For cloud routes, defaults to
+    # MODEL_SONNET; can be overridden to MODEL_HAIKU by the `#cloud-haiku`
+    # tag (or to MODEL_SONNET by `#cloud-sonnet`). For local routes, set
+    # to MODEL_LOCAL. The worker uses this for client-side cost accounting;
+    # actual remote-model selection still requires the agent preset to
+    # match (section 3 territory).
+    model: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -227,6 +243,57 @@ def _default_llm_caller(prompt: str) -> str:
     return response.text
 
 
+def _normalize_tag(tag: str) -> str:
+    """Strip leading `#` and lowercase, so callers can pass either form."""
+    return tag.lstrip("#").lower()
+
+
+def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightResult:
+    """Apply tag-based routing/model overrides (#139 §2 precedence).
+
+    Tag precedence (a tag always wins over preflight's LLM choice):
+      `#local`        → routing=local, model=local
+      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
+      `#cloud-sonnet` → routing=claude, model=claude-sonnet-4-6
+      `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
+
+    Returns a new PreflightResult so the caller can chain. Tag list is
+    normalized case-insensitively with optional leading `#`.
+    """
+    normalized = {_normalize_tag(t) for t in (tags or [])}
+    if "local" in normalized:
+        result.routing = ROUTE_LOCAL
+        result.routing_reason = "#local tag present"
+        result.model = MODEL_LOCAL
+        return result
+    if "cloud-haiku" in normalized:
+        result.routing = ROUTE_CLAUDE
+        result.routing_reason = "#cloud-haiku tag present"
+        result.model = MODEL_HAIKU
+        return result
+    if "cloud-sonnet" in normalized:
+        result.routing = ROUTE_CLAUDE
+        result.routing_reason = "#cloud-sonnet tag present"
+        result.model = MODEL_SONNET
+        return result
+    if "cloud" in normalized:
+        result.routing = ROUTE_CLAUDE
+        if not result.routing_reason:
+            result.routing_reason = "#cloud tag present"
+        if result.model not in ALLOWED_MODELS:
+            result.model = MODEL_SONNET
+        return result
+    # No override — pick a sensible default model for the routing.
+    if result.model not in ALLOWED_MODELS:
+        if result.routing == ROUTE_CLAUDE:
+            result.model = MODEL_SONNET
+        elif result.routing == ROUTE_LOCAL:
+            result.model = MODEL_LOCAL
+        # ROUTE_ASK leaves model=None — the worker will set it after the
+        # operator answers.
+    return result
+
+
 def run_preflight(
     title: str,
     tags: list[str] | None = None,
@@ -239,15 +306,18 @@ def run_preflight(
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
     if not title.strip():
         defaults = _defaults()
-        return PreflightResult(
-            budget=defaults,
-            routing=ROUTE_ASK,
-            routing_reason="empty title",
-            expected_output="text",
-            ambiguity=None,
-            sane=False,
-            sane_reason="task title is empty",
-            raw={},
+        return _apply_tag_overrides(
+            PreflightResult(
+                budget=defaults,
+                routing=ROUTE_ASK,
+                routing_reason="empty title",
+                expected_output="text",
+                ambiguity=None,
+                sane=False,
+                sane_reason="task title is empty",
+                raw={},
+            ),
+            tags_list,
         )
 
     call = caller or _default_llm_caller
@@ -257,15 +327,18 @@ def run_preflight(
     except Exception as exc:
         logger.warning("preflight LLM call failed: %s", exc)
         defaults = _defaults()
-        return PreflightResult(
-            budget=defaults,
-            routing=ROUTE_ASK,
-            routing_reason="preflight LLM call failed",
-            expected_output="text",
-            ambiguity=None,
-            sane=False,
-            sane_reason=f"preflight error: {exc}",
-            raw={},
+        return _apply_tag_overrides(
+            PreflightResult(
+                budget=defaults,
+                routing=ROUTE_ASK,
+                routing_reason="preflight LLM call failed",
+                expected_output="text",
+                ambiguity=None,
+                sane=False,
+                sane_reason=f"preflight error: {exc}",
+                raw={},
+            ),
+            tags_list,
         )
 
-    return parse_preflight_response(reply)
+    return _apply_tag_overrides(parse_preflight_response(reply), tags_list)
