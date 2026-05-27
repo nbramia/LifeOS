@@ -572,19 +572,27 @@ async def resume_claude_code_session(
         .replace("{cwd}", target.decoded_cwd)
     )
 
-    # Give the spawn a beat — if it crashed immediately, surface stderr.
+    # Give the spawn a beat. Two flavors of launcher are both valid:
+    #   (a) the launcher BECOMES the terminal (long-running) — wait() times
+    #       out, we return the running pid.
+    #   (b) the launcher is a URL dispatcher that delegates to a running
+    #       desktop app and exits cleanly (rc=0). `warp-terminal warp://…`
+    #       does exactly this — Warp opens but the launcher process is gone.
+    # rc=0 is success regardless of timing; only a non-zero exit is failure.
+    response_body = {
+        "spawned": True,
+        "pid": proc.pid,
+        "command": argv,
+        "cwd": target.decoded_cwd,
+        "inner_command": inner_rendered,
+    }
     try:
         proc.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
-        # Still running — that's the happy path. Detach from any unread output.
-        return {
-            "spawned": True,
-            "pid": proc.pid,
-            "command": argv,
-            "cwd": target.decoded_cwd,
-            "inner_command": inner_rendered,
-        }
-    # If we got here, the process exited within 0.5s — likely an error.
+        return response_body
+    if proc.returncode == 0:
+        return response_body
+    # Non-zero exit within 0.5s — surface stderr.
     stderr_preview = b""
     try:
         if proc.stderr is not None:

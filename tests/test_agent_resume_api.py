@@ -202,8 +202,8 @@ def test_resume_500_when_binary_missing(client, synthetic_session, monkeypatch):
 
 
 @pytest.mark.unit
-def test_resume_500_when_process_exits_immediately(client, synthetic_session, monkeypatch):
-    """Process exits within the 0.5s wait → 500 with stderr preview."""
+def test_resume_500_when_process_exits_nonzero_with_stderr(client, synthetic_session, monkeypatch):
+    """Process exits non-zero within the 0.5s wait → 500 with stderr preview."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
@@ -228,6 +228,37 @@ def test_resume_500_when_process_exits_immediately(client, synthetic_session, mo
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
     assert r.status_code == 500
     assert "stderr says" in r.json()["detail"]
+
+
+@pytest.mark.unit
+def test_resume_rc0_immediate_exit_is_success(client, synthetic_session, monkeypatch):
+    """URL-dispatcher launchers (`warp-terminal warp://…`) exit rc=0 right
+    after delegating to the desktop app. That MUST be treated as success —
+    the spawn worked, the terminal is now running elsewhere."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
+                        "vt claude --resume {session_id}")
+
+    class _DispatchedProc:
+        def __init__(self, argv, **kwargs):
+            self.pid = 9
+            self.returncode = 0
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+
+        def wait(self, timeout=None):
+            return self.returncode  # immediate clean exit
+
+    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["spawned"] is True
+    assert sid in body["inner_command"]
 
 
 @pytest.mark.unit
