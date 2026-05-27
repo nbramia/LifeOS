@@ -441,14 +441,15 @@
   // --- Side panel ---
   function renderPanelHeader(s) {
     const live = !TERMINAL.has(s.status);
+    const safeStatus = escapeAttr(s.status);
     panelEl.innerHTML = `
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         <div class="label">${escapeHtml(s.label || s.session_id)}</div>
         <div class="meta">
           ${live ? '<span class="live-dot" title="live"></span>' : ''}
-          <span class="badge status-${s.status}">${s.status}</span>
-          <span class="badge">${routingLabel(s.routing)}</span>
+          <span class="badge status-${safeStatus}">${escapeHtml(s.status)}</span>
+          <span class="badge">${escapeHtml(routingLabel(s.routing))}</span>
           <span class="badge">$${(s.total_dollars || 0).toFixed(4)}</span>
           <span class="badge">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
           ${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}
@@ -492,7 +493,11 @@
       });
   }
 
-  function appendEvent(ev, live) {
+  // appendEvent always renders newest-on-top so backfill and live additions
+  // share the same visual order. Backfill is delivered oldest-first, so we
+  // prepend each one as it arrives, leaving the chronologically-newest event
+  // at the top by the time live tail begins.
+  function appendEvent(ev, _live) {
     const container = document.getElementById('events');
     if (!container) return;
     const kind = String(ev.kind || '');
@@ -500,16 +505,15 @@
     const payload = ev.payload ? JSON.stringify(ev.payload, null, 0) : '';
     const truncated = payload.length > 240 ? payload.slice(0, 240) + '…' : payload;
     const div = document.createElement('div');
-    div.className = `event kind-${kind}`;
+    // classList.add validates token shape — defense-in-depth even though
+    // `kind` is server-controlled today.
+    div.classList.add('event');
+    if (kind) div.classList.add(`kind-${kind.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
     div.innerHTML = `
       <div><span class="kind">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
       ${payload ? `<div class="payload">${escapeHtml(truncated)}</div>` : ''}
     `;
-    if (live) {
-      container.prepend(div);
-    } else {
-      container.appendChild(div);
-    }
+    container.prepend(div);
   }
 
   function escapeHtml(s) {
@@ -519,6 +523,13 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  // For values that go into HTML attribute positions via template strings.
+  // Restricts to a known-safe charset so attribute-context injection is
+  // structurally impossible.
+  function escapeAttr(s) {
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
   // --- Filters ---

@@ -33,10 +33,11 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 _session_store: SessionStore | None = None
 _transcript_store: TranscriptStore | None = None
 
-# Labels are derived from transcript events (first claim/seed/spawn) and don't
-# change for the lifetime of a session, so cache by session_id to avoid
-# re-scanning transcripts on every snapshot tick.
+# Labels are stable once derived from a non-fallback source, so cache to avoid
+# re-deriving on every snapshot tick. Capped to bound memory if the process
+# accumulates a lot of session IDs over a long uptime.
 _label_cache: dict[str, str] = {}
+_LABEL_CACHE_MAX = 500
 
 # Transcript tail size used for snapshot summary fields. Capping keeps SSE
 # tick cost bounded for sessions with long transcripts.
@@ -46,7 +47,16 @@ _SUMMARY_TAIL = 100
 _SNAPSHOT_LIMIT = 200
 
 
-_ERROR_KINDS = frozenset({"failed", "managed_failed", "child_failed_internal"})
+# Event kinds that count as errors. Includes operator/peer-initiated kills
+# because the frontend renders them as failures and the count chip should
+# match. The endswith check picks up future `*_failed`/`*_error` kinds.
+_ERROR_KINDS = frozenset({
+    "failed",
+    "managed_failed",
+    "child_failed_internal",
+    "killed",
+    "cascade_killed",
+})
 
 
 def _get_session_store() -> SessionStore:
@@ -74,11 +84,13 @@ def _label_for_session(s: Session, events: list[dict[str, Any]]) -> str:
     if cached is not None:
         return cached
 
-    label = s.task_id or s.session_id
+    label: str | None = None
+
+    # Future-proof: if a transcript event ever carries a description directly
+    # (e.g. via a future enrichment in worker._claim), use it.
     for ev in events[:5]:
-        kind = ev.get("kind", "")
         payload = ev.get("payload") or {}
-        if kind in ("claim", "seed", "spawn"):
+        if ev.get("kind") in ("claim", "seed", "spawn"):
             desc = (
                 payload.get("description")
                 or payload.get("task_description")
@@ -88,10 +100,34 @@ def _label_for_session(s: Session, events: list[dict[str, Any]]) -> str:
                 label = str(desc)
                 break
 
+    # Real worker `claim`/`seed` payloads today only carry `task_id`, so for
+    # root sessions look the task description up via the TaskManager. This
+    # call is cheap (in-memory dict in the singleton) and the result is
+    # cached below.
+    if label is None and s.parent_session_id is None and s.task_id:
+        try:
+            from api.services.task_manager import get_task_manager
+
+            task = get_task_manager().get(s.task_id)
+            if task is not None and task.description:
+                label = task.description
+        except Exception as exc:  # noqa: BLE001 — defensive: never break the snapshot on label lookup
+            logger.debug("task_manager lookup failed for %s: %s", s.task_id, exc)
+
+    # Only cache when we found a real label — never the fallback, so a snapshot
+    # tick that races the `claim` append doesn't poison the cache.
+    found = label is not None
+    if label is None:
+        label = s.task_id or s.session_id
     label = label.strip().replace("\n", " ")
     if len(label) > 60:
         label = label[:57] + "…"
-    _label_cache[s.session_id] = label
+
+    if found:
+        if len(_label_cache) >= _LABEL_CACHE_MAX:
+            # Drop one arbitrary entry to keep the cache bounded.
+            _label_cache.pop(next(iter(_label_cache)))
+        _label_cache[s.session_id] = label
     return label
 
 

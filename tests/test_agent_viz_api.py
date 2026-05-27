@@ -168,6 +168,113 @@ def test_per_session_stream_rejects_traversal(client, stores):
 
 
 @pytest.mark.unit
+def test_per_session_stream_emits_events_before_close(client, stores):
+    """Verifies the stream emits transcript_event chunks before the terminal close event."""
+    session_store, transcript_store = stores
+    s = session_store.create(task_id="t-mid", status=STATUS_RUNNING)
+    transcript_store.append(s.session_id, "claim", {"description": "Running session"})
+    transcript_store.append(s.session_id, "tool_call", {"name": "lifeos_search"})
+    session_store.update_status("t-mid", STATUS_COMPLETED)
+
+    transcript_seen = False
+    closed = False
+    with client.stream("GET", f"/api/agents/sessions/{s.session_id}/stream?backfill=5") as resp:
+        assert resp.status_code == 200
+        for chunk in resp.iter_text():
+            if "event: transcript_event" in chunk and not closed:
+                transcript_seen = True
+            if "event: closed" in chunk:
+                closed = True
+                break
+    assert transcript_seen, "transcript_event chunks should arrive before the close event"
+    assert closed, "stream should emit event: closed when the session is terminal"
+
+
+@pytest.mark.unit
+def test_label_falls_back_to_task_manager_for_root_sessions(client, stores, monkeypatch):
+    """When transcript events don't carry a description (the real worker case),
+    the label should come from the task manager rather than being cached as
+    the task_id fallback."""
+    session_store, transcript_store = stores
+    s = session_store.create(task_id="t-tm", status=STATUS_RUNNING)
+    # Real worker emits this payload — no description.
+    transcript_store.append(s.session_id, "claim", {"task_id": "t-tm", "worker": "agent-worker"})
+
+    # Stub the task manager so the label lookup hits a known value.
+    class StubTask:
+        description = "Review the Q4 budget"
+
+    class StubManager:
+        def get(self, task_id):
+            return StubTask() if task_id == "t-tm" else None
+
+    monkeypatch.setattr(
+        "api.services.task_manager.get_task_manager",
+        lambda: StubManager(),
+    )
+
+    r = client.get("/api/agents/snapshot")
+    sess = next(x for x in r.json()["sessions"] if x["session_id"] == s.session_id)
+    assert sess["label"] == "Review the Q4 budget"
+
+
+@pytest.mark.unit
+def test_error_count_includes_killed_kinds(client, stores):
+    session_store, transcript_store = stores
+    s = session_store.create(task_id="t-killed", status=STATUS_RUNNING)
+    transcript_store.append(s.session_id, "tool_call", {"name": "lifeos_search"})
+    transcript_store.append(s.session_id, "killed", {"by": "operator"})
+    transcript_store.append(s.session_id, "cascade_killed", {"reason": "parent killed"})
+
+    r = client.get("/api/agents/snapshot")
+    sess = next(x for x in r.json()["sessions"] if x["session_id"] == s.session_id)
+    assert sess["error_count"] == 2
+    assert sess["tool_call_count"] == 1
+
+
+@pytest.mark.unit
+def test_label_cache_does_not_pin_fallback(client, stores, monkeypatch):
+    """If the first snapshot tick fires before any descriptive event lands,
+    the fallback (`task_id`) must not get cached. A subsequent tick with the
+    real label available should pick it up."""
+    session_store, transcript_store = stores
+    s = session_store.create(task_id="t-race", status=STATUS_RUNNING)
+    # No transcript yet — simulate the race.
+
+    class _MissingManager:
+        def get(self, task_id):
+            return None
+
+    monkeypatch.setattr(
+        "api.services.task_manager.get_task_manager",
+        lambda: _MissingManager(),
+    )
+
+    r1 = client.get("/api/agents/snapshot")
+    sess1 = next(x for x in r1.json()["sessions"] if x["session_id"] == s.session_id)
+    assert sess1["label"] == "t-race"  # fallback to task_id
+
+    # Now the real description becomes available (later claim event lands, OR
+    # task_manager would resolve it). The cache must NOT have pinned the
+    # fallback, so the new label takes effect.
+    class _StubTask:
+        description = "Real label arrives late"
+
+    class _StubManager:
+        def get(self, task_id):
+            return _StubTask()
+
+    monkeypatch.setattr(
+        "api.services.task_manager.get_task_manager",
+        lambda: _StubManager(),
+    )
+
+    r2 = client.get("/api/agents/snapshot")
+    sess2 = next(x for x in r2.json()["sessions"] if x["session_id"] == s.session_id)
+    assert sess2["label"] == "Real label arrives late"
+
+
+@pytest.mark.unit
 def test_snapshot_filters_yield_waiting_for(client, stores):
     """Ensure yield_waiting_for survives JSON round-trip as an array."""
     session_store, transcript_store = stores
