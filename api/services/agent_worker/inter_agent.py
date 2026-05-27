@@ -37,6 +37,7 @@ from api.services.agent_worker.session_store import (
     STATUS_FAILED,
     STATUS_YIELDED,
     TERMINAL_STATUSES,
+    Session,
     SessionStore,
     new_session_id,
 )
@@ -439,6 +440,42 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
     return _ok({"yielded": True, "waiting_on": children})
 
 
+def teardown_session(
+    session_store: SessionStore,
+    transcript_store: TranscriptStore,
+    target: Session,
+    transcript_kind: str,
+    transcript_payload: dict,
+    managed_driver: Any | None = None,
+) -> dict[str, Any]:
+    """Tear down a single session: kill the managed remote (best-effort),
+    flip the local DB status to FAILED, and append a transcript event.
+
+    Shared between agent-initiated `kill()` (this module) and the operator
+    HTTP kill endpoint (`api/routes/agents.py`). Authorization is the
+    caller's responsibility — this helper just runs the mechanics.
+
+    Returns `{"managed_failure": <reason or None>}` so the caller can
+    surface partial-success in its response.
+    """
+    managed_failure: str | None = None
+    if target.managed_agent_session_id and managed_driver is not None:
+        try:
+            managed_driver.kill_session(
+                target.managed_agent_session_id,
+                reason=transcript_payload.get("reason", ""),
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to local-only on remote failure
+            managed_failure = str(exc)
+            logger.warning(
+                "kill_session %s failed: %s",
+                target.managed_agent_session_id, exc,
+            )
+    session_store.update_status(target.task_id, STATUS_FAILED)
+    transcript_store.append(target.session_id, transcript_kind, transcript_payload)
+    return {"managed_failure": managed_failure}
+
+
 def kill(ctx: InterAgentContext, args: dict) -> dict:
     target_id = args.get("session_id", "").strip()
     if not target_id:
@@ -456,26 +493,18 @@ def kill(ctx: InterAgentContext, args: dict) -> dict:
     if target.status in TERMINAL_STATUSES:
         return _ok({"killed": False, "reason": f"already {target.status}"})
 
-    # Managed children: kill the remote session too so it stops accruing
-    # tokens / session-hour overhead. Without a driver we can only flip the
-    # local DB status; the worker's next managed poll will then see the
-    # local FAILED status and treat the session as terminal even if the
-    # remote still reports running.
-    if target.managed_agent_session_id and ctx.managed_driver is not None:
-        try:
-            ctx.managed_driver.kill_session(
-                target.managed_agent_session_id,
-                reason=args.get("reason", ""),
-            )
-        except Exception as exc:
-            logger.warning("kill_session %s failed: %s",
-                           target.managed_agent_session_id, exc)
-
-    ctx.session_store.update_status(target.task_id, STATUS_FAILED)
-    ctx.transcript_store.append(target_id, "killed", {
-        "by": caller.session_id, "reason": args.get("reason", ""),
-        "managed_remote": target.managed_agent_session_id,
-    })
+    teardown_session(
+        ctx.session_store,
+        ctx.transcript_store,
+        target,
+        transcript_kind="killed",
+        transcript_payload={
+            "by": caller.session_id,
+            "reason": args.get("reason", ""),
+            "managed_remote": target.managed_agent_session_id,
+        },
+        managed_driver=ctx.managed_driver,
+    )
     return _ok({"killed": True})
 
 
