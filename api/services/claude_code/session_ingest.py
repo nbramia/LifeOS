@@ -404,8 +404,18 @@ def _iter_lines(path: str) -> Iterator[dict[str, Any]]:
         return
 
 
-def parse_session(meta: SessionMeta, now: float | None = None) -> tuple[SessionMeta, list[dict[str, Any]]]:
-    """Open the jsonl, populate `meta` fields, return normalized events."""
+def parse_session(
+    meta: SessionMeta,
+    now: float | None = None,
+    live_cwds: frozenset[str] | None = None,
+) -> tuple[SessionMeta, list[dict[str, Any]]]:
+    """Open the jsonl, populate `meta` fields, return normalized events.
+
+    `live_cwds` is the precomputed set of cwds for live `claude` processes
+    on this machine. Passed in by `build_snapshot` so a single scan is
+    shared across every session in one snapshot tick. Falls back to a
+    fresh scan if omitted (convenient for direct callers and tests).
+    """
     events: list[dict[str, Any]] = []
     started_at: int = 0
     last_activity_at: int = 0
@@ -502,11 +512,14 @@ def parse_session(meta: SessionMeta, now: float | None = None) -> tuple[SessionM
     meta.last_event_kind = last_kind
     meta.last_user_text = last_user_text
     meta.subagents = subagents
-    meta.status = _infer_status(
+    cwds = live_cwds if live_cwds is not None else live_claude_cwds(now)
+    has_live = bool(meta.decoded_cwd) and meta.decoded_cwd in cwds
+    meta.status, meta.status_inferred = _infer_status(
         mtime=meta.mtime,
         last_assistant_had_pending_tool=last_assistant_had_pending_tool,
         last_event_was_error=last_event_was_error,
         now=now,
+        has_live_process=has_live,
     )
     # Choose a label: prefer the most recent user prompt (truncated); fall
     # back to the working-directory basename so the node is at least
@@ -525,28 +538,109 @@ def _infer_status(
     last_assistant_had_pending_tool: bool,
     last_event_was_error: bool,
     now: float | None = None,
-) -> str:
-    """Heuristic status — mtime-based, no process inspection.
+    has_live_process: bool = False,
+) -> tuple[str, bool]:
+    """Infer Claude Code session status.
 
-    MVP rules (process detection deferred — see issue #144 notes):
-      - Modified in the last 60s → `running`
-      - Modified within 24h → `yielded` (resumable; user closed the terminal)
-      - Older, ended on an error → `failed`
+    Returns `(status, inferred)`. `inferred=False` means the status came
+    from a process-detection signal (authoritative); `inferred=True`
+    means it was guessed from mtime alone.
+
+    Rules:
+      - Live `claude` process matches the project cwd → `running`
+        (authoritative — `inferred=False`).
+      - Modified in the last 60s → `running` (mtime-only — `inferred=True`).
+      - Modified within 24h → `yielded` (resumable; user closed the terminal).
+      - Older, ended on an error → `failed`.
       - Older, pending tool in flight → `yielded` (could be a long-running
-        tool; lacking a process check we can't say it's abandoned, so
-        prefer the resumable state to a false-negative `failed`)
-      - Otherwise → `completed`
+        tool; lacking process evidence we can't say it's abandoned).
+      - Otherwise → `completed`.
     """
+    if has_live_process:
+        return ("running", False)
     age = (now if now is not None else time.time()) - mtime
     if age < _RUNNING_MTIME_THRESHOLD:
-        return "running"
+        return ("running", True)
     if age < _YIELDED_MTIME_THRESHOLD:
-        return "yielded"
+        return ("yielded", True)
     if last_event_was_error:
-        return "failed"
+        return ("failed", True)
     if last_assistant_had_pending_tool:
-        return "yielded"
-    return "completed"
+        return ("yielded", True)
+    return ("completed", True)
+
+
+# ---------------------------------------------------------------------------
+# Live-process detection via psutil
+# ---------------------------------------------------------------------------
+
+
+# Cache the live-process scan briefly so a single snapshot tick across many
+# sessions doesn't enumerate /proc once per session.
+_PROCESS_CACHE_TTL = 5.0
+
+
+@dataclass
+class _ProcessCache:
+    expires_at: float = 0.0
+    cwds: frozenset[str] = field(default_factory=frozenset)
+
+
+_process_cache = _ProcessCache()
+_process_cache_lock = threading.Lock()
+
+
+def live_claude_cwds(now: float | None = None) -> frozenset[str]:
+    """Return the cwds of all live `claude` processes on this machine.
+
+    Used for authoritative `running` status. Cached ~5s so a snapshot
+    tick with many sessions doesn't repeatedly walk `/proc`. Returns an
+    empty frozenset if psutil is unavailable or the scan errors.
+    """
+    now_t = now if now is not None else time.time()
+    with _process_cache_lock:
+        if _process_cache.expires_at > now_t:
+            return _process_cache.cwds
+
+    cwds: set[str] = set()
+    try:
+        import psutil
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                cmdline = proc.info.get("cmdline") or []
+                # Match `claude` directly, or a wrapper whose argv basename is
+                # `claude` (the CLI ships as a Node script; some releases run
+                # under node with `claude` in argv).
+                is_claude = (
+                    name == "claude"
+                    or any(
+                        isinstance(arg, str) and arg.rsplit("/", 1)[-1] == "claude"
+                        for arg in cmdline
+                    )
+                )
+                if not is_claude:
+                    continue
+                cwd = proc.cwd()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:  # noqa: BLE001 — never crash the scan on one bad proc
+                continue
+            if cwd:
+                cwds.add(cwd)
+    except Exception as exc:  # noqa: BLE001 — psutil import/iter failures degrade gracefully
+        logger.debug("live_claude_cwds: psutil scan failed: %s", exc)
+
+    frozen = frozenset(cwds)
+    with _process_cache_lock:
+        _process_cache.expires_at = now_t + _PROCESS_CACHE_TTL
+        _process_cache.cwds = frozen
+    return frozen
+
+
+def invalidate_process_cache() -> None:
+    with _process_cache_lock:
+        _process_cache.expires_at = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -694,9 +788,11 @@ def build_snapshot(
 
     sessions: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
+    # One process-scan per snapshot tick — shared across every session.
+    cwds = live_claude_cwds(now=now_t)
     for meta in discover_sessions(projects_dir, lookback_days=lookback_days, limit=limit, now=now_t):
         try:
-            parsed_meta, _events = parse_session(meta, now=now_t)
+            parsed_meta, _events = parse_session(meta, now=now_t, live_cwds=cwds)
         except Exception as exc:  # noqa: BLE001 — never break the snapshot on one bad file
             logger.warning("claude_code parse failed for %s: %s", meta.jsonl_path, exc)
             continue
@@ -732,13 +828,16 @@ def read_normalized_events(
     """Return the normalized event list for one Claude Code session.
 
     `session_id` may include the `cc:` prefix. Subagent synthetic ids
-    (`cc:<parent>:agent:<tool_use_id>`) fall back to the parent's transcript
-    for now — see issue #144.
+    (`cc:<parent>:agent:<tool_use_id>`) return only the slice of the
+    parent's transcript that corresponds to that subagent invocation —
+    the assistant message containing the spawning `tool_use`, every
+    event in between, and the user message containing the matching
+    `tool_result` (inclusive).
     """
     bare = validate_session_id(session_id)
-    # Subagent synthetic id splits on `:agent:`; take the parent half.
+    subagent_tool_use_id: str | None = None
     if ":agent:" in bare:
-        bare = bare.split(":agent:", 1)[0]
+        bare, subagent_tool_use_id = bare.split(":agent:", 1)
         bare = validate_session_id(bare)
     # Scan projects dir for the matching jsonl. Linear scan; for very large
     # projects directories consider an explicit map cache later.
@@ -750,9 +849,49 @@ def read_normalized_events(
             continue
         candidate = proj / f"{bare}.jsonl"
         if candidate.exists():
-            return [
+            events = [
                 ev for ev in (
                     normalize_event(raw) for raw in _iter_lines(str(candidate))
                 ) if ev is not None
             ]
+            if subagent_tool_use_id:
+                return _filter_subagent_window(events, subagent_tool_use_id)
+            return events
     return []
+
+
+def _filter_subagent_window(
+    events: list[dict[str, Any]],
+    tool_use_id: str,
+) -> list[dict[str, Any]]:
+    """Slice a parent transcript to the window of one subagent invocation.
+
+    The window starts at the assistant message whose `payload.tool_uses`
+    contains `tool_use_id`, includes every event after it, and ends at
+    the user message whose `tool_results` carries that same id. If the
+    closing result hasn't been seen yet (subagent still running), returns
+    everything from the spawn forward.
+    """
+    start: int | None = None
+    end: int | None = None
+    for idx, ev in enumerate(events):
+        kind = ev.get("kind")
+        payload = ev.get("payload") or {}
+        if start is None and kind == "assistant_message":
+            for tu in payload.get("tool_uses") or []:
+                if tu.get("id") == tool_use_id:
+                    start = idx
+                    break
+            continue
+        if start is not None and kind == "tool_result":
+            for tr in payload.get("tool_results") or []:
+                if tr.get("tool_use_id") == tool_use_id:
+                    end = idx
+                    break
+            if end is not None:
+                break
+    if start is None:
+        return []
+    if end is None:
+        return events[start:]
+    return events[start : end + 1]

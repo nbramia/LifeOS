@@ -446,3 +446,140 @@ def test_read_normalized_events_for_subagent_falls_back_to_parent(tmp_path: Path
 def test_read_normalized_events_rejects_traversal():
     with pytest.raises(ValueError):
         cc.read_normalized_events("cc:../etc/passwd", projects_dir=Path("/"))
+
+
+# ---------------------------------------------------------------------------
+# Subagent transcript window filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_subagent_window_returns_spawn_to_result_slice(tmp_path: Path):
+    """Synthetic subagent id returns only events between the spawn assistant
+    turn and its matching tool_result — not the full parent transcript."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "parent.jsonl", [
+        _user_event("pre-spawn user turn"),
+        _assistant_event("before spawn"),
+        # The spawn: assistant turn with an Agent tool_use.
+        _assistant_event("spawning", tool_uses=[
+            {"id": "tu_42", "name": "Agent", "input": {"prompt": "do sub"}},
+        ]),
+        # Subagent inline activity.
+        _user_event("intermediate"),
+        # Closing tool_result.
+        _user_event(tool_results=[
+            {"tool_use_id": "tu_42", "is_error": False,
+             "content": [{"type": "text", "text": "sub done"}]},
+        ]),
+        # Stuff after — must NOT appear in the slice.
+        _user_event("post-spawn"),
+        _assistant_event("after"),
+    ])
+    events = cc.read_normalized_events("cc:parent:agent:tu_42", projects_dir=tmp_path)
+    kinds = [e["kind"] for e in events]
+    assert kinds[0] == "assistant_message"
+    assert kinds[-1] == "tool_result"
+    # 'post-spawn' user turn should not appear.
+    texts = [(e.get("payload") or {}).get("text", "") for e in events]
+    assert "post-spawn" not in texts
+    # Pre-spawn user turn also excluded.
+    assert "pre-spawn user turn" not in texts
+
+
+@pytest.mark.unit
+def test_subagent_window_returns_tail_when_result_pending(tmp_path: Path):
+    """A subagent that hasn't returned yet returns spawn → end-of-file."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "parent.jsonl", [
+        _user_event("user"),
+        _assistant_event("spawn", tool_uses=[
+            {"id": "tu_inflight", "name": "Agent", "input": {"prompt": "running"}},
+        ]),
+        _user_event("intermediate-1"),
+        _user_event("intermediate-2"),
+        # No tool_result for tu_inflight — subagent still running.
+    ])
+    events = cc.read_normalized_events("cc:parent:agent:tu_inflight", projects_dir=tmp_path)
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["assistant_message", "user_message", "user_message"]
+
+
+@pytest.mark.unit
+def test_subagent_window_empty_when_tool_use_id_missing(tmp_path: Path):
+    """Unknown tool_use_id returns no events (slice never started)."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "parent.jsonl", [
+        _user_event("hi"),
+        _assistant_event("ok"),
+    ])
+    events = cc.read_normalized_events("cc:parent:agent:tu_nonexistent", projects_dir=tmp_path)
+    assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Live-process detection (psutil)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_live_process_detection_promotes_to_running(tmp_path: Path, monkeypatch):
+    """When a live `claude` process matches the project cwd, status is
+    `running` and `status_inferred` is False (authoritative)."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "old-but-live.jsonl", [_user_event("hi"), _assistant_event("ok")])
+    # Backdate the mtime so the heuristic alone would say `completed`.
+    old = time.time() - 48 * 3600
+    os.utime(proj / "old-but-live.jsonl", (old, old))
+
+    # Force the live-process scan to claim this cwd is held by `claude`.
+    monkeypatch.setattr(cc, "live_claude_cwds", lambda now=None: frozenset({"/home/syn/Code/A"}))
+    cc.invalidate_process_cache()
+
+    metas = cc.discover_sessions(projects_dir=tmp_path, lookback_days=365)
+    meta, _ = cc.parse_session(metas[0], live_cwds=cc.live_claude_cwds())
+    assert meta.status == "running"
+    assert meta.status_inferred is False
+
+
+@pytest.mark.unit
+def test_live_process_detection_no_match_falls_back_to_heuristic(tmp_path: Path, monkeypatch):
+    """When no live process matches, mtime heuristic still applies and the
+    status is flagged as inferred."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "idle.jsonl", [_user_event("hi"), _assistant_event("ok")])
+    old = time.time() - 7200
+    os.utime(proj / "idle.jsonl", (old, old))
+    monkeypatch.setattr(cc, "live_claude_cwds", lambda now=None: frozenset())
+    cc.invalidate_process_cache()
+
+    metas = cc.discover_sessions(projects_dir=tmp_path, lookback_days=365)
+    meta, _ = cc.parse_session(metas[0], live_cwds=cc.live_claude_cwds())
+    assert meta.status == "yielded"
+    assert meta.status_inferred is True
+
+
+@pytest.mark.unit
+def test_live_process_cache_avoids_repeated_scans(monkeypatch):
+    """The process-cwd cache serves repeat calls within the TTL without re-scanning."""
+    calls: list[int] = []
+
+    class _FakeProc:
+        def __init__(self, name, cmdline, cwd_val):
+            self.info = {"name": name, "cmdline": cmdline}
+            self._cwd = cwd_val
+
+        def cwd(self):
+            return self._cwd
+
+    def _fake_iter(*_, **__):
+        calls.append(1)
+        return iter([_FakeProc("claude", [], "/some/cwd")])
+
+    import psutil as _psutil
+    cc.invalidate_process_cache()
+    monkeypatch.setattr(_psutil, "process_iter", _fake_iter)
+    a = cc.live_claude_cwds()
+    b = cc.live_claude_cwds()  # within TTL — should hit cache
+    assert a == b == frozenset({"/some/cwd"})
+    assert len(calls) == 1  # process_iter only ran once
