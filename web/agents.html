@@ -510,6 +510,22 @@
   }
   .panel-resume:hover { background: var(--accent); color: var(--bg-primary); }
   .panel-resume:disabled { opacity: 0.6; cursor: progress; }
+  .panel-focus {
+    background: var(--bg-card);
+    border: 1px solid var(--text-dim);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-focus:hover { background: var(--text-dim); color: var(--bg-primary); }
+  .panel-focus:disabled { opacity: 0.6; cursor: progress; }
   .modal-backdrop {
     position: fixed; inset: 0;
     background: rgba(0,0,0,0.55);
@@ -1200,7 +1216,8 @@
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
-        ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a terminal and resume this session">Resume</button>' : ''}
+        ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a new wezterm tab and run claude --resume">Resume</button>' : ''}
+        ${showResume ? '<button class="panel-focus" id="panel-focus" title="Switch wezterm to the existing tab for this session (if Resume was clicked before)">Focus</button>' : ''}
         <div class="label" data-field="label">${escapeHtml(s.label || s.session_id)}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         <div class="meta" data-field="meta">
@@ -1221,6 +1238,47 @@
     }
     if (showResume) {
       document.getElementById('panel-resume').onclick = () => resumeCcSession(s);
+      document.getElementById('panel-focus').onclick = () => focusCcSession(s);
+    }
+  }
+
+  async function focusCcSession(s) {
+    const btn = document.getElementById('panel-focus');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Focusing…';
+    }
+    try {
+      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/focus`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        let msg = text;
+        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        // 404 = no mapping yet (use Resume first). 410 = pane was closed
+        // (mapping cleared on server, click Resume to recreate).
+        if (r.status === 404) {
+          showToast(`No tracked tab — click Resume first.`, true);
+        } else if (r.status === 410) {
+          showToast(`Tab no longer exists. Click Resume to open a new one.`, true);
+        } else {
+          showToast(`Focus failed: ${msg}`, true);
+        }
+        return;
+      }
+      const result = await r.json();
+      showToast(`Switched wezterm to pane ${result.pane_id}.`, false);
+    } catch (err) {
+      showToast(`Focus failed: ${err.message}`, true);
+    } finally {
+      setTimeout(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = 'Focus';
+        }
+      }, 1500);
     }
   }
 
@@ -1244,12 +1302,11 @@
         throw new Error(`HTTP ${r.status}: ${msg}`);
       }
       const result = await r.json();
-      // The server tries to push `inner_command` to the system clipboard
-      // via wl-copy / xclip — that's far more reliable than the browser
-      // Clipboard API, which silently fails when the page loses focus
-      // (which happens the instant Warp opens). If the server copy
-      // didn't land, try one more time from the browser before showing
-      // the command inline so the operator can copy it manually.
+      // With the default wezterm launcher the inner command is already
+      // running inside the new tab — no paste needed. The server still
+      // copies it to the clipboard as a backup in case the operator has
+      // overridden cc_resume_cmd to a launcher that opens an empty
+      // terminal (e.g. legacy `warp://` flow).
       let copied = !!result.clipboard_copied;
       if (!copied && result.inner_command && navigator.clipboard && navigator.clipboard.writeText) {
         try {
@@ -1259,10 +1316,12 @@
           // ignore — toast will show the command for manual copy
         }
       }
-      if (copied) {
-        showToast(`Warp opened. Resume command copied to clipboard — paste it.`, false);
+      if (result.pane_id != null) {
+        showToast(`Wezterm tab opened (pane ${result.pane_id}). Focus button will return here.`, false);
+      } else if (copied) {
+        showToast(`Tab opened. Resume command copied to clipboard — paste it.`, false);
       } else if (result.inner_command) {
-        showToast(`Warp opened. Run: ${result.inner_command}`, false);
+        showToast(`Tab opened. Run: ${result.inner_command}`, false);
       } else {
         showToast(`Spawned (pid ${result.pid}) in ${result.cwd}`, false);
       }

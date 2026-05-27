@@ -157,16 +157,17 @@ Claude Code sessions do not get a Kill button — the page has no safe primitive
 
 ---
 
-## Operator controls — resume
+## Operator controls — resume and focus
 
-Claude Code sessions in `inactive` or terminal states get a green **Resume** button. The flow:
+Claude Code sessions in `inactive` or terminal states get two buttons:
 
-1. Click Resume.
-2. The server spawns a configured launcher command (`LIFEOS_CC_RESUME_CMD`). The default opens a new tab in Warp Terminal at the project's working directory.
-3. The actual `claude --resume <session_id>` command (configured via `LIFEOS_CC_RESUME_INNER_CMD`) is copied to your system clipboard server-side via `wl-copy` (Wayland) or `xclip` (X11) — done from the server because the browser Clipboard API silently fails the moment the page loses focus.
-4. A toast confirms "Warp opened. Resume command copied to clipboard — paste it." Paste the command in the new terminal and Claude Code reopens the session.
+**Resume** opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id.
 
-Resume is **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true`. Customize the launcher (`LIFEOS_CC_RESUME_CMD`) if you don't use Warp — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}` are available.
+**Focus** activates the existing tab for that session — calls `wezterm cli activate-pane --pane-id <id>` against the stored mapping. If WezTerm is the focused window the tab switches immediately; if it's hidden, the pane is selected in the background and a `notify-send` urgency hint pulses the dock icon. The OS-level window-raise across applications is restricted by Wayland compositors (no programmatic foreground steal); WezTerm under XWayland can be raised via `wmctrl`/`xdotool` if the operator needs it.
+
+Focus returns 404 if no Resume has been clicked yet for that session, and 410 if the stored pane no longer exists (e.g. user closed the tab); in both cases the toast prompts the operator to click Resume.
+
+Resume is **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` (the same flag also enables Focus). Customize the launcher (`LIFEOS_CC_RESUME_CMD`) if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The pane-tracking + Focus button assume the launcher prints a pane id on stdout, so non-WezTerm launchers leave Focus inert for those sessions.
 
 ---
 
@@ -188,9 +189,9 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | Surface Claude Code CLI sessions alongside agent worker sessions. Set false to scope the viz to LifeOS sessions only. | `true` |
 | `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | Where to find Claude Code transcripts. | `~/.claude/projects` |
 | `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | Discovery window — older jsonl files are excluded from the snapshot (they can still be loaded by direct session id). | `7` |
-| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume button. | `false` |
-| `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`. | `warp-terminal warp://action/new_tab?path={cwd_url}` |
-| `LIFEOS_CC_RESUME_INNER_CMD` | The command copied to the clipboard (intended for the new terminal). Set empty to disable clipboard copy. | `vt claude --dangerously-skip-permissions --resume {session_id}` |
+| `LIFEOS_CC_RESUME_ENABLED` | Enable the Resume and Focus buttons. | `false` |
+| `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
+| `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
 | `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
 
 ---
