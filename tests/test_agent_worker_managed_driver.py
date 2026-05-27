@@ -700,6 +700,32 @@ def test_session_state_defaults_cache_buckets_to_zero_when_absent():
 
 
 @pytest.mark.unit
+def test_session_state_parses_nested_cache_creation_object():
+    """Managed-Agents API returns cache_creation as a nested object split into
+    ephemeral_5m + ephemeral_1h buckets — both must be summed and surfaced as
+    `total_cache_creation_tokens`. (Live response confirmed 2026-05-27 returned
+    this nested shape, not the flat `cache_creation_input_tokens` key.)"""
+    handler = _make_session_handler(
+        status_body={
+            "status": "running",
+            "usage": {
+                "input_tokens": 14,
+                "output_tokens": 23034,
+                "cache_read_input_tokens": 1_706_547,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 137_571,
+                    "ephemeral_1h_input_tokens": 1_000,
+                },
+            },
+        },
+        events=[],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.total_cache_creation_tokens == 138_571  # 137_571 + 1_000
+    assert state.total_cache_read_tokens == 1_706_547
+
+
+@pytest.mark.unit
 def test_managed_session_cost_includes_cache_buckets():
     """cache_creation tokens are 1.25× input rate; cache_read is 0.10× input."""
     # 100k cache_creation at Sonnet ($3/M input × 1.25) = $0.375

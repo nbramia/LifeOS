@@ -216,7 +216,7 @@ setTimeout(() => simulation.alpha(0).stop(), 8000);  // 8s convergence backstop
 |---|---|
 | `link.strength(0.04)` | Spawn edges are *informational*, not load-bearing — weak so they don't yank parent + child off the recency-x rail. |
 | `charge -220, distanceMax(600)` | Strong-ish repulsion within 600 vbox units. Caps the influence radius so far-apart clusters don't push each other. |
-| `forceX(recencyTargetX) strength 0.18` | Soft pull toward `0.92*W` for now-recent and `0.08*W` for ≥24h-old. Strength balanced against repulsion so same-recency nodes spread vertically without escaping the x-band. |
+| `forceX(recencyTargetX) strength 0.18` | Soft pull along the recency rail, newer to the right. Rail *width* scales with the visible-node count via `recencyRailSpan()` — `0` (centered) for one visible node, `~0.30·W` for two, growing logarithmically to `0.84·W` at 32+. This way filtered-down sets re-center instead of getting pinned to their absolute time-position. |
 | `forceY(VIEW_H/2) strength 0.12` | Mild vertical centering — without it, nodes drift off-canvas; too strong and the collide force can't separate them. |
 | `forceCollide radius = nodeRadius + 14, strength 0.9` | Hard guarantee that token-based-sized nodes never overlap. |
 | `velocityDecay 0.45`, `alphaDecay 0.025` | Settles in ~6s; the 8s `alpha(0).stop()` is a backstop in case extreme node counts prevent natural convergence. |
@@ -224,6 +224,18 @@ setTimeout(() => simulation.alpha(0).stop(), 8000);  // 8s convergence backstop
 Node shape varies by source — `circle` (LifeOS), `rect` (Claude Code, `rx`/`ry` rounded), `polygon` (subagent diamond). The simulation tick re-positions whichever element is bound to each datum; size and color are re-applied on every snapshot tick via `applyShapeAttrs`. The actively-writing pulse (white border, 1.4s ease-in-out) is a CSS keyframe applied via the `.pulsing` class — far simpler than the previous vis-network `DataSet.update` polling.
 
 The `viewBox` is `1600 × 1100` with `preserveAspectRatio="xMidYMid meet"` and `overflow: visible` so collision-pushed nodes don't get clipped at the edges.
+
+### Interaction model
+
+Both link and node layers live inside a single `<g class="viewport">` whose `transform` is mutated by `d3.zoom` (scaleExtent 0.2–5). Because `d3.pointer` returns viewBox-space coordinates when the target carries a `viewBox`, pan tracks the cursor 1:1 without explicit screen↔viewBox compensation.
+
+Per-node `d3.drag` sets `fx`/`fy` on the bound datum so positions persist after drop. The drag handler's `mousedown` stops propagation, so node-drags don't also pan the canvas. Drag pins persist across snapshot ticks but are cleared on filter change (`releasePins()`) so the new visible set reflows.
+
+Selection state is tracked in `selectedSessionId` and re-applied on every render plus on `openPanel`/`closePanel` via `applySelectionStyles()`. The helper computes the 1-hop neighbor set from the link layer's bound data and toggles `.selected` (5px white border, overrides `.pulsing`), `.related` (3px translucent white), and `.dimmed` (0.28 opacity) classes on nodes / labels / edges. Clicking the SVG background (target === svg root) calls `closePanel()`; clicking an already-selected node toggles it off.
+
+### Transcript event rendering
+
+`prettyPayload(payload)` is a field-aware formatter shared by backfill + live tail. It recognizes routing decisions (`routing` + `routing_reason`), assistant text (with a `(no text — called tools)` placeholder when `text === ""` alongside non-empty `tool_uses`), tool-call pills (`Name(input_keys)`), labeled text fields (`question`, `answer`, `prompt`, `reason`, `ambiguity`, `sane_reason`, `description`, `label`), compact `budget` and `usage` lines, scalar badges (`model`, `task_id`, `expected_output`, `speed`, `service_tier`, `source`, parent/child ids), and a `pp-extra` tail for unrecognized scalars. Noisy fields (`iterations`, `inference_geo`, `server_tool_use`, the nested `cache_creation` ephemeral buckets, zero `thinking_chars`) are suppressed. Click-to-expand reveals the raw JSON in a sibling `<pre class="payload-raw">` for diagnostic inspection.
 
 ---
 

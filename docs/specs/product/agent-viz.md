@@ -38,9 +38,21 @@ The page is a force-directed graph of sessions, laid out left-to-right by recenc
 | **Size** | Log-scaled by total tokens (input + output + cache). A 100k-token session is roughly 2× a 1k-token session, not 100×. Capped so one fat node can't dominate the canvas. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
 | **Edge** | Spawn relationship — parent → subagent |
-| **X position** | Last-activity recency. Most recent sessions to the right, ≥24h old pinned to the left. Same-age sessions spread vertically via repulsion. |
+| **X position** | Last-activity recency. Most recent sessions to the right, ≥24h old pinned to the left. The recency rail compresses around center when few nodes are visible — one filtered-down node ends up centered, two sit on a narrow band — and stretches to the full width as more nodes appear. |
+| **Edge styling** | Plain curved paths (no arrowheads) between parents and subagents. When a node is selected, edges adjacent to it brighten to white. |
 
 The simulation converges in ~8 seconds and then stops, so the graph stops jittering once it settles. New snapshots arrive every 2 seconds and only nudge nodes whose positions are now misleading.
+
+### Canvas controls
+
+The graph mirrors `/crm/graph`'s pointer model:
+
+- **Drag a node** — pins it where you drop it. Useful when you want to inspect a busy cluster without the simulation nudging things around.
+- **Drag the empty background** — pans the whole graph.
+- **Scroll-wheel / pinch** — zooms in and out (0.2× – 5×).
+- **Click a node** — opens its transcript in the side panel and highlights its parent/child relationships (selected node gets a thick white border, 1-hop neighbors get a thinner white border, everything else dims).
+- **Click the same node again, or click empty background** — deselects and closes the panel.
+- **Filter change** — releases any drag-pinned positions so the new visible set lays out from scratch.
 
 ---
 
@@ -120,11 +132,11 @@ The event feed is newest-on-top. Backfill arrives first (the last 50 events by d
 
 - A **kind label** — click to filter the feed to just that kind (e.g. `tool_call`, `user_message`, `failed`). Click again to clear. When a session first opens with any `user_message` events present, the filter auto-defaults to `user_message` to focus the view on the operator-visible turns.
 - A **timestamp** in your local timezone.
-- A **payload preview** — truncated to 240 chars. Click anywhere on the event to expand to the full payload (rendered in white for legibility); click again to collapse.
+- A **payload preview** — rendered as structured fields (model badge, routing decision, tool-call pills `Name(arg, arg)`, compact budget `90s · $0.30 · 500k tok`, usage summary `↓ in · ↑ out · cache read/create`, free-text fields like `ambiguity` / `question` / `reason`). Noisy fields (`iterations`, nested `ephemeral_*`, etc.) are suppressed. Click anywhere on the event to expand — the raw JSON appears beneath the structured view for diagnostics; click again to collapse.
 
 The panel is **resizable**: drag the left edge to widen or narrow it. The chosen width is remembered across sessions via `localStorage`.
 
-Clicking the same node again, or hitting the `×` button, closes the panel. The graph stays selected; you can click another node directly without re-opening.
+Clicking the same node again, the `×` button, or empty background area closes the panel and clears the graph selection. You can click another node directly to switch focus.
 
 ---
 

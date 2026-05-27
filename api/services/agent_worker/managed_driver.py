@@ -265,7 +265,7 @@ class ManagedAgentsDriver:
             new_events=events,
             total_input_tokens=int(usage.get("input_tokens", 0)),
             total_output_tokens=int(usage.get("output_tokens", 0)),
-            total_cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0)),
+            total_cache_creation_tokens=_extract_cache_creation_tokens(usage),
             total_cache_read_tokens=int(usage.get("cache_read_input_tokens", 0)),
             final_text=final_text,
             error_reason=error_reason,
@@ -439,8 +439,42 @@ class ManagedAgentsDriver:
 
 
 # ---------------------------------------------------------------------------
-# Event-stream parsing helpers
+# Usage / event-stream parsing helpers
 # ---------------------------------------------------------------------------
+
+def _extract_cache_creation_tokens(usage: dict) -> int:
+    """Sum cache_creation tokens, handling both the flat and nested shapes
+    Anthropic's API has emitted.
+
+    Live Managed-Agents responses (confirmed 2026-05-27) return cache_creation
+    as a nested object split into ephemeral_5m / ephemeral_1h buckets:
+        {"cache_creation": {"ephemeral_5m_input_tokens": N,
+                            "ephemeral_1h_input_tokens": M}}
+    Older API doc snippets reference a flat `cache_creation_input_tokens`
+    key. We accept either so the parser survives both shapes.
+
+    Both ephemeral buckets are billed by Anthropic, so we sum them. The
+    1h-cache write is technically 2× input vs. 1.25× for 5m, but
+    `pricing.CACHE_CREATION_RATE_MULTIPLIER` only encodes the 5m multiplier
+    today — refining the split is a follow-up if 1h-cache usage becomes
+    non-trivial (currently 0 in observed responses).
+    """
+    flat = usage.get("cache_creation_input_tokens")
+    if flat is not None:
+        try:
+            return int(flat)
+        except (TypeError, ValueError):
+            return 0
+    nested = usage.get("cache_creation")
+    if isinstance(nested, dict):
+        ephem_5m = nested.get("ephemeral_5m_input_tokens", 0) or 0
+        ephem_1h = nested.get("ephemeral_1h_input_tokens", 0) or 0
+        try:
+            return int(ephem_5m) + int(ephem_1h)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
 
 def _synthesize_status_from_events(events: list[dict]) -> str | None:
     """Map event-stream signals to a terminal status string, or None.
