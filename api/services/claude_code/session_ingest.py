@@ -534,14 +534,16 @@ def parse_session(
     meta.last_event_kind = last_kind
     meta.last_user_text = last_user_text
     meta.subagents = subagents
-    cwds = live_cwds if live_cwds is not None else live_claude_cwds(now)
-    has_live = bool(meta.decoded_cwd) and meta.decoded_cwd in cwds
+    # Process-detection promotion to `running` is now applied at the
+    # snapshot level (build_snapshot) — it requires cross-session comparison
+    # within a cwd to pick the live N of M sessions. For a stand-alone
+    # parse_session call we fall back to the mtime heuristic only.
     meta.status, meta.status_inferred = _infer_status(
         mtime=meta.mtime,
         last_assistant_had_pending_tool=last_assistant_had_pending_tool,
         last_event_was_error=last_event_was_error,
         now=now,
-        has_live_process=has_live,
+        has_live_process=False,
     )
     # Choose a label: prefer the most recent user prompt (truncated); fall
     # back to the working-directory basename so the node is at least
@@ -597,6 +599,8 @@ def _infer_status(
 # ---------------------------------------------------------------------------
 
 
+
+
 # Cache the live-process scan briefly so a single snapshot tick across many
 # sessions doesn't enumerate /proc once per session.
 _PROCESS_CACHE_TTL = 5.0
@@ -605,59 +609,71 @@ _PROCESS_CACHE_TTL = 5.0
 @dataclass
 class _ProcessCache:
     expires_at: float = 0.0
-    cwds: frozenset[str] = field(default_factory=frozenset)
+    # Map of cwd → count of live `claude` processes with that cwd.
+    cwd_counts: dict[str, int] = field(default_factory=dict)
 
 
 _process_cache = _ProcessCache()
 _process_cache_lock = threading.Lock()
 
 
-def live_claude_cwds(now: float | None = None) -> frozenset[str]:
-    """Return the cwds of all live `claude` processes on this machine.
+# Wrapper processes that have `claude` in their argv but are not the actual
+# Claude Code CLI binary. Matching argv loosely (the previous approach)
+# pulled these in and inflated the running-session count.
+_WRAPPER_BINARY_BASENAMES = frozenset({"vt", "vibetunnel", "node", "bash", "sh", "zsh"})
 
-    Used for authoritative `running` status. Cached ~5s so a snapshot
-    tick with many sessions doesn't repeatedly walk `/proc`. Returns an
-    empty frozenset if psutil is unavailable or the scan errors.
+
+def live_claude_cwd_counts(now: float | None = None) -> dict[str, int]:
+    """Return a `{cwd: count}` map of live `claude` processes per project dir.
+
+    Used by `build_snapshot` to scope `running` status per-cwd: for each cwd
+    that has N live processes, the N most-recently-modified jsonl files in
+    that project are marked authoritative-running. Older jsonl files in the
+    same cwd fall back to the mtime heuristic — this prevents the previous
+    bug where one live session inflated every historical session in the
+    same project to `running`.
+
+    Strict matcher: name() == 'claude' OR exe basename == 'claude'. Wrapper
+    processes (`vt claude`, `vibetunnel fwd claude`, the chrome-native-host
+    versioned binary) are excluded explicitly.
+
+    Returns an empty dict on any failure (psutil missing, unreadable proc,
+    etc.) — the caller then uses mtime alone.
     """
     now_t = now if now is not None else time.time()
     with _process_cache_lock:
         if _process_cache.expires_at > now_t:
-            return _process_cache.cwds
+            return dict(_process_cache.cwd_counts)
 
-    cwds: set[str] = set()
+    counts: dict[str, int] = {}
     try:
         import psutil
-        for proc in psutil.process_iter(["name", "cmdline"]):
+        for proc in psutil.process_iter(["name", "exe"]):
             try:
                 name = (proc.info.get("name") or "").lower()
-                cmdline = proc.info.get("cmdline") or []
-                # Match `claude` directly, or a wrapper whose argv basename is
-                # `claude` (the CLI ships as a Node script; some releases run
-                # under node with `claude` in argv).
-                is_claude = (
-                    name == "claude"
-                    or any(
-                        isinstance(arg, str) and arg.rsplit("/", 1)[-1] == "claude"
-                        for arg in cmdline
-                    )
-                )
-                if not is_claude:
+                exe = (proc.info.get("exe") or "")
+                exe_base = exe.rsplit("/", 1)[-1].lower() if exe else ""
+                if name != "claude" and exe_base != "claude":
                     continue
+                if name in _WRAPPER_BINARY_BASENAMES or exe_base in _WRAPPER_BINARY_BASENAMES:
+                    continue
+                # Versioned shipping binary — `/home/.../claude/versions/2.1.152` —
+                # has a numeric basename that won't match 'claude'. Detect it
+                # by exe-path containment so we still count it.
                 cwd = proc.cwd()
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
             except Exception:  # noqa: BLE001 — never crash the scan on one bad proc
                 continue
             if cwd:
-                cwds.add(cwd)
+                counts[cwd] = counts.get(cwd, 0) + 1
     except Exception as exc:  # noqa: BLE001 — psutil import/iter failures degrade gracefully
-        logger.debug("live_claude_cwds: psutil scan failed: %s", exc)
+        logger.debug("live_claude_cwd_counts: psutil scan failed: %s", exc)
 
-    frozen = frozenset(cwds)
     with _process_cache_lock:
         _process_cache.expires_at = now_t + _PROCESS_CACHE_TTL
-        _process_cache.cwds = frozen
-    return frozen
+        _process_cache.cwd_counts = dict(counts)
+    return dict(counts)
 
 
 def invalidate_process_cache() -> None:
@@ -811,22 +827,45 @@ def build_snapshot(
     sessions: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     # One process-scan per snapshot tick — shared across every session.
-    cwds = live_claude_cwds(now=now_t)
+    cwd_counts = live_claude_cwd_counts(now=now_t)
+    # First pass: parse every discovered session with mtime-only status.
+    # Process-detection promotion is layered on per-cwd below so we don't
+    # over-attribute `running` to historical sessions sharing a project dir.
+    parsed_by_cwd: dict[str, list[SessionMeta]] = {}
     for meta in discover_sessions(projects_dir, lookback_days=lookback_days, limit=limit, now=now_t):
         try:
-            parsed_meta, _events = parse_session(meta, now=now_t, live_cwds=cwds)
+            parsed_meta, _events = parse_session(meta, now=now_t)
         except Exception as exc:  # noqa: BLE001 — never break the snapshot on one bad file
             logger.warning("claude_code parse failed for %s: %s", meta.jsonl_path, exc)
             continue
-        sessions.append(to_session_dict(parsed_meta))
-        for sa in parsed_meta.subagents:
-            child = subagent_session_dict(parsed_meta, sa)
-            sessions.append(child)
-            edges.append({
-                "from": parsed_meta.session_id,
-                "to": child["session_id"],
-                "type": "spawn",
-            })
+        parsed_by_cwd.setdefault(parsed_meta.decoded_cwd or "", []).append(parsed_meta)
+
+    # Second pass: for each cwd with live `claude` processes, promote the
+    # top-N (by mtime, most-recent first) sessions to authoritative `running`.
+    # This caps the running-set size by the actual process count so a single
+    # live session doesn't drag every historical jsonl in the project along.
+    for cwd, parsed_list in parsed_by_cwd.items():
+        n_live = cwd_counts.get(cwd, 0)
+        if not n_live or not cwd:
+            continue
+        parsed_list.sort(key=lambda m: m.mtime, reverse=True)
+        for parsed_meta in parsed_list[:n_live]:
+            parsed_meta.status = "running"
+            parsed_meta.status_inferred = False
+
+    # Third pass: assemble snapshot dicts + spawn edges (subagents emit from
+    # their parent's parse output, so we walk parsed_by_cwd in order).
+    for parsed_list in parsed_by_cwd.values():
+        for parsed_meta in parsed_list:
+            sessions.append(to_session_dict(parsed_meta))
+            for sa in parsed_meta.subagents:
+                child = subagent_session_dict(parsed_meta, sa)
+                sessions.append(child)
+                edges.append({
+                    "from": parsed_meta.session_id,
+                    "to": child["session_id"],
+                    "type": "spawn",
+                })
 
     if cache_ttl > 0:
         with _snapshot_cache_lock:

@@ -525,50 +525,96 @@ def test_subagent_window_empty_when_tool_use_id_missing(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_live_process_detection_promotes_to_running(tmp_path: Path, monkeypatch):
-    """When a live `claude` process matches the project cwd, status is
-    `running` and `status_inferred` is False (authoritative)."""
+def test_live_process_detection_per_cwd_topN_promotes_recent_to_running(
+    tmp_path: Path, monkeypatch
+):
+    """Live claude process in a cwd → top-N most-recent jsonls in that cwd
+    are marked authoritative-running (N = process count). Older jsonls in
+    the same cwd stay inferred from mtime — this is the regression guard
+    for the bug where one live session inflated every historical sibling."""
     proj = tmp_path / "-home-syn-Code-A"
-    _write_jsonl(proj / "old-but-live.jsonl", [_user_event("hi"), _assistant_event("ok")])
-    # Backdate the mtime so the heuristic alone would say `completed`.
+    _write_jsonl(proj / "active.jsonl", [_user_event("now")])
+    _write_jsonl(proj / "old-1.jsonl", [_user_event("then")])
+    _write_jsonl(proj / "old-2.jsonl", [_user_event("then")])
+    # Backdate the old sessions past the mtime threshold so heuristic says completed.
     old = time.time() - 48 * 3600
-    os.utime(proj / "old-but-live.jsonl", (old, old))
+    os.utime(proj / "old-1.jsonl", (old - 100, old - 100))
+    os.utime(proj / "old-2.jsonl", (old - 200, old - 200))
 
-    # Force the live-process scan to claim this cwd is held by `claude`.
-    monkeypatch.setattr(cc, "live_claude_cwds", lambda now=None: frozenset({"/home/syn/Code/A"}))
+    # 1 live `claude` process in this project — only the most-recent jsonl
+    # should be promoted to running.
+    monkeypatch.setattr(
+        cc, "live_claude_cwd_counts",
+        lambda now=None: {"/home/syn/Code/A": 1},
+    )
+    cc.invalidate_cache()
     cc.invalidate_process_cache()
 
-    metas = cc.discover_sessions(projects_dir=tmp_path, lookback_days=365)
-    meta, _ = cc.parse_session(metas[0], live_cwds=cc.live_claude_cwds())
-    assert meta.status == "running"
-    assert meta.status_inferred is False
+    sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
+    by_task = {s["task_id"]: s for s in sessions if s.get("source") == "claude_code"}
+    assert by_task["active"]["status"] == "running"
+    assert by_task["active"]["status_inferred"] is False
+    # Critical: the sibling sessions in the same cwd are NOT promoted.
+    assert by_task["old-1"]["status"] == "completed"
+    assert by_task["old-1"]["status_inferred"] is True
+    assert by_task["old-2"]["status"] == "completed"
+
+
+@pytest.mark.unit
+def test_live_process_detection_multi_process_cwd(tmp_path: Path, monkeypatch):
+    """N live processes in the same cwd → top-N most-recent jsonls all
+    get authoritative-running."""
+    proj = tmp_path / "-home-syn-Code-A"
+    _write_jsonl(proj / "s1.jsonl", [_user_event("a")])
+    _write_jsonl(proj / "s2.jsonl", [_user_event("b")])
+    _write_jsonl(proj / "s3.jsonl", [_user_event("c")])
+    # Make s3 the oldest so it's the one that DOESN'T get promoted.
+    old = time.time() - 48 * 3600
+    os.utime(proj / "s3.jsonl", (old, old))
+
+    monkeypatch.setattr(
+        cc, "live_claude_cwd_counts",
+        lambda now=None: {"/home/syn/Code/A": 2},
+    )
+    cc.invalidate_cache()
+    cc.invalidate_process_cache()
+
+    sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
+    by_task = {s["task_id"]: s for s in sessions if s.get("source") == "claude_code"}
+    # Top-2 most-recent are running (authoritative).
+    assert by_task["s1"]["status"] == "running"
+    assert by_task["s1"]["status_inferred"] is False
+    assert by_task["s2"]["status"] == "running"
+    assert by_task["s2"]["status_inferred"] is False
+    # 3rd jsonl stays on heuristic.
+    assert by_task["s3"]["status"] == "completed"
 
 
 @pytest.mark.unit
 def test_live_process_detection_no_match_falls_back_to_heuristic(tmp_path: Path, monkeypatch):
-    """When no live process matches, mtime heuristic still applies and the
-    status is flagged as inferred."""
+    """No live process in this cwd → mtime heuristic applies, status_inferred=True."""
     proj = tmp_path / "-home-syn-Code-A"
     _write_jsonl(proj / "idle.jsonl", [_user_event("hi"), _assistant_event("ok")])
     old = time.time() - 7200
     os.utime(proj / "idle.jsonl", (old, old))
-    monkeypatch.setattr(cc, "live_claude_cwds", lambda now=None: frozenset())
+    monkeypatch.setattr(cc, "live_claude_cwd_counts", lambda now=None: {})
+    cc.invalidate_cache()
     cc.invalidate_process_cache()
 
-    metas = cc.discover_sessions(projects_dir=tmp_path, lookback_days=365)
-    meta, _ = cc.parse_session(metas[0], live_cwds=cc.live_claude_cwds())
-    assert meta.status == "yielded"
-    assert meta.status_inferred is True
+    sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
+    target = next(s for s in sessions if s["task_id"] == "idle")
+    assert target["status"] == "yielded"
+    assert target["status_inferred"] is True
 
 
 @pytest.mark.unit
 def test_live_process_cache_avoids_repeated_scans(monkeypatch):
-    """The process-cwd cache serves repeat calls within the TTL without re-scanning."""
+    """The cache serves repeat calls within the TTL without re-scanning /proc."""
     calls: list[int] = []
 
     class _FakeProc:
-        def __init__(self, name, cmdline, cwd_val):
-            self.info = {"name": name, "cmdline": cmdline}
+        def __init__(self, name: str, exe: str, cwd_val: str):
+            self.info = {"name": name, "exe": exe}
             self._cwd = cwd_val
 
         def cwd(self):
@@ -576,12 +622,45 @@ def test_live_process_cache_avoids_repeated_scans(monkeypatch):
 
     def _fake_iter(*_, **__):
         calls.append(1)
-        return iter([_FakeProc("claude", [], "/some/cwd")])
+        return iter([_FakeProc("claude", "/usr/local/bin/claude", "/home/syn/Code/A")])
 
     import psutil as _psutil
     cc.invalidate_process_cache()
     monkeypatch.setattr(_psutil, "process_iter", _fake_iter)
-    a = cc.live_claude_cwds()
-    b = cc.live_claude_cwds()  # within TTL — should hit cache
-    assert a == b == frozenset({"/some/cwd"})
+    a = cc.live_claude_cwd_counts()
+    b = cc.live_claude_cwd_counts()  # within TTL — should hit cache
+    assert a == b == {"/home/syn/Code/A": 1}
     assert len(calls) == 1  # process_iter only ran once
+
+
+@pytest.mark.unit
+def test_live_process_detection_ignores_wrapper_binaries(monkeypatch):
+    """`vt claude`, `vibetunnel fwd claude`, etc. all have `claude`
+    somewhere in their argv but are NOT the CLI process. Their cwds
+    must not be counted as live-claude cwds."""
+
+    class _FakeProc:
+        def __init__(self, name: str, exe: str, cwd_val: str):
+            self.info = {"name": name, "exe": exe}
+            self._cwd = cwd_val
+
+        def cwd(self):
+            return self._cwd
+
+    fakes = [
+        # vt wrapper — name() = "bash" (excluded by wrapper list)
+        _FakeProc("bash", "/bin/bash", "/some/wrapper/cwd"),
+        # vibetunnel fwd — name() = "node" (excluded by wrapper list)
+        _FakeProc("node", "/home/syn/.nvm/.../bin/node", "/some/vibetunnel/cwd"),
+        # The real claude — name=claude is the match
+        _FakeProc("claude", "/usr/local/bin/claude", "/home/syn/Code/A"),
+    ]
+
+    def _fake_iter(*_, **__):
+        return iter(fakes)
+
+    import psutil as _psutil
+    cc.invalidate_process_cache()
+    monkeypatch.setattr(_psutil, "process_iter", _fake_iter)
+    counts = cc.live_claude_cwd_counts()
+    assert counts == {"/home/syn/Code/A": 1}
