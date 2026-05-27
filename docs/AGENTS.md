@@ -3,6 +3,8 @@
 **Status:** Complete
 **Last Updated:** 2026-05-27
 
+> **Backlog lives in GitHub issues.** Future work, deferred features, bugs, and enhancements are tracked as GitHub issues — never as `backlog.md` files in this directory. Plan files are reserved for time-bounded execution notes (migration plans, gap analyses, point-in-time issue-drafting context).
+
 **This document defines mandatory documentation standards. All contributors — human and AI — must follow these rules when creating or modifying documentation. Consistency is not optional; it ensures documentation remains navigable, maintainable, and valuable as a shared context layer.**
 
 ## Purpose
@@ -85,9 +87,11 @@ Guides are instructional — they tell you how to do something, not why it's des
 ### Plans
 
 **Location:** `docs/plans/` (gitignored — personal/active planning notes)
-**Purpose:** Active execution work — phases, tasks, roadmaps, backlogs
+**Purpose:** Time-bounded execution notes for a specific effort — migration plans, dated gap analyses, point-in-time issue-drafting context.
 
-Plans are **ephemeral**. They become git history (or, in this repo, never enter the public repo) when complete. For trackable work, prefer GitHub issues; for personal planning, use the local `docs/plans/` directory.
+**Backlog and trackable cross-contributor work belong in GitHub issues, not in `docs/plans/`.** Never create a running `backlog.md`, `todo.md`, or `ideas.md` — file an issue. Plan files exist only for the slice of work that's actively being executed and would clutter the issue tracker (e.g., "phase 2 of the linux migration"), and they're moved to `archive/` the moment that work is done.
+
+Plans are **ephemeral**. They become git history (or, in this repo, never enter the public repo) when complete.
 
 ### Archive
 
@@ -106,7 +110,8 @@ Archive content is **not** part of the public repo. When a durable insight from 
 | Coding conventions, naming rules, testing patterns | `specs/standards/` | Not in guides (standards prescribe, guides instruct) |
 | Architectural decisions with rationale and alternatives | `adr/` | Never modify after acceptance — create a new ADR to supersede |
 | Setup procedures, troubleshooting, operator how-to | `guides/` | Not design rationale |
-| Phases, tasks, roadmaps, checklists | `plans/` (or GitHub issues) | Don't put in specs |
+| Backlog, deferred features, bugs, enhancements | **GitHub issues** | Never in `backlog.md` or any plan file |
+| Time-bounded execution notes (migration plans, dated gap analyses) | `plans/` | Don't put in specs; not a substitute for GitHub issues |
 | Audit notes, investigation working files, superseded docs | `archive/` | Don't link from live specs unless promoting a specific insight |
 
 **Rule of thumb:** "Why do we build this?" → vision. "What should it be?" → product spec. "How is it built?" → technical spec. "Why did we decide?" → ADR. "How do I do X?" → guide. "When/how do we get there?" → plan.
@@ -319,11 +324,12 @@ Every doc subdirectory has an `AGENTS.md` + `CLAUDE.md` pair so any reader (huma
 Existing pairs:
 - `docs/adr/AGENTS.md` + `CLAUDE.md`
 - `docs/guides/AGENTS.md` + `CLAUDE.md`
+- `docs/specs/AGENTS.md` + `CLAUDE.md`
+- `docs/specs/product/AGENTS.md` + `CLAUDE.md`
+- `docs/specs/technical/AGENTS.md` + `CLAUDE.md`
 - `docs/specs/standards/AGENTS.md` + `CLAUDE.md`
 - `docs/vision/AGENTS.md` + `CLAUDE.md`
-- `docs/specs/product/AGENTS.md` + `CLAUDE.md` (added in #181)
-- `docs/specs/technical/AGENTS.md` + `CLAUDE.md` (added in #181)
-- `docs/plans/AGENTS.md` + `CLAUDE.md` (added in #181 — note: gitignored)
+- `docs/plans/AGENTS.md` + `CLAUDE.md` (gitignored directory; only the AGENTS pair is tracked)
 
 **AGENTS.md** is the primary instruction file (universal, works with all AI tools). **CLAUDE.md** is a one-line wrapper: `@AGENTS.md`. The `@` import is relative to the file containing it; since CLAUDE.md and AGENTS.md are always co-located, the import is always literally `@AGENTS.md`.
 
@@ -363,6 +369,7 @@ Aim for ≤30 lines. Subdirectory AGENTS.md files are wayfinding, not extended c
 **Common violations to avoid:**
 - Adding "Next Steps" or task lists to specs or ADRs.
 - Mixing planning (roadmaps, tasks) into design documents.
+- Creating a running backlog file (`backlog.md`, `todo.md`, `ideas.md`) instead of filing GitHub issues.
 - Creating documents without "Related Documents" sections.
 - Failing to update cross-references when moving or splitting documents.
 - Modifying an accepted ADR in place (instead of superseding).

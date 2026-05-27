@@ -4,9 +4,15 @@ This directory contains product specifications — what the system does from a c
 
 - `agent-viz.md` — The `/agents` page (D3 graph + side panel) that visualizes agent worker and Claude Code sessions
 - `agent-worker.md` — The `#agent`-tagged task workflow (Telegram-triggered autonomous worker)
+- `api-crm.md` — CRM-specific HTTP endpoints (people, interactions, graph data)
 - `api-reference.md` — HTTP endpoint catalog (request/response shapes, query parameters)
 - `chat-ui.md` — The web chat interface
-- `crm-ui.md` — The `/crm` page (people, interactions, graph, analytics)
+- `claude-code-orchestration.md` — How LifeOS exposes itself to Claude Code (skills, MCP, orchestration patterns)
+- `crm-analytics.md` — CRM dashboards (Family / Me / Birthdays / Relationship)
+- `crm-graph.md` — CRM graph view (pan/zoom/drag, edge semantics)
+- `crm-interactions.md` — CRM interaction timeline
+- `crm-people.md` — CRM people list and person detail views
+- `crm-ui.md` — `/crm` page index (links out to the per-view specs above)
 - `data-model.md` — Canonical entities (SourceEntity, PersonEntity) and relationships
 - `entity-resolution.md` — How emails, phones, and names link to canonical people
 - `mcp-tools.md` — The MCP tool catalog exposed to Claude Code and other agents

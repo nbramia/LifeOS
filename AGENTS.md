@@ -4,7 +4,12 @@
 > **Status:** Complete
 > **Last Updated:** 2026-03-04
 
-LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, messages, photos, financial data) for semantic search, synthesis, and proactive intelligence. Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMessage, phone calls, and contacts.
+LifeOS is a self-hosted personal AI assistant with two halves:
+
+1. **A context layer** — indexes personal data (notes, emails, messages, photos, calendar, contacts, financial data) into a unified semantically-searchable corpus with cross-source entity resolution.
+2. **An agentic layer** — an agent worker plus chat/Telegram/MCP surfaces that autonomously complete multi-step tasks against that context (drafting, scheduling, researching, prepping) and report progress as they work.
+
+Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMessage, phone calls, and contacts.
 
 ---
 
@@ -14,7 +19,8 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 - **Hybrid search**: Vector similarity (ChromaDB) + keyword matching (BM25/FTS5), fused via Reciprocal Rank Fusion. See [ADR-004](docs/adr/004-hybrid-search.md).
 - **Entity resolution**: Links emails, phones, and names across sources to canonical people using fuzzy matching with scoring.
 - **Sync phases**: Seven-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync → Entity Cleanup → Consistency Verification.
-- **Agentic chat**: Local LLM autonomously calls 15 tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
+- **Agentic chat**: Orchestrator LLM autonomously calls 15+ tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
+- **Agent worker**: Autonomous executor for `#agent`-tagged tasks (or work delegated from chat/Telegram). Runs long, multi-step sessions with the full MCP tool catalog, reports progress through the originating channel, and can route to local Gemma or cloud Claude via Managed Agents. See [specs/product/agent-worker.md](docs/specs/product/agent-worker.md).
 
 ## Tech Stack
 
