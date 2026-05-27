@@ -55,6 +55,12 @@ class Session:
     managed_agent_session_id: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Prompt-cache buckets — kept separate from total_input_tokens because
+    # they're billed at different rates (cache_creation = 1.25× input,
+    # cache_read = 0.10× input). On cache-heavy presets cache_creation on the
+    # first turn often dwarfs uncached input.
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
     total_dollars: float = 0.0
     total_active_seconds: float = 0.0
     root_session_id: str | None = None
@@ -73,6 +79,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at          INTEGER NOT NULL,
     total_input_tokens        INTEGER NOT NULL DEFAULT 0,
     total_output_tokens       INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     total_dollars             REAL    NOT NULL DEFAULT 0.0,
     total_active_seconds      REAL    NOT NULL DEFAULT 0.0,
     expected_output           TEXT,
@@ -223,6 +231,21 @@ class SessionStore:
                     "ALTER TABLE pending_questions ADD COLUMN kind TEXT "
                     "NOT NULL DEFAULT 'clarification'"
                 )
+            # Idempotent migration for the prompt-cache token buckets on
+            # `sessions`. Old rows stay at zero — we don't backfill historical
+            # sessions, the raw event payloads in transcripts still have the
+            # data if anyone ever wants to recompute.
+            sess_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "total_cache_creation_tokens" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN total_cache_creation_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "total_cache_read_tokens" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN total_cache_read_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -367,19 +390,36 @@ class SessionStore:
         tokens_in: int,
         tokens_out: int,
         dollars: float,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> None:
-        """Add to a session's cumulative token + dollar counters."""
+        """Add to a session's cumulative token + dollar counters.
+
+        Cache buckets default to zero so the local executor (which only
+        sees plain input/output) doesn't need to update; managed sessions
+        always pass all four buckets.
+        """
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET total_input_tokens  = total_input_tokens  + ?,
-                    total_output_tokens = total_output_tokens + ?,
-                    total_dollars       = total_dollars       + ?,
-                    last_activity_at    = ?
+                SET total_input_tokens          = total_input_tokens          + ?,
+                    total_output_tokens         = total_output_tokens         + ?,
+                    total_cache_creation_tokens = total_cache_creation_tokens + ?,
+                    total_cache_read_tokens     = total_cache_read_tokens     + ?,
+                    total_dollars               = total_dollars               + ?,
+                    last_activity_at            = ?
                 WHERE task_id = ?
                 """,
-                (tokens_in, tokens_out, dollars, _now(), task_id),
+                (
+                    tokens_in,
+                    tokens_out,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    dollars,
+                    _now(),
+                    task_id,
+                ),
             )
 
     def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
@@ -838,6 +878,16 @@ class SessionStore:
             last_activity_at=row["last_activity_at"],
             total_input_tokens=row["total_input_tokens"],
             total_output_tokens=row["total_output_tokens"],
+            total_cache_creation_tokens=(
+                row["total_cache_creation_tokens"]
+                if "total_cache_creation_tokens" in row.keys()
+                else 0
+            ),
+            total_cache_read_tokens=(
+                row["total_cache_read_tokens"]
+                if "total_cache_read_tokens" in row.keys()
+                else 0
+            ),
             total_dollars=row["total_dollars"],
             total_active_seconds=(
                 row["total_active_seconds"]

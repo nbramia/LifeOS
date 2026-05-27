@@ -31,14 +31,43 @@ PRICING: dict[str, dict[str, float]] = {
 }
 
 
-def cost_for(model: str, tokens_in: int, tokens_out: int) -> float:
+# Anthropic prompt-cache rate multipliers, relative to the model's base input
+# rate (see https://www.anthropic.com/pricing). cache_creation writes are
+# 1.25× input — slightly more expensive than a normal input token because of
+# the indexing work. cache_read hits are 0.10× input — a 10× discount on
+# tokens that come from the cache instead of being processed fresh.
+CACHE_CREATION_RATE_MULTIPLIER: float = 1.25
+CACHE_READ_RATE_MULTIPLIER: float = 0.10
+
+
+def cost_for(
+    model: str,
+    tokens_in: int,
+    tokens_out: int,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
     """Return the dollar cost of a single LLM call.
 
-    Unknown models fall through to a conservative Opus-rate estimate so a
-    typo can't accidentally suppress budget enforcement. Logging is the
-    caller's responsibility.
+    Anthropic charges four token buckets:
+    - `tokens_in` — uncached input tokens, at the model's input rate.
+    - `tokens_out` — output tokens, at the model's output rate.
+    - `cache_creation_tokens` — tokens written into the prompt cache on a
+      cache-cold turn, at 1.25× the input rate.
+    - `cache_read_tokens` — tokens served from the prompt cache on a cache-
+      warm turn, at 0.10× the input rate.
+
+    Cache buckets default to zero so existing two-arg call sites keep
+    working. Unknown models fall through to a conservative Opus-rate
+    estimate so a typo can't accidentally suppress budget enforcement.
     """
     rates = PRICING.get(model)
     if rates is None:
         rates = PRICING["claude-opus-4-7"]
-    return tokens_in * rates["input"] + tokens_out * rates["output"]
+    input_rate = rates["input"]
+    return (
+        tokens_in * input_rate
+        + tokens_out * rates["output"]
+        + cache_creation_tokens * input_rate * CACHE_CREATION_RATE_MULTIPLIER
+        + cache_read_tokens * input_rate * CACHE_READ_RATE_MULTIPLIER
+    )

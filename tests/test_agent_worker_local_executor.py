@@ -471,6 +471,48 @@ def test_pricing_unknown_model_falls_through_to_opus_rate():
     assert unknown == pytest.approx(opus)
 
 
+@pytest.mark.unit
+def test_pricing_cache_creation_charged_at_125pct_of_input():
+    """cache_creation tokens cost 1.25× the model's input rate."""
+    # Sonnet input rate is $3/M, so 1k cache_creation = $0.003 × 1.25 = $0.00375.
+    cost = cost_for("claude-sonnet-4-6", 0, 0, cache_creation_tokens=1000)
+    assert cost == pytest.approx(0.003 * 1.25)
+
+
+@pytest.mark.unit
+def test_pricing_cache_read_charged_at_10pct_of_input():
+    """cache_read tokens cost 0.10× the model's input rate (12.5× cheaper
+    than cache_creation, 10× cheaper than uncached input)."""
+    cost = cost_for("claude-sonnet-4-6", 0, 0, cache_read_tokens=1000)
+    assert cost == pytest.approx(0.003 * 0.10)
+
+
+@pytest.mark.unit
+def test_pricing_all_four_buckets_compose():
+    """Mixed payload: input + output + cache_creation + cache_read all sum."""
+    # Sonnet: input $3/M, output $15/M.
+    # 1k input = $0.003, 1k output = $0.015,
+    # 1k cache_creation = $0.00375, 1k cache_read = $0.0003.
+    cost = cost_for(
+        "claude-sonnet-4-6",
+        tokens_in=1000,
+        tokens_out=1000,
+        cache_creation_tokens=1000,
+        cache_read_tokens=1000,
+    )
+    assert cost == pytest.approx(0.003 + 0.015 + 0.00375 + 0.0003)
+
+
+@pytest.mark.unit
+def test_pricing_cache_buckets_default_to_zero():
+    """Two-arg call sites (the local executor) keep working unchanged."""
+    cost = cost_for("claude-haiku-4-5", 1000, 500)
+    expected_two_arg = cost_for(
+        "claude-haiku-4-5", 1000, 500, cache_creation_tokens=0, cache_read_tokens=0,
+    )
+    assert cost == pytest.approx(expected_two_arg)
+
+
 # ---------------------------------------------------------------------------
 # System-prompt structure (issue #119 — Anthropic 4.6/4.7 best practices)
 # ---------------------------------------------------------------------------
