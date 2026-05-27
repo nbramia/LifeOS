@@ -321,6 +321,71 @@ def test_resume_url_encoded_substitutions_for_uri_schemes(
 
 
 @pytest.mark.unit
+def test_resume_returns_inner_command_for_clipboard(
+    client, synthetic_session, monkeypatch
+):
+    """The inner-command setting is rendered with substitutions and surfaced
+    in the response as `inner_command` so the frontend can copy it to the
+    clipboard (Warp Linux ignores its URI-scheme `&command=`)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+    monkeypatch.setattr(
+        settings, "cc_resume_inner_cmd",
+        "vt claude --resume {session_id} --workdir {cwd}",
+    )
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            self.pid = 1
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sid in body["inner_command"]
+    assert "/home/syn/Code/A" in body["inner_command"]
+    assert "{session_id}" not in body["inner_command"]
+    assert "{cwd}" not in body["inner_command"]
+
+
+@pytest.mark.unit
+def test_resume_empty_inner_command_yields_empty_string(
+    client, synthetic_session, monkeypatch
+):
+    """Operators can disable the clipboard copy by setting INNER_CMD empty."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd", "")
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            self.pid = 1
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["inner_command"] == ""
+
+
+@pytest.mark.unit
 def test_resume_env_file_overrides_systemd_env(
     client, synthetic_session, monkeypatch, tmp_path
 ):

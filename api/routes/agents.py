@@ -560,6 +560,18 @@ async def resume_claude_code_session(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
+    # Render the inner command (the actual `claude --resume` invocation)
+    # for the frontend to copy to clipboard — Warp Linux ignores the
+    # `&command=` URI param, so the operator pastes it once the terminal
+    # opens. Same substitution rules as the outer template (raw only —
+    # URL-encoded variants aren't meaningful inside a terminal).
+    inner_template = (settings.cc_resume_inner_cmd or "").strip()
+    inner_rendered = (
+        inner_template
+        .replace("{session_id}", bare)
+        .replace("{cwd}", target.decoded_cwd)
+    )
+
     # Give the spawn a beat — if it crashed immediately, surface stderr.
     try:
         proc.wait(timeout=0.5)
@@ -570,6 +582,7 @@ async def resume_claude_code_session(
             "pid": proc.pid,
             "command": argv,
             "cwd": target.decoded_cwd,
+            "inner_command": inner_rendered,
         }
     # If we got here, the process exited within 0.5s — likely an error.
     stderr_preview = b""

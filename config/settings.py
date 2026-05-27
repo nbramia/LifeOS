@@ -210,21 +210,25 @@ class Settings(BaseSettings):
                     "depends on the operator's desktop environment."
     )
     cc_resume_cmd: str = Field(
-        default=(
-            "warp-terminal "
-            "warp://action/new_tab?path={cwd_url}"
-            "&command=vt+claude+--dangerously-skip-permissions+--resume+{session_id_url}"
-        ),
+        default="warp-terminal warp://action/new_tab?path={cwd_url}",
         alias="LIFEOS_CC_RESUME_CMD",
-        description="Template command for resuming a Claude Code session. "
-                    "Substitutions: `{session_id}` (bare uuid), `{cwd}` "
-                    "(decoded project dir), and URL-encoded variants "
-                    "`{session_id_url}` / `{cwd_url}` for use inside "
-                    "`warp://`, `vscode://`, or other URI-scheme launchers. "
-                    "The default opens the session in a new Warp tab and "
-                    "runs vt+claude inline; override to point at a "
-                    "different terminal app. Parsed with shlex.split — "
-                    "no shell metacharacters."
+        description="Launcher command for resuming a Claude Code session. "
+                    "Default opens a new Warp tab at the project directory. "
+                    "Linux Warp ignores `&command=` in its URI scheme, so the "
+                    "actual `claude --resume` command is paired with "
+                    "LIFEOS_CC_RESUME_INNER_CMD and copied to the operator's "
+                    "clipboard on click. Substitutions: `{session_id}`, "
+                    "`{cwd}`, and URL-encoded `{session_id_url}` / `{cwd_url}`. "
+                    "Parsed with shlex.split — no shell metacharacters."
+    )
+    cc_resume_inner_cmd: str = Field(
+        default="vt claude --dangerously-skip-permissions --resume {session_id}",
+        alias="LIFEOS_CC_RESUME_INNER_CMD",
+        description="Command intended to run *inside* the spawned terminal. "
+                    "Returned in the resume response and copied to the "
+                    "operator's clipboard so they can paste it once the "
+                    "terminal opens. Set to empty to disable clipboard "
+                    "copy. Substitutions: `{session_id}`, `{cwd}`."
     )
     cc_resume_env_file: str = Field(
         default="",

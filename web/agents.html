@@ -746,7 +746,27 @@
         throw new Error(`HTTP ${r.status}: ${msg}`);
       }
       const result = await r.json();
-      showToast(`Spawned (pid ${result.pid}) in ${result.cwd}`, false);
+      // Warp Linux ignores `&command=` in its URI scheme, so the actual
+      // `claude --resume` invocation comes back as `inner_command` and we
+      // copy it to the clipboard for the operator to paste once the
+      // terminal opens.
+      let copied = false;
+      if (result.inner_command && navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(result.inner_command);
+          copied = true;
+        } catch (_) {
+          // Clipboard API can fail when the page isn't focused (browser
+          // throws NotAllowedError). Fall through to a non-copy toast.
+        }
+      }
+      if (copied) {
+        showToast(`Warp opened. Resume command copied to clipboard — paste it.`, false);
+      } else if (result.inner_command) {
+        showToast(`Warp opened. Run: ${result.inner_command}`, false);
+      } else {
+        showToast(`Spawned (pid ${result.pid}) in ${result.cwd}`, false);
+      }
     } catch (err) {
       showToast(`Resume failed: ${err.message}`, true);
     } finally {
