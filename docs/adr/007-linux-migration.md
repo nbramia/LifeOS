@@ -3,8 +3,9 @@
 > **Decision:** Migrate the LifeOS server from Mac Mini (macOS) to a Linux workstation, and replace the Claude API orchestrator with a local LLM.
 > **Date:** 2026-03-04
 > **Status:** Accepted
-> **Last Updated:** 2026-03-04
+> **Last Updated:** 2026-05-27
 > **Supersedes:** [ADR-005](005-external-venv-macos-tcc.md) (external venv rationale — TCC no longer applies, but the practice is retained by convention)
+> **Amended by:** [ADR-009](009-llm-backend-toggle.md) (the local-first orchestrator default became an operator-configurable toggle)
 
 ## Context
 
