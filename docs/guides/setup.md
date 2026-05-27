@@ -355,6 +355,7 @@ launchctl list | grep lifeos
 
 > **Note:** This phase applies only to macOS machines running the Apple Data Agent.
 > On Linux, Apple data is imported via `apple_data_import.py` from nightly rsync exports.
+> The design rationale (why a `.app` wrapper, why cron, why rsync, what fails when) is captured in [ADR-010: Apple Data Agent](../adr/010-apple-data-agent.md).
 
 Phone calls, FaceTime, and iMessage sync **require Full Disk Access** to read system
 databases. Without this phase, those data sources will not sync.
