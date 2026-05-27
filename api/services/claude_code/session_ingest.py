@@ -60,8 +60,13 @@ _USAGE_CACHE_READ = "cache_read_input_tokens"
 _SUBAGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
 
 # Status-inference thresholds (seconds).
-_RUNNING_MTIME_THRESHOLD = 60
-_YIELDED_MTIME_THRESHOLD = 86_400  # 24h
+# A jsonl touched in the last 10 minutes reads as `running` even if the
+# user has stepped away — the CLI typically appends in bursts and a single
+# tight 60s threshold flipped sessions to inactive mid-pause.
+_RUNNING_MTIME_THRESHOLD = 600  # 10 min
+# Anything modified within 24h is `inactive` (resumable) — beyond that
+# we treat as truly done.
+_INACTIVE_MTIME_THRESHOLD = 86_400  # 24h
 
 # Truncation cap for tool-result payload previews (privacy + UI bandwidth).
 _PAYLOAD_PREVIEW_MAX = 240
@@ -133,7 +138,7 @@ class SessionMeta:
     mtime: float
     started_at: int = 0
     last_activity_at: int = 0
-    status: str = "yielded"
+    status: str = "inactive"
     status_inferred: bool = True
     model: str = ""
     parent_session_id: str | None = None
@@ -573,11 +578,13 @@ def _infer_status(
     Rules:
       - Live `claude` process matches the project cwd → `running`
         (authoritative — `inferred=False`).
-      - Modified in the last 60s → `running` (mtime-only — `inferred=True`).
-      - Modified within 24h → `yielded` (resumable; user closed the terminal).
+      - Modified in the last 10 minutes → `running` (mtime-only).
+      - Modified within 24h → `inactive` (resumable; user closed the
+        terminal or stepped away). Distinct from the agent worker's
+        `yielded` which specifically means 'paused waiting on children'.
       - Older, ended on an error → `failed`.
-      - Older, pending tool in flight → `yielded` (could be a long-running
-        tool; lacking process evidence we can't say it's abandoned).
+      - Older, pending tool in flight → `inactive` (could be a long-
+        running tool; lacking process evidence we can't say abandoned).
       - Otherwise → `completed`.
     """
     if has_live_process:
@@ -585,12 +592,12 @@ def _infer_status(
     age = (now if now is not None else time.time()) - mtime
     if age < _RUNNING_MTIME_THRESHOLD:
         return ("running", True)
-    if age < _YIELDED_MTIME_THRESHOLD:
-        return ("yielded", True)
+    if age < _INACTIVE_MTIME_THRESHOLD:
+        return ("inactive", True)
     if last_event_was_error:
         return ("failed", True)
     if last_assistant_had_pending_tool:
-        return ("yielded", True)
+        return ("inactive", True)
     return ("completed", True)
 
 

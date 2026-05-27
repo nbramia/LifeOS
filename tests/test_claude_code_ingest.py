@@ -288,16 +288,16 @@ def test_status_inference_running_when_mtime_fresh(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_status_inference_yielded_when_idle(tmp_path: Path):
+def test_status_inference_inactive_when_idle(tmp_path: Path):
     proj = tmp_path / "-home-syn-Code-A"
     path = proj / "idle.jsonl"
     _write_jsonl(path, [_user_event("hi"), _assistant_event("ok")])
-    # Backdate to 2h ago — past 60s threshold but before 24h.
+    # Backdate to 2h ago — past 10-min running threshold but before 24h.
     two_hours = time.time() - 7200
     os.utime(path, (two_hours, two_hours))
     metas = cc.discover_sessions(projects_dir=tmp_path)
     meta, _ = cc.parse_session(metas[0])
-    assert meta.status == "yielded"
+    assert meta.status == "inactive"
 
 
 @pytest.mark.unit
@@ -603,7 +603,7 @@ def test_live_process_detection_no_match_falls_back_to_heuristic(tmp_path: Path,
 
     sessions, _ = cc.build_snapshot(projects_dir=tmp_path, cache_ttl=0)
     target = next(s for s in sessions if s["task_id"] == "idle")
-    assert target["status"] == "yielded"
+    assert target["status"] == "inactive"
     assert target["status_inferred"] is True
 
 
