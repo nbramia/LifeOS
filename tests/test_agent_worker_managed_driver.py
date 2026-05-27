@@ -605,6 +605,47 @@ def test_kill_session_swallows_errors():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+def test_update_session_sends_post_with_agent_payload():
+    """`update_session` POSTs the agent config under `agent` to the session
+    URL — full-replacement semantics per the Managed Agents docs."""
+    captured = {}
+
+    def handler(request):
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "sess_1"})
+
+    driver = _build_driver(handler)
+    driver.update_session("sess_1", {"tools": ["lifeos_search", "lifeos_ask"]})
+
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/sessions/sess_1")
+    assert captured["body"] == {
+        "agent": {"tools": ["lifeos_search", "lifeos_ask"]}
+    }
+
+
+@pytest.mark.unit
+def test_update_session_4xx_surfaces_response_body(caplog):
+    """A 4xx response logs the body so beta-API schema mismatches are
+    visible rather than swallowed."""
+    def handler(request):
+        return httpx.Response(
+            400, json={"error": "tools[3] is not a valid identifier"}
+        )
+
+    driver = _build_driver(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            driver.update_session("sess_1", {"tools": ["bogus tool"]})
+    body_logged = any(
+        "not a valid identifier" in rec.getMessage() for rec in caplog.records
+    )
+    assert body_logged, "expected 4xx body to be surfaced in WARNING logs"
+
+
+@pytest.mark.unit
 def test_managed_session_cost_includes_overhead():
     cost = managed_session_cost("claude-opus-4-7", 1000, 1000, wall_seconds=3600)
     # 1k input ($0.015) + 1k output ($0.075) + 1 hr * $0.08
