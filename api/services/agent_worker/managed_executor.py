@@ -190,7 +190,16 @@ class ManagedExecutor:
     # ------------------------------------------------------------------
 
     def start(self, session, task: dict) -> ExecutorOutcome:
-        """Create the remote session and post the initial user message.
+        """Create the remote session, apply the per-class tool filter (if any),
+        and post the initial user message.
+
+        Flow (#139 §3):
+          1. POST /v1/sessions — container provisioned, no LLM cost yet.
+          2. POST /v1/sessions/{id} with the per-class tool filter (full
+             agent.tools replacement). Skipped for `preset_class=fullstack`
+             or unset (no filter, use preset as-is). LLM cost still zero.
+          3. POST /v1/sessions/{id}/events with user.message — cache_creation
+             fires now, scoped to the filtered tool set.
 
         On success: STATUS_RUNNING with `managed_agent_session_id` populated.
         On failure (network, API rejection, etc.): STATUS_FAILED.
@@ -206,14 +215,18 @@ class ManagedExecutor:
         self.transcript_store.append(sid, "managed_start",
                                      {"agent_id": self.agent_id, "environment_id": self.environment_id})
 
+        initial_message = _user_message_for(
+            task, sid, session.expected_output or "text", budget,
+        )
+        preset_class = getattr(session, "preset_class", None)
+
         try:
+            # Step 1: create the session WITHOUT initial_message. Provisions
+            # the container; no agent loop runs and no LLM cost is incurred.
             remote_id = self.driver.create_session(
                 agent_id=self.agent_id,
                 environment_id=self.environment_id,
                 vault_ids=self.vault_ids,
-                initial_message=_user_message_for(
-                    task, sid, session.expected_output or "text", budget,
-                ),
                 metadata={"lifeos_session_id": sid, "task_id": session.task_id},
                 title=_sanitize_title(task.get("description") or ""),
             )
@@ -227,9 +240,46 @@ class ManagedExecutor:
 
         self.session_store.set_managed_session_id(session.task_id, remote_id)
         self.transcript_store.append(sid, "managed_created", {"remote_id": remote_id})
-        # Mark as STATUS_RUNNING but with a remote handle attached. The
-        # worker's tick loop will pick it up via _poll_managed_sessions on
-        # subsequent ticks.
+
+        # Step 2: apply per-class tool filter if one was selected. Skipped for
+        # fullstack / unset / unknown classes. Best-effort — a filter failure
+        # falls back to the full preset rather than aborting the session.
+        from api.services.agent_worker.tool_filter import class_to_tool_filter
+        agent_payload = class_to_tool_filter(preset_class) if preset_class else None
+        if agent_payload is not None:
+            try:
+                self.driver.update_session(remote_id, agent_payload)
+                self.transcript_store.append(
+                    sid, "managed_filter_applied",
+                    {"preset_class": preset_class, "tool_count": len(agent_payload.get("tools", []))},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "managed update_session failed for %s (class=%s): %s — falling back to full preset",
+                    sid, preset_class, type(exc).__name__,
+                )
+                self.transcript_store.append(
+                    sid, "managed_filter_failed",
+                    {"preset_class": preset_class, "error_type": type(exc).__name__},
+                )
+
+        # Step 3: post the initial user message. cache_creation fires here on
+        # the (possibly filtered) tool set.
+        try:
+            self.driver.post_user_message(remote_id, initial_message)
+        except Exception as exc:
+            logger.error("managed post_user_message failed for %s: %s", sid, type(exc).__name__)
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            self.transcript_store.append(
+                sid, "managed_post_failed", {"error_type": type(exc).__name__},
+            )
+            return ExecutorOutcome(
+                status=STATUS_FAILED,
+                reason=f"post_user_message failed: {type(exc).__name__}",
+            )
+
+        # The worker's tick loop will pick this up via _poll_managed_sessions
+        # on subsequent ticks.
         return ExecutorOutcome(status=STATUS_RUNNING)
 
     def poll(self, session) -> ExecutorOutcome:

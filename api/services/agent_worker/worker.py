@@ -1043,6 +1043,7 @@ class Worker:
             routing=pre.routing,
             budget=budget_json,
             expected_output=pre.expected_output,
+            preset_class=pre.preset_class,
         )
         session = self.session_store.get(task_id)  # refresh
 
