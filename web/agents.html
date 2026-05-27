@@ -572,11 +572,27 @@
   }
 
   function openKillModal(session) {
-    const descendants = allSessions.filter(x =>
-      x.root_session_id === session.session_id &&
-      x.session_id !== session.session_id &&
-      !TERMINAL.has(x.status)
-    );
+    // BFS down parent_session_id so non-root targets only show *their* subtree,
+    // matching the backend cascade scope. (Filtering by root_session_id would
+    // wrongly include unrelated peers under the same root.)
+    const childrenOf = new Map();
+    for (const x of allSessions) {
+      if (!x.parent_session_id) continue;
+      if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
+      childrenOf.get(x.parent_session_id).push(x);
+    }
+    const descendants = [];
+    const queue = [session.session_id];
+    const seen = new Set([session.session_id]);
+    while (queue.length) {
+      const sid = queue.shift();
+      for (const child of (childrenOf.get(sid) || [])) {
+        if (seen.has(child.session_id)) continue;
+        seen.add(child.session_id);
+        if (!TERMINAL.has(child.status)) descendants.push(child);
+        queue.push(child.session_id);
+      }
+    }
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
