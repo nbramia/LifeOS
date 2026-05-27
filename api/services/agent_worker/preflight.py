@@ -72,6 +72,13 @@ class PreflightResult:
     # actual remote-model selection still requires the agent preset to
     # match (section 3 territory).
     model: str | None = None
+    # Preset class for per-session tool filtering (#139 §3). When set, the
+    # managed executor will call driver.update_session() with the class's
+    # filtered tool list (via tool_filter.class_to_tool_filter) between
+    # session create and the first user message — scoping cache_creation
+    # to the smaller tool set. Currently picked from tag overrides only;
+    # LLM-side preflight emission is a follow-up.
+    preset_class: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -248,6 +255,33 @@ def _normalize_tag(tag: str) -> str:
     return tag.lstrip("#").lower()
 
 
+# Preset-class tag → class name. Mirrors tool_filter.ALL_PRESET_CLASSES so
+# operators can force a class with `#research`, `#crm`, etc. Kept here as
+# a local map instead of an import so preflight stays decoupled from the
+# tool_filter implementation; the names are the contract.
+_PRESET_CLASS_TAGS = {
+    "personal-comm": "personal-comm",
+    "work-comm": "work-comm",
+    "research": "research",
+    "financial": "financial",
+    "crm": "crm",
+    "fullstack": "fullstack",
+}
+
+
+def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
+    """Return the preset_class implied by a `#<class>` tag, or None.
+
+    First match wins in the tag list order to give operators a predictable
+    override when multiple class tags slip in by mistake.
+    """
+    for raw in tags or []:
+        normalized = _normalize_tag(raw)
+        if normalized in _PRESET_CLASS_TAGS:
+            return _PRESET_CLASS_TAGS[normalized]
+    return None
+
+
 def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightResult:
     """Apply tag-based routing/model overrides (#139 §2 precedence).
 
@@ -294,6 +328,20 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
     return result
 
 
+def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightResult:
+    """Set `result.preset_class` from an explicit `#<class>` tag if present.
+
+    LLM-side preset_class emission is a follow-up; this lets operators
+    force a class today via tag while the rest of #139 §3 wiring lands.
+    """
+    if result.preset_class:  # honor an LLM/caller pre-set value
+        return result
+    forced = _detect_preset_class_from_tags(tags)
+    if forced:
+        result.preset_class = forced
+    return result
+
+
 def run_preflight(
     title: str,
     tags: list[str] | None = None,
@@ -306,16 +354,19 @@ def run_preflight(
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
     if not title.strip():
         defaults = _defaults()
-        return _apply_tag_overrides(
-            PreflightResult(
-                budget=defaults,
-                routing=ROUTE_ASK,
-                routing_reason="empty title",
-                expected_output="text",
-                ambiguity=None,
-                sane=False,
-                sane_reason="task title is empty",
-                raw={},
+        return _apply_preset_class(
+            _apply_tag_overrides(
+                PreflightResult(
+                    budget=defaults,
+                    routing=ROUTE_ASK,
+                    routing_reason="empty title",
+                    expected_output="text",
+                    ambiguity=None,
+                    sane=False,
+                    sane_reason="task title is empty",
+                    raw={},
+                ),
+                tags_list,
             ),
             tags_list,
         )
@@ -327,18 +378,24 @@ def run_preflight(
     except Exception as exc:
         logger.warning("preflight LLM call failed: %s", exc)
         defaults = _defaults()
-        return _apply_tag_overrides(
-            PreflightResult(
-                budget=defaults,
-                routing=ROUTE_ASK,
-                routing_reason="preflight LLM call failed",
-                expected_output="text",
-                ambiguity=None,
-                sane=False,
-                sane_reason=f"preflight error: {exc}",
-                raw={},
+        return _apply_preset_class(
+            _apply_tag_overrides(
+                PreflightResult(
+                    budget=defaults,
+                    routing=ROUTE_ASK,
+                    routing_reason="preflight LLM call failed",
+                    expected_output="text",
+                    ambiguity=None,
+                    sane=False,
+                    sane_reason=f"preflight error: {exc}",
+                    raw={},
+                ),
+                tags_list,
             ),
             tags_list,
         )
 
-    return _apply_tag_overrides(parse_preflight_response(reply), tags_list)
+    return _apply_preset_class(
+        _apply_tag_overrides(parse_preflight_response(reply), tags_list),
+        tags_list,
+    )

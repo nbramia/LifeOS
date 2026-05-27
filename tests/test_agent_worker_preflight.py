@@ -296,3 +296,58 @@ def test_tag_precedence_accepts_hash_prefix_form():
     result = pf.run_preflight("anything", tags=["#agent", "#cloud-haiku"],
                               caller=_stub_caller(routing="claude"))
     assert result.model == pf.MODEL_HAIKU
+
+
+# ---------------------------------------------------------------------------
+# Preset class tag detection (#139 §3 wiring)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_preset_class_tag_sets_preset_class():
+    """An explicit class tag (#research / #crm / etc.) sets preset_class."""
+    result = pf.run_preflight("dig into Q4 numbers", tags=["agent", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "research"
+
+
+@pytest.mark.unit
+def test_each_preset_class_tag_recognized():
+    """All six class tags map to the right preset_class string."""
+    for tag in ("personal-comm", "work-comm", "research", "financial", "crm", "fullstack"):
+        result = pf.run_preflight("any task", tags=["agent", tag],
+                                  caller=_stub_caller(routing="claude"))
+        assert result.preset_class == tag, f"tag #{tag} should set preset_class={tag}"
+
+
+@pytest.mark.unit
+def test_preset_class_accepts_hash_prefix_form():
+    """Operators may write `#research` or `research` — both map to the class."""
+    result = pf.run_preflight("any task", tags=["#agent", "#crm"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_first_preset_class_tag_wins_on_conflict():
+    """If two class tags slip in, the first one in the tag list wins."""
+    result = pf.run_preflight("any task", tags=["agent", "crm", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_no_class_tag_leaves_preset_class_none():
+    """Without an explicit class tag, preset_class stays None — the worker
+    defaults to fullstack (no filter)."""
+    result = pf.run_preflight("ambiguous task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class is None
+
+
+@pytest.mark.unit
+def test_preset_class_set_on_empty_title_short_circuit():
+    """The empty-title short-circuit path also honors a class tag."""
+    result = pf.run_preflight("", tags=["agent", "financial"])
+    assert result.preset_class == "financial"
+    # And the sane flag is still false (empty title is unsafe regardless of tags).
+    assert result.sane is False
