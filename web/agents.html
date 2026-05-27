@@ -488,7 +488,6 @@
     const isBlocked = s.status === 'blocked';
     const isInferred = !!s.status_inferred;
     const baseLabel = s.model_label || s.label || s.session_id.slice(0, 8);
-    const cwdHint = s.decoded_cwd ? (s.decoded_cwd.split('/').filter(Boolean).slice(-1)[0] || '') : '';
     return {
       id: s.session_id,
       label: baseLabel,
@@ -535,7 +534,7 @@
     const running = sessions.filter(s => s.status === 'running').length;
     const blocked = sessions.filter(s => s.status === 'blocked').length;
     const recent = sessions.filter(s => s.status === 'completed').length;
-    const cc = sessions.filter(s => (s.routing || s.source) === 'claude_code' || s.source === 'claude_code').length;
+    const cc = sessions.filter(s => s.source === 'claude_code').length;
     const spend = sessions.reduce((acc, s) => acc + (s.total_dollars || 0), 0);
     document.getElementById('chip-running').textContent = running;
     document.getElementById('chip-blocked').textContent = blocked;

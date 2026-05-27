@@ -451,8 +451,11 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
         yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
 
     line_count = len(events)
-    last_heartbeat = time.time()
-    idle_check_at = 0.0
+    # Track new-events time and heartbeat time separately so the
+    # idle-close check actually fires (heartbeats don't postpone close).
+    now0 = time.time()
+    last_new_event_at = now0
+    last_heartbeat_at = now0
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -463,21 +466,20 @@ async def _stream_claude_code_session(session_id: str, backfill: int):
             for ev in events[line_count:]:
                 yield f"event: transcript_event\ndata: {json.dumps(ev)}\n\n"
             line_count = len(events)
-            last_heartbeat = time.time()
-        elif time.time() - last_heartbeat >= 15.0:
+            last_new_event_at = time.time()
+            last_heartbeat_at = last_new_event_at
+        elif time.time() - last_heartbeat_at >= 15.0:
             yield ": heartbeat\n\n"
-            last_heartbeat = time.time()
-        # Claude Code has no DB status — infer idleness from mtime + last event.
-        # Close after 5 minutes of no new events so we don't hold connections forever.
-        now = time.time()
-        if now - idle_check_at >= 5.0:
-            idle_check_at = now
-            if events and (now - last_heartbeat) > 300.0:
-                yield (
-                    "event: closed\n"
-                    f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"
-                )
-                return
+            last_heartbeat_at = time.time()
+        # Claude Code has no DB status — close after 5 minutes of no new
+        # transcript events so we don't hold connections forever. Heartbeats
+        # do NOT postpone this — only real new events do.
+        if time.time() - last_new_event_at > 300.0:
+            yield (
+                "event: closed\n"
+                f"data: {json.dumps({'session_id': session_id, 'status': 'idle'})}\n\n"
+            )
+            return
 
 
 @router.get("/sessions/{session_id}/stream")

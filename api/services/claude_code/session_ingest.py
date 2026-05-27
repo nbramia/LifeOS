@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,10 +41,9 @@ logger = logging.getLogger(__name__)
 # with LifeOS session_ids, but the prefix makes routing intent explicit.
 CC_PREFIX = "cc:"
 
-# Event-type whitelist — everything else is treated as noise and dropped
-# from the normalized stream. The deny-list explicit complement is also
-# documented for the next reader.
-_RAW_TYPES_TO_KEEP = frozenset({"user", "assistant", "system"})
+# Event types dropped as noise. The keep-list is implicit in `normalize_event`
+# (we explicitly handle `user`, `assistant`, `system` and ignore everything
+# not matched).
 _RAW_TYPES_NOISE = frozenset({
     "mode", "permission-mode", "ai-title", "last-prompt", "worktree-state",
     "file-history-snapshot", "queue-operation", "attachment", "pr-link",
@@ -367,24 +367,20 @@ def _truncate(s: str, cap: int = _PAYLOAD_PREVIEW_MAX) -> str:
 def _cost_from_usage(usage: dict[str, Any], model: str) -> float:
     """Apply pricing.py to a single message's `usage` block.
 
-    Includes input + output + cache_creation + cache_read tokens via the
-    existing `cost_for` function. Cache-token pricing isn't differentiated
-    in `pricing.py` today (see #137), so this matches the agent-worker's
-    accounting — both sides are equally under/over-counted until that
-    lands. When #137 ships, this function automatically benefits.
+    Sums input + output tokens only — matches the agent worker (which
+    only reads `input_tokens` / `output_tokens` from the Anthropic API
+    response; see `managed_executor.py` and `local_executor.py`). Cache
+    tokens are tracked separately in the `SessionMeta` for visibility
+    but are NOT added into the cost so the two sources are
+    apples-to-apples until cache-aware pricing lands (#137). When #137
+    ships, both sides should be updated together.
     """
     from api.services.agent_worker.pricing import cost_for
 
     in_tok = int(usage.get(_USAGE_INPUT, 0) or 0)
     out_tok = int(usage.get(_USAGE_OUTPUT, 0) or 0)
-    cache_creation = int(usage.get(_USAGE_CACHE_CREATION, 0) or 0)
-    cache_read = int(usage.get(_USAGE_CACHE_READ, 0) or 0)
-    # Treat cache_creation tokens like input (Anthropic charges 1.25× input;
-    # cost_for uses flat input rate which under-counts by ~25% — captured by
-    # #137. cache_read is ~10% of input — also flat-priced today). Sum them
-    # into the input bucket so the total tracks tokens-seen even if the
-    # multiplier is wrong until #137 lands.
-    return cost_for(model or "", in_tok + cache_creation + cache_read, out_tok)
+    use_model = model or "claude-sonnet-4-6"  # safer default than the Opus fallback
+    return cost_for(use_model, in_tok, out_tok)
 
 
 # ---------------------------------------------------------------------------
@@ -467,20 +463,24 @@ def parse_session(meta: SessionMeta, now: float | None = None) -> tuple[SessionM
             last_event_was_error = False
         elif ev["kind"] == "tool_result":
             # A user-side tool_result turn closes one or more open tool_use ids.
-            for tr in (ev["payload"] or {}).get("tool_results", []):
+            # `last_event_was_error` becomes True if ANY result in this turn was
+            # an error — that's a more conservative signal for status inference
+            # than the last-result-wins behavior we had before.
+            results = (ev["payload"] or {}).get("tool_results", [])
+            turn_had_error = False
+            for tr in results:
                 tu_id = tr.get("tool_use_id")
                 if tu_id and tu_id in open_tool_uses:
                     open_tool_uses.discard(tu_id)
                 if tr.get("is_error"):
                     error_count += 1
-                    last_event_was_error = True
-                else:
-                    last_event_was_error = False
+                    turn_had_error = True
                 # Close any matching subagent record.
                 for sa in subagents:
                     if sa.get("tool_use_id") == tu_id:
                         sa["status"] = "failed" if tr.get("is_error") else "completed"
                         sa["last_activity_at"] = int(ts)
+            last_event_was_error = turn_had_error
             last_assistant_had_pending_tool = bool(open_tool_uses)
         elif ev["kind"] == "user_message":
             text = (ev["payload"] or {}).get("text") or ""
@@ -531,20 +531,21 @@ def _infer_status(
     MVP rules (process detection deferred — see issue #144 notes):
       - Modified in the last 60s → `running`
       - Modified within 24h → `yielded` (resumable; user closed the terminal)
-      - Older but ended on an error → `failed`
+      - Older, ended on an error → `failed`
+      - Older, pending tool in flight → `yielded` (could be a long-running
+        tool; lacking a process check we can't say it's abandoned, so
+        prefer the resumable state to a false-negative `failed`)
       - Otherwise → `completed`
     """
     age = (now if now is not None else time.time()) - mtime
     if age < _RUNNING_MTIME_THRESHOLD:
         return "running"
     if age < _YIELDED_MTIME_THRESHOLD:
-        # Still resumable: user may come back to the terminal session.
         return "yielded"
     if last_event_was_error:
         return "failed"
     if last_assistant_had_pending_tool:
-        # Idle mid-turn beyond 24h — treat as failed (abandoned with work in flight).
-        return "failed"
+        return "yielded"
     return "completed"
 
 
@@ -648,18 +649,26 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
 
 # Discovery + parse is the expensive op (touches the filesystem and reads
 # every active jsonl). Cache the snapshot dicts for a short window so the
-# 2s SSE tick doesn't hammer disk.
+# 2s SSE tick doesn't hammer disk. The cache is keyed by (projects_dir,
+# lookback_days) so callers with different scopes (e.g. tests) don't
+# cross-contaminate, and guarded by a lock so concurrent FastAPI threads
+# can't see a partially-written entry.
 _CACHE_TTL = 30.0
 
 
 @dataclass
-class _SnapshotCache:
+class _CacheEntry:
     expires_at: float = 0.0
     sessions: list[dict[str, Any]] = field(default_factory=list)
     edges: list[dict[str, Any]] = field(default_factory=list)
 
 
-_snapshot_cache = _SnapshotCache()
+_snapshot_cache: dict[tuple[str, int], _CacheEntry] = {}
+_snapshot_cache_lock = threading.Lock()
+
+
+def _cache_key(projects_dir: str | Path | None, lookback_days: int) -> tuple[str, int]:
+    return (str(projects_dir) if projects_dir is not None else "", int(lookback_days))
 
 
 def build_snapshot(
@@ -672,11 +681,16 @@ def build_snapshot(
     """Return `(sessions, edges)` for the /agents snapshot. Cached.
 
     Edges include parent→subagent spawn edges. Subagent nodes are synthetic;
-    they don't have their own jsonl.
+    they don't have their own jsonl. The cache is bypassed entirely when
+    `cache_ttl <= 0` (no read, no write) so tests get a fresh snapshot.
     """
     now_t = now if now is not None else time.time()
-    if _snapshot_cache.expires_at > now_t and cache_ttl > 0:
-        return list(_snapshot_cache.sessions), list(_snapshot_cache.edges)
+    key = _cache_key(projects_dir, lookback_days)
+    if cache_ttl > 0:
+        with _snapshot_cache_lock:
+            entry = _snapshot_cache.get(key)
+            if entry and entry.expires_at > now_t:
+                return list(entry.sessions), list(entry.edges)
 
     sessions: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -696,14 +710,19 @@ def build_snapshot(
                 "type": "spawn",
             })
 
-    _snapshot_cache.sessions = sessions
-    _snapshot_cache.edges = edges
-    _snapshot_cache.expires_at = now_t + cache_ttl
+    if cache_ttl > 0:
+        with _snapshot_cache_lock:
+            _snapshot_cache[key] = _CacheEntry(
+                expires_at=now_t + cache_ttl,
+                sessions=list(sessions),
+                edges=list(edges),
+            )
     return list(sessions), list(edges)
 
 
 def invalidate_cache() -> None:
-    _snapshot_cache.expires_at = 0.0
+    with _snapshot_cache_lock:
+        _snapshot_cache.clear()
 
 
 def read_normalized_events(
