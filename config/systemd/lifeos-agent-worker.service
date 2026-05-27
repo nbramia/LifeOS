@@ -9,6 +9,12 @@ After=network.target lifeos-api.service
 Requires=lifeos-api.service
 BindsTo=lifeos-api.service
 PartOf=lifeos-api.service
+# StartLimit* belongs in [Unit] in modern systemd — putting it in
+# [Service] gets silently ignored. Circuit breaker: if the worker
+# crashes more than 5 times in 5 minutes, systemd backs off and the
+# operator has to intervene.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -19,12 +25,8 @@ ExecStart=__VENV__/bin/python -m api.services.agent_worker.worker
 # Restart on any exit (crash OR clean) so the worker stays up through
 # unhandled exceptions, OOM kills, transient API outages, etc. The
 # only thing that keeps it down is an operator-issued `systemctl stop`.
-# StartLimit* caps protect against truly broken state — if it crashes
-# 5 times in 5 minutes systemd backs off until the operator intervenes.
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=append:__LIFEOS_DIR__/logs/agent-worker.log
 StandardError=append:__LIFEOS_DIR__/logs/agent-worker.log
 
