@@ -487,6 +487,81 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_spawned_child_failure_does_not_telegram_the_operator(tmp_path: Path):
+    """Live bug: a spawned child session's `create_session` 4xx'd, and the
+    worker fired a failure notification to operator Telegram with the
+    parent's full multi-line prompt as the "task title". Children are
+    parent-internal — their terminal status flows back through
+    `_resume_yielded_for_children`, not Telegram."""
+    from api.services.agent_worker.session_store import STATUS_RUNNING
+    api = FakeApi(tasks=[])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_FAILED, reason="create_session failed: HTTPStatusError",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+
+    # Construct a spawned-child session by hand. parent_session_id is what
+    # marks it as not-a-root.
+    parent = w.session_store.create(
+        task_id="parent_task", routing="claude", expected_output="text",
+        status=STATUS_RUNNING,
+    )
+    child = w.session_store.create(
+        task_id="spawn_child", routing="claude", expected_output="structured",
+        status=STATUS_RUNNING,
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+    # Trigger the failure handler directly as the dispatch path would.
+    w._handle_outcome(
+        child,
+        {"id": child.task_id, "description": "You are analyzing WORK Gmail activity…"},
+        ExecutorOutcome(status=STATUS_FAILED, reason="create_session failed: HTTPStatusError"),
+    )
+
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent == [], f"spawned child failure leaked to operator: {sent}"
+
+
+@pytest.mark.unit
+def test_spawned_child_completion_does_not_telegram_the_operator(tmp_path: Path):
+    """Same invariant for the COMPLETED branch — children's outputs are
+    aggregated by the parent's yield_until resumption, not surfaced to
+    Telegram individually."""
+    from api.services.agent_worker.session_store import STATUS_RUNNING
+    api = FakeApi(tasks=[])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="child output",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    parent = w.session_store.create(
+        task_id="parent_task", routing="local", expected_output="text",
+        status=STATUS_RUNNING,
+    )
+    child = w.session_store.create(
+        task_id="spawn_child", routing="local", expected_output="structured",
+        status=STATUS_RUNNING,
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    w._handle_outcome(
+        child, {"id": child.task_id, "description": "child prompt"},
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text="child output"),
+    )
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    sent_ids = w._sent_with_ids  # type: ignore[attr-defined]
+    assert sent == [], f"child completion leaked via _notify: {sent}"
+    assert sent_ids == [], f"child completion leaked via _telegram_send_with_id: {sent_ids}"
+
+
+@pytest.mark.unit
 def test_followup_reply_reopens_completed_session_and_reruns_with_new_turn(tmp_path: Path):
     """Live bug repro: the operator replied to a completion message
     ("turn this into a .md in my vault") and the response had no context.

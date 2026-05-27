@@ -79,6 +79,34 @@ def _today() -> str:
     return now.strftime("%Y-%m-%d (%A)")
 
 
+def _sanitize_title(text: str) -> str | None:
+    """Strip Unicode control / format chars from a session title.
+
+    Live bug: spawned children's titles came from the parent's freeform
+    spawn prompt, which included `\\n` newlines. Anthropic 400'd with
+    `"title: must not contain Unicode control or format characters"`.
+    We collapse any whitespace-control chars to single spaces, drop other
+    control / format codepoints entirely, then trim to 100 chars (the
+    title field is for display only). Returns None for an empty result
+    so the API uses the model's default.
+    """
+    import unicodedata
+    if not text:
+        return None
+    cleaned_chars: list[str] = []
+    for c in text:
+        cat = unicodedata.category(c)
+        if cat in ("Cc", "Cf"):  # control / format
+            if c in (" ", "\t", "\n", "\r") or c.isspace():
+                if cleaned_chars and cleaned_chars[-1] != " ":
+                    cleaned_chars.append(" ")
+            # else: drop entirely
+        else:
+            cleaned_chars.append(c)
+    cleaned = "".join(cleaned_chars).strip()[:100]
+    return cleaned or None
+
+
 class ManagedExecutor:
     """Coordinates a Managed Agents session from create through terminal event.
 
@@ -137,7 +165,7 @@ class ManagedExecutor:
                     task, sid, session.expected_output or "text", budget,
                 ),
                 metadata={"lifeos_session_id": sid, "task_id": session.task_id},
-                title=(task.get("description") or "")[:100] or None,
+                title=_sanitize_title(task.get("description") or ""),
             )
         except Exception as exc:
             # Log without exc_info — httpx exceptions can attach the request

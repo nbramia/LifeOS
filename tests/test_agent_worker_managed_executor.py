@@ -487,6 +487,38 @@ def test_cancelled_status_uses_distinct_telegram_reason(stores):
 
 
 @pytest.mark.unit
+def test_sanitize_title_strips_newlines_and_control_chars():
+    """Live repro: spawn prompt contained `\\n` newlines, Anthropic 400'd
+    with `"title: must not contain Unicode control or format characters"`.
+    The sanitizer must collapse whitespace control chars (newlines, tabs)
+    to single spaces and drop other control / format codepoints."""
+    from api.services.agent_worker.managed_executor import _sanitize_title
+
+    # Multi-line spawn prompt (common from cloud parent agents).
+    multiline = "You are analyzing WORK Gmail.\n\nStrategy:\n1. Foo\n2. Bar"
+    out = _sanitize_title(multiline)
+    assert out is not None
+    assert "\n" not in out
+    assert "\r" not in out
+    assert "\t" not in out
+    assert out.startswith("You are analyzing WORK Gmail.")
+    # Collapsed double-newline becomes a single space, not two.
+    assert "  " not in out
+
+    # Empty / whitespace-only → None so the API uses its default.
+    assert _sanitize_title("") is None
+    assert _sanitize_title(None) is None
+    assert _sanitize_title("\n\n\t\r") is None
+
+    # Length cap at 100 chars.
+    long = "x" * 500
+    assert len(_sanitize_title(long)) == 100
+
+    # Non-control unicode is preserved (em-dashes, curly quotes, etc.).
+    assert _sanitize_title("Compare — last month's data") == "Compare — last month's data"
+
+
+@pytest.mark.unit
 def test_poll_returns_running_on_transient_driver_error(stores):
     store, session, transcript = stores
     store.set_managed_session_id("t1", "sess_remote")

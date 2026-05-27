@@ -1058,55 +1058,82 @@ class Worker:
     def _handle_outcome(self, session: Session, task: dict[str, Any], outcome) -> None:
         title = task.get("description", session.task_id)
         sid = session.session_id
+        # Spawned children belong to the parent agent's flow — their
+        # terminal state is consumed by `_resume_yielded_for_children`.
+        # The operator should only ever see Telegram notifications for
+        # the ROOT session (the one tied to a #agent task in the vault).
+        # Without this guard, a child's failure / completion message
+        # leaks to the operator with the parent's internal prompt as
+        # the "task description" — confusing and operator-irrelevant.
+        is_spawned = bool(session.parent_session_id)
 
         if outcome.status == STATUS_COMPLETED:
-            self._complete_task(session.task_id)  # mark `done` in the vault
-            # Swap the tag so the task surfaces as #agent-completed for symmetry
-            # with the failed / budget-exceeded / blocked terminal tags. Failure
-            # of the swap is non-critical — _swap_tag logs and the task is
-            # already marked done in the vault.
-            self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
-            # Send via the with-id sender so we can match a future Telegram
-            # reply to this completion message and resume the task as a
-            # follow-up turn (e.g., "now turn this into a .md in my vault").
-            # When the with-id sender returns None (bot not configured, or
-            # a test stub that doesn't capture ids) fall back to the plain
-            # _notify path so the operator at least sees the result.
-            body = self._completion_summary(session, task, outcome)
-            sent_id = self._telegram_send_with_id(body)
-            if sent_id is None:
-                self._notify(body)
+            if not is_spawned:
+                self._complete_task(session.task_id)  # mark `done` in the vault
+                # Swap the tag so the task surfaces as #agent-completed for symmetry
+                # with the failed / budget-exceeded / blocked terminal tags. Failure
+                # of the swap is non-critical — _swap_tag logs and the task is
+                # already marked done in the vault.
+                self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
+                # Send via the with-id sender so we can match a future Telegram
+                # reply to this completion message and resume the task as a
+                # follow-up turn (e.g., "now turn this into a .md in my vault").
+                # When the with-id sender returns None (bot not configured, or
+                # a test stub that doesn't capture ids) fall back to the plain
+                # _notify path so the operator at least sees the result.
+                body = self._completion_summary(session, task, outcome)
+                sent_id = self._telegram_send_with_id(body)
+                if sent_id is None:
+                    self._notify(body)
+                else:
+                    try:
+                        self.session_store.register_completion_followup(
+                            session_id=sid,
+                            task_id=session.task_id,
+                            sent_message_id=sent_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "register_completion_followup failed for %s: %s",
+                            session.task_id, exc,
+                        )
             else:
-                try:
-                    self.session_store.register_completion_followup(
-                        session_id=sid,
-                        task_id=session.task_id,
-                        sent_message_id=sent_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "register_completion_followup failed for %s: %s",
-                        session.task_id, exc,
-                    )
+                # Child completion — record only; parent picks it up via yield_until.
+                self.transcript_store.append(sid, "child_completed_internal", {
+                    "parent_session_id": session.parent_session_id,
+                    "final_chars": len(outcome.final_text or ""),
+                })
             return
 
         label = _worker_label(session.routing)
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
-            self._set_task_status(session.task_id, "cancelled")
-            self._notify(
-                f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
-                f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
-            )
+            if not is_spawned:
+                self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
+                self._set_task_status(session.task_id, "cancelled")
+                self._notify(
+                    f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                )
+            else:
+                self.transcript_store.append(sid, "child_budget_exceeded_internal", {
+                    "parent_session_id": session.parent_session_id,
+                    "reason": outcome.reason,
+                })
             return
 
         if outcome.status == STATUS_FAILED:
-            self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-            self._set_task_status(session.task_id, "cancelled")
-            self._notify(
-                f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "
-                f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
-            )
+            if not is_spawned:
+                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                self._set_task_status(session.task_id, "cancelled")
+                self._notify(
+                    f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                )
+            else:
+                self.transcript_store.append(sid, "child_failed_internal", {
+                    "parent_session_id": session.parent_session_id,
+                    "reason": outcome.reason,
+                })
             return
 
         if outcome.status == STATUS_YIELDED:
@@ -1325,10 +1352,15 @@ class Worker:
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:
         title = task.get("description", session.task_id)
-        self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-        self._set_task_status(session.task_id, "cancelled")
         self.session_store.update_status(session.task_id, STATUS_FAILED)
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
+        # Spawned children flow back through `_resume_yielded_for_children`;
+        # don't poke the vault tag system and don't ping Telegram (see
+        # `_handle_outcome` for the full reasoning).
+        if session.parent_session_id:
+            return
+        self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+        self._set_task_status(session.task_id, "cancelled")
         self._notify(f"⚠️ {_worker_label(session.routing)}: task '{title}' failed: {reason}")
 
     def _mark_blocked(self, session: Session, task: dict[str, Any], question: str) -> None:
