@@ -1,7 +1,14 @@
 [Unit]
 Description=LifeOS Agent Worker
 After=network.target lifeos-api.service
+# `Requires=` cascades a stop when lifeos-api stops; `BindsTo=` plus
+# `PartOf=` add the reverse — the worker restarts when lifeos-api
+# restarts, instead of just stopping and staying down. Without these
+# the post-commit hook (which restarts lifeos-api whenever api/ or
+# config/ files change) would leave the worker stopped indefinitely.
 Requires=lifeos-api.service
+BindsTo=lifeos-api.service
+PartOf=lifeos-api.service
 
 [Service]
 Type=simple
@@ -9,8 +16,15 @@ User=__USER__
 WorkingDirectory=__LIFEOS_DIR__
 EnvironmentFile=__LIFEOS_DIR__/.env
 ExecStart=__VENV__/bin/python -m api.services.agent_worker.worker
-Restart=on-failure
+# Restart on any exit (crash OR clean) so the worker stays up through
+# unhandled exceptions, OOM kills, transient API outages, etc. The
+# only thing that keeps it down is an operator-issued `systemctl stop`.
+# StartLimit* caps protect against truly broken state — if it crashes
+# 5 times in 5 minutes systemd backs off until the operator intervenes.
+Restart=always
 RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
 StandardOutput=append:__LIFEOS_DIR__/logs/agent-worker.log
 StandardError=append:__LIFEOS_DIR__/logs/agent-worker.log
 
