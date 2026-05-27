@@ -179,7 +179,7 @@ All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLES
 2. **Set up Google OAuth**: See [Google OAuth Guide](../guides/GOOGLE-OAUTH.md)
 3. **Set up systemd services** (Linux): `sudo ./scripts/setup-systemd.sh`
 4. **Set up FDA wrapper** (macOS, for Apple Data Agent): `./scripts/create-lifeos-app.sh` — see [ADR-010: Apple Data Agent](../adr/010-apple-data-agent.md) for the design context (why a `.app` bundle, why rsync, what fails when)
-5. **Configure launchd services** (macOS): See [Launchd Setup](../guides/LAUNCHD-SETUP.md)
+5. **Configure launchd services** (macOS, legacy only — see [launchd-setup.md](launchd-setup.md) for why it's superseded post-Linux-migration)
 6. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
 
 ---
