@@ -108,23 +108,21 @@ Copy the example environment file:
 cp .env.example .env
 ```
 
-Edit `.env` with your settings:
+A minimal `.env` to boot:
 
 ```bash
 # Required
 LIFEOS_VAULT_PATH=/path/to/your/obsidian/vault
 
-# LLM backend: "local" (default, uses llama-server on port 8080) or "anthropic"
-LIFEOS_LLM_BACKEND=local
-
-# Only required if LIFEOS_LLM_BACKEND=anthropic
-# ANTHROPIC_API_KEY=sk-ant-...
+# LLM backend: "anthropic" (default; requires ANTHROPIC_API_KEY) or "local" (requires llama-server on port 8080)
+LIFEOS_LLM_BACKEND=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional but recommended
 LIFEOS_USER_NAME=YourFirstName
 ```
 
-See [Configuration Guide](CONFIGURATION.md) for all options.
+The full env-var reference (defaults, types, when-to-change notes for every `LIFEOS_*` and third-party variable) lives in [configuration.md](configuration.md).
 
 ---
 

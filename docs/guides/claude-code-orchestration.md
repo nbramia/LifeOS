@@ -48,14 +48,7 @@ You should see a `system` init event followed by an `assistant` event with Claud
 
 ## Configuration
 
-Two optional environment variables in `.env`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LIFEOS_CLAUDE_BINARY` | `~/.local/bin/claude` | Path to the Claude CLI binary |
-| `LIFEOS_CLAUDE_TIMEOUT` | `3600` (1 hour) | Safety-net timeout per session in seconds. Heartbeats keep you informed; this is a backstop. |
-
-These rarely need changing. The binary path matches the standard Claude Code installation location.
+The orchestrator reads four env vars: `LIFEOS_CLAUDE_BINARY`, `LIFEOS_CLAUDE_TIMEOUT`, `LIFEOS_CLAUDE_MAX_TURNS`, `LIFEOS_CLAUDE_MAX_COST`. Defaults rarely need changing. See [configuration.md § Claude Code Orchestration](configuration.md#claude-code-orchestration-code-telegram-command) for the full table.
 
 After changing these values, restart the server:
 ```bash

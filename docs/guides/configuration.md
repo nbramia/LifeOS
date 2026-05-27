@@ -1,298 +1,305 @@
 # Configuration Guide
 
-> **Status:** Complete
-> **Last Updated:** 2026-02-19
-> **Audience:** Operators
+**Status:** Complete
+**Last Updated:** 2026-05-27
+**Audience:** Operators
 
-Environment variables and configuration files for LifeOS.
+**This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
 
----
+Each section corresponds roughly to a section in [`config/settings.py`](../../config/settings.py). Pydantic Settings reads these from `.env` at startup; changes require a server restart (`./scripts/server.sh restart` or `sudo systemctl restart lifeos-api`).
 
-## Environment Variables
+## Required
 
-### Required
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_VAULT_PATH` | path | — | Absolute or `~`-prefixed path to your Obsidian vault. Every sync, every search, and every chat reads from here. |
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LIFEOS_VAULT_PATH` | Obsidian vault path | `~/Notes` |
+## Server
 
-### Server
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_HOST` | str | `0.0.0.0` | API server bind address. Keep `0.0.0.0` for Tailscale access; `127.0.0.1` to restrict to localhost only. |
+| `LIFEOS_PORT` | int | `8000` | API server port. |
+| `LIFEOS_CHROMA_URL` | str | `http://localhost:8001` | ChromaDB server endpoint the API connects to. |
+| `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
+| `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/code` orchestrator path resolution. |
+| `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_HOST` | Server bind address | `0.0.0.0` |
-| `LIFEOS_PORT` | Server port | `8000` |
-| `LIFEOS_CHROMA_URL` | ChromaDB server URL | `http://localhost:8001` |
-| `LIFEOS_CHROMA_PATH` | ChromaDB data directory | `./data/chromadb` |
-| `LIFEOS_CODE_DIR` | Parent directory containing LifeOS and other projects | `~/Code` |
+## LLM Backend — Synthesis and Orchestration
 
-### LLM Backend
+Governs chat synthesis, intent classification, and agentic orchestration. The toggle decision is recorded in [ADR-009](../adr/009-llm-backend-toggle.md).
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_LLM_BACKEND` | LLM backend for chat synthesis: `local` (llama-server) or `anthropic` (Claude API) | `local` |
-| `LIFEOS_LOCAL_LLM_URL` | Local LLM server URL | `http://localhost:8080` |
-| `LIFEOS_LOCAL_LLM_TIMEOUT` | Local LLM request timeout (seconds) | `90` |
-| `ANTHROPIC_API_KEY` | Claude API key (only required with `LIFEOS_LLM_BACKEND=anthropic`) | — |
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). The single knob — there is no per-query model tiering. |
+| `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | Claude model used when `LIFEOS_LLM_BACKEND=anthropic`. |
+| `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also used by specialized calls regardless of backend (relationship insights, fact extraction, web search). |
+| `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
+| `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
+| `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
+| `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
 
-### Embedding & Search
+**When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_EMBEDDING_MODEL` | Override embedding model | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` |
-| `LIFEOS_EMBEDDING_CACHE` | Embedding cache directory (empty = HuggingFace default) | — |
-| `LIFEOS_RERANKER_MODEL` | Cross-encoder reranker model | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| `LIFEOS_RERANKER_ENABLED` | Enable/disable reranking | `true` |
+## Embedding & Search
 
-### Ollama
+Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012](../adr/012-embedding-pipeline.md).
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
-| `OLLAMA_MODEL` | Model for query routing | `qwen2.5:7b-instruct` |
-| `OLLAMA_TIMEOUT` | Request timeout (seconds) | `45` |
-| `OLLAMA_RETRY_TIMEOUT` | Retry timeout (seconds) | `60` |
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_EMBEDDING_MODEL` | str | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | Sentence-transformers encoder. Changing this requires reindexing the ChromaDB collection (dimension changes). |
+| `LIFEOS_EMBEDDING_CACHE` | path | — | Embedding cache directory (empty = HuggingFace default `~/.cache/huggingface`). |
+| `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
+| `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
+| `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
 
-### User Identity
+**When to change `LIFEOS_EMBEDDING_MODEL`:** if your hardware can't hold the default (~15-22 GB transient). Smaller options: `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~80 MB) or `mixedbread-ai/mxbai-embed-large-v1` (1024-dim, ~1.3 GB, previous default).
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LIFEOS_USER_NAME` | Your first name (used in AI prompts) | `Alex` |
-| `LIFEOS_MY_PERSON_ID` | Your CRM person ID (set after first sync) | UUID |
-| `LIFEOS_WORK_DOMAIN` | Work email domain | `yourcompany.com` |
-| `LIFEOS_TIMEZONE` | IANA timezone for schedules and prompts | `America/New_York` |
+## Ollama — Intent Classifier
 
-### Relationships
+Local-LLM-backed intent classifier for the chat pipeline. Decision in [ADR-006](../adr/006-ollama-query-routing.md).
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LIFEOS_PARTNER_NAME` | Partner's first name | `Taylor` |
-| `LIFEOS_THERAPIST_PATTERNS` | Therapist names (pipe-separated) | `Dr. Smith\|Jane Doe` |
-| `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS` | Personal meeting patterns | `Taylor\|Tay` |
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `OLLAMA_HOST` | str | `http://localhost:11434` | Ollama server endpoint. |
+| `OLLAMA_MODEL` | str | `gemma4:26b` | Model used for classification. |
+| `OLLAMA_TIMEOUT` | int | `45` | Per-request timeout, seconds. |
+| `OLLAMA_RETRY_TIMEOUT` | int | `60` | Retry timeout, seconds. |
 
-### Vault Structure
+## MCP HTTP Transport
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_CURRENT_WORK_PATH` | Work folder prefix | `Work/` |
-| `LIFEOS_PERSONAL_ARCHIVE_PATH` | Archive folder prefix | `Personal/zArchive/` |
-| `LIFEOS_RELATIONSHIP_FOLDER` | Relationship folder name | `Relationship` |
+The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropic Managed Agents — see [ADR-008](../adr/008-managed-agents-cloud-routing.md)). Bearer-token gated. See [agent-worker-setup.md](agent-worker-setup.md#mcp-http-transport) for the operator setup.
 
-### Multi-Account Sync
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_MCP_HTTP_HOST` | str | `127.0.0.1` | Bind address. Keep `127.0.0.1` and front with Cloudflare Tunnel / Tailscale Funnel. |
+| `LIFEOS_MCP_HTTP_PORT` | int | `8765` | Port. |
+| `LIFEOS_MCP_BEARER_TOKEN` | str | — | Required for any non-loopback request. Generate with `openssl rand -hex 32`. Treat as a secret. |
+| `LIFEOS_MCP_HTTP_URL` | str | — | Public URL Managed Agents uses to reach the MCP server. |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_WORK_DOMAIN_2` | Second work email domain | — |
-| `LIFEOS_SYNC_WORK_GMAIL` | Enable work Gmail sync | `false` |
-| `LIFEOS_SYNC_WORK_CALENDAR` | Enable work Calendar sync | `false` |
-| `LIFEOS_SYNC_WORK2_GMAIL` | Enable 2nd work Gmail | `false` |
-| `LIFEOS_SYNC_WORK2_CALENDAR` | Enable 2nd work Calendar | `false` |
-| `LIFEOS_SYNC_SLACK` | Enable Slack sync | `false` |
+## Agent Worker — Defaults and Budgets
 
-All work sync toggles default to `false` for safety — work data is not indexed unless explicitly enabled.
+`#agent`-tagged task worker. Product spec: [agent-worker.md](../specs/product/agent-worker.md). Operator setup: [agent-worker-setup.md](agent-worker-setup.md).
 
-### Google OAuth
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
+| `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new `#agent`-tagged tasks. |
+| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
+| `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
+| `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int | `500000` | Per-task token cap when title doesn't specify. |
+| `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks until next local midnight. Set to `0` to pause new claims entirely. |
+| `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | int | `72` | How long to wait for a Telegram clarification before abandoning the task. |
+| `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
+| `LIFEOS_AGENT_OUTPUT_DIR` | path | varies | Directory for worker-written task outputs. |
+| `LIFEOS_AGENT_PREFLIGHT_MODEL` | str | `claude-haiku-4-5` | Model used for preflight (budget parsing, routing, ambiguity, sanity). |
+| `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-4-6` | Informational — actual model lives in the Anthropic Console preset. |
+| `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS` | str | — | Override for test runs. |
+| `LIFEOS_AGENT_MAX_SPAWN_DEPTH` | int | varies | Hard cap on nested spawn depth (parent → child → grandchild). |
+| `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT` | int | varies | Total descendants per root session. |
+| `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL` | int | varies | Concurrent local-executor sessions. |
+| `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` | int | varies | Concurrent Managed-Agents sessions. |
 
-Google OAuth credentials are stored at `config/credentials-{account}.json` and `config/token-{account}.json`. Use `scripts/google_auth.py` to authenticate.
+## Agent Worker — Managed Agents (Cloud)
+
+Anthropic Console artifacts the cloud path needs. See [agent-worker-setup.md](agent-worker-setup.md#anthropic-console-setup) for provisioning.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AGENT_VAULT_ID` | str | — | Anthropic Vault holding cloud-connector OAuth credentials (Gmail, Calendar, Drive, Slack…). |
+| `LIFEOS_AGENT_PRESET_ID` | str | — | Anthropic Console agent preset id (bundles Vault, model, system prompt). |
+| `LIFEOS_AGENT_ENVIRONMENT_ID` | str | — | Anthropic Console environment id binding the preset to settings. |
+| `LIFEOS_AGENT_CONNECTORS` | str | — | Comma-separated connector list pulled from the Vault. |
+| `LIFEOS_AGENT_EXTRA_MCP_SERVERS` | str | — | Additional MCP server URLs to attach to Managed Agents sessions (advanced). |
+
+## Claude Code Viz (`/agents` ingest of Claude Code sessions)
+
+Read-only ingest of Claude Code's per-session JSONL transcripts. Decision: [ADR-011](../adr/011-external-agent-ingest.md).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CLAUDE_CODE_VIZ_ENABLED` | bool | `true` | Master switch. `false` disables the entire Claude Code ingest path. |
+| `LIFEOS_CLAUDE_CODE_PROJECTS_DIR` | path | `~/.claude/projects` | Where to read Claude Code JSONLs from. |
+| `LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS` | int | varies | How far back to scan transcripts. |
+
+## Claude Code Resume (`/agents` operator-controlled re-launch)
+
+Operator-side controls for re-opening a Claude Code session from the `/agents` UI. Used in [agent-viz product spec § Operator controls — resume](../specs/product/agent-viz.md#operator-controls--resume).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CC_RESUME_ENABLED` | bool | varies | Gates the resume UI and the `POST /api/agents/sessions/{id}/resume` route. |
+| `LIFEOS_CC_RESUME_CMD` | str | — | Outer command template the server runs to relaunch a terminal (e.g., a `warp-terminal` launcher). |
+| `LIFEOS_CC_RESUME_INNER_CMD` | str | — | Inner command run inside the relaunched terminal (the `claude --resume <id>` invocation). |
+| `LIFEOS_CC_RESUME_ENV_FILE` | path | — | Optional `key=value` env file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. |
+
+## Claude Code Orchestration (`/code` Telegram command)
+
+Subprocess orchestration triggered from Telegram. See [claude-code-orchestration.md](claude-code-orchestration.md) for the operator flow.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CLAUDE_BINARY` | str | `claude` | Path to the Claude CLI binary. |
+| `LIFEOS_CLAUDE_TIMEOUT` | int | `3600` | Safety-net wall-time per session, seconds. Heartbeats keep you informed; this is a backstop. |
+| `LIFEOS_CLAUDE_MAX_TURNS` | int | `50` | Max turns per session. |
+| `LIFEOS_CLAUDE_MAX_COST` | float | `2.0` | Max cost per session, USD. |
+
+## User Identity
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_USER_NAME` | str | — | Your first name. Appears in AI prompts. |
+| `LIFEOS_MY_PERSON_ID` | str | — | Your CRM PersonEntity UUID. Set after first sync — find it via `curl "localhost:8000/api/crm/people?q=<your-name>" \| jq '.people[0].id'`. |
+| `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
+| `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
+| `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
+
+## Relationships
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_PARTNER_NAME` | str | — | Partner's first name. |
+| `LIFEOS_THERAPIST_PATTERNS` | str | — | Therapist name patterns, pipe-separated (e.g., `Dr. Example\|Example Therapist`). |
+| `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS` | str | — | Pipe-separated patterns identifying personal meetings. |
+
+## Vault Structure
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CURRENT_WORK_PATH` | str | `Work/` | Work folder prefix in the vault. |
+| `LIFEOS_PERSONAL_ARCHIVE_PATH` | str | `Personal/zArchive/` | Personal archive folder prefix. |
+| `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
+
+## Multi-Account Sync
+
+All work toggles default to `false` — work data is not indexed unless explicitly enabled.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_SYNC_WORK_GMAIL` | bool | `false` | Enable work Gmail sync. |
+| `LIFEOS_SYNC_WORK_CALENDAR` | bool | `false` | Enable work Calendar sync. |
+| `LIFEOS_SYNC_WORK2_GMAIL` | bool | `false` | Enable second work Gmail. |
+| `LIFEOS_SYNC_WORK2_CALENDAR` | bool | `false` | Enable second work Calendar. |
+| `LIFEOS_SYNC_SLACK` | bool | `false` | Enable Slack sync. |
+
+## Photos
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_PHOTOS_PATH` | path | `~/Pictures/Photos Library.photoslibrary` | Apple Photos library path. Read by the Apple Data Agent on macOS (see [ADR-010](../adr/010-apple-data-agent.md)). |
+
+## Notifications
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_ALERT_EMAIL` | str | — | Destination for CRITICAL alerts (immediate) and the nightly health digest. |
+
+## Third-party Services
 
 ### Slack
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `SLACK_CLIENT_ID` | Slack OAuth app client ID | `123456.789012` |
-| `SLACK_CLIENT_SECRET` | Slack OAuth app client secret | `abc123...` |
-| `SLACK_REDIRECT_URI` | Slack OAuth redirect URL | `http://localhost:8000/api/crm/slack/callback` |
-| `SLACK_USER_TOKEN` | User OAuth token (direct auth, alternative to OAuth flow) | `xoxp-...` |
-| `SLACK_TEAM_ID` | Workspace ID | `T02F5DW71LY` |
-
-`SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` are read by the settings module for OAuth flow. `SLACK_USER_TOKEN` and `SLACK_TEAM_ID` are read directly by the Slack sync service as an alternative to the OAuth flow.
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `SLACK_CLIENT_ID` | str | — | Slack OAuth app client ID (full OAuth flow). |
+| `SLACK_CLIENT_SECRET` | str | — | Slack OAuth app client secret. |
+| `SLACK_REDIRECT_URI` | str | — | Slack OAuth redirect URL (e.g., `http://localhost:8000/api/crm/slack/callback`). |
+| `SLACK_USER_TOKEN` | str | — | Direct user OAuth token (`xoxp-...`) — alternative to the full OAuth flow. |
+| `SLACK_TEAM_ID` | str | — | Workspace ID. |
 
 ### Telegram
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | `123456:ABC-DEF...` |
-| `TELEGRAM_CHAT_ID` | Your chat ID (from `/getUpdates`) | `7145472553` |
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | str | — | Bot token from `@BotFather`. |
+| `TELEGRAM_CHAT_ID` | str | — | Your chat ID (find via `/getUpdates`). |
 
-When both are set, Telegram is enabled as a conversational client (full chat pipeline), scheduled reminder delivery channel, and alert destination.
+When both are set, Telegram becomes a conversational client (full chat pipeline), the scheduled-reminder delivery channel, and the alerting destination.
 
-**Commands:**
+**Telegram bot commands** (`@your-bot`):
 
 | Command | Description |
-|---------|-------------|
-| `/new` | Start a new conversation (clears context) |
-| `/status` | Check LifeOS server health |
-| `/code <task>` | Run a task with Claude Code |
-| `/code_status` | Check active Claude Code session |
-| `/code_cancel` | Cancel active Claude Code session |
-| `/help` | Show available commands |
+|---|---|
+| `/new` | Start a new conversation (clears context). |
+| `/status` | Check LifeOS server health. |
+| `/code <task>` | Run a task with Claude Code orchestrator (see [claude-code-orchestration.md](claude-code-orchestration.md)). |
+| `/code_status` | Check active Claude Code session. |
+| `/code_cancel` | Cancel active Claude Code session. |
+| `/help` | Show available commands. |
 
-**Natural language:** Send any message to query LifeOS, create tasks/reminders, or draft emails. See [Reminders Guide](../guides/REMINDERS.md) and [Task Management](../guides/TASK-MANAGEMENT.md) for examples. See [Claude Code Orchestration](../guides/CLAUDE-CODE-ORCHESTRATION.md) for `/code` details.
-
-### Photos
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_PHOTOS_PATH` | Apple Photos library path | `~/Pictures/Photos Library.photoslibrary` |
+Natural-language messages run through the chat pipeline (search, synthesis, tools).
 
 ### Monarch Money
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MONARCH_EMAIL` | Monarch Money email | — |
-| `MONARCH_PASSWORD` | Monarch Money password | — |
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `MONARCH_EMAIL` | str | — | Monarch Money login email. |
+| `MONARCH_PASSWORD` | str | — | Monarch Money password. |
 
-### Claude Code Orchestration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_CLAUDE_BINARY` | Path to Claude CLI binary | `claude` (or full path) |
-| `LIFEOS_CLAUDE_TIMEOUT` | Safety-net timeout (seconds) | `3600` |
-| `LIFEOS_CLAUDE_MAX_TURNS` | Max Claude Code turns per session | `50` |
-| `LIFEOS_CLAUDE_MAX_COST` | Max Claude Code cost per session (USD) | `2.0` |
-
-Requires Claude Code installed and authenticated on the server. See [Claude Code Orchestration Guide](../guides/CLAUDE-CODE-ORCHESTRATION.md#authentication-setup) for setup.
-
-### Backup
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIFEOS_BACKUP_PATH` | Backup directory | `./data/backups` |
-
-### Notifications
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `LIFEOS_ALERT_EMAIL` | Email for sync failure alerts | `you@email.com` |
-
----
+Auth tokens are cached at `data/monarch_session.pickle` after first login. Re-authenticate when the token expires (401/525) per the steps in the root [AGENTS.md § Monarch Money](../../AGENTS.md#monarch-money-financial-data).
 
 ## Configuration Files
 
-### People Dictionary
+A handful of operator-tunable files live alongside the env vars. All are gitignored.
 
-**File**: `config/people_dictionary.json` (gitignored)
-
-Maps nicknames and aliases to canonical names:
-
-```json
-{
-  "Al": "Alex",
-  "Mike": "Michael",
-  "Liz": "Elizabeth"
-}
-```
-
-**Note**: Restart server after editing.
-
-### Relationship Overrides
-
-**File**: `config/relationship_overrides.json` (gitignored)
-
-Force relationship strength/circle for specific people:
-
-```json
-{
-  "strength_overrides": {
-    "person-uuid": 100.0
-  },
-  "circle_overrides": {
-    "person-uuid": 0
-  }
-}
-```
-
-### Family Members
-
-**File**: `config/family_members.json` (gitignored)
-
-List of family member person IDs for special handling.
-
----
+| File | Purpose |
+|---|---|
+| `config/people_dictionary.json` | Nickname/alias lookup (e.g., `"Al": "Alex"`). Restart server after edits. Template at `config/people_dictionary.example.json`. |
+| `config/relationship_overrides.json` | Force relationship strength/circle for specific person UUIDs. Template at `config/relationship_overrides.example.json`. |
+| `config/family_members.json` | Family member person UUIDs for special handling. Template at `config/family_members.example.json`. |
+| `config/crm_settings.yaml` | CRM-side tunables (filters, dashboards). |
+| `config/gdoc_sync.example.yaml`, `config/gsheet_sync.example.yaml` | Templates for Google Docs/Sheets sync configs. |
 
 ## Data Directory
 
-**Location**: `data/` (gitignored)
+Default: `data/` (gitignored). Holds personal data — back it up regularly, never commit. See [data-and-sync.md](../specs/technical/data-and-sync.md#data-stores) for the full store layout.
 
-Contains:
-- `crm.db` - SQLite database for people and interactions
-- `chromadb/` - Vector embeddings
-- `people_entities.json` - Canonical person records
-- `imessage.db` - iMessage export cache
+## Person ID Durability
 
-**Important**: This directory contains personal data. Back it up regularly but never commit it.
+When configuring overrides by person (strength, circle, tags), use **PersonEntity UUIDs**, not names — names change (renames, typos, merges); UUIDs are immutable. Find a UUID via:
 
----
-
-## ID Durability
-
-When configuring overrides by person ID (strength, circle, tags), use **person IDs** not names:
-
-- Names can change (renames, typos, merges)
-- IDs are immutable UUIDs assigned at person creation
-
-To find a person's ID:
 ```bash
 curl "http://localhost:8000/api/crm/people?q=PersonName" | jq '.people[0].id'
 ```
 
----
+## Example `.env`
 
-## Example .env File
+A minimal `.env` that boots LifeOS in its `anthropic`-backend default mode:
 
 ```bash
 # Required
 LIFEOS_VAULT_PATH=~/Notes
 
-# LLM Backend (default: local)
+# LLM Backend (default is `anthropic` — switch to `local` once you have llama-server running)
 # LIFEOS_LLM_BACKEND=local
-# ANTHROPIC_API_KEY=sk-ant-your-key-here  # only needed with LIFEOS_LLM_BACKEND=anthropic
+# ANTHROPIC_API_KEY=sk-ant-your-key-here       # required for anthropic backend
 
 # Identity
 LIFEOS_USER_NAME=YourName
 LIFEOS_WORK_DOMAIN=yourcompany.com
 LIFEOS_TIMEZONE=America/New_York
 
-# Embedding & Search
-# LIFEOS_EMBEDDING_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct
-# LIFEOS_RERANKER_ENABLED=true
+# Notifications
+LIFEOS_ALERT_EMAIL=you@example.com
 
-# Ollama
-# OLLAMA_HOST=http://localhost:11434
-# OLLAMA_MODEL=qwen2.5:7b-instruct
+# Slack (optional)
+# SLACK_USER_TOKEN=xoxp-your-token
+# SLACK_TEAM_ID=T02XXXXX
 
-# Multi-Account Sync (all default to false)
-# LIFEOS_SYNC_WORK_GMAIL=false
-# LIFEOS_SYNC_WORK_CALENDAR=false
-# LIFEOS_SYNC_SLACK=false
-
-# Slack
-SLACK_USER_TOKEN=xoxp-your-token
-SLACK_TEAM_ID=T02XXXXX
-# SLACK_CLIENT_ID=your-client-id
-# SLACK_CLIENT_SECRET=your-client-secret
-
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN=your-bot-token
-TELEGRAM_CHAT_ID=your-chat-id
+# Telegram (optional, enables conversational client)
+# TELEGRAM_BOT_TOKEN=your-bot-token
+# TELEGRAM_CHAT_ID=your-chat-id
 
 # Monarch Money (optional)
-# MONARCH_EMAIL=you@email.com
+# MONARCH_EMAIL=you@example.com
 # MONARCH_PASSWORD=your-password
-
-# Notifications
-LIFEOS_ALERT_EMAIL=you@email.com
 ```
-
----
-
-## Next Steps
-
-- [Google OAuth Setup](google-oauth.md)
-- [Slack Integration](slack-integration.md)
-- [First Run Guide](first-run.md)
 
 ## Related Documents
 
-- [Installation](installation.md) -- Initial installation walkthrough
-- [First Run](first-run.md) -- Post-installation first use guide
+- [Installation](installation.md) — Initial setup; points back here for env-var reference.
+- [First Run](first-run.md) — Post-install verification.
+- [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
+- [Claude Code Orchestration](claude-code-orchestration.md) — `/code` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
+- [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
+- [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
+- [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.
