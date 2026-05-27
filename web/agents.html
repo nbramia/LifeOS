@@ -199,6 +199,18 @@
     font-weight: 600;
     font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
     font-size: 0.72rem;
+    cursor: pointer;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    transition: background 0.12s ease;
+  }
+  .event .kind:hover {
+    background: var(--bg-elev);
+    color: var(--accent);
+  }
+  .event .kind.kind-active-filter {
+    background: var(--accent);
+    color: var(--bg-primary);
   }
   .event .ts {
     color: var(--text-dim);
@@ -387,7 +399,7 @@
     <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
     <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
-    <span class="chip spend">spend <strong id="chip-spend">$0.00</strong></span>
+    <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API)">API spend <strong id="chip-spend">$0.00</strong></span>
     <span class="chip legend" title="Node shapes: circle = LifeOS agent worker · square = Claude Code CLI · diamond = Task-tool subagent">
       <span style="opacity:0.6">●</span> agent &nbsp;
       <span style="opacity:0.6">■</span> cli &nbsp;
@@ -469,12 +481,12 @@
       stabilization: { iterations: 250, fit: true },
       solver: 'forceAtlas2Based',
       forceAtlas2Based: {
-        gravitationalConstant: -180,
-        centralGravity: 0.005,
-        springLength: 180,
-        springConstant: 0.04,
-        damping: 0.55,
-        avoidOverlap: 0.9,
+        gravitationalConstant: -90,
+        centralGravity: 0.008,
+        springLength: 150,
+        springConstant: 0.05,
+        damping: 0.6,
+        avoidOverlap: 0.7,
       },
       maxVelocity: 50,
       minVelocity: 0.5,
@@ -640,12 +652,17 @@
     const blocked = sessions.filter(s => s.status === 'blocked').length;
     const recent = sessions.filter(s => s.status === 'completed').length;
     const cc = sessions.filter(s => s.source === 'claude_code').length;
-    const spend = sessions.reduce((acc, s) => acc + (s.total_dollars || 0), 0);
+    // API spend = LifeOS agent worker sessions only. Claude Code CLI is paid
+    // via the user's subscription, not metered API tokens, so its dollar
+    // numbers would distort what the chip is meant to surface (real cost).
+    const apiSpend = sessions
+      .filter(s => s.source !== 'claude_code')
+      .reduce((acc, s) => acc + (s.total_dollars || 0), 0);
     document.getElementById('chip-running').textContent = running;
     document.getElementById('chip-blocked').textContent = blocked;
     document.getElementById('chip-recent').textContent = recent;
     document.getElementById('chip-cc').textContent = cc;
-    document.getElementById('chip-spend').textContent = '$' + spend.toFixed(2);
+    document.getElementById('chip-spend').textContent = '$' + apiSpend.toFixed(2);
   }
 
   function applySnapshot(snap) {
@@ -889,12 +906,15 @@
 
   function closePanel() {
     selectedSessionId = null;
+    eventKindFilter = null;
     if (transcriptES) { transcriptES.close(); transcriptES = null; }
     panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
   }
 
   function openPanel(sessionId) {
     if (transcriptES) { transcriptES.close(); transcriptES = null; }
+    // Reset filter when switching sessions — kinds are session-scoped.
+    eventKindFilter = null;
     selectedSessionId = sessionId;
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
@@ -920,6 +940,32 @@
       });
   }
 
+  // Kind filter state for the side-panel feed. null = show all; otherwise
+  // only events whose kind matches the filter are visible. Clicking the same
+  // kind label twice toggles back to "show all".
+  let eventKindFilter = null;
+
+  // Format a unix-epoch timestamp as "MM/DD h:mm:ssa ET" — explicit Eastern
+  // tz so it matches the rest of LifeOS (timezone='America/New_York' in
+  // settings.py) regardless of the browser machine's locale.
+  function formatTs(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const date = d.toLocaleDateString('en-US', {
+      timeZone: 'America/New_York',
+      month: 'numeric',
+      day: 'numeric',
+    });
+    const time = d.toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
+    return `${date} ${time} ET`;
+  }
+
   // appendEvent always renders newest-on-top so backfill and live additions
   // share the same visual order. Backfill is delivered oldest-first, so we
   // prepend each one as it arrives, leaving the chronologically-newest event
@@ -928,19 +974,66 @@
     const container = document.getElementById('events');
     if (!container) return;
     const kind = String(ev.kind || '');
-    const ts = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : '';
+    const ts = formatTs(ev.ts);
     const payload = ev.payload ? JSON.stringify(ev.payload, null, 0) : '';
     const truncated = payload.length > 240 ? payload.slice(0, 240) + '…' : payload;
     const div = document.createElement('div');
     // classList.add validates token shape — defense-in-depth even though
     // `kind` is server-controlled today.
     div.classList.add('event');
-    if (kind) div.classList.add(`kind-${kind.replace(/[^a-zA-Z0-9_-]/g, '_')}`);
+    if (kind) {
+      const safeKind = kind.replace(/[^a-zA-Z0-9_-]/g, '_');
+      div.classList.add(`kind-${safeKind}`);
+      div.dataset.kind = kind;
+    }
     div.innerHTML = `
-      <div><span class="kind">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
+      <div><span class="kind" role="button" tabindex="0" title="Click to filter to this event type">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
       ${payload ? `<div class="payload">${escapeHtml(truncated)}</div>` : ''}
     `;
+    // Hide the event up front if a filter is active and doesn't match.
+    if (eventKindFilter && kind !== eventKindFilter) {
+      div.style.display = 'none';
+    }
+    // Click on the kind label → toggle filter on this kind.
+    const kindEl = div.querySelector('.kind');
+    if (kindEl && kind) {
+      kindEl.addEventListener('click', () => toggleKindFilter(kind));
+      kindEl.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleKindFilter(kind);
+        }
+      });
+    }
     container.prepend(div);
+  }
+
+  function toggleKindFilter(kind) {
+    eventKindFilter = (eventKindFilter === kind) ? null : kind;
+    applyEventFilter();
+  }
+
+  function applyEventFilter() {
+    const container = document.getElementById('events');
+    if (!container) return;
+    const events = container.querySelectorAll('.event');
+    events.forEach(el => {
+      const k = el.dataset.kind;
+      if (!eventKindFilter || k === eventKindFilter) {
+        el.style.display = '';
+      } else {
+        el.style.display = 'none';
+      }
+    });
+    // Visually mark filtered state on every visible kind label.
+    container.querySelectorAll('.kind').forEach(el => {
+      const k = el.parentElement?.parentElement?.dataset?.kind;
+      if (eventKindFilter && k === eventKindFilter) {
+        el.classList.add('kind-active-filter');
+      } else {
+        el.classList.remove('kind-active-filter');
+      }
+    });
   }
 
   function escapeHtml(s) {
