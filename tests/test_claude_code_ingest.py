@@ -260,13 +260,15 @@ def test_parse_session_sums_tokens_and_cost(tmp_path: Path):
     assert meta.total_output_tokens == 75
     assert meta.total_cache_creation_tokens == 200
     assert meta.total_cache_read_tokens == 1500
-    # Cost matches the agent worker: input + output tokens only, no cache
-    # tokens (see #137 for the eventual cache-aware pricing). Sonnet rates
-    # are $3/M input, $15/M output.
-    # Msg 1: 100*3e-6 + 50*15e-6 = 0.0003 + 0.00075 = 0.00105
-    # Msg 2: 50*3e-6  + 25*15e-6 = 0.00015 + 0.000375 = 0.000525
-    # Total: 0.001575
-    assert meta.total_dollars == pytest.approx(0.001575, rel=1e-3)
+    # Cost matches the agent worker after cache-aware pricing landed
+    # (#145 / #157). Sonnet rates: $3/M input, $15/M output. cache_creation
+    # is 1.25× input ($3.75/M); cache_read is 0.10× input ($0.30/M).
+    # Msg 1: 100*3e-6 + 50*15e-6 + 200*3.75e-6 + 1000*0.30e-6
+    #      = 0.0003 + 0.00075 + 0.00075 + 0.0003 = 0.00210
+    # Msg 2: 50*3e-6 + 25*15e-6 + 0 + 500*0.30e-6
+    #      = 0.00015 + 0.000375 + 0.00015 = 0.000675
+    # Total: 0.002775
+    assert meta.total_dollars == pytest.approx(0.002775, rel=1e-3)
 
 
 # ---------------------------------------------------------------------------

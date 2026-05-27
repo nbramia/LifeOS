@@ -172,6 +172,8 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "last_activity_at": s.last_activity_at,
         "total_input_tokens": s.total_input_tokens,
         "total_output_tokens": s.total_output_tokens,
+        "total_cache_creation_tokens": getattr(s, "total_cache_creation_tokens", 0),
+        "total_cache_read_tokens": getattr(s, "total_cache_read_tokens", 0),
         "total_dollars": round(s.total_dollars, 6),
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,

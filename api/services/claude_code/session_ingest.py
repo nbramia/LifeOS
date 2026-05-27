@@ -382,20 +382,27 @@ def _truncate(s: str, cap: int = _PAYLOAD_PREVIEW_MAX) -> str:
 def _cost_from_usage(usage: dict[str, Any], model: str) -> float:
     """Apply pricing.py to a single message's `usage` block.
 
-    Sums input + output tokens only — matches the agent worker (which
-    only reads `input_tokens` / `output_tokens` from the Anthropic API
-    response; see `managed_executor.py` and `local_executor.py`). Cache
-    tokens are tracked separately in the `SessionMeta` for visibility
-    but are NOT added into the cost so the two sources are
-    apples-to-apples until cache-aware pricing lands (#137). When #137
-    ships, both sides should be updated together.
+    Sums all four Anthropic token buckets — uncached input, output,
+    cache_creation (1.25× input), cache_read (0.10× input) — matching
+    the agent worker's cost accounting after #145 / #157 landed
+    cache-aware pricing in `pricing.cost_for`. This keeps API spend
+    numbers apples-to-apples across LifeOS agent and Claude Code
+    sources.
     """
     from api.services.agent_worker.pricing import cost_for
 
     in_tok = int(usage.get(_USAGE_INPUT, 0) or 0)
     out_tok = int(usage.get(_USAGE_OUTPUT, 0) or 0)
+    cache_creation = int(usage.get(_USAGE_CACHE_CREATION, 0) or 0)
+    cache_read = int(usage.get(_USAGE_CACHE_READ, 0) or 0)
     use_model = model or "claude-sonnet-4-6"  # safer default than the Opus fallback
-    return cost_for(use_model, in_tok, out_tok)
+    return cost_for(
+        use_model,
+        in_tok,
+        out_tok,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+    )
 
 
 # ---------------------------------------------------------------------------
