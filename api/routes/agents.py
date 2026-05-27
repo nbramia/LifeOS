@@ -442,6 +442,42 @@ class CCResumeRequest(BaseModel):
     extra_env: dict[str, str] = {}
 
 
+def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
+    """Push `text` to the system clipboard via `wl-copy` (Wayland) or
+    `xclip` (X11). Returns True on success, False on any failure. Never
+    raises — the resume flow proceeds either way; the frontend gets the
+    rendered command in the response as a backup.
+    """
+    import shutil
+    import subprocess
+
+    # Wayland first (the user is on a Wayland session — WAYLAND_DISPLAY is
+    # set in the env overlay). xclip works on X11 / Xwayland.
+    candidates: list[list[str]] = []
+    if shutil.which("wl-copy"):
+        candidates.append(["wl-copy"])
+    if shutil.which("xclip"):
+        candidates.append(["xclip", "-selection", "clipboard"])
+    for argv in candidates:
+        try:
+            proc = subprocess.run(
+                argv,
+                input=text.encode("utf-8"),
+                env=env,
+                timeout=2.0,
+                check=False,
+                capture_output=True,
+            )
+            if proc.returncode == 0:
+                return True
+            logger.debug("clipboard helper %s exited rc=%d: %s",
+                         argv[0], proc.returncode, proc.stderr[:200])
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("clipboard helper %s failed: %s", argv[0], exc)
+            continue
+    return False
+
+
 def _resume_env() -> dict[str, str]:
     """Build the environment dict for the resume subprocess.
 
@@ -561,16 +597,23 @@ async def resume_claude_code_session(
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
     # Render the inner command (the actual `claude --resume` invocation)
-    # for the frontend to copy to clipboard — Warp Linux ignores the
-    # `&command=` URI param, so the operator pastes it once the terminal
-    # opens. Same substitution rules as the outer template (raw only —
-    # URL-encoded variants aren't meaningful inside a terminal).
+    # so the operator can paste it once the terminal opens — Warp Linux
+    # ignores the `&command=` URI param.
     inner_template = (settings.cc_resume_inner_cmd or "").strip()
     inner_rendered = (
         inner_template
         .replace("{session_id}", bare)
         .replace("{cwd}", target.decoded_cwd)
     )
+    # Push the rendered inner command directly to the system clipboard
+    # via wl-copy / xclip. The browser-side Clipboard API silently fails
+    # when the page loses focus (which happens the instant Warp opens),
+    # so doing the copy from the server while it still has env access is
+    # far more reliable. Failure here is non-fatal — the frontend gets
+    # the command in the response and can offer manual copy.
+    clipboard_copied = False
+    if inner_rendered:
+        clipboard_copied = _copy_to_clipboard(inner_rendered, env)
 
     # Give the spawn a beat. Two flavors of launcher are both valid:
     #   (a) the launcher BECOMES the terminal (long-running) — wait() times
@@ -585,6 +628,7 @@ async def resume_claude_code_session(
         "command": argv,
         "cwd": target.decoded_cwd,
         "inner_command": inner_rendered,
+        "clipboard_copied": clipboard_copied,
     }
     try:
         proc.wait(timeout=0.5)

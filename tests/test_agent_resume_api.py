@@ -49,6 +49,11 @@ def synthetic_session(tmp_path: Path, monkeypatch):
     from api.services.claude_code import session_ingest as cc
     cc.invalidate_cache()
     cc.invalidate_process_cache()
+    # Short-circuit the server-side clipboard helper for the default mock
+    # setup — tests that want to assert on it override `shutil.which`
+    # themselves. Without this, every test that mocks subprocess.Popen
+    # would also have to handle the `wl-copy`/`xclip` subprocess.run.
+    monkeypatch.setattr("shutil.which", lambda name: None)
     return tmp_path, sid
 
 
@@ -228,6 +233,86 @@ def test_resume_500_when_process_exits_nonzero_with_stderr(client, synthetic_ses
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
     assert r.status_code == 500
     assert "stderr says" in r.json()["detail"]
+
+
+@pytest.mark.unit
+def test_resume_pipes_inner_command_to_system_clipboard(
+    client, synthetic_session, monkeypatch
+):
+    """`inner_command` is piped to wl-copy / xclip server-side. The
+    response's `clipboard_copied` flag reflects whether the helper
+    exited rc=0."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
+                        "vt claude --resume {session_id}")
+
+    class _DispatchedProc:
+        def __init__(self, argv, **kwargs):
+            self.pid = 9
+            self.returncode = 0
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
+
+    captured: dict[str, object] = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        stderr = b""
+
+    def _fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["input"] = kwargs.get("input")
+        return _CompletedProcess()
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}" if name in ("wl-copy",) else None)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["clipboard_copied"] is True
+    # The wl-copy invocation received the rendered inner command on stdin.
+    assert captured["argv"] == ["wl-copy"]
+    assert captured["input"].decode("utf-8") == f"vt claude --resume {sid}"
+
+
+@pytest.mark.unit
+def test_resume_clipboard_failure_is_non_fatal(client, synthetic_session, monkeypatch):
+    """No clipboard helper available → spawn still succeeds, flag is False."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
+                        "vt claude --resume {session_id}")
+
+    class _DispatchedProc:
+        def __init__(self, argv, **kwargs):
+            self.pid = 9
+            self.returncode = 0
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
+    monkeypatch.setattr("shutil.which", lambda name: None)  # no clipboard tools
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["spawned"] is True
+    assert body["clipboard_copied"] is False
+    assert body["inner_command"]  # still returned so frontend can offer manual copy
 
 
 @pytest.mark.unit

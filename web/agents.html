@@ -746,18 +746,19 @@
         throw new Error(`HTTP ${r.status}: ${msg}`);
       }
       const result = await r.json();
-      // Warp Linux ignores `&command=` in its URI scheme, so the actual
-      // `claude --resume` invocation comes back as `inner_command` and we
-      // copy it to the clipboard for the operator to paste once the
-      // terminal opens.
-      let copied = false;
-      if (result.inner_command && navigator.clipboard && navigator.clipboard.writeText) {
+      // The server tries to push `inner_command` to the system clipboard
+      // via wl-copy / xclip — that's far more reliable than the browser
+      // Clipboard API, which silently fails when the page loses focus
+      // (which happens the instant Warp opens). If the server copy
+      // didn't land, try one more time from the browser before showing
+      // the command inline so the operator can copy it manually.
+      let copied = !!result.clipboard_copied;
+      if (!copied && result.inner_command && navigator.clipboard && navigator.clipboard.writeText) {
         try {
           await navigator.clipboard.writeText(result.inner_command);
           copied = true;
         } catch (_) {
-          // Clipboard API can fail when the page isn't focused (browser
-          // throws NotAllowedError). Fall through to a non-copy toast.
+          // ignore — toast will show the command for manual copy
         }
       }
       if (copied) {
