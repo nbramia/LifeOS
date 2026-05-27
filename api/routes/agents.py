@@ -176,6 +176,7 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "total_active_seconds": round(s.total_active_seconds, 3),
         "expected_output": s.expected_output,
         "label": _label_for_session(s, events),
+        "model_label": _model_label_for_routing(s.routing),
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
         "error_count": summary["error_count"],
