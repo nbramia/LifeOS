@@ -436,6 +436,141 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
                 pass
 
 
+class CCResumeRequest(BaseModel):
+    """Body for POST /api/agents/sessions/{id}/resume — accepts overrides
+    for the spawn env when the systemd-inherited env isn't enough."""
+    extra_env: dict[str, str] = {}
+
+
+def _resume_env() -> dict[str, str]:
+    """Build the environment dict for the resume subprocess.
+
+    Inherits from the FastAPI process env (typical systemd-imported env),
+    then layers in key=value lines from LIFEOS_CC_RESUME_ENV_FILE if set.
+    The file lets operators pin DISPLAY / XAUTHORITY / WAYLAND_DISPLAY /
+    DBUS_SESSION_BUS_ADDRESS explicitly — systemd usually omits them.
+    """
+    import os
+    env: dict[str, str] = dict(os.environ)
+    try:
+        from config.settings import settings
+        path = (settings.cc_resume_env_file or "").strip()
+    except Exception:  # noqa: BLE001
+        path = ""
+    if path:
+        try:
+            with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+        except OSError as exc:
+            logger.warning("cc_resume_env_file unreadable (%s): %s", path, exc)
+    return env
+
+
+@router.post("/sessions/{session_id}/resume")
+async def resume_claude_code_session(
+    session_id: str,
+    body: CCResumeRequest | None = None,
+) -> dict[str, Any]:
+    """Spawn a local terminal that re-opens a Claude Code session.
+
+    Only valid for `cc:`-prefixed sessions. Opt-in via
+    `LIFEOS_CC_RESUME_ENABLED`. Local-network only — do not expose via
+    Tailscale Funnel or the public MCP HTTP transport.
+    """
+    import shlex
+    import subprocess
+
+    if not session_id.startswith("cc:"):
+        raise HTTPException(status_code=400, detail="resume is only available for Claude Code sessions")
+
+    try:
+        from config.settings import settings
+    except Exception as exc:  # noqa: BLE001 — settings should always load
+        raise HTTPException(status_code=500, detail=f"settings unavailable: {exc}") from exc
+
+    if not getattr(settings, "cc_resume_enabled", False):
+        raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
+    template = (settings.cc_resume_cmd or "").strip()
+    if not template:
+        raise HTTPException(status_code=400, detail="LIFEOS_CC_RESUME_CMD is empty")
+
+    from api.services.claude_code import session_ingest as cc
+
+    try:
+        bare = cc.validate_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Subagent synthetic ids point at the parent's bare uuid; the operator
+    # really wants to resume the parent terminal session, not a sub-slice.
+    if ":agent:" in bare:
+        bare = bare.split(":agent:", 1)[0]
+
+    # Find the matching jsonl to recover the working directory.
+    metas = cc.discover_sessions(
+        projects_dir=settings.claude_code_projects_dir,
+        lookback_days=max(int(settings.claude_code_lookback_days), 365),  # widen lookback for resume
+    )
+    target = next((m for m in metas if m.raw_session_id == bare), None)
+    if target is None or not target.decoded_cwd:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
+
+    # Render the template — {session_id} is the only supported substitution.
+    rendered = template.replace("{session_id}", bare)
+    try:
+        argv = shlex.split(rendered)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"resume_cmd parse failed: {exc}") from exc
+    if not argv:
+        raise HTTPException(status_code=400, detail="resume_cmd resolved to an empty argv")
+
+    env = _resume_env()
+    if body and body.extra_env:
+        env.update(body.extra_env)
+
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True (explicit shlex.split above)
+            argv,
+            cwd=target.decoded_cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
+
+    # Give the spawn a beat — if it crashed immediately, surface stderr.
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        # Still running — that's the happy path. Detach from any unread output.
+        return {
+            "spawned": True,
+            "pid": proc.pid,
+            "command": argv,
+            "cwd": target.decoded_cwd,
+        }
+    # If we got here, the process exited within 0.5s — likely an error.
+    stderr_preview = b""
+    try:
+        if proc.stderr is not None:
+            stderr_preview = proc.stderr.read(1024)
+    except Exception:  # noqa: BLE001
+        pass
+    detail = (stderr_preview.decode("utf-8", errors="replace").strip()
+              or f"resume process exited rc={proc.returncode}")
+    raise HTTPException(status_code=500, detail=detail)
+
+
 async def _stream_claude_code_session(session_id: str, backfill: int):
     """Per-session SSE generator for Claude Code (cc:-prefixed) sessions."""
     from config.settings import settings

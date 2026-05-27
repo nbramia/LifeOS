@@ -247,6 +247,22 @@
     opacity: 0.6;
     cursor: progress;
   }
+  .panel-resume {
+    background: var(--bg-card);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-resume:hover { background: var(--accent); color: var(--bg-primary); }
+  .panel-resume:disabled { opacity: 0.6; cursor: progress; }
   .modal-backdrop {
     position: fixed; inset: 0;
     background: rgba(0,0,0,0.55);
@@ -445,12 +461,24 @@
   const edges = new vis.DataSet([]);
   const network = new vis.Network(graphEl, { nodes, edges }, {
     physics: {
-      // Stabilize once on load; subsequent snapshot ticks update node attrs
-      // in place via DataSet.update so positions stay put.
+      // forceAtlas2Based gives the same airy, repulsion-dominant layout the
+      // /crm graph has — clusters form from charge, not link length. Strong
+      // gravitationalConstant + avoidOverlap keep nodes from stacking even
+      // when token-based sizing makes some of them big.
       enabled: true,
-      stabilization: { iterations: 120, fit: true },
-      barnesHut: { gravitationalConstant: -2400, springLength: 130, damping: 0.6 },
-      timestep: 0.45,
+      stabilization: { iterations: 250, fit: true },
+      solver: 'forceAtlas2Based',
+      forceAtlas2Based: {
+        gravitationalConstant: -180,
+        centralGravity: 0.005,
+        springLength: 180,
+        springConstant: 0.04,
+        damping: 0.55,
+        avoidOverlap: 0.9,
+      },
+      maxVelocity: 50,
+      minVelocity: 0.5,
+      timestep: 0.4,
     },
     interaction: { hover: true, tooltipDelay: 200, dragNodes: true },
     edges: {
@@ -643,15 +671,21 @@
     const live = !TERMINAL.has(s.status);
     const safeStatus = escapeAttr(s.status);
     const isClaudeCode = (s.source === 'claude_code');
+    const isSubagent = !!s.is_subagent;
     // No kill button for Claude Code sessions — we don't have a safe primitive
     // to terminate them from outside the terminal.
     const showKill = live && !isClaudeCode;
+    // Resume button: only for terminal-state Claude Code sessions (not subagents).
+    // Whether the backend will actually accept the click depends on
+    // LIFEOS_CC_RESUME_ENABLED on the server; if disabled, click → toast error.
+    const showResume = isClaudeCode && !isSubagent && (TERMINAL.has(s.status) || s.status === 'yielded');
     const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     panelEl.innerHTML = `
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
+        ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a terminal and resume this session">Resume</button>' : ''}
         <div class="label" data-field="label">${escapeHtml(s.label || s.session_id)}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         <div class="meta" data-field="meta">
@@ -669,6 +703,43 @@
     document.getElementById('panel-close').onclick = closePanel;
     if (showKill) {
       document.getElementById('panel-kill').onclick = () => openKillModal(s);
+    }
+    if (showResume) {
+      document.getElementById('panel-resume').onclick = () => resumeCcSession(s);
+    }
+  }
+
+  async function resumeCcSession(s) {
+    const btn = document.getElementById('panel-resume');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Resuming…';
+    }
+    try {
+      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        // FastAPI returns {"detail": "..."} on HTTPException — surface that.
+        let msg = text;
+        try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+        throw new Error(`HTTP ${r.status}: ${msg}`);
+      }
+      const result = await r.json();
+      showToast(`Spawned (pid ${result.pid}) in ${result.cwd}`, false);
+    } catch (err) {
+      showToast(`Resume failed: ${err.message}`, true);
+    } finally {
+      // Re-enable after a beat so accidental double-click is harmless.
+      setTimeout(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = 'Resume';
+        }
+      }, 4000);
     }
   }
 

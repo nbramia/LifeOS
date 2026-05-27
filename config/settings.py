@@ -200,6 +200,31 @@ class Settings(BaseSettings):
                     "within this many days. Keeps the snapshot lean — older "
                     "transcripts can still be opened on demand by direct id."
     )
+    cc_resume_enabled: bool = Field(
+        default=False,
+        alias="LIFEOS_CC_RESUME_ENABLED",
+        description="When true, the /agents UI exposes a 'Resume' button on "
+                    "terminal-state Claude Code sessions that spawns a local "
+                    "terminal running the configured resume command. Opt-in "
+                    "because spawning GUI terminals from a systemd service "
+                    "depends on the operator's desktop environment."
+    )
+    cc_resume_cmd: str = Field(
+        default="vt claude --dangerously-skip-permissions --chrome --resume {session_id}",
+        alias="LIFEOS_CC_RESUME_CMD",
+        description="Template command for resuming a Claude Code session. "
+                    "The single supported substitution token is `{session_id}`, "
+                    "replaced with the bare session uuid (no `cc:` prefix). "
+                    "Parsed with shlex.split — no shell metacharacters."
+    )
+    cc_resume_env_file: str = Field(
+        default="",
+        alias="LIFEOS_CC_RESUME_ENV_FILE",
+        description="Optional path to a `key=value` file pinning DISPLAY / "
+                    "XAUTHORITY / WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS "
+                    "for the spawned terminal. Leave empty to inherit the "
+                    "systemd service's env (which usually has none of these)."
+    )
     agent_vault_id: str = Field(
         default="",
         alias="LIFEOS_AGENT_VAULT_ID",
