@@ -129,6 +129,7 @@ Run LifeOS on a cloud VM with an attached GPU (e.g., AWS p4d, Lambda Labs) to av
 - [ADR-005: External Venv](005-external-venv-macos-tcc.md) — Superseded by this ADR; TCC rationale no longer applies, external venv practice retained
 - [ADR-001: Python/FastAPI](001-python-fastapi.md) — The backend stack, unchanged by this migration
 - [ADR-006: Ollama Query Routing](006-ollama-query-routing.md) — The routing layer now runs under systemd
+- [ADR-010: Apple Data Agent](010-apple-data-agent.md) — Formalizes the Mac's post-migration role as a nightly Apple-data source
 
 ### Specifications
 - [Architecture](../specs/technical/architecture.md) — System architecture (updated for Linux deployment)
