@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Agents · LifeOS</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   :root {
@@ -122,13 +122,75 @@
   }
   main {
     display: grid;
-    grid-template-columns: 1fr 360px;
+    grid-template-columns: 1fr var(--panel-width, 360px);
     height: calc(100vh - 56px - 41px);
+  }
+  /* Drag handle on the left edge of the side panel — col-resize cursor,
+     pure CSS visual feedback on hover/active. Drag logic in JS persists
+     the width to localStorage so it survives reload. */
+  .panel-resizer {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 5px;
+    cursor: col-resize;
+    background: transparent;
+    transition: background 0.15s ease;
+    z-index: 10;
+  }
+  .panel-resizer:hover,
+  .panel-resizer.dragging {
+    background: var(--accent);
+  }
+  aside.panel { position: relative; }
+  .panel-content {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    height: 100%;
+    padding-left: 5px;  /* leave room for the resizer strip */
   }
   #graph {
     background: var(--bg-primary);
     position: relative;
     overflow: hidden;
+  }
+  #graph-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  /* D3 force-graph styles */
+  #graph-svg .link {
+    stroke: #3a3a4a;
+    stroke-width: 1.2;
+    fill: none;
+    opacity: 0.7;
+    pointer-events: none;
+  }
+  #graph-svg .node-shape {
+    cursor: pointer;
+    transition: stroke-width 0.2s ease, filter 0.2s ease;
+  }
+  #graph-svg .node-shape:hover {
+    stroke: #e8e8ed;
+    filter: brightness(1.15);
+  }
+  #graph-svg .node-label {
+    font: 12px system-ui, -apple-system, sans-serif;
+    fill: #e8e8ed;
+    text-anchor: middle;
+    pointer-events: none;
+    user-select: none;
+  }
+  /* Pulse animation for actively-writing nodes (last 60s of activity).
+     White border that alternates thick / thin via CSS keyframe — no JS
+     polling required. */
+  @keyframes node-pulse {
+    0%, 100% { stroke: var(--running); stroke-width: 2; }
+    50%      { stroke: #ffffff;        stroke-width: 5; }
+  }
+  #graph-svg .node-shape.pulsing {
+    animation: node-pulse 1.4s ease-in-out infinite;
   }
   #graph .empty-state {
     position: absolute;
@@ -254,6 +316,19 @@
     max-height: 8rem;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Click anywhere on a feed item (except the kind label, which filters)
+     to expand it — full untruncated payload + white text. Click again to
+     collapse. The cursor signals affordance only on the content area. */
+  .event .payload { cursor: pointer; }
+  .event.expanded {
+    background: var(--bg-elev);
+  }
+  .event.expanded .payload {
+    color: var(--text-primary);
+    max-height: none;
+    overflow: visible;
+    text-overflow: clip;
   }
   .panel-close {
     background: none;
@@ -441,6 +516,20 @@
 </header>
 <div class="filters">
   <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
+  <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
+    <select id="filter-recency">
+      <option value="60">1 min</option>
+      <option value="1800" selected>30 min</option>
+      <option value="86400">24 h</option>
+      <option value="604800">1 wk</option>
+      <option value="all">all time</option>
+    </select>
+  </label>
+  <label title="Limit to sessions whose project working directory matches.">cwd
+    <select id="filter-cwd">
+      <option value="all">all</option>
+    </select>
+  </label>
   <label>route
     <select id="filter-route">
       <option value="all">all</option>
@@ -465,14 +554,18 @@
 </div>
 <main>
   <section id="graph">
+    <svg id="graph-svg" preserveAspectRatio="xMidYMid meet"></svg>
     <div class="empty-state" id="empty-state">
       <div class="icon">🛠️</div>
       <div class="label">No agent sessions yet</div>
       <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
     </div>
   </section>
-  <aside class="panel" id="panel">
-    <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+  <aside class="panel" id="panel-outer">
+    <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
+    <div class="panel-content" id="panel">
+      <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+    </div>
   </aside>
 </main>
 
@@ -493,89 +586,130 @@
   const filterTerminalEl = document.getElementById('filter-terminal');
   const filterRouteEl = document.getElementById('filter-route');
   const filterStatusEl = document.getElementById('filter-status');
+  const filterRecencyEl = document.getElementById('filter-recency');
+  const filterCwdEl = document.getElementById('filter-cwd');
   const connStateEl = document.getElementById('connection-state');
   const emptyStateEl = document.getElementById('empty-state');
   const panelEl = document.getElementById('panel');
+  const panelOuterEl = document.getElementById('panel-outer');
+  const panelResizerEl = document.getElementById('panel-resizer');
+  // Operator chooses recency manually → don't auto-flip on include-finished toggle.
+  let recencyManuallySet = false;
 
   let allSessions = [];
   let allEdges = [];
   let selectedSessionId = null;
   let transcriptES = null;
 
+  // -------------------------------------------------------------------
+  // D3 force-directed graph (mirrors /crm/graph patterns).
+  // Replaced an earlier vis-network implementation — see #173 for context.
+  // -------------------------------------------------------------------
   const graphEl = document.getElementById('graph');
-  const nodes = new vis.DataSet([]);
-  const edges = new vis.DataSet([]);
-  const network = new vis.Network(graphEl, { nodes, edges }, {
-    physics: {
-      // forceAtlas2Based gives the same airy, repulsion-dominant layout the
-      // /crm graph has — clusters form from charge, not link length. Strong
-      // gravitationalConstant + avoidOverlap keep nodes from stacking even
-      // when token-based sizing makes some of them big.
-      enabled: true,
-      stabilization: { iterations: 250, fit: true },
-      solver: 'forceAtlas2Based',
-      forceAtlas2Based: {
-        gravitationalConstant: -90,
-        centralGravity: 0.008,
-        springLength: 150,
-        springConstant: 0.05,
-        damping: 0.6,
-        avoidOverlap: 0.7,
-      },
-      maxVelocity: 50,
-      minVelocity: 0.5,
-      timestep: 0.4,
-    },
-    interaction: { hover: true, tooltipDelay: 200, dragNodes: true },
-    edges: {
-      arrows: { to: { enabled: true, scaleFactor: 0.6 } },
-      color: { color: '#3a3a4a', highlight: '#6366f1' },
-      width: 1.5,
-      smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.45 },
-    },
-    nodes: {
-      shape: 'dot',
-      size: 18,
-      borderWidth: 2,
-      color: { background: '#1a1a24', border: '#2a2a3a' },
-      font: { color: '#e8e8ed', size: 13, face: 'system-ui', strokeWidth: 0 },
-    },
+  const svg = d3.select('#graph-svg');
+  // viewBox-driven coordinates: pick a virtual canvas and let SVG scale
+  // it to fit the actual element. Easier than tracking pixel size and
+  // resizing canvases — and gives us a clean window for the recency-x rail.
+  const VIEW_W = 1600;
+  const VIEW_H = 1100;
+  svg.attr('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
+  // Allow the SVG to render content outside the viewBox so collision-pushed
+  // nodes don't get clipped at the edges. The viewBox is the *intended*
+  // window; physics may briefly nudge nodes beyond it.
+  svg.style('overflow', 'visible');
+  // Arrow marker for spawn edges (parent → subagent).
+  svg.append('defs').append('marker')
+    .attr('id', 'arrow-head')
+    .attr('viewBox', '0 -5 10 10')
+    .attr('refX', 16).attr('refY', 0)
+    .attr('markerWidth', 7).attr('markerHeight', 7)
+    .attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#3a3a4a');
+  const linkLayer = svg.append('g').attr('class', 'links');
+  const nodeLayer = svg.append('g').attr('class', 'nodes');
+
+  // Map session.last_activity_at → x in viewBox coords. Newer to the right,
+  // older to the left, clamped at 24h. Used as a soft `forceX` target —
+  // repulsion can still spread same-recency nodes.
+  function recencyTargetX(s) {
+    const nowSec = Date.now() / 1000;
+    const ageSec = Math.max(0, nowSec - (s.last_activity_at || nowSec));
+    const ageNorm = Math.min(ageSec, 86400) / 86400;
+    return VIEW_W * (0.92 - ageNorm * 0.84);  // newer → ~0.92*W, old → ~0.08*W
+  }
+
+  // Force simulation. Constants chosen to mirror /crm/graph's settled feel:
+  // weak link strength, strong charge, very weak centering, and aggressive
+  // collision so the token-based-sized nodes never overlap.
+  const simulation = d3.forceSimulation()
+    .force('link', d3.forceLink().id(d => d.session_id).distance(80).strength(0.04))
+    .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
+    .force('center-y', d3.forceY(VIEW_H / 2).strength(0.12))
+    .force('recency-x', d3.forceX(recencyTargetX).strength(0.18))
+    .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 14).strength(0.9))
+    .alphaDecay(0.025)
+    .alphaMin(0.001)
+    .velocityDecay(0.45);
+
+  // 8-second backstop in case the simulation doesn't naturally converge.
+  setTimeout(() => simulation.alpha(0).stop(), 8000);
+
+  // Per-tick: position SVG elements from the simulation's computed (x, y).
+  simulation.on('tick', () => {
+    nodeLayer.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
+    linkLayer.selectAll('.link').attr('d', d => {
+      const sx = d.source.x, sy = d.source.y;
+      const tx = d.target.x, ty = d.target.y;
+      // Gentle curve so spawn edges don't all sit on top of each other.
+      const dx = tx - sx, dy = ty - sy;
+      const dr = Math.sqrt(dx * dx + dy * dy) * 1.6 || 1;
+      return `M${sx},${sy}A${dr},${dr} 0 0,1 ${tx},${ty}`;
+    });
   });
 
-  // Settle physics shortly after initial layout so subsequent updates don't
-  // re-stabilize the whole graph on every snapshot tick.
-  network.once('stabilizationIterationsDone', () => {
-    network.setOptions({ physics: { enabled: false } });
-  });
+  // Strip the user's home directory prefix for display.
+  // /home/nathanramia/Code/LifeOS → /Code/LifeOS
+  function shortenCwd(p) {
+    if (!p) return p;
+    const m = p.match(/^\/(home|Users)\/[^/]+(\/.*)?$/);
+    if (m) return m[2] || '/';
+    return p;
+  }
 
-  // Pulse the border of actively-writing nodes (recent activity in last 60s).
-  // Toggles borderWidth between a thin and thick value every ~700ms — pure
-  // DataSet.update on the targeted IDs so the rest of the canvas doesn't
-  // re-render.
-  let pulsePhase = 0;
-  setInterval(() => {
-    if (activelyWritingIds.size === 0) return;
-    pulsePhase = (pulsePhase + 1) % 2;
-    const next = pulsePhase === 0 ? 2 : 5;
-    const updates = [];
-    activelyWritingIds.forEach(id => updates.push({ id, borderWidth: next }));
-    if (updates.length) {
-      try { nodes.update(updates); } catch (_) {}
+  // Re-populate the cwd dropdown with unique decoded_cwd values from the
+  // snapshot. Preserves operator selection if the chosen cwd still exists.
+  let _lastCwdOptionKey = '';
+  function updateCwdOptions(sessions) {
+    if (!filterCwdEl) return;
+    const cwds = [...new Set(sessions.map(s => s.decoded_cwd).filter(Boolean))].sort();
+    const key = cwds.join('|');
+    if (key === _lastCwdOptionKey) return;
+    _lastCwdOptionKey = key;
+    const current = filterCwdEl.value;
+    filterCwdEl.innerHTML = '<option value="all">all</option>'
+      + cwds.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(shortenCwd(c))}</option>`).join('');
+    if (current && (current === 'all' || cwds.includes(current))) {
+      filterCwdEl.value = current;
     }
-  }, 700);
-
-  network.on('click', (params) => {
-    if (params.nodes && params.nodes.length > 0) {
-      openPanel(params.nodes[0]);
-    }
-  });
+    const wrap = filterCwdEl.closest('label');
+    if (wrap) wrap.style.display = cwds.length > 0 ? '' : 'none';
+  }
 
   function applyFilters(sessions) {
     const showTerm = filterTerminalEl.checked;
     const route = filterRouteEl.value;
     const status = filterStatusEl.value;
+    const recencyRaw = filterRecencyEl ? filterRecencyEl.value : 'all';
+    const recencySec = (recencyRaw === 'all') ? null : Number(recencyRaw);
+    const cwdSel = filterCwdEl ? filterCwdEl.value : 'all';
+    const nowSec = Date.now() / 1000;
     return sessions.filter(s => {
       if (!showTerm && TERMINAL.has(s.status)) return false;
+      if (recencySec !== null && s.last_activity_at
+          && (nowSec - s.last_activity_at) > recencySec) {
+        return false;
+      }
+      if (cwdSel !== 'all' && s.decoded_cwd !== cwdSel) return false;
       if (route !== 'all') {
         const r = s.routing || 'local';
         if (r !== route) return false;
@@ -584,6 +718,12 @@
       return true;
     });
   }
+
+  function applyRecencyDefault() {
+    if (recencyManuallySet || !filterRecencyEl) return;
+    filterRecencyEl.value = filterTerminalEl.checked ? '604800' : '1800';
+  }
+  applyRecencyDefault();
 
   function routingLabel(routing) {
     if (!routing || routing === 'local') return 'Local';
@@ -610,106 +750,160 @@
     return Math.min(56, Math.max(14, 14 + grown));
   }
 
-  // Tracks the IDs of nodes currently considered 'actively writing' — fresh
-  // activity in the last 60s. We pulse their border via a setInterval to
-  // separate them visually from a session that's running-but-quiet within
-  // the broader 10-min running window.
-  const activelyWritingIds = new Set();
+  // Node radius in viewBox units — used by collide force and shape sizing.
+  // Drives the visual size across all three shape types (circle / rect /
+  // diamond) so size still encodes token volume.
+  function nodeRadius(d) {
+    return sizeForTokens(
+      (d.total_input_tokens || 0)
+      + (d.total_output_tokens || 0)
+      + (d.total_cache_creation_tokens || 0)
+      + (d.total_cache_read_tokens || 0)
+    );
+  }
 
-  function nodeFor(s) {
-    const color = STATUS_COLORS[s.status] || '#6b7280';
-    const isTerminal = TERMINAL.has(s.status);
-    const isBlocked = s.status === 'blocked';
-    const isInferred = !!s.status_inferred;
-    const isClaudeCode = (s.source === 'claude_code');
-    const isSubagent = !!s.is_subagent;
-    // Recent-activity window: a node that was touched in the last 60s
-    // earns a pulsing border. Running-but-quiet nodes (within 10min but
-    // outside 60s) still read as `running` but don't blink.
-    const nowSec = Date.now() / 1000;
-    const isActivelyWriting = s.status === 'running'
-      && s.last_activity_at
-      && (nowSec - s.last_activity_at) < 60;
-    if (isActivelyWriting) activelyWritingIds.add(s.session_id);
-    else activelyWritingIds.delete(s.session_id);
-    const totalTokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
-    const size = sizeForTokens(totalTokens);
-    const fill = isTerminal ? hexWithAlpha(color, 0.35) : hexWithAlpha(color, 0.85);
-    const border = color;
-    // Source distinction by shape:
-    //   - LifeOS agent worker sessions → `dot` (circle)
-    //   - Claude Code terminal sessions → `box` (rounded square)
-    //   - Claude Code Task-tool subagent nodes → `diamond`
-    // Status color + token-based size still apply across all shapes.
-    const shape = isSubagent ? 'diamond' : (isClaudeCode ? 'box' : 'dot');
-    // Box-shape nodes use `widthConstraint` for sizing rather than radius;
-    // map our log-token size into a width/height to keep visual parity.
-    const boxSide = Math.max(size * 1.8, 36);
-    // Prefer the model label; when the parser couldn't find a model in the
-    // transcript, show "?" for CC sessions instead of the longer fallback so
-    // it reads as "model unknown" at a glance. The routing badge in the side
-    // panel still says "Claude Code" so context isn't lost.
-    let label = s.model_label || routingLabel(s.routing) || s.session_id.slice(0, 8);
-    if (isClaudeCode && label === 'Claude Code') label = '?';
+  // Build the SVG content for a node group: shape + label. Shape varies by
+  // source (circle / rounded rect / diamond) but the per-frame transform
+  // is handled by the simulation tick. Status color → fill; token volume →
+  // size; recent activity (<60s) → `.pulsing` class for CSS keyframe.
+  function nodeColors(d) {
+    const c = STATUS_COLORS[d.status] || '#6b7280';
+    const isTerm = TERMINAL.has(d.status);
     return {
-      id: s.session_id,
-      label: label,
-      title: [
-        s.label,
-        s.decoded_cwd ? `cwd: ${s.decoded_cwd}` : null,
-        `source: ${isClaudeCode ? 'Claude Code CLI' : 'LifeOS agent'}`,
-        `status: ${s.status}${isInferred ? ' (inferred)' : ''}`,
-        `routing: ${routingLabel(s.routing)}`,
-        `tokens: ${s.total_input_tokens} in / ${s.total_output_tokens} out`,
-        `cost: $${(s.total_dollars || 0).toFixed(4)}`,
-        `active: ${(s.total_active_seconds || 0).toFixed(1)}s`,
-        s.last_event_kind ? `last: ${s.last_event_kind}` : null,
-      ].filter(Boolean).join('\n'),
-      shape: shape,
-      color: {
-        background: fill,
-        border: border,
-        highlight: { background: color, border: '#e8e8ed' },
-      },
-      size: size,
-      widthConstraint: shape === 'box' ? { minimum: boxSide, maximum: boxSide * 2 } : undefined,
-      heightConstraint: shape === 'box' ? { minimum: boxSide * 0.55 } : undefined,
-      margin: shape === 'box' ? 10 : undefined,
-      borderWidth: isBlocked ? 4 : 2,
-      borderWidthSelected: isBlocked ? 4 : 3,
-      // Dashed border signals an inferred status (Claude Code only today).
-      shapeProperties: isInferred ? { borderDashes: [4, 3] } : { borderDashes: false },
-      shadow: !isTerminal ? { enabled: true, color: hexWithAlpha(color, 0.45), size: 14, x: 0, y: 0 } : false,
-      font: { color: '#e8e8ed' },
+      fill: isTerm ? hexWithAlpha(c, 0.35) : hexWithAlpha(c, 0.85),
+      stroke: c,
+      borderWidth: d.status === 'blocked' ? 4 : 2,
     };
   }
 
-  // Incremental DataSet update. Avoids vis-network re-stabilizing the
-  // entire physics simulation every 2s — nodes stay put, only the attrs
-  // (color/size/title) tick.
+  function nodeLabel(d) {
+    const isCc = d.source === 'claude_code';
+    let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
+    if (isCc && label === 'Claude Code') label = '?';
+    return label;
+  }
+
+  function nodeTitle(d) {
+    const isCc = d.source === 'claude_code';
+    return [
+      d.label,
+      d.decoded_cwd ? `cwd: ${d.decoded_cwd}` : null,
+      `source: ${isCc ? 'Claude Code CLI' : 'LifeOS agent'}`,
+      `status: ${d.status}`,
+      `routing: ${routingLabel(d.routing)}`,
+      `tokens: ${d.total_input_tokens} in / ${d.total_output_tokens} out`,
+      `cost: $${(d.total_dollars || 0).toFixed(4)}`,
+      d.last_event_kind ? `last: ${d.last_event_kind}` : null,
+    ].filter(Boolean).join('\n');
+  }
+
+  function isActivelyWriting(d) {
+    const nowSec = Date.now() / 1000;
+    return d.status === 'running'
+      && d.last_activity_at
+      && (nowSec - d.last_activity_at) < 60;
+  }
+
+  function nodeShapeTag(d) {
+    if (d.is_subagent) return 'polygon';   // diamond
+    if (d.source === 'claude_code') return 'rect';  // rounded square
+    return 'circle';                       // dot
+  }
+
+  // Set shape-specific attrs (radius/width/points). Called on enter+update.
+  function applyShapeAttrs(sel) {
+    sel.each(function(d) {
+      const el = d3.select(this);
+      const r = nodeRadius(d);
+      const colors = nodeColors(d);
+      el.attr('fill', colors.fill).attr('stroke', colors.stroke)
+        .attr('stroke-width', colors.borderWidth)
+        .classed('pulsing', isActivelyWriting(d));
+      if (this.tagName === 'circle') {
+        el.attr('r', r);
+      } else if (this.tagName === 'rect') {
+        const side = r * 1.8;
+        el.attr('x', -side / 2).attr('y', -side / 2)
+          .attr('width', side).attr('height', side)
+          .attr('rx', Math.min(side * 0.22, 12))
+          .attr('ry', Math.min(side * 0.22, 12));
+      } else if (this.tagName === 'polygon') {
+        // Diamond: 4 vertices, half-side = r * sqrt(2)/2 * 1.4
+        const h = r * 1.4;
+        el.attr('points', `0,${-h} ${h},0 0,${h} ${-h},0`);
+      }
+    });
+  }
+
+  // Incremental D3 join — nodes and links carry session_id and edge id as
+  // keys so positions persist across snapshot ticks. Simulation gets the
+  // updated array and `alpha(0.3).restart()` reflows new arrivals.
   function renderGraph(sessions, snapshotEdges) {
     const visible = applyFilters(sessions);
     const visibleIds = new Set(visible.map(s => s.session_id));
 
-    const nextNodesById = new Map(visible.map(s => [s.session_id, nodeFor(s)]));
-    const existingNodeIds = new Set(nodes.getIds());
-    const toRemove = [...existingNodeIds].filter(id => !nextNodesById.has(id));
-    if (toRemove.length) nodes.remove(toRemove);
-    nodes.update([...nextNodesById.values()]);
+    // ----- Links (parent → subagent spawn edges) -----
+    const visibleLinks = (snapshotEdges || [])
+      .filter(e => visibleIds.has(e.from) && visibleIds.has(e.to))
+      .map(e => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to }));
 
-    const nextEdgesById = new Map();
-    for (const e of snapshotEdges) {
-      if (!visibleIds.has(e.from) || !visibleIds.has(e.to)) continue;
-      const id = `${e.from}->${e.to}`;
-      nextEdgesById.set(id, { id, from: e.from, to: e.to });
-    }
-    const existingEdgeIds = new Set(edges.getIds());
-    const edgesToRemove = [...existingEdgeIds].filter(id => !nextEdgesById.has(id));
-    if (edgesToRemove.length) edges.remove(edgesToRemove);
-    edges.update([...nextEdgesById.values()]);
+    linkLayer.selectAll('path.link')
+      .data(visibleLinks, d => d.id)
+      .join(
+        enter => enter.append('path').attr('class', 'link').attr('marker-end', 'url(#arrow-head)'),
+        update => update,
+        exit => exit.remove()
+      );
+
+    // ----- Nodes -----
+    // Preserve per-node positions across re-renders by reading them off the
+    // simulation's previous data, so a snapshot tick doesn't jitter the
+    // already-laid-out nodes.
+    const oldById = new Map();
+    nodeLayer.selectAll('.node').each(function(d) { oldById.set(d.session_id, d); });
+    const merged = visible.map(s => {
+      const prev = oldById.get(s.session_id);
+      if (prev) {
+        // Mutate prev in place (D3 forces hold the same object reference).
+        Object.assign(prev, s);
+        return prev;
+      }
+      // New node — seed at recency-x target so it doesn't fly in from (0, 0).
+      return Object.assign({ x: recencyTargetX(s), y: VIEW_H / 2 }, s);
+    });
+
+    const sel = nodeLayer.selectAll('.node')
+      .data(merged, d => d.session_id);
+
+    const entered = sel.enter().append('g')
+      .attr('class', 'node')
+      .style('cursor', 'pointer')
+      .on('click', (event, d) => openPanel(d.session_id));
+    // One shape element per node, type chosen by source.
+    entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
+      .attr('class', 'node-shape');
+    entered.append('title');
+    entered.append('text').attr('class', 'node-label');
+
+    const all = entered.merge(sel);
+    applyShapeAttrs(all.select('.node-shape'));
+    all.select('text.node-label')
+      .attr('y', d => nodeRadius(d) + 14)
+      .text(d => nodeLabel(d));
+    all.select('title').text(d => nodeTitle(d));
+
+    sel.exit().remove();
+
+    // Feed the merged node array + links into the simulation. `alpha(0.3)`
+    // is enough to spread new nodes without throwing the whole layout
+    // around; existing nodes already have stable (x, y).
+    simulation.nodes(merged);
+    simulation.force('link').links(visibleLinks);
+    simulation.alpha(0.3).restart();
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
-    updateChips(sessions);
+    updateChips(visible);
+    updateCwdOptions(allSessions);
   }
 
   function updateChips(sessions) {
@@ -1010,7 +1204,15 @@
     fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
       .then(r => r.json())
       .then(payload => {
-        (payload.events || []).forEach(ev => appendEvent(ev, false));
+        const events = payload.events || [];
+        // Default kind-filter to user_message when any exist — most of the
+        // time the operator just wants to skim the user prompts. If there
+        // are none (e.g. a freshly-spawned subagent), no filter is applied.
+        if (events.some(ev => (ev.kind || '') === 'user_message')) {
+          eventKindFilter = 'user_message';
+        }
+        events.forEach(ev => appendEvent(ev, false));
+        applyEventFilter();
         // Now open live SSE.
         const es = new EventSource(`/api/agents/sessions/${encodeURIComponent(sessionId)}/stream?backfill=0`);
         transcriptES = es;
@@ -1074,7 +1276,7 @@
     }
     div.innerHTML = `
       <div><span class="kind" role="button" tabindex="0" title="Click to filter to this event type">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
-      ${payload ? `<div class="payload">${escapeHtml(truncated)}</div>` : ''}
+      ${payload ? `<div class="payload" data-full="${escapeHtml(payload)}" title="Click to expand">${escapeHtml(truncated)}</div>` : ''}
     `;
     // Hide the event up front if a filter is active and doesn't match.
     if (eventKindFilter && kind !== eventKindFilter) {
@@ -1083,7 +1285,10 @@
     // Click on the kind label → toggle filter on this kind.
     const kindEl = div.querySelector('.kind');
     if (kindEl && kind) {
-      kindEl.addEventListener('click', () => toggleKindFilter(kind));
+      kindEl.addEventListener('click', e => {
+        e.stopPropagation();
+        toggleKindFilter(kind);
+      });
       kindEl.addEventListener('keydown', e => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
@@ -1091,7 +1296,20 @@
         }
       });
     }
+    // Click anywhere else on the event → toggle expanded (full text + white).
+    div.addEventListener('click', e => {
+      if (e.target.closest('.kind')) return;  // kind label owns its click
+      toggleEventExpanded(div, payload, truncated);
+    });
     container.prepend(div);
+  }
+
+  function toggleEventExpanded(eventEl, fullText, truncatedText) {
+    const payloadEl = eventEl.querySelector('.payload');
+    const expanded = eventEl.classList.toggle('expanded');
+    if (payloadEl) {
+      payloadEl.textContent = expanded ? fullText : truncatedText;
+    }
   }
 
   function toggleKindFilter(kind) {
@@ -1139,9 +1357,72 @@
   }
 
   // --- Filters ---
-  [filterTerminalEl, filterRouteEl, filterStatusEl].forEach(el =>
+  filterTerminalEl.addEventListener('change', () => {
+    applyRecencyDefault();
+    renderGraph(allSessions, allEdges);
+  });
+  if (filterRecencyEl) {
+    filterRecencyEl.addEventListener('change', () => {
+      recencyManuallySet = true;
+      renderGraph(allSessions, allEdges);
+    });
+  }
+  [filterRouteEl, filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', () => renderGraph(allSessions, allEdges))
   );
+
+  // --- Side panel resize ---
+  // Drag handle on the left edge of aside.panel resizes the panel width.
+  // Persists in localStorage so the operator's chosen width survives reload.
+  // CSS var `--panel-width` drives the grid layout; updating it shifts the
+  // graph column automatically. The SVG-based D3 graph uses viewBox sizing
+  // so it scales with its container — no explicit redraw needed.
+  (function setupPanelResizer() {
+    if (!panelResizerEl || !panelOuterEl) return;
+    const STORAGE_KEY = 'lifeos.agents.panelWidth';
+    const MIN_WIDTH = 280;
+    const MAX_RATIO = 0.7;
+    const setWidth = (px) => {
+      const max = Math.floor(window.innerWidth * MAX_RATIO);
+      const clamped = Math.max(MIN_WIDTH, Math.min(max, Math.round(px)));
+      document.documentElement.style.setProperty('--panel-width', clamped + 'px');
+      return clamped;
+    };
+    // Restore last width if present.
+    try {
+      const saved = parseInt(localStorage.getItem(STORAGE_KEY) || '', 10);
+      if (saved && !isNaN(saved)) setWidth(saved);
+    } catch (_) {}
+
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+    panelResizerEl.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startWidth = panelOuterEl.getBoundingClientRect().width;
+      panelResizerEl.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      // Dragging left increases panel width (delta = startX - clientX).
+      const newWidth = setWidth(startWidth + (startX - e.clientX));
+      try { localStorage.setItem(STORAGE_KEY, String(newWidth)); } catch (_) {}
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      panelResizerEl.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      // SVG viewBox auto-scales; nudge the simulation so collision can
+      // settle if any node ended up partly out of view after the resize.
+      try { simulation.alpha(0.1).restart(); } catch (_) {}
+    });
+  })();
 
   // --- Initial load + stream ---
   fetch('/api/agents/snapshot')
