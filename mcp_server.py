@@ -289,6 +289,16 @@ class LifeOSMCPServer:
         self.client = httpx.Client(timeout=30.0)
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
+        # Per-session tool-result cache (#139 §4). Bypassed when the caller
+        # doesn't supply a session id (which is the common case for local-CLI
+        # tool calls; cache hits matter most on managed-agent HTTP calls).
+        try:
+            from api.services.agent_worker.tool_result_cache import (
+                SessionToolResultCache,
+            )
+            self._result_cache = SessionToolResultCache()
+        except Exception:  # pragma: no cover — keep server bootable without agent worker
+            self._result_cache = None
         self._load_openapi_spec()
         self._register_inter_agent_tools()
 
@@ -926,8 +936,32 @@ class LifeOSMCPServer:
         except httpx.RequestError as e:
             return {"error": f"Request failed: {e}"}
 
-    def _call_api(self, tool_name: str, arguments: dict) -> dict:
-        """Call the LifeOS API based on tool name and arguments."""
+    @staticmethod
+    def _cache_eligible(tool_name: str) -> bool:
+        """Tools whose results are safe to cache for 60s within a session.
+
+        Only GET-shaped tools (read-only). Writes (drafts, calendar events,
+        tasks, memories), inter-agent dispatch, and the sync trigger are
+        excluded — they're either idempotent in the wrong direction or
+        sensitive to fresh state.
+        """
+        cfg = next(
+            (c for c in CURATED_ENDPOINTS.values() if c.get("name") == tool_name),
+            None,
+        )
+        if cfg is None:
+            return False
+        return cfg.get("method", "").upper() == "GET"
+
+    def _call_api(self, tool_name: str, arguments: dict, session_id: str | None = None) -> dict:
+        """Call the LifeOS API based on tool name and arguments.
+
+        `session_id` (optional) enables the per-session result cache (#139 §4):
+        when supplied, identical GET-style tool calls within the same session
+        are served from a 60s LRU instead of round-tripping to the API. Writes
+        (POST/PUT/DELETE) are never cached. The cache also skips inter-agent
+        tools and the sync trigger (both sensitive to fresh state).
+        """
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
@@ -938,6 +972,13 @@ class LifeOSMCPServer:
         # managed agents pass it explicitly per the system prompt.
         if tool_name.startswith("lifeos_agent_"):
             return self._handle_inter_agent(tool_name, dict(arguments))
+
+        # Cache check for read-only tools when the caller is session-aware.
+        cache_key_args = arguments
+        if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
+            cached = self._result_cache.get(session_id, tool_name, cache_key_args)
+            if cached is not None:
+                return cached
 
         # Find the endpoint config
         endpoint_config = None
@@ -985,6 +1026,10 @@ class LifeOSMCPServer:
                         body = self._fetch_email_body(msg["message_id"], account)
                         if body:
                             msg["body"] = body
+
+            # Store in the per-session cache for read-only tools (#139 §4).
+            if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
+                self._result_cache.put(session_id, tool_name, cache_key_args, result)
 
             return result
         except httpx.HTTPStatusError as e:
