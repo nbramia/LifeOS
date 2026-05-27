@@ -210,12 +210,21 @@ class Settings(BaseSettings):
                     "depends on the operator's desktop environment."
     )
     cc_resume_cmd: str = Field(
-        default="vt claude --dangerously-skip-permissions --chrome --resume {session_id}",
+        default=(
+            "warp-terminal "
+            "warp://action/new_tab?path={cwd_url}"
+            "&command=vt+claude+--dangerously-skip-permissions+--resume+{session_id_url}"
+        ),
         alias="LIFEOS_CC_RESUME_CMD",
         description="Template command for resuming a Claude Code session. "
-                    "The single supported substitution token is `{session_id}`, "
-                    "replaced with the bare session uuid (no `cc:` prefix). "
-                    "Parsed with shlex.split — no shell metacharacters."
+                    "Substitutions: `{session_id}` (bare uuid), `{cwd}` "
+                    "(decoded project dir), and URL-encoded variants "
+                    "`{session_id_url}` / `{cwd_url}` for use inside "
+                    "`warp://`, `vscode://`, or other URI-scheme launchers. "
+                    "The default opens the session in a new Warp tab and "
+                    "runs vt+claude inline; override to point at a "
+                    "different terminal app. Parsed with shlex.split — "
+                    "no shell metacharacters."
     )
     cc_resume_env_file: str = Field(
         default="",

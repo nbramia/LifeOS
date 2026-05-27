@@ -247,6 +247,80 @@ def test_resume_rejects_traversal_session_id(client, monkeypatch):
 
 
 @pytest.mark.unit
+def test_resume_substitutes_cwd_token(client, synthetic_session, monkeypatch):
+    """`{cwd}` is replaced with the decoded project working directory."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd",
+                        "echo --working-dir {cwd} --resume {session_id}")
+
+    captured: dict[str, object] = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            self.pid = 1
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    assert "/home/syn/Code/A" in captured["argv"]
+    assert sid in captured["argv"]
+
+
+@pytest.mark.unit
+def test_resume_url_encoded_substitutions_for_uri_schemes(
+    client, synthetic_session, monkeypatch
+):
+    """`{cwd_url}` and `{session_id_url}` are URL-encoded — needed for
+    embedding inside `warp://action/new_tab?path=...&command=...` and other
+    URI-scheme launchers where spaces and slashes must be %-encoded."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(
+        settings, "cc_resume_cmd",
+        "echo warp://action/new_tab?path={cwd_url}&command=vt+claude+--resume+{session_id_url}",
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            self.pid = 1
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    # cwd /home/syn/Code/A should be encoded to %2Fhome%2Fsyn%2FCode%2FA
+    full = " ".join(captured["argv"])
+    assert "%2Fhome%2Fsyn%2FCode%2FA" in full
+    # The bare session_id has no special chars so URL-encoding is a no-op,
+    # but the {session_id_url} token must have been substituted (no literal token).
+    assert "{session_id_url}" not in full
+    assert "{cwd_url}" not in full
+    # The non-URL substitutions are NOT applied inside the URL-encoded params
+    # (they would break the URL); only the *_url variants land there.
+    assert "/home/syn/Code/A" not in full or "%2Fhome%2Fsyn%2FCode%2FA" in full
+
+
+@pytest.mark.unit
 def test_resume_env_file_overrides_systemd_env(
     client, synthetic_session, monkeypatch, tmp_path
 ):
