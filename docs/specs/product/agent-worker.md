@@ -178,6 +178,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 
 - [Agent Worker — Technical](../technical/agent-worker.md) — Architecture, executors, prompts, state machine, restart resumability
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup (Gemma swap, MCP HTTP transport, Vault provisioning, agent preset)
+- [Agent Viz](agent-viz.md) — Live `/agents` page showing in-flight and recently-finished worker sessions
 - [Task Management](task-management.md) — How `#agent` tasks live alongside regular tasks in the Obsidian Tasks plugin
 - [MCP Tools](mcp-tools.md) — The `lifeos_agent_*` family for inter-agent coordination
 - [API Reference](api-reference.md) — `POST /api/tasks/{id}/swap-tag` and other task endpoints the worker uses

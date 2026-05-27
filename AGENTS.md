@@ -58,6 +58,8 @@ LifeOS is a self-hosted AI assistant that indexes personal data (notes, emails, 
 | What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
+| What does `/agents` show? | [specs/product/agent-viz.md](docs/specs/product/agent-viz.md) |
+| How does the `/agents` page work internally? | [specs/technical/agent-viz.md](docs/specs/technical/agent-viz.md) |
 | How do I set up the project? | [guides/installation.md](docs/guides/installation.md) |
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
