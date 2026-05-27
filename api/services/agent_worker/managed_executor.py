@@ -14,6 +14,7 @@ context needed is `last_event_id` for the resume cursor.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -37,6 +38,55 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 
 
 logger = logging.getLogger(__name__)
+
+
+# Runaway detection thresholds (#139 Section 5). Picked behaviorally, not
+# from cost/wall time, because thresholds based on tokens or seconds vary
+# with task class; tool-call counts scale uniformly across task types.
+TOOL_LOOP_KILL_THRESHOLD = 4
+NO_PROGRESS_KILL_THRESHOLD = 15
+MAX_TOOL_RESULT_CHARS = 20_000  # Matches local_executor's truncation behavior.
+TRUNCATION_MARKER = " […truncated]"
+
+
+def _tool_signature(event: dict) -> str | None:
+    """Stable key for tool-loop detection: `(name, sorted-args-JSON)`.
+
+    Returns None for non-`tool_use` events. Args are JSON-canonicalized with
+    sorted keys so an agent that re-orders kwargs between calls still gets
+    detected. Falls back to the raw `input` if it isn't a dict (rare, but
+    don't crash the worker on a schema surprise).
+    """
+    if event.get("type") != "tool_use":
+        return None
+    name = event.get("name") or event.get("tool_name") or ""
+    raw_input = event.get("input") or event.get("arguments") or {}
+    try:
+        args_key = json.dumps(raw_input, sort_keys=True, default=str)
+    except Exception:
+        args_key = repr(raw_input)
+    return f"{name}::{args_key}"
+
+
+def _truncate_oversized_tool_result(event: dict) -> dict:
+    """Return a copy of `event` with its tool_result payload truncated if
+    it exceeds MAX_TOOL_RESULT_CHARS.
+
+    The full payload is still on Anthropic's side — this only shrinks what
+    we mirror into our transcript file. The transcript is what we re-feed
+    to parents on resume-after-children, so truncating here directly cuts
+    that re-feed cost. The marker preserves the truncated-ness signal.
+    """
+    if event.get("type") != "tool_result":
+        return event
+    content = event.get("content")
+    if not isinstance(content, str) or len(content) <= MAX_TOOL_RESULT_CHARS:
+        return event
+    truncated = content[: MAX_TOOL_RESULT_CHARS - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+    new_event = dict(event)
+    new_event["content"] = truncated
+    new_event["_truncated_from_chars"] = len(content)
+    return new_event
 
 
 def _user_message_for(task: dict, session_id: str, expected_output: str, budget: dict) -> str:
@@ -204,9 +254,26 @@ class ManagedExecutor:
             logger.warning("managed poll failed for %s: %s", remote_id, exc)
             return ExecutorOutcome(status=STATUS_RUNNING, reason=f"poll error: {exc}")
 
-        # Mirror events to transcript.
+        # Mirror events to transcript, truncating oversized tool_results so
+        # the transcript doesn't bloat for huge payloads that we'd re-feed
+        # to parents during spawn-after-children resume.
         for event in state.new_events:
-            self.transcript_store.append(sid, f"managed_event_{event.get('type', 'unknown')}", event)
+            stored = _truncate_oversized_tool_result(event)
+            self.transcript_store.append(sid, f"managed_event_{stored.get('type', 'unknown')}", stored)
+
+        # Update runaway counters from the new events (#139 Section 5).
+        runaway_kind = self._detect_runaway(session.task_id, state.new_events)
+        if runaway_kind:
+            try:
+                self.driver.kill_session(remote_id, reason=runaway_kind)
+            except Exception as exc:  # pragma: no cover — best-effort kill
+                logger.warning("kill_session %s failed: %s", remote_id, exc)
+            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
+            self.transcript_store.append(sid, "runaway_killed", {"kind": runaway_kind})
+            return ExecutorOutcome(
+                status=STATUS_BUDGET_EXCEEDED,
+                reason=f"runaway killed ({runaway_kind})",
+            )
 
         # 1. Token spend delta — compare absolute remote totals to our row,
         # across all four buckets (uncached input, output, cache_creation,
@@ -286,6 +353,62 @@ class ManagedExecutor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _detect_runaway(self, task_id: str, new_events: list[dict]) -> str | None:
+        """Walk `new_events`, update persisted runaway counters, and return
+        a kill reason if any threshold tripped — else None.
+
+        Two behavioral signals:
+        - `tool_loop_detected`: same tool + identical args fires
+          TOOL_LOOP_KILL_THRESHOLD consecutive times with no intervening
+          *different* tool call. A different tool resets the count, so the
+          agent can legitimately retry after a transient failure (e.g. a
+          tool returning an error then immediately retrying same args ONCE
+          is fine; 4× in a row with no diversity is not).
+        - `no_text_in_15_tool_calls`: NO_PROGRESS_KILL_THRESHOLD `tool_use`
+          events fire without any intervening `agent.message`. Indicates
+          the agent is tool-thrashing without surfacing its reasoning.
+
+        Persisted state survives worker restarts so cross-poll counting is
+        consistent. State is reset by `agent.message` (no-progress) or a
+        change in tool signature (tool-loop).
+        """
+        state = self.session_store.get_runaway_state(task_id)
+        signature = state["tool_loop_signature"]
+        loop_count = state["tool_loop_count"]
+        since_msg = state["tool_calls_since_message"]
+
+        kill: str | None = None
+        for event in new_events:
+            etype = event.get("type", "")
+            if etype == "agent.message":
+                since_msg = 0
+                continue
+            if etype != "tool_use":
+                continue
+            since_msg += 1
+            if since_msg >= NO_PROGRESS_KILL_THRESHOLD:
+                kill = "no_text_in_15_tool_calls"
+                break
+            sig = _tool_signature(event)
+            if sig is None:
+                continue
+            if sig == signature:
+                loop_count += 1
+            else:
+                signature = sig
+                loop_count = 1
+            if loop_count >= TOOL_LOOP_KILL_THRESHOLD:
+                kill = "tool_loop_detected"
+                break
+
+        self.session_store.set_runaway_state(
+            task_id,
+            tool_loop_signature=signature,
+            tool_loop_count=loop_count,
+            tool_calls_since_message=since_msg,
+        )
+        return kill
 
     @staticmethod
     def _budget_breach(refreshed_session, budget: dict) -> str | None:
