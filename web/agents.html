@@ -228,6 +228,112 @@
     float: right;
   }
   .panel-close:hover { background: var(--bg-card); color: var(--text-primary); }
+  .panel-kill {
+    background: var(--bg-card);
+    border: 1px solid var(--failed);
+    color: var(--failed);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-kill:hover { background: var(--failed); color: var(--bg-primary); }
+  .panel-kill:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    animation: fadeIn 0.15s ease;
+  }
+  .modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    width: min(420px, 90vw);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .modal h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+  .modal .target {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+    word-break: break-word;
+  }
+  .modal .descendants {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin: 0.5rem 0;
+    max-height: 6rem;
+    overflow-y: auto;
+  }
+  .modal textarea {
+    width: 100%;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+    resize: vertical;
+    min-height: 3rem;
+    margin: 0.5rem 0;
+  }
+  .modal .actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.75rem;
+  }
+  .modal button {
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.85rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .modal button.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .modal button:hover { filter: brightness(1.15); }
+  .toast {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    font-size: 0.85rem;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+    z-index: 110;
+    animation: fadeIn 0.2s ease;
+  }
+  .toast.error { border-color: var(--failed); color: var(--failed); }
   .live-dot {
     display: inline-block;
     width: 8px;
@@ -442,9 +548,11 @@
   function renderPanelHeader(s) {
     const live = !TERMINAL.has(s.status);
     const safeStatus = escapeAttr(s.status);
+    const showKill = live;
     panelEl.innerHTML = `
       <div class="panel-header">
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
+        ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
         <div class="label">${escapeHtml(s.label || s.session_id)}</div>
         <div class="meta">
           ${live ? '<span class="live-dot" title="live"></span>' : ''}
@@ -458,6 +566,100 @@
       <div class="events" id="events"></div>
     `;
     document.getElementById('panel-close').onclick = closePanel;
+    if (showKill) {
+      document.getElementById('panel-kill').onclick = () => openKillModal(s);
+    }
+  }
+
+  function openKillModal(session) {
+    // BFS down parent_session_id so non-root targets only show *their* subtree,
+    // matching the backend cascade scope. (Filtering by root_session_id would
+    // wrongly include unrelated peers under the same root.)
+    const childrenOf = new Map();
+    for (const x of allSessions) {
+      if (!x.parent_session_id) continue;
+      if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
+      childrenOf.get(x.parent_session_id).push(x);
+    }
+    const descendants = [];
+    const queue = [session.session_id];
+    const seen = new Set([session.session_id]);
+    while (queue.length) {
+      const sid = queue.shift();
+      for (const child of (childrenOf.get(sid) || [])) {
+        if (seen.has(child.session_id)) continue;
+        seen.add(child.session_id);
+        if (!TERMINAL.has(child.status)) descendants.push(child);
+        queue.push(child.session_id);
+      }
+    }
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-labelledby="kill-title">
+        <h2 id="kill-title">Kill agent session?</h2>
+        <div class="target">${escapeHtml(session.label || session.session_id)}</div>
+        ${descendants.length > 0 ? `
+          <div class="descendants">
+            Will also kill ${descendants.length} descendant${descendants.length === 1 ? '' : 's'}:
+            ${descendants.slice(0, 5).map(d =>
+              `<div>• ${escapeHtml(d.label || d.session_id)}</div>`
+            ).join('')}
+            ${descendants.length > 5 ? `<div>…and ${descendants.length - 5} more</div>` : ''}
+          </div>
+        ` : ''}
+        <label style="font-size:0.75rem;color:var(--text-secondary)">Reason (optional)</label>
+        <textarea id="kill-reason" placeholder="Why are you killing this?"></textarea>
+        <div class="actions">
+          <button id="kill-cancel">Cancel</button>
+          <button class="danger" id="kill-confirm">Kill</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const cleanup = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); };
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) cleanup(); });
+    document.getElementById('kill-cancel').onclick = cleanup;
+    document.getElementById('kill-confirm').onclick = async () => {
+      const reason = document.getElementById('kill-reason').value || '';
+      const confirmBtn = document.getElementById('kill-confirm');
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Killing…';
+      try {
+        const r = await fetch(`/api/agents/sessions/${encodeURIComponent(session.session_id)}/kill`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        });
+        if (!r.ok) {
+          const text = await r.text();
+          throw new Error(`HTTP ${r.status}: ${text}`);
+        }
+        const result = await r.json();
+        const failures = result.failures || [];
+        const killed = result.killed || [];
+        if (killed.length === 0 && result.reason) {
+          showToast(`Already ${result.reason}`, false);
+        } else if (failures.length === 0) {
+          showToast(`Killed ${killed.length} session${killed.length === 1 ? '' : 's'}`, false);
+        } else {
+          showToast(`Killed ${killed.length}; ${failures.length} remote failure(s)`, true);
+        }
+        cleanup();
+      } catch (err) {
+        showToast(`Kill failed: ${err.message}`, true);
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Kill';
+      }
+    };
+  }
+
+  function showToast(message, isError) {
+    const t = document.createElement('div');
+    t.className = 'toast' + (isError ? ' error' : '');
+    t.textContent = message;
+    document.body.appendChild(t);
+    setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 3500);
   }
 
   function closePanel() {

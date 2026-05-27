@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from api.services.agent_worker.session_store import (
     TERMINAL_STATUSES,
@@ -239,6 +240,129 @@ async def stream_snapshots() -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+class KillRequest(BaseModel):
+    reason: str = ""
+
+
+def _collect_subtree(session_store: SessionStore, target: Session) -> list[Session]:
+    """Return `target` followed by every non-self descendant in its subtree.
+
+    Walks via `parent_session_id` so non-root targets only take down their
+    own children — not unrelated peers under the same root.
+    """
+    root_id = target.root_session_id or target.session_id
+    all_in_root: list[Session] = list(session_store.list_descendants(root_id))
+    if target.session_id != root_id:
+        # `list_descendants` excludes the root itself; ensure we have the
+        # root in the pool too in case the target's parent chain runs back
+        # up through it.
+        root_session = session_store.get_by_session_id(root_id)
+        if root_session is not None:
+            all_in_root.append(root_session)
+
+    children_of: dict[str, list[Session]] = {}
+    for s in all_in_root:
+        if s.session_id == target.session_id:
+            continue
+        children_of.setdefault(s.parent_session_id or "", []).append(s)
+
+    subtree: list[Session] = [target]
+    queue: list[str] = [target.session_id]
+    seen: set[str] = {target.session_id}
+    while queue:
+        sid = queue.pop(0)
+        for child in children_of.get(sid, []):
+            if child.session_id in seen:
+                continue
+            seen.add(child.session_id)
+            subtree.append(child)
+            queue.append(child.session_id)
+    return subtree
+
+
+def _maybe_managed_driver():
+    """Lazy-instantiate a ManagedAgentsDriver when credentials are available.
+
+    Returning `None` is fine — `teardown_session` then degrades to a
+    local-only kill, and the worker's next managed poll reconciles the
+    remote side. We don't reuse the worker's driver because the worker
+    runs in a separate process.
+    """
+    try:
+        from config.settings import settings
+        api_key = settings.anthropic_api_key
+        if not api_key:
+            return None
+        from api.services.agent_worker.managed_driver import ManagedAgentsDriver
+        return ManagedAgentsDriver(api_key=api_key)
+    except Exception as exc:  # noqa: BLE001 — never block the kill on driver setup
+        logger.warning("operator kill: managed driver unavailable: %s", exc)
+        return None
+
+
+@router.post("/sessions/{session_id}/kill")
+async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
+    """Operator-initiated kill: stop the target session and all descendants
+    in its subtree. Target gets an `operator_killed` transcript event;
+    descendants get `cascade_killed`.
+
+    Local-network only — must NOT be exposed via Tailscale Funnel or the
+    public MCP HTTP transport.
+    """
+    session_store = _get_session_store()
+    transcript_store = _get_transcript_store()
+    reason = (body.reason if body else "").strip() if body else ""
+
+    target = session_store.get_by_session_id(session_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+    if target.status in TERMINAL_STATUSES:
+        return {"killed": [], "failures": [], "reason": f"already {target.status}"}
+
+    subtree = _collect_subtree(session_store, target)
+    driver = _maybe_managed_driver()
+    try:
+        from api.services.agent_worker.inter_agent import teardown_session as _teardown
+
+        killed: list[str] = []
+        failures: list[dict[str, str]] = []
+        for idx, s in enumerate(subtree):
+            if s.status in TERMINAL_STATUSES:
+                continue
+            if idx == 0:
+                kind = "operator_killed"
+                payload = {
+                    "reason": reason,
+                    "managed_remote": s.managed_agent_session_id,
+                }
+            else:
+                kind = "cascade_killed"
+                payload = {
+                    "root": target.session_id,
+                    "reason": reason,
+                    "managed_remote": s.managed_agent_session_id,
+                }
+            result = _teardown(
+                session_store, transcript_store, s,
+                transcript_kind=kind,
+                transcript_payload=payload,
+                managed_driver=driver,
+            )
+            killed.append(s.session_id)
+            if result.get("managed_failure"):
+                failures.append({
+                    "session_id": s.session_id,
+                    "reason": result["managed_failure"],
+                })
+        return {"killed": killed, "failures": failures}
+    finally:
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 @router.get("/sessions/{session_id}/stream")
