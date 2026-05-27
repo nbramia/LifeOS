@@ -168,8 +168,11 @@
     pointer-events: none;
   }
   #graph-svg .node-shape {
-    cursor: pointer;
+    cursor: grab;
     transition: stroke-width 0.2s ease, filter 0.2s ease;
+  }
+  #graph-svg .node-shape:active {
+    cursor: grabbing;
   }
   #graph-svg .node-shape:hover {
     stroke: #e8e8ed;
@@ -191,6 +194,32 @@
   }
   #graph-svg .node-shape.pulsing {
     animation: node-pulse 1.4s ease-in-out infinite;
+  }
+  /* Selection emphasis — `!important` on stroke beats the pulsing keyframe
+     when both apply (selected actively-writing node prefers selection cue). */
+  #graph-svg .node-shape.selected {
+    stroke: #ffffff !important;
+    stroke-width: 5 !important;
+    animation: none !important;
+  }
+  #graph-svg .node-shape.related {
+    stroke: rgba(255, 255, 255, 0.78) !important;
+    stroke-width: 3 !important;
+    animation: none !important;
+  }
+  #graph-svg .node-shape.dimmed {
+    opacity: 0.28;
+  }
+  #graph-svg .node-label.dimmed {
+    opacity: 0.35;
+  }
+  #graph-svg .link.highlighted {
+    stroke: #ffffff;
+    stroke-width: 2.4;
+    opacity: 1;
+  }
+  #graph-svg .link.dimmed {
+    opacity: 0.18;
   }
   #graph .empty-state {
     position: absolute;
@@ -330,6 +359,110 @@
     overflow: visible;
     text-overflow: clip;
   }
+  /* Pretty payload — replaces raw JSON in the collapsed view. The raw JSON
+     is still emitted in a sibling .payload-raw <pre> revealed on expand,
+     so power users can still inspect the full shape. */
+  .event .payload {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    max-height: 14rem;
+  }
+  .event .payload-raw {
+    display: none;
+    margin-top: 0.35rem;
+    padding-top: 0.35rem;
+    border-top: 1px dashed var(--border);
+    color: var(--text-secondary);
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 20rem;
+    overflow-y: auto;
+  }
+  .event.expanded .payload-raw { display: block; }
+  .pp-text {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .pp-text.muted { color: var(--text-dim); font-style: italic; }
+  .pp-routing {
+    color: var(--text-primary);
+    margin-top: 0.15rem;
+  }
+  .pp-routing .pp-target {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .pp-routing .pp-reason { color: var(--text-secondary); }
+  .pp-field {
+    margin-top: 0.25rem;
+    color: var(--text-secondary);
+  }
+  .pp-field .pp-label,
+  .pp-budget .pp-label,
+  .pp-usage  .pp-label,
+  .pp-kv     .pp-label,
+  .pp-badge  .pp-label {
+    text-transform: uppercase;
+    font-size: 0.62rem;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    margin-right: 0.3rem;
+  }
+  .pp-field .pp-value {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .pp-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+  }
+  .pp-tool {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+  }
+  .pp-tool .pp-tool-name { color: var(--accent); font-weight: 600; }
+  .pp-tool .pp-tool-args { color: var(--text-dim); }
+  .pp-budget, .pp-usage {
+    margin-top: 0.25rem;
+    color: var(--text-secondary);
+  }
+  .pp-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+  }
+  .pp-badge {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.7rem;
+    color: var(--text-primary);
+  }
+  .pp-badge.pp-warn { color: var(--blocked); border-color: var(--blocked); }
+  .pp-extra {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.9rem;
+    margin-top: 0.3rem;
+    color: var(--text-secondary);
+  }
+  .pp-empty { color: var(--text-dim); font-style: italic; }
   .panel-close {
     background: none;
     border: none;
@@ -506,7 +639,7 @@
     <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
     <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
-    <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API)">API spend <strong id="chip-spend">$0.00</strong></span>
+    <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API).">API spend <strong id="chip-spend">$0.00</strong></span>
     <span class="chip legend" title="Node shapes: circle = LifeOS agent worker · square = Claude Code CLI · diamond = Task-tool subagent">
       <span style="opacity:0.6">●</span> agent &nbsp;
       <span style="opacity:0.6">■</span> cli &nbsp;
@@ -617,25 +750,57 @@
   // nodes don't get clipped at the edges. The viewBox is the *intended*
   // window; physics may briefly nudge nodes beyond it.
   svg.style('overflow', 'visible');
-  // Arrow marker for spawn edges (parent → subagent).
-  svg.append('defs').append('marker')
-    .attr('id', 'arrow-head')
-    .attr('viewBox', '0 -5 10 10')
-    .attr('refX', 16).attr('refY', 0)
-    .attr('markerWidth', 7).attr('markerHeight', 7)
-    .attr('orient', 'auto')
-    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#3a3a4a');
-  const linkLayer = svg.append('g').attr('class', 'links');
-  const nodeLayer = svg.append('g').attr('class', 'nodes');
+  // Single zoomable viewport that wraps both layers — the d3.zoom behavior
+  // mutates this group's transform, mirroring /crm/graph (crm.html:17528).
+  const viewport = svg.append('g').attr('class', 'viewport');
+  const linkLayer = viewport.append('g').attr('class', 'links');
+  const nodeLayer = viewport.append('g').attr('class', 'nodes');
+
+  // Pan (drag background) + zoom (wheel / pinch). d3.drag on nodes stops
+  // propagation, so node-drags don't also pan the canvas.
+  const zoom = d3.zoom()
+    .scaleExtent([0.2, 5])
+    .on('zoom', (event) => {
+      viewport.attr('transform', event.transform);
+    });
+  svg.call(zoom);
+  // Match crm.html: cursor hint on the background so the operator knows it's
+  // pannable. Node cursors override this when hovering a draggable node.
+  svg.style('cursor', 'grab');
+  svg.on('mousedown.cursor', () => svg.style('cursor', 'grabbing'));
+  svg.on('mouseup.cursor',   () => svg.style('cursor', 'grab'));
+
+  // Click on empty SVG background → deselect (mirrors /crm/graph's
+  // close-panels-on-empty-click pattern at crm.html:17522). Node clicks bubble
+  // up too, but we only act when the target is the svg itself.
+  svg.on('click', (event) => {
+    if (event.target === svg.node() && selectedSessionId) closePanel();
+  });
+
+  // Width fraction of the viewBox used by the recency rail. Scales with the
+  // visible-node count: 1 node centers, 2 nodes sit on a narrow band, many
+  // nodes spread across most of the canvas.
+  let visibleCount = 0;
+  // Sorted-and-joined visible session_id set from the previous render. Used
+  // to detect structural changes (filter operations, new sessions arriving,
+  // sessions terminating out of view) so the simulation only re-energizes
+  // when there's an actual reason to move nodes — never on a same-set
+  // snapshot tick, which would otherwise jitter every 2 seconds.
+  let _lastVisibleIdsKey = '';
+  function recencyRailSpan() {
+    if (visibleCount <= 1) return 0;
+    return Math.min(0.84, 0.15 + 0.15 * Math.log2(visibleCount));
+  }
 
   // Map session.last_activity_at → x in viewBox coords. Newer to the right,
-  // older to the left, clamped at 24h. Used as a soft `forceX` target —
-  // repulsion can still spread same-recency nodes.
+  // older to the left, clamped at 24h. Width of the rail shrinks as
+  // visibleCount shrinks so single-node filters end up centered.
   function recencyTargetX(s) {
+    const span = recencyRailSpan();
     const nowSec = Date.now() / 1000;
     const ageSec = Math.max(0, nowSec - (s.last_activity_at || nowSec));
     const ageNorm = Math.min(ageSec, 86400) / 86400;
-    return VIEW_W * (0.92 - ageNorm * 0.84);  // newer → ~0.92*W, old → ~0.08*W
+    return VIEW_W * (0.5 + span / 2 - ageNorm * span);
   }
 
   // Force simulation. Constants chosen to mirror /crm/graph's settled feel:
@@ -850,7 +1015,7 @@
     linkLayer.selectAll('path.link')
       .data(visibleLinks, d => d.id)
       .join(
-        enter => enter.append('path').attr('class', 'link').attr('marker-end', 'url(#arrow-head)'),
+        enter => enter.append('path').attr('class', 'link'),
         update => update,
         exit => exit.remove()
       );
@@ -877,8 +1042,25 @@
 
     const entered = sel.enter().append('g')
       .attr('class', 'node')
-      .style('cursor', 'pointer')
-      .on('click', (event, d) => openPanel(d.session_id));
+      .style('cursor', 'grab')
+      .call(d3.drag()
+        .on('start', (event, d) => {
+          if (!event.active) simulation.alphaTarget(0.1).restart();
+          d.fx = d.x;
+          d.fy = d.y;
+        })
+        .on('drag', (event, d) => {
+          d.fx = event.x;
+          d.fy = event.y;
+        })
+        .on('end', (event, d) => {
+          if (!event.active) simulation.alphaTarget(0);
+          // Leave fx/fy set so the node stays where dropped (mirrors /crm/graph).
+        }))
+      .on('click', (event, d) => {
+        if (d.session_id === selectedSessionId) closePanel();
+        else openPanel(d.session_id);
+      });
     // One shape element per node, type chosen by source.
     entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
       .attr('class', 'node-shape');
@@ -894,16 +1076,73 @@
 
     sel.exit().remove();
 
-    // Feed the merged node array + links into the simulation. `alpha(0.3)`
-    // is enough to spread new nodes without throwing the whole layout
-    // around; existing nodes already have stable (x, y).
+    // Feed the merged node array + links into the simulation. Only re-energize
+    // alpha when the visible *set* actually changed (new ids appeared or old
+    // ones disappeared) — otherwise the 2s snapshot tick would keep nudging
+    // settled nodes for no structural reason, manifesting as periodic jitter.
+    // visibleCount feeds `recencyRailSpan()` so the rail compresses to center
+    // when few nodes are visible.
+    visibleCount = merged.length;
     simulation.nodes(merged);
     simulation.force('link').links(visibleLinks);
-    simulation.alpha(0.3).restart();
+    const visibleIdsKey = visible.map(s => s.session_id).sort().join('|');
+    if (visibleIdsKey !== _lastVisibleIdsKey) {
+      _lastVisibleIdsKey = visibleIdsKey;
+      simulation.alpha(0.3).restart();
+    }
 
     emptyStateEl.style.display = visible.length === 0 ? '' : 'none';
     updateChips(visible);
     updateCwdOptions(allSessions);
+    applySelectionStyles();
+  }
+
+  // Pull session_id off a link endpoint regardless of whether the force-link
+  // pass has converted it from a string id into a node object yet.
+  function linkEndpoints(e) {
+    const s = (typeof e.source === 'object') ? e.source.session_id : e.source;
+    const t = (typeof e.target === 'object') ? e.target.session_id : e.target;
+    return [s, t];
+  }
+
+  // 1-hop parent/child set for the currently selected session.
+  function relatedTo(sessionId) {
+    const out = new Set();
+    if (!sessionId) return out;
+    linkLayer.selectAll('path.link').each(function(e) {
+      const [s, t] = linkEndpoints(e);
+      if (s === sessionId) out.add(t);
+      if (t === sessionId) out.add(s);
+    });
+    return out;
+  }
+
+  // Toggle .selected / .related / .dimmed across the visible nodes + edges
+  // based on `selectedSessionId`. Cheap to re-run on every render and panel
+  // open/close — no allocations per node beyond the related set.
+  function applySelectionStyles() {
+    const hasSelection = !!selectedSessionId;
+    const related = relatedTo(selectedSessionId);
+
+    nodeLayer.selectAll('.node-shape')
+      .classed('selected', d => hasSelection && d.session_id === selectedSessionId)
+      .classed('related',  d => hasSelection && related.has(d.session_id))
+      .classed('dimmed',   d => hasSelection && d.session_id !== selectedSessionId && !related.has(d.session_id));
+
+    nodeLayer.selectAll('text.node-label')
+      .classed('dimmed', d => hasSelection && d.session_id !== selectedSessionId && !related.has(d.session_id));
+
+    linkLayer.selectAll('path.link')
+      .classed('highlighted', e => {
+        if (!hasSelection) return false;
+        const [s, t] = linkEndpoints(e);
+        return s === selectedSessionId || t === selectedSessionId;
+      })
+      .classed('dimmed', e => {
+        if (!hasSelection) return false;
+        const [s, t] = linkEndpoints(e);
+        return s !== selectedSessionId && t !== selectedSessionId;
+      });
   }
 
   function updateChips(sessions) {
@@ -1189,6 +1428,7 @@
     eventKindFilter = null;
     if (transcriptES) { transcriptES.close(); transcriptES = null; }
     panelEl.innerHTML = '<div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>';
+    applySelectionStyles();
   }
 
   function openPanel(sessionId) {
@@ -1196,6 +1436,7 @@
     // Reset filter when switching sessions — kinds are session-scoped.
     eventKindFilter = null;
     selectedSessionId = sessionId;
+    applySelectionStyles();
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
     renderPanelHeader(s);
@@ -1254,6 +1495,149 @@
     return `${date} ${time} ET`;
   }
 
+  // Compact 1.3k / 500k / 1.2M for token counts and similar.
+  function formatNumCompact(n) {
+    const x = Number(n);
+    if (!isFinite(x)) return String(n);
+    if (Math.abs(x) >= 1_000_000) return (x / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (Math.abs(x) >= 1_000)     return (x / 1_000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(x);
+  }
+
+  // Field-aware payload renderer. Maps the most common transcript-event
+  // shapes (model responses, routing decisions, tool calls, errors, etc.)
+  // to compact human-readable HTML. Anything unrecognized falls through to
+  // a generic key/value tail, and the full raw JSON is always available
+  // via click-to-expand for diagnostics.
+  const NOISE_FIELDS = new Set([
+    'iterations', 'inference_geo', 'server_tool_use', 'cache_creation',
+    'ephemeral_1h_input_tokens', 'ephemeral_5m_input_tokens',
+    'thinking_chars',  // surfaced separately when nonzero
+  ]);
+  const SECONDARY_BADGES = ['model', 'task_id', 'expected_output', 'speed', 'service_tier', 'source', 'parent_session_id', 'child_session_id'];
+
+  function prettyPayload(payload) {
+    if (payload == null) return '';
+    if (typeof payload !== 'object') {
+      return `<div class="pp-text">${escapeHtml(String(payload))}</div>`;
+    }
+    const parts = [];
+
+    // Routing decision (routing_resolved et al.)
+    if (payload.routing) {
+      let s = `<div class="pp-routing">→ <span class="pp-target">${escapeHtml(String(payload.routing))}</span>`;
+      if (payload.routing_reason) s += ` <span class="pp-reason">· ${escapeHtml(payload.routing_reason)}</span>`;
+      s += `</div>`;
+      parts.push(s);
+    }
+
+    // Primary text body. `text` empty + `tool_uses` present is the common
+    // assistant-called-tools case — surface that explicitly.
+    if (typeof payload.text === 'string' && payload.text.trim()) {
+      parts.push(`<div class="pp-text">${escapeHtml(payload.text)}</div>`);
+    } else if (payload.text === '' && Array.isArray(payload.tool_uses) && payload.tool_uses.length) {
+      parts.push(`<div class="pp-text muted">(no text — called tools)</div>`);
+    }
+
+    // Tool uses → pills with name + arg keys.
+    if (Array.isArray(payload.tool_uses) && payload.tool_uses.length) {
+      const tools = payload.tool_uses.map(t => {
+        const name = t && t.name ? String(t.name) : 'tool';
+        const argKeys = Array.isArray(t && t.input_keys)
+          ? t.input_keys
+          : (t && t.input && typeof t.input === 'object' ? Object.keys(t.input) : []);
+        const argStr = argKeys.length ? `<span class="pp-tool-args">(${escapeHtml(argKeys.join(', '))})</span>` : '';
+        return `<span class="pp-tool"><span class="pp-tool-name">${escapeHtml(name)}</span>${argStr}</span>`;
+      }).join('');
+      parts.push(`<div class="pp-tools">${tools}</div>`);
+    }
+
+    // Labeled freeform fields — render in this order so the reader sees the
+    // semantically most useful info first.
+    const TEXT_FIELDS = [
+      ['question', 'question'],
+      ['answer', 'answer'],
+      ['prompt', 'prompt'],
+      ['reason', 'reason'],
+      ['ambiguity', 'ambiguity'],
+      ['sane_reason', 'sane reason'],
+      ['description', 'description'],
+      ['label', 'label'],
+    ];
+    for (const [field, label] of TEXT_FIELDS) {
+      const v = payload[field];
+      if (typeof v === 'string' && v.trim()) {
+        parts.push(`<div class="pp-field"><span class="pp-label">${escapeHtml(label)}</span><span class="pp-value">${escapeHtml(v)}</span></div>`);
+      }
+    }
+
+    // Budget — compact "90s · $0.30 · 500k tok"
+    if (payload.budget && typeof payload.budget === 'object') {
+      const b = payload.budget;
+      const bits = [];
+      if (b.wall_seconds != null)  bits.push(`${b.wall_seconds}s`);
+      if (b.max_dollars != null)   bits.push(`$${Number(b.max_dollars).toFixed(2)}`);
+      if (b.max_tokens != null)    bits.push(`${formatNumCompact(b.max_tokens)} tok`);
+      if (bits.length) parts.push(`<div class="pp-budget"><span class="pp-label">budget</span>${escapeHtml(bits.join(' · '))}</div>`);
+    }
+
+    // Usage — compact "↓ 1 in · ↑ 1.3k out · cache 400k read / 199 create"
+    if (payload.usage && typeof payload.usage === 'object') {
+      const u = payload.usage;
+      const bits = [];
+      if (u.input_tokens != null)  bits.push(`↓ ${formatNumCompact(u.input_tokens)} in`);
+      if (u.output_tokens != null) bits.push(`↑ ${formatNumCompact(u.output_tokens)} out`);
+      const cacheR = u.cache_read_input_tokens;
+      const cacheC = u.cache_creation_input_tokens;
+      if (cacheR || cacheC) {
+        const cb = [];
+        if (cacheR) cb.push(`${formatNumCompact(cacheR)} read`);
+        if (cacheC) cb.push(`${formatNumCompact(cacheC)} create`);
+        bits.push(`cache ${cb.join(' / ')}`);
+      }
+      if (bits.length) parts.push(`<div class="pp-usage"><span class="pp-label">usage</span>${escapeHtml(bits.join(' · '))}</div>`);
+    }
+
+    // Thinking chars (only if nonzero — when zero it's pure noise).
+    if (typeof payload.thinking_chars === 'number' && payload.thinking_chars > 0) {
+      parts.push(`<div class="pp-field"><span class="pp-label">thinking</span><span class="pp-value">${formatNumCompact(payload.thinking_chars)} chars</span></div>`);
+    }
+
+    // Scalar badges (model, task_id, etc.)
+    const badges = [];
+    for (const f of SECONDARY_BADGES) {
+      const v = payload[f];
+      if (v != null && typeof v !== 'object') {
+        badges.push(`<span class="pp-badge"><span class="pp-label">${escapeHtml(f.replace(/_/g, ' '))}</span>${escapeHtml(String(v))}</span>`);
+      }
+    }
+    if (payload.sane === false) {
+      badges.push(`<span class="pp-badge pp-warn">not sane</span>`);
+    }
+    if (badges.length) parts.push(`<div class="pp-badges">${badges.join('')}</div>`);
+
+    // Anything else (scalar tail) — fields we didn't explicitly handle.
+    const handled = new Set([
+      'routing', 'routing_reason', 'text', 'tool_uses',
+      ...TEXT_FIELDS.map(t => t[0]),
+      'budget', 'usage', 'thinking_chars',
+      ...SECONDARY_BADGES, 'sane',
+      ...NOISE_FIELDS,
+    ]);
+    const remainder = Object.entries(payload).filter(([k, v]) =>
+      !handled.has(k) && v != null
+      && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+    );
+    if (remainder.length) {
+      const items = remainder.map(([k, v]) =>
+        `<span class="pp-kv"><span class="pp-label">${escapeHtml(k.replace(/_/g, ' '))}</span>${escapeHtml(String(v))}</span>`
+      ).join('');
+      parts.push(`<div class="pp-extra">${items}</div>`);
+    }
+
+    return parts.length ? parts.join('') : `<div class="pp-empty">(no fields)</div>`;
+  }
+
   // appendEvent always renders newest-on-top so backfill and live additions
   // share the same visual order. Backfill is delivered oldest-first, so we
   // prepend each one as it arrives, leaving the chronologically-newest event
@@ -1263,8 +1647,9 @@
     if (!container) return;
     const kind = String(ev.kind || '');
     const ts = formatTs(ev.ts);
-    const payload = ev.payload ? JSON.stringify(ev.payload, null, 0) : '';
-    const truncated = payload.length > 240 ? payload.slice(0, 240) + '…' : payload;
+    const payload = ev.payload || null;
+    const prettyHtml = payload ? prettyPayload(payload) : '';
+    const rawJson = payload ? JSON.stringify(payload, null, 2) : '';
     const div = document.createElement('div');
     // classList.add validates token shape — defense-in-depth even though
     // `kind` is server-controlled today.
@@ -1276,7 +1661,8 @@
     }
     div.innerHTML = `
       <div><span class="kind" role="button" tabindex="0" title="Click to filter to this event type">${escapeHtml(kind)}</span><span class="ts">${escapeHtml(ts)}</span></div>
-      ${payload ? `<div class="payload" data-full="${escapeHtml(payload)}" title="Click to expand">${escapeHtml(truncated)}</div>` : ''}
+      ${prettyHtml ? `<div class="payload" title="Click to expand">${prettyHtml}</div>` : ''}
+      ${rawJson ? `<pre class="payload-raw">${escapeHtml(rawJson)}</pre>` : ''}
     `;
     // Hide the event up front if a filter is active and doesn't match.
     if (eventKindFilter && kind !== eventKindFilter) {
@@ -1296,20 +1682,12 @@
         }
       });
     }
-    // Click anywhere else on the event → toggle expanded (full text + white).
+    // Click anywhere else on the event → toggle expanded (reveals raw JSON).
     div.addEventListener('click', e => {
-      if (e.target.closest('.kind')) return;  // kind label owns its click
-      toggleEventExpanded(div, payload, truncated);
+      if (e.target.closest('.kind')) return;
+      div.classList.toggle('expanded');
     });
     container.prepend(div);
-  }
-
-  function toggleEventExpanded(eventEl, fullText, truncatedText) {
-    const payloadEl = eventEl.querySelector('.payload');
-    const expanded = eventEl.classList.toggle('expanded');
-    if (payloadEl) {
-      payloadEl.textContent = expanded ? fullText : truncatedText;
-    }
   }
 
   function toggleKindFilter(kind) {
@@ -1357,18 +1735,33 @@
   }
 
   // --- Filters ---
+  // Release any drag-pinned positions so the new visible set lays out from
+  // the recency rail / center forces instead of frozen drop points.
+  function releasePins() {
+    nodeLayer.selectAll('.node').each(function(d) { d.fx = null; d.fy = null; });
+  }
+  function onFilterChange() {
+    releasePins();
+    // Reset the pan/zoom transform so the new visible set lays out at the
+    // natural scale + position. Without this, an operator who had zoomed
+    // into a corner would see the freshly-filtered set still anchored
+    // there — usually empty space — even though the simulation correctly
+    // re-centered around the recency rail + center-y forces.
+    svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
+    renderGraph(allSessions, allEdges);
+  }
   filterTerminalEl.addEventListener('change', () => {
     applyRecencyDefault();
-    renderGraph(allSessions, allEdges);
+    onFilterChange();
   });
   if (filterRecencyEl) {
     filterRecencyEl.addEventListener('change', () => {
       recencyManuallySet = true;
-      renderGraph(allSessions, allEdges);
+      onFilterChange();
     });
   }
   [filterRouteEl, filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
-    el.addEventListener('change', () => renderGraph(allSessions, allEdges))
+    el.addEventListener('change', onFilterChange)
   );
 
   // --- Side panel resize ---
