@@ -351,3 +351,113 @@ def test_preset_class_set_on_empty_title_short_circuit():
     assert result.preset_class == "financial"
     # And the sane flag is still false (empty title is unsafe regardless of tags).
     assert result.sane is False
+
+
+# ---------------------------------------------------------------------------
+# Cost gates: fail-fast budget check (#139 §6) + cost preview (#139 §7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_cloud_route_emits_cost_estimate():
+    """Cloud-routed tasks get a non-zero cache-cold cost estimate so the
+    orchestrator can preview cost before dispatch."""
+    result = pf.run_preflight("research task", tags=["agent", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.estimated_cost_dollars > 0
+
+
+@pytest.mark.unit
+def test_local_route_emits_zero_estimate():
+    """Local routing is free compute (operator paid for the hardware)."""
+    result = pf.run_preflight("anything", tags=["agent", "local"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_fullstack_estimate_higher_than_research_estimate():
+    """Larger preset classes are estimated more expensively — that's the
+    whole point of per-class filtering."""
+    full = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                            caller=_stub_caller(routing="claude"))
+    research = pf.run_preflight("any task", tags=["agent", "research"],
+                                caller=_stub_caller(routing="claude"))
+    assert full.estimated_cost_dollars > research.estimated_cost_dollars
+
+
+@pytest.mark.unit
+def test_fail_fast_refuses_when_estimate_exceeds_2x_max_dollars():
+    """§6 acceptance: refuse dispatch when cache-cold estimate exceeds
+    2× max_dollars (refuse only when even the cheap path can't fit)."""
+    # fullstack on Sonnet = 100k × $3/M × 1.25 ≈ $0.375. 2× = $0.75.
+    # Set max_dollars below that floor (so 2× margin still doesn't fit).
+    import json
+    def stub_caller(_p):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.10},
+            "routing": "claude",
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    result = pf.run_preflight("expensive task", tags=["agent", "fullstack"],
+                              caller=stub_caller)
+    assert result.sane is False
+    assert "budget_too_small" in result.sane_reason
+
+
+@pytest.mark.unit
+def test_fail_fast_does_not_refuse_when_2x_margin_fits():
+    """Cache-warm tasks aren't over-refused: when 2× max_dollars covers
+    the estimate, dispatch is allowed (real cost may be 10× cheaper from
+    cache_read on a warm cache)."""
+    import json
+    def stub_caller(_p):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 5.0},
+            "routing": "claude",
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    result = pf.run_preflight("normal task", tags=["agent", "research"],
+                              caller=stub_caller)
+    assert result.sane is True
+    assert "budget_too_small" not in result.sane_reason
+
+
+@pytest.mark.unit
+def test_cost_confirmation_triggers_above_threshold(monkeypatch):
+    """§7 acceptance: estimate > threshold sets needs_cost_confirmation."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.01)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    # fullstack estimate is well over a penny.
+    assert result.needs_cost_confirmation is True
+
+
+@pytest.mark.unit
+def test_cost_confirmation_not_triggered_below_threshold(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 1000.0)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_cost_confirmation_disabled_when_threshold_zero(monkeypatch):
+    """Threshold=0 disables confirmation entirely (auto-dispatch all)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.0)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.needs_cost_confirmation is False

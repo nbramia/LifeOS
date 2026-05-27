@@ -127,6 +127,42 @@ _CLASS_SPECIALTIES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Per-class cache_creation token estimates (#139 §6). These are conservative
+# hardcoded floors used by preflight's fail-fast budget check. The full §6
+# acceptance specifies a live per-class startup probe — that operational
+# experiment is deferred; meanwhile these estimates let the refuse-on-too-small
+# logic land today. Probe-derived values can overwrite this table when the
+# experiment lands; the consumer just calls `estimated_cache_creation_tokens`.
+#
+# Numbers below are rough order-of-magnitude — small classes (~3 specialty
+# tools + cross-cutting) land around 25-40k tokens, larger classes (~10+
+# specialty tools) land around 40-70k, and `fullstack` is the un-filtered
+# preset which production has measured at ~100k.
+_CACHE_CREATION_TOKEN_ESTIMATES: dict[str, int] = {
+    PRESET_CLASS_PERSONAL_COMM: 45_000,
+    PRESET_CLASS_WORK_COMM: 50_000,
+    PRESET_CLASS_RESEARCH: 35_000,
+    PRESET_CLASS_FINANCIAL: 30_000,
+    PRESET_CLASS_CRM: 60_000,
+    PRESET_CLASS_FULLSTACK: 100_000,
+}
+
+
+def estimated_cache_creation_tokens(preset_class: str | None) -> int:
+    """Return the conservative cache_creation token estimate for a preset
+    class. Used by preflight (#139 §6) to refuse dispatch when the cache-
+    cold cost would blow through the task's budget.
+
+    None / unknown classes fall back to the fullstack estimate so we err
+    toward over-refusing rather than silently letting a runaway through.
+    """
+    if preset_class is None:
+        return _CACHE_CREATION_TOKEN_ESTIMATES[PRESET_CLASS_FULLSTACK]
+    return _CACHE_CREATION_TOKEN_ESTIMATES.get(
+        preset_class, _CACHE_CREATION_TOKEN_ESTIMATES[PRESET_CLASS_FULLSTACK]
+    )
+
+
 def class_to_tool_filter(preset_class: str) -> dict | None:
     """Build the `agent.tools` payload for `driver.update_session()`.
 
