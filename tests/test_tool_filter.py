@@ -13,6 +13,7 @@ from api.services.agent_worker.tool_filter import (
     PRESET_CLASS_RESEARCH,
     PRESET_CLASS_WORK_COMM,
     class_to_tool_filter,
+    estimated_cache_creation_tokens,
 )
 
 
@@ -123,3 +124,31 @@ def test_all_classes_constant_matches_handled_classes():
         # Either None (fullstack) or a real payload — never raises.
         result = class_to_tool_filter(cls)
         assert result is None or "tools" in result
+
+
+# ---------------------------------------------------------------------------
+# Per-class cost estimates (#139 §6 — hardcoded floor pending live probe)
+# ---------------------------------------------------------------------------
+
+def test_estimated_cache_creation_tokens_positive_for_every_class():
+    """Each named class returns a positive estimate."""
+    for cls in ALL_PRESET_CLASSES:
+        est = estimated_cache_creation_tokens(cls)
+        assert est > 0, f"{cls} estimate must be positive"
+
+
+def test_fullstack_estimate_is_highest():
+    """Unfiltered preset is the worst-case — no filter can be cheaper."""
+    full = estimated_cache_creation_tokens(PRESET_CLASS_FULLSTACK)
+    for cls in (PRESET_CLASS_PERSONAL_COMM, PRESET_CLASS_WORK_COMM,
+                PRESET_CLASS_RESEARCH, PRESET_CLASS_FINANCIAL,
+                PRESET_CLASS_CRM):
+        assert estimated_cache_creation_tokens(cls) <= full
+
+
+def test_unknown_class_falls_back_to_fullstack_estimate():
+    """Conservative default — over-estimating cost is safer than
+    under-estimating (we'd rather refuse a runaway than allow one)."""
+    full = estimated_cache_creation_tokens(PRESET_CLASS_FULLSTACK)
+    assert estimated_cache_creation_tokens("not-a-real-class") == full
+    assert estimated_cache_creation_tokens(None) == full
