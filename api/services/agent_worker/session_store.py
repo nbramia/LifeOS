@@ -182,7 +182,17 @@ CREATE TABLE IF NOT EXISTS managed_cursor (
     task_id                          TEXT PRIMARY KEY,
     last_event_id                    TEXT,
     accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0,
-    final_text                       TEXT
+    final_text                       TEXT,
+    -- Runaway detection counters (#139 Section 5). Persisted so cross-poll
+    -- signals survive worker restarts mid-session.
+    -- `tool_loop_signature` is the (tool_name, sorted_args_json) of the most
+    -- recent tool call; `tool_loop_count` is how many consecutive times that
+    -- exact signature has fired with no intervening *different* tool. A
+    -- different tool resets the count. `tool_calls_since_message` increments
+    -- on each tool_use and resets to 0 on each agent.message.
+    tool_loop_signature              TEXT,
+    tool_loop_count                  INTEGER NOT NULL DEFAULT 0,
+    tool_calls_since_message         INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -244,6 +254,21 @@ class SessionStore:
             if "total_cache_read_tokens" not in sess_cols:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN total_cache_read_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            # Idempotent migrations for the runaway detection counters on
+            # managed_cursor (#139 Section 5).
+            mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
+            if "tool_loop_signature" not in mc_cols:
+                conn.execute("ALTER TABLE managed_cursor ADD COLUMN tool_loop_signature TEXT")
+            if "tool_loop_count" not in mc_cols:
+                conn.execute(
+                    "ALTER TABLE managed_cursor ADD COLUMN tool_loop_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "tool_calls_since_message" not in mc_cols:
+                conn.execute(
+                    "ALTER TABLE managed_cursor ADD COLUMN tool_calls_since_message "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
 
@@ -519,6 +544,61 @@ class SessionStore:
         if not row:
             return None
         return row["final_text"]
+
+    # ------------------------------------------------------------------
+    # Runaway detection state (#139 Section 5)
+    # ------------------------------------------------------------------
+
+    def get_runaway_state(self, task_id: str) -> dict:
+        """Return the persisted runaway counters for `task_id`.
+
+        Defaults to a clean state (signature=None, both counts 0) when no
+        managed_cursor row exists yet. Callers that have never seen events
+        for this session can treat the result as a virgin starting point.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tool_loop_signature, tool_loop_count, tool_calls_since_message "
+                "FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "tool_loop_signature": None,
+                "tool_loop_count": 0,
+                "tool_calls_since_message": 0,
+            }
+        return {
+            "tool_loop_signature": row["tool_loop_signature"],
+            "tool_loop_count": int(row["tool_loop_count"] or 0),
+            "tool_calls_since_message": int(row["tool_calls_since_message"] or 0),
+        }
+
+    def set_runaway_state(
+        self,
+        task_id: str,
+        *,
+        tool_loop_signature: str | None,
+        tool_loop_count: int,
+        tool_calls_since_message: int,
+    ) -> None:
+        """Persist runaway counters. Upsert into managed_cursor so a fresh
+        session (no prior cursor row) gets a row with the counters set."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO managed_cursor (
+                    task_id, tool_loop_signature, tool_loop_count,
+                    tool_calls_since_message
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    tool_loop_signature      = excluded.tool_loop_signature,
+                    tool_loop_count          = excluded.tool_loop_count,
+                    tool_calls_since_message = excluded.tool_calls_since_message
+                """,
+                (task_id, tool_loop_signature, tool_loop_count, tool_calls_since_message),
+            )
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:
         """Add to a session's cumulative active-execution seconds.

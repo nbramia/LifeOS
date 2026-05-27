@@ -672,3 +672,221 @@ def test_poll_returns_running_on_transient_driver_error(stores):
     assert outcome.status == STATUS_RUNNING
     # Session not yet marked terminal.
     assert store.get("t1").status != STATUS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Runaway detection (#139 Section 5)
+# ---------------------------------------------------------------------------
+
+def _tool_use(tool_name: str, args: dict, event_id: str = "evt") -> dict:
+    """Helper: build a `tool_use` event in the shape the driver returns."""
+    return {"id": event_id, "type": "tool_use", "name": tool_name, "input": args}
+
+
+def _agent_message(text: str = "thinking", event_id: str = "evt") -> dict:
+    return {"id": event_id, "type": "agent.message",
+            "content": [{"type": "text", "text": text}]}
+
+
+def _tool_result(payload: str, event_id: str = "evt") -> dict:
+    return {"id": event_id, "type": "tool_result", "content": payload}
+
+
+@pytest.mark.unit
+def test_runaway_tool_loop_kill_after_four_identical_calls(stores):
+    """Same tool + identical args 4× consecutively → kill."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    def same(i):
+        return _tool_use("lifeos_search", {"q": "X"}, f"evt_{i}")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_4",
+            new_events=[same(1), same(2), same(3), same(4)],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "tool_loop_detected" in outcome.reason
+    assert driver.kills  # remote session was killed
+
+
+@pytest.mark.unit
+def test_runaway_tool_loop_not_triggered_by_three_identical_calls(stores):
+    """Threshold is 4 — three identical calls is still tolerated (could
+    be a transient retry sequence)."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    def same(i):
+        return _tool_use("lifeos_search", {"q": "X"}, f"evt_{i}")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_3",
+            new_events=[same(1), same(2), same(3)],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_RUNNING
+    assert not driver.kills
+
+
+@pytest.mark.unit
+def test_runaway_tool_loop_resets_on_different_tool(stores):
+    """A different tool resets the loop counter so a legitimate retry path
+    (toolA, toolA, toolB, toolA, toolA, toolA, toolA) doesn't trip."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # 3× toolA, then a different tool, then 3× toolA again — none of those
+    # streaks reach the 4-call threshold individually.
+    events = [
+        _tool_use("toolA", {"q": "X"}, "evt_1"),
+        _tool_use("toolA", {"q": "X"}, "evt_2"),
+        _tool_use("toolA", {"q": "X"}, "evt_3"),
+        _tool_use("toolB", {"q": "Y"}, "evt_4"),
+        _tool_use("toolA", {"q": "X"}, "evt_5"),
+        _tool_use("toolA", {"q": "X"}, "evt_6"),
+    ]
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_6",
+            new_events=events,
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_RUNNING
+    assert not driver.kills
+
+
+@pytest.mark.unit
+def test_runaway_tool_loop_persists_across_polls(stores):
+    """Counter survives across polls: 2 identical calls in poll 1, 2 more
+    identical in poll 2 → 4 consecutive → kill on poll 2."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    def same(i):
+        return _tool_use("lifeos_search", {"q": "X"}, f"evt_{i}")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_2",
+            new_events=[same(1), same(2)],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_4",
+            new_events=[same(3), same(4)],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome1 = executor.poll(session)
+    assert outcome1.status == STATUS_RUNNING
+    session = store.get("t1")
+    outcome2 = executor.poll(session)
+    assert outcome2.status == STATUS_BUDGET_EXCEEDED
+    assert "tool_loop_detected" in outcome2.reason
+
+
+@pytest.mark.unit
+def test_runaway_no_progress_kill_after_fifteen_tools_no_message(stores):
+    """15 tool calls with no agent.message → kill."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # 15 different tools so tool-loop doesn't fire first.
+    events = [
+        _tool_use(f"tool_{i}", {"i": i}, f"evt_{i}") for i in range(15)
+    ]
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_14",
+            new_events=events,
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "no_text_in_15_tool_calls" in outcome.reason
+
+
+@pytest.mark.unit
+def test_runaway_no_progress_resets_on_agent_message(stores):
+    """An intervening agent.message resets the no-progress counter."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # 10 tools, then a message, then 10 more tools — neither streak
+    # reaches 15, so no kill.
+    events = (
+        [_tool_use(f"tool_{i}", {"i": i}, f"evt_a_{i}") for i in range(10)]
+        + [_agent_message("here's an update", "evt_msg")]
+        + [_tool_use(f"tool_{i}", {"i": i}, f"evt_b_{i}") for i in range(10)]
+    )
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_b_9",
+            new_events=events,
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_RUNNING
+
+
+@pytest.mark.unit
+def test_oversized_tool_result_truncated_in_transcript(stores):
+    """A >20KB tool_result is truncated when mirrored to the transcript."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    big_payload = "X" * 30_000
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_1",
+            new_events=[_tool_result(big_payload, "evt_1")],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    executor.poll(session)
+    # The transcript should hold a truncated copy, not the full payload.
+    entries = transcript.read(session.session_id)
+    tool_results = [e for e in entries if e["kind"] == "managed_event_tool_result"]
+    assert tool_results
+    stored = tool_results[0]["payload"]
+    assert len(stored["content"]) < 30_000
+    assert "[…truncated]" in stored["content"]
+    assert stored.get("_truncated_from_chars") == 30_000
+
+
+@pytest.mark.unit
+def test_undersized_tool_result_not_truncated(stores):
+    """Tool results under the threshold pass through unchanged."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    payload = "ok"
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_1",
+            new_events=[_tool_result(payload, "evt_1")],
+            total_input_tokens=0, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    executor.poll(session)
+    entries = transcript.read(session.session_id)
+    tool_results = [e for e in entries if e["kind"] == "managed_event_tool_result"]
+    assert tool_results[0]["payload"]["content"] == "ok"
+    assert "_truncated_from_chars" not in tool_results[0]["payload"]
