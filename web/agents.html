@@ -370,8 +370,13 @@
     <span class="chip running">running <strong id="chip-running">0</strong></span>
     <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
-    <span class="chip" title="Claude Code terminal sessions visible">cc <strong id="chip-cc">0</strong></span>
+    <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
     <span class="chip spend">spend <strong id="chip-spend">$0.00</strong></span>
+    <span class="chip legend" title="Node shapes: circle = LifeOS agent worker · square = Claude Code CLI · diamond = Task-tool subagent">
+      <span style="opacity:0.6">●</span> agent &nbsp;
+      <span style="opacity:0.6">■</span> cli &nbsp;
+      <span style="opacity:0.6">◆</span> sub
+    </span>
   </div>
 </header>
 <div class="filters">
@@ -520,19 +525,34 @@
     const isTerminal = TERMINAL.has(s.status);
     const isBlocked = s.status === 'blocked';
     const isInferred = !!s.status_inferred;
+    const isClaudeCode = (s.source === 'claude_code');
+    const isSubagent = !!s.is_subagent;
     const totalTokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
     const size = sizeForTokens(totalTokens);
-    // Fill the node by status: full saturation while live, subdued when
-    // terminal. Both keep the same hue so you can still tell at a glance
-    // whether the session ended in success or failure.
     const fill = isTerminal ? hexWithAlpha(color, 0.35) : hexWithAlpha(color, 0.85);
     const border = color;
+    // Source distinction by shape:
+    //   - LifeOS agent worker sessions → `dot` (circle)
+    //   - Claude Code terminal sessions → `box` (rounded square)
+    //   - Claude Code Task-tool subagent nodes → `diamond`
+    // Status color + token-based size still apply across all shapes.
+    const shape = isSubagent ? 'diamond' : (isClaudeCode ? 'box' : 'dot');
+    // Box-shape nodes use `widthConstraint` for sizing rather than radius;
+    // map our log-token size into a width/height to keep visual parity.
+    const boxSide = Math.max(size * 1.8, 36);
+    // Prefer the model label; when the parser couldn't find a model in the
+    // transcript, show "?" for CC sessions instead of the longer fallback so
+    // it reads as "model unknown" at a glance. The routing badge in the side
+    // panel still says "Claude Code" so context isn't lost.
+    let label = s.model_label || routingLabel(s.routing) || s.session_id.slice(0, 8);
+    if (isClaudeCode && label === 'Claude Code') label = '?';
     return {
       id: s.session_id,
-      label: s.model_label || routingLabel(s.routing) || s.session_id.slice(0, 8),
+      label: label,
       title: [
         s.label,
         s.decoded_cwd ? `cwd: ${s.decoded_cwd}` : null,
+        `source: ${isClaudeCode ? 'Claude Code CLI' : 'LifeOS agent'}`,
         `status: ${s.status}${isInferred ? ' (inferred)' : ''}`,
         `routing: ${routingLabel(s.routing)}`,
         `tokens: ${s.total_input_tokens} in / ${s.total_output_tokens} out`,
@@ -540,12 +560,16 @@
         `active: ${(s.total_active_seconds || 0).toFixed(1)}s`,
         s.last_event_kind ? `last: ${s.last_event_kind}` : null,
       ].filter(Boolean).join('\n'),
+      shape: shape,
       color: {
         background: fill,
         border: border,
         highlight: { background: color, border: '#e8e8ed' },
       },
       size: size,
+      widthConstraint: shape === 'box' ? { minimum: boxSide, maximum: boxSide * 2 } : undefined,
+      heightConstraint: shape === 'box' ? { minimum: boxSide * 0.55 } : undefined,
+      margin: shape === 'box' ? 10 : undefined,
       borderWidth: isBlocked ? 4 : 2,
       borderWidthSelected: isBlocked ? 4 : 3,
       // Dashed border signals an inferred status (Claude Code only today).
