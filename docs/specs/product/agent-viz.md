@@ -185,5 +185,6 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 
 - [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, D3 force config, status inference rules, security boundaries
 - [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
+- [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here
 - [Agent Worker — Technical](../technical/agent-worker.md) — Sessions, transcripts, kill primitives
 - [Architecture](../technical/architecture.md) — Where the viz fits in the broader code structure
