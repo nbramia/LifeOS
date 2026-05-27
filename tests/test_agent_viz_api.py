@@ -298,3 +298,33 @@ def test_label_truncates_long_descriptions(client, stores):
     sess = r.json()["sessions"][0]
     assert len(sess["label"]) <= 60
     assert sess["label"].endswith("…")
+
+
+@pytest.mark.unit
+def test_model_label_local_routing(client, stores):
+    session_store, _ = stores
+    session_store.create(task_id="t-local", status=STATUS_RUNNING, routing="local")
+    r = client.get("/api/agents/snapshot")
+    sess = r.json()["sessions"][0]
+    assert sess["model_label"] == "Local"
+
+
+@pytest.mark.unit
+def test_model_label_claude_routing_derives_from_settings(client, stores, monkeypatch):
+    """Claude-routed sessions surface a short label derived from the configured
+    `agent_managed_model` setting — Sonnet / Haiku / Opus / Claude."""
+    from config import settings as settings_mod
+    session_store, _ = stores
+    session_store.create(task_id="t-claude", status=STATUS_RUNNING, routing="claude")
+
+    monkeypatch.setattr(settings_mod.settings, "agent_managed_model", "claude-haiku-4-5")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Haiku"
+
+    monkeypatch.setattr(settings_mod.settings, "agent_managed_model", "claude-sonnet-4-6")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Sonnet"
+
+    monkeypatch.setattr(settings_mod.settings, "agent_managed_model", "claude-opus-4-7")
+    sess = client.get("/api/agents/snapshot").json()["sessions"][0]
+    assert sess["model_label"] == "Opus"
