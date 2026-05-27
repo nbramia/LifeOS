@@ -66,6 +66,12 @@ class ManagedSessionState:
     new_events: list[dict] = field(default_factory=list)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Anthropic charges two extra token buckets beyond plain input/output —
+    # cache_creation (1.25× input rate) and cache_read (0.10× input rate).
+    # On cache-heavy presets, cache_creation on the first turn can dominate
+    # session cost, so we mirror both buckets from the usage payload.
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
     final_text: str | None = None
     error_reason: str | None = None
     # MCP servers that failed to initialize during this session — informational,
@@ -259,6 +265,8 @@ class ManagedAgentsDriver:
             new_events=events,
             total_input_tokens=int(usage.get("input_tokens", 0)),
             total_output_tokens=int(usage.get("output_tokens", 0)),
+            total_cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0)),
+            total_cache_read_tokens=int(usage.get("cache_read_input_tokens", 0)),
             final_text=final_text,
             error_reason=error_reason,
             init_failed_mcps=init_failed_mcps,
@@ -509,8 +517,21 @@ def managed_session_cost(
     tokens_in: int,
     tokens_out: int,
     wall_seconds: float,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> float:
-    """Total $ for a managed session: token cost + session-hour overhead."""
-    tokens = cost_for(model, tokens_in, tokens_out)
+    """Total $ for a managed session: token cost + session-hour overhead.
+
+    Cache buckets default to zero so callers that only care about plain
+    token cost (e.g., the local executor's wall-time accounting) don't
+    need to update. Managed sessions should always pass all four buckets.
+    """
+    tokens = cost_for(
+        model,
+        tokens_in,
+        tokens_out,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+    )
     overhead = (wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
     return tokens + overhead

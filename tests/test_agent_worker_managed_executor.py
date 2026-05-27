@@ -435,6 +435,82 @@ def test_poll_kills_remote_session_on_token_budget_breach(stores):
 
 
 @pytest.mark.unit
+def test_poll_persists_cache_creation_and_cache_read_deltas(stores):
+    """All four token buckets (uncached input, output, cache_creation,
+    cache_read) must flow from driver state through record_spend into the
+    sessions row. Confirms the dollar total reflects cache costs."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_1",
+            new_events=[{"id": "evt_1", "type": "x"}],
+            total_input_tokens=10,
+            total_output_tokens=5,
+            total_cache_creation_tokens=100_000,
+            total_cache_read_tokens=2_000,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver, model="claude-sonnet-4-6")
+    executor.poll(session)
+    refreshed = store.get("t1")
+    assert refreshed.total_input_tokens == 10
+    assert refreshed.total_output_tokens == 5
+    assert refreshed.total_cache_creation_tokens == 100_000
+    assert refreshed.total_cache_read_tokens == 2_000
+    # Sonnet input $3/M:
+    # 10 input = $0.00003, 5 output ($15/M) = $0.000075,
+    # 100k cache_creation (×1.25) = $0.375, 2k cache_read (×0.10) = $0.0006.
+    # The dollar total also accrues session-hour overhead from test wall time
+    # ($0.08/hr) so we tolerate a small positive delta above the token cost.
+    expected_token_dollars = (
+        10 * 3.0e-6
+        + 5 * 15.0e-6
+        + 100_000 * 3.0e-6 * 1.25
+        + 2_000 * 3.0e-6 * 0.10
+    )
+    overhead_upper_bound = 60.0 / 3600.0 * 0.08  # 60s wall = generous
+    assert expected_token_dollars <= refreshed.total_dollars <= expected_token_dollars + overhead_upper_bound
+
+
+@pytest.mark.unit
+def test_poll_computes_cache_token_deltas_against_prior_state(stores):
+    """Token totals are absolute remote counts; record_spend gets deltas only."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_1",
+            new_events=[{"id": "evt_1", "type": "x"}],
+            total_input_tokens=5,
+            total_output_tokens=3,
+            total_cache_creation_tokens=50_000,
+            total_cache_read_tokens=1_000,
+        ),
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_2",
+            new_events=[{"id": "evt_2", "type": "y"}],
+            total_input_tokens=12,
+            total_output_tokens=8,
+            total_cache_creation_tokens=50_000,  # no new cache_creation
+            total_cache_read_tokens=4_500,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver)
+    executor.poll(session)
+    session = store.get("t1")
+    executor.poll(session)
+    refreshed = store.get("t1")
+    # Cumulative absolute totals — not double-counted.
+    assert refreshed.total_input_tokens == 12
+    assert refreshed.total_output_tokens == 8
+    assert refreshed.total_cache_creation_tokens == 50_000
+    assert refreshed.total_cache_read_tokens == 4_500
+
+
+@pytest.mark.unit
 def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
     store, session, transcript = stores
     store.set_routing_and_budget(
@@ -458,6 +534,66 @@ def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
     assert outcome.status == STATUS_BUDGET_EXCEEDED
     assert "max_dollars" in outcome.reason
     assert driver.kills
+
+
+@pytest.mark.unit
+def test_poll_dollar_breach_fires_from_cache_creation_cost_alone(stores):
+    """The whole point of #137: cache_creation-heavy sessions must trip
+    max_dollars even when uncached input + output are negligible. Previously
+    the dollar count missed cache cost entirely, so this didn't fire."""
+    store, session, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": 1_000_000, "max_dollars": 0.10},
+        expected_output="text",
+    )
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # 100k cache_creation at Sonnet ($3/M × 1.25) = $0.375 — over the $0.10 cap.
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_x",
+            new_events=[],
+            total_input_tokens=3,
+            total_output_tokens=81,
+            total_cache_creation_tokens=100_000,
+            total_cache_read_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver, model="claude-sonnet-4-6")
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "max_dollars" in outcome.reason
+
+
+@pytest.mark.unit
+def test_poll_dollar_breach_takes_precedence_over_token_breach(stores):
+    """When both budgets would breach, max_dollars wins. Dollars-first
+    enforcement means runaway cache_creation cost can't be masked by a
+    generous token cap."""
+    store, session, transcript = stores
+    store.set_routing_and_budget(
+        "t1",
+        routing="claude",
+        # Both caps fail: 200 tokens > 100-cap AND $0.003 > $0.001-cap.
+        budget={"wall_seconds": 3600, "max_tokens": 100, "max_dollars": 0.001},
+        expected_output="text",
+    )
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_x",
+            new_events=[],
+            total_input_tokens=200, total_output_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver, model="claude-opus-4-7")
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert "max_dollars" in outcome.reason
+    assert "max_tokens" not in outcome.reason
 
 
 # ---------------------------------------------------------------------------

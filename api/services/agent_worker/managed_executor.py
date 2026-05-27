@@ -208,13 +208,35 @@ class ManagedExecutor:
         for event in state.new_events:
             self.transcript_store.append(sid, f"managed_event_{event.get('type', 'unknown')}", event)
 
-        # 1. Token spend delta — compare absolute remote totals to our row.
+        # 1. Token spend delta — compare absolute remote totals to our row,
+        # across all four buckets (uncached input, output, cache_creation,
+        # cache_read). Anthropic bills cache_creation at 1.25× input and
+        # cache_read at 0.10× input; pricing.cost_for applies the multipliers.
         delta_in = max(0, state.total_input_tokens - (session.total_input_tokens or 0))
         delta_out = max(0, state.total_output_tokens - (session.total_output_tokens or 0))
-        token_delta_dollars = cost_for(self.model, delta_in, delta_out)
-        if delta_in or delta_out:
+        delta_cache_creation = max(
+            0,
+            state.total_cache_creation_tokens - (session.total_cache_creation_tokens or 0),
+        )
+        delta_cache_read = max(
+            0,
+            state.total_cache_read_tokens - (session.total_cache_read_tokens or 0),
+        )
+        token_delta_dollars = cost_for(
+            self.model,
+            delta_in,
+            delta_out,
+            cache_creation_tokens=delta_cache_creation,
+            cache_read_tokens=delta_cache_read,
+        )
+        if delta_in or delta_out or delta_cache_creation or delta_cache_read:
             self.session_store.record_spend(
-                session.task_id, delta_in, delta_out, token_delta_dollars,
+                session.task_id,
+                delta_in,
+                delta_out,
+                token_delta_dollars,
+                cache_creation_tokens=delta_cache_creation,
+                cache_read_tokens=delta_cache_read,
             )
 
         # 2. Session-hour overhead delta — we only want to add what's accrued
@@ -267,16 +289,23 @@ class ManagedExecutor:
 
     @staticmethod
     def _budget_breach(refreshed_session, budget: dict) -> str | None:
-        """Return the budget kind that was exceeded, or None."""
+        """Return the budget kind that was exceeded, or None.
+
+        Dollars-first: with cache_creation and cache_read now in the dollar
+        total, `total_dollars` is the authoritative spend signal. `max_tokens`
+        remains a soft secondary gate — it only counts uncached input +
+        output, which understates cache-heavy cost, but is preserved so
+        existing token-only callers keep working.
+        """
         if not budget:
             return None
+        if budget.get("max_dollars") is not None:
+            if (refreshed_session.total_dollars or 0) >= budget["max_dollars"]:
+                return "max_dollars"
         if budget.get("max_tokens"):
             used = (refreshed_session.total_input_tokens or 0) + (refreshed_session.total_output_tokens or 0)
             if used >= budget["max_tokens"]:
                 return "max_tokens"
-        if budget.get("max_dollars") is not None:
-            if (refreshed_session.total_dollars or 0) >= budget["max_dollars"]:
-                return "max_dollars"
         return None
 
     # ------------------------------------------------------------------
