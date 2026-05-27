@@ -33,7 +33,7 @@ OPENAPI_URL = f"{API_BASE}/openapi.json"
 CURATED_ENDPOINTS = {
     "/api/ask": {
         "name": "lifeos_ask",
-        "description": "Query the knowledge base with RAG synthesis. Returns a natural language answer with source citations. Use for open-ended questions like 'what did we discuss about X?' or 'summarize my notes on Y'. For raw search results without synthesis, use lifeos_search instead.",
+        "description": "RAG synthesis over the vault. Returns a natural-language answer with citations. Use for open-ended questions ('what did we discuss about X?'). For raw chunks, use lifeos_search.",
         "method": "POST"
     },
     "/api/search": {
@@ -48,12 +48,12 @@ CURATED_ENDPOINTS = {
     },
     "/api/calendar/search": {
         "name": "lifeos_calendar_search",
-        "description": "Search calendar events by keyword. Returns past and future events matching the query. Use for 'when did I meet with X?' or 'find meetings about Y'. For upcoming events only, use lifeos_calendar_upcoming.",
+        "description": "Search past and future calendar events by keyword ('when did I meet with X?'). For upcoming events only, use lifeos_calendar_upcoming.",
         "method": "GET"
     },
     "/api/gmail/search": {
         "name": "lifeos_gmail_search",
-        "description": "Search emails in Gmail. Returns email metadata and full body for top 5 results. Use for 'find emails about X' or 'what did Y say in email?'. Supports filtering by account (personal/work).",
+        "description": "Search Gmail. Returns metadata + full body for top 5 results. Filter by account (personal/work).",
         "method": "GET"
     },
     "/api/drive/search": {
@@ -78,41 +78,12 @@ CURATED_ENDPOINTS = {
     },
     "/api/people/search": {
         "name": "lifeos_people_search",
-        "description": """Search for people in your network by name or email. Returns entity_id (required for other people tools), relationship_strength, and active_channels. Always use this first to get entity_id before calling lifeos_person_profile, lifeos_person_timeline, lifeos_person_connections, or lifeos_person_facts.
-
-RETURNS for each match:
-- canonical_name, email, company, position
-- relationship_strength: 0-100 score (higher = closer relationship)
-- active_channels: Communication channels with recent activity (last 7 days)
-- days_since_contact: Days since last interaction
-- entity_id: Required for all follow-up tools
-
-FOLLOW-UP TOOLS (use entity_id):
-- lifeos_person_profile(entity_id) → Full CRM profile with contact info, notes, tags
-- lifeos_person_timeline(entity_id) → Chronological interaction history
-- lifeos_person_connections(entity_id) → Who they work with, shared meetings
-- lifeos_person_facts(entity_id) → Extracted facts (family, interests, etc.)
-- lifeos_imessage_search(entity_id=...) → Message history
-
-ROUTING GUIDANCE based on active_channels:
-- "imessage" active → lifeos_imessage_search with entity_id
-- "gmail" active → lifeos_gmail_search with their email
-- "slack" active → lifeos_slack_search with user_id
-- No active channels → Check profile for notes (dormant contact)""",
+        "description": "Find people by name/email. Returns entity_id (required by lifeos_person_*), relationship_strength, active_channels. Always call first to get entity_id.",
         "method": "GET"
     },
     "/api/crm/people/{entity_id}:PATCH": {
         "name": "lifeos_person_update",
-        "description": """Update a person's profile in the CRM. Can set notes, tags, category, or birthday. Requires entity_id from lifeos_people_search. Only provided fields are changed.
-
-PARAMETERS:
-- entity_id (required): Person entity ID from lifeos_people_search
-- notes: Free-text notes (replaces existing)
-- tags: Classification tags (replaces existing)
-- category: work, personal, family, or other
-- birthday: MM-DD format (month-day only), empty string to clear
-
-FOLLOW-UP TOOLS: Use lifeos_person_profile(entity_id) to verify the update.""",
+        "description": "Update a person's CRM profile (notes, tags, category, birthday MM-DD). Requires entity_id from lifeos_people_search; only provided fields change.",
         "method": "PATCH",
         "path": "/api/crm/people/{entity_id}"
     },
@@ -123,28 +94,22 @@ FOLLOW-UP TOOLS: Use lifeos_person_profile(entity_id) to verify the update.""",
     },
     "/api/imessage/search": {
         "name": "lifeos_imessage_search",
-        "description": "Search iMessage/SMS text message history. Returns messages with sender, timestamp, and content. Use for 'what did X text me about?' or 'find messages about Y'. Supports filtering by phone number, entity_id, date range, or direction (sent/received).",
+        "description": "Search iMessage/SMS history. Filter by phone, entity_id, date range, or direction (sent/received).",
         "method": "GET"
     },
     "/api/gmail/drafts": {
         "name": "lifeos_gmail_draft",
-        "description": "Create a draft email in Gmail. Returns draft ID and URL to open in Gmail. Use when user wants to compose an email. The draft is NOT sent - user must review and send manually. Provide 'to', 'subject', 'body'. Optional: 'cc', 'bcc', 'account' (personal/work).",
+        "description": "Create a Gmail draft (NOT sent — user reviews). Returns draft ID + URL. Required: to, subject, body. Optional: cc, bcc, account.",
         "method": "POST"
     },
     "/api/slack/search": {
         "name": "lifeos_slack_search",
-        "description": "Semantic search across Slack messages. Returns messages with channel, user, and content. Use for 'what was discussed in Slack about X?' or 'find messages from Y in Slack'. Searches DMs, group DMs, and channels.",
+        "description": "Semantic search across Slack DMs, group DMs, and channels. Returns channel, user, content.",
         "method": "POST"
     },
     "/api/crm/people/{person_id}/facts": {
         "name": "lifeos_person_facts",
-        "description": """Get extracted facts about a person from their interactions. Returns facts organized by category (family, interests, work, dates) with confidence scores. Requires entity_id from lifeos_people_search. Use before drafting personalized messages or preparing for meetings.
-
-Categories: family (spouse, kids, pets), interests (hobbies, sports), background (hometown, alma_mater), work (role, projects), dates (birthday), travel
-
-Each fact includes: key, value, confidence (0-1), confirmed status, source_quote
-
-WORKFLOW: lifeos_people_search → get entity_id → lifeos_person_facts""",
+        "description": "Get extracted facts about a person (family, interests, work, dates, travel) with confidence scores. Requires entity_id. Use before drafting personalized messages.",
         "method": "GET"
     },
     "/api/crm/people/{entity_id}/facts/{fact_id}:PUT": {
@@ -167,168 +132,52 @@ WORKFLOW: lifeos_people_search → get entity_id → lifeos_person_facts""",
     },
     "/api/crm/people/{person_id}": {
         "name": "lifeos_person_profile",
-        "description": """Get comprehensive CRM profile for a person. Returns all contact info (emails, phones), relationship metrics, tags, and notes. Requires entity_id from lifeos_people_search. Use for 'tell me about X' or when you need full contact details.
-
-WHAT IT RETURNS:
-- emails, phone_numbers, linkedin_url
-- company, position, vault_contexts
-- relationship_strength (0-100), category (work/personal/family)
-- meeting_count, email_count, message_count
-- tags, notes (user annotations)
-- facts (extracted personal details)
-
-REQUIRES: entity_id from lifeos_people_search.
-
-Use this instead of lifeos_people_search when you need all emails, phone numbers, or user notes.""",
+        "description": "Full CRM profile: emails, phones, company, relationship_strength, tags, notes, facts. Requires entity_id. Use for 'tell me about X' or full contact details.",
         "method": "GET"
     },
     "/api/crm/people/{person_id}/timeline": {
         "name": "lifeos_person_timeline",
-        "description": """Get chronological interaction history for a person. Returns recent emails, messages, meetings in time order. Requires entity_id from lifeos_people_search. Use for 'catch me up on X' or 'what's been happening with Y?'.
-
-RETURNS chronological list of interactions (newest first):
-- source_type: gmail, imessage, calendar, slack, vault
-- timestamp, summary, metadata (subject, attendees, etc.)
-
-PARAMETERS:
-- person_id (required): entity_id from lifeos_people_search
-- days_back: How far back to look (default: 365)
-- source_type: Filter by source (e.g., "imessage", "gmail,slack")
-- limit: Max results (default: 50)
-
-WORKFLOW: lifeos_people_search → get entity_id → lifeos_person_timeline""",
+        "description": "Chronological interactions for a person (emails, messages, meetings, vault). Requires entity_id. Use for 'catch me up on X'.",
         "method": "GET"
     },
     "/api/calendar/meeting-prep": {
         "name": "lifeos_meeting_prep",
-        "description": """Get intelligent meeting preparation context for a date. Returns each meeting with related notes, past meetings with same attendees, and relevant documents. Use for 'prep me for my meetings today' or 'what should I know for my 1:1 with X?'.
-
-RETURNS for each meeting:
-- title, time, attendees, location, description
-- related_notes: People notes, past meeting notes, topic notes
-- attachments: Files attached to calendar event
-
-PARAMETERS:
-- date: YYYY-MM-DD format (defaults to today)
-- include_all_day: Include all-day events (default: false)
-- max_related_notes: Max notes per meeting (default: 4)
-
-Use this instead of separate calendar + vault searches for meeting prep.""",
+        "description": "Meeting prep for a date: each event with related notes, past meetings with same attendees, attachments. Defaults to today.",
         "method": "GET"
     },
     "/api/crm/family/communication-gaps": {
         "name": "lifeos_communication_gaps",
-        "description": """Find people you haven't contacted recently. Requires comma-separated person_ids from lifeos_people_search. Use for 'who should I reach out to?' or 'which family members haven't I talked to?'. Returns days since last contact.
-
-RETURNS:
-- gaps: List of communication gaps (person_id, person_name, gap_days)
-- person_summaries: days_since_last_contact, average_gap_days, current_gap_days
-
-PARAMETERS:
-- person_ids (required): Comma-separated entity IDs from lifeos_people_search
-- days_back: History to analyze (default: 365)
-- min_gap_days: Minimum gap to report (default: 14)
-
-WORKFLOW: lifeos_people_search → get entity_ids → lifeos_communication_gaps(person_ids=id1,id2,id3)""",
+        "description": "Find people not contacted recently. Required: comma-separated person_ids (entity_ids). Returns days since last contact + gap stats.",
         "method": "GET"
     },
     "/api/crm/people/{person_id}/connections": {
         "name": "lifeos_person_connections",
-        "description": """Get people connected to a person through shared meetings, emails, messages, and LinkedIn. Use after lifeos_people_search to find who someone works with or knows.
-
-RETURNS for each connection:
-- person_id, name, company, relationship_type
-- shared_events_count, shared_threads_count, shared_messages_count
-- shared_slack_count, shared_whatsapp_count
-- relationship_strength, last_seen_together
-
-Use for 'who does X work with?' or 'who are X's connections?'.
-
-REQUIRES: person_id (entity_id) from lifeos_people_search.""",
+        "description": "People connected to a person via shared meetings, emails, messages, LinkedIn. Requires entity_id. Use for 'who does X work with?'.",
         "method": "GET"
     },
     "/api/crm/relationship/insights": {
         "name": "lifeos_relationship_insights",
-        "description": """Get relationship insights and observations about people. Returns patterns like 'frequently meets with X' or 'collaborates on Y project'. Insights are extracted from therapy notes and conversations.
-
-RETURNS:
-- insights: List with category, text, source_title, source_link, confirmed status
-- Categories: communication_patterns, emotional_needs, conflict_areas, growth_areas
-
-PARAMETERS:
-- person_id (optional): Focus on specific person (defaults to primary relationship)
-
-Use for understanding relationship dynamics and patterns.""",
+        "description": "Relationship insights (communication_patterns, emotional_needs, conflict_areas, growth_areas) extracted from notes. Optional person_id; defaults to primary relationship.",
         "method": "GET"
     },
     "/api/photos/person/{person_id}": {
         "name": "lifeos_photos_person",
-        "description": """Get photos containing a specific person from Apple Photos face recognition.
-
-RETURNS:
-- person_id: The requested person's entity ID
-- photos: List of photos with uuid, timestamp, source_link
-- count: Total number of photos
-
-PARAMETERS:
-- person_id (required): entity_id from lifeos_people_search
-- limit: Max photos to return (default: 50)
-
-REQUIRES: entity_id from lifeos_people_search.
-
-Use for 'show me photos of X' or 'find pictures with Y'.""",
+        "description": "Photos of a person (Apple Photos face recognition). Requires entity_id. Use for 'show me photos of X'.",
         "method": "GET"
     },
     "/api/photos/shared/{person_a_id}/{person_b_id}": {
         "name": "lifeos_photos_shared",
-        "description": """Get photos where two people appear together (co-appearances).
-
-RETURNS:
-- person_a_id, person_b_id: The two people
-- shared_photo_count: Total photos together
-- photos: List of photos with uuid, timestamp, source_link
-
-PARAMETERS:
-- person_a_id (required): First person's entity_id
-- person_b_id (required): Second person's entity_id
-- limit: Max photos to return (default: 20)
-
-Use for 'photos of me with X' or 'pictures of X and Y together'.
-
-WORKFLOW: lifeos_people_search for both people → get entity_ids → lifeos_photos_shared""",
+        "description": "Photos where two people appear together. Required: person_a_id + person_b_id (entity_ids). Use for 'pictures of X and Y together'.",
         "method": "GET"
     },
     "/api/photos/stats": {
         "name": "lifeos_photos_stats",
-        "description": """Get statistics about Apple Photos library face recognition data.
-
-RETURNS:
-- total_named_people: People recognized in Photos
-- people_with_contacts: People linked to Apple Contacts
-- total_face_detections: Total face appearances
-- multi_person_photos: Photos with 2+ named people
-- photos_enabled: Whether Photos integration is available
-
-Use to check Photos integration status or get overview of photo data.""",
+        "description": "Apple Photos face-recognition stats: named_people, face_detections, multi_person_photos, integration status.",
         "method": "GET"
     },
     "/api/reminders:POST": {
         "name": "lifeos_reminder_create",
-        "description": """Create a scheduled reminder that sends messages via Telegram.
-
-Three message types:
-- static: Sends message_content as-is (e.g., "Time for your evening review")
-- prompt: Runs message_content through the full LifeOS chat pipeline (calendar, email, vault, Claude synthesis) and sends the result. This is the powerful one for automated briefings.
-- endpoint: Calls a LifeOS API endpoint directly and sends formatted result (lighter weight, no Claude cost)
-
-Schedule types:
-- once: Fire once at schedule_value (ISO datetime, e.g., "2026-02-07T14:00:00")
-- cron: Recurring via cron expression (e.g., "30 7 * * 1-5" for 7:30 AM weekdays)
-
-Example morning briefing:
-  name="Morning Briefing", schedule_type="cron", schedule_value="30 7 * * 1-5",
-  message_type="prompt", message_content="Summarize my meetings today and suggest top 3 priorities"
-""",
+        "description": "Schedule a Telegram reminder. schedule_type=once|cron; message_type=static|prompt|endpoint (prompt runs full LifeOS pipeline).",
         "method": "POST",
         "path": "/api/reminders"
     },
@@ -340,19 +189,7 @@ Example morning briefing:
     },
     "/api/reminders/{reminder_id}:PUT": {
         "name": "lifeos_reminder_update",
-        "description": """Update an existing reminder's schedule, message, or other properties. Use lifeos_reminder_list to find reminder IDs. Only provided fields are changed.
-
-PARAMETERS:
-- reminder_id (required): Reminder ID from lifeos_reminder_list
-- name: Display name
-- schedule_type: 'once' or 'cron'
-- schedule_value: ISO datetime for 'once', cron expression for 'cron'
-- message_type: 'static', 'prompt', or 'endpoint'
-- message_content: The message text or prompt
-- timezone: IANA timezone (e.g., 'America/New_York')
-- enabled: Whether the reminder is active
-
-FOLLOW-UP TOOLS: Use lifeos_reminder_list to verify the update.""",
+        "description": "Update a reminder by reminder_id (from lifeos_reminder_list). Only provided fields change.",
         "method": "PUT",
         "path": "/api/reminders/{reminder_id}"
     },
@@ -369,12 +206,7 @@ FOLLOW-UP TOOLS: Use lifeos_reminder_list to verify the update.""",
     },
     "/api/admin/sync:POST": {
         "name": "lifeos_sync_trigger",
-        "description": """Trigger a data sync for a specific source. Returns immediately — sync runs in background.
-
-PARAMETERS:
-- source (required): vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, or linkedin
-
-FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
+        "description": "Trigger a background data sync. source: vault, calendar, contacts, slack, photos, gmail, imessage, phone, facetime, linkedin.",
         "method": "POST",
         "path": "/api/admin/sync",
         "custom_handler": True
@@ -401,7 +233,7 @@ FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
     },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
-        "description": "Create a task in LifeOS. Tasks are stored as Obsidian-compatible markdown in LifeOS/Tasks/{Context}.md. Supports contexts (Work, Personal, Finance, etc.), priority (high/medium/low), due dates, and tags.",
+        "description": "Create a task (Obsidian markdown). Supports context, priority, due_date, tags. With dry_run=true + #agent tag, returns preflight routing + cost estimate instead of creating.",
         "method": "POST",
         "path": "/api/tasks"
     },
@@ -431,13 +263,13 @@ FOLLOW-UP TOOLS: Use lifeos_health to check sync status.""",
     },
     "/api/calendar/events:POST": {
         "name": "lifeos_calendar_create",
-        "description": "Create a Google Calendar event. Provide title, start_time (ISO datetime), end_time (ISO datetime). Optional: attendees (email list), description, location, account (personal/work). Invite emails are automatically sent to attendees. [CLARIFY] before creating events with attendees.",
+        "description": "Create a Google Calendar event. Required: title, start_time, end_time (ISO). Optional: attendees, description, location, account. Invites are auto-sent. [CLARIFY] before adding attendees.",
         "method": "POST",
         "path": "/api/calendar/events"
     },
     "/api/calendar/events/{event_id}:PUT": {
         "name": "lifeos_calendar_update",
-        "description": "Update an existing calendar event. Requires event_id from lifeos_calendar_search. Only provided fields are changed. Optional: title, start_time, end_time, attendees, description, location, account. Update emails are sent to attendees. [CLARIFY] before updating events.",
+        "description": "Update a calendar event by event_id (from lifeos_calendar_search). Only provided fields change. Update emails are sent. [CLARIFY] first.",
         "method": "PUT",
         "path": "/api/calendar/events/{event_id}"
     },
@@ -457,6 +289,16 @@ class LifeOSMCPServer:
         self.client = httpx.Client(timeout=30.0)
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
+        # Per-session tool-result cache (#139 §4). Bypassed when the caller
+        # doesn't supply a session id (which is the common case for local-CLI
+        # tool calls; cache hits matter most on managed-agent HTTP calls).
+        try:
+            from api.services.agent_worker.tool_result_cache import (
+                SessionToolResultCache,
+            )
+            self._result_cache = SessionToolResultCache()
+        except Exception:  # pragma: no cover — keep server bootable without agent worker
+            self._result_cache = None
         self._load_openapi_spec()
         self._register_inter_agent_tools()
 
@@ -905,7 +747,8 @@ class LifeOSMCPServer:
                     "priority": {"type": "string", "description": "Priority: high, medium, low"},
                     "due_date": {"type": "string", "description": "Due date in YYYY-MM-DD format"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
-                    "reminder_id": {"type": "string", "description": "Linked reminder ID"}
+                    "reminder_id": {"type": "string", "description": "Linked reminder ID"},
+                    "dry_run": {"type": "boolean", "description": "When true with an #agent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
                 "required": ["description"]
             },
@@ -1093,8 +936,32 @@ class LifeOSMCPServer:
         except httpx.RequestError as e:
             return {"error": f"Request failed: {e}"}
 
-    def _call_api(self, tool_name: str, arguments: dict) -> dict:
-        """Call the LifeOS API based on tool name and arguments."""
+    @staticmethod
+    def _cache_eligible(tool_name: str) -> bool:
+        """Tools whose results are safe to cache for 60s within a session.
+
+        Only GET-shaped tools (read-only). Writes (drafts, calendar events,
+        tasks, memories), inter-agent dispatch, and the sync trigger are
+        excluded — they're either idempotent in the wrong direction or
+        sensitive to fresh state.
+        """
+        cfg = next(
+            (c for c in CURATED_ENDPOINTS.values() if c.get("name") == tool_name),
+            None,
+        )
+        if cfg is None:
+            return False
+        return cfg.get("method", "").upper() == "GET"
+
+    def _call_api(self, tool_name: str, arguments: dict, session_id: str | None = None) -> dict:
+        """Call the LifeOS API based on tool name and arguments.
+
+        `session_id` (optional) enables the per-session result cache (#139 §4):
+        when supplied, identical GET-style tool calls within the same session
+        are served from a 60s LRU instead of round-tripping to the API. Writes
+        (POST/PUT/DELETE) are never cached. The cache also skips inter-agent
+        tools and the sync trigger (both sensitive to fresh state).
+        """
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
@@ -1105,6 +972,13 @@ class LifeOSMCPServer:
         # managed agents pass it explicitly per the system prompt.
         if tool_name.startswith("lifeos_agent_"):
             return self._handle_inter_agent(tool_name, dict(arguments))
+
+        # Cache check for read-only tools when the caller is session-aware.
+        cache_key_args = arguments
+        if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
+            cached = self._result_cache.get(session_id, tool_name, cache_key_args)
+            if cached is not None:
+                return cached
 
         # Find the endpoint config
         endpoint_config = None
@@ -1152,6 +1026,10 @@ class LifeOSMCPServer:
                         body = self._fetch_email_body(msg["message_id"], account)
                         if body:
                             msg["body"] = body
+
+            # Store in the per-session cache for read-only tools (#139 §4).
+            if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
+                self._result_cache.put(session_id, tool_name, cache_key_args, result)
 
             return result
         except httpx.HTTPStatusError as e:

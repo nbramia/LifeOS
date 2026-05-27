@@ -18,7 +18,6 @@ Run categories:
 - pytest -n auto              # Parallel execution (requires pytest-xdist)
 """
 import gc
-import os
 
 import pytest
 
@@ -32,6 +31,79 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "requires_ollama: Requires Ollama running")
     config.addinivalue_line("markers", "requires_server: Requires API server running")
     config.addinivalue_line("markers", "requires_db: Requires direct database access (may conflict with running server)")
+    config.addinivalue_line(
+        "markers",
+        "allow_anthropic_api: Test is explicitly allowed to hit api.anthropic.com "
+        "(used for the canary test that verifies the ban itself works).",
+    )
+    _install_anthropic_request_guard()
+
+
+# ---------------------------------------------------------------------------
+# Anthropic API call guard (#138)
+#
+# Bleeds happen when a test forgets to mock the LLM client and silently makes
+# a real billed call. Guard installs a process-wide httpx transport hook that
+# raises if any test attempts a request to api.anthropic.com (or the platform
+# console). Tests can opt in to a real call with @pytest.mark.allow_anthropic_api
+# — used for the deliberate canary that confirms the guard fires.
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_HOSTS = ("api.anthropic.com", "platform.claude.com")
+_anthropic_guard_active = False
+
+
+def _install_anthropic_request_guard() -> None:
+    """Patch httpx so any request to Anthropic's API hosts raises during
+    pytest collection. The patch is installed once and stays active for the
+    full pytest run. Tests carrying `@pytest.mark.allow_anthropic_api`
+    bypass the check.
+    """
+    global _anthropic_guard_active
+    if _anthropic_guard_active:
+        return
+    import httpx
+
+    original_send = httpx.Client.send
+    original_async_send = httpx.AsyncClient.send
+
+    def _is_allowed() -> bool:
+        # Read the current test's request fixture indirectly via the pytest
+        # node-tracking attribute set by `pytest_runtest_setup`.
+        node = getattr(_install_anthropic_request_guard, "_current_node", None)
+        if node is None:
+            return False
+        return node.get_closest_marker("allow_anthropic_api") is not None
+
+    def _guard(request):
+        host = (request.url.host or "").lower()
+        for blocked in _ANTHROPIC_HOSTS:
+            if host == blocked or host.endswith("." + blocked):
+                if _is_allowed():
+                    return
+                raise RuntimeError(
+                    f"Test attempted a real Anthropic API call to {request.url}. "
+                    "Mock the LLM client (httpx.MockTransport, AsyncMock, etc.) "
+                    "or mark the test @pytest.mark.allow_anthropic_api if a "
+                    "real call is intended."
+                )
+
+    def patched_send(self, request, *args, **kwargs):
+        _guard(request)
+        return original_send(self, request, *args, **kwargs)
+
+    async def patched_async_send(self, request, *args, **kwargs):
+        _guard(request)
+        return await original_async_send(self, request, *args, **kwargs)
+
+    httpx.Client.send = patched_send
+    httpx.AsyncClient.send = patched_async_send
+    _anthropic_guard_active = True
+
+
+def pytest_runtest_setup(item):
+    """Hand the active test item to the guard so it can check markers."""
+    _install_anthropic_request_guard._current_node = item
 
 
 @pytest.fixture(scope="session")
@@ -199,6 +271,7 @@ def pytest_runtest_teardown(item, nextitem):
     ChromaDB clients) can push memory to 100%. This hook cleans up after
     each test to keep memory usage bounded.
     """
+    _install_anthropic_request_guard._current_node = None
     gc.collect()
 
 

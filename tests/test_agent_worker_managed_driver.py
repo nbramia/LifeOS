@@ -605,6 +605,47 @@ def test_kill_session_swallows_errors():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+def test_update_session_sends_post_with_agent_payload():
+    """`update_session` POSTs the agent config under `agent` to the session
+    URL — full-replacement semantics per the Managed Agents docs."""
+    captured = {}
+
+    def handler(request):
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "sess_1"})
+
+    driver = _build_driver(handler)
+    driver.update_session("sess_1", {"tools": ["lifeos_search", "lifeos_ask"]})
+
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/sessions/sess_1")
+    assert captured["body"] == {
+        "agent": {"tools": ["lifeos_search", "lifeos_ask"]}
+    }
+
+
+@pytest.mark.unit
+def test_update_session_4xx_surfaces_response_body(caplog):
+    """A 4xx response logs the body so beta-API schema mismatches are
+    visible rather than swallowed."""
+    def handler(request):
+        return httpx.Response(
+            400, json={"error": "tools[3] is not a valid identifier"}
+        )
+
+    driver = _build_driver(handler)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            driver.update_session("sess_1", {"tools": ["bogus tool"]})
+    body_logged = any(
+        "not a valid identifier" in rec.getMessage() for rec in caplog.records
+    )
+    assert body_logged, "expected 4xx body to be surfaced in WARNING logs"
+
+
+@pytest.mark.unit
 def test_managed_session_cost_includes_overhead():
     cost = managed_session_cost("claude-opus-4-7", 1000, 1000, wall_seconds=3600)
     # 1k input ($0.015) + 1k output ($0.075) + 1 hr * $0.08
@@ -617,3 +658,61 @@ def test_managed_session_cost_partial_hour():
     # 30 minutes of session-hour overhead.
     cost = managed_session_cost("local", 0, 0, wall_seconds=1800)
     assert cost == pytest.approx(0.5 * MANAGED_SESSION_HOUR_OVERHEAD)
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache token buckets (#137)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_session_state_parses_cache_creation_and_cache_read_tokens():
+    """The four-bucket usage payload from the live API must flow through
+    `get_session_state` into the materialized `ManagedSessionState`."""
+    handler = _make_session_handler(
+        status_body={
+            "status": "running",
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 81,
+                "cache_creation_input_tokens": 109_075,
+                "cache_read_input_tokens": 2_000,
+            },
+        },
+        events=[],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.total_input_tokens == 3
+    assert state.total_output_tokens == 81
+    assert state.total_cache_creation_tokens == 109_075
+    assert state.total_cache_read_tokens == 2_000
+
+
+@pytest.mark.unit
+def test_session_state_defaults_cache_buckets_to_zero_when_absent():
+    """Older API responses omit the cache buckets — should default to zero."""
+    handler = _make_session_handler(
+        status_body={"status": "running", "usage": {"input_tokens": 5, "output_tokens": 7}},
+        events=[],
+    )
+    state = _build_driver(handler).get_session_state("sess")
+    assert state.total_cache_creation_tokens == 0
+    assert state.total_cache_read_tokens == 0
+
+
+@pytest.mark.unit
+def test_managed_session_cost_includes_cache_buckets():
+    """cache_creation tokens are 1.25× input rate; cache_read is 0.10× input."""
+    # 100k cache_creation at Sonnet ($3/M input × 1.25) = $0.375
+    # 50k cache_read at Sonnet ($3/M input × 0.10) = $0.015
+    # 1000 input + 1000 output = $0.003 + $0.015 = $0.018
+    # No wall time → no overhead.
+    cost = managed_session_cost(
+        "claude-sonnet-4-6",
+        tokens_in=1000,
+        tokens_out=1000,
+        wall_seconds=0,
+        cache_creation_tokens=100_000,
+        cache_read_tokens=50_000,
+    )
+    expected = 0.018 + 0.375 + 0.015
+    assert cost == pytest.approx(expected)

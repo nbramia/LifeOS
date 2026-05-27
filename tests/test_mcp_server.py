@@ -9,10 +9,8 @@ These tests verify that:
 Run with: pytest tests/test_mcp_server.py -v
 Requires: LifeOS API running on localhost:8000
 """
-import json
 import pytest
 import httpx
-import subprocess
 import sys
 from pathlib import Path
 
@@ -254,7 +252,6 @@ class TestAPIOpenAPISync:
         spec.loader.exec_module(module)
 
         server = module.LifeOSMCPServer()
-        schemas = openapi_spec.get("components", {}).get("schemas", {})
 
         # Check that lifeos_ask has question field
         ask_tool = next((t for t in server.tools if t["name"] == "lifeos_ask"), None)
@@ -267,3 +264,128 @@ class TestAPIOpenAPISync:
         if search_tool:
             props = search_tool["inputSchema"].get("properties", {})
             assert "query" in props, "lifeos_search missing 'query' property"
+
+
+# ---------------------------------------------------------------------------
+# Tool description sizing (#139 §1) — keep cache_creation cheap.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_curated_endpoint_descriptions_average_under_30_words():
+    """Every tool description ships into the MCP system prompt, contributing
+    to cache_creation cost on every fresh managed session. Keep the average
+    under 30 words; no single description over 30 words.
+
+    Run `python -c "from mcp_server import CURATED_ENDPOINTS; ..."` to
+    measure manually."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    descriptions = [
+        cfg["description"] for cfg in module.CURATED_ENDPOINTS.values()
+    ]
+    word_counts = [len(d.split()) for d in descriptions]
+    avg = sum(word_counts) / len(word_counts)
+    over_threshold = [
+        (cfg["name"], len(cfg["description"].split()))
+        for cfg in module.CURATED_ENDPOINTS.values()
+        if len(cfg["description"].split()) > 30
+    ]
+    assert avg <= 30, f"avg description word count too high: {avg:.1f}"
+    assert not over_threshold, (
+        f"tools with >30-word description: {over_threshold}. "
+        "Trim them — every word lands in cache_creation."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-session tool result cache integration (#139 §4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_call_api_caches_get_results_per_session():
+    """Identical GET-shaped calls within the same session hit the cache:
+    the second call MUST NOT round-trip to the API."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.LifeOSMCPServer()
+    # Replace the httpx client with a mock so we can count call counts.
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"events": [{"title": "standup"}]}
+    fake_response.raise_for_status = MagicMock()
+    fake.get.return_value = fake_response
+    server.client = fake
+
+    # First call: round-trips.
+    r1 = server._call_api(
+        "lifeos_calendar_upcoming", {"days": 7}, session_id="sess_X"
+    )
+    # Second call: should hit the cache, not the HTTP client.
+    r2 = server._call_api(
+        "lifeos_calendar_upcoming", {"days": 7}, session_id="sess_X"
+    )
+    assert r1 == r2
+    assert fake.get.call_count == 1, "expected exactly one HTTP call (second served from cache)"
+
+
+@pytest.mark.unit
+def test_call_api_does_not_cache_writes():
+    """POST/PUT/DELETE tools are never cached."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.LifeOSMCPServer()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"id": "draft_1"}
+    fake_response.raise_for_status = MagicMock()
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    server._call_api(
+        "lifeos_gmail_draft",
+        {"to": "x@y", "subject": "hi", "body": "ok"},
+        session_id="sess_X",
+    )
+    server._call_api(
+        "lifeos_gmail_draft",
+        {"to": "x@y", "subject": "hi", "body": "ok"},
+        session_id="sess_X",
+    )
+    # Both calls hit the API — POST is never cached.
+    assert fake.post.call_count == 2
+
+
+@pytest.mark.unit
+def test_call_api_skips_cache_when_session_id_missing():
+    """Without a session_id (e.g., local CLI use), the cache is bypassed."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.LifeOSMCPServer()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"events": []}
+    fake_response.raise_for_status = MagicMock()
+    fake.get.return_value = fake_response
+    server.client = fake
+
+    server._call_api("lifeos_calendar_upcoming", {"days": 7})
+    server._call_api("lifeos_calendar_upcoming", {"days": 7})
+    # Both calls round-trip — no session, no cache.
+    assert fake.get.call_count == 2

@@ -34,6 +34,15 @@ ROUTE_ASK = "ask"
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 
+# Per-task model identifiers emitted by preflight. The cloud routing case
+# defaults to Sonnet for general work; Haiku is selected by tag override (or
+# in future by smart routing — see #139 §2 rubric). "local" maps to the
+# local Gemma backend. None means "no override, use settings.agent_managed_model".
+MODEL_LOCAL = "local"
+MODEL_HAIKU = "claude-haiku-4-5"
+MODEL_SONNET = "claude-sonnet-4-6"
+ALLOWED_MODELS = (MODEL_LOCAL, MODEL_HAIKU, MODEL_SONNET)
+
 
 @dataclass
 class PreflightBudget:
@@ -56,6 +65,29 @@ class PreflightResult:
     ambiguity: PreflightAmbiguity | None = None
     sane: bool = True
     sane_reason: str = ""
+    # Per-task model selection (#139 §2). For cloud routes, defaults to
+    # MODEL_SONNET; can be overridden to MODEL_HAIKU by the `#cloud-haiku`
+    # tag (or to MODEL_SONNET by `#cloud-sonnet`). For local routes, set
+    # to MODEL_LOCAL. The worker uses this for client-side cost accounting;
+    # actual remote-model selection still requires the agent preset to
+    # match (section 3 territory).
+    model: str | None = None
+    # Preset class for per-session tool filtering (#139 §3). When set, the
+    # managed executor will call driver.update_session() with the class's
+    # filtered tool list (via tool_filter.class_to_tool_filter) between
+    # session create and the first user message — scoping cache_creation
+    # to the smaller tool set. Currently picked from tag overrides only;
+    # LLM-side preflight emission is a follow-up.
+    preset_class: str | None = None
+    # Cache-cold cost estimate for this dispatch (#139 §6). Computed from
+    # the per-class cache_creation token estimate + the model's input rate.
+    # Used to refuse dispatch when even the cache-cold cost would exceed
+    # 2× max_dollars (refuse only when the cheap path can't fit either).
+    estimated_cost_dollars: float = 0.0
+    # When True, the orchestrator should surface a confirmation prompt to
+    # the operator before dispatching (#139 §7). Driven by
+    # settings.agent_cost_confirm_threshold_dollars.
+    needs_cost_confirmation: bool = False
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -227,6 +259,161 @@ def _default_llm_caller(prompt: str) -> str:
     return response.text
 
 
+def _normalize_tag(tag: str) -> str:
+    """Strip leading `#` and lowercase, so callers can pass either form."""
+    return tag.lstrip("#").lower()
+
+
+# Preset-class tag → class name. Mirrors tool_filter.ALL_PRESET_CLASSES so
+# operators can force a class with `#research`, `#crm`, etc. Kept here as
+# a local map instead of an import so preflight stays decoupled from the
+# tool_filter implementation; the names are the contract.
+_PRESET_CLASS_TAGS = {
+    "personal-comm": "personal-comm",
+    "work-comm": "work-comm",
+    "research": "research",
+    "financial": "financial",
+    "crm": "crm",
+    "fullstack": "fullstack",
+}
+
+
+def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
+    """Return the preset_class implied by a `#<class>` tag, or None.
+
+    First match wins in the tag list order to give operators a predictable
+    override when multiple class tags slip in by mistake.
+    """
+    for raw in tags or []:
+        normalized = _normalize_tag(raw)
+        if normalized in _PRESET_CLASS_TAGS:
+            return _PRESET_CLASS_TAGS[normalized]
+    return None
+
+
+def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightResult:
+    """Apply tag-based routing/model overrides (#139 §2 precedence).
+
+    Tag precedence (a tag always wins over preflight's LLM choice):
+      `#local`        → routing=local, model=local
+      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
+      `#cloud-sonnet` → routing=claude, model=claude-sonnet-4-6
+      `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
+
+    Returns a new PreflightResult so the caller can chain. Tag list is
+    normalized case-insensitively with optional leading `#`.
+    """
+    normalized = {_normalize_tag(t) for t in (tags or [])}
+    if "local" in normalized:
+        result.routing = ROUTE_LOCAL
+        result.routing_reason = "#local tag present"
+        result.model = MODEL_LOCAL
+        return result
+    if "cloud-haiku" in normalized:
+        result.routing = ROUTE_CLAUDE
+        result.routing_reason = "#cloud-haiku tag present"
+        result.model = MODEL_HAIKU
+        return result
+    if "cloud-sonnet" in normalized:
+        result.routing = ROUTE_CLAUDE
+        result.routing_reason = "#cloud-sonnet tag present"
+        result.model = MODEL_SONNET
+        return result
+    if "cloud" in normalized:
+        result.routing = ROUTE_CLAUDE
+        if not result.routing_reason:
+            result.routing_reason = "#cloud tag present"
+        if result.model not in ALLOWED_MODELS:
+            result.model = MODEL_SONNET
+        return result
+    # No override — pick a sensible default model for the routing.
+    if result.model not in ALLOWED_MODELS:
+        if result.routing == ROUTE_CLAUDE:
+            result.model = MODEL_SONNET
+        elif result.routing == ROUTE_LOCAL:
+            result.model = MODEL_LOCAL
+        # ROUTE_ASK leaves model=None — the worker will set it after the
+        # operator answers.
+    return result
+
+
+def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightResult:
+    """Set `result.preset_class` from an explicit `#<class>` tag if present.
+
+    LLM-side preset_class emission is a follow-up; this lets operators
+    force a class today via tag while the rest of #139 §3 wiring lands.
+    """
+    if result.preset_class:  # honor an LLM/caller pre-set value
+        return result
+    forced = _detect_preset_class_from_tags(tags)
+    if forced:
+        result.preset_class = forced
+    return result
+
+
+def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
+    """Compute the cache-cold cost estimate and apply #139 §6 + §7 gates.
+
+    §6 (fail-fast): if the estimated cache-cold dispatch cost exceeds
+    2× the task's `max_dollars`, refuse via `sane=False` with reason
+    `budget_too_small`. The 2× margin (not 1×) keeps cache-warm tasks
+    from being over-refused — when prompt cache is warm the real cost
+    is 0.10× input instead of 1.25× cache_creation, so the cheap path
+    is 12.5× cheaper; refusing only when even the cold path can't fit
+    avoids killing tasks that would have happily run from cache.
+
+    §7 (cost preview): set `needs_cost_confirmation=True` when the
+    estimate exceeds `settings.agent_cost_confirm_threshold_dollars`.
+    Local-routed tasks always set the estimate to 0 and never trigger
+    confirmation.
+    """
+    if result.routing != ROUTE_CLAUDE:
+        result.estimated_cost_dollars = 0.0
+        result.needs_cost_confirmation = False
+        return result
+
+    # Local imports keep preflight cheap to import when cost gating isn't
+    # in play (and avoid a settings-import cycle in some test paths).
+    from api.services.agent_worker.pricing import (
+        CACHE_CREATION_RATE_MULTIPLIER,
+        MANAGED_SESSION_HOUR_OVERHEAD,
+        PRICING,
+    )
+    from api.services.agent_worker.tool_filter import estimated_cache_creation_tokens
+
+    model = result.model or MODEL_SONNET
+    rates = PRICING.get(model) or PRICING["claude-opus-4-7"]
+    cache_tokens = estimated_cache_creation_tokens(result.preset_class)
+    cache_cold_dollars = cache_tokens * rates["input"] * CACHE_CREATION_RATE_MULTIPLIER
+    # Add session-hour overhead as a small floor so estimates align with
+    # `managed_session_cost`'s shape (token cost + overhead).
+    overhead = (result.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
+    result.estimated_cost_dollars = round(cache_cold_dollars + overhead, 4)
+
+    # §6 fail-fast — refuse only when 2× margin can't fit.
+    if (
+        result.budget.max_dollars > 0
+        and result.estimated_cost_dollars > 2.0 * result.budget.max_dollars
+    ):
+        result.sane = False
+        result.sane_reason = (
+            f"budget_too_small: cache-cold estimate ${result.estimated_cost_dollars:.2f} "
+            f"exceeds 2× max_dollars (${result.budget.max_dollars:.2f}). "
+            "Raise the budget or pick a smaller preset_class."
+        )
+
+    # §7 confirm-threshold check. Local import so settings reload in tests works.
+    try:
+        from config.settings import settings as _settings
+        threshold = float(_settings.agent_cost_confirm_threshold_dollars)
+    except Exception:
+        threshold = 1.0
+    if threshold > 0 and result.estimated_cost_dollars > threshold:
+        result.needs_cost_confirmation = True
+
+    return result
+
+
 def run_preflight(
     title: str,
     tags: list[str] | None = None,
@@ -239,16 +426,22 @@ def run_preflight(
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
     if not title.strip():
         defaults = _defaults()
-        return PreflightResult(
-            budget=defaults,
-            routing=ROUTE_ASK,
-            routing_reason="empty title",
-            expected_output="text",
-            ambiguity=None,
-            sane=False,
-            sane_reason="task title is empty",
-            raw={},
-        )
+        return _apply_cost_gates(_apply_preset_class(
+            _apply_tag_overrides(
+                PreflightResult(
+                    budget=defaults,
+                    routing=ROUTE_ASK,
+                    routing_reason="empty title",
+                    expected_output="text",
+                    ambiguity=None,
+                    sane=False,
+                    sane_reason="task title is empty",
+                    raw={},
+                ),
+                tags_list,
+            ),
+            tags_list,
+        ))
 
     call = caller or _default_llm_caller
     prompt = build_preflight_prompt(title, tags_list)
@@ -257,15 +450,24 @@ def run_preflight(
     except Exception as exc:
         logger.warning("preflight LLM call failed: %s", exc)
         defaults = _defaults()
-        return PreflightResult(
-            budget=defaults,
-            routing=ROUTE_ASK,
-            routing_reason="preflight LLM call failed",
-            expected_output="text",
-            ambiguity=None,
-            sane=False,
-            sane_reason=f"preflight error: {exc}",
-            raw={},
-        )
+        return _apply_cost_gates(_apply_preset_class(
+            _apply_tag_overrides(
+                PreflightResult(
+                    budget=defaults,
+                    routing=ROUTE_ASK,
+                    routing_reason="preflight LLM call failed",
+                    expected_output="text",
+                    ambiguity=None,
+                    sane=False,
+                    sane_reason=f"preflight error: {exc}",
+                    raw={},
+                ),
+                tags_list,
+            ),
+            tags_list,
+        ))
 
-    return parse_preflight_response(reply)
+    return _apply_cost_gates(_apply_preset_class(
+        _apply_tag_overrides(parse_preflight_response(reply), tags_list),
+        tags_list,
+    ))

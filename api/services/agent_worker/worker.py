@@ -70,6 +70,28 @@ def _worker_label(routing: str | None) -> str:
     return "Agent worker"
 
 
+def _format_token_buckets(
+    tokens_in: int,
+    cache_creation: int,
+    cache_read: int,
+    tokens_out: int,
+) -> str:
+    """Render the four token buckets for the completion message.
+
+    Cache buckets are only included when non-zero so local-path completions
+    (which never write or read the prompt cache) collapse to the original
+    "N tokens" form. Managed cloud sessions always have at least
+    cache_creation populated on first turn.
+    """
+    parts: list[str] = [f"{tokens_in:,} input"]
+    if cache_creation:
+        parts.append(f"{cache_creation:,} cached-write")
+    if cache_read:
+        parts.append(f"{cache_read:,} cached-read")
+    parts.append(f"{tokens_out:,} output")
+    return " + ".join(parts)
+
+
 def _is_readable_tool_result(text: str) -> bool:
     """Heuristic: is this tool result useful to dump inline as the
     operator-facing completion body? Skip raw JSON dumps (list_threads,
@@ -955,7 +977,11 @@ class Worker:
             agent_id=agent_id,
             environment_id=environment_id,
             vault_ids=vault_ids,
-            model=settings.agent_managed_model,
+            # Dev iteration may set LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS to a
+            # cheaper model (e.g. Haiku) so the executor's client-side cost
+            # accounting matches the model the operator is actually charged
+            # for during prompt-engineering runs.
+            model=settings.agent_managed_model_for_tests or settings.agent_managed_model,
         )
         return self._managed_executor
 
@@ -1017,6 +1043,7 @@ class Worker:
             routing=pre.routing,
             budget=budget_json,
             expected_output=pre.expected_output,
+            preset_class=pre.preset_class,
         )
         session = self.session_store.get(task_id)  # refresh
 
@@ -1179,13 +1206,21 @@ class Worker:
 
     def _completion_summary(self, session: Session, task: dict[str, Any], outcome) -> str:
         refreshed = self.session_store.get(session.task_id) or session
-        tokens = (refreshed.total_input_tokens or 0) + (refreshed.total_output_tokens or 0)
         # Use active seconds (excludes sleeps) so the figure reflects real
         # work, not wall time since the session was first created.
         active_s = int(refreshed.total_active_seconds or 0)
         expected = refreshed.expected_output or "text"
         title = task.get("description", session.task_id)
         label = _worker_label(refreshed.routing or session.routing)
+        # Four-bucket token breakdown so the operator can see what drove cost.
+        # For local sessions cache buckets are always zero and collapse out of
+        # the rendered string.
+        tokens_summary = _format_token_buckets(
+            refreshed.total_input_tokens or 0,
+            refreshed.total_cache_creation_tokens or 0,
+            refreshed.total_cache_read_tokens or 0,
+            refreshed.total_output_tokens or 0,
+        )
 
         # Body: prefer the agent's final text. When it's empty (the agent
         # used a tool and idled without summarizing — sometimes happens with
@@ -1250,7 +1285,7 @@ class Worker:
 
         return (
             f"✅ {label}: completed '{title}' "
-            f"({expected}) — {tokens:,} tokens, ${refreshed.total_dollars:.2f}, "
+            f"({expected}) — {tokens_summary}, ${refreshed.total_dollars:.2f}, "
             f"{active_s}s active.\n\n{result_blurb}{footer}"
         )
 
@@ -1375,7 +1410,12 @@ class Worker:
         parts.append("")
         parts.append("Children:")
         for c in child_sessions:
-            tokens = (c.total_input_tokens or 0) + (c.total_output_tokens or 0)
+            tokens = (
+                (c.total_input_tokens or 0)
+                + (c.total_output_tokens or 0)
+                + (c.total_cache_creation_tokens or 0)
+                + (c.total_cache_read_tokens or 0)
+            )
             header = f"- [{c.status}] {c.session_id} — {tokens} tokens, ${c.total_dollars:.4f}"
             parts.append(header)
             body = self._child_final_text(c)

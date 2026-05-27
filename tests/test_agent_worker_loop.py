@@ -439,6 +439,61 @@ def test_completion_summary_uses_transcript_pointer_when_final_text_empty(tmp_pa
 
 
 @pytest.mark.unit
+def test_format_token_buckets_collapses_when_cache_is_zero():
+    """Local-path sessions never hit the prompt cache — the rendered string
+    should collapse to the original `N input + M output` shape."""
+    from api.services.agent_worker.worker import _format_token_buckets
+    assert _format_token_buckets(100, 0, 0, 50) == "100 input + 50 output"
+
+
+@pytest.mark.unit
+def test_format_token_buckets_includes_cache_creation_and_read_when_nonzero():
+    """Cloud sessions surface all four buckets so the operator can see what
+    drove cost (cache_creation typically dominates first-turn spend)."""
+    from api.services.agent_worker.worker import _format_token_buckets
+    rendered = _format_token_buckets(3, 109_075, 2_000, 81)
+    assert "3 input" in rendered
+    assert "109,075 cached-write" in rendered
+    assert "2,000 cached-read" in rendered
+    assert "81 output" in rendered
+
+
+@pytest.mark.unit
+def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
+    """When a managed session populated all four token buckets, the operator-
+    facing Telegram message must surface them — that's the visible signal
+    that #137 actually landed."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "draft email", "status": "todo",
+         "tags": ["agent", "cloud"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="Drafted.",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=executor)
+    w.tick()
+    # Inject realistic four-bucket token totals via record_spend, then
+    # re-render the summary directly using the refreshed row.
+    w.session_store.record_spend(
+        "t1",
+        tokens_in=3,
+        tokens_out=81,
+        dollars=0.42,
+        cache_creation_tokens=109_075,
+        cache_read_tokens=2_000,
+    )
+    refreshed = w.session_store.get("t1")
+    msg = w._completion_summary(refreshed, {"id": "t1", "description": "draft email"},
+                                executor.outcome)
+    assert "3 input" in msg
+    assert "109,075 cached-write" in msg
+    assert "2,000 cached-read" in msg
+    assert "81 output" in msg
+
+
+@pytest.mark.unit
 def test_completion_summary_includes_init_failed_mcps_footer(tmp_path: Path):
     """When the managed executor reports MCPs that failed to initialize,
     the completion summary appends a "Note: N MCP server(s) unavailable"
@@ -1011,9 +1066,12 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     vault = tmp_path / "MyVault"
     monkeypatch.setattr(_settings, "vault_path", vault, raising=False)
 
+    # Tag is "local" — not "cloud" — so the deterministic tag precedence
+    # (#139 §2) routes this task to the local executor. The test exercises
+    # the over-cap spillover via _StubExecutor on the local path.
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Big report on Julia",
-         "status": "todo", "tags": ["agent", "cloud"]},
+         "status": "todo", "tags": ["agent", "local"]},
     ])
     long_text = (
         "Julia Barnes is the CEO of The Movement Cooperative.\n\n"
@@ -1022,12 +1080,6 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text=long_text,
     ))
-    w = _make_worker(tmp_path, api,
-                     preflight_caller=_golden_preflight(routing="claude"),
-                     local_executor=executor)  # used for unrelated paths
-    # Force the local path so we can drive the completion through _StubExecutor.
-    # Use routing="local" on the preflight so the worker takes the local branch
-    # while still exercising the cap logic.
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="local"),
                      local_executor=executor)

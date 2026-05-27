@@ -157,6 +157,25 @@ class Settings(BaseSettings):
                     "actual model is whatever the agent preset says; this "
                     "value is just used for client-side token-cost accounting."
     )
+    agent_managed_model_for_tests: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS",
+        description="Optional dev-only override of `agent_managed_model` used "
+                    "when iterating on the cloud agent path. Set to e.g. "
+                    "`claude-haiku-4-5` to swap cost accounting to the cheaper "
+                    "model during iteration. Empty (default) means no override. "
+                    "This only changes client-side dollar accounting; the "
+                    "actual remote model is still the agent preset's setting."
+    )
+    agent_cost_confirm_threshold_dollars: float = Field(
+        default=1.0,
+        alias="LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS",
+        description="When preflight's cost estimate for a managed-agent task "
+                    "exceeds this dollar threshold, the orchestrator must "
+                    "confirm with the operator before dispatching (#139 §7). "
+                    "Set to 0 to disable confirmation (auto-dispatch all "
+                    "managed tasks regardless of estimate)."
+    )
     claude_code_viz_enabled: bool = Field(
         default=True,
         alias="LIFEOS_CLAUDE_CODE_VIZ_ENABLED",

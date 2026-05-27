@@ -66,6 +66,12 @@ class ManagedSessionState:
     new_events: list[dict] = field(default_factory=list)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Anthropic charges two extra token buckets beyond plain input/output —
+    # cache_creation (1.25× input rate) and cache_read (0.10× input rate).
+    # On cache-heavy presets, cache_creation on the first turn can dominate
+    # session cost, so we mirror both buckets from the usage payload.
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
     final_text: str | None = None
     error_reason: str | None = None
     # MCP servers that failed to initialize during this session — informational,
@@ -259,6 +265,8 @@ class ManagedAgentsDriver:
             new_events=events,
             total_input_tokens=int(usage.get("input_tokens", 0)),
             total_output_tokens=int(usage.get("output_tokens", 0)),
+            total_cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0)),
+            total_cache_read_tokens=int(usage.get("cache_read_input_tokens", 0)),
             final_text=final_text,
             error_reason=error_reason,
             init_failed_mcps=init_failed_mcps,
@@ -387,6 +395,31 @@ class ManagedAgentsDriver:
             )
         resp.raise_for_status()
 
+    def update_session(self, session_id: str, agent_payload: dict) -> None:
+        """Replace the session's agent config — used to filter tools per-class.
+
+        Per the Managed Agents docs, `POST /v1/sessions/{id}` accepts an
+        `agent.tools` and `agent.mcp_servers` array (full replacement). The
+        update is session-local — it does not propagate back to the preset
+        and does not persist across sessions. Sessions start `idle`; this
+        call doesn't trigger the agent.
+
+        `agent_payload` is the dict that goes under the `agent` key, e.g.
+        `{"tools": ["lifeos_search", "lifeos_ask", ...]}`. The caller is
+        responsible for shaping the payload (see `tool_filter.class_to_tool_filter`).
+
+        Best-effort: 4xx errors are logged and the response body is surfaced
+        in logs before raising, so a beta-API schema mismatch shows up
+        loudly rather than silently degrading the session.
+        """
+        body = {"agent": agent_payload}
+        resp = self._client.post(
+            f"{self.base_url}/sessions/{session_id}",
+            headers=self._headers(),
+            json=body,
+        )
+        self._raise_for_status_with_body(resp)
+
     def kill_session(self, session_id: str, reason: str = "") -> None:
         """Terminate a session early — used for budget breach / cascade-kill.
 
@@ -509,8 +542,21 @@ def managed_session_cost(
     tokens_in: int,
     tokens_out: int,
     wall_seconds: float,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> float:
-    """Total $ for a managed session: token cost + session-hour overhead."""
-    tokens = cost_for(model, tokens_in, tokens_out)
+    """Total $ for a managed session: token cost + session-hour overhead.
+
+    Cache buckets default to zero so callers that only care about plain
+    token cost (e.g., the local executor's wall-time accounting) don't
+    need to update. Managed sessions should always pass all four buckets.
+    """
+    tokens = cost_for(
+        model,
+        tokens_in,
+        tokens_out,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+    )
     overhead = (wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
     return tokens + overhead

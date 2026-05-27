@@ -53,8 +53,19 @@ class Session:
     expected_output: str | None = None
     parent_session_id: str | None = None
     managed_agent_session_id: str | None = None
+    # Preset class for per-session tool filtering (#139 §3). When set,
+    # ManagedExecutor.start() calls driver.update_session() with the
+    # class's filtered tool list between create and the first user
+    # message — scoping cache_creation to the smaller tool set.
+    preset_class: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Prompt-cache buckets — kept separate from total_input_tokens because
+    # they're billed at different rates (cache_creation = 1.25× input,
+    # cache_read = 0.10× input). On cache-heavy presets cache_creation on the
+    # first turn often dwarfs uncached input.
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
     total_dollars: float = 0.0
     total_active_seconds: float = 0.0
     root_session_id: str | None = None
@@ -73,6 +84,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at          INTEGER NOT NULL,
     total_input_tokens        INTEGER NOT NULL DEFAULT 0,
     total_output_tokens       INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     total_dollars             REAL    NOT NULL DEFAULT 0.0,
     total_active_seconds      REAL    NOT NULL DEFAULT 0.0,
     expected_output           TEXT,
@@ -80,7 +93,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     root_session_id           TEXT,
     spawn_depth               INTEGER NOT NULL DEFAULT 0,
     yield_waiting_for         TEXT,  -- JSON array of session_ids the agent is waiting on
-    managed_agent_session_id  TEXT
+    managed_agent_session_id  TEXT,
+    preset_class              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -174,7 +188,17 @@ CREATE TABLE IF NOT EXISTS managed_cursor (
     task_id                          TEXT PRIMARY KEY,
     last_event_id                    TEXT,
     accrued_session_hour_dollars     REAL NOT NULL DEFAULT 0.0,
-    final_text                       TEXT
+    final_text                       TEXT,
+    -- Runaway detection counters (#139 Section 5). Persisted so cross-poll
+    -- signals survive worker restarts mid-session.
+    -- `tool_loop_signature` is the (tool_name, sorted_args_json) of the most
+    -- recent tool call; `tool_loop_count` is how many consecutive times that
+    -- exact signature has fired with no intervening *different* tool. A
+    -- different tool resets the count. `tool_calls_since_message` increments
+    -- on each tool_use and resets to 0 on each agent.message.
+    tool_loop_signature              TEXT,
+    tool_loop_count                  INTEGER NOT NULL DEFAULT 0,
+    tool_calls_since_message         INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -222,6 +246,42 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE pending_questions ADD COLUMN kind TEXT "
                     "NOT NULL DEFAULT 'clarification'"
+                )
+            # Idempotent migration for the prompt-cache token buckets on
+            # `sessions`. Old rows stay at zero — we don't backfill historical
+            # sessions, the raw event payloads in transcripts still have the
+            # data if anyone ever wants to recompute.
+            sess_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "total_cache_creation_tokens" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN total_cache_creation_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "total_cache_read_tokens" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN total_cache_read_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            # Idempotent migration for the per-session preset_class column
+            # (#139 §3 worker wiring). Old rows stay NULL → fullstack.
+            if "preset_class" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN preset_class TEXT"
+                )
+            # Idempotent migrations for the runaway detection counters on
+            # managed_cursor (#139 Section 5).
+            mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
+            if "tool_loop_signature" not in mc_cols:
+                conn.execute("ALTER TABLE managed_cursor ADD COLUMN tool_loop_signature TEXT")
+            if "tool_loop_count" not in mc_cols:
+                conn.execute(
+                    "ALTER TABLE managed_cursor ADD COLUMN tool_loop_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "tool_calls_since_message" not in mc_cols:
+                conn.execute(
+                    "ALTER TABLE managed_cursor ADD COLUMN tool_calls_since_message "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
 
     # ------------------------------------------------------------------
@@ -343,19 +403,22 @@ class SessionStore:
         routing: str | None,
         budget: dict | None,
         expected_output: str | None = None,
+        preset_class: str | None = None,
     ) -> None:
-        """Update routing decision and budget after the preflight call."""
+        """Update routing, budget, expected_output, and preset_class after preflight."""
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET routing = ?, budget_json = ?, expected_output = ?, last_activity_at = ?
+                SET routing = ?, budget_json = ?, expected_output = ?,
+                    preset_class = ?, last_activity_at = ?
                 WHERE task_id = ?
                 """,
                 (
                     routing,
                     json.dumps(budget) if budget else None,
                     expected_output,
+                    preset_class,
                     _now(),
                     task_id,
                 ),
@@ -367,19 +430,36 @@ class SessionStore:
         tokens_in: int,
         tokens_out: int,
         dollars: float,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> None:
-        """Add to a session's cumulative token + dollar counters."""
+        """Add to a session's cumulative token + dollar counters.
+
+        Cache buckets default to zero so the local executor (which only
+        sees plain input/output) doesn't need to update; managed sessions
+        always pass all four buckets.
+        """
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET total_input_tokens  = total_input_tokens  + ?,
-                    total_output_tokens = total_output_tokens + ?,
-                    total_dollars       = total_dollars       + ?,
-                    last_activity_at    = ?
+                SET total_input_tokens          = total_input_tokens          + ?,
+                    total_output_tokens         = total_output_tokens         + ?,
+                    total_cache_creation_tokens = total_cache_creation_tokens + ?,
+                    total_cache_read_tokens     = total_cache_read_tokens     + ?,
+                    total_dollars               = total_dollars               + ?,
+                    last_activity_at            = ?
                 WHERE task_id = ?
                 """,
-                (tokens_in, tokens_out, dollars, _now(), task_id),
+                (
+                    tokens_in,
+                    tokens_out,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    dollars,
+                    _now(),
+                    task_id,
+                ),
             )
 
     def set_managed_session_id(self, task_id: str, managed_id: str) -> None:
@@ -479,6 +559,61 @@ class SessionStore:
         if not row:
             return None
         return row["final_text"]
+
+    # ------------------------------------------------------------------
+    # Runaway detection state (#139 Section 5)
+    # ------------------------------------------------------------------
+
+    def get_runaway_state(self, task_id: str) -> dict:
+        """Return the persisted runaway counters for `task_id`.
+
+        Defaults to a clean state (signature=None, both counts 0) when no
+        managed_cursor row exists yet. Callers that have never seen events
+        for this session can treat the result as a virgin starting point.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tool_loop_signature, tool_loop_count, tool_calls_since_message "
+                "FROM managed_cursor WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "tool_loop_signature": None,
+                "tool_loop_count": 0,
+                "tool_calls_since_message": 0,
+            }
+        return {
+            "tool_loop_signature": row["tool_loop_signature"],
+            "tool_loop_count": int(row["tool_loop_count"] or 0),
+            "tool_calls_since_message": int(row["tool_calls_since_message"] or 0),
+        }
+
+    def set_runaway_state(
+        self,
+        task_id: str,
+        *,
+        tool_loop_signature: str | None,
+        tool_loop_count: int,
+        tool_calls_since_message: int,
+    ) -> None:
+        """Persist runaway counters. Upsert into managed_cursor so a fresh
+        session (no prior cursor row) gets a row with the counters set."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO managed_cursor (
+                    task_id, tool_loop_signature, tool_loop_count,
+                    tool_calls_since_message
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    tool_loop_signature      = excluded.tool_loop_signature,
+                    tool_loop_count          = excluded.tool_loop_count,
+                    tool_calls_since_message = excluded.tool_calls_since_message
+                """,
+                (task_id, tool_loop_signature, tool_loop_count, tool_calls_since_message),
+            )
 
     def record_active_seconds(self, task_id: str, seconds: float) -> None:
         """Add to a session's cumulative active-execution seconds.
@@ -838,6 +973,16 @@ class SessionStore:
             last_activity_at=row["last_activity_at"],
             total_input_tokens=row["total_input_tokens"],
             total_output_tokens=row["total_output_tokens"],
+            total_cache_creation_tokens=(
+                row["total_cache_creation_tokens"]
+                if "total_cache_creation_tokens" in row.keys()
+                else 0
+            ),
+            total_cache_read_tokens=(
+                row["total_cache_read_tokens"]
+                if "total_cache_read_tokens" in row.keys()
+                else 0
+            ),
             total_dollars=row["total_dollars"],
             total_active_seconds=(
                 row["total_active_seconds"]
@@ -847,6 +992,11 @@ class SessionStore:
             expected_output=row["expected_output"],
             parent_session_id=row["parent_session_id"],
             managed_agent_session_id=row["managed_agent_session_id"],
+            preset_class=(
+                row["preset_class"]
+                if "preset_class" in row.keys()
+                else None
+            ),
             root_session_id=(
                 row["root_session_id"] if "root_session_id" in row.keys() else None
             ),

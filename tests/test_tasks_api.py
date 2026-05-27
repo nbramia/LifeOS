@@ -85,6 +85,61 @@ class TestTasksAPI:
         })
         assert response.status_code in (400, 422)  # Validation error
 
+    # --- DRY RUN (#138) ---
+
+    def test_dry_run_with_agent_tag_returns_preflight_preview(self, client, mock_task_manager):
+        """dry_run=true on an #agent task runs preflight and returns the
+        routing decision + cost estimate WITHOUT creating the task."""
+        from api.services.agent_worker.preflight import (
+            PreflightBudget,
+            PreflightResult,
+            ROUTE_CLAUDE,
+        )
+        fake_result = PreflightResult(
+            budget=PreflightBudget(wall_seconds=600, max_tokens=20_000, max_dollars=2.0),
+            routing=ROUTE_CLAUDE,
+            routing_reason="multi-step task; needs cloud",
+            expected_output="text",
+            ambiguity=None,
+            sane=True,
+            sane_reason="",
+        )
+        with patch("api.services.agent_worker.preflight.run_preflight", return_value=fake_result):
+            response = client.post("/api/tasks", json={
+                "description": "draft my Q4 review",
+                "tags": ["agent"],
+                "dry_run": True,
+            })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["dry_run"] is True
+        assert data["routing"] == "claude"
+        assert data["budget"]["max_dollars"] == 2.0
+        assert data["estimated_dollars"] > 0
+        # The dry-run path does NOT touch the task manager.
+        mock_task_manager.create.assert_not_called()
+
+    def test_dry_run_without_agent_tag_falls_through_to_create(self, client, mock_task_manager):
+        """dry_run is a no-op for non-#agent tasks — the task is still created."""
+        response = client.post("/api/tasks", json={
+            "description": "shopping list",
+            "dry_run": True,
+        })
+        assert response.status_code == 200
+        # Falls through to real task creation.
+        mock_task_manager.create.assert_called_once()
+
+    def test_dry_run_false_creates_task_normally(self, client, mock_task_manager):
+        """dry_run=false on an #agent task still creates it (the worker
+        picks it up later and does its own preflight)."""
+        response = client.post("/api/tasks", json={
+            "description": "dispatch this",
+            "tags": ["agent"],
+            "dry_run": False,
+        })
+        assert response.status_code == 200
+        mock_task_manager.create.assert_called_once()
+
     # --- LIST ---
 
     def test_list_tasks(self, client, mock_task_manager):

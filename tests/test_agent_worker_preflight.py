@@ -200,3 +200,264 @@ def test_preflight_prompt_includes_ordered_precedence():
     assert "use claude" in prompt
     assert "capability" in prompt.lower() or "infer from capability" in prompt.lower()
     assert "ask" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tag precedence (#139 §2)
+# ---------------------------------------------------------------------------
+
+def _stub_caller(routing="claude"):
+    """Build a fake caller returning a minimal preflight JSON."""
+    import json
+    def call(_prompt):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.50},
+            "routing": routing,
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    return call
+
+
+@pytest.mark.unit
+def test_cloud_haiku_tag_forces_haiku_routing():
+    """`#cloud-haiku` always picks Haiku, regardless of preflight's choice."""
+    result = pf.run_preflight("ambiguous task", tags=["agent", "cloud-haiku"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_HAIKU
+    assert "cloud-haiku" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_cloud_sonnet_tag_forces_sonnet_routing():
+    """`#cloud-sonnet` always picks Sonnet."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud-sonnet"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+    assert "cloud-sonnet" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_local_tag_overrides_to_local_model():
+    """`#local` forces local regardless of preflight's choice."""
+    result = pf.run_preflight("task", tags=["agent", "local"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.model == pf.MODEL_LOCAL
+
+
+@pytest.mark.unit
+def test_cloud_tag_keeps_preflight_routing_but_defaults_model_to_sonnet():
+    """`#cloud` says cloud but leaves the model open — defaults to Sonnet
+    when preflight didn't pick a specific model."""
+    result = pf.run_preflight("anything", tags=["agent", "cloud"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+
+
+@pytest.mark.unit
+def test_untagged_cloud_route_defaults_to_sonnet():
+    """No model-specifying tag, preflight returns `claude` → Sonnet default."""
+    result = pf.run_preflight("draft an email", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.model == pf.MODEL_SONNET
+
+
+@pytest.mark.unit
+def test_untagged_local_route_sets_model_to_local():
+    """Local routing without override gets MODEL_LOCAL."""
+    result = pf.run_preflight("quick lookup", tags=["agent"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.model == pf.MODEL_LOCAL
+
+
+@pytest.mark.unit
+def test_tag_precedence_haiku_wins_over_sonnet_tag():
+    """If both #cloud-haiku and #cloud-sonnet are present, the first match
+    in the precedence ladder wins (haiku checked before sonnet)."""
+    result = pf.run_preflight("anything",
+                              tags=["agent", "cloud-haiku", "cloud-sonnet"],
+                              caller=_stub_caller(routing="claude"))
+    # Per the ladder docstring: cloud-haiku is checked before cloud-sonnet.
+    assert result.model == pf.MODEL_HAIKU
+
+
+@pytest.mark.unit
+def test_tag_precedence_accepts_hash_prefix_form():
+    """Operators sometimes write the leading `#`; the parser must accept it."""
+    result = pf.run_preflight("anything", tags=["#agent", "#cloud-haiku"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.model == pf.MODEL_HAIKU
+
+
+# ---------------------------------------------------------------------------
+# Preset class tag detection (#139 §3 wiring)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_preset_class_tag_sets_preset_class():
+    """An explicit class tag (#research / #crm / etc.) sets preset_class."""
+    result = pf.run_preflight("dig into Q4 numbers", tags=["agent", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "research"
+
+
+@pytest.mark.unit
+def test_each_preset_class_tag_recognized():
+    """All six class tags map to the right preset_class string."""
+    for tag in ("personal-comm", "work-comm", "research", "financial", "crm", "fullstack"):
+        result = pf.run_preflight("any task", tags=["agent", tag],
+                                  caller=_stub_caller(routing="claude"))
+        assert result.preset_class == tag, f"tag #{tag} should set preset_class={tag}"
+
+
+@pytest.mark.unit
+def test_preset_class_accepts_hash_prefix_form():
+    """Operators may write `#research` or `research` — both map to the class."""
+    result = pf.run_preflight("any task", tags=["#agent", "#crm"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_first_preset_class_tag_wins_on_conflict():
+    """If two class tags slip in, the first one in the tag list wins."""
+    result = pf.run_preflight("any task", tags=["agent", "crm", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_no_class_tag_leaves_preset_class_none():
+    """Without an explicit class tag, preset_class stays None — the worker
+    defaults to fullstack (no filter)."""
+    result = pf.run_preflight("ambiguous task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class is None
+
+
+@pytest.mark.unit
+def test_preset_class_set_on_empty_title_short_circuit():
+    """The empty-title short-circuit path also honors a class tag."""
+    result = pf.run_preflight("", tags=["agent", "financial"])
+    assert result.preset_class == "financial"
+    # And the sane flag is still false (empty title is unsafe regardless of tags).
+    assert result.sane is False
+
+
+# ---------------------------------------------------------------------------
+# Cost gates: fail-fast budget check (#139 §6) + cost preview (#139 §7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_cloud_route_emits_cost_estimate():
+    """Cloud-routed tasks get a non-zero cache-cold cost estimate so the
+    orchestrator can preview cost before dispatch."""
+    result = pf.run_preflight("research task", tags=["agent", "research"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.estimated_cost_dollars > 0
+
+
+@pytest.mark.unit
+def test_local_route_emits_zero_estimate():
+    """Local routing is free compute (operator paid for the hardware)."""
+    result = pf.run_preflight("anything", tags=["agent", "local"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_fullstack_estimate_higher_than_research_estimate():
+    """Larger preset classes are estimated more expensively — that's the
+    whole point of per-class filtering."""
+    full = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                            caller=_stub_caller(routing="claude"))
+    research = pf.run_preflight("any task", tags=["agent", "research"],
+                                caller=_stub_caller(routing="claude"))
+    assert full.estimated_cost_dollars > research.estimated_cost_dollars
+
+
+@pytest.mark.unit
+def test_fail_fast_refuses_when_estimate_exceeds_2x_max_dollars():
+    """§6 acceptance: refuse dispatch when cache-cold estimate exceeds
+    2× max_dollars (refuse only when even the cheap path can't fit)."""
+    # fullstack on Sonnet = 100k × $3/M × 1.25 ≈ $0.375. 2× = $0.75.
+    # Set max_dollars below that floor (so 2× margin still doesn't fit).
+    import json
+    def stub_caller(_p):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.10},
+            "routing": "claude",
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    result = pf.run_preflight("expensive task", tags=["agent", "fullstack"],
+                              caller=stub_caller)
+    assert result.sane is False
+    assert "budget_too_small" in result.sane_reason
+
+
+@pytest.mark.unit
+def test_fail_fast_does_not_refuse_when_2x_margin_fits():
+    """Cache-warm tasks aren't over-refused: when 2× max_dollars covers
+    the estimate, dispatch is allowed (real cost may be 10× cheaper from
+    cache_read on a warm cache)."""
+    import json
+    def stub_caller(_p):
+        return json.dumps({
+            "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 5.0},
+            "routing": "claude",
+            "routing_reason": "stub",
+            "expected_output": "text",
+            "ambiguity": None,
+            "sane": True,
+            "sane_reason": "",
+        })
+    result = pf.run_preflight("normal task", tags=["agent", "research"],
+                              caller=stub_caller)
+    assert result.sane is True
+    assert "budget_too_small" not in result.sane_reason
+
+
+@pytest.mark.unit
+def test_cost_confirmation_triggers_above_threshold(monkeypatch):
+    """§7 acceptance: estimate > threshold sets needs_cost_confirmation."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.01)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    # fullstack estimate is well over a penny.
+    assert result.needs_cost_confirmation is True
+
+
+@pytest.mark.unit
+def test_cost_confirmation_not_triggered_below_threshold(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 1000.0)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_cost_confirmation_disabled_when_threshold_zero(monkeypatch):
+    """Threshold=0 disables confirmation entirely (auto-dispatch all)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.0)
+    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.needs_cost_confirmation is False

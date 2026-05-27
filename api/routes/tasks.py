@@ -26,6 +26,35 @@ class CreateTaskRequest(BaseModel):
     due_date: Optional[str] = Field(default=None, description="Due date (YYYY-MM-DD)")
     tags: Optional[list[str]] = Field(default=None, description="List of tags (e.g., ['work', 'urgent'])")
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
+    dry_run: Optional[bool] = Field(
+        default=False,
+        description="When true and the task carries the #agent tag, run the "
+                    "Haiku preflight and return the routing + cost estimate "
+                    "without creating the task. Used by prompt-engineering "
+                    "iteration to inspect routing decisions without dispatching "
+                    "a managed session. Costs ~$0.001 for the preflight call.",
+    )
+
+
+class PreflightPreviewResponse(BaseModel):
+    """Response shape when `dry_run=true` is supplied to task creation.
+
+    Returns the preflight routing + budget + cost estimate without creating
+    the task. Used by dev iteration to inspect routing decisions cheaply.
+    """
+    dry_run: bool = True
+    routing: str = Field(description="Routing decision: local / claude / ask")
+    routing_reason: str
+    expected_output: str
+    budget: dict
+    estimated_dollars: float = Field(
+        description="Cost estimate for the routed session (model token cost "
+                    "given budget.max_tokens, plus session-hour overhead for "
+                    "managed sessions). Excludes the preflight call cost."
+    )
+    sane: bool
+    sane_reason: str
+    ambiguity: Optional[dict] = None
 
 
 class UpdateTaskRequest(BaseModel):
@@ -80,9 +109,20 @@ class TaskListResponse(BaseModel):
 # Routes (static paths MUST come before {id} to avoid capture)
 # ---------------------------------------------------------------------------
 
-@router.post("", response_model=TaskResponse)
+@router.post("")
 async def create_task(request: CreateTaskRequest):
-    """Create a new task. All new tasks land in Inbox; move them later via update."""
+    """Create a new task, or preview its agent routing without creating it.
+
+    When `dry_run=true` and the request carries the #agent tag, the route runs
+    the Haiku preflight classifier and returns the routing decision + cost
+    estimate without persisting a task or dispatching a session. Used by
+    prompt-engineering iteration to inspect routing decisions cheaply
+    (only the preflight call costs anything, ~$0.001).
+
+    For non-#agent tasks (or `dry_run=false`), the task is created normally.
+    """
+    if request.dry_run and _has_agent_tag(request.tags):
+        return _build_preflight_preview(request)
     manager = get_task_manager()
     task = manager.create(
         description=request.description,
@@ -92,6 +132,52 @@ async def create_task(request: CreateTaskRequest):
         reminder_id=request.reminder_id,
     )
     return TaskResponse.from_task(task)
+
+
+def _has_agent_tag(tags: Optional[list[str]]) -> bool:
+    if not tags:
+        return False
+    return any(t.lstrip("#").lower() == "agent" for t in tags)
+
+
+def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResponse:
+    """Run preflight and synthesize a cost estimate without dispatching."""
+    # Imports kept local so the route module stays import-cheap for non-agent
+    # task operations; agent_worker pulls in the LLM client.
+    from api.services.agent_worker.preflight import (
+        ROUTE_CLAUDE,
+        run_preflight,
+    )
+    from api.services.agent_worker.pricing import cost_for, MANAGED_SESSION_HOUR_OVERHEAD
+    from config.settings import settings
+
+    pre = run_preflight(request.description, tags=request.tags or [])
+    # Worst-case estimate: assume budget.max_tokens is fully consumed, split
+    # 50/50 between input and output. Excludes cache_creation because dry_run
+    # can't know preset size; this is a floor, not a calibrated estimate.
+    model = (
+        settings.agent_managed_model_for_tests or settings.agent_managed_model
+        if pre.routing == ROUTE_CLAUDE
+        else "local"
+    )
+    half_tokens = max(0, pre.budget.max_tokens // 2)
+    estimated = cost_for(model, half_tokens, half_tokens)
+    if pre.routing == ROUTE_CLAUDE:
+        estimated += (pre.budget.wall_seconds / 3600.0) * MANAGED_SESSION_HOUR_OVERHEAD
+    return PreflightPreviewResponse(
+        routing=pre.routing,
+        routing_reason=pre.routing_reason,
+        expected_output=pre.expected_output,
+        budget={
+            "wall_seconds": pre.budget.wall_seconds,
+            "max_tokens": pre.budget.max_tokens,
+            "max_dollars": pre.budget.max_dollars,
+        },
+        estimated_dollars=round(estimated, 4),
+        sane=pre.sane,
+        sane_reason=pre.sane_reason,
+        ambiguity={"question": pre.ambiguity.question} if pre.ambiguity else None,
+    )
 
 
 @router.get("", response_model=TaskListResponse)
