@@ -487,6 +487,159 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_cloud_yield_resume_creates_fresh_managed_session_with_children_output(tmp_path: Path):
+    """Live bug: cloud parents that called yield_until ended up in FAILED
+    because `_resume_yielded_for_children` short-circuited non-local
+    routings. Now we create a fresh Anthropic session, pass the original
+    task + each child's final_text as the initial user message, and let
+    the parent's poll loop pick it up via the new managed_session_id."""
+    from api.services.agent_worker.session_store import STATUS_RUNNING, STATUS_YIELDED, STATUS_COMPLETED
+    api = FakeApi(tasks=[
+        {"id": "p1", "description": "Compare gmail vs slack — aggregate child outputs",
+         "status": "in_progress", "tags": [RUNNING_TAG, "cloud"]},
+    ])
+    # Track what the driver was asked to do.
+    create_calls: list[dict] = []
+    class _StubDriver:
+        def create_session(self, **kwargs):
+            create_calls.append(kwargs)
+            return "sesn_new_remote_id"
+    class _StubManagedExec:
+        agent_id = "agent_x"
+        environment_id = "env_x"
+        vault_ids = ["vlt_x"]
+        driver = _StubDriver()
+        def start(self, session, task):
+            return ExecutorOutcome(status=STATUS_RUNNING)
+        def poll(self, session):
+            return ExecutorOutcome(status=STATUS_RUNNING)
+
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED)))
+    w._managed_executor = _StubManagedExec()  # type: ignore[assignment]
+
+    # Construct a cloud parent that's yielded waiting on two children.
+    parent = w.session_store.create(
+        task_id="p1", routing="claude", status=STATUS_YIELDED,
+        expected_output="structured",
+    )
+    w.session_store.set_managed_session_id("p1", "sesn_old_remote")
+    c1 = w.session_store.create(
+        task_id="spawn_c1", routing="claude", status=STATUS_COMPLETED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    c2 = w.session_store.create(
+        task_id="spawn_c2", routing="claude", status=STATUS_COMPLETED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    # Cache each child's final_text as managed children do post-completion.
+    w.session_store.set_managed_final_text(c1.task_id, "Gmail: 1,451 emails received in April.")
+    w.session_store.set_managed_final_text(c2.task_id, "Slack: 230 messages sent in April.")
+    w.session_store.set_yield_waiting_for("p1", [c1.session_id, c2.session_id])
+
+    w._resume_yielded_for_children()
+
+    assert len(create_calls) == 1, "should have created exactly one fresh managed session"
+    call = create_calls[0]
+    msg = call["initial_message"]
+    # Original task is restated for the fresh session (no prior history).
+    assert "Compare gmail vs slack" in msg
+    # Both children's outputs are in the resume message.
+    assert "Gmail: 1,451 emails received" in msg
+    assert "Slack: 230 messages sent" in msg
+    # Both child session_ids show up in the [status] header lines.
+    assert c1.session_id in msg
+    assert c2.session_id in msg
+    # Parent session row now points at the new remote id.
+    refreshed = w.session_store.get("p1")
+    assert refreshed.managed_agent_session_id == "sesn_new_remote_id"
+    # Status flipped to RUNNING; yield_waiting_for cleared.
+    assert refreshed.status == STATUS_RUNNING
+    assert not refreshed.yield_waiting_for
+    # No Telegram messages leaked during the resume.
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent == []
+
+
+@pytest.mark.unit
+def test_recovery_skips_json_tool_results_and_summarizes_tool_calls(tmp_path: Path):
+    """Live bug: a cloud agent idled after calling list_threads (which
+    returned a 30KB JSON payload). The recovery code surfaced that raw
+    JSON as the operator-facing completion body — unreadable. Now we
+    skip JSON-shaped or oversize results and fall back to a compact
+    "tools called: X, Y, Z" summary."""
+    from api.services.agent_worker.transcript_store import TranscriptStore as _TS
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "compare gmail vs slack",
+         "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    ts = _TS(transcripts_dir=tmp_path / "transcripts")
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_use",
+              {"name": "lifeos_gmail_search"})
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_use",
+              {"name": "lifeos_agent_spawn"})
+    # Last tool result is a giant JSON dump — recovery must skip it.
+    json_dump = '{"threads":[' + ('{"id":"x"},' * 500) + '{"id":"end"}]}'
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_result", {
+        "is_error": False,
+        "content": [{"type": "text", "text": json_dump}],
+    })
+    msg = w._completion_summary(sess, {"id": "t1", "description": "compare"},
+                                executor.outcome)
+    # JSON body NOT inlined.
+    assert json_dump[:50] not in msg
+    assert '{"threads"' not in msg
+    # Instead, surface tool-call summary mentioning the calls.
+    assert "Tools called" in msg
+    assert "lifeos_gmail_search" in msg
+    assert "lifeos_agent_spawn" in msg
+
+
+@pytest.mark.unit
+def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
+    """Sanity check the other branch: when the last tool result IS short
+    and text-shaped (e.g. lifeos_gmail_draft returned a few-hundred-char
+    summary), inline it — that's the genuine "show what the agent did"
+    case from PR #130."""
+    from api.services.agent_worker.transcript_store import TranscriptStore as _TS
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "draft", "status": "todo",
+         "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    ts = _TS(transcripts_dir=tmp_path / "transcripts")
+    ts.append(sess.session_id, "managed_event_agent.mcp_tool_result", {
+        "is_error": False,
+        "content": [{"type": "text",
+                     "text": "Draft created — to: kevin@example.com, "
+                             "subject: Apologies for delay"}],
+    })
+    msg = w._completion_summary(sess, {"id": "t1", "description": "draft"},
+                                executor.outcome)
+    assert "Draft created" in msg
+    assert "Tools called" not in msg
+
+
+@pytest.mark.unit
 def test_spawned_child_failure_does_not_telegram_the_operator(tmp_path: Path):
     """Live bug: a spawned child session's `create_session` 4xx'd, and the
     worker fired a failure notification to operator Telegram with the
