@@ -354,3 +354,61 @@ def test_focus_410_when_probed_pane_also_fails(
     r = client.post(f"/api/agents/sessions/{sid}/focus")
     assert r.status_code == 410
     assert wezterm_store.get(sid) is None
+
+
+@pytest.mark.unit
+def test_focus_resolves_session_without_calling_discover_sessions(
+    tmp_path: Path, client, wezterm_store, monkeypatch,
+):
+    """The /focus session-meta lookup should glob project dirs directly
+    instead of running the full `discover_sessions` walk (which parses
+    every transcript under ~/.claude/projects/). Build a layout with
+    ≥2 project dirs and monkeypatch `discover_sessions` to fail loudly —
+    if focus still works, we've confirmed the helper no longer relies on it.
+    """
+    from config.settings import settings
+    from api.services.claude_code import session_ingest as cc
+
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+
+    # Two project dirs; target jsonl lives in the second one.
+    proj_a = tmp_path / "-home-syn-Code-Other"
+    proj_b = tmp_path / "-home-syn-Code-Target"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+    (proj_a / "decoy-uuid.jsonl").write_text("{}\n", encoding="utf-8")
+    sid_bare = "real-target-uuid"
+    (proj_b / f"{sid_bare}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(settings, "claude_code_projects_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "claude_code_lookback_days", 365)
+    cc.invalidate_cache()
+    cc.invalidate_process_cache()
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("discover_sessions must not be called by _lookup_cc_session_meta")
+    monkeypatch.setattr(cc, "discover_sessions", _boom)
+
+    # Probe returns a pane_id so the focus path completes.
+    from api.services import cc_pane_locate
+    captured_jsonl: dict[str, str] = {}
+
+    def _probe(path, env=None, proc_root="/proc"):
+        captured_jsonl["path"] = path
+        return 55
+    monkeypatch.setattr(cc_pane_locate, "locate_pane_for_transcript", _probe)
+
+    class _OK:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: _OK())
+
+    r = client.post(f"/api/agents/sessions/cc:{sid_bare}/focus")
+    assert r.status_code == 200, r.text
+    assert r.json()["pane_id"] == 55
+
+    # The probe was handed the jsonl from the *target* project dir, not the decoy.
+    assert captured_jsonl["path"] == str(proj_b / f"{sid_bare}.jsonl")

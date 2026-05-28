@@ -995,28 +995,56 @@ async def resume_claude_code_session(
 def _lookup_cc_session_meta(session_id: str):
     """Resolve a `cc:`-prefixed session id back to its discovered SessionMeta.
 
-    Mirrors the lookup the /resume endpoint does. Returns (meta, bare_id)
-    or raises HTTPException with an appropriate status. Used by /focus to
-    locate the transcript jsonl for the FD probe fallback.
+    Used by /focus to locate the transcript jsonl for the FD probe fallback.
+    Returns (meta, bare_id) or raises HTTPException with an appropriate status.
+
+    Searches project dirs directly for `<bare>.jsonl` rather than calling
+    `discover_sessions`, which would parse every transcript under
+    `~/.claude/projects/` on every Go To cache miss. The /focus caller only
+    reads `meta.jsonl_path` and `meta.decoded_cwd`, so we synthesize a
+    minimal SessionMeta with just those two fields populated.
     """
-    from api.services.claude_code import session_ingest as cc
+    import os
+    from pathlib import Path
+
+    from api.services.claude_code.session_ingest import (
+        CC_PREFIX,
+        SessionMeta,
+        decode_project_key,
+        validate_session_id,
+    )
     from config.settings import settings
 
     try:
-        bare = cc.validate_session_id(session_id)
+        bare = validate_session_id(session_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if ":agent:" in bare:
         bare = bare.split(":agent:", 1)[0]
 
-    metas = cc.discover_sessions(
-        projects_dir=settings.claude_code_projects_dir,
-        lookback_days=max(int(settings.claude_code_lookback_days), 365),
-    )
-    target = next((m for m in metas if m.raw_session_id == bare), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-    return target, bare
+    root = Path(os.path.expanduser(str(settings.claude_code_projects_dir)))
+    if root.exists() and root.is_dir():
+        for proj in root.iterdir():
+            if not proj.is_dir():
+                continue
+            candidate = proj / f"{bare}.jsonl"
+            if candidate.exists():
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                project_key = proj.name
+                meta = SessionMeta(
+                    session_id=CC_PREFIX + bare,
+                    raw_session_id=bare,
+                    project_key=project_key,
+                    decoded_cwd=decode_project_key(project_key),
+                    jsonl_path=str(candidate),
+                    mtime=mtime,
+                )
+                return meta, bare
+
+    raise HTTPException(status_code=404, detail=f"session {session_id} not found")
 
 
 def _activate_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
