@@ -1,147 +1,36 @@
 """
-Tests for Local LLM Query Router (P3.5).
-
-Tests the OllamaClient and QueryRouter services.
+Tests for the QueryRouter (local-LLM routing + keyword fallback).
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
-import httpx
+from unittest.mock import patch, AsyncMock
 
-# Most tests in this file are fast unit tests (mocked Ollama)
+# Most tests in this file are fast unit tests (mocked local LLM)
 pytestmark = pytest.mark.unit
-
-
-class TestOllamaClient:
-    """Test the Ollama client for local LLM inference."""
-
-    def test_client_initialization(self):
-        """Client should initialize with the configured defaults."""
-        from api.services.ollama_client import OllamaClient
-        from config.settings import settings
-
-        client = OllamaClient()
-        assert client.host == settings.ollama_host
-        assert client.model == settings.ollama_model
-        assert client.timeout == settings.ollama_timeout
-
-    def test_client_custom_settings(self):
-        """Client should accept custom settings."""
-        from api.services.ollama_client import OllamaClient
-
-        client = OllamaClient(
-            host="http://custom:8080",
-            model="custom-model",
-            timeout=30
-        )
-        assert client.host == "http://custom:8080"
-        assert client.model == "custom-model"
-        assert client.timeout == 30
-
-    @pytest.mark.asyncio
-    async def test_generate_success(self):
-        """Generate should return response from Ollama."""
-        from api.services.ollama_client import OllamaClient
-
-        mock_response = {
-            "response": '{"sources": ["vault"], "reasoning": "test"}',
-            "done": True
-        }
-
-        with patch('httpx.AsyncClient') as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client_class.return_value.__aenter__.return_value = mock_client
-            mock_response_obj = MagicMock()
-            mock_response_obj.json.return_value = mock_response
-            mock_response_obj.raise_for_status = MagicMock()
-            mock_client.post.return_value = mock_response_obj
-
-            client = OllamaClient()
-            result = await client.generate("test prompt")
-
-            assert result == '{"sources": ["vault"], "reasoning": "test"}'
-
-    @pytest.mark.asyncio
-    async def test_generate_timeout(self):
-        """Generate should raise timeout error gracefully."""
-        from api.services.ollama_client import OllamaClient, OllamaError
-
-        with patch('httpx.AsyncClient') as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client_class.return_value.__aenter__.return_value = mock_client
-            mock_client.post.side_effect = httpx.TimeoutException("timeout")
-
-            client = OllamaClient()
-            with pytest.raises(OllamaError) as exc_info:
-                await client.generate("test prompt")
-
-            assert "timeout" in str(exc_info.value).lower()
-
-    @pytest.mark.asyncio
-    async def test_generate_connection_error(self):
-        """Generate should raise connection error gracefully."""
-        from api.services.ollama_client import OllamaClient, OllamaError
-
-        with patch('httpx.AsyncClient') as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client_class.return_value.__aenter__.return_value = mock_client
-            mock_client.post.side_effect = httpx.ConnectError("connection failed")
-
-            client = OllamaClient()
-            with pytest.raises(OllamaError) as exc_info:
-                await client.generate("test prompt")
-
-            assert "connection" in str(exc_info.value).lower()
-
-    def test_is_available_true(self):
-        """is_available should return True when Ollama is running with models."""
-        from api.services.ollama_client import OllamaClient
-
-        with patch('httpx.get') as mock_get:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {
-                "models": [{"name": "llama3.2:3b"}]
-            }
-            mock_get.return_value = mock_response
-
-            client = OllamaClient()
-            assert client.is_available() is True
-
-    def test_is_available_false(self):
-        """is_available should return False when Ollama is not running."""
-        from api.services.ollama_client import OllamaClient
-
-        with patch('httpx.get') as mock_get:
-            mock_get.side_effect = httpx.ConnectError("connection failed")
-
-            client = OllamaClient()
-            assert client.is_available() is False
 
 
 class TestQueryRouter:
     """Test the query router service."""
 
     def test_router_initialization(self):
-        """Router should initialize with Ollama client."""
+        """Router should initialize without arguments."""
         from api.services.query_router import QueryRouter
 
         router = QueryRouter()
-        assert router.ollama_client is not None
+        assert router is not None
 
     @pytest.mark.asyncio
     async def test_route_parses_valid_json(self):
         """Router should parse valid JSON response from LLM."""
         from api.services.query_router import QueryRouter
 
-        with patch('api.services.ollama_client.OllamaClient') as MockClient:
-            mock_client = AsyncMock()
-            mock_client.generate.return_value = '{"sources": ["calendar", "vault"], "reasoning": "schedule query"}'
-            mock_client.is_available.return_value = True
-            MockClient.return_value = mock_client
-
+        with (
+            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+            patch(
+                "api.services.query_router.generate_text",
+                AsyncMock(return_value='{"sources": ["calendar", "vault"], "reasoning": "schedule query"}'),
+            ),
+        ):
             router = QueryRouter()
-            router.ollama_client = mock_client
-
             result = await router.route("What meetings do I have tomorrow?")
 
             assert "calendar" in result.sources
@@ -152,33 +41,26 @@ class TestQueryRouter:
         """Router should fall back to vault on invalid JSON."""
         from api.services.query_router import QueryRouter
 
-        with patch('api.services.ollama_client.OllamaClient') as MockClient:
-            mock_client = AsyncMock()
-            mock_client.generate.return_value = 'invalid json response'
-            mock_client.is_available.return_value = True
-            MockClient.return_value = mock_client
-
+        with (
+            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+            patch(
+                "api.services.query_router.generate_text",
+                AsyncMock(return_value="invalid json response"),
+            ),
+        ):
             router = QueryRouter()
-            router.ollama_client = mock_client
-
             result = await router.route("test query")
 
             assert "vault" in result.sources
             assert "fallback" in result.reasoning.lower()
 
     @pytest.mark.asyncio
-    async def test_route_fallback_when_ollama_unavailable(self):
-        """Router should use keyword fallback when Ollama is unavailable."""
+    async def test_route_fallback_when_llm_unavailable(self):
+        """Router should use keyword fallback when the local LLM is unavailable."""
         from api.services.query_router import QueryRouter
 
-        with patch('api.services.ollama_client.OllamaClient') as MockClient:
-            mock_client = MagicMock()
-            mock_client.is_available.return_value = False  # Sync method returns False
-            MockClient.return_value = mock_client
-
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False):
             router = QueryRouter()
-            router.ollama_client = mock_client
-
             result = await router.route("What meetings do I have?")
 
             assert "calendar" in result.sources
@@ -189,15 +71,14 @@ class TestQueryRouter:
         """Router result should include latency measurement."""
         from api.services.query_router import QueryRouter
 
-        with patch('api.services.ollama_client.OllamaClient') as MockClient:
-            mock_client = AsyncMock()
-            mock_client.generate.return_value = '{"sources": ["vault"], "reasoning": "test"}'
-            mock_client.is_available.return_value = True
-            MockClient.return_value = mock_client
-
+        with (
+            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+            patch(
+                "api.services.query_router.generate_text",
+                AsyncMock(return_value='{"sources": ["vault"], "reasoning": "test"}'),
+            ),
+        ):
             router = QueryRouter()
-            router.ollama_client = mock_client
-
             result = await router.route("test query")
 
             assert result.latency_ms >= 0
@@ -360,23 +241,22 @@ class TestRouterAccuracy:
 
 
 @pytest.mark.slow
-@pytest.mark.requires_ollama
+@pytest.mark.integration
 class TestRouterIntegration:
-    """Integration tests with real Ollama (skip if not available)."""
+    """Integration tests against a running local LLM (llama-server). Skipped if not available."""
 
     @pytest.fixture
-    def ollama_available(self):
-        """Check if Ollama is available."""
-        from api.services.ollama_client import OllamaClient
-        client = OllamaClient()
-        return client.is_available()
+    def llm_available(self):
+        """Check if the local LLM is available."""
+        from api.services.llm_client import is_local_routing_llm_available
+        return is_local_routing_llm_available()
 
     @pytest.mark.slow
     @pytest.mark.asyncio
-    async def test_real_ollama_routing(self, ollama_available):
-        """Test routing with real Ollama if available."""
-        if not ollama_available:
-            pytest.skip("Ollama not available")
+    async def test_real_routing(self, llm_available):
+        """Test routing with the real local LLM if available."""
+        if not llm_available:
+            pytest.skip("Local LLM server not available")
 
         from api.services.query_router import QueryRouter
 
@@ -390,17 +270,17 @@ class TestRouterIntegration:
 
     @pytest.mark.slow
     @pytest.mark.asyncio
-    async def test_real_ollama_latency(self, ollama_available):
-        """Routing latency should be reasonable for 7B model."""
-        if not ollama_available:
-            pytest.skip("Ollama not available")
+    async def test_real_routing_latency(self, llm_available):
+        """Routing latency should be reasonable for the running local model."""
+        if not llm_available:
+            pytest.skip("Local LLM server not available")
 
         from api.services.query_router import QueryRouter
 
         router = QueryRouter()
         result = await router.route("What's on my calendar?")
 
-        # 7B model is slower than 3B, allow up to 15s for first call (model loading)
+        # Allow up to 15s for first call (model loading on llama-server cold start)
         assert result.latency_ms < 15000, f"Latency too high: {result.latency_ms}ms"
 
 
@@ -435,8 +315,8 @@ class TestPeopleRouting:
     @pytest.mark.asyncio
     async def test_people_keywords_route_to_people_source(self, router):
         """Test that people keywords route to people source."""
-        # Mock Ollama as unavailable to use keyword fallback
-        with patch.object(router.ollama_client, 'is_available', return_value=False):
+        # Force keyword fallback by pretending the local LLM is unavailable.
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False):
             result = await router.route("prep me for meeting with Kevin")
         assert "people" in result.sources
         assert "calendar" in result.sources
@@ -522,7 +402,7 @@ class TestActionAfterRouting:
     @pytest.mark.asyncio
     async def test_combines_web_and_personal_sources(self, router):
         """Can combine web with personal sources."""
-        with patch.object(router.ollama_client, 'is_available', return_value=False):
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False):
             result = await router.route("What's the weather for my NYC trip tomorrow?")
         # Should have web for weather and calendar for trip
         assert "web" in result.sources or "calendar" in result.sources

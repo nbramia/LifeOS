@@ -1,17 +1,13 @@
 """End-to-end tests for the People Query Orchestrator."""
 import pytest
-
-# Mark all tests as unit tests
-pytestmark = pytest.mark.unit
-
-from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 from api.services.query_router import QueryRouter
 from api.services.briefings import BriefingsService
-from api.services.person_entity import PersonEntity, PersonEntityStore
-from api.services.entity_resolver import EntityResolver
-from api.services.interaction_store import InteractionStore, Interaction
+from api.services.person_entity import PersonEntity
+
+# Mark all tests as unit tests
+pytestmark = pytest.mark.unit
 
 
 class TestQueryRoutingE2E:
@@ -22,7 +18,7 @@ class TestQueryRoutingE2E:
         """Test the complete routing for a people query."""
         router = QueryRouter()
 
-        with patch.object(router.ollama_client, 'is_available', return_value=False):
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False):
             result = await router.route("prep me for my 1:1 with Kevin tomorrow")
 
         assert "people" in result.sources
@@ -66,7 +62,7 @@ class TestBriefingIntegration:
         )
 
         # Gather context with email provided
-        context = service.gather_context("Kevin", email="kevin@company.com")
+        service.gather_context("Kevin", email="kevin@company.com")
 
         # Verify resolver was called with email
         mock_resolver.resolve.assert_called()

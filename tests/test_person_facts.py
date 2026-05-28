@@ -9,9 +9,7 @@ Covers:
 """
 import pytest
 import json
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from api.services.person_facts import (
@@ -509,12 +507,12 @@ class TestPersonFactExtractor:
     def test_sample_interactions_prioritizes_calendar(self, extractor):
         """Calendar and vault interactions are always included."""
         interactions = [
-            {"id": f"gmail-{i}", "timestamp": f"2025-01-01T10:00:00", "source_type": "gmail"}
+            {"id": f"gmail-{i}", "timestamp": "2025-01-01T10:00:00", "source_type": "gmail"}
             for i in range(400)
         ]
         # Add some calendar events
         interactions.extend([
-            {"id": f"cal-{i}", "timestamp": f"2024-06-01T10:00:00", "source_type": "calendar"}
+            {"id": f"cal-{i}", "timestamp": "2024-06-01T10:00:00", "source_type": "calendar"}
             for i in range(10)
         ])
 
@@ -744,10 +742,10 @@ class TestValidateAndDedup:
             {"candidate": 0, "action": "reject", "reason": "Universal fact"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._validate_and_dedup_ollama([fact], [], "John")
 
@@ -765,10 +763,10 @@ class TestValidateAndDedup:
              "evidence_strength": 4, "reason": "More detailed version"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._validate_and_dedup_ollama([candidate], [existing], "John")
 
@@ -785,10 +783,10 @@ class TestValidateAndDedup:
              "reason": "New unique fact"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._validate_and_dedup_ollama([fact], [], "John")
 
@@ -806,10 +804,10 @@ class TestValidateAndDedup:
              "evidence_strength": 4, "reason": "More detail"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._validate_and_dedup_ollama([candidate], [existing], "John")
 
@@ -836,9 +834,7 @@ class TestValidateAndDedup:
             self._make_fact(value="true", category="preferences"),
         ]
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=False)
+        with patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=False)):
 
             result = await extractor._validate_and_dedup_ollama(facts, [], "John")
 
@@ -859,10 +855,10 @@ class TestValidateAndDedup:
              "reason": "Same topic as C0 — backpacking"},
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._validate_and_dedup_ollama([fact_a, fact_b], [], "John")
 
@@ -895,10 +891,10 @@ class TestSemanticDedupOllama:
             {"candidate": 0, "reason": "Same topic as E0 (backpacking)"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._semantic_dedup_ollama(candidates, existing, "John")
 
@@ -912,10 +908,10 @@ class TestSemanticDedupOllama:
 
         mock_result = {"remove": []}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._semantic_dedup_ollama(candidates, existing, "John")
 
@@ -933,10 +929,10 @@ class TestSemanticDedupOllama:
             {"candidate": 1, "reason": "Same topic as C0 (backpacking)"}
         ]}
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(return_value=mock_result)
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(return_value=mock_result)),
+        ):
 
             result = await extractor._semantic_dedup_ollama(candidates, [], "John")
 
@@ -951,9 +947,7 @@ class TestSemanticDedupOllama:
             self._make_fact("Participates in backpacking trips"),
         ]
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=False)
+        with patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=False)):
 
             result = await extractor._semantic_dedup_ollama(candidates, [], "John")
 
@@ -964,10 +958,10 @@ class TestSemanticDedupOllama:
         """All candidates kept when Ollama call fails."""
         candidates = [self._make_fact("Goes backpacking")]
 
-        with patch("api.services.ollama_client.OllamaClient") as MockClient:
-            instance = MockClient.return_value
-            instance.is_available_async = AsyncMock(return_value=True)
-            instance.generate_json = AsyncMock(side_effect=Exception("Connection failed"))
+        with (
+            patch("api.services.llm_client.ais_local_routing_llm_available", AsyncMock(return_value=True)),
+            patch("api.services.llm_client.generate_json", AsyncMock(side_effect=Exception("Connection failed"))),
+        ):
 
             result = await extractor._semantic_dedup_ollama(candidates, [], "John")
 

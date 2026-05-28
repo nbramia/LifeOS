@@ -632,6 +632,142 @@ def get_anthropic_llm() -> AnthropicLLMClient:
 
 def reset_local_llm() -> None:
     """Reset all singletons (for testing)."""
-    global _llm_client, _anthropic_client
+    global _llm_client, _anthropic_client, _routing_client
     _llm_client = None
     _anthropic_client = None
+    _routing_client = None
+
+
+# ============================================================================
+# Routing / validation helpers — always go to the local llama-server.
+#
+# Query routing, fact filtering, and entity-cleanup auto-hide decisions used
+# to call Ollama directly (separate runtime at :11434). They were never sent
+# to the cloud and they're cheap enough to keep local even when the main
+# orchestrator is on Anthropic. These helpers wrap LocalLLMClient with the
+# small text / JSON helpers those callers actually need so the rest of the
+# codebase doesn't need to think about Ollama vs llama-server.
+# ============================================================================
+
+_routing_client: LocalLLMClient | None = None
+
+
+def _get_local_routing_client() -> LocalLLMClient:
+    """Return a LocalLLMClient pinned to llama-server, regardless of LIFEOS_LLM_BACKEND.
+
+    Distinct from ``get_local_llm`` because that one switches to Anthropic
+    when the backend is set to ``anthropic``; routing/validation should stay
+    local even then.
+    """
+    global _routing_client
+    if _routing_client is None:
+        _routing_client = LocalLLMClient()
+    return _routing_client
+
+
+def extract_json(text: str) -> dict:
+    """Extract a JSON object from an LLM response.
+
+    Handles raw JSON, ```json fenced blocks, plain ``` fences, and JSON
+    embedded in surrounding prose. Returns the first balanced object.
+
+    Raises:
+        ValueError: if no parseable JSON object is found.
+    """
+    text = text or ""
+    # Raw JSON
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+
+    # ```json fenced block
+    import re as _re
+    fenced = _re.search(r'```json\s*([\s\S]*?)\s*```', text)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+    fenced_any = _re.search(r'```\s*([\s\S]*?)\s*```', text)
+    if fenced_any:
+        try:
+            return json.loads(fenced_any.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # First balanced object in the text
+    start = text.find('{')
+    if start >= 0:
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    raise ValueError(f"Failed to extract JSON from LLM response: {text[:200]}…")
+
+
+async def generate_text(
+    prompt: str,
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+    timeout: float | None = None,
+) -> str:
+    """Generate raw text from the local LLM.
+
+    Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
+    A per-call ``timeout`` uses a transient client so concurrent default-
+    timeout calls aren't affected.
+    """
+    client = LocalLLMClient(timeout=timeout) if timeout is not None else _get_local_routing_client()
+    response = await client.acreate(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return response.text or ""
+
+
+async def generate_json(
+    prompt: str,
+    *,
+    max_tokens: int = 4096,
+    temperature: float = 0.1,
+    timeout: float | None = None,
+) -> dict:
+    """Generate a JSON dict from the local LLM.
+
+    Replaces ``OllamaClient.generate_json(...)`` for routing / validation
+    callers. Uses a low temperature by default for structured output.
+    """
+    text = await generate_text(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout=timeout,
+    )
+    return extract_json(text)
+
+
+def is_local_routing_llm_available() -> bool:
+    """Sync availability check for routing/validation callers."""
+    try:
+        return _get_local_routing_client().is_available()
+    except Exception:
+        return False
+
+
+async def ais_local_routing_llm_available() -> bool:
+    """Async availability check for routing/validation callers."""
+    try:
+        return await _get_local_routing_client().ais_available()
+    except Exception:
+        return False

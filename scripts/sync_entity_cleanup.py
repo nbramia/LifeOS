@@ -22,7 +22,6 @@ import asyncio
 import logging
 import re
 import sys
-import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.person_entity import PersonEntity, get_person_entity_store
-from api.services.review_queue import get_review_queue_store, ReviewType
+from api.services.review_queue import get_review_queue_store
 
 logger = logging.getLogger(__name__)
 
@@ -328,13 +327,14 @@ async def classify_with_llm(
         return [], []
 
     try:
-        from api.services.ollama_client import OllamaClient, OllamaError
-
-        client = OllamaClient()
+        from api.services.llm_client import (
+            generate_json,
+            is_local_routing_llm_available,
+        )
 
         # Check if LLM is available
-        if not client.is_available():
-            logger.warning("Ollama not available, queueing all ambiguous entities for manual review")
+        if not is_local_routing_llm_available():
+            logger.warning("Local LLM not available, queueing all ambiguous entities for manual review")
             return [], entities
 
         auto_hide = []
@@ -366,7 +366,7 @@ Example:
 Only respond with the JSON object, no other text."""
 
             try:
-                result = await client.generate_json(prompt, timeout=60)
+                result = await generate_json(prompt, timeout=60)
 
                 for entity, orig_confidence, reason in batch:
                     name = entity.canonical_name
@@ -382,9 +382,11 @@ Only respond with the JSON object, no other text."""
                         queue_for_manual.append((entity, confidence, f"{reason} (LLM: {entity_type})"))
                         logger.debug(f"LLM uncertain: {name} (type: {entity_type}, confidence: {confidence})")
 
-            except OllamaError as e:
+            except Exception as e:
+                # Local-LLM call failed (timeout, malformed JSON, etc.) —
+                # queue the whole batch for manual review rather than
+                # mis-classify.
                 logger.warning(f"LLM classification failed for batch: {e}")
-                # Queue entire batch for manual review
                 queue_for_manual.extend(batch)
 
         logger.info(f"LLM classification: {len(auto_hide)} auto-hide, "
@@ -392,7 +394,7 @@ Only respond with the JSON object, no other text."""
         return auto_hide, queue_for_manual
 
     except ImportError:
-        logger.warning("Ollama client not available, queueing all for manual review")
+        logger.warning("Local LLM helpers not available, queueing all for manual review")
         return [], entities
 
 
