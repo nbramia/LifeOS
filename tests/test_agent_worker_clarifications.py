@@ -593,3 +593,91 @@ def test_native_reply_targets_specific_older_thread(tmp_path: Path):
     assert store.deposit_answer(100, "revisit old")
     assert store.get_question_by_message_id(100)["answer"] == "revisit old"
     assert store.get_question_by_message_id(200)["answer"] is None
+
+
+# =============================================================================
+# Operator root-spawn dispatch + routing-ask resolution (Issue #235)
+# =============================================================================
+
+
+def _ask_preflight():
+    def _caller(prompt):
+        import json
+        return json.dumps({
+            "budget": {"wall_seconds": 3600, "max_tokens": 1000, "max_dollars": 5.0},
+            "routing": "ask", "routing_reason": "test ambiguous model",
+            "expected_output": "text",
+            "ambiguity": None, "sane": True, "sane_reason": "",
+        })
+    return _caller
+
+
+@pytest.mark.unit
+def test_operator_session_dispatches_and_registers_followup(tmp_path: Path):
+    """An operator root-spawn (no #agent task, origin='operator') is picked up
+    by the spawned-session dispatch, seeded with the enqueued prompt, and its
+    completion registers a replyable follow-up (Phase 1)."""
+    from api.services.agent_worker.operator_spawn import create_operator_session
+
+    api = FakeApi([])  # no #agent vault tasks
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    res = create_operator_session(w.session_store, "do the operator task", explicit_routing="local")
+    assert res["ok"] and res["routing"] == "local"
+
+    w.tick()
+    assert executor.calls, "operator session should dispatch to the executor"
+    # Seeded with the enqueued prompt as the task description (not the task id).
+    assert executor.calls[0][1] == "do the operator task"
+    # Completion registered a follow-up → the notification is replyable.
+    followup = w.session_store.get_recent_resumable_followup(within_seconds=3600)
+    assert followup is not None and followup["kind"] == "followup"
+
+
+@pytest.mark.unit
+def test_operator_ask_resolution_dispatches_after_reply(tmp_path: Path):
+    """An ambiguous operator spawn parks at 'ask'; replying 'local' flips it to
+    claimed and the next tick dispatches it with the prompt intact."""
+    from api.services.agent_worker.operator_spawn import create_operator_session
+
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    res = create_operator_session(w.session_store, "ambiguous task", preflight_caller=_ask_preflight())
+    assert res["needs_routing"]
+    # Telegram would register the routing clarification keyed to its message id.
+    w.session_store.create_pending_question(
+        session_id=res["session_id"], task_id=res["task_id"],
+        question="local or claude?", sent_message_id=7777,
+    )
+
+    w.tick()  # still blocked — nothing dispatched
+    assert executor.calls == []
+
+    assert w.session_store.deposit_answer(7777, "local")
+    w.tick()  # _process_clarification_answers flips blocked -> claimed (dispatch runs earlier in the tick)
+    assert executor.calls == []
+    w.tick()  # now spawned-session dispatch picks it up
+    assert executor.calls, "operator session should dispatch after routing resolved"
+    assert executor.calls[0][1] == "ambiguous task"
+
+
+@pytest.mark.unit
+def test_operator_session_coexists_with_agent_task(tmp_path: Path):
+    """An operator spawn and a normal #agent task both run in the same tick
+    without interfering."""
+    from api.services.agent_worker.operator_spawn import create_operator_session
+
+    api = FakeApi([{"id": "t1", "description": "agent task", "status": "todo", "tags": ["agent"]}])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    create_operator_session(w.session_store, "operator task", explicit_routing="local")
+    w.tick()
+
+    descriptions = {c[1] for c in executor.calls}
+    assert "operator task" in descriptions
+    assert "agent task" in descriptions
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]

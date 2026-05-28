@@ -416,10 +416,11 @@ class Worker:
         """
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
-            # Skip top-level claimed sessions (those came from the tick claim
-            # path and will be dispatched by _dispatch). Spawned children have
-            # a parent_session_id set.
-            if not session.parent_session_id:
+            # Skip top-level claimed sessions from the #agent tick claim path
+            # (those are dispatched by _dispatch). Pick up spawned children
+            # (parent set) and operator root-spawns (#235, no parent but
+            # origin='operator').
+            if not session.parent_session_id and session.origin != "operator":
                 continue
             # The first pending message is the prompt from the parent — drain
             # it so the executor's seeded user turn picks it up.
@@ -549,6 +550,18 @@ class Worker:
                 self.transcript_store.append(session_id, "routing_resolved", {
                     "from": "ask", "to": resolved,
                 })
+                if session.origin == "operator":
+                    # Operator root-spawn: flip back to CLAIMED so the
+                    # spawned-session dispatch picks it up next tick (it drains
+                    # the enqueued prompt as the task description). The #agent
+                    # inline path below would look up a non-existent vault task
+                    # and lose the prompt.
+                    self.session_store.update_status(task_id, STATUS_CLAIMED)
+                    self.session_store.mark_question_processed(q["id"])
+                    self.transcript_store.append(
+                        session_id, "operator_routing_resolved", {"to": resolved},
+                    )
+                    continue
                 # Refresh the session view so downstream code sees the new routing.
                 session = self.session_store.get_by_session_id(session_id)
 

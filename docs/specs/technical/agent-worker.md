@@ -269,6 +269,14 @@ Security: lineage checks ensure a session can only message / kill / yield-on its
 
 Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget breaches at any descendant cascade-kill the entire lineage. Limits configurable via `LIFEOS_AGENT_MAX_SPAWN_DEPTH`, `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT`, `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL`, `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED`.
 
+### Operator root-spawn (#235)
+
+`lifeos_agent_spawn` is same-lineage only (requires a parent session). Operators start agents on demand — with no backing `#agent` vault task — via `create_operator_session()` (`api/services/agent_worker/operator_spawn.py`), reachable from Telegram (`/agent [local|claude] <task>`) and web chat (the same `/agent` slash command).
+
+- **Routing** follows override-then-preflight: an explicit `local`/`claude` keyword wins; otherwise `run_preflight()` decides. On `ROUTE_ASK` the session parks at `blocked` with `routing='ask'` and the caller sends the "local or claude?" clarification (the worker resolves it on reply).
+- **Provenance** is marked with the additive `sessions.origin = 'operator'` column. The worker's `_dispatch_spawned_sessions` skip is relaxed to claim parentless sessions when `origin='operator'`, so they dispatch alongside spawned children without colliding with the top-level `#agent` claim path (which uses NULL origin). The prompt is enqueued as a pending message and drained as the task description on dispatch.
+- Operator sessions are root sessions (`parent_session_id=None`), so their terminal notifications surface to the operator and register a replyable follow-up (Phase 1 / #234). Default budget comes from the `agent_default_*` settings; local concurrency cap of 1 means operator local spawns queue behind running ones.
+
 ---
 
 ## Budget enforcement

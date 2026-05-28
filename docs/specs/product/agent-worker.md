@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-26
+> **Last Updated:** 2026-05-28
 
 LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -121,6 +121,10 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 2. **Clarification requests** — if the preflight can't determine routing OR if a task title is genuinely ambiguous (e.g., "reply to Alex" with no email reference), the worker pauses the task at `#agent-blocked` and asks one targeted question on Telegram. Reply by using Telegram's native reply feature (long-press the bot's message, hit Reply). The worker picks up your answer within the next poll cycle and resumes.
 
 3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)".
+
+**Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: reply to it (Telegram's native reply, on any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). For convenience, a plain message sent within 30 minutes of a notification continues the most recent thread without needing the reply gesture; after 30 minutes a plain message goes to normal chat.
+
+**Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous, the bot asks you "local or claude?" before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 
 Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS`). After that the task is abandoned permanently and you get a Telegram heads-up. The transcript is preserved.
 

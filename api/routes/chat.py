@@ -897,6 +897,58 @@ class SaveToVaultRequest(BaseModel):
     guidance: Optional[str] = None
 
 
+async def _handle_agent_slash(stripped: str, conversation_id, store):
+    """Stream the SSE response for a `/agent [local|claude] <task>` chat command.
+
+    Operator agent spawn from web chat (#235), calling the same
+    `create_operator_session` entry point as the Telegram `/agent` command.
+    Web has no inline reply mechanism yet (added in Phase 3 / #236), so an
+    ambiguous auto-route asks the user to re-run with an explicit model.
+    """
+    rest = stripped[len("/agent"):].strip()
+    explicit = None
+    parts = rest.split(maxsplit=1)
+    if parts and parts[0].lower() in ("local", "claude"):
+        explicit = parts[0].lower()
+        task = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        task = rest
+
+    yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': 'Operator agent spawn', 'latency_ms': 0})}\n\n"
+
+    if not task:
+        msg = "Usage: `/agent [local|claude] <task>` — e.g. `/agent claude refactor the parser`."
+    else:
+        try:
+            from api.services.agent_worker.operator_spawn import create_operator_session
+            from api.services.agent_worker.session_store import SessionStore
+            result = await asyncio.to_thread(
+                create_operator_session, SessionStore(), task, explicit_routing=explicit,
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)[:200]}
+
+        if not result.get("ok"):
+            msg = f"Couldn't spawn agent: {result.get('error')}"
+        elif result.get("needs_routing"):
+            msg = (
+                "I couldn't tell whether to use the local or cloud model — "
+                "re-run as `/agent local <task>` or `/agent claude <task>`."
+            )
+        else:
+            label = "Claude (cloud)" if result["routing"] == "claude" else "local Gemma"
+            msg = (
+                f"🤖 Spawned {label} agent: {task[:120]}\n\n"
+                f"Track it on the Agents page; the result appears there when it's done."
+            )
+
+    for chunk in msg:
+        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+        await asyncio.sleep(0.002)
+    store.add_message(conversation_id, "assistant", msg)
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
 @router.post("/ask/stream")
 async def ask_stream(request: AskStreamRequest):
     """
@@ -933,6 +985,15 @@ async def ask_stream(request: AskStreamRequest):
 
             # Save user message
             store.add_message(conversation_id, "user", request.question)
+
+            # `/agent [local|claude] <task>` — spawn an operator agent on demand
+            # (#235). Equivalent affordance to Telegram's /agent command, calling
+            # the same create_operator_session entry point.
+            _stripped = request.question.strip()
+            if _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent "):
+                async for _ev in _handle_agent_slash(_stripped, conversation_id, store):
+                    yield _ev
+                return
 
             # Get conversation history for context in follow-up questions
             conversation_history = store.get_messages(conversation_id, limit=10)
