@@ -157,17 +157,21 @@ Claude Code sessions do not get a Kill button — the page has no safe primitive
 
 ---
 
-## Operator controls — resume and focus
+## Operator controls — resume and Go To
 
-Claude Code sessions in `inactive` or terminal states get two buttons:
+Claude Code sessions get up to two buttons:
 
-**Resume** opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id.
+**Resume** (shown on terminal / `inactive` / `yielded` sessions) opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id.
 
-**Focus** activates the existing tab for that session — calls `wezterm cli activate-pane --pane-id <id>` against the stored mapping. If WezTerm is the focused window the tab switches immediately; if it's hidden, the pane is selected in the background and a `notify-send` urgency hint pulses the dock icon. The OS-level window-raise across applications is restricted by Wayland compositors (no programmatic foreground steal); WezTerm under XWayland can be raised via `wmctrl`/`xdotool` if the operator needs it.
+**Go To** (shown on every non-subagent Claude Code session, including live ones) jumps focus to the existing WezTerm pane for that session. Double-clicking the node in the graph does the same thing. The endpoint resolves the pane id in three steps:
 
-Focus returns 404 if no Resume has been clicked yet for that session, and 410 if the stored pane no longer exists (e.g. user closed the tab); in both cases the toast prompts the operator to click Resume.
+1. **Cached mapping** — first checks `data/cc_wezterm.db`, populated by either a prior Resume click *or* the optional [SessionStart hook](../../guides/agents-go-to.md) which binds every new `claude` start to its wezterm pane.
+2. **FD probe** — if the cache misses, `lsof` finds which process holds the session's transcript file open; the holder's controlling TTY is matched against `wezterm cli list --format json`'s `tty_name`. Cwd is not enough to disambiguate when multiple panes share a project; the transcript file is. The result is cached for the next click.
+3. **Activate-pane** — once a pane id is known, `wezterm cli activate-pane --pane-id <id>` switches focus. If WezTerm is the focused window the tab switches immediately; if it's hidden, the pane is selected in the background and a `notify-send` urgency hint pulses the dock icon. The OS-level window-raise across applications is restricted by Wayland compositors (no programmatic foreground steal); WezTerm under XWayland can be raised via `wmctrl`/`xdotool` if the operator needs it.
 
-Resume is **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` (the same flag also enables Focus). Customize the launcher (`LIFEOS_CC_RESUME_CMD`) if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The pane-tracking + Focus button assume the launcher prints a pane id on stdout, so non-WezTerm launchers leave Focus inert for those sessions.
+If a cached pane has gone stale (typical: user closed the tab), the activate-pane call fails, the mapping is cleared, and the probe runs once more — the session may have been resumed in a fresh pane. Only when both the cache *and* a fresh probe come up empty does Go To return 404 (toast: "Couldn't locate pane — install the SessionStart hook if claude is running in wezterm"); when a pane existed but is gone and no replacement can be found it returns 410.
+
+Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` (the same flag also gates Go To). Customize the launcher (`LIFEOS_CC_RESUME_CMD`) if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
 
 ---
 

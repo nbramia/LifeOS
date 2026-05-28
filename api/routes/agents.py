@@ -12,9 +12,9 @@ import logging
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from api.services.agent_worker.session_store import (
     TERMINAL_STATUSES,
@@ -749,6 +749,16 @@ class CCResumeRequest(BaseModel):
     extra_env: dict[str, str] = {}
 
 
+class CCPaneBindRequest(BaseModel):
+    """Body for POST /api/agents/cc-pane-bind — written by the SessionStart
+    hook script on every `claude` start. Lets the /agents Focus / Go To
+    button target sessions that were never opened via /agents Resume.
+    """
+    session_id: str = Field(..., min_length=1, max_length=128)
+    pane_id: int = Field(..., ge=0)
+    cwd: str = Field(default="", max_length=4096)
+
+
 def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     """Push `text` to the system clipboard via `wl-copy` (Wayland) or
     `xclip` (X11). Returns True on success, False on any failure. Never
@@ -1204,12 +1214,149 @@ async def resume_claude_code_session(
     }
 
 
+def _lookup_cc_session_meta(session_id: str):
+    """Resolve a `cc:`-prefixed session id back to its discovered SessionMeta.
+
+    Used by /focus to locate the transcript jsonl for the FD probe fallback.
+    Returns (meta, bare_id) or raises HTTPException with an appropriate status.
+
+    Searches project dirs directly for `<bare>.jsonl` rather than calling
+    `discover_sessions`, which would parse every transcript under
+    `~/.claude/projects/` on every Go To cache miss. The /focus caller only
+    reads `meta.jsonl_path` and `meta.decoded_cwd`, so we synthesize a
+    minimal SessionMeta with just those two fields populated.
+    """
+    import os
+    from pathlib import Path
+
+    from api.services.claude_code.session_ingest import (
+        CC_PREFIX,
+        SessionMeta,
+        decode_project_key,
+        validate_session_id,
+    )
+    from config.settings import settings
+
+    try:
+        bare = validate_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if ":agent:" in bare:
+        bare = bare.split(":agent:", 1)[0]
+
+    root = Path(os.path.expanduser(str(settings.claude_code_projects_dir)))
+    if root.exists() and root.is_dir():
+        for proj in root.iterdir():
+            if not proj.is_dir():
+                continue
+            candidate = proj / f"{bare}.jsonl"
+            if candidate.exists():
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                project_key = proj.name
+                meta = SessionMeta(
+                    session_id=CC_PREFIX + bare,
+                    raw_session_id=bare,
+                    project_key=project_key,
+                    decoded_cwd=decode_project_key(project_key),
+                    jsonl_path=str(candidate),
+                    mtime=mtime,
+                )
+                return meta, bare
+
+    raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+
+
+def _activate_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
+    """Run `wezterm cli activate-pane --pane-id <id>`. Returns (success, detail).
+
+    Raises HTTPException only for unrecoverable errors (wezterm missing,
+    timeout). A non-zero rc returns (False, stderr) so the caller can
+    decide whether to re-probe.
+    """
+    import shutil
+    import subprocess
+
+    wezterm_bin = shutil.which("wezterm") or "wezterm"
+    argv = [wezterm_bin, "cli", "activate-pane", "--pane-id", str(pane_id)]
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv
+            argv,
+            env=env,
+            capture_output=True,
+            timeout=3.0,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"wezterm not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail=f"wezterm activate-pane timed out: {exc}") from exc
+
+    if proc.returncode == 0:
+        return True, ""
+    return False, (proc.stderr.decode("utf-8", errors="replace").strip()
+                   or f"wezterm activate-pane exited rc={proc.returncode}")
+
+
+@router.post("/cc-pane-bind")
+async def cc_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, Any]:
+    """Localhost-only endpoint called by the Claude Code SessionStart hook.
+
+    Writes `session_id → pane_id` into `data/cc_wezterm.db` at the moment a
+    `claude` invocation starts inside a wezterm pane, so the /agents
+    Focus / Go To button can later target the pane authoritatively without
+    the FD-probe fallback. The session_id from the hook payload is the
+    bare uuid; we prefix with `cc:` to match the store's keying convention.
+
+    Bound to 127.0.0.1 only — never expose this endpoint publicly. Anyone
+    who can reach it could rewrite the pane mapping for any session.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="cc-pane-bind is localhost-only")
+
+    from api.services.claude_code import session_ingest as cc
+
+    try:
+        bare = cc.validate_session_id(body.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Storage convention: keys are always `cc:`-prefixed (matches /resume's
+    # upsert). `validate_session_id` strips the prefix from the request, so
+    # we re-prefix unconditionally.
+    storage_id = f"cc:{bare}"
+    cwd = body.cwd or ""
+
+    from api.services.cc_wezterm_store import get_default_store
+    mapping = get_default_store().upsert(storage_id, int(body.pane_id), cwd)
+    return {
+        "bound": True,
+        "session_id": storage_id,
+        "pane_id": mapping.pane_id,
+        "cwd": mapping.cwd,
+    }
+
+
 @router.post("/sessions/{session_id}/focus")
 async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
-    """Activate the WezTerm pane that was opened for this session by a prior
-    Resume click. Returns 404 if there's no stored pane mapping (use
-    Resume to create one) and 410 if the pane no longer exists (mapping
-    cleared).
+    """Activate the WezTerm pane running this Claude Code session.
+
+    Resolution order:
+      1. Cached mapping in `data/cc_wezterm.db` (written by /resume or by
+         the SessionStart hook → /cc-pane-bind).
+      2. FD-probe fallback (`cc_pane_locate`): walk the session's
+         transcript file's holders to a wezterm pane via TTY matching.
+         On hit, cache the mapping so subsequent calls are O(1).
+      3. If activate-pane fails on a cached mapping (typical: user closed
+         the tab), the mapping is cleared and the probe runs once more —
+         the session may have been resumed in a fresh pane.
+
+    Returns 404 only when no mapping exists AND probe finds nothing
+    (session not running, non-wezterm terminal). Returns 410 when a pane
+    existed but is now gone and no replacement can be found.
 
     Caveat: on GNOME Wayland the compositor disallows cross-client window
     raise, so this reliably switches the tab within wezterm but cannot
@@ -1217,8 +1364,6 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     follows the activate-pane call to flash the dock icon as a hint.
     """
     import shlex
-    import shutil
-    import subprocess
 
     if not session_id.startswith("cc:"):
         raise HTTPException(status_code=400, detail="focus is only available for Claude Code sessions")
@@ -1232,37 +1377,66 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
 
     from api.services.cc_wezterm_store import get_default_store
+    from api.services import cc_pane_locate
+
     store = get_default_store()
-    mapping = store.get(session_id)
-    if mapping is None:
-        raise HTTPException(
-            status_code=404,
-            detail="no tracked wezterm tab for this session — use Resume to create one",
-        )
-
-    wezterm_bin = shutil.which("wezterm") or "wezterm"
-    argv = [wezterm_bin, "cli", "activate-pane", "--pane-id", str(mapping.pane_id)]
     env = _resume_env()
-    try:
-        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell=True
-            argv,
-            env=env,
-            capture_output=True,
-            timeout=3.0,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail=f"wezterm not found: {exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(status_code=504, detail=f"wezterm activate-pane timed out: {exc}") from exc
 
-    if proc.returncode != 0:
-        # Most common cause: the user closed the tab. Clear the stale
-        # mapping so a subsequent Resume can write a fresh one.
+    # Resolve session metadata lazily — only needed if cache misses or the
+    # cached pane is stale and we need to re-probe.
+    meta = None
+    def _meta():
+        nonlocal meta
+        if meta is None:
+            meta, _ = _lookup_cc_session_meta(session_id)
+        return meta
+
+    def _probe_and_store() -> int | None:
+        try:
+            m = _meta()
+        except HTTPException:
+            return None
+        if not m.jsonl_path:
+            return None
+        pane_id = cc_pane_locate.locate_pane_for_transcript(m.jsonl_path, env=env)
+        if pane_id is None:
+            return None
+        store.upsert(session_id, pane_id, m.decoded_cwd or "")
+        return pane_id
+
+    mapping = store.get(session_id)
+    probed_this_request = False
+
+    if mapping is None:
+        # No cache → probe before giving up.
+        probed = _probe_and_store()
+        probed_this_request = True
+        if probed is None:
+            raise HTTPException(
+                status_code=404,
+                detail="couldn't locate pane — session not running, "
+                       "wezterm unreachable, or SessionStart hook not installed",
+            )
+        mapping = store.get(session_id)
+        assert mapping is not None  # _probe_and_store just wrote it
+
+    ok, detail = _activate_pane(mapping.pane_id, env)
+    if not ok:
+        # Stale mapping — pane was closed, or wezterm restarted and pane
+        # ids reset. Clear the mapping; if the cache came from a prior
+        # request, re-probe once before giving up.
         store.delete(session_id)
-        detail = (proc.stderr.decode("utf-8", errors="replace").strip()
-                  or f"wezterm activate-pane exited rc={proc.returncode}")
-        raise HTTPException(status_code=410, detail=detail)
+        if probed_this_request:
+            raise HTTPException(status_code=410, detail=detail)
+        probed = _probe_and_store()
+        if probed is None:
+            raise HTTPException(status_code=410, detail=detail)
+        mapping = store.get(session_id)
+        assert mapping is not None
+        ok, detail = _activate_pane(mapping.pane_id, env)
+        if not ok:
+            store.delete(session_id)
+            raise HTTPException(status_code=410, detail=detail)
 
     _notify_dock(
         env,

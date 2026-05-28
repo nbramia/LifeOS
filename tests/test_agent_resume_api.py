@@ -662,7 +662,7 @@ def test_focus_returns_404_when_no_mapping(client, wezterm_store, monkeypatch):
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     r = client.post("/api/agents/sessions/cc:no-mapping/focus")
     assert r.status_code == 404
-    assert "resume" in r.json()["detail"].lower()
+    assert "couldn't locate pane" in r.json()["detail"].lower()
 
 
 @pytest.mark.unit

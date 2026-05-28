@@ -70,7 +70,8 @@ All under `/api/agents`. Local-network only — the kill and resume endpoints mu
 | `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). |
 | `POST /sessions/{id}/kill` | Operator kill — body `{reason: ""}`. LifeOS sessions only. Cascades to descendants in the subtree. |
 | `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. |
-| `POST /sessions/{id}/focus` | Activate the WezTerm tab previously opened for this session. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. 404 if no mapping exists; 410 (and mapping cleared) if `wezterm cli activate-pane` fails because the pane no longer exists. |
+| `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. |
+| `POST /cc-pane-bind` | Localhost-only endpoint called by the Claude Code SessionStart hook. Body `{session_id, pane_id, cwd}`. Upserts the mapping in `cc_wezterm.db` so Go To can target newly-started `claude` invocations without a probe. 403 from non-loopback callers. |
 
 Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when there's no new event, so dropped connections surface quickly through the browser's `EventSource` retry.
 
@@ -273,14 +274,15 @@ The endpoint must not be exposed via Tailscale Funnel or the public MCP HTTP tra
 
 ---
 
-## Claude Code resume + focus
+## Claude Code resume + Go To
 
 ```
 POST /api/agents/sessions/{id}/resume   body: {"extra_env": {...}}
 POST /api/agents/sessions/{id}/focus    body: (none)
+POST /api/agents/cc-pane-bind           body: {session_id, pane_id, cwd}   (localhost only)
 ```
 
-Both opt-in via `LIFEOS_CC_RESUME_ENABLED`. Resume spawns a new WezTerm tab and records the new pane id; Focus revisits that pane.
+All three opt-in via `LIFEOS_CC_RESUME_ENABLED` (except `/cc-pane-bind`, which is gated by client IP only — `127.0.0.1` / `::1`). Resume spawns a new WezTerm tab and records the new pane id; Go To (`/focus`) revisits the pane for a session, falling back to an FD probe when no mapping is cached; `/cc-pane-bind` is the SessionStart hook entry point that pre-populates the mapping at `claude` startup.
 
 ### Resume
 
@@ -295,15 +297,32 @@ Both opt-in via `LIFEOS_CC_RESUME_ENABLED`. Resume spawns a new WezTerm tab and 
 
 Response: `{spawned: true, pid, pane_id, command, cwd, inner_command, clipboard_copied}`. The frontend uses `pane_id` to decide whether the Focus button can target this session; if `null`, Focus will respond 404.
 
-### Focus
+### Go To (`/focus`)
 
 1. Validate `cc:` prefix and the `LIFEOS_CC_RESUME_ENABLED` gate.
-2. `CCWezTermStore.get(session_id)`. 404 if missing — operator must click Resume first.
-3. `subprocess.run(["wezterm", "cli", "activate-pane", "--pane-id", str(pane_id)], capture_output=True, timeout=3.0)`.
-4. rc≠0 → delete the stored mapping and return 410 with stderr preview. The mapping is stale (typically: user closed the tab), so the next Resume click writes a fresh one.
-5. Best-effort `notify-send --urgency=critical` so a hidden WezTerm window pulses the dock icon — GNOME Wayland disallows cross-client window raise, so this is the strongest attention hint we can issue from outside the focused client.
+2. **Cache lookup.** `CCWezTermStore.get(session_id)` — populated by Resume *and* by the SessionStart hook → `/cc-pane-bind` write path.
+3. **Probe fallback (cache miss).** Resolve the session's `transcript_path` via `discover_sessions(...)`, then call `cc_pane_locate.locate_pane_for_transcript(jsonl_path)`:
+   - `lsof -t -- <jsonl_path>` → PIDs holding the file open.
+   - For each PID, read `/proc/<pid>/fd/0` and keep entries that resolve to `/dev/pts/N` (interactive `claude` processes have fd 0 attached to their controlling pts).
+   - `wezterm cli list --format json` → match `tty_name` to the holder's pts; first match wins. Wezterm's JSON output does not expose pane.pid in any supported version, but `tty_name` is reliable.
+   - On hit, upsert the mapping so subsequent calls are O(1).
+   - All subprocess calls are timeout-bounded (lsof 2s, wezterm cli 2s) and any failure (missing binary, malformed JSON, no holders) returns `None` rather than raising.
+4. **Activate.** `subprocess.run(["wezterm", "cli", "activate-pane", "--pane-id", str(pane_id)], capture_output=True, timeout=3.0)`.
+5. **Stale-mapping re-probe.** If activate-pane returns rc≠0 on a *cached* mapping, the pane has likely been closed. Delete the mapping, re-run the probe once; if the second probe finds a new pane, retry activate. Only after both attempts fail does the endpoint return 410. A freshly-probed mapping that fails to activate skips straight to 410 (no second probe — we just generated this pane id).
+6. Best-effort `notify-send --urgency=critical` so a hidden WezTerm window pulses the dock icon — GNOME Wayland disallows cross-client window raise, so this is the strongest attention hint we can issue from outside the focused client.
 
 Response: `{focused: true, pane_id, cwd}`.
+
+404 means neither the cache nor the probe surfaced a pane (session not running, non-wezterm terminal, hook not installed). 410 means a pane was identified at some point but is now gone and no replacement could be found.
+
+### `/cc-pane-bind` (SessionStart hook entry point)
+
+1. Reject any request whose `request.client.host` is not in `{"127.0.0.1", "::1"}` with 403.
+2. `validate_session_id(body.session_id)` — strips any `cc:` prefix and rejects path-traversal characters; 400 on failure.
+3. Re-prefix unconditionally (`storage_id = f"cc:{bare}"`) so the keying matches `/resume`'s upsert convention.
+4. `CCWezTermStore.upsert(storage_id, body.pane_id, body.cwd or "")`. `pane_id` is validated by pydantic (`ge=0`).
+
+The hook script (`scripts/claude-session-pane.sh`) is invoked by Claude Code's SessionStart hook. It reads the standard SessionStart JSON payload (`{session_id, cwd, transcript_path, source}`) from stdin, picks up `$WEZTERM_PANE` from the env, and POSTs to this endpoint. No-ops gracefully if any of those are missing (non-wezterm terminal, `jq`/`curl` not installed, server unreachable) — never blocks `claude` startup.
 
 ---
 
@@ -338,7 +357,8 @@ The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tails
 - Are not registered as MCP tools — so they cannot be invoked through the MCP layer even if an attacker has a bearer token.
 - Kill calls into worker primitives that already have an audit trail (every kill emits a transcript event).
 - Resume runs a configured launcher via `shlex.split` only — no `shell=True`. Template substitutions are URL-encoded where they go into URI strings. The rendered `{inner_command}` is split into individual argv tokens before reaching the launcher, so a malicious inner command cannot smuggle shell metacharacters.
-- Focus calls `wezterm cli activate-pane` with a fixed argv (no template) using the pane id from the local SQLite mapping. The store is only writeable from the same process (no cross-machine exposure), and pane ids are integers — there is no path for an external caller to inject arbitrary argv.
+- Focus calls `wezterm cli activate-pane` with a fixed argv (no template) using the pane id from the local SQLite mapping. The store is only writeable from the same process (no cross-machine exposure), and pane ids are integers — there is no path for an external caller to inject arbitrary argv. The FD-probe fallback never reads attacker-controlled data: `lsof` is invoked with the transcript path that LifeOS itself derived from `discover_sessions`, and `/proc/<pid>/fd/0` is read as a symlink target whose filtering keeps only `/dev/pts/N` paths.
+- `/cc-pane-bind` is bound to loopback by IP check (`127.0.0.1` / `::1`); the public MCP transport runs on the same host but a different prefix and would never route to it. The accepted body is constrained: `session_id` runs through `validate_session_id` (rejects path traversal), `pane_id` must be a non-negative int, `cwd` is opaque text.
 
 Per-source guarantees:
 
