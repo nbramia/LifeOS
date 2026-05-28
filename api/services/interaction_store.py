@@ -4,7 +4,6 @@ Interaction Store for LifeOS People System v2.
 Stores lightweight interaction records with links to sources.
 Each interaction represents a single touchpoint (email, meeting, note mention).
 """
-import re
 import sqlite3
 import uuid
 import logging
@@ -18,6 +17,7 @@ from config.settings import settings
 from config.people_config import InteractionConfig
 
 from api.utils.datetime_utils import make_aware as _make_aware
+from api.services import backup_retention as _backup_retention
 
 logger = logging.getLogger(__name__)
 
@@ -214,107 +214,24 @@ def build_calendar_link(event_id: str, calendar_id: str = "primary") -> str:
     return f"https://calendar.google.com/calendar/event?eid={event_id}"
 
 
-# Tiered backup retention buckets, in days. A backup is kept iff it is the
-# newest one falling in any of these buckets:
-#   - the 5 most recent (daily slots) — always kept
-#   - week-numbered buckets between DAILY_KEEP and WEEKLY_HORIZON  (1 per week)
-#   - month-numbered buckets between WEEKLY_HORIZON and MONTHLY_HORIZON (1 per month)
-#   - quarter-numbered buckets beyond MONTHLY_HORIZON               (1 per ~3 months)
-_DAILY_KEEP = 5
-_WEEKLY_HORIZON_DAYS = 35      # past day 35 we step down to monthly
-_MONTHLY_HORIZON_DAYS = 365    # past day 365 we step down to quarterly
-_WEEK_DAYS = 7
-_MONTH_DAYS = 30
-_QUARTER_DAYS = 90
-
-# Shared between the writer (``create_backup``) and the pruner so any
-# future change to the naming scheme — e.g., adding microseconds or
-# switching to ISO-8601 — automatically updates both sides instead of
-# silently desyncing them (which would make every new backup invisible to
-# retention math and let the directory grow unbounded).
-_BACKUP_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
-_BACKUP_FILENAME_TEMPLATE = "interactions.db.{ts}.backup"
-_BACKUP_FILE_GLOB = "interactions.db.*.backup"
-_BACKUP_FILE_RE = re.compile(r"^interactions\.db\.(\d{8}_\d{6})\.backup$")
+# Backup retention is owned by ``api.services.backup_retention`` so other
+# SQLite stores (crm.db, sync_health.db, …) can adopt the same policy
+# without copy-pasting the bucket math. See issue #227. The wrappers
+# below are kept so legacy test code that imported the private helpers
+# from this module keeps working.
+_BACKUP_DB_BASENAME = "interactions.db"
 
 
 def _backup_filename(ts: datetime) -> str:
-    """Canonical backup filename for a given timestamp."""
-    return _BACKUP_FILENAME_TEMPLATE.format(ts=ts.strftime(_BACKUP_TIMESTAMP_FORMAT))
+    return _backup_retention.backup_filename(_BACKUP_DB_BASENAME, ts)
 
 
 def _parse_backup_timestamp(name: str) -> Optional[datetime]:
-    """Parse the timestamp embedded in a backup filename, or None on mismatch.
-
-    Files with non-canonical names (e.g., ``interactions.db.pre-upgrade.backup``)
-    are intentionally returned as None so ``_prune_backups`` leaves them
-    alone — operators sometimes drop those in for manual safekeeping.
-    """
-    m = _BACKUP_FILE_RE.match(name)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(m.group(1), _BACKUP_TIMESTAMP_FORMAT)
-    except ValueError:
-        return None
+    return _backup_retention.parse_backup_timestamp(name, _BACKUP_DB_BASENAME)
 
 
 def _prune_backups(backup_dir: Path, now: Optional[datetime] = None) -> list[Path]:
-    """Apply the tiered backup retention to ``backup_dir``.
-
-    Keeps the 5 most recent backups (daily slots), then one per week back to
-    35 days, then one per month back to a year, then one per quarter beyond.
-    Anything else is deleted. Returns the list of paths removed (useful for
-    logging and tests).
-
-    Backups with names that don't match the standard
-    ``interactions.db.YYYYMMDD_HHMMSS.backup`` pattern are ignored — never
-    counted toward retention slots, never deleted.
-    """
-    if now is None:
-        now = datetime.now()
-
-    candidates: list[tuple[datetime, Path]] = []
-    for path in backup_dir.glob(_BACKUP_FILE_GLOB):
-        ts = _parse_backup_timestamp(path.name)
-        if ts is not None:
-            candidates.append((ts, path))
-
-    if not candidates:
-        return []
-
-    # Newest first
-    candidates.sort(key=lambda x: x[0], reverse=True)
-
-    keep: set[Path] = set()
-
-    # Tier 1: the 5 most recent — always kept.
-    for _, path in candidates[:_DAILY_KEEP]:
-        keep.add(path)
-
-    # Tiers 2/3/4: bucket the older ones; keep the newest in each bucket.
-    seen_buckets: set[tuple[str, int]] = set()
-    for ts, path in candidates[_DAILY_KEEP:]:
-        age_days = (now - ts).total_seconds() / 86400.0
-        if age_days < _WEEKLY_HORIZON_DAYS:
-            bucket = ("week", int(age_days // _WEEK_DAYS))
-        elif age_days < _MONTHLY_HORIZON_DAYS:
-            bucket = ("month", int(age_days // _MONTH_DAYS))
-        else:
-            bucket = ("quarter", int(age_days // _QUARTER_DAYS))
-        if bucket not in seen_buckets:
-            seen_buckets.add(bucket)
-            keep.add(path)
-
-    removed: list[Path] = []
-    for _, path in candidates:
-        if path not in keep:
-            try:
-                path.unlink()
-                removed.append(path)
-            except OSError as e:
-                logger.warning(f"Could not remove old backup {path}: {e}")
-    return removed
+    return _backup_retention.prune(backup_dir, _BACKUP_DB_BASENAME, now=now)
 
 
 class InteractionStore:

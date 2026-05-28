@@ -1210,6 +1210,31 @@ def create_slack_source_entity(
     )
 
 
+def create_phone_source_entity(
+    phone: str,
+    observed_name: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity for an observed phone number.
+
+    The ``source_id`` convention is ``phone_{e164}``. Centralising this
+    here keeps the two phone-call import paths
+    (``scripts/apple_data_import.import_phone_calls`` on Linux and
+    ``scripts/sync_phone_calls.py`` native on macOS) from drifting if the
+    format ever changes — silent duplicates were the failure mode that
+    motivated issue #228.
+    """
+    return SourceEntity(
+        source_type="phone",
+        source_id=f"phone_{phone}",
+        observed_name=observed_name,
+        observed_phone=phone,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
 def create_imessage_source_entity(
     handle: str,
     display_name: Optional[str] = None,
