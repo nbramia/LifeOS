@@ -4,6 +4,7 @@ Interaction Store for LifeOS People System v2.
 Stores lightweight interaction records with links to sources.
 Each interaction represents a single touchpoint (email, meeting, note mention).
 """
+import re
 import sqlite3
 import uuid
 import logging
@@ -211,6 +212,91 @@ def build_calendar_link(event_id: str, calendar_id: str = "primary") -> str:
         Google Calendar web URL
     """
     return f"https://calendar.google.com/calendar/event?eid={event_id}"
+
+
+# Tiered backup retention buckets, in days. A backup is kept iff it is the
+# newest one falling in any of these buckets:
+#   - the 5 most recent (daily slots) — always kept
+#   - week-numbered buckets between DAILY_KEEP and WEEKLY_HORIZON  (1 per week)
+#   - month-numbered buckets between WEEKLY_HORIZON and MONTHLY_HORIZON (1 per month)
+#   - quarter-numbered buckets beyond MONTHLY_HORIZON               (1 per ~3 months)
+_DAILY_KEEP = 5
+_WEEKLY_HORIZON_DAYS = 35      # past day 35 we step down to monthly
+_MONTHLY_HORIZON_DAYS = 365    # past day 365 we step down to quarterly
+_WEEK_DAYS = 7
+_MONTH_DAYS = 30
+_QUARTER_DAYS = 90
+
+_BACKUP_FILE_RE = re.compile(r"^interactions\.db\.(\d{8})_(\d{6})\.backup$")
+
+
+def _parse_backup_timestamp(name: str) -> Optional[datetime]:
+    """Parse the timestamp embedded in a backup filename, or None on mismatch."""
+    m = _BACKUP_FILE_RE.match(name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def _prune_backups(backup_dir: Path, now: Optional[datetime] = None) -> list[Path]:
+    """Apply the tiered backup retention to ``backup_dir``.
+
+    Keeps the 5 most recent backups (daily slots), then one per week back to
+    35 days, then one per month back to a year, then one per quarter beyond.
+    Anything else is deleted. Returns the list of paths removed (useful for
+    logging and tests).
+
+    Backups with names that don't match the standard
+    ``interactions.db.YYYYMMDD_HHMMSS.backup`` pattern are ignored — never
+    counted toward retention slots, never deleted.
+    """
+    if now is None:
+        now = datetime.now()
+
+    candidates: list[tuple[datetime, Path]] = []
+    for path in backup_dir.glob("interactions.db.*.backup"):
+        ts = _parse_backup_timestamp(path.name)
+        if ts is not None:
+            candidates.append((ts, path))
+
+    if not candidates:
+        return []
+
+    # Newest first
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    keep: set[Path] = set()
+
+    # Tier 1: the 5 most recent — always kept.
+    for _, path in candidates[:_DAILY_KEEP]:
+        keep.add(path)
+
+    # Tiers 2/3/4: bucket the older ones; keep the newest in each bucket.
+    seen_buckets: set[tuple[str, int]] = set()
+    for ts, path in candidates[_DAILY_KEEP:]:
+        age_days = (now - ts).total_seconds() / 86400.0
+        if age_days < _WEEKLY_HORIZON_DAYS:
+            bucket = ("week", int(age_days // _WEEK_DAYS))
+        elif age_days < _MONTHLY_HORIZON_DAYS:
+            bucket = ("month", int(age_days // _MONTH_DAYS))
+        else:
+            bucket = ("quarter", int(age_days // _QUARTER_DAYS))
+        if bucket not in seen_buckets:
+            seen_buckets.add(bucket)
+            keep.add(path)
+
+    removed: list[Path] = []
+    for _, path in candidates:
+        if path not in keep:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError as e:
+                logger.warning(f"Could not remove old backup {path}: {e}")
+    return removed
 
 
 class InteractionStore:
@@ -1181,10 +1267,8 @@ class InteractionStore:
 
     def create_backup(self) -> Optional[Path]:
         """
-        Create a backup of interactions.db.
-
-        Uses LIFEOS_BACKUP_PATH from settings.
-        Keeps only 2 most recent backups.
+        Create a backup of interactions.db and prune old ones via the
+        tiered retention policy in ``_prune_backups``.
 
         Returns:
             Path to backup file if created, None if no db to backup
@@ -1206,11 +1290,11 @@ class InteractionStore:
             shutil.copy2(db_path, backup_path)
             logger.info(f"Created interactions backup: {backup_path}")
 
-            # Keep only 2 most recent backups
-            backups = sorted(backup_dir.glob("interactions.db.*.backup"))
-            for old_backup in backups[:-2]:
-                old_backup.unlink()
-                logger.debug(f"Removed old backup: {old_backup}")
+            removed = _prune_backups(backup_dir)
+            if removed:
+                logger.info(
+                    f"Backup retention pruned {len(removed)} old backup(s)"
+                )
 
             return backup_path
         except Exception as e:

@@ -259,7 +259,19 @@ def _extract_phone_from_title(title: str) -> str | None:
 
 
 def import_phone_calls(dry_run: bool = False) -> dict:
-    """Import phone call history from JSON export."""
+    """Import phone call history from the Mac Mini's JSON export.
+
+    Mirrors the source_entity behaviour of ``scripts/sync_phone_calls.py``
+    (the macOS-native version). For each call we observe we ensure a
+    phone-keyed SourceEntity exists (``phone_{e164}``) and is linked to a
+    PersonEntity, then create the Interaction. Same pattern as iMessage.
+
+    Without this, new phone numbers calling in were silently dropped — the
+    issue #199 §2 drift pattern. The dashboard stayed green because
+    interactions kept flowing for *already-known* numbers, while
+    ``source_entities WHERE source_type='phone'`` quietly stopped
+    accumulating on 2026-03-03.
+    """
     calls_path = IMPORT_DIR / "phone_calls.json"
     if not calls_path.exists():
         return {"status": "skipped", "reason": "phone_calls.json not found"}
@@ -275,12 +287,26 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
     from api.services.interaction_store import get_interaction_store, Interaction
     from api.services.entity_resolver import get_entity_resolver
+    from api.services.source_entity import (
+        SourceEntity,
+        get_source_entity_store,
+        LINK_STATUS_AUTO,
+    )
 
     store = get_interaction_store()
     resolver = get_entity_resolver()
+    se_store = get_source_entity_store()
+
+    # Per-phone cache for this run so we don't hit the DB again for every
+    # call from the same number (typical export has 100s of calls across
+    # dozens of unique numbers).
+    seen_phones: set[str] = set()
+
     imported = 0
     skipped = 0
     unresolved = 0
+    source_entities_created = 0
+    source_entities_updated = 0
 
     for call in calls:
         source_id = call.get("source_id", "")
@@ -290,12 +316,6 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
         source_type = call.get("source_type", "phone")
 
-        # Check if already exists
-        existing = store.get_by_source(source_type, source_id)
-        if existing:
-            skipped += 1
-            continue
-
         timestamp = None
         if call.get("timestamp"):
             try:
@@ -304,13 +324,58 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
-        # Resolve phone number to a PersonEntity
         title = call.get("title", "")
         phone = _extract_phone_from_title(title)
-        person = resolver.resolve_by_phone(phone) if phone else None
+        if not phone:
+            unresolved += 1
+            continue
 
+        # Resolve / create PersonEntity by phone. ``create_if_missing=True``
+        # ensures a never-before-seen caller still gets a Person row, so
+        # source_entities never carry a dangling canonical_person_id.
+        result = resolver.resolve(phone=phone, create_if_missing=True)
+        person = result.entity if result else None
         if not person:
             unresolved += 1
+            continue
+
+        # Ensure a phone-keyed source_entity exists and is linked.
+        # This happens BEFORE the "existing interaction?" check so that
+        # already-imported calls still contribute to source_entity
+        # accumulation when the resolver / entity store grows new rows.
+        # The seen_phones cache keeps this O(unique_phones), not O(calls).
+        if phone not in seen_phones:
+            seen_phones.add(phone)
+            se_source_id = f"phone_{phone}"
+            now = datetime.now(timezone.utc)
+            existing_se = se_store.get_by_source("phone", se_source_id)
+            if existing_se:
+                existing_se.observed_phone = phone
+                existing_se.observed_at = timestamp or now
+                se_store.update(existing_se)
+                source_entities_updated += 1
+                se = existing_se
+            else:
+                se = SourceEntity(
+                    source_type="phone",
+                    source_id=se_source_id,
+                    observed_name=None,
+                    observed_phone=phone,
+                    metadata={},
+                    observed_at=timestamp or now,
+                )
+                se = se_store.add(se)
+                source_entities_created += 1
+            if se.canonical_person_id != person.id:
+                se_store.link_to_person(
+                    se.id, person.id,
+                    confidence=0.95, status=LINK_STATUS_AUTO,
+                )
+
+        # Skip calls already in the interaction store.
+        existing = store.get_by_source(source_type, source_id)
+        if existing:
+            skipped += 1
             continue
 
         interaction = Interaction(
@@ -328,9 +393,18 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
     logger.info(
         f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid), "
-        f"{unresolved} unresolved (no matching person)"
+        f"{unresolved} unresolved (no phone in title), "
+        f"{source_entities_created} source_entities created, "
+        f"{source_entities_updated} updated"
     )
-    return {"status": "ok", "imported": imported, "skipped": skipped, "unresolved": unresolved}
+    return {
+        "status": "ok",
+        "imported": imported,
+        "skipped": skipped,
+        "unresolved": unresolved,
+        "source_entities_created": source_entities_created,
+        "source_entities_updated": source_entities_updated,
+    }
 
 
 def import_photos_faces(dry_run: bool = False) -> dict:
@@ -674,8 +748,9 @@ def main():
             # (which emits its own SYNC_STATS line). Nothing to count here.
             pass
         elif name == "phone":
-            # import_phone_calls → {"imported", "skipped", "unresolved"}
+            # import_phone_calls → {"imported", "source_entities_created", …}
             aggregate["interactions_created"] += int(result.get("imported", 0) or 0)
+            aggregate["source_entities_created"] += int(result.get("source_entities_created", 0) or 0)
         elif name == "photos":
             # import_photos_faces → {"sources_created", "interactions_created"}
             aggregate["source_entities_created"] += int(result.get("sources_created", 0) or 0)
