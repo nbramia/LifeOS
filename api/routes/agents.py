@@ -583,6 +583,14 @@ def _resume_env() -> dict[str, str]:
     then layers in key=value lines from LIFEOS_CC_RESUME_ENV_FILE if set.
     The file lets operators pin DISPLAY / XAUTHORITY / WAYLAND_DISPLAY /
     DBUS_SESSION_BUS_ADDRESS explicitly — systemd usually omits them.
+
+    Also derives XDG_RUNTIME_DIR (`/run/user/<uid>`) when missing — it's
+    required for wezterm cli to locate the GUI's socket at
+    `$XDG_RUNTIME_DIR/wezterm/gui-sock-<pid>`. Without it, `wezterm cli`
+    silently auto-starts a headless `wezterm-mux-server` and spawns
+    tabs into THAT (invisible to the user). The systemd unit's env
+    usually lacks XDG_RUNTIME_DIR even when the env file is set, so
+    we always backfill the convention.
     """
     import os
     env: dict[str, str] = dict(os.environ)
@@ -604,6 +612,15 @@ def _resume_env() -> dict[str, str]:
                     env[k.strip()] = v.strip()
         except OSError as exc:
             logger.warning("cc_resume_env_file unreadable (%s): %s", path, exc)
+
+    # Backfill XDG_RUNTIME_DIR using the standard `/run/user/<uid>`
+    # convention if the env didn't already define it. wezterm cli needs
+    # this to find the running GUI's socket.
+    if not env.get("XDG_RUNTIME_DIR"):
+        uid = os.getuid()
+        candidate = f"/run/user/{uid}"
+        if os.path.isdir(candidate):
+            env["XDG_RUNTIME_DIR"] = candidate
     return env
 
 
