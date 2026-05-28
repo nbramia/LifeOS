@@ -227,16 +227,34 @@ _WEEK_DAYS = 7
 _MONTH_DAYS = 30
 _QUARTER_DAYS = 90
 
-_BACKUP_FILE_RE = re.compile(r"^interactions\.db\.(\d{8})_(\d{6})\.backup$")
+# Shared between the writer (``create_backup``) and the pruner so any
+# future change to the naming scheme — e.g., adding microseconds or
+# switching to ISO-8601 — automatically updates both sides instead of
+# silently desyncing them (which would make every new backup invisible to
+# retention math and let the directory grow unbounded).
+_BACKUP_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+_BACKUP_FILENAME_TEMPLATE = "interactions.db.{ts}.backup"
+_BACKUP_FILE_GLOB = "interactions.db.*.backup"
+_BACKUP_FILE_RE = re.compile(r"^interactions\.db\.(\d{8}_\d{6})\.backup$")
+
+
+def _backup_filename(ts: datetime) -> str:
+    """Canonical backup filename for a given timestamp."""
+    return _BACKUP_FILENAME_TEMPLATE.format(ts=ts.strftime(_BACKUP_TIMESTAMP_FORMAT))
 
 
 def _parse_backup_timestamp(name: str) -> Optional[datetime]:
-    """Parse the timestamp embedded in a backup filename, or None on mismatch."""
+    """Parse the timestamp embedded in a backup filename, or None on mismatch.
+
+    Files with non-canonical names (e.g., ``interactions.db.pre-upgrade.backup``)
+    are intentionally returned as None so ``_prune_backups`` leaves them
+    alone — operators sometimes drop those in for manual safekeeping.
+    """
     m = _BACKUP_FILE_RE.match(name)
     if not m:
         return None
     try:
-        return datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S")
+        return datetime.strptime(m.group(1), _BACKUP_TIMESTAMP_FORMAT)
     except ValueError:
         return None
 
@@ -257,7 +275,7 @@ def _prune_backups(backup_dir: Path, now: Optional[datetime] = None) -> list[Pat
         now = datetime.now()
 
     candidates: list[tuple[datetime, Path]] = []
-    for path in backup_dir.glob("interactions.db.*.backup"):
+    for path in backup_dir.glob(_BACKUP_FILE_GLOB):
         ts = _parse_backup_timestamp(path.name)
         if ts is not None:
             candidates.append((ts, path))
@@ -1283,8 +1301,9 @@ class InteractionStore:
         backup_dir = Path(settings.backup_path)
         backup_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = backup_dir / f"interactions.db.{timestamp}.backup"
+        # Filename construction goes through the same helper the pruner
+        # uses to parse, so any future schema tweak stays in sync.
+        backup_path = backup_dir / _backup_filename(datetime.now())
 
         try:
             shutil.copy2(db_path, backup_path)
