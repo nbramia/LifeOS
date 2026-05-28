@@ -150,7 +150,7 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 
 5. **Timeout**: A watchdog timer kills the subprocess after 10 minutes (configurable). You'll get a timeout notification in Telegram.
 
-6. **MCP tools**: Claude Code sessions have access to LifeOS data via MCP tools (`lifeos_ask`, `lifeos_search`, `lifeos_calendar_*`, etc.). This lets Claude reference personal data while performing code tasks. See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md#mcp-tools) for the full tool list.
+6. **MCP tools**: Claude Code sessions have access to LifeOS data via MCP tools (`lifeos_ask`, `lifeos_search`, `lifeos_calendar_*`, etc.). This lets Claude reference personal data while performing code tasks. See [MCP Tools](../specs/product/mcp-tools.md) for the full tool list.
 
 7. **Server shutdown**: Active sessions are gracefully terminated during server restart.
 
@@ -229,4 +229,4 @@ If Claude is working in the wrong directory, make your task description more exp
 ## Related Documents
 
 - [Scripts Reference](scripts.md) -- All LifeOS scripts with usage examples
-- [API Reference](../specs/product/api-reference.md) -- MCP tools used by Claude Code sessions
+- [MCP Tools](../specs/product/mcp-tools.md) -- MCP tools used by Claude Code sessions

@@ -135,7 +135,7 @@ Available tools include:
 - `lifeos_task_create` / `lifeos_task_list` - Task management
 - `lifeos_reminder_create` / `lifeos_reminder_list` - Reminders
 
-See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md) for full tool list.
+See [MCP Tools](../specs/product/mcp-tools.md) for full tool list.
 
 ---
 
@@ -177,7 +177,8 @@ Run this checklist to ensure everything is working:
    - macOS: [Launchd Setup](../guides/LAUNCHD-SETUP.md) for auto-start
 
 3. **Learn the API**:
-   - [API Reference](../architecture/API-MCP-REFERENCE.md)
+   - [API Reference](../specs/product/api-reference.md)
+   - [MCP Tools](../specs/product/mcp-tools.md)
 
 ---
 
