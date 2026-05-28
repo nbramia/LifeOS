@@ -315,6 +315,110 @@ async def stream_snapshots() -> StreamingResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Agent threads for web /chat (#236, Phase 3 of #233)
+# ---------------------------------------------------------------------------
+
+
+class SpawnRequest(BaseModel):
+    """Body for POST /api/agents/spawn — operator agent spawn from web chat."""
+    prompt: str
+    # "local" | "claude" force the model; "auto"/None routes via preflight.
+    routing: str | None = None
+
+
+class ReplyRequest(BaseModel):
+    """Body for POST /api/agents/threads/{id}/reply."""
+    text: str
+
+
+def _thread_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
+    """Session dict plus a `resumable` flag for the threads panel."""
+    d = _session_to_dict(s, transcript)
+    d["resumable"] = s.status in TERMINAL_STATUSES
+    d["origin"] = getattr(s, "origin", None)
+    return d
+
+
+@router.get("/threads")
+async def list_threads(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    """List recent/resumable agent threads (root sessions only) for /chat.
+
+    Spawned children are internal to a parent's flow, so only top-level
+    sessions (no `parent_session_id`) are surfaced as conversable threads.
+    """
+    session_store = _get_session_store()
+    transcript_store = _get_transcript_store()
+    sessions = session_store.list_sessions(limit=_SNAPSHOT_LIMIT)
+    threads = [
+        _thread_dict(s, transcript_store)
+        for s in sessions
+        if not s.parent_session_id
+    ]
+    return {"threads": threads[:limit], "total": len(threads)}
+
+
+@router.get("/threads/{session_id}")
+async def get_thread(
+    session_id: str,
+    limit: int = Query(200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """A single thread: session metadata + a transcript tail."""
+    session_store = _get_session_store()
+    transcript_store = _get_transcript_store()
+    session = session_store.get_by_session_id(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="thread not found")
+    try:
+        events = transcript_store.read(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    tail = events[-limit:] if len(events) > limit else events
+    return {"thread": _thread_dict(session, transcript_store), "events": tail, "total": len(events)}
+
+
+@router.post("/threads/{session_id}/reply")
+async def reply_to_thread(session_id: str, body: ReplyRequest) -> dict[str, Any]:
+    """Reply to a completed/failed thread to resume it as a follow-up turn.
+
+    Deposits into the same follow-up path a Telegram reply consumes — the
+    worker's next tick reopens the session via `_resume_as_followup`.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="reply text is required")
+    session_store = _get_session_store()
+    session = session_store.get_by_session_id(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="thread not found")
+    if session.status not in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"thread is {session.status}; can only reply to a finished thread",
+        )
+    session_store.enqueue_web_followup(session_id, session.task_id, text)
+    return {"ok": True, "session_id": session_id, "status": "queued"}
+
+
+@router.post("/spawn")
+async def spawn_agent(body: SpawnRequest) -> dict[str, Any]:
+    """Spawn an operator agent on demand (#235's create_operator_session)."""
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    routing = body.routing
+    explicit = routing if routing in ("local", "claude") else None  # "auto"/None → preflight
+    from api.services.agent_worker.operator_spawn import create_operator_session
+
+    session_store = _get_session_store()
+    result = await asyncio.to_thread(
+        create_operator_session, session_store, prompt, explicit_routing=explicit,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "spawn failed"))
+    return result
+
+
 class KillRequest(BaseModel):
     reason: str = ""
 
