@@ -94,6 +94,52 @@ def test_get_thread_404(stores, client):
     assert resp.status_code == 404
 
 
+def test_thread_conversation_from_messages(stores, client):
+    """The thread detail reconstructs a user/assistant conversation (with tool
+    calls attached) from the local messages table."""
+    session_store, _ = stores
+    s = session_store.create(task_id="t", status=STATUS_COMPLETED, routing="local")
+    sid = s.session_id
+    session_store.append_message(sid, "system", "you are an agent")
+    session_store.append_message(sid, "user", "research the best CRMs")
+    session_store.append_message(sid, "assistant", [
+        {"type": "text", "text": "Here are the top 3."},
+        {"type": "tool_use", "id": "x", "name": "lifeos_search", "input": {"q": "CRM"}},
+    ])
+    # Tool results fed back as a user turn — internal plumbing, should be hidden.
+    session_store.append_message(sid, "user", [
+        {"type": "tool_result", "tool_use_id": "x", "content": "12 results"},
+    ])
+    session_store.append_message(sid, "assistant", [{"type": "text", "text": "HubSpot fits best."}])
+
+    conv = client.get(f"/api/agents/threads/{sid}").json()["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant", "assistant"]
+    assert conv[0]["text"] == "research the best CRMs"
+    assert conv[1]["text"] == "Here are the top 3."
+    assert conv[1]["tools"] == [{"name": "lifeos_search", "input": {"q": "CRM"}}]
+    assert conv[2]["text"] == "HubSpot fits best."
+
+
+def test_reconstruct_conversation_from_managed_events():
+    """Cloud sessions (no messages-table rows) reconstruct from transcript."""
+    from api.routes.agents import _reconstruct_conversation
+    events = [
+        {"kind": "managed_event_agent.tool_use", "payload": {"name": "drive_search", "input": {"q": "x"}}},
+        {"kind": "managed_event_agent.message", "payload": {"content": [{"text": "Found 3 files."}]}},
+        {"kind": "managed_event_agent.message", "payload": {"content": [{"text": "Done."}]}},
+    ]
+    conv = _reconstruct_conversation([], events)
+    assert conv[0]["role"] == "assistant"
+    assert conv[0]["tools"] == [{"name": "drive_search", "input": {"q": "x"}}]
+    assert conv[0]["text"] == "Found 3 files."
+    assert conv[1]["text"] == "Done." and conv[1]["tools"] == []
+
+
+def test_reconstruct_conversation_empty():
+    from api.routes.agents import _reconstruct_conversation
+    assert _reconstruct_conversation([], []) == []
+
+
 # ---------------------------------------------------------------------------
 # POST /threads/{id}/reply
 # ---------------------------------------------------------------------------

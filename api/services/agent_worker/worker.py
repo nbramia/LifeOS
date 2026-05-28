@@ -660,8 +660,10 @@ class Worker:
         task = self._fetch_task(task_id) or {"id": task_id, "description": task_id}
 
         if session.routing == ROUTE_LOCAL:
+            # Surface-neutral prefix: follow-ups arrive from Telegram replies and
+            # the web /chat thread view (#236), so don't hardcode "Telegram".
             self.session_store.append_message(
-                sid, "user", f"(user replied on Telegram) {answer}",
+                sid, "user", f"(operator reply) {answer}",
             )
             executor = self._get_local_executor(caller_session_id=sid)
             try:

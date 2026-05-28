@@ -202,8 +202,9 @@ The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable vi
 Web `/chat` speaks to the same agent-thread model as Telegram (#236, Phase 3 of #233):
 
 - **Threads panel** (sidebar) — lists recent/resumable agent sessions (root sessions only) with a status badge (running / completed / failed / budget / blocked). Backed by `GET /api/agents/threads`; polled for live-ish updates (the `/agents` page uses the `/api/agents/stream` SSE for the full graph).
-- **Reply** — completed/failed threads show a reply box; sending it (`POST /api/agents/threads/{id}/reply`) reopens the session as a follow-up turn via the shared follow-up table — the same path a Telegram reply takes.
-- **Run as agent** — the composer has a model selector (auto / local / cloud) and a spawn button; it sends the composer text to `POST /api/agents/spawn` (Phase 2's `create_operator_session`), and the new thread appears in the panel. `auto` routes via preflight.
+- **Open a thread** — clicking a thread loads its full conversation into the main chat body: user prompts and the agent's replies render as chat bubbles, with the agent's tool calls shown as collapsible detail under each reply. Backed by `GET /api/agents/threads/{id}`, which returns a reconstructed `conversation` (from the session's message history, or the managed transcript for cloud sessions). A banner marks the thread; **Exit to chat** (or **+**) returns to normal chat.
+- **Reply / continue** — while a thread is open the composer continues *that thread*: sending a message posts to `POST /api/agents/threads/{id}/reply`, which reopens the session as a follow-up turn via the shared follow-up table (the same path a Telegram reply takes). The view polls and re-renders as the agent's new turns land. Only completed/failed threads are continuable; a running thread opens read-only.
+- **Run as agent** — the composer has a model selector (auto / local / cloud) and a spawn button; it sends the composer text to `POST /api/agents/spawn` (Phase 2's `create_operator_session`), and the new thread appears in the panel. `auto` routes via preflight; an ambiguous auto-route returns 409 asking for an explicit model.
 
 ## Implementation Details
 
