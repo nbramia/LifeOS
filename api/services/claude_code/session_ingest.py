@@ -459,11 +459,25 @@ def parse_session(
     last_user_text = ""
     model = ""
     subagents: list[dict[str, Any]] = []
+    # Session titles written by the CLI as their own record types (dropped from
+    # the normalized event stream as noise, but captured here for labeling):
+    #   custom-title → the user's explicit `/rename` value (`customTitle`)
+    #   ai-title     → the CLI's auto-generated summary title (`aiTitle`)
+    # Latest record of each wins (they're appended over the session's life).
+    custom_title = ""
+    ai_title = ""
     # Track open tool_use ids so we can decide if the last assistant turn
     # is "waiting on a tool result" (yielded) vs. final.
     open_tool_uses: set[str] = set()
 
     for raw in _iter_lines(meta.jsonl_path):
+        rtype = raw.get("type")
+        if rtype == "custom-title":
+            custom_title = (raw.get("customTitle") or "").strip() or custom_title
+            continue
+        if rtype == "ai-title":
+            ai_title = (raw.get("aiTitle") or "").strip() or ai_title
+            continue
         ev = normalize_event(raw)
         if ev is None:
             continue
@@ -550,10 +564,17 @@ def parse_session(
         now=now,
         has_live_process=False,
     )
-    # Choose a label: prefer the most recent user prompt (truncated); fall
-    # back to the working-directory basename so the node is at least
-    # locatable. Falls back to session_id last.
-    if last_user_text:
+    # Choose a label, most human-intentful first:
+    #   1. the user's explicit `/rename` (custom-title) — always wins
+    #   2. the CLI's auto-generated summary title (ai-title)
+    #   3. the most recent user prompt (truncated)
+    #   4. the working-directory basename, so the node is at least locatable
+    #   5. the raw session id as a last resort
+    if custom_title:
+        meta.label = _truncate(custom_title.replace("\n", " "), 60)
+    elif ai_title:
+        meta.label = _truncate(ai_title.replace("\n", " "), 60)
+    elif last_user_text:
         meta.label = _truncate(last_user_text.replace("\n", " "), 60)
     elif meta.decoded_cwd:
         meta.label = basename_for(meta.decoded_cwd)

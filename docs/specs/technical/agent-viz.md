@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-27
+> **Last Updated:** 2026-05-28
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -146,6 +146,8 @@ Event normalization (`normalize_event`) maps three Claude Code message types int
 - **assistant** → `assistant_text`, `tool_call`, `extended_thinking`. Usage block is summed into the session totals (input, output, cache_creation @ 1.25× the input rate, cache_read @ 0.10×).
 - **user** → `user_message` (operator's text input) or `tool_result` (model's tool-call response). Tool results are truncated to 240 chars.
 - **system** → `system_message`. Permission-mode changes etc. are dropped as noise.
+
+**Session label precedence.** `parse_session` picks a Claude Code session's display label, most human-intentful first: the user's explicit `/rename` (the CLI's `custom-title` record → `customTitle`), then the CLI's auto-generated `ai-title` (`aiTitle`), then the most recent user prompt (truncated to 60), then the working-directory basename, then the raw session id. The `custom-title` / `ai-title` records are dropped from the normalized *event* stream as noise but read here for labeling; the latest record of each kind wins.
 
 Subagent spawns are detected when an assistant message contains a `tool_use` block with `name in {"Agent", "Task"}`. Each such tool-use becomes a synthetic session node — `subagent_session_dict(parent, subagent)` — with id `<parent>:agent:<tool_use_id>` and a spawn edge from the parent. These nodes don't have their own jsonl; clicking one currently loads the parent's transcript (filtered-by-tool-use-id is future work).
 
