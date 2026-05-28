@@ -480,6 +480,56 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
+def _find_live_wezterm_socket(xdg_runtime_dir: str | None) -> str | None:
+    """Return the path to a wezterm-gui socket whose owning PID is alive.
+
+    Scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*`. Each filename ends in
+    the wezterm-gui process's pid; we keep only sockets whose pid
+    responds to a `kill -0` liveness check (filters out stale sockets
+    left behind by crashed wezterm-gui processes). If multiple GUI
+    instances are running, pick the most-recently-modified socket
+    (the user's "current" wezterm typically being the one they just
+    interacted with).
+
+    Returns None if no live socket exists, leaving wezterm cli to fall
+    back to its default discovery.
+    """
+    import os
+
+    if not xdg_runtime_dir:
+        return None
+    sock_dir = os.path.join(xdg_runtime_dir, "wezterm")
+    if not os.path.isdir(sock_dir):
+        return None
+    candidates: list[tuple[float, str]] = []
+    try:
+        names = os.listdir(sock_dir)
+    except OSError:
+        return None
+    for name in names:
+        if not name.startswith("gui-sock-"):
+            continue
+        pid_str = name[len("gui-sock-"):]
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)  # signal 0 = liveness check, no actual signal sent
+        except (OSError, ProcessLookupError, PermissionError):
+            continue
+        path = os.path.join(sock_dir, name)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((mtime, path))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
     """Best-effort `notify-send --urgency=critical` so a hidden wezterm
     window pulses the dock icon. Wayland disallows cross-client window
@@ -621,6 +671,17 @@ def _resume_env() -> dict[str, str]:
         candidate = f"/run/user/{uid}"
         if os.path.isdir(candidate):
             env["XDG_RUNTIME_DIR"] = candidate
+
+    # Point wezterm cli directly at the LIVE wezterm-gui socket. Without
+    # this, wezterm cli scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*` and
+    # picks a stale socket reference (observed even when only one live
+    # socket file exists on disk — wezterm appears to cache historical
+    # gui pids from log files). Setting WEZTERM_UNIX_SOCKET bypasses the
+    # discovery and forces the connection to the user's actual window.
+    if not env.get("WEZTERM_UNIX_SOCKET"):
+        socket_path = _find_live_wezterm_socket(env.get("XDG_RUNTIME_DIR"))
+        if socket_path:
+            env["WEZTERM_UNIX_SOCKET"] = socket_path
 
     # Prepend $HOME/.local/bin to PATH so the spawned terminal can find
     # user-installed binaries (notably claude itself, which the npm CLI
