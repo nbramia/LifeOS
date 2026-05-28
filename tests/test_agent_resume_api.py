@@ -405,7 +405,9 @@ def test_resume_pipes_inner_command_to_system_clipboard(
     body = r.json()
     assert body["clipboard_copied"] is True
     assert captured_run["argv"] == ["wl-copy"]
-    assert captured_run["input"].decode("utf-8") == f"claude --resume {sid}"
+    # Clipboard is cwd-prefixed so it works when pasted into any terminal
+    # — `claude --resume <id>` only finds the session in its project cwd.
+    assert captured_run["input"].decode("utf-8") == f"cd /home/syn/Code/A && claude --resume {sid}"
 
 
 @pytest.mark.unit
@@ -557,6 +559,74 @@ def test_resume_env_file_overrides_systemd_env(
     assert r.status_code == 200, r.text
     assert captured["env"]["DISPLAY"] == ":0"
     assert captured["env"]["XAUTHORITY"] == "/run/user/1000/x"
+
+
+# ---------------------------------------------------------------------------
+# WEZTERM_PANE auto-injection (for the default wezterm launcher)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_resume_injects_wezterm_pane_env_when_launcher_is_wezterm(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """Default `wezterm cli spawn` errors with 'WEZTERM_PANE not set' when
+    called from outside wezterm. The resume endpoint probes `wezterm cli
+    list` first and pins WEZTERM_PANE into the spawn env, preferring the
+    `default` workspace's pane."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd",
+                        "wezterm cli spawn --cwd {cwd} -- {inner_command}")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
+                        "claude --resume {session_id}")
+
+    Proc, captured = _make_fake_proc(stdout=b"42\n", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    # Pretend wezterm is on PATH so the injection helper runs.
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+
+    # Fake `wezterm cli list --format json` — two windows; the default
+    # workspace pane should be chosen over the other.
+    class _ListedCP:
+        returncode = 0
+        stdout = (
+            b'[{"window_id":0,"tab_id":0,"pane_id":99,"workspace":"scratch"},'
+            b'{"window_id":1,"tab_id":1,"pane_id":7,"workspace":"default"}]'
+        )
+        stderr = b""
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: _ListedCP())
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    # The Popen env now carries WEZTERM_PANE pointing at the default-workspace pane.
+    assert captured["env"].get("WEZTERM_PANE") == "7"
+
+
+@pytest.mark.unit
+def test_resume_skips_pane_injection_when_launcher_is_not_wezterm(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """Operator-overridden non-wezterm launcher → no WEZTERM_PANE meddling."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+    # Even if wezterm is on PATH, the injection helper only runs when the
+    # launcher argv[0] is wezterm — non-wezterm launchers stay untouched.
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200
+    assert "WEZTERM_PANE" not in captured["env"]
 
 
 # ---------------------------------------------------------------------------

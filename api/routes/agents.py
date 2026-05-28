@@ -480,6 +480,152 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
+def _find_live_wezterm_socket(xdg_runtime_dir: str | None) -> str | None:
+    """Return the path to a wezterm-gui socket whose owning PID is alive.
+
+    Scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*`. Each filename ends in
+    the wezterm-gui process's pid; we keep only sockets whose pid
+    responds to a `kill -0` liveness check (filters out stale sockets
+    left behind by crashed wezterm-gui processes). If multiple GUI
+    instances are running, pick the most-recently-modified socket
+    (the user's "current" wezterm typically being the one they just
+    interacted with).
+
+    Returns None if no live socket exists, leaving wezterm cli to fall
+    back to its default discovery.
+    """
+    import os
+
+    if not xdg_runtime_dir:
+        return None
+    sock_dir = os.path.join(xdg_runtime_dir, "wezterm")
+    if not os.path.isdir(sock_dir):
+        return None
+    candidates: list[tuple[float, str]] = []
+    try:
+        names = os.listdir(sock_dir)
+    except OSError:
+        return None
+    for name in names:
+        if not name.startswith("gui-sock-"):
+            continue
+        pid_str = name[len("gui-sock-"):]
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)  # signal 0 = liveness check, no actual signal sent
+        except (OSError, ProcessLookupError, PermissionError):
+            continue
+        path = os.path.join(sock_dir, name)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((mtime, path))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
+    """Best-effort `notify-send --urgency=critical` so a hidden wezterm
+    window pulses the dock icon. Wayland disallows cross-client window
+    raise; this is the strongest attention hint we can issue from
+    outside the focused client.
+
+    Crucially, we send the notification AS wezterm (via app-name +
+    desktop-entry hint pointing at `org.wezfurlong.wezterm`) so GNOME
+    Shell associates the urgency with wezterm's dock icon and pulses
+    *that* icon — not a generic LifeOS one. The .desktop file lives at
+    `/usr/share/applications/org.wezfurlong.wezterm.desktop` (set by the
+    wezterm package).
+
+    Failure (no notify-send, libnotify not running, etc.) is silent on
+    purpose — the dock flash is an extra; the underlying spawn/focus
+    already succeeded by the time this is called.
+    """
+    import shutil
+    import subprocess
+
+    notify_bin = shutil.which("notify-send")
+    if not notify_bin:
+        return
+    try:
+        subprocess.run(  # noqa: S603 — fixed argv
+            [
+                notify_bin,
+                "--urgency=critical",
+                "--app-name=org.wezfurlong.wezterm",
+                "--hint=string:desktop-entry:org.wezfurlong.wezterm",
+                "--icon=org.wezfurlong.wezterm",
+                summary,
+                body,
+            ],
+            env=env,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _inject_wezterm_pane(env: dict[str, str]) -> None:
+    """Set $WEZTERM_PANE in `env` to an existing pane id, so `wezterm cli
+    spawn` knows which window to add the new tab to. No-op if WEZTERM_PANE
+    is already set, if wezterm isn't running, or if the probe fails — in
+    those cases the spawn will surface its own error.
+
+    Pane selection: prefer panes in the `default` workspace (the user's
+    primary window), fall back to any pane. We deliberately don't store
+    the chosen window — wezterm's mux state is the source of truth, and
+    pane ids reset on wezterm-gui restart.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    if env.get("WEZTERM_PANE"):
+        return
+    wezterm_bin = shutil.which("wezterm")
+    if not wezterm_bin:
+        return
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv
+            [wezterm_bin, "cli", "list", "--format", "json"],
+            env=env,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return
+    if proc.returncode != 0:
+        return
+    try:
+        panes = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(panes, list) or not panes:
+        return
+
+    preferred = next(
+        (p for p in panes
+         if isinstance(p, dict) and p.get("workspace") == "default" and "pane_id" in p),
+        None,
+    )
+    chosen = preferred or next(
+        (p for p in panes if isinstance(p, dict) and "pane_id" in p),
+        None,
+    )
+    if chosen is None:
+        return
+    env["WEZTERM_PANE"] = str(chosen["pane_id"])
+
+
 def _resume_env() -> dict[str, str]:
     """Build the environment dict for the resume subprocess.
 
@@ -487,6 +633,14 @@ def _resume_env() -> dict[str, str]:
     then layers in key=value lines from LIFEOS_CC_RESUME_ENV_FILE if set.
     The file lets operators pin DISPLAY / XAUTHORITY / WAYLAND_DISPLAY /
     DBUS_SESSION_BUS_ADDRESS explicitly — systemd usually omits them.
+
+    Also derives XDG_RUNTIME_DIR (`/run/user/<uid>`) when missing — it's
+    required for wezterm cli to locate the GUI's socket at
+    `$XDG_RUNTIME_DIR/wezterm/gui-sock-<pid>`. Without it, `wezterm cli`
+    silently auto-starts a headless `wezterm-mux-server` and spawns
+    tabs into THAT (invisible to the user). The systemd unit's env
+    usually lacks XDG_RUNTIME_DIR even when the env file is set, so
+    we always backfill the convention.
     """
     import os
     env: dict[str, str] = dict(os.environ)
@@ -508,6 +662,41 @@ def _resume_env() -> dict[str, str]:
                     env[k.strip()] = v.strip()
         except OSError as exc:
             logger.warning("cc_resume_env_file unreadable (%s): %s", path, exc)
+
+    # Backfill XDG_RUNTIME_DIR using the standard `/run/user/<uid>`
+    # convention if the env didn't already define it. wezterm cli needs
+    # this to find the running GUI's socket.
+    if not env.get("XDG_RUNTIME_DIR"):
+        uid = os.getuid()
+        candidate = f"/run/user/{uid}"
+        if os.path.isdir(candidate):
+            env["XDG_RUNTIME_DIR"] = candidate
+
+    # Point wezterm cli directly at the LIVE wezterm-gui socket. Without
+    # this, wezterm cli scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*` and
+    # picks a stale socket reference (observed even when only one live
+    # socket file exists on disk — wezterm appears to cache historical
+    # gui pids from log files). Setting WEZTERM_UNIX_SOCKET bypasses the
+    # discovery and forces the connection to the user's actual window.
+    if not env.get("WEZTERM_UNIX_SOCKET"):
+        socket_path = _find_live_wezterm_socket(env.get("XDG_RUNTIME_DIR"))
+        if socket_path:
+            env["WEZTERM_UNIX_SOCKET"] = socket_path
+
+    # Prepend $HOME/.local/bin to PATH so the spawned terminal can find
+    # user-installed binaries (notably claude itself, which the npm CLI
+    # installs there). systemd's lifeos-api unit inherits the bare system
+    # PATH (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin`)
+    # so without this the inner `claude --resume` errors with
+    # "No viable candidates found in PATH". The wezterm CLI propagates
+    # our env through to the spawned tab, so setting PATH here is
+    # sufficient — no template wrapping needed.
+    home = env.get("HOME", "")
+    if home:
+        local_bin = f"{home}/.local/bin"
+        current_path = env.get("PATH", "")
+        if os.path.isdir(local_bin) and local_bin not in current_path.split(":"):
+            env["PATH"] = f"{local_bin}:{current_path}" if current_path else local_bin
     return env
 
 
@@ -598,6 +787,15 @@ async def resume_claude_code_session(
     if body and body.extra_env:
         env.update(body.extra_env)
 
+    # `wezterm cli spawn` (the default launcher) needs to know which window
+    # to spawn the new tab into. When called from a systemd context there's
+    # no $WEZTERM_PANE and wezterm can't probe focus, so it errors out
+    # ("--pane-id was not specified and $WEZTERM_PANE is not set"). Probe
+    # `wezterm cli list` for an existing pane and pin its id into the env
+    # — wezterm then spawns into that pane's window.
+    if "wezterm" in argv[0]:
+        _inject_wezterm_pane(env)
+
     try:
         proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True (explicit shlex.split above)
             argv,
@@ -612,14 +810,24 @@ async def resume_claude_code_session(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
-    # Push the rendered inner command directly to the system clipboard.
-    # For the wezterm path (default) this is redundant since wezterm runs
-    # `{inner_command}` directly, but it's cheap and serves as a backup if
-    # the operator overrides cc_resume_cmd to a launcher that opens an
-    # empty terminal (e.g., the legacy `warp-terminal warp://…` flow).
-    clipboard_copied = False
+    # Push a cwd-portable form of the inner command to the system
+    # clipboard. `claude --resume <id>` only finds the session when run
+    # in the matching project directory (claude scopes sessions by cwd),
+    # so we wrap with `cd <cwd> && ...` — that way pasting the clipboard
+    # into any terminal works. The wezterm path doesn't need this (it
+    # already runs with `--cwd target.decoded_cwd`), but the clipboard
+    # is a backup for operator-overridden non-wezterm launchers AND
+    # for the case where the wezterm tab opened off-screen and the
+    # operator just wants to run the command somewhere visible.
+    clipboard_text = ""
     if inner_rendered:
-        clipboard_copied = _copy_to_clipboard(inner_rendered, env)
+        clipboard_text = (
+            f"cd {shlex.quote(target.decoded_cwd)} && {inner_rendered}"
+            if target.decoded_cwd else inner_rendered
+        )
+    clipboard_copied = False
+    if clipboard_text:
+        clipboard_copied = _copy_to_clipboard(clipboard_text, env)
 
     # Two launcher flavors coexist:
     #   (a) `wezterm cli spawn` exits cleanly with a pane id on stdout — we
@@ -642,7 +850,7 @@ async def resume_claude_code_session(
             "pane_id": None,
             "command": argv,
             "cwd": target.decoded_cwd,
-            "inner_command": inner_rendered,
+            "inner_command": clipboard_text or inner_rendered,
             "clipboard_copied": clipboard_copied,
         }
         return response_body
@@ -670,13 +878,23 @@ async def resume_claude_code_session(
         except Exception as exc:  # noqa: BLE001 — store failure is non-fatal
             logger.warning("cc_wezterm_store upsert failed for %s: %s", session_id, exc)
 
+    # Pulse the wezterm dock icon so the operator knows a new tab is
+    # waiting — Wayland disallows cross-client window raise, so without
+    # this hint the spawn would be invisible if wezterm is hidden.
+    pane_label = f"pane {pane_id}" if pane_id is not None else "new tab"
+    _notify_dock(
+        env,
+        "Agent session resumed",
+        f"Wezterm opened {pane_label} in {shlex.quote(target.decoded_cwd)}",
+    )
+
     return {
         "spawned": True,
         "pid": proc.pid,
         "pane_id": pane_id,
         "command": argv,
         "cwd": target.decoded_cwd,
-        "inner_command": inner_rendered,
+        "inner_command": clipboard_text or inner_rendered,
         "clipboard_copied": clipboard_copied,
     }
 
@@ -741,28 +959,11 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
                   or f"wezterm activate-pane exited rc={proc.returncode}")
         raise HTTPException(status_code=410, detail=detail)
 
-    # Best-effort dock flash so a hidden wezterm window gets attention —
-    # the compositor won't raise it programmatically (see docstring), but
-    # the urgency hint on the .desktop entry will pulse the icon.
-    notify_bin = shutil.which("notify-send")
-    if notify_bin:
-        try:
-            subprocess.run(  # noqa: S603 — fixed argv
-                [
-                    notify_bin,
-                    "--urgency=critical",
-                    "--app-name=LifeOS",
-                    "--icon=utilities-terminal",
-                    "Agent session focused",
-                    f"Switched wezterm to pane {mapping.pane_id} ({shlex.quote(mapping.cwd)})",
-                ],
-                env=env,
-                capture_output=True,
-                timeout=2.0,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+    _notify_dock(
+        env,
+        "Agent session focused",
+        f"Switched wezterm to pane {mapping.pane_id} ({shlex.quote(mapping.cwd)})",
+    )
 
     return {
         "focused": True,
