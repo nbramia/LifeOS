@@ -512,6 +512,12 @@ class Worker:
         for q in answered:
             session_id = q["session_id"]
             task_id = q["task_id"]
+            # `code_followup` rows (#237) point at a Claude Code session, not an
+            # agent-worker session — the Telegram listener resumes those itself.
+            # Skip them here so the worker doesn't treat them as agent threads.
+            if q.get("kind") == "code_followup":
+                self.session_store.mark_question_processed(q["id"])
+                continue
             session = self.session_store.get_by_session_id(session_id)
             if session is None:
                 # Stale — session was deleted? Mark processed so we don't loop.

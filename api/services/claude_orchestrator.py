@@ -247,6 +247,10 @@ class ClaudeOrchestrator:
         self._heartbeat: Optional[threading.Timer] = None
         self._typing_stop: Optional[threading.Event] = None
         self._notification_callback: Optional[Callable[[str], None]] = None
+        # Fired once when a session completes successfully (status "completed",
+        # session_id known). Used to register the completion message in the
+        # shared follow-up table so a reply resumes the session (#237).
+        self._on_complete: Optional[Callable[["ClaudeSession"], None]] = None
 
     def is_busy(self) -> bool:
         return self._active_session is not None and self._active_session.status in (
@@ -262,6 +266,7 @@ class ClaudeOrchestrator:
         working_dir: str,
         plan_mode: bool = False,
         notification_callback: Optional[Callable[[str], None]] = None,
+        on_complete: Optional[Callable[["ClaudeSession"], None]] = None,
     ) -> ClaudeSession:
         """Spawn a Claude Code subprocess for the given task."""
         with self._lock:
@@ -275,6 +280,7 @@ class ClaudeOrchestrator:
             )
             self._active_session = session
             self._notification_callback = notification_callback
+            self._on_complete = on_complete
 
         prompt = task
         if plan_mode:
@@ -344,6 +350,7 @@ class ClaudeOrchestrator:
         self,
         message: str,
         notification_callback: Optional[Callable[[str], None]] = None,
+        on_complete: Optional[Callable[["ClaudeSession"], None]] = None,
     ) -> Optional[ClaudeSession]:
         """Resume a recently completed session with a follow-up message."""
         with self._lock:
@@ -359,6 +366,7 @@ class ClaudeOrchestrator:
             self._active_session = session
             self._last_completed = None
             self._notification_callback = notification_callback
+            self._on_complete = on_complete
 
         self._spawn(message, session, resume_session_id=session.session_id)
         return session
@@ -676,7 +684,17 @@ class ClaudeOrchestrator:
             # Keep completed sessions for follow-up resumption
             if final_status == "completed" and session and session.session_id:
                 self._last_completed = session
+                # Register the completion in the shared follow-up table so a
+                # reply resumes this session uniformly with #agent threads
+                # (#237). Fired after the final notification was sent, so the
+                # callback can match against that message's id.
+                if self._on_complete:
+                    try:
+                        self._on_complete(session)
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.warning(f"on_complete callback failed: {exc}")
             self._active_session = None
+            self._on_complete = None
         self._process = None
 
 

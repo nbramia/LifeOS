@@ -999,6 +999,25 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_open_question_by_message_id(self, sent_message_id: int) -> dict | None:
+        """Return the open (unanswered, not-timed-out) question a reply to
+        `sent_message_id` matches — on any chunk — or None.
+
+        Read-only sibling of `deposit_answer`: lets a caller inspect the matched
+        row's `kind` and route the reply (e.g. a `code_followup` resumes Claude
+        Code rather than the agent worker) before recording an answer.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?))) "
+                "ORDER BY id ASC LIMIT 1",
+                (int(sent_message_id), int(sent_message_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_answered_unprocessed_questions(self) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
