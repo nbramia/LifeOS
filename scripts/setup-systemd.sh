@@ -207,7 +207,29 @@ echo ""
 echo "Installing sudoers rule for passwordless systemctl..."
 SUDOERS_FILE="/etc/sudoers.d/lifeos"
 TMP_SUDOERS=$(mktemp)
-echo "$REAL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start lifeos-api, /usr/bin/systemctl stop lifeos-api, /usr/bin/systemctl restart lifeos-api, /usr/bin/systemctl start lifeos-api.service, /usr/bin/systemctl stop lifeos-api.service, /usr/bin/systemctl restart lifeos-api.service, /usr/bin/systemctl start lifeos-llm, /usr/bin/systemctl stop lifeos-llm, /usr/bin/systemctl start lifeos-llm.service, /usr/bin/systemctl stop lifeos-llm.service, /usr/bin/systemctl start lifeos-mcp-http, /usr/bin/systemctl stop lifeos-mcp-http, /usr/bin/systemctl restart lifeos-mcp-http, /usr/bin/systemctl start lifeos-mcp-http.service, /usr/bin/systemctl stop lifeos-mcp-http.service, /usr/bin/systemctl restart lifeos-mcp-http.service, /usr/bin/systemctl start lifeos-agent-worker, /usr/bin/systemctl stop lifeos-agent-worker, /usr/bin/systemctl restart lifeos-agent-worker, /usr/bin/systemctl start lifeos-agent-worker.service, /usr/bin/systemctl stop lifeos-agent-worker.service, /usr/bin/systemctl restart lifeos-agent-worker.service" > "$TMP_SUDOERS"
+# Build the NOPASSWD command list programmatically. Each unit gets
+# start/stop/reset-failed (in both name and name.service forms); units
+# that should also restart get restart entries too. `reset-failed` is
+# required to recover units that have tripped systemd's StartLimit (e.g.
+# the agent worker getting cascade-restarted past the rate limit during
+# a dev session); without it, plain `restart` can't break out of the
+# failed state. lifeos-llm intentionally lacks `restart` because of GPU
+# memory cleanup concerns — operator uses stop + start instead.
+_sudo_cmds=()
+for unit in lifeos-api lifeos-mcp-http lifeos-agent-worker; do
+    for verb in start stop restart reset-failed; do
+        _sudo_cmds+=("/usr/bin/systemctl $verb $unit" "/usr/bin/systemctl $verb $unit.service")
+    done
+done
+for verb in start stop reset-failed; do
+    _sudo_cmds+=("/usr/bin/systemctl $verb lifeos-llm" "/usr/bin/systemctl $verb lifeos-llm.service")
+done
+# Join with ", " for the sudoers Cmnd_Alias line
+IFS=','
+_sudo_csv="${_sudo_cmds[*]}"
+unset IFS
+_sudo_csv="${_sudo_csv//,/, }"
+echo "$REAL_USER ALL=(root) NOPASSWD: $_sudo_csv" > "$TMP_SUDOERS"
 if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
     mv "$TMP_SUDOERS" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
