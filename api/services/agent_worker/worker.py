@@ -1138,10 +1138,21 @@ class Worker:
             # tag becomes `#agent-failed` and the operator can decide whether
             # to retry. Spawned children keep the old behavior; their parent
             # consumes their outcome and decides what to surface.
+            #
+            # Cost gate: when the agent spent real money, give the benefit of
+            # the doubt even if the transcript looks light — Anthropic's events
+            # endpoint can lag (see managed_executor._backfill_events_on_terminal),
+            # and a session with non-trivial spend almost certainly did real
+            # work that produced a side effect we just don't see in the local
+            # transcript. The $0.05 floor is roughly "two LLM rounds with cache
+            # reads" — below that, an empty result really is no-work.
+            refreshed_for_guard = self.session_store.get(session.task_id) or session
+            spent = float(refreshed_for_guard.total_dollars or 0.0)
             if (
                 not is_spawned
                 and not (outcome.final_text or "").strip()
                 and not self._had_side_effect_tool_use(sid)
+                and spent < 0.05
             ):
                 self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
                 self._set_task_status(session.task_id, "cancelled")
