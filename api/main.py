@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _calendar_indexer = None
 _telegram_listener = None
 _reminder_scheduler = None
+_scheduler_watcher = None
 _job_queue = None
 _task_watcher = None
 
@@ -53,7 +54,7 @@ _task_watcher = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _job_queue, _task_watcher
+    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher
 
     # Startup: Recover any incomplete merge operations
     try:
@@ -87,13 +88,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start Telegram bot listener: {e}")
 
-    # Startup: Start reminder scheduler
+    # Startup: Start the scheduler (cron/one-off triggers → actions) and watch
+    # LifeOS/Scheduler/ for external edits (e.g. via Obsidian). Markdown is the
+    # source of truth, so rebuild the index from the vault before firing.
     try:
-        from api.services.reminder_store import get_reminder_scheduler
-        _reminder_scheduler = get_reminder_scheduler()
+        from api.services.scheduler_store import get_scheduler, get_scheduler_store
+        from api.services.scheduler_watcher import SchedulerWatcher
+        store = get_scheduler_store()
+        store.rebuild_index()
+        _reminder_scheduler = get_scheduler()
         _reminder_scheduler.start()
+        _scheduler_watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
+        _scheduler_watcher.start()
     except Exception as e:
-        logger.error(f"Failed to start reminder scheduler: {e}")
+        logger.error(f"Failed to start scheduler: {e}")
 
     # Startup: Start job queue worker
     try:
@@ -156,7 +164,11 @@ async def lifespan(app: FastAPI):
 
     if _reminder_scheduler:
         _reminder_scheduler.stop()
-        logger.info("Reminder scheduler stopped")
+        logger.info("Scheduler stopped")
+
+    if _scheduler_watcher:
+        _scheduler_watcher.stop()
+        logger.info("Scheduler file watcher stopped")
 
     if _task_watcher:
         _task_watcher.stop()
