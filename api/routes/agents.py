@@ -480,6 +480,59 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
+def _inject_wezterm_pane(env: dict[str, str]) -> None:
+    """Set $WEZTERM_PANE in `env` to an existing pane id, so `wezterm cli
+    spawn` knows which window to add the new tab to. No-op if WEZTERM_PANE
+    is already set, if wezterm isn't running, or if the probe fails — in
+    those cases the spawn will surface its own error.
+
+    Pane selection: prefer panes in the `default` workspace (the user's
+    primary window), fall back to any pane. We deliberately don't store
+    the chosen window — wezterm's mux state is the source of truth, and
+    pane ids reset on wezterm-gui restart.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    if env.get("WEZTERM_PANE"):
+        return
+    wezterm_bin = shutil.which("wezterm")
+    if not wezterm_bin:
+        return
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv
+            [wezterm_bin, "cli", "list", "--format", "json"],
+            env=env,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return
+    if proc.returncode != 0:
+        return
+    try:
+        panes = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(panes, list) or not panes:
+        return
+
+    preferred = next(
+        (p for p in panes
+         if isinstance(p, dict) and p.get("workspace") == "default" and "pane_id" in p),
+        None,
+    )
+    chosen = preferred or next(
+        (p for p in panes if isinstance(p, dict) and "pane_id" in p),
+        None,
+    )
+    if chosen is None:
+        return
+    env["WEZTERM_PANE"] = str(chosen["pane_id"])
+
+
 def _resume_env() -> dict[str, str]:
     """Build the environment dict for the resume subprocess.
 
@@ -597,6 +650,15 @@ async def resume_claude_code_session(
     env = _resume_env()
     if body and body.extra_env:
         env.update(body.extra_env)
+
+    # `wezterm cli spawn` (the default launcher) needs to know which window
+    # to spawn the new tab into. When called from a systemd context there's
+    # no $WEZTERM_PANE and wezterm can't probe focus, so it errors out
+    # ("--pane-id was not specified and $WEZTERM_PANE is not set"). Probe
+    # `wezterm cli list` for an existing pane and pin its id into the env
+    # — wezterm then spawns into that pane's window.
+    if "wezterm" in argv[0]:
+        _inject_wezterm_pane(env)
 
     try:
         proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True (explicit shlex.split above)
