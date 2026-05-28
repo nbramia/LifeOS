@@ -61,6 +61,11 @@ CURATED_ENDPOINTS = {
         "description": "Search files in Google Drive by name or content. Returns file metadata with links. Use for 'find the document about X' or 'what files do I have about Y?'.",
         "method": "GET"
     },
+    "/api/vault/write": {
+        "name": "lifeos_vault_write",
+        "description": "Write a text file into the Obsidian vault. Use for any task needing a `.md` deliverable. `path` is vault-relative; parents auto-created. `mode`: `create` (default), `overwrite`, `append`.",
+        "method": "POST"
+    },
     "/api/conversations": {
         "name": "lifeos_conversations_list",
         "description": "List recent LifeOS conversations. Returns conversation IDs and titles for continuing previous chats.",

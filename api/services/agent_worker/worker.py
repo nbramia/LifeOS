@@ -1129,6 +1129,32 @@ class Worker:
         is_spawned = bool(session.parent_session_id)
 
         if outcome.status == STATUS_COMPLETED:
+            # Guard against silent "I gave up" completions. When the agent
+            # produces no final text AND no side-effect tool was successfully
+            # called (no draft, no vault write, no calendar event, etc.), the
+            # session is effectively a no-op. Marking it `done` hides the
+            # failure — the operator sees `#agent-completed` and assumes work
+            # happened. Route these through the failure path instead so the
+            # tag becomes `#agent-failed` and the operator can decide whether
+            # to retry. Spawned children keep the old behavior; their parent
+            # consumes their outcome and decides what to surface.
+            if (
+                not is_spawned
+                and not (outcome.final_text or "").strip()
+                and not self._had_side_effect_tool_use(sid)
+            ):
+                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                self._set_task_status(session.task_id, "cancelled")
+                recovered = self._recover_result_from_transcript(sid) or (
+                    "no tool calls or final text recovered"
+                )
+                self._notify(
+                    f"⚠️ {_worker_label(session.routing)}: task '{title}' returned "
+                    f"empty result with no side-effect tool use — marking failed. "
+                    f"What the agent did:\n\n{recovered}\n\n"
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                )
+                return
             if not is_spawned:
                 self._complete_task(session.task_id)  # mark `done` in the vault
                 # Swap the tag so the task surfaces as #agent-completed for symmetry
@@ -1385,6 +1411,58 @@ class Worker:
             logger.warning("recover_result_from_transcript failed for %s: %s",
                           session_id, exc)
         return ""
+
+    # Tool names whose successful invocation is a real-world side effect
+    # (file written, email drafted, calendar event created, memory saved,
+    # task created, etc.). If the agent calls one of these and then idles
+    # without a final text reply, the work happened — don't treat as failed.
+    # Anything ending in these suffixes counts; updates the list as we add
+    # write tools to the MCP server.
+    _SIDE_EFFECT_TOOL_SUFFIXES = (
+        "_create", "_update", "_delete", "_complete", "_write",
+        "_send", "_draft", "_trigger", "_confirm", "_spawn", "_kill",
+    )
+
+    def _had_side_effect_tool_use(self, session_id: str) -> bool:
+        """Return True if the agent successfully invoked any write-side-effect
+        tool during the session. Used by the empty-final-text guard in
+        `_handle_outcome` to distinguish "agent did real work but didn't
+        summarize" (legitimate completion) from "agent gave up after a
+        read-only research spree" (silent failure)."""
+        import json as _json
+        try:
+            path = self.transcript_store.dir / f"{session_id}.jsonl"
+            if not path.exists():
+                return False
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+                    kind = d.get("kind", "")
+                    payload = d.get("payload", {}) or {}
+
+                    if kind == "tool_call" and not payload.get("is_error"):
+                        name = str(payload.get("tool") or "")
+                    elif kind in (
+                        "managed_event_agent.mcp_tool_use",
+                        "managed_event_agent.tool_use",
+                    ):
+                        # Pair-with-result would be more accurate, but the
+                        # tool_use event fires only when the call is dispatched
+                        # — an outright permission denial wouldn't reach here.
+                        # Good-enough for the failure guard.
+                        name = str(payload.get("name") or "")
+                    else:
+                        continue
+
+                    if any(name.endswith(s) for s in self._SIDE_EFFECT_TOOL_SUFFIXES):
+                        return True
+        except Exception as exc:
+            logger.warning("had_side_effect_tool_use failed for %s: %s",
+                          session_id, exc)
+        return False
 
     def _build_resume_message(
         self,

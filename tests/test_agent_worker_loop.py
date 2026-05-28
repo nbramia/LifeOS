@@ -928,6 +928,75 @@ def test_empty_final_text_surfaces_last_tool_result_from_transcript(tmp_path: Pa
 
 
 @pytest.mark.unit
+def test_empty_final_text_without_side_effect_marks_failed(tmp_path: Path):
+    """Live bug repro: an agent runs a bunch of read-only searches, finds
+    nothing useful, and idles without a final reply. Previously this got
+    marked #agent-completed and the operator never noticed the silent
+    failure. The empty-final-text guard now routes it through the failure
+    path so the operator gets a Telegram alert and the task carries
+    #agent-failed."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "research thing", "status": "todo",
+         "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+
+    # Empty result + no side-effect tool → failure path
+    assert api.tasks["t1"]["status"] == "cancelled", api.tasks["t1"]
+    assert FAILED_TAG in api.tasks["t1"]["tags"]
+    assert COMPLETED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_empty_final_text_with_side_effect_tool_still_marks_completed(tmp_path: Path):
+    """Counterpoint to the failure-on-empty test: when the agent DID do
+    real work (e.g., called lifeos_gmail_draft to create a draft) and just
+    didn't write a final summary, the task is legitimately complete. The
+    side-effect-tool check distinguishes "agent gave up" from "agent did
+    the work but skipped the summary".
+
+    Drives `_handle_outcome` directly (not via tick) because tick() would
+    skip a pre-claimed task; the goal here is to exercise the empty-text
+    branch with a transcript that already contains a side-effect tool use.
+    """
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "draft an email", "status": "todo",
+         "tags": ["agent", "running"]},  # already #agent-running for the swap
+    ])
+    # Manually flip the running tag — handle_outcome's success path swaps
+    # RUNNING_TAG → COMPLETED_TAG, so the running tag must be present.
+    api.tasks["t1"]["tags"] = ["agent-running"]
+
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="",
+                     )))
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    w.transcript_store.append(sess.session_id, "tool_call", {
+        "tool": "lifeos_gmail_draft", "is_error": False,
+    })
+
+    w._handle_outcome(
+        sess,
+        {"id": "t1", "description": "draft an email"},
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text=""),
+    )
+
+    # Side-effect tool was present → completion path took over
+    assert api.tasks["t1"]["status"] == "done", api.tasks["t1"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
 def test_claim_sets_vault_status_to_in_progress(tmp_path: Path):
     """When the worker claims a task (swap #agent → #agent-running), the
     vault checkbox status must also flip to "in_progress" so the operator
