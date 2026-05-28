@@ -9,6 +9,11 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `005-external-venv-macos-tcc.md` — Virtual environment at ~/.venvs to avoid TCC scanning **(Superseded by 007)**
 - `006-ollama-query-routing.md` — Local Ollama + Qwen 2.5 for query classification
 - `007-linux-migration.md` — Linux migration and local LLM orchestration (supersedes 005)
+- `008-managed-agents-cloud-routing.md` — Routing agent-worker sessions to cloud Claude via Managed Agents
+- `009-llm-backend-toggle.md` — `LIFEOS_LLM_BACKEND` switch between Anthropic and local llama-server
+- `010-apple-data-agent.md` — Mac as nightly source for iMessage, calls, and contacts
+- `011-external-agent-ingest.md` — Read-only direct-access ingest path for external agents
+- `012-embedding-pipeline.md` — GPU embedding pipeline with CPU fallback
 
 ## Key Principles
 
