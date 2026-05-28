@@ -523,6 +523,12 @@ class TelegramBotListener:
         reopens the session as a new user turn, then shows a visible
         continuation prefix. Returns True if the message was consumed as a
         resume; False to fall through to the chat pipeline.
+
+        Like the native reply-deposit path (`_maybe_deposit_agent_answer`),
+        this hands off to the agent worker via the shared `pending_questions`
+        table; if that process is down the deposited turn waits until it comes
+        back rather than running immediately. Accepted edge — both deposit
+        paths share this property.
         """
         try:
             from api.services.agent_worker.session_store import SessionStore
