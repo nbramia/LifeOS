@@ -104,7 +104,11 @@ async def _summarize_one(session: dict[str, Any]) -> bool:
 
     try:
         await agent_viz_summary.summarize_session(
-            sid, label=label, last_activity_at=last_activity, events=events,
+            sid,
+            label=label,
+            last_activity_at=last_activity,
+            events=events,
+            status=str(session.get("status") or ""),
         )
         return True
     except Exception as exc:  # noqa: BLE001

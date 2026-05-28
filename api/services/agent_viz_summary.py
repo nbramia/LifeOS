@@ -45,11 +45,56 @@ class SummaryResult:
         return {"short_label": self.short_label, "summary": self.summary}
 
 
-# In-process cache key: session_id → (last_activity_at, SummaryResult). When
-# the session's last_activity_at advances, the entry is recomputed. Disk cache
-# (below) is the durable layer; this just keeps hot reads fingertip-fast.
-_cache: dict[str, tuple[float, SummaryResult]] = {}
+# In-process cache: session_id → (last_activity_at, created_at, SummaryResult).
+# Disk cache (below) is the durable layer; this just keeps hot reads
+# fingertip-fast. `created_at` is wall-clock seconds at write time and feeds
+# the live-session grace window below.
+_cache: dict[str, tuple[float, float, SummaryResult]] = {}
 _CACHE_MAX = 500
+
+# Non-terminal sessions move `last_activity_at` on every tool call. Without
+# a grace window the cache would be stale within seconds of being written
+# and the prefetch loop would burn Gemma cycles re-summarizing the same hot
+# session every tick. A cached summary for a live session counts as "fresh
+# enough" for this many seconds — only after that do we re-summarize on
+# next access. Terminal sessions ignore this grace and use cache forever.
+_LIVE_REFRESH_GRACE_SECONDS = 60 * 60  # 60 min
+
+# Statuses that mean the session is done and `last_activity_at` is frozen.
+# Imported lazily inside _is_terminal so this module stays importable
+# without the agent_worker package on tests/standalone scripts.
+_TERMINAL_STATUSES_CACHE: frozenset[str] | None = None
+
+
+def _is_terminal(status: str) -> bool:
+    global _TERMINAL_STATUSES_CACHE
+    if _TERMINAL_STATUSES_CACHE is None:
+        try:
+            from api.services.agent_worker.session_store import TERMINAL_STATUSES
+            _TERMINAL_STATUSES_CACHE = frozenset(TERMINAL_STATUSES)
+        except Exception:  # noqa: BLE001
+            _TERMINAL_STATUSES_CACHE = frozenset({
+                "completed", "failed", "budget_exceeded", "killed", "cascade_killed",
+            })
+    return (status or "") in _TERMINAL_STATUSES_CACHE
+
+
+def _is_fresh_enough(cached_activity: float, cached_created_at: float,
+                     new_activity: float, status: str) -> bool:
+    """True iff the cached summary can be served even though the session
+    may have advanced. Terminal: always (activity is frozen). Live: only
+    if the cache is within the grace window AND we haven't already
+    invalidated it via the activity timestamp."""
+    # Exact match on activity → never stale regardless of status.
+    if cached_activity >= new_activity:
+        return True
+    # Activity moved forward. Terminal sessions shouldn't reach here
+    # (activity is frozen), but if status is somehow misreported treat
+    # them as not-fresh and re-summarize.
+    if _is_terminal(status):
+        return False
+    # Live session: cached entry stays valid for the grace window.
+    return (time.time() - cached_created_at) < _LIVE_REFRESH_GRACE_SECONDS
 
 # --- Disk cache (SQLite) ---------------------------------------------------
 # Survives server restarts so we never re-summarize a terminal session twice.
@@ -91,11 +136,14 @@ def _init_db() -> None:
         conn.commit()
 
 
-def _disk_get(session_id: str, last_activity_at: float) -> SummaryResult | None:
+def _disk_get(session_id: str, last_activity_at: float, status: str = "") -> SummaryResult | None:
+    """Read the disk cache. Honors the live-session grace window so a hot
+    session doesn't get re-summarized on every tick of the prefetch loop.
+    """
     try:
         with sqlite3.connect(_resolve_db_path()) as conn:
             row = conn.execute(
-                "SELECT last_activity_at, short_label, summary "
+                "SELECT last_activity_at, short_label, summary, created_at "
                 "FROM agent_viz_summary WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
@@ -104,9 +152,8 @@ def _disk_get(session_id: str, last_activity_at: float) -> SummaryResult | None:
         return None
     if not row:
         return None
-    cached_activity, short_label, summary = row
-    # Stale: the session has moved since we summarized it.
-    if cached_activity < last_activity_at:
+    cached_activity, short_label, summary, created_at = row
+    if not _is_fresh_enough(cached_activity, float(created_at), last_activity_at, status):
         return None
     return SummaryResult(short_label=short_label, summary=summary)
 
@@ -312,22 +359,30 @@ async def summarize_session(
     label: str,
     last_activity_at: float,
     events: list[dict[str, Any]],
+    status: str = "",
 ) -> SummaryResult:
     """Return cached summary or compute a fresh one.
 
     Caller passes events (already fetched) so this module doesn't take a
     dependency on the transcript store / claude_code ingest dispatch logic
     that already lives in api/routes/agents.py.
+
+    `status` controls live-session staleness handling — terminal sessions
+    cache forever; non-terminal ones get a grace window
+    (_LIVE_REFRESH_GRACE_SECONDS) before being re-summarized even when
+    `last_activity_at` advances.
     """
     cached = _cache.get(session_id)
-    if cached and cached[0] >= last_activity_at:
-        return cached[1]
+    if cached:
+        cached_activity, cached_created_at, cached_result = cached
+        if _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status):
+            return cached_result
 
     # Disk cache check — populated by a previous call (possibly across a
     # restart). Promotes into the in-process cache on hit.
-    disk_hit = _disk_get(session_id, last_activity_at)
+    disk_hit = _disk_get(session_id, last_activity_at, status)
     if disk_hit is not None:
-        _cache[session_id] = (last_activity_at, disk_hit)
+        _cache[session_id] = (last_activity_at, time.time(), disk_hit)
         return disk_hit
 
     ctx = _extract_context(events)
@@ -378,24 +433,27 @@ async def summarize_session(
     result = SummaryResult(short_label=short_label, summary=summary)
     if len(_cache) >= _CACHE_MAX:
         _cache.pop(next(iter(_cache)))
-    _cache[session_id] = (last_activity_at, result)
+    now = time.time()
+    _cache[session_id] = (last_activity_at, now, result)
     _disk_put(session_id, last_activity_at, result)
     return result
 
 
-def get_cached_summary(session_id: str, last_activity_at: float) -> SummaryResult | None:
+def get_cached_summary(session_id: str, last_activity_at: float, status: str = "") -> SummaryResult | None:
     """Synchronous peek for the snapshot path — never triggers an LLM call.
 
     Checks the in-process cache first, then the disk cache. A hit on disk is
     promoted into the in-process cache so subsequent snapshot ticks are
-    free.
+    free. Honors the live-session grace window via `status`.
     """
     cached = _cache.get(session_id)
-    if cached and cached[0] >= last_activity_at:
-        return cached[1]
-    disk = _disk_get(session_id, last_activity_at)
+    if cached:
+        cached_activity, cached_created_at, cached_result = cached
+        if _is_fresh_enough(cached_activity, cached_created_at, last_activity_at, status):
+            return cached_result
+    disk = _disk_get(session_id, last_activity_at, status)
     if disk is not None:
-        _cache[session_id] = (last_activity_at, disk)
+        _cache[session_id] = (last_activity_at, time.time(), disk)
         return disk
     return None
 

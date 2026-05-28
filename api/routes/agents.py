@@ -188,13 +188,13 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         # block on the LLM — short labels for unfetched sessions appear when
         # the operator opens the panel.
         "short_label": _short_label_for_snapshot(
-            s.session_id, s.last_activity_at or 0.0
+            s.session_id, s.last_activity_at or 0.0, s.status or "",
         ),
     }
 
 
-def _short_label_for_snapshot(session_id: str, last_activity_at: float) -> str | None:
-    cached = agent_viz_summary.get_cached_summary(session_id, last_activity_at)
+def _short_label_for_snapshot(session_id: str, last_activity_at: float, status: str = "") -> str | None:
+    cached = agent_viz_summary.get_cached_summary(session_id, last_activity_at, status)
     return cached.short_label if cached else None
 
 
@@ -246,7 +246,11 @@ def _build_snapshot() -> dict[str, Any]:
     for sd in cc_sessions:
         sd.setdefault(
             "short_label",
-            _short_label_for_snapshot(sd.get("session_id") or "", sd.get("last_activity_at") or 0.0),
+            _short_label_for_snapshot(
+                sd.get("session_id") or "",
+                sd.get("last_activity_at") or 0.0,
+                sd.get("status") or "",
+            ),
         )
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
@@ -325,9 +329,10 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
     Cached by (session_id, last_activity_at). A session that hasn't moved
     since the last call gets a cache hit and zero LLM cost.
     """
-    # Resolve the session's label + last_activity_at + events.
+    # Resolve the session's label + last_activity_at + status + events.
     last_activity = 0.0
     label = session_id
+    status = ""
 
     if session_id.startswith("cc:"):
         if not _claude_code_enabled():
@@ -346,6 +351,7 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
+            status = str(match.get("status") or "")
     else:
         session_store = _get_session_store()
         s = session_store.get_by_session_id(session_id)
@@ -358,12 +364,14 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         label = _label_for_session(s, events)
         last_activity = float(s.last_activity_at or 0.0)
+        status = s.status or ""
 
     result = await agent_viz_summary.summarize_session(
         session_id,
         label=label,
         last_activity_at=last_activity,
         events=events,
+        status=status,
     )
     return {"session_id": session_id, **result.as_dict()}
 
