@@ -968,3 +968,95 @@ class TestAtomicReplace:
 
         with pytest.raises(ValueError, match="mismatched source_type"):
             temp_store.atomic_replace("vault", mixed)
+
+
+# ============================================================================
+# Tiered backup retention (_prune_backups)
+# ============================================================================
+
+
+class TestBackupRetention:
+    """Tiered retention policy: 5 daily + weekly to 35d + monthly to 1yr + quarterly beyond."""
+
+    @staticmethod
+    def _make_backup(d, ts: datetime):
+        """Create an empty backup file with the canonical filename and matching mtime."""
+        name = f"interactions.db.{ts.strftime('%Y%m%d_%H%M%S')}.backup"
+        p = d / name
+        p.touch()
+        return p
+
+    def test_keeps_5_most_recent_unconditionally(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # 10 backups, one per day for the past 10 days.
+        for i in range(10):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        removed = _prune_backups(tmp_path, now=now)
+        kept = sorted(p.name for p in tmp_path.glob("*.backup"))
+
+        # 10 backups, days 0..9 by age:
+        #   days 0-4 → 5 daily slots (unconditional)
+        #   days 5,6 → both in week-0 bucket; only day 5 (newest) survives
+        #   days 7,8,9 → all in week-1 bucket; only day 7 (newest) survives
+        # → 5 + 2 = 7 kept, days 6/8/9 pruned.
+        assert len(kept) == 7
+        removed_names = {p.name for p in removed}
+        for prune_age in (6, 8, 9):
+            stamp = (now - timedelta(days=prune_age)).strftime("%Y%m%d_%H%M%S")
+            assert any(stamp in n for n in removed_names), \
+                f"day-{prune_age} backup should have been pruned; removed={sorted(removed_names)}"
+
+    def test_weekly_bucket_keeps_one_per_week(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # Past 35 days: should end up with 5 daily + one per week (weeks 1-4)
+        for i in range(35):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        _prune_backups(tmp_path, now=now)
+        kept = sorted(p.name for p in tmp_path.glob("*.backup"))
+
+        # 5 daily (days 0-4) + week-0 bucket newest (day 5) + week-1 (day 7-or-newer)
+        # + week-2, week-3, week-4. That's 5 + 5 = 10 maximum.
+        assert 5 <= len(kept) <= 10
+
+    def test_monthly_bucket_kicks_in_past_35_days(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # Backups every 5 days going back 6 months
+        for i in range(0, 180, 5):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        _prune_backups(tmp_path, now=now)
+        kept_dates = sorted(
+            datetime.strptime(p.name[len("interactions.db."):-len(".backup")], "%Y%m%d_%H%M%S")
+            for p in tmp_path.glob("*.backup")
+        )
+
+        # Past day 35 we should see roughly monthly granularity, not 5-day.
+        old = [d for d in kept_dates if (now - d).days > 35]
+        if len(old) >= 2:
+            gaps = [(old[i+1] - old[i]).days for i in range(len(old) - 1)]
+            # In the monthly tier, gaps should be on the order of a month, not 5 days.
+            assert max(gaps) >= 25, f"monthly tier should produce ~30-day gaps, got {gaps}"
+
+    def test_no_matching_files_returns_empty(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        # Files with wrong shape — must be untouched.
+        (tmp_path / "interactions.db.notatimestamp.backup").touch()
+        (tmp_path / "something_else.txt").touch()
+        removed = _prune_backups(tmp_path)
+        assert removed == []
+        # The wrong-shape file should still exist (the helper ignores it).
+        assert (tmp_path / "interactions.db.notatimestamp.backup").exists()
+
+    def test_fewer_than_5_backups_nothing_pruned(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28)
+        for i in range(3):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+        removed = _prune_backups(tmp_path, now=now)
+        assert removed == []
+        assert len(list(tmp_path.glob("*.backup"))) == 3

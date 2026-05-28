@@ -259,7 +259,30 @@ def _extract_phone_from_title(title: str) -> str | None:
 
 
 def import_phone_calls(dry_run: bool = False) -> dict:
-    """Import phone call history from JSON export."""
+    """Import phone call history from the Mac Mini's JSON export.
+
+    Mirrors the source_entity behaviour of ``scripts/sync_phone_calls.py``
+    (the macOS-native version). For each call whose phone number resolves
+    to an existing PersonEntity, we ensure a phone-keyed SourceEntity
+    exists (``phone_{e164}``), update its ``observed_at`` to the most
+    recent call we've seen for that number in this batch, link it to the
+    person if it isn't already, then create the Interaction.
+
+    Scope: only resolvable callers get source_entities. Callers we've never
+    associated with a Person (spam, robocalls, first-time inbound) stay in
+    ``unresolved``. The entity-resolver has no phone-only create-if-missing
+    branch (see ``api/services/entity_resolver.py:881``) and adding one
+    here would mint a junk PersonEntity per spam call. Filed as a separate
+    follow-up.
+
+    The source_entity update happens BEFORE the "interaction already
+    exists?" check so that re-imports still close the issue #199 §2 drift
+    gap when a Person row was created out-of-band between runs.
+
+    Manual SourceEntity→Person links (``link_status='manual'``) are never
+    overwritten by the auto resolver — a human's curated link beats a
+    nightly's best guess.
+    """
     calls_path = IMPORT_DIR / "phone_calls.json"
     if not calls_path.exists():
         return {"status": "skipped", "reason": "phone_calls.json not found"}
@@ -275,12 +298,30 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
     from api.services.interaction_store import get_interaction_store, Interaction
     from api.services.entity_resolver import get_entity_resolver
+    from api.services.source_entity import (
+        SourceEntity,
+        get_source_entity_store,
+        LINK_STATUS_AUTO,
+    )
 
     store = get_interaction_store()
     resolver = get_entity_resolver()
+    se_store = get_source_entity_store()
+
+    # Per-phone cache for this run so we don't hit the DB again for every
+    # call from the same number (typical export has 100s of calls across
+    # dozens of unique numbers).
+    seen_phones: set[str] = set()
+
+    # Hoisted once per run — used as the fallback observed_at when a call
+    # has no timestamp; recomputing in the hot loop just adds noise.
+    now = datetime.now(timezone.utc)
+
     imported = 0
     skipped = 0
     unresolved = 0
+    source_entities_created = 0
+    source_entities_updated = 0
 
     for call in calls:
         source_id = call.get("source_id", "")
@@ -290,12 +331,6 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
         source_type = call.get("source_type", "phone")
 
-        # Check if already exists
-        existing = store.get_by_source(source_type, source_id)
-        if existing:
-            skipped += 1
-            continue
-
         timestamp = None
         if call.get("timestamp"):
             try:
@@ -304,13 +339,91 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
-        # Resolve phone number to a PersonEntity
         title = call.get("title", "")
         phone = _extract_phone_from_title(title)
-        person = resolver.resolve_by_phone(phone) if phone else None
+        if not phone:
+            unresolved += 1
+            continue
 
+        # Resolve to PersonEntity by phone. Note: the resolver has no
+        # "create from phone alone" branch (see entity_resolver.py:881 —
+        # only email and name create-if-missing paths exist), so callers
+        # whose phone we've never linked to a known Person are deliberately
+        # left in ``unresolved``. Adding a phone-only create branch is a
+        # separate, broader change (filed as a follow-up); doing it here
+        # would auto-create a junk Person for every spam call.
+        result = resolver.resolve(phone=phone, create_if_missing=False)
+        person = result.entity if result else None
         if not person:
             unresolved += 1
+            continue
+
+        # Ensure a phone-keyed source_entity exists and is linked.
+        # This happens BEFORE the "existing interaction?" check so that
+        # already-imported calls still contribute to source_entity
+        # accumulation when the resolver / entity store grows new rows.
+        # ``seen_phones`` dedups within this run; per-call freshness is
+        # preserved by computing the merged observed_at across all calls
+        # seen for the same phone before the first DB write.
+        if phone not in seen_phones:
+            seen_phones.add(phone)
+            se_source_id = f"phone_{phone}"
+            # The most-recent valid timestamp among any call for this phone
+            # in this batch — prevents observed_at from ratcheting backwards
+            # when the export isn't strictly chronological. Malformed
+            # timestamps inside other calls are skipped silently.
+            same_phone_timestamps: list[datetime] = []
+            for c in calls:
+                if (
+                    c.get("timestamp")
+                    and _extract_phone_from_title(c.get("title", "")) == phone
+                ):
+                    try:
+                        same_phone_timestamps.append(
+                            datetime.fromisoformat(c["timestamp"])
+                        )
+                    except (ValueError, TypeError):
+                        continue
+            this_phone_max_ts = max(same_phone_timestamps, default=timestamp or now)
+            existing_se = se_store.get_by_source("phone", se_source_id)
+            if existing_se:
+                # Preserve fields we don't have authoritative data for in
+                # this importer (observed_name comes from Address Book on
+                # the Mac-side path; here we only know the number).
+                if existing_se.observed_at is None or this_phone_max_ts > existing_se.observed_at:
+                    existing_se.observed_at = this_phone_max_ts
+                existing_se.observed_phone = phone
+                se_store.update(existing_se)
+                source_entities_updated += 1
+                se = existing_se
+            else:
+                se = SourceEntity(
+                    source_type="phone",
+                    source_id=se_source_id,
+                    observed_name=None,
+                    observed_phone=phone,
+                    metadata={},
+                    observed_at=this_phone_max_ts,
+                )
+                se = se_store.add(se)
+                source_entities_created += 1
+            # Only re-link from auto-quality data: never clobber a manual
+            # link (link_status == "manual") because that represents a
+            # human's judgement that this number belongs to a specific
+            # person, possibly across a merge or rename.
+            if (
+                se.canonical_person_id != person.id
+                and (se.link_status or "auto") != "manual"
+            ):
+                se_store.link_to_person(
+                    se.id, person.id,
+                    confidence=0.95, status=LINK_STATUS_AUTO,
+                )
+
+        # Skip calls already in the interaction store.
+        existing = store.get_by_source(source_type, source_id)
+        if existing:
+            skipped += 1
             continue
 
         interaction = Interaction(
@@ -328,9 +441,18 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
     logger.info(
         f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid), "
-        f"{unresolved} unresolved (no matching person)"
+        f"{unresolved} unresolved (no phone in title), "
+        f"{source_entities_created} source_entities created, "
+        f"{source_entities_updated} updated"
     )
-    return {"status": "ok", "imported": imported, "skipped": skipped, "unresolved": unresolved}
+    return {
+        "status": "ok",
+        "imported": imported,
+        "skipped": skipped,
+        "unresolved": unresolved,
+        "source_entities_created": source_entities_created,
+        "source_entities_updated": source_entities_updated,
+    }
 
 
 def import_photos_faces(dry_run: bool = False) -> dict:
@@ -674,8 +796,14 @@ def main():
             # (which emits its own SYNC_STATS line). Nothing to count here.
             pass
         elif name == "phone":
-            # import_phone_calls → {"imported", "skipped", "unresolved"}
+            # import_phone_calls → {"imported", "source_entities_created",
+            # "source_entities_updated", ...}. The orchestrator's
+            # SYNC_STATS schema has no "source_entities_updated" field —
+            # update counts surface only in the importer's log line. Worth
+            # adding to the schema if we ever start tracking
+            # "things changed without growing the table".
             aggregate["interactions_created"] += int(result.get("imported", 0) or 0)
+            aggregate["source_entities_created"] += int(result.get("source_entities_created", 0) or 0)
         elif name == "photos":
             # import_photos_faces → {"sources_created", "interactions_created"}
             aggregate["source_entities_created"] += int(result.get("sources_created", 0) or 0)
