@@ -122,7 +122,7 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)".
 
-**Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: reply to it (Telegram's native reply, on any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). For convenience, a plain message sent within 30 minutes of a notification continues the most recent thread without needing the reply gesture; after 30 minutes a plain message goes to normal chat.
+**Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
 **Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous, the bot asks you "local or claude?" before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 

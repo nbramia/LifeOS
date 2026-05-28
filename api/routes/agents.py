@@ -456,6 +456,75 @@ def _thread_dict(s: Session) -> dict[str, Any]:
     }
 
 
+def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[dict]:
+    """Build a readable conversation — `[{role, text, tools:[{name, input}]}]` —
+    for the web /chat thread view.
+
+    Prefers the local `messages` table (the authoritative structured
+    conversation for local / operator sessions); falls back to the managed
+    transcript events for cloud sessions whose turns live remotely. Tool calls
+    are attached to the assistant turn that issued them so the UI can show them
+    as collapsible detail under the reply.
+    """
+    turns: list[dict] = []
+
+    if messages:
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                continue
+            if role == "user":
+                # String user content is a real prompt / follow-up. List content
+                # is tool results fed back to the model — internal plumbing, skip.
+                if isinstance(content, str) and content.strip():
+                    turns.append({"role": "user", "text": content.strip(), "tools": []})
+                continue
+            if role == "assistant":
+                text_parts: list[str] = []
+                tools: list[dict] = []
+                if isinstance(content, str):
+                    text_parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text" and block.get("text"):
+                            text_parts.append(block["text"])
+                        elif block.get("type") == "tool_use":
+                            tools.append({
+                                "name": block.get("name", "tool"),
+                                "input": block.get("input", {}),
+                            })
+                text = "\n".join(p.strip() for p in text_parts if p and p.strip()).strip()
+                if text or tools:
+                    turns.append({"role": "assistant", "text": text, "tools": tools})
+        return turns
+
+    # Managed (cloud) sessions: turns live in the transcript, not the DB.
+    pending_tools: list[dict] = []
+    for ev in events:
+        kind = ev.get("kind", "")
+        payload = ev.get("payload") or {}
+        if kind in ("managed_event_agent.mcp_tool_use", "managed_event_agent.tool_use", "tool_call"):
+            pending_tools.append({
+                "name": payload.get("name") or payload.get("tool") or "tool",
+                "input": payload.get("input") or payload.get("arguments") or {},
+            })
+        elif kind == "managed_event_agent.message":
+            text_parts = [
+                c.get("text") for c in (payload.get("content") or [])
+                if isinstance(c, dict) and c.get("text")
+            ]
+            text = "\n".join(t.strip() for t in text_parts if t).strip()
+            if text or pending_tools:
+                turns.append({"role": "assistant", "text": text, "tools": pending_tools})
+                pending_tools = []
+    if pending_tools:
+        turns.append({"role": "assistant", "text": "", "tools": pending_tools})
+    return turns
+
+
 @router.get("/threads")
 async def list_threads(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     """List recent/resumable agent threads (root sessions only) for /chat.
@@ -485,7 +554,19 @@ async def get_thread(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     tail = events[-limit:] if len(events) > limit else events
-    return {"thread": _thread_dict(session), "events": tail, "total": len(events)}
+    # Reconstructed conversation for the /chat thread view: user/assistant
+    # turns with the agent's tool calls attached (collapsible in the UI).
+    try:
+        messages = session_store.get_messages(session_id)
+    except Exception:  # noqa: BLE001 — never break the read on a messages-table hiccup
+        messages = []
+    conversation = _reconstruct_conversation(messages, events)
+    return {
+        "thread": _thread_dict(session),
+        "conversation": conversation,
+        "events": tail,
+        "total": len(events),
+    }
 
 
 @router.post("/threads/{session_id}/reply")

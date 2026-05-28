@@ -1010,11 +1010,8 @@ class SessionStore:
 
     def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
         """Return the most recent open follow-up whose notification was sent
-        within `within_seconds`, or None.
-
-        Powers the "plain message resumes the last agent thread" path: a
-        non-reply Telegram message within the window resumes the most recently
-        completed/failed thread without requiring the native reply gesture.
+        within `within_seconds`, or None — a "is there a recently-finished,
+        still-open agent thread?" query.
         """
         cutoff = _now() - int(within_seconds)
         with self._connect() as conn:

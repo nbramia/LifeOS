@@ -384,10 +384,6 @@ class TelegramBotListener:
 
     _STATE_FILE = Path("data/telegram_state.json")
     _DEDUP_WINDOW = 1000  # Track last N message IDs for deduplication
-    # A plain (non-reply) message within this window of an agent thread's
-    # terminal notification resumes that thread instead of starting a fresh
-    # chat query. Beyond it, plain messages route to the chat pipeline.
-    _AGENT_THREAD_RESUME_WINDOW_SECONDS = 30 * 60
 
     def __init__(self):
         self._stop_event = threading.Event()
@@ -514,39 +510,6 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"agent-worker deposit_answer failed: {exc}")
             return False
-
-    async def _maybe_resume_recent_agent_thread(self, text: str, chat_id: str) -> bool:
-        """Resume the most recent completed/failed agent thread when a plain
-        (non-reply) message arrives within the resume window.
-
-        Deposits the message into that thread's open follow-up so the worker
-        reopens the session as a new user turn, then shows a visible
-        continuation prefix. Returns True if the message was consumed as a
-        resume; False to fall through to the chat pipeline.
-
-        Like the native reply-deposit path (`_maybe_deposit_agent_answer`),
-        this hands off to the agent worker via the shared `pending_questions`
-        table; if that process is down the deposited turn waits until it comes
-        back rather than running immediately. Accepted edge — both deposit
-        paths share this property.
-        """
-        try:
-            from api.services.agent_worker.session_store import SessionStore
-            store = SessionStore()
-            row = store.get_recent_resumable_followup(
-                within_seconds=self._AGENT_THREAD_RESUME_WINDOW_SECONDS,
-            )
-            if not row:
-                return False
-            if not store.deposit_answer(row["sent_message_id"], text):
-                return False
-        except Exception as exc:
-            logger.warning(f"agent-thread resume check failed: {exc}")
-            return False
-
-        label = (row.get("question") or "").strip() or "your last agent task"
-        await send_message_async(f'↪ continuing "{label}"', chat_id=chat_id)
-        return True
 
     async def _handle_agent_spawn(self, rest: str, chat_id: str):
         """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
@@ -681,13 +644,10 @@ class TelegramBotListener:
         if await self._check_code_followup(text, chat_id):
             return
 
-        # Plain message (no native reply gesture) within the resume window:
-        # resume the most recent completed/failed agent thread so a quick
-        # "actually, also do X" continues the conversation instead of
-        # silently starting a fresh chat query. Native reply-to (handled
-        # above) still targets a specific, possibly older, thread.
-        if await self._maybe_resume_recent_agent_thread(text, chat_id):
-            return
+        # Agent-thread replies are resumed only via an explicit reply-to gesture
+        # (handled near the top of this method). A plain message is always a
+        # fresh chat query — no implicit "recent thread" capture — so unrelated
+        # questions never get silently swallowed into a finished agent thread.
 
         # Send through chat pipeline (intent classification happens there)
         try:
