@@ -78,7 +78,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 
 ### Task Management Tools
 
-Tasks can also be managed via natural language chat. See [Task Management Guide](../guides/TASK-MANAGEMENT.md).
+Tasks can also be managed via natural language chat. See [Task Management spec](task-management.md).
 
 | Tool | Description |
 |------|-------------|
@@ -90,7 +90,7 @@ Tasks can also be managed via natural language chat. See [Task Management Guide]
 
 ### Reminders & Telegram Tools
 
-Reminders can also be managed via natural language chat. See [Reminders Guide](../guides/REMINDERS.md).
+Reminders can also be managed via natural language chat. See [Reminders Guide](../../guides/reminders.md).
 
 | Tool | Description |
 |------|-------------|

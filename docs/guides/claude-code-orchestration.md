@@ -6,9 +6,11 @@
 
 Run Claude Code tasks remotely from Telegram. Send `/code <task>` and get results back as messages.
 
+> **For what `/code` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). **For implementation** (subprocess spawning, stream parsing, plan/clarification flow), see [Claude Code Orchestration — technical spec](../specs/technical/claude-code-orchestration.md). This file is the operator how-to.
+
 ## Prerequisites
 
-1. **Telegram configured** — `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set in `.env`. See [Configuration](../getting-started/CONFIGURATION.md#telegram).
+1. **Telegram configured** — `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set in `.env`. See [configuration.md § Telegram](configuration.md#telegram).
 
 2. **Claude Code installed on the server** — the CLI binary must exist at the configured path.
 
@@ -48,14 +50,7 @@ You should see a `system` init event followed by an `assistant` event with Claud
 
 ## Configuration
 
-Two optional environment variables in `.env`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LIFEOS_CLAUDE_BINARY` | `~/.local/bin/claude` | Path to the Claude CLI binary |
-| `LIFEOS_CLAUDE_TIMEOUT` | `3600` (1 hour) | Safety-net timeout per session in seconds. Heartbeats keep you informed; this is a backstop. |
-
-These rarely need changing. The binary path matches the standard Claude Code installation location.
+The orchestrator reads four env vars: `LIFEOS_CLAUDE_BINARY`, `LIFEOS_CLAUDE_TIMEOUT`, `LIFEOS_CLAUDE_MAX_TURNS`, `LIFEOS_CLAUDE_MAX_COST`. Defaults rarely need changing. See [configuration.md § Claude Code Orchestration](configuration.md#claude-code-orchestration-code-telegram-command) for the full table.
 
 After changing these values, restart the server:
 ```bash
@@ -147,33 +142,7 @@ Only one session runs at a time. If you send `/code` while a session is active, 
 
 ## How It Works
 
-1. **Subprocess spawning**: `/code` spawns `claude -p <task>` as a subprocess on the server with `--output-format stream-json` for structured output parsing.
-
-2. **Stream parsing**: A background thread reads the subprocess stdout line-by-line, parsing JSON events (init, assistant, result).
-
-3. **[NOTIFY] extraction**: Assistant events are scanned for lines matching `[NOTIFY] <message>`. These are relayed to Telegram via the sync `send_message()` function.
-
-4. **Completion**: The result event triggers a final notification to Telegram with the task outcome.
-
-5. **Timeout**: A watchdog timer kills the subprocess after 10 minutes (configurable). You'll get a timeout notification in Telegram.
-
-6. **MCP tools**: Claude Code sessions have access to LifeOS data via MCP tools (`lifeos_ask`, `lifeos_search`, `lifeos_calendar_*`, etc.). This lets Claude reference personal data while performing code tasks. See [API & MCP Reference](../architecture/API-MCP-REFERENCE.md#mcp-tools) for the full tool list.
-
-7. **Server shutdown**: Active sessions are gracefully terminated during server restart.
-
-### System Prompt
-
-Claude Code receives a system prompt instructing it to:
-- **Interpret tasks creatively** — think about what you actually want, not just the literal words. Requests from Telegram are brief and informal; Claude will explore the directory, understand conventions, and do the full job (e.g., "write a cron job" means create the script AND install the cron entry)
-- **Be persistent and resourceful** — try alternative approaches before giving up, debug errors independently, and only ask the user for help after exhausting options
-- **Know the environment** — vault location, project directories, available tools (git, cron, Python venv)
-- Always include a completion summary via `[NOTIFY]`
-
-Only `[NOTIFY]` lines are relayed — all other output (tool calls, file reads, intermediate steps) stays in the subprocess.
-
-### Heartbeat Updates
-
-Every 5 minutes, if the session is still running, you'll receive an automatic progress ping ("Still working... (5m elapsed)") via Telegram. This happens regardless of whether Claude has sent any `[NOTIFY]` messages, so you always know the session is alive.
+Implementation moved to the [technical spec](../specs/technical/claude-code-orchestration.md) — that covers subprocess spawning, stream parsing, `[NOTIFY]`/`[CLARIFY]` extraction, the system prompt, the heartbeat timer, and budget enforcement. Operator-facing summary: it's a one-shot `claude` subprocess with `--output-format stream-json --dangerously-skip-permissions`, parsed in real time, with `[NOTIFY]` checkpoints relayed to Telegram and a 5-minute heartbeat so you always know it's alive.
 
 ---
 
@@ -235,5 +204,8 @@ If Claude is working in the wrong directory, make your task description more exp
 
 ## Related Documents
 
+- [Claude Code Orchestration — Product](../specs/product/claude-code-orchestration.md) -- What `/code` does (consumer view); plan mode; clarifications; budgets
+- [Claude Code Orchestration — Technical](../specs/technical/claude-code-orchestration.md) -- Implementation: subprocess, stream parsing, system prompt, cancellation
+- [Configuration](configuration.md) -- `LIFEOS_CLAUDE_*` env vars
+- [MCP Tools](../specs/product/mcp-tools.md) -- MCP tools available to Claude Code sessions
 - [Scripts Reference](scripts.md) -- All LifeOS scripts with usage examples
-- [API Reference](../specs/product/api-reference.md) -- MCP tools used by Claude Code sessions
