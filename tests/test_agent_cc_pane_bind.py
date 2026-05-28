@@ -235,7 +235,7 @@ def test_focus_404_when_cache_miss_and_probe_finds_nothing(
     r = client.post(f"/api/agents/sessions/{sid}/focus")
     assert r.status_code == 404
     detail = r.json()["detail"].lower()
-    assert "probe" in detail or "no tracked" in detail
+    assert "couldn't locate pane" in detail
 
 
 @pytest.mark.unit

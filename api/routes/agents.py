@@ -1192,8 +1192,8 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
         if probed is None:
             raise HTTPException(
                 status_code=404,
-                detail="no tracked wezterm tab and pane probe found nothing — "
-                       "install the SessionStart hook or run Resume",
+                detail="couldn't locate pane — session not running, "
+                       "wezterm unreachable, or SessionStart hook not installed",
             )
         mapping = store.get(session_id)
         assert mapping is not None  # _probe_and_store just wrote it

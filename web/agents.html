@@ -1129,17 +1129,20 @@
         }, 220);
       })
       .on('dblclick', (event, d) => {
-        // Double-click = Go To. Only fires for Claude Code sessions
-        // (non-subagent) since the backend endpoint is cc-only.
+        // Double-click = Go To. Only handled for Claude Code sessions
+        // (non-subagent) since the backend endpoint is cc-only — for
+        // anything else, let the deferred single-click panel toggle run
+        // normally rather than silently swallowing it.
+        if (d.source !== 'claude_code' || d.is_subagent) {
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();  // suppress d3.zoom default dblclick zoom-in
         if (_nodeClickTimer) {
           clearTimeout(_nodeClickTimer);
           _nodeClickTimer = null;
         }
-        if (d.source === 'claude_code' && !d.is_subagent) {
-          focusCcSession(d);
-        }
+        focusCcSession(d);
       });
     // One shape element per node, type chosen by source.
     entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
@@ -1340,7 +1343,7 @@
         // not running, or in a non-wezterm terminal). 410 = mapping existed
         // and the pane is gone (typical: closed tab); a re-probe also failed.
         if (r.status === 404) {
-          showToast(`Couldn't locate pane. If claude is running in wezterm, install the SessionStart hook.`, true);
+          showToast(`Couldn't locate pane — session not running, wezterm unreachable, or SessionStart hook not installed.`, true);
         } else if (r.status === 410) {
           showToast(`Pane no longer exists. Click Resume to open a new one.`, true);
         } else {
