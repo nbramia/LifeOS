@@ -344,6 +344,31 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_timeout_closes_code_followup_without_nudge(tmp_path: Path):
+    """A stale code_followup row (#237) is timed out (closed) but does NOT get
+    the agent-worker 'still waiting / re-tag with #agent' nudge — it points at a
+    Claude Code session, not an #agent task."""
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    qid = w.session_store.create_pending_question(
+        session_id="claude_xyz", task_id="code_claude_xyz",
+        question="fix the bug", sent_message_id=77, kind="code_followup",
+    )
+    with w.session_store._connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET sent_at = ? WHERE id = ?",
+            (int(time.time()) - 4 * 86400, qid),
+        )
+
+    w._timeout_stale_clarifications()
+
+    assert w.session_store.get_question_by_message_id(77)["timed_out"] == 1
+    assert not any("still waiting on your reply" in s for s in w._sent)
+
+
+@pytest.mark.unit
 def test_lifeos_agent_user_ask_blocks_and_records_question(tmp_path: Path):
     """An agent calling `lifeos_agent_user_ask` should park the session and record
     a pending_question that the user can reply-thread to."""
