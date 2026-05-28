@@ -261,19 +261,20 @@ def _extract_phone_from_title(title: str) -> str | None:
 def import_phone_calls(dry_run: bool = False) -> dict:
     """Import phone call history from the Mac Mini's JSON export.
 
-    Mirrors the source_entity behaviour of ``scripts/sync_phone_calls.py``
-    (the macOS-native version). For each call whose phone number resolves
-    to an existing PersonEntity, we ensure a phone-keyed SourceEntity
-    exists (``phone_{e164}``), update its ``observed_at`` to the most
-    recent call we've seen for that number in this batch, link it to the
-    person if it isn't already, then create the Interaction.
+    For every observed phone number we ensure a phone-keyed SourceEntity
+    exists (``phone_{e164}``) with its ``observed_at`` set to the most-
+    recent call we've seen for that number in this batch:
 
-    Scope: only resolvable callers get source_entities. Callers we've never
-    associated with a Person (spam, robocalls, first-time inbound) stay in
-    ``unresolved``. The entity-resolver has no phone-only create-if-missing
-    branch (see ``api/services/entity_resolver.py:881``) and adding one
-    here would mint a junk PersonEntity per spam call. Filed as a separate
-    follow-up.
+    - If the number resolves to an existing PersonEntity, link the
+      source_entity to that person (unless a manual link already exists)
+      and create the Interaction record for the call.
+    - If the number doesn't resolve to any Person, the source_entity is
+      stored **unlinked** (``canonical_person_id IS NULL``). This is
+      issue #226's policy: phone alone never creates a Person — auto-
+      creating one per spam call would pollute the People graph — but we
+      keep the forensic observation so ``scripts/link_source_entities.py``
+      can retro-link it later when the matching Contact / email arrives.
+      No Interaction is created (interactions require ``person_id``).
 
     The source_entity update happens BEFORE the "interaction already
     exists?" check so that re-imports still close the issue #199 §2 drift
@@ -345,23 +346,16 @@ def import_phone_calls(dry_run: bool = False) -> dict:
             unresolved += 1
             continue
 
-        # Resolve to PersonEntity by phone. Note: the resolver has no
-        # "create from phone alone" branch (see entity_resolver.py:881 —
-        # only email and name create-if-missing paths exist), so callers
-        # whose phone we've never linked to a known Person are deliberately
-        # left in ``unresolved``. Adding a phone-only create branch is a
-        # separate, broader change (filed as a follow-up); doing it here
-        # would auto-create a junk Person for every spam call.
+        # Resolve to an existing PersonEntity by phone — phone alone never
+        # CREATES a Person (issue #226). May return None.
         result = resolver.resolve(phone=phone, create_if_missing=False)
         person = result.entity if result else None
-        if not person:
-            unresolved += 1
-            continue
 
-        # Ensure a phone-keyed source_entity exists and is linked.
-        # This happens BEFORE the "existing interaction?" check so that
-        # already-imported calls still contribute to source_entity
-        # accumulation when the resolver / entity store grows new rows.
+        # Ensure a phone-keyed source_entity exists for the observed number.
+        # We do this even when no Person matches: the row stays unlinked
+        # (``canonical_person_id IS NULL``) and ``link_source_entities.py``
+        # will retro-link it on a future pass when the matching Contact /
+        # email finally appears.
         # ``seen_phones`` dedups within this run; per-call freshness is
         # preserved by computing the merged observed_at across all calls
         # seen for the same phone before the first DB write.
@@ -408,17 +402,26 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 se = se_store.add(se)
                 source_entities_created += 1
             # Only re-link from auto-quality data: never clobber a manual
-            # link (link_status == "manual") because that represents a
-            # human's judgement that this number belongs to a specific
-            # person, possibly across a merge or rename.
+            # link (link_status == "manual"). Skip link entirely if there's
+            # no matching Person yet — the source_entity stays unlinked
+            # until retro-linking finds a match.
             if (
-                se.canonical_person_id != person.id
+                person is not None
+                and se.canonical_person_id != person.id
                 and (se.link_status or "auto") != "manual"
             ):
                 se_store.link_to_person(
                     se.id, person.id,
                     confidence=0.95, status=LINK_STATUS_AUTO,
                 )
+
+        # No Person → no Interaction row (the interactions schema requires
+        # person_id). The source_entity is what carries the observation
+        # forward; ``unresolved`` still tracks the count so dashboards can
+        # see how many calls didn't link to a known person tonight.
+        if person is None:
+            unresolved += 1
+            continue
 
         # Skip calls already in the interaction store.
         existing = store.get_by_source(source_type, source_id)
