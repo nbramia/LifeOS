@@ -300,10 +300,15 @@ def _output_dir() -> str:
 
 
 def _user_message_for(task: dict) -> str:
-    """Build the opening user turn from the task description."""
+    """Build the opening user turn from the task description.
+
+    Prepended with the LifeOS capabilities preamble so the local-routed
+    agent (Gemma) has the same situational awareness as the cloud route.
+    """
+    from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
     title = (task.get("description") or "").strip()
     context = task.get("context")
-    parts = [f"Task: {title}"]
+    parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
     parts.append("Please complete this task using the tools available.")

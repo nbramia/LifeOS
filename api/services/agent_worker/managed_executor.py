@@ -92,8 +92,13 @@ def _truncate_oversized_tool_result(event: dict) -> dict:
 def _user_message_for(task: dict, session_id: str, expected_output: str, budget: dict) -> str:
     """The initial user turn sent to a managed session.
 
-    Purely task-specific. Persona, ambiguity policy, and output-format
-    requirements all live in the agent preset (Anthropic console).
+    Prepended with the LifeOS capabilities preamble (see
+    `capabilities_preamble.py`) so the agent knows what data and tools
+    are available before it reads the task. The preamble is the same on
+    every call and benefits from prompt caching after the first request.
+
+    Persona, ambiguity policy, and output-format requirements live in
+    the agent preset (Anthropic console).
 
     Budget is framed as a *soft* target: Anthropic doesn't enforce it
     server-side, the worker kills the session externally on breach.
@@ -105,11 +110,12 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     can't be inferred server-side because the request crosses a
     process boundary.
     """
+    from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
     title = (task.get("description") or "").strip()
     context = task.get("context")
     max_dollars = budget.get("max_dollars")
     dollars_str = f"~${max_dollars}" if max_dollars is not None else "unset"
-    parts = [f"Task: {title}"]
+    parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
     parts.append(
