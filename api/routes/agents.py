@@ -621,6 +621,21 @@ def _resume_env() -> dict[str, str]:
         candidate = f"/run/user/{uid}"
         if os.path.isdir(candidate):
             env["XDG_RUNTIME_DIR"] = candidate
+
+    # Prepend $HOME/.local/bin to PATH so the spawned terminal can find
+    # user-installed binaries (notably claude itself, which the npm CLI
+    # installs there). systemd's lifeos-api unit inherits the bare system
+    # PATH (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin`)
+    # so without this the inner `claude --resume` errors with
+    # "No viable candidates found in PATH". The wezterm CLI propagates
+    # our env through to the spawned tab, so setting PATH here is
+    # sufficient — no template wrapping needed.
+    home = env.get("HOME", "")
+    if home:
+        local_bin = f"{home}/.local/bin"
+        current_path = env.get("PATH", "")
+        if os.path.isdir(local_bin) and local_bin not in current_path.split(":"):
+            env["PATH"] = f"{local_bin}:{current_path}" if current_path else local_bin
     return env
 
 
