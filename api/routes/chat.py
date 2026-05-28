@@ -919,11 +919,13 @@ async def _handle_agent_slash(stripped: str, conversation_id, store):
     if not task:
         msg = "Usage: `/agent [local|claude] <task>` — e.g. `/agent claude refactor the parser`."
     else:
+        sess_store = None
         try:
             from api.services.agent_worker.operator_spawn import create_operator_session
             from api.services.agent_worker.session_store import SessionStore
+            sess_store = SessionStore()
             result = await asyncio.to_thread(
-                create_operator_session, SessionStore(), task, explicit_routing=explicit,
+                create_operator_session, sess_store, task, explicit_routing=explicit,
             )
         except Exception as exc:
             result = {"ok": False, "error": str(exc)[:200]}
@@ -931,6 +933,13 @@ async def _handle_agent_slash(stripped: str, conversation_id, store):
         if not result.get("ok"):
             msg = f"Couldn't spawn agent: {result.get('error')}"
         elif result.get("needs_routing"):
+            # No inline routing-clarification flow on the web surface — tear the
+            # parked session down so it doesn't linger as a blocked thread.
+            if sess_store is not None:
+                try:
+                    sess_store.delete_session(result["session_id"])
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
             msg = (
                 "I couldn't tell whether to use the local or cloud model — "
                 "re-run as `/agent local <task>` or `/agent claude <task>`."

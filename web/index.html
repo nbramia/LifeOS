@@ -2955,13 +2955,16 @@
             list.innerHTML = '';
             threads.forEach(t => {
                 const label = escapeHtml((t.label || t.task_id || t.session_id || 'agent').toString());
+                // escapeHtml leaves double-quotes intact; escape them for the
+                // title="…" attribute context to prevent attribute breakout.
+                const labelAttr = label.replace(/"/g, '&quot;');
                 const status = (t.status || '').toString();
                 const sid = t.session_id;
                 const div = document.createElement('div');
                 div.className = 'agent-thread';
                 div.innerHTML =
                     '<div class="agent-thread-top">' +
-                        '<span class="agent-thread-label" title="' + label + '">' + label + '</span>' +
+                        '<span class="agent-thread-label" title="' + labelAttr + '">' + label + '</span>' +
                         '<span class="agent-badge ' + escapeHtml(status) + '">' + (escapeHtml(status) || '?') + '</span>' +
                         (t.resumable ? '<button class="agents-refresh" title="Reply" onclick="toggleAgentReply(\'' + sid + '\')">↩</button>' : '') +
                     '</div>' +

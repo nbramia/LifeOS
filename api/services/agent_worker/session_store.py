@@ -972,6 +972,19 @@ class SessionStore:
             )
         return True
 
+    def delete_session(self, session_id: str) -> None:
+        """Hard-delete a session and its queued messages/questions/turns.
+
+        Used to clean up an operator spawn that couldn't be routed (preflight
+        returned `ask` but the calling surface has no clarification flow), so it
+        doesn't linger as a permanently-blocked thread.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM pending_questions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
     def enqueue_web_followup(self, session_id: str, task_id: str, answer: str) -> int:
         """Queue a follow-up turn from a non-Telegram surface (web /chat, #236).
 

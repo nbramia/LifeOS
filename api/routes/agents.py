@@ -332,12 +332,29 @@ class ReplyRequest(BaseModel):
     text: str
 
 
-def _thread_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
-    """Session dict plus a `resumable` flag for the threads panel."""
-    d = _session_to_dict(s, transcript)
-    d["resumable"] = s.status in TERMINAL_STATUSES
-    d["origin"] = getattr(s, "origin", None)
-    return d
+def _thread_dict(s: Session) -> dict[str, Any]:
+    """Lightweight thread projection for the panel — no transcript read.
+
+    The list endpoint is polled, so it avoids `_session_to_dict`'s per-session
+    JSONL read (whose event-summary fields the panel doesn't use). `label`
+    resolves via the cached TaskManager lookup, not the transcript.
+    """
+    return {
+        "session_id": s.session_id,
+        "task_id": s.task_id,
+        "status": s.status,
+        "routing": s.routing,
+        "parent_session_id": s.parent_session_id,
+        "root_session_id": s.root_session_id,
+        "started_at": s.started_at,
+        "last_activity_at": s.last_activity_at,
+        "total_dollars": round(s.total_dollars, 6),
+        "expected_output": s.expected_output,
+        "label": _label_for_session(s, []),
+        "model_label": _model_label_for_routing(s.routing),
+        "origin": getattr(s, "origin", None),
+        "resumable": s.status in TERMINAL_STATUSES,
+    }
 
 
 @router.get("/threads")
@@ -348,13 +365,8 @@ async def list_threads(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     sessions (no `parent_session_id`) are surfaced as conversable threads.
     """
     session_store = _get_session_store()
-    transcript_store = _get_transcript_store()
     sessions = session_store.list_sessions(limit=_SNAPSHOT_LIMIT)
-    threads = [
-        _thread_dict(s, transcript_store)
-        for s in sessions
-        if not s.parent_session_id
-    ]
+    threads = [_thread_dict(s) for s in sessions if not s.parent_session_id]
     return {"threads": threads[:limit], "total": len(threads)}
 
 
@@ -374,7 +386,7 @@ async def get_thread(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     tail = events[-limit:] if len(events) > limit else events
-    return {"thread": _thread_dict(session, transcript_store), "events": tail, "total": len(events)}
+    return {"thread": _thread_dict(session), "events": tail, "total": len(events)}
 
 
 @router.post("/threads/{session_id}/reply")
@@ -416,6 +428,15 @@ async def spawn_agent(body: SpawnRequest) -> dict[str, Any]:
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "spawn failed"))
+    if result.get("needs_routing"):
+        # Preflight was ambiguous about the model. The web surface has no inline
+        # routing-clarification flow (unlike Telegram), so don't leave a parked
+        # session that never runs — tear it down and ask for an explicit model.
+        session_store.delete_session(result["session_id"])
+        raise HTTPException(
+            status_code=409,
+            detail="Ambiguous which model to use — retry with routing 'local' or 'claude'.",
+        )
     return result
 
 

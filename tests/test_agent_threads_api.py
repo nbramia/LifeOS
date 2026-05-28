@@ -172,3 +172,24 @@ def test_spawn_auto_routing_uses_preflight(stores, client, monkeypatch):
     resp = client.post("/api/agents/spawn", json={"prompt": "summarize my week", "routing": "auto"})
     assert resp.status_code == 200
     assert resp.json()["routing"] == "local"
+
+
+def test_spawn_auto_ambiguous_returns_409_and_cleans_up(stores, client, monkeypatch):
+    """When preflight is ambiguous (ROUTE_ASK), the web spawn has no inline
+    clarification flow — it must 409 and not leave a parked session behind."""
+    session_store, _ = stores
+    import api.services.agent_worker.operator_spawn as op
+
+    def ask_preflight(title, tags=None, caller=None):
+        from api.services.agent_worker.preflight import PreflightResult, PreflightBudget
+        return PreflightResult(
+            budget=PreflightBudget(wall_seconds=60, max_tokens=100, max_dollars=1.0),
+            routing="ask", routing_reason="ambiguous", expected_output="text",
+            ambiguity=None, sane=True, sane_reason="", raw={},
+        )
+
+    monkeypatch.setattr(op, "run_preflight", ask_preflight)
+    resp = client.post("/api/agents/spawn", json={"prompt": "do the thing", "routing": "auto"})
+    assert resp.status_code == 409
+    # No parked operator session was left behind.
+    assert session_store.list_sessions(status="blocked") == []
