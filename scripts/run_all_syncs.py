@@ -1012,6 +1012,17 @@ def run_all_syncs(
         except Exception as e:
             logger.warning(f"Failed to reap orphan sync_runs: {e}")
 
+        # Monarch session expiry check (issue #199 §3 acceptance criterion).
+        # Surfaces re-auth need in the nightly log *before* the monthly
+        # sync hits a 401/525. Cheap — just stats the pickle's mtime.
+        try:
+            from api.services.monarch import get_session_status
+            mstatus = get_session_status()
+            if mstatus["status"] in ("expiring_soon", "expired", "missing"):
+                logger.warning(f"Monarch session: {mstatus['message']}")
+        except Exception as e:
+            logger.warning(f"Monarch session-status check failed: {e}")
+
     # Trigger Photos.app to open and start iCloud sync in background (macOS only)
     # This runs at the beginning so Photos can sync throughout the entire process
     if not dry_run and sys.platform == "darwin":

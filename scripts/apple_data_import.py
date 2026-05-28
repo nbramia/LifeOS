@@ -649,6 +649,11 @@ def main():
     # Emit canonical sync stats for the orchestrator. Aggregates across all
     # sub-imports so run_all_syncs.py records the true row deltas instead of
     # inferring zero from output that doesn't match its regex patterns.
+    #
+    # Each import_* function uses a different result-dict shape (historical),
+    # so the dispatch is explicit per source. An if/elif chain — not unguarded
+    # accumulators — keeps an `import_contacts` that grows new keys later
+    # (e.g. someone adds "sources_created") from being double-counted.
     from api.services.sync_health import emit_sync_stats
     aggregate = {
         "interactions_created": 0,
@@ -659,23 +664,31 @@ def main():
     for name, result in results.items():
         if not isinstance(result, dict):
             continue
-        # Contacts: {"created", "updated", "linked"} from import_contacts.
         if name == "contacts":
+            # import_contacts → {"created", "updated", "linked"}
             aggregate["source_entities_created"] += int(result.get("created", 0) or 0)
             aggregate["people_updated"] += int(result.get("linked", 0) or 0)
-        # Photos faces: "sources_created" + "interactions_created"
-        aggregate["source_entities_created"] += int(result.get("sources_created", 0) or 0)
-        aggregate["interactions_created"] += int(result.get("interactions_created", 0) or 0)
-        # Phone uses "imported" as interactions
-        aggregate["interactions_created"] += int(result.get("imported", 0) or 0)
-        # WhatsApp returns nested {contacts: {...}, messages: {...}}
-        contacts = result.get("contacts")
-        if isinstance(contacts, dict):
-            aggregate["source_entities_created"] += int(contacts.get("source_entities_created", 0) or 0)
-            aggregate["people_updated"] += int(contacts.get("persons_linked", 0) or 0)
-        messages = result.get("messages")
-        if isinstance(messages, dict):
-            aggregate["interactions_created"] += int(messages.get("interactions_created", 0) or 0)
+        elif name == "imessage":
+            # import_imessage just copies the db; the actual source_entity /
+            # interaction creation happens later in sync_imessage_interactions
+            # (which emits its own SYNC_STATS line). Nothing to count here.
+            pass
+        elif name == "phone":
+            # import_phone_calls → {"imported", "skipped", "unresolved"}
+            aggregate["interactions_created"] += int(result.get("imported", 0) or 0)
+        elif name == "photos":
+            # import_photos_faces → {"sources_created", "interactions_created"}
+            aggregate["source_entities_created"] += int(result.get("sources_created", 0) or 0)
+            aggregate["interactions_created"] += int(result.get("interactions_created", 0) or 0)
+        elif name == "whatsapp":
+            # import_whatsapp → {"contacts": {...}, "messages": {...}}
+            contacts = result.get("contacts")
+            if isinstance(contacts, dict):
+                aggregate["source_entities_created"] += int(contacts.get("source_entities_created", 0) or 0)
+                aggregate["people_updated"] += int(contacts.get("persons_linked", 0) or 0)
+            messages = result.get("messages")
+            if isinstance(messages, dict):
+                aggregate["interactions_created"] += int(messages.get("interactions_created", 0) or 0)
     emit_sync_stats(aggregate)
 
     # Non-zero exit on any per-source error so run_all_syncs.run_sync marks

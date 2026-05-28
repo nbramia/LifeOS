@@ -134,6 +134,13 @@ class EmbeddingService:
         whole vault reindex — bubble up as ConnectionError / DNS failures and
         kill the load. When the model is already cached on disk, the right
         behaviour is to skip the network probe entirely.
+
+        Thread safety: mutates ``os.environ`` for the duration of the retry.
+        ``EmbeddingService`` is a process-wide singleton loaded lazily on
+        first access (typically the background sync worker), so concurrent
+        loads don't happen in practice. The try/finally restores the env
+        before any other code can observe it. If a future caller starts
+        triggering loads from multiple threads at once, wrap this in a lock.
         """
         try:
             return st_cls(**load_kwargs)

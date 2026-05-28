@@ -394,6 +394,11 @@ def emit_sync_stats(stats: dict) -> None:
     bypassing brittle regex inference. Each top-level sync script should call
     this once with its final tallies. Only int-valued keys are read by the
     parser; nested dicts and strings are ignored for forwards-compat.
+
+    The output is intentionally single-line — the parser regex
+    ``SYNC_STATS:(\\{[^\\n]*\\})`` will not match across newlines, so the
+    JSON payload must not contain literal newlines (``json.dumps`` doesn't
+    add any). Don't pretty-print the dict here.
     """
     import json as _json
     # Keep on its own line so the parser regex matches cleanly even when the
@@ -754,6 +759,9 @@ def detect_silent_source_entity_drift(
     warnings: list[dict] = []
 
     try:
+        # Both DBs run in WAL mode (see InteractionStore / SourceEntityStore
+        # init). Read connections see a consistent snapshot at open time;
+        # concurrent writes by an ongoing sync don't block us or skew rows.
         i_conn = sqlite3.connect(str(interactions_path))
         c_conn = sqlite3.connect(str(crm_path))
         try:

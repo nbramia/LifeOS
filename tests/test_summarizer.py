@@ -89,7 +89,7 @@ class TestGenerateSummary:
 
     @patch("api.services.summarizer.httpx.Client")
     def test_returns_none_on_timeout(self, mock_client_class):
-        """Should return (None, False) on Ollama timeout for retry tracking."""
+        """Should return (None, False) on LLM timeout for retry tracking."""
         import httpx
         from api.services.summarizer import generate_summary
 
@@ -191,7 +191,7 @@ class TestIsSummarizerLLMAvailable:
 
     @patch("api.services.summarizer.httpx.Client")
     def test_returns_true_when_available(self, mock_client_class):
-        """Should return True when Ollama responds."""
+        """Should return True when the local LLM server responds."""
         from api.services.summarizer import is_summarizer_llm_available
 
         mock_client = MagicMock()
@@ -205,7 +205,7 @@ class TestIsSummarizerLLMAvailable:
 
     @patch("api.services.summarizer.httpx.Client")
     def test_returns_false_on_error(self, mock_client_class):
-        """Should return False when Ollama fails."""
+        """Should return False when the local LLM server fails."""
         from api.services.summarizer import is_summarizer_llm_available
 
         mock_client = MagicMock()
@@ -241,16 +241,16 @@ class TestCreateSummaryChunk:
 
 
 class TestSummarizerIntegration:
-    """Integration tests with actual Ollama (requires running server)."""
+    """Integration tests with the local LLM server (requires llama-server running)."""
 
     @pytest.mark.slow
     @pytest.mark.integration
     def test_real_summary_generation(self):
-        """Test actual summary generation with Ollama."""
+        """Test actual summary generation against the local LLM server."""
         from api.services.summarizer import generate_summary, is_summarizer_llm_available
 
         if not is_summarizer_llm_available():
-            pytest.skip("Ollama not available")
+            pytest.skip("Local LLM server not available")
 
         content = """# Meeting Notes - Q4 Budget Review
 

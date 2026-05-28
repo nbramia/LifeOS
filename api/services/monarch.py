@@ -13,6 +13,7 @@ Session caching avoids repeated login/MFA. First login must be interactive
 """
 import asyncio
 import logging
+import time
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
@@ -39,7 +40,7 @@ def get_session_age_days() -> Optional[float]:
     """
     if not SESSION_PATH.exists():
         return None
-    age_seconds = datetime.now().timestamp() - SESSION_PATH.stat().st_mtime
+    age_seconds = time.time() - SESSION_PATH.stat().st_mtime
     return age_seconds / 86400.0
 
 

@@ -130,6 +130,9 @@ if __name__ == '__main__':
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. "processed"
     # is the file count so the orchestrator's generic counter matches reality.
+    # On dry runs result lacks "files_indexed", so emit zero — the orchestrator
+    # never invokes the script with --dry-run during a real sync, but keeping
+    # the line emission unconditional makes ad-hoc test runs less surprising.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "processed": int(result.get("files_indexed", 0) or 0),
