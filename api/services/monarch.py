@@ -13,6 +13,7 @@ Session caching avoids repeated login/MFA. First login must be interactive
 """
 import asyncio
 import logging
+import time
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,56 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 SESSION_PATH = Path(__file__).parent.parent.parent / "data" / "monarch_session.pickle"
+
+# Empirically observed Monarch session lifetime. Re-auth before this is hit
+# so the monthly sync doesn't silently 401/525. See issue #199 §3.
+SESSION_EXPIRY_DAYS = 30
+SESSION_WARNING_DAYS = 25  # Surface in health endpoints before things break.
+
+
+def get_session_age_days() -> Optional[float]:
+    """Return the cached Monarch session's age in days, or None if not present.
+
+    Uses the file mtime of the saved pickle — monarchmoney writes the file
+    fresh on each successful authentication, so mtime is a faithful proxy
+    for "last good login". Returns ``None`` (not 0) when no session exists so
+    callers can distinguish "fresh install" from "session just rotated".
+    """
+    if not SESSION_PATH.exists():
+        return None
+    age_seconds = time.time() - SESSION_PATH.stat().st_mtime
+    return age_seconds / 86400.0
+
+
+def get_session_status() -> dict:
+    """Summarise Monarch session freshness for /health and dashboards."""
+    age = get_session_age_days()
+    if age is None:
+        return {
+            "exists": False,
+            "age_days": None,
+            "status": "missing",
+            "message": (
+                "No cached Monarch session at data/monarch_session.pickle. "
+                "Run the interactive login documented in AGENTS.md to authenticate."
+            ),
+        }
+
+    if age >= SESSION_EXPIRY_DAYS:
+        status = "expired"
+        message = f"Monarch session is {age:.0f}d old — likely expired (>={SESSION_EXPIRY_DAYS}d). Re-authenticate."
+    elif age >= SESSION_WARNING_DAYS:
+        status = "expiring_soon"
+        message = f"Monarch session is {age:.0f}d old — re-auth recommended before it expires (~{SESSION_EXPIRY_DAYS}d)."
+    else:
+        status = "ok"
+        message = f"Monarch session is {age:.0f}d old."
+    return {
+        "exists": True,
+        "age_days": round(age, 1),
+        "status": status,
+        "message": message,
+    }
 
 
 class MonarchClient:

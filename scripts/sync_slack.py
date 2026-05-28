@@ -56,18 +56,18 @@ def run_slack_sync(full: bool = False, dry_run: bool = True) -> dict:
         results = sync.incremental_sync()
 
     # Log results
-    logger.info(f"\n=== Slack Sync Results ===")
+    logger.info("\n=== Slack Sync Results ===")
 
     if "users" in results and results["users"]:
         users = results["users"]
-        logger.info(f"Users:")
+        logger.info("Users:")
         logger.info(f"  Synced: {users.get('synced', 0)}")
         logger.info(f"  Created: {users.get('created', 0)}")
         logger.info(f"  Updated: {users.get('updated', 0)}")
 
     if "messages" in results and results["messages"]:
         msgs = results["messages"]
-        logger.info(f"Messages:")
+        logger.info("Messages:")
         logger.info(f"  Channels synced: {msgs.get('channels_synced', 0)}")
         logger.info(f"  Messages indexed: {msgs.get('messages_indexed', 0)}")
         logger.info(f"  Interactions created: {msgs.get('interactions_created', 0)}")
@@ -81,6 +81,16 @@ def run_slack_sync(full: bool = False, dry_run: bool = True) -> dict:
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output.
+    from api.services.sync_health import emit_sync_stats
+    users = results.get("users") or {}
+    msgs = results.get("messages") or {}
+    emit_sync_stats({
+        "source_entities_created": int(users.get("created", 0) or 0),
+        "people_updated": int(users.get("updated", 0) or 0),
+        "interactions_created": int(msgs.get("interactions_created", 0) or 0),
+    })
 
     return results
 

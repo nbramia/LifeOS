@@ -9,11 +9,23 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
-from api.services.monarch import get_monarch_client
+from api.services.monarch import get_monarch_client, get_session_status
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/monarch", tags=["monarch"])
+
+
+@router.get("/session_status")
+async def session_status():
+    """Report Monarch session age + expiry-soon warnings.
+
+    Used by /health/services and dashboards to surface the impending re-auth
+    requirement *before* the monthly sync hits 401/525. The session is just a
+    pickle on disk — checking its age is cheap and doesn't make any network
+    calls.
+    """
+    return get_session_status()
 
 
 @router.get("/accounts")

@@ -67,15 +67,20 @@ get_server_pid() {
 kill_server() {
     log_info "Stopping any existing server processes..."
 
-    # Method 1: Kill by port
+    # Method 1: Kill by port — catches whoever is currently bound.
     local pids=$(get_server_pid)
     if [ -n "$pids" ]; then
         echo "$pids" | xargs kill -9 2>/dev/null || true
         log_info "Killed processes on port $PORT: $pids"
     fi
 
-    # Method 2: Kill by process name (catch any stragglers)
-    pkill -9 -f "uvicorn api.main:app" 2>/dev/null || true
+    # Method 2: Kill by process name — catches stragglers that haven't bound
+    # yet (mid-startup) or have lost the port. The cmdline we actually launch
+    # is `python -c "import uvicorn\nuvicorn.run('api.main:app', ...)"`, NOT
+    # `uvicorn api.main:app`, so the legacy pattern silently missed every
+    # ghost process. Match against the chunk that's stable across both the
+    # script-launched and systemd-launched paths.
+    pkill -9 -f "uvicorn.run.*api.main:app" 2>/dev/null || true
 
     # Method 3: Clean up any HuggingFace lock files that might cause hangs
     rm -f ~/.cache/huggingface/hub/.locks/models--sentence-transformers--all-MiniLM-L6-v2/*.lock 2>/dev/null || true

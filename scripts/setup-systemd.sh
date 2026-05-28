@@ -160,6 +160,9 @@ echo "  lifeos-api: $(systemctl is-active lifeos-api.service)"
 systemctl enable --now lifeos-watchdog.timer
 echo "  lifeos-watchdog.timer: $(systemctl is-active lifeos-watchdog.timer)"
 
+systemctl enable --now lifeos-server-watchdog.timer
+echo "  lifeos-server-watchdog.timer: $(systemctl is-active lifeos-server-watchdog.timer)"
+
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 

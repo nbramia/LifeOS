@@ -8,6 +8,7 @@ NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
 """
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from config.settings import settings
@@ -16,6 +17,34 @@ logger = logging.getLogger(__name__)
 
 # GPU error keywords — shared between load-time and encode-time fallback
 _GPU_ERROR_KEYWORDS = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
+
+# Network error keywords — model load tries to check HF for updates even when
+# the snapshot is already cached. We retry offline if any of these fire.
+_NETWORK_ERROR_KEYWORDS = (
+    "huggingface.co",
+    "max retries exceeded",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "connection refused",
+    "connection timed out",
+    "connection reset",
+    "name resolution",
+    "getaddrinfo",
+    "dns",
+)
+
+
+def _looks_like_network_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like a transient network failure."""
+    msg = str(exc).lower()
+    if any(kw in msg for kw in _NETWORK_ERROR_KEYWORDS):
+        return True
+    # huggingface_hub raises specific subclasses for offline / network issues;
+    # fall back to module name matching to avoid importing it at module load.
+    cls_module = type(exc).__module__ or ""
+    if cls_module.startswith("huggingface_hub") or cls_module.startswith("requests"):
+        return True
+    return False
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -63,7 +92,7 @@ class EmbeddingService:
                 if self._force_cpu:
                     load_kwargs["device"] = "cpu"
 
-                self._model = SentenceTransformer(**load_kwargs)
+                self._model = self._load_with_offline_retry(SentenceTransformer, load_kwargs)
                 from api.services.service_health import mark_service_healthy
                 mark_service_healthy("embedding_model")
             except RuntimeError as e:
@@ -72,11 +101,12 @@ class EmbeddingService:
                 if any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
                     logger.warning(f"GPU embedding load failed ({e}), falling back to CPU")
                     try:
-                        self._model = SentenceTransformer(
-                            self.model_name,
+                        cpu_kwargs = dict(
+                            model_name_or_path=self.model_name,
                             cache_folder=self.cache_dir,
                             device="cpu",
                         )
+                        self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
                         self._force_cpu = True
                         from api.services.service_health import mark_service_healthy
                         mark_service_healthy("embedding_model")
@@ -94,6 +124,58 @@ class EmbeddingService:
                 mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
                 raise
         return self._model
+
+    def _load_with_offline_retry(self, st_cls, load_kwargs: dict):
+        """Load the SentenceTransformer, retrying with HF_HUB_OFFLINE=1 on network errors.
+
+        Sentence-transformers contacts HuggingFace at startup to check for
+        updates even when the snapshot is already cached locally. Past
+        outages — including the 2026-05-23 DNS retry storm that took down the
+        whole vault reindex — bubble up as ConnectionError / DNS failures and
+        kill the load. When the model is already cached on disk, the right
+        behaviour is to skip the network probe entirely.
+
+        Thread safety: mutates ``os.environ`` for the duration of the retry.
+        ``EmbeddingService`` is a process-wide singleton loaded lazily on
+        first access (typically the background sync worker), so concurrent
+        loads don't happen in practice. The try/finally restores the env
+        before any other code can observe it. If a future caller starts
+        triggering loads from multiple threads at once, wrap this in a lock.
+        """
+        try:
+            return st_cls(**load_kwargs)
+        except Exception as exc:
+            if not _looks_like_network_error(exc):
+                raise
+            logger.warning(
+                f"Embedding model load failed with network error ({exc.__class__.__name__}: {exc}). "
+                "Retrying with HF_HUB_OFFLINE=1 to skip the upstream version check."
+            )
+            prev_offline = os.environ.get("HF_HUB_OFFLINE")
+            prev_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            try:
+                model = st_cls(**load_kwargs)
+            finally:
+                # Restore env so other components keep their previous behaviour.
+                if prev_offline is None:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                else:
+                    os.environ["HF_HUB_OFFLINE"] = prev_offline
+                if prev_tf_offline is None:
+                    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                else:
+                    os.environ["TRANSFORMERS_OFFLINE"] = prev_tf_offline
+            try:
+                from api.services.service_health import record_degradation
+                record_degradation(
+                    "embedding_model", "load", "offline_cache",
+                    f"HF network unreachable: {exc}",
+                )
+            except Exception:
+                pass
+            return model
 
     def _encode_with_fallback(self, data, **kwargs):
         """Encode with GPU→CPU fallback on RuntimeError.

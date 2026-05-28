@@ -864,6 +864,26 @@ def main():
             logger.info(f"Refreshing stats for {len(all_affected)} affected people...")
             refresh_person_stats(list(all_affected))
 
+    # Canonical line consumed by run_all_syncs._parse_sync_output. Aggregates
+    # across gmail + calendar across whichever accounts ran (personal / work /
+    # work2) so the orchestrator records the true total instead of inferring
+    # from interleaved per-account log lines.
+    from api.services.sync_health import emit_sync_stats
+    aggregate = {
+        "interactions_created": 0,
+        "source_entities_created": 0,
+        "errors": 0,
+    }
+    for stats in all_stats.values():
+        if not isinstance(stats, dict):
+            continue
+        # Gmail uses "inserted"; calendar uses "interactions_inserted".
+        aggregate["interactions_created"] += int(stats.get("inserted", 0) or 0)
+        aggregate["interactions_created"] += int(stats.get("interactions_inserted", 0) or 0)
+        aggregate["source_entities_created"] += int(stats.get("source_entities_created", 0) or 0)
+        aggregate["errors"] += int(stats.get("errors", 0) or 0)
+    emit_sync_stats(aggregate)
+
     return all_stats
 
 

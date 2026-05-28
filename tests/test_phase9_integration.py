@@ -11,7 +11,7 @@ import pytest
 import tempfile
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 
 @pytest.mark.integration
@@ -123,7 +123,7 @@ class TestPhase9Integration:
 
     def test_document_summary_generation(self):
         """Verify document summaries are generated correctly."""
-        from api.services.summarizer import generate_summary, _fallback_summary
+        from api.services.summarizer import _fallback_summary
 
         # Test fallback summary (no Ollama needed)
         content = """# Budget Review Meeting
@@ -172,35 +172,35 @@ Meeting with Kevin and Sarah to discuss Q4 projections.
 
     def test_all_services_can_be_imported(self):
         """Verify all Phase 9 services can be imported."""
-        # This tests that there are no import errors
+        # Import-only smoke test — the assertions ARE the imports succeeding.
+        # noqa keeps ruff from stripping the "unused" imports.
 
         # P9.1 - Contextual Chunking
-        from api.services.chunker import (
+        from api.services.chunker import (  # noqa: F401
             generate_chunk_context,
             add_context_to_chunks,
             _infer_topic,
         )
 
         # P9.2 - Cross-Encoder Re-ranking
-        from api.services.reranker import (
+        from api.services.reranker import (  # noqa: F401
             RerankerService,
             get_reranker,
         )
 
         # P9.3 - Overlapping Chunks (deduplication)
-        from api.services.hybrid_search import (
+        from api.services.hybrid_search import (  # noqa: F401
             deduplicate_overlapping_chunks,
         )
 
         # P9.4 - Document Summaries
-        from api.services.summarizer import (
+        from api.services.summarizer import (  # noqa: F401
             generate_summary,
-            is_ollama_available,
+            is_summarizer_llm_available,
             create_summary_chunk,
             _fallback_summary,
         )
 
-        # All imports succeeded
         assert True
 
 
@@ -329,7 +329,7 @@ class TestPhase9EndToEnd:
 
         # Time the search (without reranker to get base latency)
         start = time.time()
-        results = hybrid.search("test content", top_k=10, use_reranker=False)
+        hybrid.search("test content", top_k=10, use_reranker=False)
         elapsed = time.time() - start
 
         # Should complete in under 500ms for 100 docs

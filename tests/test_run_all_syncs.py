@@ -180,6 +180,12 @@ def _run_llm_test(
     fail_sources = fail_sources or set()
     run_sync_mock = MagicMock(side_effect=_make_run_sync_side_effect(fail_sources))
 
+    # Without patching subprocess.run, every test would trigger a real
+    # `scripts/server.sh restart` (the post-sync server reload) and wait
+    # ~12s per test for systemd. Mock it to a clean exit so each test runs
+    # in milliseconds. Same for telegram + drift detector (need real DBs).
+    fake_restart = MagicMock(returncode=0, stdout="", stderr="")
+
     with (
         patch("scripts.run_all_syncs.SYNC_SOURCES", LLM_TEST_SYNC_SOURCES),
         patch("scripts.run_all_syncs.SYNC_ORDER", LLM_TEST_SYNC_ORDER),
@@ -188,6 +194,10 @@ def _run_llm_test(
         patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
         patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
         patch("scripts.run_all_syncs.backup_interactions"),
+        patch("scripts.run_all_syncs.send_sync_summary_telegram"),
+        patch("scripts.run_all_syncs.reap_orphan_sync_runs", return_value=0),
+        patch("scripts.run_all_syncs.detect_silent_source_entity_drift", return_value=[]),
+        patch("scripts.run_all_syncs.subprocess.run", return_value=fake_restart),
         patch("urllib.request.urlopen"),
         patch("scripts.run_all_syncs._is_llm_running", return_value=llm_running),
         patch("scripts.run_all_syncs._get_available_gpu_memory_mb", return_value=gpu_memory_mb),
@@ -403,6 +413,64 @@ class TestTimeoutBytesDecoding:
 
         assert success is False
         assert "timed out" in stats["error"].lower()
+
+
+class TestParseSyncOutput:
+    """Tests for _parse_sync_output, the bridge between sync scripts and sync_runs."""
+
+    def test_sync_stats_line_is_authoritative(self):
+        """SYNC_STATS:{json} overrides anything the regex fallback would infer."""
+        from scripts.run_all_syncs import _parse_sync_output
+
+        # Regex would parse "inserted: 5" as interactions_created=5, but the
+        # canonical line says 100 — the canonical line must win.
+        output = (
+            "Some preamble\n"
+            "Inserted: 5\n"
+            'SYNC_STATS:{"interactions_created": 100, "source_entities_created": 42}\n'
+            "Trailing log\n"
+        )
+        stats = _parse_sync_output(output)
+        assert stats["interactions_created"] == 100
+        assert stats["source_entities_created"] == 42
+        # Generic "created" is derived from categorized values.
+        assert stats["created"] == 142
+
+    def test_falls_back_to_regex_when_no_canonical_line(self):
+        """Regex parsing still works for scripts that haven't been migrated."""
+        from scripts.run_all_syncs import _parse_sync_output
+
+        output = (
+            "=== iMessage Sync Summary ===\n"
+            "Inserted: 47\n"
+            "Source entities created: 12\n"
+        )
+        stats = _parse_sync_output(output)
+        assert stats["interactions_created"] == 47
+        assert stats["source_entities_created"] == 12
+
+    def test_malformed_sync_stats_falls_back_to_regex(self):
+        """A bad JSON payload shouldn't blank out everything — fall back to regex."""
+        from scripts.run_all_syncs import _parse_sync_output
+
+        output = (
+            "SYNC_STATS:{not valid json\n"
+            "Inserted: 7\n"
+        )
+        stats = _parse_sync_output(output)
+        assert stats["interactions_created"] == 7
+
+    def test_later_sync_stats_line_wins(self):
+        """Wrappers (e.g. apple_data_import aggregating sub-imports) can override."""
+        from scripts.run_all_syncs import _parse_sync_output
+
+        output = (
+            'SYNC_STATS:{"interactions_created": 5}\n'
+            'SYNC_STATS:{"interactions_created": 50, "source_entities_created": 3}\n'
+        )
+        stats = _parse_sync_output(output)
+        assert stats["interactions_created"] == 50
+        assert stats["source_entities_created"] == 3
 
 
 class TestGetAvailableSystemRAM:

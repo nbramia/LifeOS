@@ -32,7 +32,7 @@ Usage:
 """
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional
@@ -417,6 +417,17 @@ class ServiceHealthRegistry:
         else:
             overall = "healthy"
 
+        # Monarch session age (issue #199 §3) — surface re-auth need before
+        # the monthly sync 401s. Cheap (just file mtime), no network.
+        monarch_session = None
+        try:
+            from api.services.monarch import get_session_status
+            monarch_session = get_session_status()
+        except Exception:
+            monarch_session = None
+        if monarch_session and monarch_session.get("status") in ("expired", "missing"):
+            overall = "degraded" if overall == "healthy" else overall
+
         return {
             "overall_status": overall,
             "services": services,
@@ -425,6 +436,7 @@ class ServiceHealthRegistry:
             "critical_issues": [
                 {"service": svc, "error": err} for svc, err in critical_issues
             ],
+            "monarch_session": monarch_session,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 

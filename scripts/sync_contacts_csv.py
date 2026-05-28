@@ -239,7 +239,7 @@ def sync_contacts_csv(csv_path: str = None, dry_run: bool = True) -> dict:
         person_store.save()
 
     # Log summary
-    logger.info(f"\n=== Contacts CSV Sync Summary ===")
+    logger.info("\n=== Contacts CSV Sync Summary ===")
     logger.info(f"Contacts read: {stats['contacts_read']}")
     logger.info(f"Source entities created: {stats['source_entities_created']}")
     logger.info(f"Source entities updated: {stats['source_entities_updated']}")
@@ -251,6 +251,15 @@ def sync_contacts_csv(csv_path: str = None, dry_run: bool = True) -> dict:
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "source_entities_created": stats["source_entities_created"],
+        "people_created": stats["persons_created"],
+        "people_updated": stats["persons_updated"] + stats["persons_linked"],
+        "errors": stats["errors"],
+    })
 
     return stats
 

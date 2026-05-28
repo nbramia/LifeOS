@@ -27,6 +27,9 @@ from api.services.sync_health import (
     get_recent_errors,
     get_sync_summary,
     check_sync_health,
+    reap_orphan_sync_runs,
+    emit_sync_stats,
+    detect_silent_source_entity_drift,
 )
 
 
@@ -362,6 +365,152 @@ class TestSyncHealthIntegration:
             health = get_sync_health("calendar")
             assert health.last_status == SyncStatus.SUCCESS
             assert health.last_error is None
+
+
+class TestOrphanReaper:
+    """Tests for reap_orphan_sync_runs — cleans up rows from killed processes."""
+
+    def test_reaps_old_running_rows(self, temp_db):
+        """Rows in status=running older than max_age_hours are marked failed."""
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            conn = get_sync_health_db()
+            # 10h ago — should be reaped at default 8h cutoff
+            old = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+            conn.execute(
+                "INSERT INTO sync_runs (source, status, started_at) VALUES (?, ?, ?)",
+                ("gmail_personal", "running", old),
+            )
+            conn.commit()
+            conn.close()
+
+            reaped = reap_orphan_sync_runs()
+            assert reaped == 1
+
+            health = get_sync_health("gmail_personal")
+            assert health.last_status == SyncStatus.FAILED
+
+    def test_leaves_fresh_running_rows_alone(self, temp_db):
+        """A sync that started 1h ago is still legitimately running."""
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            conn = get_sync_health_db()
+            recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            conn.execute(
+                "INSERT INTO sync_runs (source, status, started_at) VALUES (?, ?, ?)",
+                ("gmail_personal", "running", recent),
+            )
+            conn.commit()
+            conn.close()
+
+            reaped = reap_orphan_sync_runs()
+            assert reaped == 0
+
+    def test_returns_zero_when_no_orphans(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert reap_orphan_sync_runs() == 0
+
+
+class TestSourceEntityDriftDetector:
+    """Tests for the silent-regression detector from issue #199 §2."""
+
+    def _seed(self, tmp_path, interactions: list, source_entities: list):
+        """Seed minimal interactions.db / crm.db with given rows."""
+        import sqlite3
+        i_path = tmp_path / "interactions.db"
+        c_path = tmp_path / "crm.db"
+        i_conn = sqlite3.connect(str(i_path))
+        i_conn.execute(
+            "CREATE TABLE interactions (id TEXT, source_type TEXT, created_at TEXT)"
+        )
+        i_conn.executemany(
+            "INSERT INTO interactions (id, source_type, created_at) VALUES (?, ?, ?)",
+            interactions,
+        )
+        i_conn.commit()
+        i_conn.close()
+
+        c_conn = sqlite3.connect(str(c_path))
+        c_conn.execute(
+            "CREATE TABLE source_entities (id TEXT, source_type TEXT, created_at TEXT)"
+        )
+        c_conn.executemany(
+            "INSERT INTO source_entities (id, source_type, created_at) VALUES (?, ?, ?)",
+            source_entities,
+        )
+        c_conn.commit()
+        c_conn.close()
+        return str(i_path), str(c_path)
+
+    def test_flags_drift_when_interactions_flow_but_entities_stale(self, tmp_path):
+        now = datetime.now(timezone.utc)
+        recent_iso = now.isoformat()
+        stale_iso = (now - timedelta(days=60)).isoformat()
+
+        i_path, c_path = self._seed(
+            tmp_path,
+            interactions=[("i1", "imessage", recent_iso)],
+            source_entities=[("se1", "imessage", stale_iso)],
+        )
+
+        warnings = detect_silent_source_entity_drift(
+            interactions_db=i_path, crm_db=c_path
+        )
+        assert len(warnings) == 1
+        assert warnings[0]["source"] == "imessage"
+        assert warnings[0]["gap_days"] > 30
+
+    def test_quiet_source_does_not_trip(self, tmp_path):
+        """A source with no recent interactions shouldn't be flagged at all."""
+        now = datetime.now(timezone.utc)
+        old_interaction = (now - timedelta(days=90)).isoformat()
+        stale_iso = (now - timedelta(days=60)).isoformat()
+
+        i_path, c_path = self._seed(
+            tmp_path,
+            interactions=[("i1", "slack", old_interaction)],
+            source_entities=[("se1", "slack", stale_iso)],
+        )
+        # Default lookback = 7 days; slack interaction is 90 days old, so it
+        # isn't considered "active" and shouldn't warn.
+        warnings = detect_silent_source_entity_drift(
+            interactions_db=i_path, crm_db=c_path
+        )
+        assert warnings == []
+
+    def test_healthy_source_does_not_trip(self, tmp_path):
+        now = datetime.now(timezone.utc)
+        recent_iso = now.isoformat()
+
+        i_path, c_path = self._seed(
+            tmp_path,
+            interactions=[("i1", "gmail", recent_iso)],
+            source_entities=[("se1", "gmail", recent_iso)],
+        )
+        assert detect_silent_source_entity_drift(
+            interactions_db=i_path, crm_db=c_path
+        ) == []
+
+    def test_missing_dbs_returns_empty(self, tmp_path):
+        """Fresh install or test environment without dbs: no false alerts."""
+        assert detect_silent_source_entity_drift(
+            interactions_db=str(tmp_path / "nope.db"),
+            crm_db=str(tmp_path / "also-nope.db"),
+        ) == []
+
+
+class TestEmitSyncStats:
+    """Tests for emit_sync_stats — the canonical stats-reporting helper."""
+
+    def test_prints_machine_readable_line(self, capsys):
+        emit_sync_stats({"interactions_created": 5, "source_entities_created": 2})
+        captured = capsys.readouterr()
+        # Single line, parseable by the orchestrator's regex.
+        import re
+        import json
+        match = re.search(r"SYNC_STATS:(\{.*\})", captured.out)
+        assert match, f"Expected SYNC_STATS line in: {captured.out!r}"
+        payload = json.loads(match.group(1))
+        assert payload["interactions_created"] == 5
+        assert payload["source_entities_created"] == 2
 
 
 class TestSyncHealthDailyCheck:

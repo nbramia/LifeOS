@@ -90,7 +90,7 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
 
     elapsed = time.time() - start_time
 
-    logger.info(f"\n=== Vault Reindex Results ===")
+    logger.info("\n=== Vault Reindex Results ===")
     logger.info(f"  Files indexed: {files_indexed}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
@@ -101,15 +101,39 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     }
 
 
+def clear_bm25_index():
+    """Drop all BM25 chunks. Use when the index has stale doc_ids (e.g. after
+    migrating the vault from a different OS path, so the macOS doc_ids
+    accumulated alongside the current Linux ones)."""
+    from api.services.bm25_index import BM25Index
+    index = BM25Index()
+    before = index.count()
+    index.clear()
+    logger.info(f"BM25 index cleared: {before} rows dropped")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Reindex Obsidian vault')
     parser.add_argument('--execute', action='store_true', help='Actually perform reindex')
     parser.add_argument('--force', action='store_true', help='Force full reindex (not incremental)')
     parser.add_argument('--clear-vectors', action='store_true', help='Clear vector store before indexing (use when changing embedding model)')
+    parser.add_argument('--clear-bm25', action='store_true', help='Clear BM25 index before indexing (use to drop stale doc_ids from a previous vault path)')
     parser.add_argument('--skip-summaries', action='store_true', help='Skip LLM summary generation for faster indexing')
     args = parser.parse_args()
 
     if args.clear_vectors and args.execute:
         clear_vector_store()
+    if args.clear_bm25 and args.execute:
+        clear_bm25_index()
 
-    sync_vault_reindex(dry_run=not args.execute, force=args.force, skip_summaries=args.skip_summaries)
+    result = sync_vault_reindex(dry_run=not args.execute, force=args.force, skip_summaries=args.skip_summaries)
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output. "processed"
+    # is the file count so the orchestrator's generic counter matches reality.
+    # On dry runs result lacks "files_indexed", so emit zero — the orchestrator
+    # never invokes the script with --dry-run during a real sync, but keeping
+    # the line emission unconditional makes ad-hoc test runs less surprising.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(result.get("files_indexed", 0) or 0),
+    })
