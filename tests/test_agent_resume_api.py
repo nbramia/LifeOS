@@ -575,6 +575,11 @@ def test_resume_injects_wezterm_pane_env_when_launcher_is_wezterm(
     list` first and pins WEZTERM_PANE into the spawn env, preferring the
     `default` workspace's pane."""
     from config.settings import settings
+    # Strip any inherited WEZTERM_PANE — tests must assert on what the
+    # injection helper produces, not whatever value the dev's outer shell
+    # happens to have (running pytest inside a wezterm session leaks
+    # WEZTERM_PANE=<host pane> into the child process and masks the test).
+    monkeypatch.delenv("WEZTERM_PANE", raising=False)
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd",
                         "wezterm cli spawn --cwd {cwd} -- {inner_command}")
@@ -613,6 +618,8 @@ def test_resume_skips_pane_injection_when_launcher_is_not_wezterm(
 ):
     """Operator-overridden non-wezterm launcher → no WEZTERM_PANE meddling."""
     from config.settings import settings
+    # Same env-isolation reason as the sibling test above.
+    monkeypatch.delenv("WEZTERM_PANE", raising=False)
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
 
