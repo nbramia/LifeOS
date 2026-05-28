@@ -376,7 +376,6 @@ class SlackSync:
         for date_key, day_messages in messages_by_date.items():
             # Use earliest message timestamp for the interaction
             earliest = min(day_messages, key=lambda m: m.timestamp)
-            latest = max(day_messages, key=lambda m: m.timestamp)
 
             # Build snippet from first message with content
             snippet = None
@@ -537,36 +536,76 @@ class SlackSync:
         """
         Perform an incremental sync of new Slack data.
 
-        Only fetches messages newer than the last indexed timestamp.
-        Only processes DMs for users linked to CRM people (same as full_sync).
+        Step 1: Refresh the workspace user list to SourceEntity (issue #224).
+            Without this, users added between the last manual ``full_sync``
+            and tonight stay invisible to entity resolution — messages flow
+            into ``interactions`` for retro-matched senders while
+            ``source_entities WHERE source_type='slack'`` silently stops
+            growing. ``users.list`` is cheap (~1s for thousands of users)
+            and ``add_or_update`` is idempotent.
+        Step 2: Sync new DM messages (only for users linked to CRM people).
 
         Args:
             create_interactions: If True, create CRM Interaction records
 
         Returns:
-            Sync statistics
+            Dict with the same shape as ``full_sync``:
+            ``{users, messages, status, errors, elapsed_seconds}``.
         """
         logger.info("Starting incremental Slack sync")
+        start_time = time.time()
 
-        results = self.sync_messages(
-            full=False,
-            dm_only=True,
-            create_interactions=create_interactions,
-            linked_only=True,
-        )
+        results: dict = {
+            "users": {},
+            "messages": {},
+            "status": "success",
+            "errors": [],
+        }
+
+        # Step 1: Sync users first (needed for entity resolution).
+        # Resilience matches ``full_sync``: a flaky ``users.list`` shouldn't
+        # take down the whole nightly.
+        try:
+            results["users"] = self.sync_users()
+        except Exception as e:
+            error_msg = f"User sync failed: {e}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+
+        # Step 2: Sync new messages.
+        try:
+            results["messages"] = self.sync_messages(
+                full=False,
+                dm_only=True,
+                create_interactions=create_interactions,
+                linked_only=True,
+            )
+            if results["messages"].get("errors"):
+                results["errors"].extend(results["messages"]["errors"])
+        except Exception as e:
+            error_msg = f"Message sync failed: {e}"
+            logger.error(error_msg)
+            results["errors"].append(error_msg)
+
+        if results["errors"]:
+            results["status"] = "partial"
+
+        elapsed = time.time() - start_time
+        results["elapsed_seconds"] = round(elapsed, 1)
 
         # Store actual Slack message counts on PersonEntity (incremental = accumulate)
-        message_counts = results.get("message_counts", {})
+        message_counts = results["messages"].get("message_counts", {})
         if message_counts:
             self._store_message_counts(message_counts, full_sync=False)
 
         # Refresh PersonEntity stats for all affected people
-        affected_ids = results.get("affected_person_ids", set())
+        affected_ids = results["messages"].get("affected_person_ids", set())
         if affected_ids:
             from api.services.person_stats import refresh_person_stats
             logger.info(f"Refreshing stats for {len(affected_ids)} affected people...")
             refresh_person_stats(list(affected_ids))
 
+        logger.info(f"Incremental Slack sync complete in {elapsed:.1f}s")
         return results
 
 
