@@ -499,6 +499,53 @@ class TestPhoneImport:
             "unresolved phone observations must NOT auto-link to any person"
         assert se.observed_phone == "+18005551234"
 
+    def test_multiple_calls_from_unknown_caller_dedup_to_one_se(self, tmp_path):
+        """Multiple calls from the same unknown number in a single batch
+        produce exactly one source_entity (deduped via seen_phones) and
+        increment orphan_observations once per call (so dashboards can see
+        how many calls weren't linked tonight, not just how many unique
+        numbers)."""
+        from scripts.apple_data_import import import_phone_calls
+        from unittest.mock import MagicMock
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_calls(import_dir, [
+            {
+                "id": f"call-{i}",
+                "source_id": f"SRC-{i}",
+                "source_type": "phone",
+                "person_id": "",
+                "timestamp": f"2026-01-15T10:0{i}:00+00:00",
+                "title": "Incoming Phone - +18005550199",
+            }
+            for i in range(3)
+        ])
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = None  # never matches
+
+        se_store, mock_interaction_store, stack = self._wire_phone_import(
+            tmp_path, import_dir, mock_resolver,
+        )
+        with stack:
+            result = import_phone_calls(dry_run=False)
+
+        assert result["imported"] == 0
+        assert result["source_entities_created"] == 1, \
+            "seen_phones should dedup three calls from the same number to one SE"
+        assert result["orphan_observations"] == 3, \
+            "every call (not just the first) counts as an orphan observation"
+        mock_interaction_store.add_if_not_exists.assert_not_called()
+
+        # Exactly one row landed in source_entities for this number.
+        rows = []
+        for c_phone in ("+18005550199",):
+            row = se_store.get_by_source("phone", f"phone_{c_phone}")
+            if row is not None:
+                rows.append(row)
+        assert len(rows) == 1
+        assert rows[0].canonical_person_id in (None, "")
+
     def test_no_phone_in_title_skipped(self, tmp_path):
         """Call with no extractable phone number should be skipped."""
         from scripts.apple_data_import import import_phone_calls

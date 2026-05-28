@@ -787,10 +787,13 @@ class EntityResolver:
         Phone-only never creates a PersonEntity — see issue #226. A raw phone
         observation with no name or email tells you very little about who the
         caller is, and auto-creating a person per observation would pollute
-        the People graph with one row per spam call. Importers handle the
-        "unknown caller" case by storing an unlinked source_entity instead;
-        ``scripts/link_source_entities.py`` then retro-links it whenever the
-        same number later shows up associated with a known Contact / email.
+        the People graph with one row per spam call. ``apple_data_import``
+        handles the "unknown caller" case by storing an unlinked source_entity
+        instead so ``scripts/link_source_entities.py`` can retro-link it when
+        the same number later shows up linked to a Contact or email.
+        ``scripts/sync_phone_calls.py`` and ``api/services/whatsapp.py`` still
+        drop unresolved observations today and should adopt the same pattern
+        in a follow-up.
 
         Args:
             name: Person's name
