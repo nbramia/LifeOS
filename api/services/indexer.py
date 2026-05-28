@@ -436,8 +436,10 @@ class IndexerService:
         self.vector_store.update_document(chunks, metadata)
 
         # Update in BM25 index for keyword search
-        # First delete any existing chunks for this file
-        self.bm25_index.delete_document(str(path.resolve()))
+        # First delete all existing chunks (numbered + summary) for this file —
+        # delete_document only matches one exact id, which left stale chunks
+        # behind whenever the count shrank or the vault path changed.
+        self.bm25_index.delete_by_path(str(path.resolve()))
         # Add each chunk to BM25
         for i, chunk in enumerate(chunks):
             doc_id = f"{path.resolve()}_{i}"
@@ -499,11 +501,8 @@ class IndexerService:
         # This works even for non-existent files
         real_path = os.path.realpath(file_path)
         self.vector_store.delete_document(real_path)
-        self.bm25_index.delete_document(real_path)
-
-        # Also delete summary chunk if exists
-        summary_id = f"{real_path}::summary"
-        self.bm25_index.delete_document(summary_id)
+        # delete_by_path drops numbered chunks + the summary in one query.
+        self.bm25_index.delete_by_path(real_path)
 
         logger.debug(f"Deleted {file_path} from index (resolved: {real_path})")
 

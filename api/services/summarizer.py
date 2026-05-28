@@ -2,7 +2,9 @@
 Document summarization service using local LLM.
 
 Generates brief summaries for document discovery and high-level search.
-Uses Ollama with qwen2.5:7b-instruct for zero-cost local summarization.
+Talks to the OpenAI-compatible local LLM server (llama-server) configured by
+``settings.local_llm_url`` — same endpoint the orchestrator uses, so there's
+no second model to keep running.
 
 ## Tiered Summarization
 
@@ -108,7 +110,7 @@ def generate_summary(
     use_retry_prompt: bool = False
 ) -> tuple[Optional[str], bool]:
     """
-    Generate a document summary using local LLM.
+    Generate a document summary using the local OpenAI-compatible LLM server.
 
     Args:
         content: Document content to summarize
@@ -139,23 +141,26 @@ def generate_summary(
         prompt_template = RETRY_PROMPT if use_retry_prompt else SUMMARY_PROMPT
         prompt = prompt_template.format(content=truncated)
 
-        # Call Ollama synchronously
-        url = f"{settings.ollama_host}/api/generate"
+        # OpenAI-compatible chat completions against the local llama-server.
+        # We pass model="local" because llama-server ignores the field but the
+        # OpenAI spec requires it to be present.
+        url = f"{settings.local_llm_url.rstrip('/')}/v1/chat/completions"
         payload = {
-            "model": settings.ollama_model,
-            "prompt": prompt,
+            "model": "local",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 75,
             "stream": False,
-            "options": {
-                "temperature": 0.2,  # Low temperature for factual summary
-                "num_predict": 75,   # Force very brief response
-            }
         }
 
         with httpx.Client(timeout=timeout) as client:
             response = client.post(url, json=payload)
             response.raise_for_status()
             data = response.json()
-            summary = data.get("response", "").strip()
+            choices = data.get("choices") or []
+            summary = ""
+            if choices:
+                summary = (choices[0].get("message", {}).get("content") or "").strip()
 
         # Validate summary (increased max for 7B model verbosity)
         if len(summary) < 20 or len(summary) > 1000:
@@ -166,10 +171,10 @@ def generate_summary(
         return summary, True
 
     except httpx.TimeoutException as e:
-        logger.warning(f"Ollama timeout for {file_name}: {e}")
+        logger.warning(f"LLM timeout for {file_name}: {e}")
         return None, False  # Mark as failure for retry
     except httpx.ConnectError as e:
-        logger.warning(f"Ollama connection failed for {file_name}: {e}")
+        logger.warning(f"LLM connection failed for {file_name}: {e}")
         return None, False  # Mark as failure for retry
     except Exception as e:
         logger.warning(f"Summary generation failed for {file_name}: {e}")
@@ -262,11 +267,12 @@ def _fallback_summary(content: str, file_name: str) -> str:
     return f"Document '{file_name}' containing various notes."
 
 
-def is_ollama_available() -> bool:
-    """Check if Ollama server is available for summarization."""
+def is_summarizer_llm_available() -> bool:
+    """Check if the local LLM server is reachable for summarization."""
     try:
+        url = f"{settings.local_llm_url.rstrip('/')}/health"
         with httpx.Client(timeout=2.0) as client:
-            response = client.get(settings.ollama_host)
+            response = client.get(url)
             return response.status_code == 200
     except Exception:
         return False

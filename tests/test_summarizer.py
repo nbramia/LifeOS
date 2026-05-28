@@ -30,8 +30,8 @@ class TestGenerateSummary:
         assert success is True  # Not a failure, just skipped
 
     @patch("api.services.summarizer.httpx.Client")
-    def test_calls_ollama_with_prompt(self, mock_client_class):
-        """Should call Ollama with the summary prompt."""
+    def test_calls_llm_with_prompt(self, mock_client_class):
+        """Should POST a chat completion to the local LLM with the prompt."""
         from api.services.summarizer import generate_summary
 
         # Setup mock
@@ -40,7 +40,11 @@ class TestGenerateSummary:
         mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
         mock_response = MagicMock()
         mock_response.json.return_value = {
-            "response": "This is a meeting note about Q4 budget planning with Kevin and Sarah."
+            "choices": [{
+                "message": {
+                    "content": "This is a meeting note about Q4 budget planning with Kevin and Sarah."
+                }
+            }]
         }
         mock_client.post.return_value = mock_response
 
@@ -52,6 +56,10 @@ class TestGenerateSummary:
         assert summary is not None
         assert "meeting note" in summary.lower() or "budget" in summary.lower()
         mock_client.post.assert_called_once()
+        # Hits the OpenAI-compatible chat endpoint, not legacy Ollama /api/generate.
+        call_args = mock_client.post.call_args
+        url = call_args[0][0]
+        assert url.endswith("/v1/chat/completions")
 
     @patch("api.services.summarizer.httpx.Client")
     def test_truncates_long_content(self, mock_client_class):
@@ -63,17 +71,20 @@ class TestGenerateSummary:
         mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
         mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
         mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "A valid summary text here."}
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "A valid summary text here."}}]
+        }
         mock_client.post.return_value = mock_response
 
         # Call with very long content
         long_content = "A" * 5000
-        result = generate_summary(long_content, "test.md", max_content_chars=2000)
+        generate_summary(long_content, "test.md", max_content_chars=2000)
 
         # Verify the call was made with truncated content
         call_args = mock_client.post.call_args
         payload = call_args[1]["json"]
-        prompt = payload["prompt"]
+        # OpenAI chat format: prompt lives inside messages[0].content
+        prompt = payload["messages"][0]["content"]
         assert "[... content truncated ...]" in prompt
 
     @patch("api.services.summarizer.httpx.Client")
@@ -175,13 +186,13 @@ This is the actual content.
         assert len(result) < 200
 
 
-class TestIsOllamaAvailable:
-    """Test the is_ollama_available function."""
+class TestIsSummarizerLLMAvailable:
+    """Test the is_summarizer_llm_available function."""
 
     @patch("api.services.summarizer.httpx.Client")
     def test_returns_true_when_available(self, mock_client_class):
         """Should return True when Ollama responds."""
-        from api.services.summarizer import is_ollama_available
+        from api.services.summarizer import is_summarizer_llm_available
 
         mock_client = MagicMock()
         mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -190,19 +201,19 @@ class TestIsOllamaAvailable:
         mock_response.status_code = 200
         mock_client.get.return_value = mock_response
 
-        assert is_ollama_available() is True
+        assert is_summarizer_llm_available() is True
 
     @patch("api.services.summarizer.httpx.Client")
     def test_returns_false_on_error(self, mock_client_class):
         """Should return False when Ollama fails."""
-        from api.services.summarizer import is_ollama_available
+        from api.services.summarizer import is_summarizer_llm_available
 
         mock_client = MagicMock()
         mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
         mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
         mock_client.get.side_effect = Exception("connection failed")
 
-        assert is_ollama_available() is False
+        assert is_summarizer_llm_available() is False
 
 
 class TestCreateSummaryChunk:
@@ -236,9 +247,9 @@ class TestSummarizerIntegration:
     @pytest.mark.integration
     def test_real_summary_generation(self):
         """Test actual summary generation with Ollama."""
-        from api.services.summarizer import generate_summary, is_ollama_available
+        from api.services.summarizer import generate_summary, is_summarizer_llm_available
 
-        if not is_ollama_available():
+        if not is_summarizer_llm_available():
             pytest.skip("Ollama not available")
 
         content = """# Meeting Notes - Q4 Budget Review

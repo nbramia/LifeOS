@@ -121,6 +121,46 @@ class BM25Index:
         finally:
             conn.close()
 
+    def delete_by_path(self, file_path: str) -> int:
+        """Delete every chunk indexed for ``file_path`` (chunks + summary).
+
+        Chunk ``doc_id`` values are ``{path}_{i}``; the summary uses
+        ``{path}::summary``. ``delete_document`` only matches an exact id, so
+        callers that wanted to drop "all chunks for this file" — like the
+        indexer's re-index path — silently leaked stale rows whenever the
+        chunk count shrank or the path changed (e.g. macOS → Linux). This
+        helper clears everything for the given path in one query.
+
+        Args:
+            file_path: Absolute file path used as the doc_id prefix.
+
+        Returns:
+            Number of rows removed (chunks + summary).
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # FTS5 doesn't support ESCAPE on LIKE, so escape special chars
+            # by enumerating the two known suffix patterns explicitly. The
+            # summary uses '::summary' and chunks use '_<int>'.
+            cursor = conn.execute(
+                """
+                DELETE FROM chunks_fts
+                WHERE doc_id = ?
+                   OR doc_id = ?
+                   OR doc_id GLOB ?
+                """,
+                (
+                    file_path,                       # legacy: path with no suffix
+                    f"{file_path}::summary",         # summary chunk
+                    f"{file_path}_*",                # numbered chunks
+                ),
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
     def _sanitize_query(self, query: str, use_or: bool = True) -> str:
         """
         Sanitize query for FTS5 MATCH syntax.
