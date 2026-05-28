@@ -261,19 +261,20 @@ def _extract_phone_from_title(title: str) -> str | None:
 def import_phone_calls(dry_run: bool = False) -> dict:
     """Import phone call history from the Mac Mini's JSON export.
 
-    Mirrors the source_entity behaviour of ``scripts/sync_phone_calls.py``
-    (the macOS-native version). For each call whose phone number resolves
-    to an existing PersonEntity, we ensure a phone-keyed SourceEntity
-    exists (``phone_{e164}``), update its ``observed_at`` to the most
-    recent call we've seen for that number in this batch, link it to the
-    person if it isn't already, then create the Interaction.
+    For every observed phone number we ensure a phone-keyed SourceEntity
+    exists (``phone_{e164}``) with its ``observed_at`` set to the most-
+    recent call we've seen for that number in this batch:
 
-    Scope: only resolvable callers get source_entities. Callers we've never
-    associated with a Person (spam, robocalls, first-time inbound) stay in
-    ``unresolved``. The entity-resolver has no phone-only create-if-missing
-    branch (see ``api/services/entity_resolver.py:881``) and adding one
-    here would mint a junk PersonEntity per spam call. Filed as a separate
-    follow-up.
+    - If the number resolves to an existing PersonEntity, link the
+      source_entity to that person (unless a manual link already exists)
+      and create the Interaction record for the call.
+    - If the number doesn't resolve to any Person, the source_entity is
+      stored **unlinked** (``canonical_person_id IS NULL``). This is
+      issue #226's policy: phone alone never creates a Person — auto-
+      creating one per spam call would pollute the People graph — but we
+      keep the forensic observation so ``scripts/link_source_entities.py``
+      can retro-link it later when the matching Contact / email arrives.
+      No Interaction is created (interactions require ``person_id``).
 
     The source_entity update happens BEFORE the "interaction already
     exists?" check so that re-imports still close the issue #199 §2 drift
@@ -317,9 +318,30 @@ def import_phone_calls(dry_run: bool = False) -> dict:
     # has no timestamp; recomputing in the hot loop just adds noise.
     now = datetime.now(timezone.utc)
 
+    # Pre-compute max-timestamp per unique phone in ONE pass so the main
+    # loop doesn't go quadratic. With ~50-100 unique phones in a typical
+    # 800-call export, the naive per-phone scan was running the
+    # _extract_phone_from_title regex tens of thousands of times.
+    phone_max_ts: dict[str, datetime] = {}
+    for c in calls:
+        ts_str = c.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            continue
+        c_phone = _extract_phone_from_title(c.get("title", ""))
+        if not c_phone:
+            continue
+        existing = phone_max_ts.get(c_phone)
+        if existing is None or ts > existing:
+            phone_max_ts[c_phone] = ts
+
     imported = 0
     skipped = 0
-    unresolved = 0
+    unresolved_no_phone = 0
+    orphan_observations = 0       # call from a phone we couldn't link to any Person
     source_entities_created = 0
     source_entities_updated = 0
 
@@ -342,49 +364,26 @@ def import_phone_calls(dry_run: bool = False) -> dict:
         title = call.get("title", "")
         phone = _extract_phone_from_title(title)
         if not phone:
-            unresolved += 1
+            unresolved_no_phone += 1
             continue
 
-        # Resolve to PersonEntity by phone. Note: the resolver has no
-        # "create from phone alone" branch (see entity_resolver.py:881 —
-        # only email and name create-if-missing paths exist), so callers
-        # whose phone we've never linked to a known Person are deliberately
-        # left in ``unresolved``. Adding a phone-only create branch is a
-        # separate, broader change (filed as a follow-up); doing it here
-        # would auto-create a junk Person for every spam call.
+        # Resolve to an existing PersonEntity by phone — phone alone never
+        # CREATES a Person (issue #226). May return None.
         result = resolver.resolve(phone=phone, create_if_missing=False)
         person = result.entity if result else None
-        if not person:
-            unresolved += 1
-            continue
 
-        # Ensure a phone-keyed source_entity exists and is linked.
-        # This happens BEFORE the "existing interaction?" check so that
-        # already-imported calls still contribute to source_entity
-        # accumulation when the resolver / entity store grows new rows.
+        # Ensure a phone-keyed source_entity exists for the observed number.
+        # We do this even when no Person matches: the row stays unlinked
+        # (``canonical_person_id IS NULL``) and ``link_source_entities.py``
+        # will retro-link it on a future pass when the matching Contact /
+        # email finally appears.
         # ``seen_phones`` dedups within this run; per-call freshness is
-        # preserved by computing the merged observed_at across all calls
-        # seen for the same phone before the first DB write.
+        # preserved using the pre-computed ``phone_max_ts`` table built
+        # above (O(N) instead of O(N²)).
         if phone not in seen_phones:
             seen_phones.add(phone)
             se_source_id = f"phone_{phone}"
-            # The most-recent valid timestamp among any call for this phone
-            # in this batch — prevents observed_at from ratcheting backwards
-            # when the export isn't strictly chronological. Malformed
-            # timestamps inside other calls are skipped silently.
-            same_phone_timestamps: list[datetime] = []
-            for c in calls:
-                if (
-                    c.get("timestamp")
-                    and _extract_phone_from_title(c.get("title", "")) == phone
-                ):
-                    try:
-                        same_phone_timestamps.append(
-                            datetime.fromisoformat(c["timestamp"])
-                        )
-                    except (ValueError, TypeError):
-                        continue
-            this_phone_max_ts = max(same_phone_timestamps, default=timestamp or now)
+            this_phone_max_ts = phone_max_ts.get(phone, timestamp or now)
             existing_se = se_store.get_by_source("phone", se_source_id)
             if existing_se:
                 # Preserve fields we don't have authoritative data for in
@@ -408,17 +407,28 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 se = se_store.add(se)
                 source_entities_created += 1
             # Only re-link from auto-quality data: never clobber a manual
-            # link (link_status == "manual") because that represents a
-            # human's judgement that this number belongs to a specific
-            # person, possibly across a merge or rename.
+            # link (link_status == "manual"). Skip link entirely if there's
+            # no matching Person yet — the source_entity stays unlinked
+            # until retro-linking finds a match.
             if (
-                se.canonical_person_id != person.id
+                person is not None
+                and se.canonical_person_id != person.id
                 and (se.link_status or "auto") != "manual"
             ):
                 se_store.link_to_person(
                     se.id, person.id,
                     confidence=0.95, status=LINK_STATUS_AUTO,
                 )
+
+        # No Person → no Interaction row (the interactions schema requires
+        # person_id). The unlinked source_entity is what carries the
+        # observation forward; the ``orphan_observations`` counter is the
+        # right "we saw this call but couldn't link it" metric — distinct
+        # from ``unresolved_no_phone`` which is a true failure (the title
+        # didn't contain a number we could extract at all).
+        if person is None:
+            orphan_observations += 1
+            continue
 
         # Skip calls already in the interaction store.
         existing = store.get_by_source(source_type, source_id)
@@ -441,7 +451,8 @@ def import_phone_calls(dry_run: bool = False) -> dict:
 
     logger.info(
         f"Phone calls: {imported} imported, {skipped} skipped (existing/invalid), "
-        f"{unresolved} unresolved (no phone in title), "
+        f"{unresolved_no_phone} bad (no phone in title), "
+        f"{orphan_observations} orphan observations (phone-only, no matching Person yet), "
         f"{source_entities_created} source_entities created, "
         f"{source_entities_updated} updated"
     )
@@ -449,7 +460,11 @@ def import_phone_calls(dry_run: bool = False) -> dict:
         "status": "ok",
         "imported": imported,
         "skipped": skipped,
-        "unresolved": unresolved,
+        # Kept as a back-compat alias for any consumer still reading the
+        # old name. New code should prefer the two split counters below.
+        "unresolved": unresolved_no_phone + orphan_observations,
+        "unresolved_no_phone": unresolved_no_phone,
+        "orphan_observations": orphan_observations,
         "source_entities_created": source_entities_created,
         "source_entities_updated": source_entities_updated,
     }

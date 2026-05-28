@@ -782,14 +782,26 @@ class EntityResolver:
         2. Phone exact match (if phone provided, E.164 format)
         3. Name exact match
         4. Fuzzy name match with context boost
-        5. Create new entity (if create_if_missing)
+        5. Create new entity from email or name (if create_if_missing)
+
+        Phone-only never creates a PersonEntity — see issue #226. A raw phone
+        observation with no name or email tells you very little about who the
+        caller is, and auto-creating a person per observation would pollute
+        the People graph with one row per spam call. ``apple_data_import``
+        handles the "unknown caller" case by storing an unlinked source_entity
+        instead so ``scripts/link_source_entities.py`` can retro-link it when
+        the same number later shows up linked to a Contact or email.
+        ``scripts/sync_phone_calls.py`` and ``api/services/whatsapp.py`` still
+        drop unresolved observations today and should adopt the same pattern
+        in a follow-up.
 
         Args:
             name: Person's name
             email: Person's email
             phone: Person's phone (E.164 format, e.g., +1XXXXXXXXXX)
             context_path: Vault path for context boost
-            create_if_missing: Create new entity if not found
+            create_if_missing: Create new entity (from email or name) if not
+                found. Has no effect when only ``phone`` is provided.
 
         Returns:
             ResolutionResult or None

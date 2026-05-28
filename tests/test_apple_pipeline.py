@@ -376,8 +376,49 @@ class TestPhoneImport:
         with open(import_dir / "phone_calls.json", "w") as f:
             json.dump({"calls": calls, "exported_at": "2026-01-01T00:00:00+00:00"}, f)
 
-    def test_resolved_call_imported(self, tmp_path):
-        """Call with a phone number matching a known person should be imported."""
+    def _wire_phone_import(self, tmp_path, import_dir, mock_resolver):
+        """Common test scaffolding: real ``SourceEntityStore`` on tmp_path,
+        mock interaction store + entity resolver. Returns the
+        ``SourceEntityStore`` and a ``MagicMock`` interaction store so
+        callers can inspect both sides of the dual-write."""
+        from unittest.mock import MagicMock
+        from api.services.source_entity import SourceEntityStore
+
+        se_store = SourceEntityStore(db_path=str(tmp_path / "crm.db"))
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.get_by_source.return_value = None
+
+        # PersonEntityStore is consulted indirectly via SourceEntityStore.add
+        # for the ``validate_person`` path; pass a permissive mock that
+        # claims every person id exists.
+        mock_person_store = MagicMock()
+        mock_person_store.get_canonical_id.side_effect = lambda pid: pid
+        mock_person_store.get_by_id.side_effect = lambda pid: MagicMock(id=pid)
+
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("scripts.apple_data_import.IMPORT_DIR", import_dir))
+        stack.enter_context(patch(
+            "api.services.interaction_store.get_interaction_store",
+            return_value=mock_interaction_store,
+        ))
+        stack.enter_context(patch(
+            "api.services.entity_resolver.get_entity_resolver",
+            return_value=mock_resolver,
+        ))
+        stack.enter_context(patch(
+            "api.services.source_entity.get_source_entity_store",
+            return_value=se_store,
+        ))
+        stack.enter_context(patch(
+            "api.services.person_entity.get_person_entity_store",
+            return_value=mock_person_store,
+        ))
+        return se_store, mock_interaction_store, stack
+
+    def test_resolved_call_imported_and_linked(self, tmp_path):
+        """Call with a phone matching a known person creates a linked
+        source_entity + the Interaction."""
         from scripts.apple_data_import import import_phone_calls
         from unittest.mock import MagicMock
 
@@ -393,28 +434,36 @@ class TestPhoneImport:
 
         mock_person = MagicMock()
         mock_person.id = "person-abc"
-
         mock_resolver = MagicMock()
-        mock_resolver.resolve_by_phone.return_value = mock_person
+        mock_resolver.resolve.return_value = MagicMock(entity=mock_person)
 
-        mock_store = MagicMock()
-        mock_store.get_by_source.return_value = None
-
-        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
-             patch("api.services.interaction_store.get_interaction_store", return_value=mock_store), \
-             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver):
+        se_store, mock_interaction_store, stack = self._wire_phone_import(
+            tmp_path, import_dir, mock_resolver,
+        )
+        with stack:
             result = import_phone_calls(dry_run=False)
 
         assert result["status"] == "ok"
         assert result["imported"] == 1
         assert result["unresolved"] == 0
-        mock_resolver.resolve_by_phone.assert_called_once_with("+15551234567")
-        # Verify person_id was set on the Interaction
-        added = mock_store.add_if_not_exists.call_args[0][0]
+        # Resolver was called with the new shape.
+        mock_resolver.resolve.assert_called_once()
+        kwargs = mock_resolver.resolve.call_args.kwargs
+        assert kwargs == {"phone": "+15551234567", "create_if_missing": False}
+        # Interaction was created with the resolved person.
+        added = mock_interaction_store.add_if_not_exists.call_args[0][0]
         assert added.person_id == "person-abc"
+        # source_entity exists AND is linked.
+        se = se_store.get_by_source("phone", "phone_+15551234567")
+        assert se is not None
+        assert se.canonical_person_id == "person-abc"
 
-    def test_unresolved_call_skipped(self, tmp_path):
-        """Call with no matching person should be skipped."""
+    def test_unresolved_call_stores_orphan_source_entity(self, tmp_path):
+        """Issue #226 policy: an unresolved phone observation still produces
+        an unlinked source_entity (``canonical_person_id IS NULL``), so
+        ``link_source_entities`` can retro-link it once the matching Contact
+        / email arrives. No Interaction is created — those require a person.
+        """
         from scripts.apple_data_import import import_phone_calls
         from unittest.mock import MagicMock
 
@@ -429,19 +478,73 @@ class TestPhoneImport:
         }])
 
         mock_resolver = MagicMock()
-        mock_resolver.resolve_by_phone.return_value = None
+        mock_resolver.resolve.return_value = None  # no match
 
-        mock_store = MagicMock()
-        mock_store.get_by_source.return_value = None
+        se_store, mock_interaction_store, stack = self._wire_phone_import(
+            tmp_path, import_dir, mock_resolver,
+        )
+        with stack:
+            result = import_phone_calls(dry_run=False)
 
-        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
-             patch("api.services.interaction_store.get_interaction_store", return_value=mock_store), \
-             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver):
+        # The call is counted as unresolved AND no interaction is added…
+        assert result["imported"] == 0
+        assert result["unresolved"] == 1
+        mock_interaction_store.add_if_not_exists.assert_not_called()
+        # …but the observation IS captured as an unlinked source_entity,
+        # ready for ``link_source_entities`` to pick up next time around.
+        assert result["source_entities_created"] == 1
+        se = se_store.get_by_source("phone", "phone_+18005551234")
+        assert se is not None, "orphan source_entity should exist for unknown caller"
+        assert se.canonical_person_id in (None, ""), \
+            "unresolved phone observations must NOT auto-link to any person"
+        assert se.observed_phone == "+18005551234"
+
+    def test_multiple_calls_from_unknown_caller_dedup_to_one_se(self, tmp_path):
+        """Multiple calls from the same unknown number in a single batch
+        produce exactly one source_entity (deduped via seen_phones) and
+        increment orphan_observations once per call (so dashboards can see
+        how many calls weren't linked tonight, not just how many unique
+        numbers)."""
+        from scripts.apple_data_import import import_phone_calls
+        from unittest.mock import MagicMock
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_calls(import_dir, [
+            {
+                "id": f"call-{i}",
+                "source_id": f"SRC-{i}",
+                "source_type": "phone",
+                "person_id": "",
+                "timestamp": f"2026-01-15T10:0{i}:00+00:00",
+                "title": "Incoming Phone - +18005550199",
+            }
+            for i in range(3)
+        ])
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve.return_value = None  # never matches
+
+        se_store, mock_interaction_store, stack = self._wire_phone_import(
+            tmp_path, import_dir, mock_resolver,
+        )
+        with stack:
             result = import_phone_calls(dry_run=False)
 
         assert result["imported"] == 0
-        assert result["unresolved"] == 1
-        mock_store.add_if_not_exists.assert_not_called()
+        assert result["source_entities_created"] == 1, \
+            "seen_phones should dedup three calls from the same number to one SE"
+        assert result["orphan_observations"] == 3, \
+            "every call (not just the first) counts as an orphan observation"
+        mock_interaction_store.add_if_not_exists.assert_not_called()
+
+        # Exactly one row landed in source_entities for this number.
+        rows = []
+        for c_phone in ("+18005550199",):
+            row = se_store.get_by_source("phone", f"phone_{c_phone}")
+            if row is not None:
+                rows.append(row)
+        assert len(rows) == 1
+        assert rows[0].canonical_person_id in (None, "")
 
     def test_no_phone_in_title_skipped(self, tmp_path):
         """Call with no extractable phone number should be skipped."""
