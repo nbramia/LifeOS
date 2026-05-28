@@ -14,6 +14,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `troubleshooting.md` — Common issues and solutions
 - `claude-code-orchestration.md` — Claude Code multi-agent orchestration patterns
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)
+- `agents-go-to.md` — /agents "Go To" wezterm pane setup (SessionStart hook + FD probe)
 
 ## Key Principles
 

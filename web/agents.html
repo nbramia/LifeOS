@@ -837,6 +837,10 @@
   // when there's an actual reason to move nodes — never on a same-set
   // snapshot tick, which would otherwise jitter every 2 seconds.
   let _lastVisibleIdsKey = '';
+  // Click-vs-dblclick debounce on graph nodes. See node `.on('click')` /
+  // `.on('dblclick')` handlers — a deferred timer lets a second click
+  // arrive in time to cancel the panel toggle and run Go To instead.
+  let _nodeClickTimer = null;
   function recencyRailSpan() {
     if (visibleCount <= 1) return 0;
     return Math.min(0.84, 0.15 + 0.15 * Math.log2(visibleCount));
@@ -1113,8 +1117,29 @@
           // Leave fx/fy set so the node stays where dropped (mirrors /crm/graph).
         }))
       .on('click', (event, d) => {
-        if (d.session_id === selectedSessionId) closePanel();
-        else openPanel(d.session_id);
+        // Defer the panel toggle so a quick second click can cancel it
+        // and run the dblclick Go To instead. Single-click latency is
+        // ~220ms — noticeable but acceptable for a graph UI where
+        // dblclick is a first-class action.
+        if (_nodeClickTimer) clearTimeout(_nodeClickTimer);
+        _nodeClickTimer = setTimeout(() => {
+          _nodeClickTimer = null;
+          if (d.session_id === selectedSessionId) closePanel();
+          else openPanel(d.session_id);
+        }, 220);
+      })
+      .on('dblclick', (event, d) => {
+        // Double-click = Go To. Only fires for Claude Code sessions
+        // (non-subagent) since the backend endpoint is cc-only.
+        event.preventDefault();
+        event.stopPropagation();  // suppress d3.zoom default dblclick zoom-in
+        if (_nodeClickTimer) {
+          clearTimeout(_nodeClickTimer);
+          _nodeClickTimer = null;
+        }
+        if (d.source === 'claude_code' && !d.is_subagent) {
+          focusCcSession(d);
+        }
       });
     // One shape element per node, type chosen by source.
     entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
@@ -1249,6 +1274,11 @@
     // Whether the backend will actually accept the click depends on
     // LIFEOS_CC_RESUME_ENABLED on the server; if disabled, click → toast error.
     const showResume = isClaudeCode && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
+    // Go To button: any non-subagent CC session, including live ones. The
+    // backend uses a stored mapping (set by Resume or by the SessionStart
+    // hook) and falls back to an FD probe so this works for sessions
+    // started organically in wezterm.
+    const showGoTo = isClaudeCode && !isSubagent;
     const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     panelEl.innerHTML = `
@@ -1256,7 +1286,7 @@
         <button class="panel-close" aria-label="Close" id="panel-close">×</button>
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
         ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a new wezterm tab and run claude --resume">Resume</button>' : ''}
-        ${showResume ? '<button class="panel-focus" id="panel-focus" title="Select the existing wezterm tab for this session. Wayland disallows cross-app window raise — click the wezterm dock icon to bring it forward; it will already be on the right tab.">Focus</button>' : ''}
+        ${showGoTo ? '<button class="panel-focus" id="panel-focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one). Double-clicking the node does the same. Wayland disallows cross-app window raise — click the wezterm dock icon to bring it forward; it will already be on the right pane.">Go To</button>' : ''}
         <div class="label" data-field="label">${escapeHtml(s.label || s.session_id)}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         <div class="meta" data-field="meta">
@@ -1282,15 +1312,20 @@
     }
     if (showResume) {
       document.getElementById('panel-resume').onclick = () => resumeCcSession(s);
+    }
+    if (showGoTo) {
       document.getElementById('panel-focus').onclick = () => focusCcSession(s);
     }
   }
 
   async function focusCcSession(s) {
+    // Called from both the panel Go To button AND the graph node dblclick.
+    // Button reference may be null if dblclick fires before the panel
+    // header rendered — handle gracefully.
     const btn = document.getElementById('panel-focus');
     if (btn) {
       btn.disabled = true;
-      btn.textContent = 'Focusing…';
+      btn.textContent = 'Locating…';
     }
     try {
       const r = await fetch(`/api/agents/sessions/${encodeURIComponent(s.session_id)}/focus`, {
@@ -1301,29 +1336,29 @@
         const text = await r.text();
         let msg = text;
         try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-        // 404 = no mapping yet (use Resume first). 410 = pane was closed
-        // (mapping cleared on server, click Resume to recreate).
+        // 404 = no cached mapping AND probe couldn't find a pane (session
+        // not running, or in a non-wezterm terminal). 410 = mapping existed
+        // and the pane is gone (typical: closed tab); a re-probe also failed.
         if (r.status === 404) {
-          showToast(`No tracked tab — click Resume first.`, true);
+          showToast(`Couldn't locate pane. If claude is running in wezterm, install the SessionStart hook.`, true);
         } else if (r.status === 410) {
-          showToast(`Tab no longer exists. Click Resume to open a new one.`, true);
+          showToast(`Pane no longer exists. Click Resume to open a new one.`, true);
         } else {
-          showToast(`Focus failed: ${msg}`, true);
+          showToast(`Go To failed: ${msg}`, true);
         }
         return;
       }
-      const result = await r.json();
-      // Wayland disallows cross-client window raise, so the tab is selected
+      // Wayland disallows cross-client window raise, so the pane is selected
       // inside wezterm but the window doesn't pop forward — set the
       // expectation in the toast.
-      showToast(`Tab selected in wezterm. Click the wezterm dock icon to bring it forward.`, false);
+      showToast(`Pane selected in wezterm. Click the wezterm dock icon to bring it forward.`, false);
     } catch (err) {
-      showToast(`Focus failed: ${err.message}`, true);
+      showToast(`Go To failed: ${err.message}`, true);
     } finally {
       setTimeout(() => {
         if (btn) {
           btn.disabled = false;
-          btn.textContent = 'Focus';
+          btn.textContent = 'Go To';
         }
       }, 1500);
     }
