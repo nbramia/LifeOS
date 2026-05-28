@@ -300,7 +300,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
     from api.services.interaction_store import get_interaction_store, Interaction
     from api.services.entity_resolver import get_entity_resolver
     from api.services.source_entity import (
-        SourceEntity,
+        create_phone_source_entity,
         get_source_entity_store,
         LINK_STATUS_AUTO,
     )
@@ -382,9 +382,15 @@ def import_phone_calls(dry_run: bool = False) -> dict:
         # above (O(N) instead of O(N²)).
         if phone not in seen_phones:
             seen_phones.add(phone)
-            se_source_id = f"phone_{phone}"
             this_phone_max_ts = phone_max_ts.get(phone, timestamp or now)
-            existing_se = se_store.get_by_source("phone", se_source_id)
+            # Use the shared factory so the ``phone_{e164}`` source_id format
+            # stays defined in exactly one place (see issue #228 — silent
+            # duplicates were the failure mode if it drifts).
+            template = create_phone_source_entity(
+                phone=phone,
+                observed_at=this_phone_max_ts,
+            )
+            existing_se = se_store.get_by_source(template.source_type, template.source_id)
             if existing_se:
                 # Preserve fields we don't have authoritative data for in
                 # this importer (observed_name comes from Address Book on
@@ -396,15 +402,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
                 source_entities_updated += 1
                 se = existing_se
             else:
-                se = SourceEntity(
-                    source_type="phone",
-                    source_id=se_source_id,
-                    observed_name=None,
-                    observed_phone=phone,
-                    metadata={},
-                    observed_at=this_phone_max_ts,
-                )
-                se = se_store.add(se)
+                se = se_store.add(template)
                 source_entities_created += 1
             # Only re-link from auto-quality data: never clobber a manual
             # link (link_status == "manual"). Skip link entirely if there's

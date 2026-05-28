@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from api.services.entity_resolver import get_entity_resolver
 from api.services.interaction_store import get_interaction_db_path
 from api.services.source_entity import (
+    create_phone_source_entity,
     get_source_entity_store,
-    SourceEntity,
     LINK_STATUS_AUTO,
 )
 from api.services.person_entity import get_person_entity_store
@@ -196,21 +196,19 @@ def sync_phone_calls(
             continue
 
         try:
-            # Create/update SourceEntity for this phone
-            source_id = f"phone_{phone}"
-
+            # Create/update SourceEntity for this phone via the shared
+            # factory (issue #228) so the ``phone_{e164}`` source_id format
+            # stays defined in exactly one place.
             if phone not in seen_phones:
-                existing_source = source_store.get_by_source('phone', source_id)
-
-                source_entity = SourceEntity(
-                    source_type='phone',
-                    source_id=source_id,
+                source_entity = create_phone_source_entity(
+                    phone=phone,
                     observed_name=name if name else None,
-                    observed_phone=phone,
                     metadata={
                         'last_call_type': CALL_TYPE_NAMES.get(call_type, "Unknown"),
                     },
-                    observed_at=datetime.now(timezone.utc),
+                )
+                existing_source = source_store.get_by_source(
+                    source_entity.source_type, source_entity.source_id,
                 )
 
                 if existing_source:

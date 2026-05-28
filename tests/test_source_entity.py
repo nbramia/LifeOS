@@ -418,6 +418,35 @@ class TestFactoryFunctions:
         assert entity.source_id == "event123:Jane@Example.com"
         assert entity.observed_email == "jane@example.com"
 
+    def test_create_phone_source_entity(self):
+        """Phone factory uses the canonical ``phone_{e164}`` source_id and
+        sets observed_phone (issue #228 — single definition of the format).
+        """
+        from api.services.source_entity import create_phone_source_entity
+
+        entity = create_phone_source_entity(
+            phone="+15551234567",
+            observed_name="Mom",
+        )
+
+        assert entity.source_type == "phone"
+        assert entity.source_id == "phone_+15551234567"
+        assert entity.observed_phone == "+15551234567"
+        assert entity.observed_name == "Mom"
+        # observed_at defaults to "now" when not supplied.
+        assert entity.observed_at is not None
+        # Email is irrelevant here.
+        assert entity.observed_email is None
+
+    def test_create_phone_source_entity_minimal(self):
+        """Only ``phone`` is required; everything else takes safe defaults."""
+        from api.services.source_entity import create_phone_source_entity
+
+        entity = create_phone_source_entity(phone="+15558675309")
+        assert entity.source_id == "phone_+15558675309"
+        assert entity.observed_name is None
+        assert entity.metadata == {}
+
     def test_create_imessage_source_entity_phone(self):
         """Test iMessage source entity with phone number."""
         entity = create_imessage_source_entity(
