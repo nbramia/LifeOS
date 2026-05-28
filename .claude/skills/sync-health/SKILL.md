@@ -88,19 +88,73 @@ print(f'chroma_vectors={chroma_count}')
 
 ### VRAM usage (AMDGPU sysfs — primary source) + rocm-smi attribution
 
-!`for d in /sys/class/drm/card*/device; do if [ -f "$d/mem_info_vram_used" ]; then u=$(cat "$d/mem_info_vram_used"); t=$(cat "$d/mem_info_vram_total"); if [ "$t" -gt 0 ]; then awk -v u="$u" -v t="$t" 'BEGIN {printf "VRAM: %.1f / %.1f GB (%d%%)\n", u/1073741824, t/1073741824, u*100/t}'; fi; break; fi; done; echo "---"; rocm-smi --showpids 2>/dev/null | awk '/^[0-9]+/ {printf "  PID %s (%s): %.1f GB VRAM\n", $1, $2, $4/1073741824}' | sort -k4 -nr | head -8`
+!`~/.venvs/lifeos/bin/python -c "
+import subprocess
+from pathlib import Path
+GB = 1024**3
+for d in sorted(Path('/sys/class/drm').glob('card*/device')):
+    u_p = d / 'mem_info_vram_used'
+    t_p = d / 'mem_info_vram_total'
+    if u_p.exists() and t_p.exists():
+        try:
+            u = int(u_p.read_text().strip())
+            t = int(t_p.read_text().strip())
+            if t > 0:
+                print(f'VRAM: {u/GB:.1f} / {t/GB:.1f} GB ({u*100//t}%)')
+        except Exception:
+            pass
+        break
+print('---')
+try:
+    out = subprocess.run(['rocm-smi', '--showpids'], capture_output=True, text=True, timeout=5).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit() and len(parts) >= 4:
+            try:
+                vram = int(parts[3]) / GB
+                rows.append((vram, parts[0], parts[1]))
+            except (ValueError, IndexError):
+                pass
+    for vram, pid, name in sorted(rows, reverse=True)[:8]:
+        print(f'  PID {pid} ({name}): {vram:.1f} GB VRAM')
+except Exception as e:
+    print(f'(rocm-smi unavailable: {e})')
+" 2>/dev/null`
 
 ### LifeOS services — uptime + status
 
 !`for svc in lifeos-api lifeos-chromadb lifeos-llm lifeos-mcp-http lifeos-agent-worker; do active=$(systemctl is-active $svc.service 2>/dev/null); since=$(systemctl show $svc.service --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2-); echo "$svc: $active (since $since)"; done`
 
-### Server stacking — multiple uvicorn PIDs on :8000
+### Server stacking — multiple LISTENERS on :8000
 
-!`pids=$(lsof -ti :8000 2>/dev/null | sort -u); count=$(echo "$pids" | grep -c .); echo "pids_on_8000=$count"; if [ "$count" -gt 1 ]; then echo "DUPLICATE_PIDS: $pids"; fi`
+!`pids=$(ss -lntpH 2>/dev/null | grep ':8000 ' | grep -oP 'pid=\K[0-9]+' | sort -u); count=$(echo "$pids" | grep -c .); echo "listener_pids_on_8000=$count"; if [ "$count" -gt 1 ]; then echo "DUPLICATE_LISTENERS: $pids"; fi; echo "(client connections to :8000, for context: $(lsof -ti :8000 2>/dev/null | sort -u | wc -l) total fds)"`
 
 ### Watchdog timer state
 
-!`for t in lifeos-watchdog lifeos-server-watchdog lifeos-gpu-watchdog lifeos-sync; do echo "$t: $(systemctl list-timers $t.timer --no-pager 2>/dev/null | awk 'NR==2 {printf "next=%s %s   last=%s %s", $1, $2, $5, $6}')"; done`
+!`~/.venvs/lifeos/bin/python -c "
+import subprocess
+for t in ['lifeos-watchdog', 'lifeos-server-watchdog', 'lifeos-gpu-watchdog', 'lifeos-sync']:
+    try:
+        out = subprocess.run(
+            ['systemctl', 'list-timers', f'{t}.timer', '--no-pager'],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()
+        # The output is a header row, data row(s), then footer. Find the data row.
+        data = None
+        for line in out:
+            if t in line:
+                data = line
+                break
+        if not data:
+            print(f'{t}: (timer not installed)')
+            continue
+        # Columns: NEXT (3 cols) | LEFT | LAST (3 cols) | PASSED | UNIT | ACTIVATES
+        # Just dump the line with our prefix; humans can read it.
+        print(f'{t}: {data.strip()}')
+    except Exception as e:
+        print(f'{t}: (error: {e})')
+" 2>/dev/null`
 
 ### Watchdog log tails (last 5 entries each)
 
@@ -232,7 +286,7 @@ Expected-active services depend on settings:
 
 #### Server Stacking
 
-✅ if `pids_on_8000=1`. 🔴 if `DUPLICATE_PIDS` present — the issue #199 §5 pattern that PR #214 added the pkill fix for. Suggest `./scripts/server.sh restart`.
+✅ if `listener_pids_on_8000=1`. 🔴 if `DUPLICATE_LISTENERS` present — the issue #199 §5 pattern that PR #214 added the pkill fix for. Suggest `./scripts/server.sh restart`. The "client connections" count is informational only; agent-worker and mcp-http legitimately keep open FDs to the API.
 
 #### Watchdogs
 
