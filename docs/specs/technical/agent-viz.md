@@ -69,7 +69,8 @@ All under `/api/agents`. Local-network only — the kill and resume endpoints mu
 | `GET /sessions/{id}/events?limit=N` | Last N transcript events (default 200, max 2000). Dispatches by `cc:` prefix to the Claude Code ingest path. |
 | `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). |
 | `POST /sessions/{id}/kill` | Operator kill — body `{reason: ""}`. LifeOS sessions only. Cascades to descendants in the subtree. |
-| `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. |
+| `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. |
+| `POST /sessions/{id}/focus` | Activate the WezTerm tab previously opened for this session. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. 404 if no mapping exists; 410 (and mapping cleared) if `wezterm cli activate-pane` fails because the pane no longer exists. |
 
 Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when there's no new event, so dropped connections surface quickly through the browser's `EventSource` retry.
 
@@ -272,23 +273,37 @@ The endpoint must not be exposed via Tailscale Funnel or the public MCP HTTP tra
 
 ---
 
-## Claude Code resume
+## Claude Code resume + focus
 
 ```
 POST /api/agents/sessions/{id}/resume   body: {"extra_env": {...}}
+POST /api/agents/sessions/{id}/focus    body: (none)
 ```
 
-Resume opt-in via `LIFEOS_CC_RESUME_ENABLED`. Spawns a configured launcher and pushes the actual `claude --resume` command to the system clipboard server-side.
+Both opt-in via `LIFEOS_CC_RESUME_ENABLED`. Resume spawns a new WezTerm tab and records the new pane id; Focus revisits that pane.
+
+### Resume
 
 1. Validate the session id (must start with `cc:`, must pass `validate_session_id`). Strip a `:agent:...` suffix if present — operator clicks on a subagent diamond mean "resume the parent terminal".
 2. Look up the meta via `discover_sessions(...)` with a widened 365-day lookback (resume is fine on old sessions). 404 if not found or no `decoded_cwd`.
-3. Render `LIFEOS_CC_RESUME_CMD` with the substitutions `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}` (URL-encoded for embedding inside `warp://…` / `vscode://…` URIs).
+3. Render `LIFEOS_CC_RESUME_INNER_CMD` with `{session_id}` / `{cwd}` first, then render `LIFEOS_CC_RESUME_CMD` with the same substitutions plus `{session_id_url}` / `{cwd_url}` (URL-encoded for legacy URI-scheme launchers) and `{inner_command}` (which expands to the rendered inner command's argv tokens, picked apart by `shlex.split`).
 4. `shlex.split(rendered)` — no `shell=True`, ever.
 5. Build the env: inherit `os.environ`, then layer `LIFEOS_CC_RESUME_ENV_FILE` (key=value lines pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS`), then merge `body.extra_env` last.
-6. Render `LIFEOS_CC_RESUME_INNER_CMD` and push it to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11). Server-side because the browser Clipboard API silently fails the instant the page loses focus to the spawned terminal.
-7. `subprocess.Popen(argv, cwd=decoded_cwd, env=env, start_new_session=True)`. Wait up to 0.5s; rc=0 is success regardless of timing (Warp's URL dispatcher exits clean after handing off to a running desktop app).
+6. Push the rendered inner command to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11) as a backup — redundant for the default WezTerm path (which runs the inner command directly) but useful if the operator has overridden `LIFEOS_CC_RESUME_CMD` to a legacy launcher that opens an empty terminal.
+7. `subprocess.Popen(argv, cwd=decoded_cwd, env=env, stdout=PIPE, stderr=PIPE, start_new_session=True)`. `proc.communicate(timeout=1.5)` to drain stdout — that's where `wezterm cli spawn` prints the new pane id. rc=0 with no integer on stdout is still success (operator may have configured a non-WezTerm launcher); rc≠0 surfaces stderr as 500. A `TimeoutExpired` keeps the launcher alive and returns `pane_id: null` — for launchers that BECOME the terminal.
+8. If stdout's first token parses as an int, persist `session_id → pane_id` via `CCWezTermStore.upsert` (SQLite at `data/cc_wezterm.db`).
 
-Response: `{spawned: true, pid, command, cwd, inner_command, clipboard_copied}`. The frontend falls back to a manual-copy toast if `clipboard_copied` is false.
+Response: `{spawned: true, pid, pane_id, command, cwd, inner_command, clipboard_copied}`. The frontend uses `pane_id` to decide whether the Focus button can target this session; if `null`, Focus will respond 404.
+
+### Focus
+
+1. Validate `cc:` prefix and the `LIFEOS_CC_RESUME_ENABLED` gate.
+2. `CCWezTermStore.get(session_id)`. 404 if missing — operator must click Resume first.
+3. `subprocess.run(["wezterm", "cli", "activate-pane", "--pane-id", str(pane_id)], capture_output=True, timeout=3.0)`.
+4. rc≠0 → delete the stored mapping and return 410 with stderr preview. The mapping is stale (typically: user closed the tab), so the next Resume click writes a fresh one.
+5. Best-effort `notify-send --urgency=critical` so a hidden WezTerm window pulses the dock icon — GNOME Wayland disallows cross-client window raise, so this is the strongest attention hint we can issue from outside the focused client.
+
+Response: `{focused: true, pane_id, cwd}`.
 
 ---
 
@@ -317,12 +332,13 @@ RestartSec=10
 
 ## Security boundaries
 
-The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. Both `/kill` and `/resume`:
+The threat model: the LifeOS MCP HTTP transport is publicly accessible via Tailscale Funnel and is the obvious place an external agent or compromised credential could hit LifeOS endpoints. `/kill`, `/resume`, and `/focus`:
 
 - Live under `/api/agents/*` — the MCP transport never proxies this prefix.
 - Are not registered as MCP tools — so they cannot be invoked through the MCP layer even if an attacker has a bearer token.
 - Kill calls into worker primitives that already have an audit trail (every kill emits a transcript event).
-- Resume runs a configured launcher via `shlex.split` only — no `shell=True`. Template substitutions are URL-encoded where they go into URI strings.
+- Resume runs a configured launcher via `shlex.split` only — no `shell=True`. Template substitutions are URL-encoded where they go into URI strings. The rendered `{inner_command}` is split into individual argv tokens before reaching the launcher, so a malicious inner command cannot smuggle shell metacharacters.
+- Focus calls `wezterm cli activate-pane` with a fixed argv (no template) using the pane id from the local SQLite mapping. The store is only writeable from the same process (no cross-machine exposure), and pane ids are integers — there is no path for an external caller to inject arbitrary argv.
 
 Per-source guarantees:
 

@@ -1,10 +1,14 @@
-"""Tests for the Claude Code resume endpoint (issue #160).
+"""Tests for the Claude Code resume + focus endpoints (issues #160 + wezterm).
 
-Resume spawns a local terminal via subprocess. Every test in this file
-mocks `subprocess.Popen` so no real process is launched.
+`resume` spawns a wezterm tab via `wezterm cli spawn` and captures the
+pane id from stdout. `focus` calls `wezterm cli activate-pane` to revisit
+the same tab. Both spawn subprocesses, so every test in this file mocks
+the subprocess calls and the cc_wezterm_store; no real wezterm is
+required.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -57,6 +61,48 @@ def synthetic_session(tmp_path: Path, monkeypatch):
     return tmp_path, sid
 
 
+@pytest.fixture
+def wezterm_store(tmp_path: Path, monkeypatch):
+    """Swap the default cc_wezterm store for a tmp-path-backed one so tests
+    can introspect what got persisted without touching the real DB."""
+    from api.services import cc_wezterm_store as mod
+    store = mod.CCWezTermStore(db_path=tmp_path / "cc_wezterm.db")
+    monkeypatch.setattr(mod, "_default_store", store)
+    yield store
+    store.close()
+
+
+def _make_fake_proc(*, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0,
+                    timeout: bool = False):
+    """Build a _FakeProc class whose `communicate` matches the requested
+    outcome. Tests instantiate it indirectly via `subprocess.Popen` mock."""
+
+    captured: dict[str, object] = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            captured["env"] = kwargs.get("env") or {}
+            self.pid = 4242
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is True or timeout == "force":
+                raise subprocess.TimeoutExpired(cmd=captured["argv"], timeout=timeout)
+            self.returncode = returncode
+            return stdout, stderr
+
+    if timeout:
+        class _TimingOut(_FakeProc):
+            def communicate(self, timeout=None):  # noqa: D401
+                raise subprocess.TimeoutExpired(cmd=captured["argv"], timeout=timeout)
+        return _TimingOut, captured
+    return _FakeProc, captured
+
+
 # ---------------------------------------------------------------------------
 # Gating: disabled / non-cc / missing template
 # ---------------------------------------------------------------------------
@@ -98,29 +144,15 @@ def test_resume_empty_template_400(client, synthetic_session, monkeypatch):
 
 @pytest.mark.unit
 def test_resume_substitutes_session_id_and_spawns_with_cwd(
-    client, synthetic_session, monkeypatch
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd",
                         "echo claude --resume {session_id} --extra")
 
-    captured: dict[str, object] = {}
-
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            self.pid = 4242
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            # Long-running process — pretend it's still up.
-            raise __import__("subprocess").TimeoutExpired(cmd=captured["argv"], timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
@@ -140,29 +172,46 @@ def test_resume_substitutes_session_id_and_spawns_with_cwd(
 
 
 @pytest.mark.unit
+def test_resume_substitutes_inner_command_token(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """The default wezterm template inserts the rendered inner_command via
+    `{inner_command}` — its argv tokens should land in the spawn argv."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd",
+                        "wezterm cli spawn --cwd {cwd} -- {inner_command}")
+    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
+                        "claude --resume {session_id}")
+
+    Proc, captured = _make_fake_proc(stdout=b"17\n", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    argv = captured["argv"]
+    assert argv[0] == "wezterm"
+    assert "spawn" in argv
+    assert "--" in argv
+    # Inner command's individual tokens appear after the `--`.
+    dd = argv.index("--")
+    inner_tokens = argv[dd + 1:]
+    assert inner_tokens[0] == "claude"
+    assert sid in inner_tokens
+
+
+@pytest.mark.unit
 def test_resume_subagent_id_resolves_to_parent_cwd(
-    client, synthetic_session, monkeypatch
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
     """Resuming a subagent synthetic id should resume the parent terminal."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
 
-    captured: dict[str, object] = {}
-
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            self.pid = 5
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd=captured["argv"], timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     sub_id = f"cc:{sid}:agent:toolu_01abc"
@@ -186,12 +235,81 @@ def test_resume_returns_404_when_session_not_discovered(client, monkeypatch, tmp
 
 
 # ---------------------------------------------------------------------------
+# Pane id capture + store integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_resume_captures_pane_id_from_stdout_and_stores_it(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """When the launcher prints a pane id (wezterm cli spawn's contract),
+    the endpoint surfaces it AND persists session_id→pane_id."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo 42")
+
+    Proc, _captured = _make_fake_proc(stdout=b"42\n", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pane_id"] == 42
+
+    mapping = wezterm_store.get(f"cc:{sid}")
+    assert mapping is not None
+    assert mapping.pane_id == 42
+    assert mapping.cwd == "/home/syn/Code/A"
+
+
+@pytest.mark.unit
+def test_resume_pane_id_null_when_stdout_has_no_integer(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """If the operator overrides the launcher to a URL dispatcher that
+    prints nothing useful, we don't fabricate a pane id."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
+
+    Proc, _captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pane_id"] is None
+    # Nothing should be stored when there's no pane id to remember.
+    assert wezterm_store.get(f"cc:{sid}") is None
+
+
+@pytest.mark.unit
+def test_resume_pane_id_null_when_stdout_is_not_an_integer(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo hello")
+
+    Proc, _captured = _make_fake_proc(stdout=b"not-a-number\n", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200
+    assert r.json()["pane_id"] is None
+
+
+# ---------------------------------------------------------------------------
 # Failure handling
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_resume_500_when_binary_missing(client, synthetic_session, monkeypatch):
+def test_resume_500_when_binary_missing(client, synthetic_session, wezterm_store, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "no-such-binary {session_id}")
@@ -207,27 +325,16 @@ def test_resume_500_when_binary_missing(client, synthetic_session, monkeypatch):
 
 
 @pytest.mark.unit
-def test_resume_500_when_process_exits_nonzero_with_stderr(client, synthetic_session, monkeypatch):
-    """Process exits non-zero within the 0.5s wait → 500 with stderr preview."""
+def test_resume_500_when_process_exits_nonzero_with_stderr(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """Non-zero exit within the timeout → 500 with stderr preview."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
 
-    class _ExitedProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 7
-            self.returncode = 2
-
-            class _Stream:
-                def read(self, n):
-                    return b"stderr says: bad config\n"
-            self.stderr = _Stream()
-            self.stdout = MagicMock()
-
-        def wait(self, timeout=None):
-            return self.returncode
-
-    monkeypatch.setattr("subprocess.Popen", _ExitedProc)
+    Proc, _captured = _make_fake_proc(stdout=b"", stderr=b"stderr says: bad config\n", returncode=2)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
@@ -236,39 +343,57 @@ def test_resume_500_when_process_exits_nonzero_with_stderr(client, synthetic_ses
 
 
 @pytest.mark.unit
-def test_resume_pipes_inner_command_to_system_clipboard(
-    client, synthetic_session, monkeypatch
+def test_resume_timeout_returns_spawned_without_pane_id(
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
-    """`inner_command` is piped to wl-copy / xclip server-side. The
-    response's `clipboard_copied` flag reflects whether the helper
-    exited rc=0."""
+    """A launcher that BECOMES the terminal (rare; not the default) times
+    out the proc.communicate. We treat that as a successful spawn but
+    surface pane_id=None so the focus button knows there's nothing tracked."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
+
+    Proc, _captured = _make_fake_proc(timeout=True)
+    monkeypatch.setattr("subprocess.Popen", Proc)
+
+    _, sid = synthetic_session
+    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["spawned"] is True
+    assert body["pane_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Clipboard backup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_resume_pipes_inner_command_to_system_clipboard(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
+    """`inner_command` is piped to wl-copy / xclip server-side as a backup
+    for operators who override cc_resume_cmd to a launcher that doesn't
+    run the inner command itself (e.g. the legacy warp:// flow)."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
     monkeypatch.setattr(settings, "cc_resume_inner_cmd",
-                        "vt claude --resume {session_id}")
+                        "claude --resume {session_id}")
 
-    class _DispatchedProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 9
-            self.returncode = 0
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
+    Proc, _captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
-        def wait(self, timeout=None):
-            return 0
-
-    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
-
-    captured: dict[str, object] = {}
+    captured_run: dict[str, object] = {}
 
     class _CompletedProcess:
         returncode = 0
         stderr = b""
 
     def _fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["input"] = kwargs.get("input")
+        captured_run["argv"] = argv
+        captured_run["input"] = kwargs.get("input")
         return _CompletedProcess()
 
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}" if name in ("wl-copy",) else None)
@@ -279,31 +404,23 @@ def test_resume_pipes_inner_command_to_system_clipboard(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["clipboard_copied"] is True
-    # The wl-copy invocation received the rendered inner command on stdin.
-    assert captured["argv"] == ["wl-copy"]
-    assert captured["input"].decode("utf-8") == f"vt claude --resume {sid}"
+    assert captured_run["argv"] == ["wl-copy"]
+    assert captured_run["input"].decode("utf-8") == f"claude --resume {sid}"
 
 
 @pytest.mark.unit
-def test_resume_clipboard_failure_is_non_fatal(client, synthetic_session, monkeypatch):
+def test_resume_clipboard_failure_is_non_fatal(
+    client, synthetic_session, wezterm_store, monkeypatch
+):
     """No clipboard helper available → spawn still succeeds, flag is False."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
     monkeypatch.setattr(settings, "cc_resume_inner_cmd",
-                        "vt claude --resume {session_id}")
+                        "claude --resume {session_id}")
 
-    class _DispatchedProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 9
-            self.returncode = 0
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-
-        def wait(self, timeout=None):
-            return 0
-
-    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
+    Proc, _captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
     monkeypatch.setattr("shutil.which", lambda name: None)  # no clipboard tools
 
     _, sid = synthetic_session
@@ -313,37 +430,6 @@ def test_resume_clipboard_failure_is_non_fatal(client, synthetic_session, monkey
     assert body["spawned"] is True
     assert body["clipboard_copied"] is False
     assert body["inner_command"]  # still returned so frontend can offer manual copy
-
-
-@pytest.mark.unit
-def test_resume_rc0_immediate_exit_is_success(client, synthetic_session, monkeypatch):
-    """URL-dispatcher launchers (`warp-terminal warp://…`) exit rc=0 right
-    after delegating to the desktop app. That MUST be treated as success —
-    the spawn worked, the terminal is now running elsewhere."""
-    from config.settings import settings
-    monkeypatch.setattr(settings, "cc_resume_enabled", True)
-    monkeypatch.setattr(settings, "cc_resume_cmd", "echo {session_id}")
-    monkeypatch.setattr(settings, "cc_resume_inner_cmd",
-                        "vt claude --resume {session_id}")
-
-    class _DispatchedProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 9
-            self.returncode = 0
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-
-        def wait(self, timeout=None):
-            return self.returncode  # immediate clean exit
-
-    monkeypatch.setattr("subprocess.Popen", _DispatchedProc)
-
-    _, sid = synthetic_session
-    r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["spawned"] is True
-    assert sid in body["inner_command"]
 
 
 @pytest.mark.unit
@@ -358,32 +444,20 @@ def test_resume_rejects_traversal_session_id(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Env file
+# Substitution coverage
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_resume_substitutes_cwd_token(client, synthetic_session, monkeypatch):
+def test_resume_substitutes_cwd_token(client, synthetic_session, wezterm_store, monkeypatch):
     """`{cwd}` is replaced with the decoded project working directory."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd",
                         "echo --working-dir {cwd} --resume {session_id}")
 
-    captured: dict[str, object] = {}
-
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            captured["argv"] = argv
-            self.pid = 1
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
@@ -394,74 +468,45 @@ def test_resume_substitutes_cwd_token(client, synthetic_session, monkeypatch):
 
 @pytest.mark.unit
 def test_resume_url_encoded_substitutions_for_uri_schemes(
-    client, synthetic_session, monkeypatch
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
-    """`{cwd_url}` and `{session_id_url}` are URL-encoded — needed for
-    embedding inside `warp://action/new_tab?path=...&command=...` and other
-    URI-scheme launchers where spaces and slashes must be %-encoded."""
+    """`{cwd_url}` and `{session_id_url}` are URL-encoded — preserved for
+    operators who override the launcher to a URI-scheme dispatcher."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(
         settings, "cc_resume_cmd",
-        "echo warp://action/new_tab?path={cwd_url}&command=vt+claude+--resume+{session_id_url}",
+        "echo warp://action/new_tab?path={cwd_url}&command=claude+--resume+{session_id_url}",
     )
 
-    captured: dict[str, object] = {}
-
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            captured["argv"] = argv
-            self.pid = 1
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
     assert r.status_code == 200, r.text
-    # cwd /home/syn/Code/A should be encoded to %2Fhome%2Fsyn%2FCode%2FA
     full = " ".join(captured["argv"])
     assert "%2Fhome%2Fsyn%2FCode%2FA" in full
-    # The bare session_id has no special chars so URL-encoding is a no-op,
-    # but the {session_id_url} token must have been substituted (no literal token).
     assert "{session_id_url}" not in full
     assert "{cwd_url}" not in full
-    # The non-URL substitutions are NOT applied inside the URL-encoded params
-    # (they would break the URL); only the *_url variants land there.
-    assert "/home/syn/Code/A" not in full or "%2Fhome%2Fsyn%2FCode%2FA" in full
 
 
 @pytest.mark.unit
 def test_resume_returns_inner_command_for_clipboard(
-    client, synthetic_session, monkeypatch
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
     """The inner-command setting is rendered with substitutions and surfaced
-    in the response as `inner_command` so the frontend can copy it to the
-    clipboard (Warp Linux ignores its URI-scheme `&command=`)."""
+    in the response as `inner_command`."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
     monkeypatch.setattr(
         settings, "cc_resume_inner_cmd",
-        "vt claude --resume {session_id} --workdir {cwd}",
+        "claude --resume {session_id} --workdir {cwd}",
     )
 
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 1
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, _captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
@@ -475,7 +520,7 @@ def test_resume_returns_inner_command_for_clipboard(
 
 @pytest.mark.unit
 def test_resume_empty_inner_command_yields_empty_string(
-    client, synthetic_session, monkeypatch
+    client, synthetic_session, wezterm_store, monkeypatch
 ):
     """Operators can disable the clipboard copy by setting INNER_CMD empty."""
     from config.settings import settings
@@ -483,17 +528,8 @@ def test_resume_empty_inner_command_yields_empty_string(
     monkeypatch.setattr(settings, "cc_resume_cmd", "echo launching")
     monkeypatch.setattr(settings, "cc_resume_inner_cmd", "")
 
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            self.pid = 1
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, _captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
@@ -503,7 +539,7 @@ def test_resume_empty_inner_command_yields_empty_string(
 
 @pytest.mark.unit
 def test_resume_env_file_overrides_systemd_env(
-    client, synthetic_session, monkeypatch, tmp_path
+    client, synthetic_session, wezterm_store, monkeypatch, tmp_path
 ):
     """LIFEOS_CC_RESUME_ENV_FILE values appear in the Popen env kwarg."""
     from config.settings import settings
@@ -513,23 +549,104 @@ def test_resume_env_file_overrides_systemd_env(
     env_path.write_text("DISPLAY=:0\nXAUTHORITY=/run/user/1000/x\n# comment\n\n", encoding="utf-8")
     monkeypatch.setattr(settings, "cc_resume_env_file", str(env_path))
 
-    captured: dict[str, object] = {}
-
-    class _FakeProc:
-        def __init__(self, argv, **kwargs):
-            captured["env"] = kwargs.get("env") or {}
-            self.pid = 1
-            self.stdout = MagicMock()
-            self.stderr = MagicMock()
-            self.returncode = None
-
-        def wait(self, timeout=None):
-            raise __import__("subprocess").TimeoutExpired(cmd="x", timeout=timeout)
-
-    monkeypatch.setattr("subprocess.Popen", _FakeProc)
+    Proc, captured = _make_fake_proc(stdout=b"", returncode=0)
+    monkeypatch.setattr("subprocess.Popen", Proc)
 
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
     assert r.status_code == 200, r.text
     assert captured["env"]["DISPLAY"] == ":0"
     assert captured["env"]["XAUTHORITY"] == "/run/user/1000/x"
+
+
+# ---------------------------------------------------------------------------
+# /focus endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_focus_rejects_non_cc_session(client):
+    r = client.post("/api/agents/sessions/some-lifeos-uuid/focus")
+    assert r.status_code == 400
+
+
+@pytest.mark.unit
+def test_focus_disabled_by_default(client, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", False)
+    r = client.post("/api/agents/sessions/cc:any-id/focus")
+    assert r.status_code == 400
+    assert "disabled" in r.json()["detail"].lower()
+
+
+@pytest.mark.unit
+def test_focus_returns_404_when_no_mapping(client, wezterm_store, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    r = client.post("/api/agents/sessions/cc:no-mapping/focus")
+    assert r.status_code == 404
+    assert "resume" in r.json()["detail"].lower()
+
+
+@pytest.mark.unit
+def test_focus_calls_activate_pane_when_mapping_exists(
+    client, wezterm_store, monkeypatch
+):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj")
+
+    captured: dict[str, object] = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def _fake_run(argv, **kwargs):
+        captured.setdefault("calls", []).append(argv)
+        return _Completed()
+
+    # `wezterm` must be locatable for the focus code to assemble the argv;
+    # notify-send is optional (covered by a separate test).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    r = client.post("/api/agents/sessions/cc:session-x/focus")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["focused"] is True
+    assert body["pane_id"] == 17
+    assert body["cwd"] == "/tmp/proj"
+
+    # Activate-pane was called with the stored pane id.
+    calls = captured["calls"]
+    assert any(
+        argv[0].endswith("wezterm") and argv[1:] == ["cli", "activate-pane", "--pane-id", "17"]
+        for argv in calls
+    )
+
+
+@pytest.mark.unit
+def test_focus_returns_410_and_clears_mapping_when_activate_fails(
+    client, wezterm_store, monkeypatch
+):
+    """Most common failure: user closed the tab. Server clears the stale
+    mapping and returns 410 so the UI can prompt for Resume."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj")
+
+    class _Failed:
+        returncode = 1
+        stdout = b""
+        stderr = b"no such pane: 17\n"
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: _Failed())
+
+    r = client.post("/api/agents/sessions/cc:session-x/focus")
+    assert r.status_code == 410
+    assert "no such pane" in r.json()["detail"]
+    # Stale mapping is cleared so the next Resume can write a fresh one.
+    assert wezterm_store.get("cc:session-x") is None

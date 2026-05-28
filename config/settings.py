@@ -210,25 +210,29 @@ class Settings(BaseSettings):
                     "depends on the operator's desktop environment."
     )
     cc_resume_cmd: str = Field(
-        default="warp-terminal warp://action/new_tab?path={cwd_url}",
+        default="wezterm cli spawn --cwd {cwd} -- {inner_command}",
         alias="LIFEOS_CC_RESUME_CMD",
         description="Launcher command for resuming a Claude Code session. "
-                    "Default opens a new Warp tab at the project directory. "
-                    "Linux Warp ignores `&command=` in its URI scheme, so the "
-                    "actual `claude --resume` command is paired with "
-                    "LIFEOS_CC_RESUME_INNER_CMD and copied to the operator's "
-                    "clipboard on click. Substitutions: `{session_id}`, "
-                    "`{cwd}`, and URL-encoded `{session_id_url}` / `{cwd_url}`. "
-                    "Parsed with shlex.split — no shell metacharacters."
+                    "Default uses `wezterm cli spawn` which opens a new tab "
+                    "AND runs the resume command in one shot, no clipboard "
+                    "paste needed. Wezterm prints the new pane id on stdout, "
+                    "which the /agents page stores so the new `Focus` action "
+                    "can call `wezterm cli activate-pane` to revisit the tab. "
+                    "Substitutions: `{session_id}`, `{cwd}`, `{inner_command}` "
+                    "(rendered LIFEOS_CC_RESUME_INNER_CMD), and URL-encoded "
+                    "`{session_id_url}` / `{cwd_url}`. Parsed with shlex.split "
+                    "— no shell metacharacters."
     )
     cc_resume_inner_cmd: str = Field(
-        default="vt claude --dangerously-skip-permissions --resume {session_id}",
+        default="claude --dangerously-skip-permissions --resume {session_id}",
         alias="LIFEOS_CC_RESUME_INNER_CMD",
-        description="Command intended to run *inside* the spawned terminal. "
-                    "Returned in the resume response and copied to the "
-                    "operator's clipboard so they can paste it once the "
-                    "terminal opens. Set to empty to disable clipboard "
-                    "copy. Substitutions: `{session_id}`, `{cwd}`."
+        description="Command run *inside* the spawned terminal — the actual "
+                    "`claude --resume` invocation. The default template for "
+                    "LIFEOS_CC_RESUME_CMD substitutes this in via "
+                    "`{inner_command}` so wezterm launches the tab with the "
+                    "resume already running. Substitutions: `{session_id}`, "
+                    "`{cwd}`. Set to empty to skip the inner command (spawn "
+                    "an empty terminal)."
     )
     cc_resume_env_file: str = Field(
         default="",

@@ -559,12 +559,25 @@ async def resume_claude_code_session(
     if target is None or not target.decoded_cwd:
         raise HTTPException(status_code=404, detail=f"session {session_id} not found or has no cwd")
 
-    # Template substitutions:
+    # Render the inner command first so the outer template can substitute
+    # `{inner_command}` (wezterm path) AND so we can copy it to the clipboard
+    # as a backup if the spawn doesn't actually run it (legacy launcher path).
+    inner_template = (settings.cc_resume_inner_cmd or "").strip()
+    inner_rendered = (
+        inner_template
+        .replace("{session_id}", bare)
+        .replace("{cwd}", target.decoded_cwd)
+    )
+
+    # Template substitutions on the launcher:
     #   {session_id}     — bare uuid (no cc: prefix)
     #   {cwd}            — decoded project working directory
     #   {session_id_url} — URL-encoded session_id for use inside `warp://`,
     #                      `vscode://` etc. query strings
     #   {cwd_url}        — URL-encoded cwd for the same
+    #   {inner_command}  — the rendered inner_command, inserted unquoted so
+    #                      shlex.split sees its individual argv tokens (used
+    #                      by the default `wezterm cli spawn ... -- {inner_command}`)
     import urllib.parse
     rendered = (
         template
@@ -572,6 +585,7 @@ async def resume_claude_code_session(
         .replace("{cwd_url}", urllib.parse.quote(target.decoded_cwd, safe=""))
         .replace("{session_id}", bare)
         .replace("{cwd}", target.decoded_cwd)
+        .replace("{inner_command}", inner_rendered)
     )
     try:
         argv = shlex.split(rendered)
@@ -598,56 +612,163 @@ async def resume_claude_code_session(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
-    # Render the inner command (the actual `claude --resume` invocation)
-    # so the operator can paste it once the terminal opens — Warp Linux
-    # ignores the `&command=` URI param.
-    inner_template = (settings.cc_resume_inner_cmd or "").strip()
-    inner_rendered = (
-        inner_template
-        .replace("{session_id}", bare)
-        .replace("{cwd}", target.decoded_cwd)
-    )
-    # Push the rendered inner command directly to the system clipboard
-    # via wl-copy / xclip. The browser-side Clipboard API silently fails
-    # when the page loses focus (which happens the instant Warp opens),
-    # so doing the copy from the server while it still has env access is
-    # far more reliable. Failure here is non-fatal — the frontend gets
-    # the command in the response and can offer manual copy.
+    # Push the rendered inner command directly to the system clipboard.
+    # For the wezterm path (default) this is redundant since wezterm runs
+    # `{inner_command}` directly, but it's cheap and serves as a backup if
+    # the operator overrides cc_resume_cmd to a launcher that opens an
+    # empty terminal (e.g., the legacy `warp-terminal warp://…` flow).
     clipboard_copied = False
     if inner_rendered:
         clipboard_copied = _copy_to_clipboard(inner_rendered, env)
 
-    # Give the spawn a beat. Two flavors of launcher are both valid:
-    #   (a) the launcher BECOMES the terminal (long-running) — wait() times
-    #       out, we return the running pid.
-    #   (b) the launcher is a URL dispatcher that delegates to a running
-    #       desktop app and exits cleanly (rc=0). `warp-terminal warp://…`
-    #       does exactly this — Warp opens but the launcher process is gone.
-    # rc=0 is success regardless of timing; only a non-zero exit is failure.
-    response_body = {
+    # Two launcher flavors coexist:
+    #   (a) `wezterm cli spawn` exits cleanly with a pane id on stdout — we
+    #       want to wait for it, parse the id, store it, and return.
+    #   (b) The launcher BECOMES the terminal (rare; not the default) —
+    #       communicate() times out, no pane id available, return spawned=True.
+    # A 1.5s timeout is plenty for (a) and short enough that the API stays
+    # snappy for (b).
+    pane_id: int | None = None
+    stdout_bytes = b""
+    stderr_bytes = b""
+    try:
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        # Long-running launcher — no pane id this turn, but the spawn is
+        # in progress; surface what we have.
+        response_body = {
+            "spawned": True,
+            "pid": proc.pid,
+            "pane_id": None,
+            "command": argv,
+            "cwd": target.decoded_cwd,
+            "inner_command": inner_rendered,
+            "clipboard_copied": clipboard_copied,
+        }
+        return response_body
+
+    if proc.returncode != 0:
+        detail = (stderr_bytes.decode("utf-8", errors="replace").strip()
+                  or f"resume process exited rc={proc.returncode}")
+        raise HTTPException(status_code=500, detail=detail)
+
+    # `wezterm cli spawn` prints a single integer (the pane id) on stdout.
+    # If the operator overrode cc_resume_cmd to a launcher that doesn't
+    # print one, we just skip the focus mapping for this session.
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    if stdout_text:
+        first_token = stdout_text.split()[0]
+        try:
+            pane_id = int(first_token)
+        except ValueError:
+            pane_id = None
+
+    if pane_id is not None:
+        try:
+            from api.services.cc_wezterm_store import get_default_store
+            get_default_store().upsert(session_id, pane_id, target.decoded_cwd)
+        except Exception as exc:  # noqa: BLE001 — store failure is non-fatal
+            logger.warning("cc_wezterm_store upsert failed for %s: %s", session_id, exc)
+
+    return {
         "spawned": True,
         "pid": proc.pid,
+        "pane_id": pane_id,
         "command": argv,
         "cwd": target.decoded_cwd,
         "inner_command": inner_rendered,
         "clipboard_copied": clipboard_copied,
     }
+
+
+@router.post("/sessions/{session_id}/focus")
+async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
+    """Activate the WezTerm pane that was opened for this session by a prior
+    Resume click. Returns 404 if there's no stored pane mapping (use
+    Resume to create one) and 410 if the pane no longer exists (mapping
+    cleared).
+
+    Caveat: on GNOME Wayland the compositor disallows cross-client window
+    raise, so this reliably switches the tab within wezterm but cannot
+    bring a hidden wezterm window to the foreground. A `notify-send`
+    follows the activate-pane call to flash the dock icon as a hint.
+    """
+    import shlex
+    import shutil
+    import subprocess
+
+    if not session_id.startswith("cc:"):
+        raise HTTPException(status_code=400, detail="focus is only available for Claude Code sessions")
+
     try:
-        proc.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        return response_body
-    if proc.returncode == 0:
-        return response_body
-    # Non-zero exit within 0.5s — surface stderr.
-    stderr_preview = b""
+        from config.settings import settings
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"settings unavailable: {exc}") from exc
+
+    if not getattr(settings, "cc_resume_enabled", False):
+        raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
+
+    from api.services.cc_wezterm_store import get_default_store
+    store = get_default_store()
+    mapping = store.get(session_id)
+    if mapping is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no tracked wezterm tab for this session — use Resume to create one",
+        )
+
+    wezterm_bin = shutil.which("wezterm") or "wezterm"
+    argv = [wezterm_bin, "cli", "activate-pane", "--pane-id", str(mapping.pane_id)]
+    env = _resume_env()
     try:
-        if proc.stderr is not None:
-            stderr_preview = proc.stderr.read(1024)
-    except Exception:  # noqa: BLE001
-        pass
-    detail = (stderr_preview.decode("utf-8", errors="replace").strip()
-              or f"resume process exited rc={proc.returncode}")
-    raise HTTPException(status_code=500, detail=detail)
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell=True
+            argv,
+            env=env,
+            capture_output=True,
+            timeout=3.0,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"wezterm not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail=f"wezterm activate-pane timed out: {exc}") from exc
+
+    if proc.returncode != 0:
+        # Most common cause: the user closed the tab. Clear the stale
+        # mapping so a subsequent Resume can write a fresh one.
+        store.delete(session_id)
+        detail = (proc.stderr.decode("utf-8", errors="replace").strip()
+                  or f"wezterm activate-pane exited rc={proc.returncode}")
+        raise HTTPException(status_code=410, detail=detail)
+
+    # Best-effort dock flash so a hidden wezterm window gets attention —
+    # the compositor won't raise it programmatically (see docstring), but
+    # the urgency hint on the .desktop entry will pulse the icon.
+    notify_bin = shutil.which("notify-send")
+    if notify_bin:
+        try:
+            subprocess.run(  # noqa: S603 — fixed argv
+                [
+                    notify_bin,
+                    "--urgency=critical",
+                    "--app-name=LifeOS",
+                    "--icon=utilities-terminal",
+                    "Agent session focused",
+                    f"Switched wezterm to pane {mapping.pane_id} ({shlex.quote(mapping.cwd)})",
+                ],
+                env=env,
+                capture_output=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    return {
+        "focused": True,
+        "pane_id": mapping.pane_id,
+        "cwd": mapping.cwd,
+    }
 
 
 async def _stream_claude_code_session(session_id: str, backfill: int):
