@@ -153,8 +153,15 @@ async def _prefetch_loop() -> None:
                         "agent_viz prefetch: summarized %s in %.1fs",
                         sid, elapsed,
                     )
-                else:
-                    cooldown[sid] = tick + _FAILURE_BACKOFF_TICKS
+                # Park every attempted session, success or failure. A real
+                # summary drops out of the candidate list on its own (it now
+                # has a cached short_label), so the cooldown only matters for a
+                # session that "succeeds" without producing a cacheable label —
+                # e.g. a live transcript with only tool calls and no
+                # user/assistant text. Without a cooldown such a session sorts
+                # first every tick, gets re-picked in ~0s, and starves every
+                # other candidate behind it.
+                cooldown[sid] = tick + _FAILURE_BACKOFF_TICKS
                 # Only do one per tick — keeps Gemma queue shallow.
                 break
         except asyncio.CancelledError:

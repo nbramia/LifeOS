@@ -386,13 +386,23 @@ async def summarize_session(
         return disk_hit
 
     ctx = _extract_context(events)
-    # If we have nothing to summarize, return a deterministic fallback so the
-    # UI still gets *something*. Don't cache (next time we may have content).
+    # Nothing to summarize: return a deterministic fallback so the UI still
+    # gets *something*. A terminal session will never gain content, so cache
+    # the fallback to keep it out of the prefetch candidate list forever; a
+    # live session might produce content later, so leave it uncached and let
+    # the next access retry.
     if not ctx["first_user"] and not ctx["final_assistant"] and not ctx["prs"]:
-        return SummaryResult(
+        result = SummaryResult(
             short_label=_fallback_label(label),
             summary="(No transcript content yet.)",
         )
+        if _is_terminal(status):
+            now = time.time()
+            if len(_cache) >= _CACHE_MAX:
+                _cache.pop(next(iter(_cache)))
+            _cache[session_id] = (last_activity_at, now, result)
+            _disk_put(session_id, last_activity_at, result)
+        return result
 
     prompt = _build_prompt(label, ctx)
     try:

@@ -434,3 +434,55 @@ def test_search_endpoint_requires_query(client, summary_db):
     # The app maps RequestValidationError to 400 (see api/main.py).
     assert client.get("/api/agents/search").status_code == 400
     assert client.get("/api/agents/search", params={"q": ""}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# No-content fallback caching. A session whose transcript carries no
+# user/assistant text (only a seed + tool calls — the real agent-worker case)
+# hits the deterministic fallback in summarize_session. A *terminal* such
+# session must cache the fallback so it drops out of the prefetch candidate
+# list; otherwise the prefetch loop re-picks it every tick in ~0s and starves
+# every other candidate behind it (head-of-line starvation).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_no_content_terminal_session_caches_fallback(summary_db):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    sid = "sess_nocontent_terminal"
+    # Only a seed (task_id) + tool calls — no user/assistant text. This is the
+    # shape that produced the production starvation bug.
+    events = [
+        {"kind": "seed", "payload": {"task_id": "t1"}},
+        {"kind": "tool_call", "payload": {"tool": "Bash"}},
+    ]
+    result = asyncio.run(avs.summarize_session(
+        sid, label="Clean Up The Indexer", last_activity_at=1000.0,
+        events=events, status=STATUS_COMPLETED,
+    ))
+    # Fallback derived from the label — no LLM call.
+    assert result.short_label == "Clean Up The Indexer"
+    # Cached, so the snapshot peek returns it and the session drops out of the
+    # prefetch candidate list instead of being re-picked forever.
+    cached = avs.get_cached_summary(sid, 1000.0, status=STATUS_COMPLETED)
+    assert cached is not None
+    assert cached.short_label == "Clean Up The Indexer"
+
+
+@pytest.mark.unit
+def test_no_content_live_session_not_cached(summary_db):
+    import asyncio
+    from api.services import agent_viz_summary as avs
+
+    sid = "sess_nocontent_live"
+    events = [{"kind": "seed", "payload": {"task_id": "t1"}}]
+    result = asyncio.run(avs.summarize_session(
+        sid, label="Running Task", last_activity_at=1000.0,
+        events=events, status=STATUS_RUNNING,
+    ))
+    assert result.short_label == "Running Task"
+    # A live session may gain content later, so the fallback must NOT be
+    # cached — the next access should retry.
+    assert avs.get_cached_summary(sid, 1000.0, status=STATUS_RUNNING) is None
