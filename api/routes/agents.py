@@ -480,6 +480,41 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
+def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
+    """Best-effort `notify-send --urgency=critical` so a hidden wezterm
+    window pulses the dock icon. Wayland disallows cross-client window
+    raise; this is the strongest attention hint we can issue from
+    outside the focused client.
+
+    Failure (no notify-send, libnotify not running, etc.) is silent on
+    purpose — the dock flash is an extra; the underlying spawn/focus
+    already succeeded by the time this is called.
+    """
+    import shutil
+    import subprocess
+
+    notify_bin = shutil.which("notify-send")
+    if not notify_bin:
+        return
+    try:
+        subprocess.run(  # noqa: S603 — fixed argv
+            [
+                notify_bin,
+                "--urgency=critical",
+                "--app-name=LifeOS",
+                "--icon=utilities-terminal",
+                summary,
+                body,
+            ],
+            env=env,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _inject_wezterm_pane(env: dict[str, str]) -> None:
     """Set $WEZTERM_PANE in `env` to an existing pane id, so `wezterm cli
     spawn` knows which window to add the new tab to. No-op if WEZTERM_PANE
@@ -674,14 +709,24 @@ async def resume_claude_code_session(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
 
-    # Push the rendered inner command directly to the system clipboard.
-    # For the wezterm path (default) this is redundant since wezterm runs
-    # `{inner_command}` directly, but it's cheap and serves as a backup if
-    # the operator overrides cc_resume_cmd to a launcher that opens an
-    # empty terminal (e.g., the legacy `warp-terminal warp://…` flow).
-    clipboard_copied = False
+    # Push a cwd-portable form of the inner command to the system
+    # clipboard. `claude --resume <id>` only finds the session when run
+    # in the matching project directory (claude scopes sessions by cwd),
+    # so we wrap with `cd <cwd> && ...` — that way pasting the clipboard
+    # into any terminal works. The wezterm path doesn't need this (it
+    # already runs with `--cwd target.decoded_cwd`), but the clipboard
+    # is a backup for operator-overridden non-wezterm launchers AND
+    # for the case where the wezterm tab opened off-screen and the
+    # operator just wants to run the command somewhere visible.
+    clipboard_text = ""
     if inner_rendered:
-        clipboard_copied = _copy_to_clipboard(inner_rendered, env)
+        clipboard_text = (
+            f"cd {shlex.quote(target.decoded_cwd)} && {inner_rendered}"
+            if target.decoded_cwd else inner_rendered
+        )
+    clipboard_copied = False
+    if clipboard_text:
+        clipboard_copied = _copy_to_clipboard(clipboard_text, env)
 
     # Two launcher flavors coexist:
     #   (a) `wezterm cli spawn` exits cleanly with a pane id on stdout — we
@@ -704,7 +749,7 @@ async def resume_claude_code_session(
             "pane_id": None,
             "command": argv,
             "cwd": target.decoded_cwd,
-            "inner_command": inner_rendered,
+            "inner_command": clipboard_text or inner_rendered,
             "clipboard_copied": clipboard_copied,
         }
         return response_body
@@ -732,13 +777,23 @@ async def resume_claude_code_session(
         except Exception as exc:  # noqa: BLE001 — store failure is non-fatal
             logger.warning("cc_wezterm_store upsert failed for %s: %s", session_id, exc)
 
+    # Pulse the wezterm dock icon so the operator knows a new tab is
+    # waiting — Wayland disallows cross-client window raise, so without
+    # this hint the spawn would be invisible if wezterm is hidden.
+    pane_label = f"pane {pane_id}" if pane_id is not None else "new tab"
+    _notify_dock(
+        env,
+        "Agent session resumed",
+        f"Wezterm opened {pane_label} in {shlex.quote(target.decoded_cwd)}",
+    )
+
     return {
         "spawned": True,
         "pid": proc.pid,
         "pane_id": pane_id,
         "command": argv,
         "cwd": target.decoded_cwd,
-        "inner_command": inner_rendered,
+        "inner_command": clipboard_text or inner_rendered,
         "clipboard_copied": clipboard_copied,
     }
 
@@ -803,28 +858,11 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
                   or f"wezterm activate-pane exited rc={proc.returncode}")
         raise HTTPException(status_code=410, detail=detail)
 
-    # Best-effort dock flash so a hidden wezterm window gets attention —
-    # the compositor won't raise it programmatically (see docstring), but
-    # the urgency hint on the .desktop entry will pulse the icon.
-    notify_bin = shutil.which("notify-send")
-    if notify_bin:
-        try:
-            subprocess.run(  # noqa: S603 — fixed argv
-                [
-                    notify_bin,
-                    "--urgency=critical",
-                    "--app-name=LifeOS",
-                    "--icon=utilities-terminal",
-                    "Agent session focused",
-                    f"Switched wezterm to pane {mapping.pane_id} ({shlex.quote(mapping.cwd)})",
-                ],
-                env=env,
-                capture_output=True,
-                timeout=2.0,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+    _notify_dock(
+        env,
+        "Agent session focused",
+        f"Switched wezterm to pane {mapping.pane_id} ({shlex.quote(mapping.cwd)})",
+    )
 
     return {
         "focused": True,

@@ -405,7 +405,9 @@ def test_resume_pipes_inner_command_to_system_clipboard(
     body = r.json()
     assert body["clipboard_copied"] is True
     assert captured_run["argv"] == ["wl-copy"]
-    assert captured_run["input"].decode("utf-8") == f"claude --resume {sid}"
+    # Clipboard is cwd-prefixed so it works when pasted into any terminal
+    # — `claude --resume <id>` only finds the session in its project cwd.
+    assert captured_run["input"].decode("utf-8") == f"cd /home/syn/Code/A && claude --resume {sid}"
 
 
 @pytest.mark.unit
