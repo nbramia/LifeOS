@@ -376,6 +376,22 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
     return {"session_id": session_id, **result.as_dict()}
 
 
+@router.get("/search")
+async def search_sessions(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(200, ge=1, le=500),
+) -> dict[str, Any]:
+    """Substring search over cached session summaries (short_label + summary).
+
+    Powers the /agents search box's summary tiers. The client handles the
+    label tier locally; this endpoint covers the LLM-generated summary text
+    that isn't fully loaded client-side. Reads only the disk cache — it never
+    triggers summary generation, so it's cheap and safe to call on keystroke.
+    """
+    matches = agent_viz_summary.search_cached_summaries(q, limit=limit)
+    return {"query": q, "matches": matches}
+
+
 @router.get("/stream")
 async def stream_snapshots() -> StreamingResponse:
     """SSE stream emitting a full snapshot every ~2 seconds."""
