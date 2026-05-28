@@ -1576,12 +1576,26 @@
       });
   }
 
+  // Track the in-flight summary fetch so a new openPanel can abort the old
+  // one — otherwise stale long-running fetches pile up behind Gemma.
+  let summaryAbort = null;
+
   // Fetch and render the LLM-generated session summary. Decoupled from the
   // event stream — slow LLM calls won't block transcript display. The panel
   // header shows "Summarizing…" until this resolves.
   async function fetchSessionSummary(sessionId) {
+    if (summaryAbort) summaryAbort.abort();
+    const ac = new AbortController();
+    summaryAbort = ac;
+    // 5 minutes — covers worst-case Gemma queueing (a big CC session behind
+    // the agent worker can easily push past 60s). The browser will return
+    // an AbortError if the LLM is genuinely stuck so the user can retry.
+    const timeoutId = setTimeout(() => ac.abort(), 5 * 60 * 1000);
     try {
-      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/summary`);
+      const r = await fetch(
+        `/api/agents/sessions/${encodeURIComponent(sessionId)}/summary`,
+        { signal: ac.signal },
+      );
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       // Bail if the operator moved on to a different session while we waited.
@@ -1606,9 +1620,27 @@
           .text(d => nodeLabel(d));
       }
     } catch (err) {
+      // AbortError from a panel switch is expected — just bail silently.
+      if (err.name === 'AbortError' && sessionId !== selectedSessionId) return;
       if (sessionId !== selectedSessionId) return;
       const bodyEl = document.querySelector('#session-summary [data-field="ss-body"]');
-      if (bodyEl) bodyEl.textContent = `Summary unavailable: ${err.message}`;
+      if (!bodyEl) return;
+      const friendly = err.name === 'AbortError'
+        ? 'Timed out — Gemma may be busy.'
+        : `Summary unavailable: ${err.message}.`;
+      bodyEl.innerHTML = `${escapeHtml(friendly)} <a href="#" data-action="retry-summary" style="color:var(--accent)">Retry</a>`;
+      const retry = bodyEl.querySelector('[data-action="retry-summary"]');
+      if (retry) {
+        retry.addEventListener('click', e => {
+          e.preventDefault();
+          bodyEl.textContent = 'Summarizing…';
+          document.getElementById('session-summary')?.classList.add('loading');
+          fetchSessionSummary(sessionId);
+        });
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      if (summaryAbort === ac) summaryAbort = null;
     }
   }
 

@@ -230,11 +230,16 @@ async def summarize_session(
         # ~3000 tokens regularly hits the cap mid-reasoning, leaving content
         # empty. Observed real CC sessions used ~2400 completion tokens
         # (≈9.5k chars reasoning + 200 chars JSON), so 4096 is the floor.
+        #
+        # 240s timeout: a fresh fast-path summary lands in ~25-30s, but when
+        # Gemma is already serving chat / the agent worker, the queue can push
+        # past 120s. The frontend has its own 5-minute abort, so this is the
+        # outer bound for "Gemma will finish eventually" before we give up.
         text = await generate_text(
             prompt,
             max_tokens=4096,
             temperature=0.2,
-            timeout=120.0,
+            timeout=240.0,
         )
         data = extract_json(text)
         short_label = str(data.get("short_label") or "").strip()
