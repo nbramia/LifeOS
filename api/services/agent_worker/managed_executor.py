@@ -491,6 +491,64 @@ class ManagedExecutor:
     # Finalize
     # ------------------------------------------------------------------
 
+    # When status flips to a terminal value, Anthropic's events endpoint
+    # often lags by a few seconds before reflecting the agent's final
+    # rounds of activity. Without this delay+re-poll, the transcript
+    # ends up missing the last batch of events even though they were
+    # billed in the session totals. 5s was empirically enough to catch
+    # the gap observed on task 614217bb (final ~5000 output tokens of
+    # agent work that never made it to the transcript on the in-flight
+    # polls). Worst case the operator waits an extra 5s for the Telegram
+    # completion alert — fine.
+    _TERMINAL_BACKFILL_DELAY_SECONDS = 5.0
+
+    def _backfill_events_on_terminal(self, session, state) -> None:
+        """Re-fetch events one more time after a brief delay, in case
+        Anthropic's events endpoint lagged behind the status endpoint.
+        Appends any newly-visible events to the transcript (dedupe by
+        event id against what's already there)."""
+        remote_id = session.managed_agent_session_id
+        if not remote_id:
+            return
+        time.sleep(self._TERMINAL_BACKFILL_DELAY_SECONDS)
+        try:
+            late_events = self.driver.list_events(remote_id, after_id=None)
+        except Exception as exc:
+            logger.warning("backfill list_events failed for %s: %s", remote_id, exc)
+            return
+        if not late_events:
+            return
+        # Dedupe against what's already in the transcript. Read each line
+        # once and pluck `payload.id`.
+        seen_ids: set[str] = set()
+        for ev in self.transcript_store.iter_events(session.session_id):
+            payload = ev.get("payload", {}) or {}
+            eid = payload.get("id")
+            if eid:
+                seen_ids.add(eid)
+        added = 0
+        for event in late_events:
+            eid = event.get("id")
+            if not eid or eid in seen_ids:
+                continue
+            stored = _truncate_oversized_tool_result(event)
+            self.transcript_store.append(
+                session.session_id,
+                f"managed_event_{stored.get('type', 'unknown')}",
+                stored,
+            )
+            added += 1
+        if added:
+            logger.info("backfilled %d late event(s) for %s after terminal",
+                        added, session.task_id)
+            # Also refresh final_text from the now-complete event stream so
+            # the operator sees the real answer, not an early-batch stub.
+            from api.services.agent_worker.managed_driver import _extract_final_text
+            refreshed = _extract_final_text(late_events)
+            if refreshed and refreshed != state.final_text:
+                state.final_text = refreshed
+                self.session_store.set_managed_final_text(session.task_id, refreshed)
+
     def _finalize_remote(self, session, state) -> ExecutorOutcome:
         # Session-hour overhead has already been booked incrementally in
         # poll(), so finalize doesn't need to add anything more — just record
@@ -500,6 +558,10 @@ class ManagedExecutor:
         # synthesized alias for forward-compat in case the API later transitions
         # status fields between the two.
         if state.status in ("idle", "completed"):
+            # Wait for Anthropic's events endpoint to catch up, then
+            # backfill anything we missed. The status endpoint goes
+            # terminal before /events fully reflects the final rounds.
+            self._backfill_events_on_terminal(session, state)
             # `state.final_text` reflects only events in *this* poll batch. If
             # the agent.message arrived in a prior batch and only the idle
             # event arrived now, fall back to the cached value persisted by

@@ -68,6 +68,16 @@ class _FakeDriver:
     def kill_session(self, session_id, reason=""):
         self.kills.append((session_id, reason))
 
+    def list_events(self, session_id, after_id=None):
+        """Used by _backfill_events_on_terminal. Tests set
+        `late_events_responses` to control what the post-terminal re-fetch
+        returns (one response per call). Default: empty (no backfill)."""
+        if not hasattr(self, "late_events_responses"):
+            return []
+        if not self.late_events_responses:
+            return []
+        return self.late_events_responses.pop(0)
+
 
 def _make_executor(store, transcript, driver, *, model="claude-sonnet-4-6"):
     return ManagedExecutor(
@@ -338,6 +348,95 @@ def test_poll_uses_since_cursor_on_subsequent_calls(stores):
 # ---------------------------------------------------------------------------
 # poll() — terminal states
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.unit
+def test_terminal_backfill_picks_up_lagging_events(stores, monkeypatch):
+    """When status flips to `idle` but Anthropic's events endpoint hasn't
+    caught up, the in-flight poll has only a small window of events. The
+    backfill re-polls after a brief delay and appends any newly-visible
+    events to the transcript so `_had_side_effect_tool_use` and
+    `_recover_result_from_transcript` see the full picture.
+
+    Live bug repro (task 614217bb): worker captured ~27 events / 513
+    output tokens, but session totals said 5512 output tokens. The
+    deliverable file got written by a write tool whose event never made
+    it to the transcript on the in-flight polls."""
+    from api.services.agent_worker import managed_executor as me
+
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    # Skip the real sleep in the backfill — keep tests fast.
+    monkeypatch.setattr(me.ManagedExecutor, "_TERMINAL_BACKFILL_DELAY_SECONDS", 0.0)
+
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="idle",
+            last_event_id="evt_early",
+            new_events=[
+                {"id": "evt_early", "type": "agent.mcp_tool_use",
+                 "payload": {"name": "lifeos_search"}},
+            ],
+            total_input_tokens=10, total_output_tokens=20,
+            final_text="",
+        ),
+    ])
+    # On the terminal-backfill re-fetch, surface the late events that the
+    # in-flight poll missed — including a side-effect tool use and the
+    # real final_text.
+    driver.late_events_responses = [[
+        {"id": "evt_early", "type": "agent.mcp_tool_use",
+         "payload": {"name": "lifeos_search"}},  # dupe — should be skipped
+        {"id": "evt_late_1", "type": "agent.mcp_tool_use",
+         "payload": {"name": "lifeos_vault_write"}},
+        {"id": "evt_late_2", "type": "agent.message",
+         "content": [{"type": "text", "text": "Wrote the file to vault."}]},
+    ]]
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+
+    # Backfill catches the late events…
+    events_in_transcript = list(transcript.iter_events(session.session_id))
+    eids = {e.get("payload", {}).get("id") for e in events_in_transcript}
+    assert "evt_late_1" in eids, "late vault_write event missing from transcript"
+    assert "evt_late_2" in eids, "late agent.message missing from transcript"
+    # …and dedupes the duplicate.
+    early_count = sum(1 for e in events_in_transcript
+                      if e.get("payload", {}).get("id") == "evt_early")
+    assert early_count == 1, f"evt_early appeared {early_count} times (should be 1)"
+    # final_text refreshes from the backfill so the operator sees the real answer.
+    assert outcome.final_text == "Wrote the file to vault."
+
+
+@pytest.mark.unit
+def test_terminal_backfill_skipped_when_no_late_events(stores, monkeypatch):
+    """When the in-flight poll already has all events, the backfill
+    appends nothing and doesn't override final_text."""
+    from api.services.agent_worker import managed_executor as me
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    monkeypatch.setattr(me.ManagedExecutor, "_TERMINAL_BACKFILL_DELAY_SECONDS", 0.0)
+
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="idle",
+            last_event_id="evt_done",
+            new_events=[{"id": "evt_done", "type": "agent.message",
+                        "content": [{"type": "text", "text": "in-flight final."}]}],
+            total_input_tokens=5, total_output_tokens=10,
+            final_text="in-flight final.",
+        ),
+    ])
+    driver.late_events_responses = [[
+        {"id": "evt_done", "type": "agent.message",
+         "content": [{"type": "text", "text": "in-flight final."}]},
+    ]]
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.final_text == "in-flight final."
+
 
 @pytest.mark.unit
 def test_poll_finalizes_completed(stores):

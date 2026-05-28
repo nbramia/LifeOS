@@ -954,6 +954,44 @@ def test_empty_final_text_without_side_effect_marks_failed(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_empty_final_text_with_high_spend_skips_failure_guard(tmp_path: Path):
+    """Belt-and-suspenders for the empty-result guard: even when the
+    transcript shows no side-effect tool use, if the session burned real
+    money (≥$0.05) we assume Anthropic's events endpoint lagged and a
+    write tool fired off-transcript. Marking such a session as failed
+    would alarm the operator about a session that almost certainly
+    produced something. The backfill in managed_executor closes most of
+    this gap; this guard handles the residual lag."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "expensive research", "status": "todo",
+         "tags": ["agent", "running"]},
+    ])
+    api.tasks["t1"]["tags"] = ["agent-running"]
+
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text="",
+                     )))
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    # Pretend the session ran up a real bill — $0.50 is well above the
+    # $0.05 cost gate. No transcript events; no final text.
+    w.session_store.record_spend("t1", 1000, 500, 0.50,
+                                  cache_creation_tokens=0, cache_read_tokens=0)
+
+    w._handle_outcome(
+        sess,
+        {"id": "t1", "description": "expensive research"},
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text=""),
+    )
+    # Cost gate trips → completion path runs (NOT failure path).
+    assert api.tasks["t1"]["status"] == "done", api.tasks["t1"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
 def test_empty_final_text_with_side_effect_tool_still_marks_completed(tmp_path: Path):
     """Counterpoint to the failure-on-empty test: when the agent DID do
     real work (e.g., called lifeos_gmail_draft to create a draft) and just
