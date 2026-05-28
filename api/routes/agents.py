@@ -486,6 +486,13 @@ def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
     raise; this is the strongest attention hint we can issue from
     outside the focused client.
 
+    Crucially, we send the notification AS wezterm (via app-name +
+    desktop-entry hint pointing at `org.wezfurlong.wezterm`) so GNOME
+    Shell associates the urgency with wezterm's dock icon and pulses
+    *that* icon — not a generic LifeOS one. The .desktop file lives at
+    `/usr/share/applications/org.wezfurlong.wezterm.desktop` (set by the
+    wezterm package).
+
     Failure (no notify-send, libnotify not running, etc.) is silent on
     purpose — the dock flash is an extra; the underlying spawn/focus
     already succeeded by the time this is called.
@@ -501,8 +508,9 @@ def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
             [
                 notify_bin,
                 "--urgency=critical",
-                "--app-name=LifeOS",
-                "--icon=utilities-terminal",
+                "--app-name=org.wezfurlong.wezterm",
+                "--hint=string:desktop-entry:org.wezfurlong.wezterm",
+                "--icon=org.wezfurlong.wezterm",
                 summary,
                 body,
             ],
