@@ -1,10 +1,11 @@
 #!/bin/bash
 # LifeOS Server Watchdog
-# Run via cron every 5 minutes to detect and fix server issues:
-#   - Duplicate uvicorn processes (causes Telegram 409 errors)
+# Runs every 5 minutes to detect and fix server issues:
+#   - Duplicate uvicorn processes (causes Telegram 409 errors and ghost-server confusion)
 #   - Unresponsive server (stale after long syncs)
 #
-# Cron entry:
+# Linux: triggered by lifeos-server-watchdog.timer (installed by setup-systemd.sh).
+# macOS cron entry:
 #   */5 * * * * /Applications/LifeOS.app/Contents/MacOS/LifeOS server-watchdog
 
 set -euo pipefail

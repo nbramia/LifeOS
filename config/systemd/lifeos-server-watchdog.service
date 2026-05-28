@@ -1,0 +1,9 @@
+[Unit]
+Description=LifeOS API server watchdog — reaps duplicate uvicorn PIDs, restarts if unresponsive
+After=lifeos-api.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/server-watchdog.sh
