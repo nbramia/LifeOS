@@ -176,6 +176,15 @@ class Settings(BaseSettings):
                     "Set to 0 to disable confirmation (auto-dispatch all "
                     "managed tasks regardless of estimate)."
     )
+    agent_viz_prefetch_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_AGENT_VIZ_PREFETCH_ENABLED",
+        description="When true, a background loop walks the /agents snapshot "
+                    "between user actions and pre-computes Gemma summaries for "
+                    "any session that doesn't already have one cached, yielding "
+                    "to the agent worker when it's running. Set false to make "
+                    "summaries strictly click-on-demand."
+    )
     claude_code_viz_enabled: bool = Field(
         default=True,
         alias="LIFEOS_CLAUDE_CODE_VIZ_ENABLED",

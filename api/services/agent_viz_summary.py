@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
+import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from api.services.llm_client import extract_json, generate_text
@@ -41,10 +45,115 @@ class SummaryResult:
         return {"short_label": self.short_label, "summary": self.summary}
 
 
-# Cache key: session_id → (last_activity_at, SummaryResult). When the session's
-# last_activity_at advances, the entry is recomputed.
+# In-process cache key: session_id → (last_activity_at, SummaryResult). When
+# the session's last_activity_at advances, the entry is recomputed. Disk cache
+# (below) is the durable layer; this just keeps hot reads fingertip-fast.
 _cache: dict[str, tuple[float, SummaryResult]] = {}
 _CACHE_MAX = 500
+
+# --- Disk cache (SQLite) ---------------------------------------------------
+# Survives server restarts so we never re-summarize a terminal session twice.
+# Co-located under data/ next to other observability stores. WAL so concurrent
+# request handlers don't serialize on writes.
+
+_DB_PATH: str | None = None
+_DB_LOCK = threading.Lock()
+
+
+def _resolve_db_path() -> str:
+    global _DB_PATH
+    if _DB_PATH is None:
+        try:
+            from config.settings import settings
+            data_dir = Path(settings.chroma_path).parent
+        except Exception:  # noqa: BLE001
+            data_dir = Path("data")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _DB_PATH = str(data_dir / "agent_viz_summaries.db")
+    return _DB_PATH
+
+
+def _init_db() -> None:
+    path = _resolve_db_path()
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_viz_summary (
+                session_id TEXT PRIMARY KEY,
+                last_activity_at REAL NOT NULL,
+                short_label TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _disk_get(session_id: str, last_activity_at: float) -> SummaryResult | None:
+    try:
+        with sqlite3.connect(_resolve_db_path()) as conn:
+            row = conn.execute(
+                "SELECT last_activity_at, short_label, summary "
+                "FROM agent_viz_summary WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        logger.debug("disk cache read failed for %s: %s", session_id, exc)
+        return None
+    if not row:
+        return None
+    cached_activity, short_label, summary = row
+    # Stale: the session has moved since we summarized it.
+    if cached_activity < last_activity_at:
+        return None
+    return SummaryResult(short_label=short_label, summary=summary)
+
+
+def _disk_put(session_id: str, last_activity_at: float, result: SummaryResult) -> None:
+    try:
+        with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO agent_viz_summary "
+                "(session_id, last_activity_at, short_label, summary, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, last_activity_at, result.short_label, result.summary, int(time.time())),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        # Persistence is best-effort — never block a successful summary on
+        # a disk write failure (full disk, permissions, locked DB, …).
+        logger.warning("disk cache write failed for %s: %s", session_id, exc)
+
+
+def prune_disk_cache(max_age_days: int = 90, max_rows: int = 5000) -> int:
+    """Drop rows older than `max_age_days`; if still over `max_rows`, drop
+    oldest. Returns count deleted. Safe to call from a periodic task or
+    leave unscheduled — the table is bounded by session count anyway.
+    """
+    cutoff = int(time.time()) - max_age_days * 86400
+    deleted = 0
+    try:
+        with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+            cur = conn.execute(
+                "DELETE FROM agent_viz_summary WHERE created_at < ?", (cutoff,)
+            )
+            deleted += cur.rowcount
+            (count,) = conn.execute("SELECT COUNT(*) FROM agent_viz_summary").fetchone()
+            if count > max_rows:
+                cur = conn.execute(
+                    "DELETE FROM agent_viz_summary WHERE session_id IN ("
+                    "  SELECT session_id FROM agent_viz_summary "
+                    "  ORDER BY created_at ASC LIMIT ?"
+                    ")",
+                    (count - max_rows,),
+                )
+                deleted += cur.rowcount
+            conn.commit()
+    except sqlite3.Error as exc:
+        logger.warning("disk cache prune failed: %s", exc)
+    return deleted
 
 
 def _trim(text: str, cap: int) -> str:
@@ -214,6 +323,13 @@ async def summarize_session(
     if cached and cached[0] >= last_activity_at:
         return cached[1]
 
+    # Disk cache check — populated by a previous call (possibly across a
+    # restart). Promotes into the in-process cache on hit.
+    disk_hit = _disk_get(session_id, last_activity_at)
+    if disk_hit is not None:
+        _cache[session_id] = (last_activity_at, disk_hit)
+        return disk_hit
+
     ctx = _extract_context(events)
     # If we have nothing to summarize, return a deterministic fallback so the
     # UI still gets *something*. Don't cache (next time we may have content).
@@ -263,16 +379,33 @@ async def summarize_session(
     if len(_cache) >= _CACHE_MAX:
         _cache.pop(next(iter(_cache)))
     _cache[session_id] = (last_activity_at, result)
+    _disk_put(session_id, last_activity_at, result)
     return result
 
 
 def get_cached_summary(session_id: str, last_activity_at: float) -> SummaryResult | None:
-    """Synchronous peek for the snapshot path — never triggers an LLM call."""
+    """Synchronous peek for the snapshot path — never triggers an LLM call.
+
+    Checks the in-process cache first, then the disk cache. A hit on disk is
+    promoted into the in-process cache so subsequent snapshot ticks are
+    free.
+    """
     cached = _cache.get(session_id)
     if cached and cached[0] >= last_activity_at:
         return cached[1]
+    disk = _disk_get(session_id, last_activity_at)
+    if disk is not None:
+        _cache[session_id] = (last_activity_at, disk)
+        return disk
     return None
 
 
 def reset_cache() -> None:
+    """Clear in-process cache only. Use for tests; disk cache survives."""
     _cache.clear()
+
+
+# Initialize the DB lazily on first import — cheap (just ensures the schema
+# exists) and avoids forcing every test that imports this module to set up
+# a temp DB path. _resolve_db_path() picks up settings at call time.
+_init_db()
