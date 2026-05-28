@@ -12,11 +12,16 @@ class TestQueryRouter:
     """Test the query router service."""
 
     def test_router_initialization(self):
-        """Router should initialize without arguments."""
+        """Router should initialize with no constructor args (Ollama client is gone)."""
         from api.services.query_router import QueryRouter
 
         router = QueryRouter()
-        assert router is not None
+        # The migrated router exposes no ollama_client attribute — the
+        # previous version had ``router.ollama_client``; we want a hard
+        # failure if it ever creeps back in.
+        assert not hasattr(router, "ollama_client")
+        # And the keyword fallback is still wired up.
+        assert callable(getattr(router, "_keyword_fallback", None))
 
     @pytest.mark.asyncio
     async def test_route_parses_valid_json(self):

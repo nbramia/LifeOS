@@ -321,11 +321,13 @@ class Settings(BaseSettings):
                     "When false, llama-server must be started manually."
     )
 
-    # Local LLM Router (Ollama — used for summarization and fact validation)
-    # Default model picked because it's the one actually pre-installed on
-    # Nathan's setup; users with different ollama models should override via
-    # OLLAMA_MODEL. The summarizer 404s silently if this model isn't available,
-    # so installation order matters more than the specific identifier.
+    # Local LLM Router — historically Ollama-named; now consumed by the
+    # llama-server-backed summarizer / fact-validation paths after the
+    # 2026-05 migration. The env var aliases (OLLAMA_HOST / OLLAMA_MODEL /
+    # OLLAMA_TIMEOUT / OLLAMA_RETRY_TIMEOUT) are kept so existing operator
+    # .env files don't need to change; only ``ollama_timeout`` /
+    # ``ollama_retry_timeout`` are still read in code (as generic request
+    # timeouts), ``ollama_host`` / ``ollama_model`` are vestigial.
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_model: str = Field(default="gemma4:26b", alias="OLLAMA_MODEL")
     ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")

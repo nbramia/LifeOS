@@ -26,7 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="$PROJECT_DIR/logs/gpu-watchdog.log"
 ALERT_STAMP_FILE="$PROJECT_DIR/logs/gpu-watchdog-alert.stamp"
-ENV_FILE="$PROJECT_DIR/.env"
+# Overridable for testing; defaults to the project .env in production.
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 
 THRESHOLD_PCT="${LIFEOS_VRAM_ALERT_PCT:-80}"
 COOLDOWN_MIN="${LIFEOS_VRAM_ALERT_COOLDOWN_MIN:-60}"
@@ -38,20 +39,26 @@ log() {
 }
 
 send_telegram() {
+    # Returns 0 on successful POST, non-zero otherwise. ``--data-urlencode``
+    # protects against rocm-smi / ps output containing & or = which would
+    # otherwise truncate the Telegram payload.
     local message="$1"
     if [ ! -f "$ENV_FILE" ]; then
-        return
+        return 1
     fi
     local bot_token chat_id
     bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
     if [ -z "$bot_token" ] || [ -z "$chat_id" ]; then
-        return
+        return 1
     fi
-    /usr/bin/curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+    # ``-f`` makes curl return non-zero on HTTP 4xx/5xx so an invalid bot
+    # token / wrong chat_id reports as failure to the caller, not silent
+    # success.
+    /usr/bin/curl -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1
 }
 
 # Locate the first AMDGPU card sysfs node that exposes VRAM stats. Multi-GPU
@@ -101,13 +108,14 @@ fi
 NOW=$(date +%s)
 if [ -f "$ALERT_STAMP_FILE" ]; then
     LAST=$(cat "$ALERT_STAMP_FILE")
-    if (( NOW - LAST < COOLDOWN_MIN * 60 )); then
+    # Guard against a truncated / non-numeric stamp file tripping ``set -e``
+    # inside the arithmetic. Fall back to "no prior alert" if unparseable.
+    if [[ "$LAST" =~ ^[0-9]+$ ]] && (( NOW - LAST < COOLDOWN_MIN * 60 )); then
         # Already alerted recently; just log.
         log "VRAM at ${PCT}% (${USED_GB}/${TOTAL_GB} GB) — alert suppressed (cooldown)"
         exit 0
     fi
 fi
-echo "$NOW" > "$ALERT_STAMP_FILE"
 
 log "VRAM SATURATED: ${PCT}% (${USED_GB}/${TOTAL_GB} GB)"
 
@@ -128,6 +136,12 @@ fi
 
 MSG=$(printf '⚠️ *LifeOS VRAM Saturated*\n\nVRAM at %d%% (%.1f / %.1f GB) — embedding loads may OOM and lock up the GPU.\n\n*Top consumers:*\n%s' \
     "$PCT" "$USED_GB" "$TOTAL_GB" "$CONSUMERS")
-send_telegram "$MSG"
+# Stamp written AFTER the Telegram POST so a transient curl failure doesn't
+# silently suppress the next 5-min retry.
+if send_telegram "$MSG"; then
+    echo "$NOW" > "$ALERT_STAMP_FILE"
+else
+    log "Telegram POST failed; will retry on next tick"
+fi
 
 exit 0

@@ -141,14 +141,14 @@ def _ollama_warm(model: str) -> bool:
 def _is_llm_running() -> bool:
     """Detect any GPU-resident process that would compete with embeddings.
 
-    Source-agnostic: any process holding most of the VRAM counts — whether it's
-    ollama, llama-server (lifeos-llm.service), or another model. If VRAM
-    detection is unavailable, returns False (nothing we can free).
+    Source-agnostic: any process holding most of the VRAM counts — whether
+    it's ollama, llama-server (lifeos-llm.service), or another model. If
+    VRAM detection is unavailable, returns False (nothing we can free).
 
-    Note: `_stop_llm_for_embeddings` can only unload ollama-held models. If a
-    non-ollama LLM (e.g. llama-server) is pinning VRAM, the orchestrator's
-    post-stop check will see VRAM is still pinned and the embedding sources
-    will fall back to CPU (existing behavior).
+    ``_stop_llm_for_embeddings`` knows how to stop both ollama-pinned models
+    and ``lifeos-llm.service``. If a third runtime is pinning VRAM that we
+    can't stop, the post-stop check will still see VRAM is pinned and the
+    embedding sources will fall back to CPU.
     """
     available = _get_available_gpu_memory_mb()
     if available is None:
@@ -189,22 +189,90 @@ def _get_available_system_ram_mb() -> int | None:
 # Track ollama models we unloaded so _start_llm can re-warm them
 _ollama_models_unloaded: list[str] = []
 
+# Track whether we stopped lifeos-llm.service so _start_llm can restart it.
+# This is the main runtime LifeOS uses now (llama-server); the ollama path
+# above only kicks in when an operator has Ollama running for other tools
+# like Hermes.
+_lifeos_llm_was_stopped: bool = False
+
+
+def _stop_lifeos_llm_service() -> bool:
+    """Stop ``lifeos-llm.service`` (llama-server) via the passwordless sudo
+    allowlist installed by ``setup-systemd.sh``.
+
+    Returns True if the service was running and we successfully stopped it,
+    False if it wasn't running or we couldn't reach it.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "lifeos-llm.service"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if active.stdout.strip() != "active":
+            return False
+        result = subprocess.run(
+            ["sudo", "-n", "systemctl", "stop", "lifeos-llm.service"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("Stopped lifeos-llm.service to free VRAM for embeddings")
+            return True
+        logger.warning(
+            f"Could not stop lifeos-llm.service (rc={result.returncode}): {result.stderr.strip()}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"lifeos-llm stop attempt failed: {e}")
+        return False
+
+
+def _start_lifeos_llm_service() -> bool:
+    """Restart ``lifeos-llm.service`` after embedding phases complete."""
+    logger = logging.getLogger(__name__)
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "systemctl", "start", "lifeos-llm.service"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            logger.info("Restarted lifeos-llm.service")
+            return True
+        logger.warning(
+            f"Could not restart lifeos-llm.service (rc={result.returncode}): {result.stderr.strip()}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"lifeos-llm restart attempt failed: {e}")
+        return False
+
 
 def _stop_llm_for_embeddings() -> bool:
-    """Free GPU memory for embeddings by unloading any ollama-held models.
+    """Free GPU memory for embeddings.
 
-    Returns True if at least one model was unloaded.
+    Handles both LLM runtimes that LifeOS may need to coordinate with:
+    - llama-server via ``lifeos-llm.service`` (the main runtime — typically
+      holds ~16 GB pinned with the Gemma 4 26B GGUF).
+    - Ollama, when an operator is running it for other tools (e.g. Hermes).
+      ``OLLAMA_KEEP_ALIVE=-1`` service-wide would otherwise leave its model
+      pinned alongside llama-server's.
+
+    Returns True if at least one runtime was stopped.
     """
-    global _ollama_models_unloaded
+    global _ollama_models_unloaded, _lifeos_llm_was_stopped
     logger = logging.getLogger(__name__)
 
-    # Unload any ollama-loaded models. With OLLAMA_KEEP_ALIVE=-1 set
-    # service-wide, these otherwise stay pinned in VRAM and prevent
-    # embeddings from allocating their working set.
+    # Stop llama-server first — it's typically the bigger consumer.
+    _lifeos_llm_was_stopped = _stop_lifeos_llm_service()
+
+    # Then unload any ollama-pinned models (no-op when ollama isn't running).
     unloaded = _ollama_unload_all()
-    if not unloaded:
+    if unloaded:
+        _ollama_models_unloaded = unloaded
+
+    if not _lifeos_llm_was_stopped and not unloaded:
+        # Nothing to do — neither runtime was holding memory we could free.
         return False
-    _ollama_models_unloaded = unloaded
 
     # Wait for VRAM to actually be freed
     for _ in range(10):
@@ -213,13 +281,17 @@ def _stop_llm_for_embeddings() -> bool:
         if available is not None and available >= _EMBEDDING_MEMORY_THRESHOLD_MB:
             logger.info(f"GPU memory freed: {available} MB available")
             return True
-    logger.warning("Ollama models unloaded but GPU memory not fully freed within timeout")
+    logger.warning("LLM runtimes stopped but GPU memory not fully freed within timeout")
     return True
 
 
 def _start_llm() -> None:
-    """Restore LLM state after embedding phases — re-warm any ollama models we unloaded."""
-    global _ollama_models_unloaded
+    """Restore LLM state after embedding phases — restart whatever we stopped."""
+    global _ollama_models_unloaded, _lifeos_llm_was_stopped
+
+    if _lifeos_llm_was_stopped:
+        _start_lifeos_llm_service()
+        _lifeos_llm_was_stopped = False
 
     # Re-warm exactly the ollama models we unloaded — we restore whatever
     # was actually pinned in VRAM before the sync, not whatever

@@ -394,16 +394,25 @@ class TestExtractJson:
             extract_json("no json here")
 
 
+@pytest.fixture
+def _routing_singleton_reset():
+    """Reset the routing-client singleton around each test so mutations don't leak."""
+    from api.services import llm_client as mod
+    prev = mod._routing_client
+    mod._routing_client = None
+    yield mod
+    mod._routing_client = prev
+
+
 class TestRoutingHelpers:
     """Tests for ``generate_text``, ``generate_json``, and availability checks."""
 
     @pytest.mark.asyncio
-    async def test_generate_text_calls_local_client(self):
+    async def test_generate_text_calls_local_client(self, _routing_singleton_reset):
         """generate_text should round-trip through LocalLLMClient.acreate()."""
         from unittest.mock import AsyncMock, MagicMock
-        from api.services import llm_client as mod
+        mod = _routing_singleton_reset
 
-        mod._routing_client = None
         fake_client = MagicMock()
         fake_resp = MagicMock(text="result text")
         fake_client.acreate = AsyncMock(return_value=fake_resp)
@@ -416,33 +425,31 @@ class TestRoutingHelpers:
         assert kwargs["temperature"] == 0.5
 
     @pytest.mark.asyncio
-    async def test_generate_json_extracts(self):
+    async def test_generate_json_extracts(self, _routing_singleton_reset):
         """generate_json should parse the JSON object from the LLM response."""
         from unittest.mock import AsyncMock
-        from api.services import llm_client as mod
+        mod = _routing_singleton_reset
 
         with patch.object(mod, "generate_text", AsyncMock(return_value='{"answer": 7}')):
             result = await mod.generate_json("count please")
         assert result == {"answer": 7}
 
     @pytest.mark.asyncio
-    async def test_routing_helpers_use_local_singleton(self):
+    async def test_routing_helpers_use_local_singleton(self, _routing_singleton_reset):
         """``_get_local_routing_client`` caches a LocalLLMClient even when backend=anthropic."""
-        from api.services import llm_client as mod
+        mod = _routing_singleton_reset
 
-        mod._routing_client = None
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.llm_backend = "anthropic"
             mock_settings.local_llm_url = "http://localhost:8080"
             mock_settings.local_llm_timeout = 90
             client = mod._get_local_routing_client()
             assert isinstance(client, mod.LocalLLMClient)
-        mod._routing_client = None
 
-    def test_is_available_swallows_errors(self):
+    def test_is_available_swallows_errors(self, _routing_singleton_reset):
         """is_local_routing_llm_available returns False rather than propagating."""
         from unittest.mock import MagicMock
-        from api.services import llm_client as mod
+        mod = _routing_singleton_reset
 
         bad_client = MagicMock()
         bad_client.is_available.side_effect = RuntimeError("boom")

@@ -10,6 +10,7 @@ and speaks the OpenAI chat completions API.
 """
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -682,14 +683,13 @@ def extract_json(text: str) -> dict:
         pass
 
     # ```json fenced block
-    import re as _re
-    fenced = _re.search(r'```json\s*([\s\S]*?)\s*```', text)
+    fenced = re.search(r'```json\s*([\s\S]*?)\s*```', text)
     if fenced:
         try:
             return json.loads(fenced.group(1))
         except json.JSONDecodeError:
             pass
-    fenced_any = _re.search(r'```\s*([\s\S]*?)\s*```', text)
+    fenced_any = re.search(r'```\s*([\s\S]*?)\s*```', text)
     if fenced_any:
         try:
             return json.loads(fenced_any.group(1))
