@@ -639,11 +639,13 @@ class Worker:
 
         # The task may be parked at any terminal tag — completed, failed, or
         # budget-exceeded are all replyable now. Swap whichever is current
-        # back to running.
-        for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
-            if self._swap_tag(task_id, terminal_tag, RUNNING_TAG):
-                break
-        self._set_task_status(task_id, "in_progress")
+        # back to running. Operator root-spawns (#235) have no backing vault
+        # task, so skip the tag/status mutations (they would 404).
+        if session.origin != "operator":
+            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+                if self._swap_tag(task_id, terminal_tag, RUNNING_TAG):
+                    break
+            self._set_task_status(task_id, "in_progress")
         self.session_store.update_status(task_id, STATUS_RUNNING)
         self.transcript_store.append(sid, "followup_received", {
             "question_id": q["id"], "answer_chars": len(answer),
@@ -1147,6 +1149,11 @@ class Worker:
         # leaks to the operator with the parent's internal prompt as
         # the "task description" — confusing and operator-irrelevant.
         is_spawned = bool(session.parent_session_id)
+        # Operator root-spawns (#235) are root sessions (no parent) so they DO
+        # notify the operator, but they have no backing #agent vault task — the
+        # vault mutations (complete / swap-tag / set-status) would 404. Gate
+        # those on `has_vault_task`; notifications + follow-up still fire.
+        has_vault_task = not is_spawned and session.origin != "operator"
 
         if outcome.status == STATUS_COMPLETED:
             # Guard against silent "I gave up" completions. When the agent
@@ -1174,8 +1181,9 @@ class Worker:
                 and not self._had_side_effect_tool_use(sid)
                 and spent < 0.05
             ):
-                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
                 recovered = self._recover_result_from_transcript(sid) or (
                     "no tool calls or final text recovered"
                 )
@@ -1189,12 +1197,13 @@ class Worker:
                 )
                 return
             if not is_spawned:
-                self._complete_task(session.task_id)  # mark `done` in the vault
-                # Swap the tag so the task surfaces as #agent-completed for symmetry
-                # with the failed / budget-exceeded / blocked terminal tags. Failure
-                # of the swap is non-critical — _swap_tag logs and the task is
-                # already marked done in the vault.
-                self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
+                if has_vault_task:
+                    self._complete_task(session.task_id)  # mark `done` in the vault
+                    # Swap the tag so the task surfaces as #agent-completed for symmetry
+                    # with the failed / budget-exceeded / blocked terminal tags. Failure
+                    # of the swap is non-critical — _swap_tag logs and the task is
+                    # already marked done in the vault.
+                    self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
                 # Send via the with-id sender so we can match a future Telegram
                 # reply to this completion message and resume the task as a
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
@@ -1211,8 +1220,9 @@ class Worker:
         label = _worker_label(session.routing)
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             if not is_spawned:
-                self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
                 self._notify_terminal(
                     session,
                     f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
@@ -1228,8 +1238,9 @@ class Worker:
 
         if outcome.status == STATUS_FAILED:
             if not is_spawned:
-                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
                 self._notify_terminal(
                     session,
                     f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "

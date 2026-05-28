@@ -681,3 +681,32 @@ def test_operator_session_coexists_with_agent_task(tmp_path: Path):
     assert "operator task" in descriptions
     assert "agent task" in descriptions
     assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_operator_completion_skips_vault_mutations(tmp_path: Path):
+    """Operator sessions have no backing vault task, so terminal handling must
+    not call _complete_task / _swap_tag / _set_task_status (they would 404).
+    The notification + follow-up still fire."""
+    from api.services.agent_worker.operator_spawn import create_operator_session
+
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    res = create_operator_session(w.session_store, "operator task", explicit_routing="local")
+    op_task_id = res["task_id"]
+
+    vault_calls: list[tuple[str, str]] = []
+    orig_complete, orig_swap, orig_status = w._complete_task, w._swap_tag, w._set_task_status
+    w._complete_task = lambda tid: vault_calls.append(("complete", tid)) or orig_complete(tid)
+    w._swap_tag = lambda tid, f, t: vault_calls.append(("swap", tid)) or orig_swap(tid, f, t)
+    w._set_task_status = lambda tid, s: vault_calls.append(("status", tid)) or orig_status(tid, s)
+
+    w.tick()
+
+    assert executor.calls, "operator session should have dispatched"
+    # No vault mutation was attempted against the synthetic operator task id.
+    assert not any(tid == op_task_id for _, tid in vault_calls), vault_calls
+    # The completion still registered a replyable follow-up.
+    assert w.session_store.get_recent_resumable_followup(within_seconds=3600) is not None

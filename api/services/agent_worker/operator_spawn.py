@@ -79,10 +79,21 @@ def create_operator_session(
 
     needs_routing = routing == ROUTE_ASK
     status = STATUS_BLOCKED if needs_routing else STATUS_CLAIMED
-    task_id = f"op_{new_session_id().removeprefix('sess_')}"
+    session_id = new_session_id()
+    task_id = f"op_{session_id.removeprefix('sess_')}"
 
+    # Enqueue the prompt BEFORE the session row exists. The worker is a separate
+    # process ticking against the shared DB; if it observed a CLAIMED operator
+    # session before the prompt landed, _dispatch_spawned_sessions would drain
+    # zero pending messages and run the agent with the synthetic session id as
+    # its task description. pending_messages has no FK on session_id, so seeding
+    # it first is safe — the row is only ever read once the session is dispatched.
+    # The prompt becomes the dispatched session's task description (drained by
+    # _dispatch_spawned_sessions) so the executor seeds the real task.
+    session_store.enqueue_message(session_id, "operator", prompt)
     session = session_store.create(
         task_id=task_id,
+        session_id=session_id,
         status=status,
         routing=routing,
         budget=budget or _operator_budget(),
@@ -90,10 +101,6 @@ def create_operator_session(
         parent_session_id=None,
         origin="operator",
     )
-    # The prompt becomes the dispatched session's task description (drained from
-    # pending_messages by _dispatch_spawned_sessions), so the executor seeds the
-    # conversation with the real task rather than the synthetic task id.
-    session_store.enqueue_message(session.session_id, "operator", prompt)
 
     logger.info(
         "operator spawn: session=%s routing=%s (%s) needs_routing=%s",
