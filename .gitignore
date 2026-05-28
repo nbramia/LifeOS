@@ -131,6 +131,7 @@ vault/
 chromadb/
 .ralph/
 .playwright-mcp/
+.mm/
 
 # =============================================================================
 # DATE-PREFIXED DOCS (personal development notes)
