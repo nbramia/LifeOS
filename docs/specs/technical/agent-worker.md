@@ -322,9 +322,7 @@ Clarifications older than `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` (default 72
 
 Every terminal-state notification — `#agent-completed`, `#agent-failed`, and `#agent-budget-exceeded` — registers a follow-up (`kind='followup'`) via `register_completion_followup()`, so a reply reopens the session as a new user turn (`_resume_as_followup()` swaps whichever terminal tag is current back to `#agent-running`). This makes failures and budget cut-offs replyable, not just clean completions.
 
-Two ways to target a thread:
-- **Native reply** to any chunk of a notification → resumes that specific thread (works regardless of age).
-- **Plain message** (no reply gesture) within `_AGENT_THREAD_RESUME_WINDOW_SECONDS` (30 min) → resumes the most recent resumable thread (`get_recent_resumable_followup()`), prefixed with a visible `↪ continuing "<task>"`. Beyond the window, a plain message routes to the normal chat pipeline.
+Targeting a thread on Telegram is **explicit only**: a **native reply** to any chunk of a notification resumes that specific thread (works regardless of age). A plain (non-reply) message is always a fresh chat query — there is no implicit "recent thread" capture, so an unrelated question right after a task finishes is never silently swallowed into the agent thread.
 
 ---
 

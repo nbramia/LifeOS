@@ -333,25 +333,28 @@ class TestMessageDedup:
 
 
 # =============================================================================
-# Plain-message agent-thread resume (Issue #234, Phase 1)
+# Plain messages never implicitly resume an agent thread (regression)
 # =============================================================================
 
 
-class TestAgentThreadResume:
-    """A plain (non-reply) message within the window resumes the most recent
-    completed/failed agent thread instead of starting a fresh chat query."""
+class TestNoImplicitThreadResume:
+    """A plain (non-reply) Telegram message is always a fresh chat query, even
+    when a recently-completed agent thread exists. Agent threads are resumed
+    ONLY via an explicit reply-to gesture (handled separately)."""
 
-    def _make_listener(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_plain_message_with_open_thread_goes_to_chat(self, tmp_path):
         from api.services.telegram import TelegramBotListener
-        state_file = tmp_path / "telegram_state.json"
-        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
-            return TelegramBotListener()
-
-    def _store_with_followup(self, tmp_path, *, label="email Bob", msg_ids=(900,)):
         from api.services.agent_worker.session_store import (
             STATUS_COMPLETED,
             SessionStore,
         )
+
+        state_file = tmp_path / "telegram_state.json"
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            listener = TelegramBotListener()
+
+        # A resumable agent thread exists in the store...
         store = SessionStore(db_path=tmp_path / "sessions.db")
         sess = store.create(
             task_id="t1", status=STATUS_COMPLETED, routing="local",
@@ -359,58 +362,27 @@ class TestAgentThreadResume:
         )
         store.register_completion_followup(
             session_id=sess.session_id, task_id="t1",
-            sent_message_ids=list(msg_ids), label=label,
+            sent_message_ids=[900], label="email Bob",
         )
-        return store
 
-    @pytest.mark.asyncio
-    async def test_plain_message_within_window_resumes(self, tmp_path):
-        listener = self._make_listener(tmp_path)
-        store = self._store_with_followup(tmp_path, label="email Bob")
-
+        # ...but a plain (non-reply) message must still route to the chat pipeline.
+        update = {"message": {"message_id": 7, "text": "what's the weather", "chat": {"id": "123"}}}
         with patch("api.services.agent_worker.session_store.SessionStore", return_value=store), \
-             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
-            handled = await listener._maybe_resume_recent_agent_thread("also CC Jane", "123")
-
-        assert handled is True
-        # The message was deposited into the follow-up (now no longer resumable).
-        assert store.get_recent_resumable_followup(within_seconds=1800) is None
-        # A visible continuation prefix was sent.
-        mock_send.assert_awaited_once()
-        assert 'continuing "email Bob"' in mock_send.await_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_no_recent_thread_falls_through(self, tmp_path):
-        from api.services.agent_worker.session_store import SessionStore
-        listener = self._make_listener(tmp_path)
-        empty_store = SessionStore(db_path=tmp_path / "sessions.db")  # no follow-ups
-
-        with patch("api.services.agent_worker.session_store.SessionStore", return_value=empty_store), \
-             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
-            handled = await listener._maybe_resume_recent_agent_thread("hello there", "123")
-
-        assert handled is False
-        mock_send.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_handle_update_routes_plain_message_to_resume(self, tmp_path):
-        """Integration: a plain message with a resumable thread short-circuits
-        the chat pipeline."""
-        listener = self._make_listener(tmp_path)
-        update = {"message": {"message_id": 7, "text": "and add a PS", "chat": {"id": "123"}}}
-
-        with patch.object(listener, "_check_agent_approval", return_value=False), \
+             patch.object(listener, "_check_agent_approval", return_value=False), \
              patch.object(listener, "_check_agent_clarification", return_value=False), \
              patch.object(listener, "_check_code_followup", new_callable=AsyncMock, return_value=False), \
-             patch.object(listener, "_maybe_resume_recent_agent_thread", new_callable=AsyncMock, return_value=True) as mock_resume, \
              patch("api.services.telegram.settings") as mock_settings, \
              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             mock_settings.telegram_chat_id = "123"
+            mock_chat.return_value = {"answer": "sunny", "conversation_id": "c1", "code_intent": False}
             await listener._handle_update(update)
 
-        mock_resume.assert_awaited_once()
-        mock_chat.assert_not_awaited()  # resume short-circuited the chat pipeline
+        # Routed to chat, NOT swallowed into the agent thread.
+        mock_chat.assert_awaited_once()
+        # The thread's follow-up is untouched (still resumable via explicit reply).
+        assert store.get_recent_resumable_followup(within_seconds=1800) is not None
 
 
 # =============================================================================
