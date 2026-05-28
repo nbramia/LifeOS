@@ -6,6 +6,8 @@
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude Opus (Anthropic Managed Agents) or a local Gemma model. This guide covers **prerequisites only** — the worker itself ships in later issues.
 
+> **Env-var reference:** every `LIFEOS_*` and third-party variable mentioned below is defined in [configuration.md](configuration.md) with its default, type, and "when to change" notes. This guide gives operator-flow context; configuration.md is the catalog.
+
 ---
 
 ## What this issue (#99) sets up
