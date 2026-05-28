@@ -347,6 +347,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 
 ## Related Documents
 
+- [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Decision record for the local-vs-cloud executor split
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here

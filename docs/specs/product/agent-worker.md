@@ -176,6 +176,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 
 ## Related Documents
 
+- [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Why local + cloud, how routing is decided, cost model
 - [Agent Worker — Technical](../technical/agent-worker.md) — Architecture, executors, prompts, state machine, restart resumability
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup (Gemma swap, MCP HTTP transport, Vault provisioning, agent preset)
 - [Agent Viz](agent-viz.md) — Live `/agents` page showing in-flight and recently-finished worker sessions
