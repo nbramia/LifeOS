@@ -61,9 +61,13 @@ def run_slack_sync(full: bool = False, dry_run: bool = True) -> dict:
     if "users" in results and results["users"]:
         users = results["users"]
         logger.info("Users:")
-        logger.info(f"  Synced: {users.get('synced', 0)}")
+        # ``sync_slack_users`` returns ``total`` (count of fetched users),
+        # not ``synced`` — the historical 'Synced:' key always logged 0.
+        logger.info(f"  Total: {users.get('total', 0)}")
         logger.info(f"  Created: {users.get('created', 0)}")
         logger.info(f"  Updated: {users.get('updated', 0)}")
+        logger.info(f"  Skipped (bots): {users.get('skipped_bots', 0)}")
+        logger.info(f"  Skipped (deleted): {users.get('skipped_deleted', 0)}")
 
     if "messages" in results and results["messages"]:
         msgs = results["messages"]
