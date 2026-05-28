@@ -101,6 +101,11 @@ class RetentionPolicy:
     quarter_days: int = 90
 
 
+#: A shared, immutable default. ``frozen=True`` on ``RetentionPolicy`` is
+#: load-bearing here: it makes this safe to use as a function default
+#: parameter (otherwise the standard Python footgun of a mutable default
+#: shared across all callers would apply). Don't change the dataclass to
+#: non-frozen without also auditing every ``policy=`` default.
 DEFAULT_POLICY = RetentionPolicy()
 
 

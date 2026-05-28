@@ -5,6 +5,7 @@ The integration tests over ``interaction_store._prune_backups`` live in
 same code path via the legacy alias. These tests target the helper
 directly so any other store can adopt it with confidence.
 """
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -139,5 +140,5 @@ class TestNoOps:
     def test_default_policy_is_immutable(self):
         # Defensive: DEFAULT_POLICY is a frozen dataclass, so accidental
         # in-place mutation by a caller can't bleed into other callers.
-        with pytest.raises((AttributeError, Exception)):
+        with pytest.raises(FrozenInstanceError):
             DEFAULT_POLICY.daily_keep = 99  # type: ignore[misc]
