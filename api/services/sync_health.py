@@ -387,6 +387,64 @@ def _init_schema(conn: sqlite3.Connection):
         logger.info(f"Migrated sync_runs table: added {len(migrations)} columns")
 
 
+def emit_sync_stats(stats: dict) -> None:
+    """Print the canonical ``SYNC_STATS:{json}`` line consumed by run_all_syncs.
+
+    The orchestrator's ``_parse_sync_output`` treats this as authoritative,
+    bypassing brittle regex inference. Each top-level sync script should call
+    this once with its final tallies. Only int-valued keys are read by the
+    parser; nested dicts and strings are ignored for forwards-compat.
+    """
+    import json as _json
+    # Keep on its own line so the parser regex matches cleanly even when the
+    # surrounding output has interleaved logging.
+    print("SYNC_STATS:" + _json.dumps(stats), flush=True)
+
+
+def reap_orphan_sync_runs(max_age_hours: int = 8) -> int:
+    """Mark stale ``status='running'`` rows as failed.
+
+    A row can stay in the running state forever if the sync process was killed
+    without unwinding (SIGKILL, kernel OOM, lost ssh, system reboot). Without
+    cleanup, the dashboard shows phantom in-progress syncs and the staleness
+    check uses the wrong "last completed" timestamp.
+
+    Args:
+        max_age_hours: rows older than this are reaped. Default 8h covers even
+            the longest vault reindex (4h) with a generous safety margin.
+
+    Returns:
+        Number of orphan rows reaped.
+    """
+    conn = get_sync_health_db()
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        cursor = conn.execute(
+            """
+            UPDATE sync_runs
+            SET status = ?,
+                completed_at = ?,
+                error_message = COALESCE(error_message, 'Reaped orphan: process died without unwinding'),
+                errors = MAX(errors, 1)
+            WHERE status = ?
+              AND started_at < ?
+            """,
+            (
+                SyncStatus.FAILED.value,
+                datetime.now(timezone.utc).isoformat(),
+                SyncStatus.RUNNING.value,
+                cutoff,
+            ),
+        )
+        reaped = cursor.rowcount
+        conn.commit()
+        if reaped:
+            logger.warning(f"Reaped {reaped} orphan sync_runs row(s) older than {max_age_hours}h")
+        return reaped
+    finally:
+        conn.close()
+
+
 def record_sync_start(source: str) -> int:
     """
     Record the start of a sync operation.
@@ -646,6 +704,110 @@ def get_sync_summary() -> dict:
         "disabled_sources": [h.source for h in disabled],
         "all_healthy": len(stale) == 0 and len(failed) == 0 and len(never_run) == 0,
     }
+
+
+def detect_silent_source_entity_drift(
+    interactions_db: Optional[str] = None,
+    crm_db: Optional[str] = None,
+    interactions_lookback_days: int = 7,
+    source_entity_stale_days: int = 30,
+) -> list[dict]:
+    """Return per-source warnings when interactions are flowing but source_entities aren't.
+
+    Diagnoses the silent regression pattern from issue #199 §2: a source still
+    persists new interactions every night, but stops producing new
+    ``source_entities`` rows. Without this detector, ``sync_runs`` happily
+    records ``success`` and the dashboard reads "healthy" while entity
+    resolution rots in the background.
+
+    The check is intentionally lenient: we look at MAX(created_at) and only
+    warn when the gap exceeds ``source_entity_stale_days``, so a source that
+    legitimately hasn't observed any new handles (e.g. you didn't message a
+    new phone number this week) won't trip an alert. The intent is to catch
+    the months-long drift, not normal quiet days.
+
+    Args:
+        interactions_db: Path to interactions.db. Defaults to data/interactions.db.
+        crm_db: Path to crm.db. Defaults to data/crm.db.
+        interactions_lookback_days: Only consider sources with interactions
+            newer than this. Avoids false positives for genuinely-defunct sources.
+        source_entity_stale_days: Warn when the newest source_entity is older
+            than this. 30 days is generous — most user behaviour produces at
+            least one new entity per month per active source.
+
+    Returns:
+        List of warnings, each ``{"source": str, "last_interaction": iso8601,
+        "last_source_entity": iso8601 | None, "gap_days": float}``.
+        Empty list when everything looks consistent.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    project_root = Path(__file__).parent.parent.parent
+    interactions_path = Path(interactions_db) if interactions_db else project_root / "data" / "interactions.db"
+    crm_path = Path(crm_db) if crm_db else project_root / "data" / "crm.db"
+
+    if not interactions_path.exists() or not crm_path.exists():
+        return []  # Fresh install or test environment — nothing to compare
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=interactions_lookback_days)).isoformat()
+    warnings: list[dict] = []
+
+    try:
+        i_conn = sqlite3.connect(str(interactions_path))
+        c_conn = sqlite3.connect(str(crm_path))
+        try:
+            # Sources with any interactions in the lookback window
+            active = i_conn.execute(
+                """
+                SELECT source_type, MAX(created_at) AS latest
+                FROM interactions
+                WHERE created_at > ?
+                GROUP BY source_type
+                """,
+                (cutoff,),
+            ).fetchall()
+
+            for source_type, latest_interaction in active:
+                if not source_type or not latest_interaction:
+                    continue
+                row = c_conn.execute(
+                    "SELECT MAX(created_at) FROM source_entities WHERE source_type = ?",
+                    (source_type,),
+                ).fetchone()
+                latest_se = row[0] if row else None
+
+                if latest_se is None:
+                    warnings.append({
+                        "source": source_type,
+                        "last_interaction": latest_interaction,
+                        "last_source_entity": None,
+                        "gap_days": None,
+                    })
+                    continue
+
+                try:
+                    se_dt = datetime.fromisoformat(latest_se.replace("Z", "+00:00"))
+                    if se_dt.tzinfo is None:
+                        se_dt = se_dt.replace(tzinfo=timezone.utc)
+                except (ValueError, AttributeError):
+                    continue
+                gap_days = (datetime.now(timezone.utc) - se_dt).total_seconds() / 86400.0
+                if gap_days > source_entity_stale_days:
+                    warnings.append({
+                        "source": source_type,
+                        "last_interaction": latest_interaction,
+                        "last_source_entity": latest_se,
+                        "gap_days": round(gap_days, 1),
+                    })
+        finally:
+            i_conn.close()
+            c_conn.close()
+    except sqlite3.DatabaseError as e:
+        logger.warning(f"Source-entity drift detector skipped (db error): {e}")
+        return []
+
+    return warnings
 
 
 def check_sync_health() -> tuple[bool, str]:

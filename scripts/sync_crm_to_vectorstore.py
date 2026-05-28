@@ -121,11 +121,19 @@ def main():
             min_interactions=args.min_interactions,
         )
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  Indexed: {result['indexed']}")
         print(f"  Skipped: {result['skipped']}")
         print(f"  Errors:  {result['errors']}")
         print(f"  Total checked: {result['total_checked']}")
+
+        # Canonical line consumed by run_all_syncs._parse_sync_output.
+        from api.services.sync_health import emit_sync_stats
+        emit_sync_stats({
+            "processed": int(result.get("total_checked", 0) or 0),
+            "people_updated": int(result.get("indexed", 0) or 0),
+            "errors": int(result.get("errors", 0) or 0),
+        })
 
     else:
         # Dry run
@@ -143,13 +151,13 @@ def main():
         if len(result["eligible"]) > 20:
             print(f"\n  ... and {len(result['eligible']) - 20} more")
 
-        print(f"\nSummary:")
+        print("\nSummary:")
         print(f"  Eligible for indexing: {len(result['eligible'])}")
         print(f"  Skipped (hidden): {result['skipped_hidden']}")
         print(f"  Skipped (low activity): {result['skipped_low_activity']}")
         print(f"  Total people: {result['total']}")
 
-        print(f"\nTo execute, run with --execute flag")
+        print("\nTo execute, run with --execute flag")
 
 
 if __name__ == "__main__":

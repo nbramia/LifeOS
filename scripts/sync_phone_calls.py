@@ -324,7 +324,7 @@ def sync_phone_calls(
     interaction_conn.close()
 
     # Log summary
-    logger.info(f"\n=== Phone Calls Sync Summary ===")
+    logger.info("\n=== Phone Calls Sync Summary ===")
     logger.info(f"Calls read: {stats['calls_read']}")
     logger.info(f"Interactions created: {stats['interactions_created']}")
     logger.info(f"Source entities created: {stats['source_entities_created']}")
@@ -343,6 +343,15 @@ def sync_phone_calls(
             from api.services.person_stats import refresh_person_stats
             logger.info(f"Refreshing stats for {len(affected_person_ids)} affected people...")
             refresh_person_stats(list(affected_person_ids))
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "interactions_created": stats["interactions_created"],
+        "source_entities_created": stats["source_entities_created"],
+        "people_updated": stats["persons_linked"],
+        "errors": stats["errors"],
+    })
 
     return stats
 

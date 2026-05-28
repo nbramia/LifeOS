@@ -67,11 +67,18 @@ def sync_linkedin(csv_path: str = DEFAULT_CSV_PATH, dry_run: bool = True) -> dic
         entity_resolver=resolver,
     )
 
-    logger.info(f"\n=== LinkedIn Sync Results ===")
+    logger.info("\n=== LinkedIn Sync Results ===")
     logger.info(f"  Connections processed: {results.get('connections_processed', 0)}")
     logger.info(f"  Entities created: {results.get('entities_created', 0)}")
     logger.info(f"  Entities updated: {results.get('entities_updated', 0)}")
     logger.info(f"  Connections skipped: {results.get('connections_skipped', 0)}")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "source_entities_created": int(results.get("entities_created", 0) or 0),
+        "people_updated": int(results.get("entities_updated", 0) or 0),
+    })
 
     return results
 

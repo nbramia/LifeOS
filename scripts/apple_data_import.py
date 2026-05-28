@@ -646,6 +646,38 @@ def main():
 
     print(json.dumps({"results": results}, indent=2))
 
+    # Emit canonical sync stats for the orchestrator. Aggregates across all
+    # sub-imports so run_all_syncs.py records the true row deltas instead of
+    # inferring zero from output that doesn't match its regex patterns.
+    from api.services.sync_health import emit_sync_stats
+    aggregate = {
+        "interactions_created": 0,
+        "source_entities_created": 0,
+        "people_created": 0,
+        "people_updated": 0,
+    }
+    for name, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        # Contacts: {"created", "updated", "linked"} from import_contacts.
+        if name == "contacts":
+            aggregate["source_entities_created"] += int(result.get("created", 0) or 0)
+            aggregate["people_updated"] += int(result.get("linked", 0) or 0)
+        # Photos faces: "sources_created" + "interactions_created"
+        aggregate["source_entities_created"] += int(result.get("sources_created", 0) or 0)
+        aggregate["interactions_created"] += int(result.get("interactions_created", 0) or 0)
+        # Phone uses "imported" as interactions
+        aggregate["interactions_created"] += int(result.get("imported", 0) or 0)
+        # WhatsApp returns nested {contacts: {...}, messages: {...}}
+        contacts = result.get("contacts")
+        if isinstance(contacts, dict):
+            aggregate["source_entities_created"] += int(contacts.get("source_entities_created", 0) or 0)
+            aggregate["people_updated"] += int(contacts.get("persons_linked", 0) or 0)
+        messages = result.get("messages")
+        if isinstance(messages, dict):
+            aggregate["interactions_created"] += int(messages.get("interactions_created", 0) or 0)
+    emit_sync_stats(aggregate)
+
     # Non-zero exit on any per-source error so run_all_syncs.run_sync marks
     # apple_import as FAILED and sync_health records it. "skipped" is fine —
     # it means nothing to do.

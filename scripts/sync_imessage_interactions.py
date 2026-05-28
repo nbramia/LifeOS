@@ -222,6 +222,15 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
             logger.info(f"Refreshing stats for {len(affected_person_ids)} affected people...")
             refresh_person_stats(list(affected_person_ids))
 
+    # Canonical line consumed by run_all_syncs._parse_sync_output. Existing
+    # human-readable lines above are kept; the parser uses this dict as truth.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "interactions_created": stats["inserted"],
+        "source_entities_created": stats["source_entities_created"],
+        "errors": stats["errors"],
+    })
+
     return stats
 
 

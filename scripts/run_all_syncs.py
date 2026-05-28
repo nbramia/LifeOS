@@ -49,6 +49,8 @@ from api.services.sync_health import (
     get_sync_health,
     get_sync_summary,
     check_sync_health,
+    reap_orphan_sync_runs,
+    detect_silent_source_entity_drift,
 )
 from config.settings import settings
 
@@ -844,7 +846,13 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
 
 
 def _parse_sync_output(output: str) -> dict:
-    """Parse sync script output for statistics."""
+    """Parse sync script output for statistics.
+
+    Scripts can emit a single canonical line ``SYNC_STATS:{json}`` with their
+    final tallies, which takes precedence over the regex fallbacks below. The
+    regex fallback exists for scripts that haven't been migrated yet and for
+    backwards compatibility with older log captures.
+    """
     import re
 
     stats = {
@@ -858,6 +866,40 @@ def _parse_sync_output(output: str) -> dict:
         "interactions_created": 0,
         "source_entities_created": 0,
     }
+
+    # Authoritative path: a single SYNC_STATS:{json} line emitted by the
+    # script. If present, treat it as ground truth and skip regex inference.
+    # Last occurrence wins, so a top-level wrapper script (e.g.
+    # apple_data_import.py aggregating across sub-imports) can override
+    # earlier emissions.
+    sync_stats_matches = re.findall(r"SYNC_STATS:(\{[^\n]*\})", output)
+    if sync_stats_matches:
+        try:
+            parsed = json.loads(sync_stats_matches[-1])
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if isinstance(value, (int, float)):
+                        stats[key] = int(value)
+                # Aggregate generic counters from categorized ones for
+                # backwards compatibility with downstream consumers.
+                stats["created"] = max(
+                    stats["created"],
+                    stats["people_created"]
+                    + stats["interactions_created"]
+                    + stats["source_entities_created"],
+                )
+                stats["updated"] = max(stats["updated"], stats["people_updated"])
+                # Still parse CONSISTENCY_SUMMARY below — it's orthogonal.
+                consistency_match = re.search(r"CONSISTENCY_SUMMARY:(\{.*\})", output)
+                if consistency_match:
+                    try:
+                        consistency_data = json.loads(consistency_match.group(1))
+                        stats.update(consistency_data)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                return stats
+        except (json.JSONDecodeError, ValueError):
+            pass  # Fall through to regex parsing
 
     # Generic patterns (for backwards compatibility)
     generic_patterns = [
@@ -960,6 +1002,15 @@ def run_all_syncs(
     logger.info(f"Sync triggered: {trigger}")
     logger.info(f"Starting sync run for {len(sources)} sources...")
     logger.info(f"Log file: {log_file}")
+
+    # Clean up sync_runs rows left in status='running' by killed/crashed
+    # processes. Otherwise they pin the dashboard's "last completed" timestamp
+    # and make recently-failed sources look healthy.
+    if not dry_run:
+        try:
+            reap_orphan_sync_runs()
+        except Exception as e:
+            logger.warning(f"Failed to reap orphan sync_runs: {e}")
 
     # Trigger Photos.app to open and start iCloud sync in background (macOS only)
     # This runs at the beginning so Photos can sync throughout the entire process
@@ -1123,6 +1174,19 @@ def run_all_syncs(
     # Check overall health
     is_healthy, health_msg = check_sync_health()
     logger.info(f"Overall health: {health_msg}")
+
+    # Silent-regression check: warn if a source keeps creating interactions
+    # but stopped persisting source_entities (issue #199 §2). Run after the
+    # sync so the data we look at is post-tonight, not pre-tonight.
+    try:
+        drift = detect_silent_source_entity_drift()
+        for w in drift:
+            logger.warning(
+                f"source_entity drift: {w['source']} interactions through {w['last_interaction']} "
+                f"but last source_entity={w['last_source_entity']} (gap={w['gap_days']}d)"
+            )
+    except Exception as e:
+        logger.warning(f"Source-entity drift detector failed: {e}")
 
     # Calculate duration
     end_time = datetime.now()
