@@ -284,6 +284,40 @@
     text-align: center;
     font-size: 0.85rem;
   }
+  .session-summary {
+    padding: 0.55rem 0.7rem 0.65rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+  .session-summary .ss-label {
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.25rem;
+  }
+  .session-summary .ss-short {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.92rem;
+    margin-bottom: 0.35rem;
+  }
+  .session-summary .ss-body {
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .session-summary .ss-body ul {
+    margin: 0.1rem 0 0;
+    padding-left: 1.1rem;
+  }
+  .session-summary .ss-body li { margin: 0.1rem 0; }
+  .session-summary.loading .ss-body {
+    color: var(--text-dim);
+    font-style: italic;
+  }
   .events {
     flex: 1;
     overflow-y: auto;
@@ -958,6 +992,11 @@
   }
 
   function nodeLabel(d) {
+    // Prefer the LLM-generated short label when we have one — it tells the
+    // operator what the session is actually about, which is far more useful
+    // than knowing it ran on Opus vs. Sonnet. Falls back to the model badge
+    // until the summary is fetched (lazy, on panel open).
+    if (d.short_label) return d.short_label;
     const isCc = d.source === 'claude_code';
     let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
     if (isCc && label === 'Claude Code') label = '?';
@@ -1229,6 +1268,11 @@
           <span class="badge" data-field="tokens">${s.total_input_tokens}↓ / ${s.total_output_tokens}↑</span>
           <span data-field="depth">${s.spawn_depth ? `<span class="badge">depth ${s.spawn_depth}</span>` : ''}</span>
         </div>
+      </div>
+      <div class="session-summary loading" id="session-summary">
+        <div class="ss-label">Summary</div>
+        <div class="ss-short" data-field="ss-short">${escapeHtml(s.short_label || '')}</div>
+        <div class="ss-body" data-field="ss-body">Summarizing…</div>
       </div>
       <div class="events" id="events"></div>
     `;
@@ -1502,6 +1546,7 @@
     const s = allSessions.find(x => x.session_id === sessionId);
     if (!s) return;
     renderPanelHeader(s);
+    fetchSessionSummary(sessionId);
 
     // Backfill then live tail.
     fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
@@ -1529,6 +1574,58 @@
         const e = document.getElementById('events');
         if (e) e.innerHTML = `<div class="event">Failed to load events: ${escapeHtml(String(err))}</div>`;
       });
+  }
+
+  // Fetch and render the LLM-generated session summary. Decoupled from the
+  // event stream — slow LLM calls won't block transcript display. The panel
+  // header shows "Summarizing…" until this resolves.
+  async function fetchSessionSummary(sessionId) {
+    try {
+      const r = await fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/summary`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      // Bail if the operator moved on to a different session while we waited.
+      if (sessionId !== selectedSessionId) return;
+      const wrap = document.getElementById('session-summary');
+      if (!wrap) return;
+      wrap.classList.remove('loading');
+      const shortEl = wrap.querySelector('[data-field="ss-short"]');
+      const bodyEl = wrap.querySelector('[data-field="ss-body"]');
+      if (shortEl) shortEl.textContent = data.short_label || '';
+      if (bodyEl) bodyEl.innerHTML = renderSummaryBody(data.summary || '');
+      // Patch the in-memory session so subsequent snapshot ticks pick up the
+      // short label. Also nudge the corresponding node immediately so the
+      // operator doesn't wait up to 2s for the next tick.
+      const s = allSessions.find(x => x.session_id === sessionId);
+      if (s && data.short_label) {
+        s.short_label = data.short_label;
+        nodeLayer.selectAll('.node')
+          .filter(d => d.session_id === sessionId)
+          .each(function(d) { d.short_label = data.short_label; })
+          .select('text.node-label')
+          .text(d => nodeLabel(d));
+      }
+    } catch (err) {
+      if (sessionId !== selectedSessionId) return;
+      const bodyEl = document.querySelector('#session-summary [data-field="ss-body"]');
+      if (bodyEl) bodyEl.textContent = `Summary unavailable: ${err.message}`;
+    }
+  }
+
+  // Minimal markdown — only converts leading `- ` lines into a <ul>. Anything
+  // else is rendered as escaped text with line breaks preserved. We control
+  // the Gemma prompt so the only expected formatting is bullets vs. paragraph.
+  function renderSummaryBody(text) {
+    const lines = (text || '').split(/\r?\n/);
+    const isBullet = l => /^\s*[-*]\s+/.test(l);
+    if (lines.some(isBullet)) {
+      const items = lines.filter(isBullet).map(l => {
+        const content = l.replace(/^\s*[-*]\s+/, '');
+        return `<li>${escapeHtml(content)}</li>`;
+      });
+      return `<ul>${items.join('')}</ul>`;
+    }
+    return escapeHtml(text);
   }
 
   // Kind filter state for the side-panel feed. null = show all; otherwise

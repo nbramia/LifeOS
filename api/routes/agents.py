@@ -22,6 +22,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services import agent_viz_summary
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,19 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "last_event_kind": summary["last_event_kind"],
         "tool_call_count": summary["tool_call_count"],
         "error_count": summary["error_count"],
+        # Populated only if a previous /summary call has cached a result for
+        # this session at its current last_activity_at. Snapshot ticks never
+        # block on the LLM — short labels for unfetched sessions appear when
+        # the operator opens the panel.
+        "short_label": _short_label_for_snapshot(
+            s.session_id, s.last_activity_at or 0.0
+        ),
     }
+
+
+def _short_label_for_snapshot(session_id: str, last_activity_at: float) -> str | None:
+    cached = agent_viz_summary.get_cached_summary(session_id, last_activity_at)
+    return cached.short_label if cached else None
 
 
 def _claude_code_enabled() -> bool:
@@ -227,6 +240,14 @@ def _build_snapshot() -> dict[str, Any]:
     ]
 
     cc_sessions, cc_edges = _claude_code_snapshot()
+    # CC session dicts come from claude_code/session_ingest.py and don't carry
+    # the short_label field — attach it the same way (cached-only, no LLM in
+    # the snapshot path).
+    for sd in cc_sessions:
+        sd.setdefault(
+            "short_label",
+            _short_label_for_snapshot(sd.get("session_id") or "", sd.get("last_activity_at") or 0.0),
+        )
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
 
@@ -291,6 +312,60 @@ async def get_session_events(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     tail = events[-limit:] if len(events) > limit else events
     return {"session_id": session_id, "events": tail, "total": len(events)}
+
+
+@router.get("/sessions/{session_id}/summary")
+async def get_session_summary(session_id: str) -> dict[str, Any]:
+    """Concise "what did this session work on" summary for the /agents panel.
+
+    Pulls the first user message, final assistant message, and any PR
+    references out of the transcript, then asks the local Gemma LLM to
+    produce a short node label (2-6 words) and a 1-2 sentence recap.
+
+    Cached by (session_id, last_activity_at). A session that hasn't moved
+    since the last call gets a cache hit and zero LLM cost.
+    """
+    # Resolve the session's label + last_activity_at + events.
+    last_activity = 0.0
+    label = session_id
+
+    if session_id.startswith("cc:"):
+        if not _claude_code_enabled():
+            raise HTTPException(status_code=404, detail="claude_code viz disabled")
+        try:
+            from config.settings import settings
+            from api.services.claude_code import session_ingest as cc
+
+            events = cc.read_normalized_events(session_id, settings.claude_code_projects_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Find this CC session in the cached snapshot to pull label + activity.
+        cc_sessions, _ = _claude_code_snapshot()
+        match = next((s for s in cc_sessions if s.get("session_id") == session_id), None)
+        if match:
+            label = str(match.get("label") or session_id)
+            last_activity = float(match.get("last_activity_at") or 0.0)
+    else:
+        session_store = _get_session_store()
+        s = session_store.get_by_session_id(session_id)
+        if s is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        transcript_store = _get_transcript_store()
+        try:
+            events = transcript_store.read(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        label = _label_for_session(s, events)
+        last_activity = float(s.last_activity_at or 0.0)
+
+    result = await agent_viz_summary.summarize_session(
+        session_id,
+        label=label,
+        last_activity_at=last_activity,
+        events=events,
+    )
+    return {"session_id": session_id, **result.as_dict()}
 
 
 @router.get("/stream")
