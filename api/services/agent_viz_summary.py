@@ -226,14 +226,15 @@ async def summarize_session(
     prompt = _build_prompt(label, ctx)
     try:
         # Gemma 4 burns most of its budget on reasoning_content; only
-        # `content` is returned in `text` by LocalLLMClient. A tight cap
-        # (e.g. 600) regularly truncates the JSON mid-string. 2000 leaves
-        # ample room for the actual response body after reasoning.
+        # `content` is returned in `text` by LocalLLMClient. Anything under
+        # ~3000 tokens regularly hits the cap mid-reasoning, leaving content
+        # empty. Observed real CC sessions used ~2400 completion tokens
+        # (≈9.5k chars reasoning + 200 chars JSON), so 4096 is the floor.
         text = await generate_text(
             prompt,
-            max_tokens=2000,
+            max_tokens=4096,
             temperature=0.2,
-            timeout=90.0,
+            timeout=120.0,
         )
         data = extract_json(text)
         short_label = str(data.get("short_label") or "").strip()
