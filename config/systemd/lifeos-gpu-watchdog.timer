@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS GPU VRAM Watchdog Timer (every 5 min)
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
