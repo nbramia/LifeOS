@@ -73,9 +73,11 @@ You can override the API base URL with `LIFEOS_API_URL` if you run on a non-defa
 
 Open two wezterm panes in the same project directory, run `claude` in each, then open `/agents` in your browser. Both sessions should show a **Go To** button. Click it (or double-click the node in the graph) — wezterm focuses the right pane. On GNOME Wayland the focus changes inside wezterm but the window won't pop forward (compositor restriction); click the wezterm dock icon to bring it forward, the right pane will already be selected.
 
-If the toast says "Couldn't locate pane", the most likely causes are:
+If the toast says "Couldn't locate pane" — meaning the session isn't running where we can reach it, wezterm itself can't be queried, or no cached mapping exists — the most likely causes are:
 
 - The SessionStart hook isn't installed yet for sessions started *before* the hook landed. Restart the `claude` invocation; the hook will fire and bind on the new session.
+- WezTerm has been restarted since the session began. `wezterm cli list` can no longer see the original pane id, so the probe and any cached mapping are stale. Click **Resume** to open a fresh pane (this rewrites the mapping), or restart `claude` so the SessionStart hook re-binds.
+- WezTerm is unreachable (`wezterm cli list` errors, the gui-sock socket is gone, or the binary isn't on PATH).
 - `lsof` isn't on PATH (the probe fallback uses it).
 - The session is in a non-wezterm terminal — Go To only works for wezterm.
 
