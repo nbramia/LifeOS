@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-26
+> **Last Updated:** 2026-05-28
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -298,17 +298,25 @@ A managed session's `managed_agent_session_id` is durable across worker restarts
 
 When the worker needs operator input mid-task — preflight routing=ask, ambiguity question, or `lifeos_agent_user_ask` mid-loop — it:
 
-1. Sends a Telegram message via `send_message_capture_id()` (returns the Telegram `message_id`).
-2. Persists `(session_id, telegram_message_id, question)` in `pending_questions`.
+1. Sends a Telegram message via `send_message_capture_ids()` (returns the `message_id` of **every** 4096-char chunk).
+2. Persists `(session_id, telegram_message_ids, question)` in `pending_questions` — the full chunk list in `sent_message_ids` (JSON), with the first chunk in `sent_message_id`.
 3. Swaps the tag to `#agent-blocked` and parks the session.
 4. For managed sessions: also calls `driver.kill_session` to stop session-hour billing while waiting.
 
-When the operator replies (using Telegram's native reply feature), the bot's `_maybe_deposit_agent_answer()` hook intercepts the `reply_to_message_id` and calls `SessionStore.deposit_answer()`. The worker's `_process_clarification_answers()` runs each tick, picks up answered questions, parses the answer (for routing questions: extracts `local` / `claude` from free-text), updates the session, and re-dispatches.
+When the operator replies (using Telegram's native reply feature), the bot's `_maybe_deposit_agent_answer()` hook intercepts the `reply_to_message_id` and calls `SessionStore.deposit_answer()`, which matches a reply landing on **any** chunk (membership in `sent_message_ids`, not just the first). The worker's `_process_clarification_answers()` runs each tick, picks up answered questions, parses the answer (for routing questions: extracts `local` / `claude` from free-text), updates the session, and re-dispatches.
 
 For local sessions, the parent session resumes via the existing pending_messages drain.
 For managed sessions, a new remote session is created with the resolved routing.
 
 Clarifications older than `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` (default 72h) are abandoned with a Telegram heads-up; the transcript stays preserved.
+
+### Replyable terminal threads
+
+Every terminal-state notification — `#agent-completed`, `#agent-failed`, and `#agent-budget-exceeded` — registers a follow-up (`kind='followup'`) via `register_completion_followup()`, so a reply reopens the session as a new user turn (`_resume_as_followup()` swaps whichever terminal tag is current back to `#agent-running`). This makes failures and budget cut-offs replyable, not just clean completions.
+
+Two ways to target a thread:
+- **Native reply** to any chunk of a notification → resumes that specific thread (works regardless of age).
+- **Plain message** (no reply gesture) within `_AGENT_THREAD_RESUME_WINDOW_SECONDS` (30 min) → resumes the most recent resumable thread (`get_recent_resumable_followup()`), prefixed with a visible `↪ continuing "<task>"`. Beyond the window, a plain message routes to the normal chat pipeline.
 
 ---
 
