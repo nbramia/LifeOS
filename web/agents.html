@@ -2066,7 +2066,9 @@
   let searchDebounceTimer = null;
 
   const SEARCH_TIER = { label: 0, short_label: 1, summary: 2 };
-  const SEARCH_BADGE = { label: 'name', short_label: 'summary', summary: 'summary' };
+  // Distinct badge per matched field so the operator can tell which tier hit:
+  // the task name, the node's short label, or the paragraph summary.
+  const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
 
   function sessionDisplayName(s) {
     return s.short_label || s.label || s.session_id.slice(0, 8);
