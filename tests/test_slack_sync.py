@@ -96,6 +96,61 @@ class TestIncrementalSyncCallsSyncUsers:
                    for e in result["errors"])
         assert result["users"] == {}
 
+    def test_new_workspace_user_persists_to_source_entities(self, tmp_path):
+        """End-to-end: a user added between full_syncs lands in source_entities on
+        the next nightly run. This is issue #224 AC #2 — the regression the PR
+        actually exists to fix. Uses a real ``SourceEntityStore`` against a
+        tmp_path so we exercise the persistence layer, not just mocks.
+        """
+        from api.services.slack_integration import SlackUser
+        from api.services.slack_sync import SlackSync
+        from api.services.source_entity import SourceEntityStore
+
+        # Real store, isolated from the project DB.
+        entity_store = SourceEntityStore(db_path=str(tmp_path / "crm.db"))
+
+        # Mock SlackClient returns one workspace user.
+        new_user = SlackUser(
+            user_id="U_NEW_HUMAN",
+            username="alice",
+            real_name="Alice Wonderland",
+            display_name="alice",
+            email="alice@example.com",
+            is_bot=False,
+            is_deleted=False,
+            team_id="T_WORKSPACE",
+        )
+        mock_client = MagicMock()
+        mock_client.list_users.return_value = [new_user]
+
+        # sync_messages is irrelevant for this test — short-circuit it.
+        mock_indexer = MagicMock()
+        sync = SlackSync(
+            client=mock_client,
+            indexer=mock_indexer,
+            entity_store=entity_store,
+            interaction_store=MagicMock(),
+        )
+        sync.sync_messages = MagicMock(return_value={
+            "channels_synced": 0, "messages_indexed": 0,
+            "interactions_created": 0, "errors": [],
+            "message_counts": {}, "affected_person_ids": set(),
+        })
+        sync._store_message_counts = MagicMock()
+
+        # Precondition: store starts empty.
+        assert entity_store.get_by_source("slack", "default:U_NEW_HUMAN") is None
+
+        result = sync.incremental_sync(create_interactions=False)
+
+        # Postcondition: the user is now in source_entities.
+        persisted = entity_store.get_by_source("slack", "default:U_NEW_HUMAN")
+        assert persisted is not None, \
+            "incremental_sync should have persisted the new workspace user as a source_entity"
+        assert persisted.observed_email == "alice@example.com"
+        assert result["users"]["created"] == 1
+        assert result["status"] == "success"
+
     def test_message_counts_still_persisted_after_shape_change(self, sync_with_mocks):
         """Internal ``_store_message_counts`` reaches into the nested
         ``results["messages"]["message_counts"]`` now — make sure the
