@@ -361,6 +361,102 @@ class TestSingleton:
 # ---- LLMResponse / LLMUsage ----
 
 
+class TestExtractJson:
+    """Tests for the shared ``extract_json`` helper used by routing/validation callers."""
+
+    def test_raw_json(self):
+        from api.services.llm_client import extract_json
+        assert extract_json('{"a": 1}') == {"a": 1}
+
+    def test_fenced_json_block(self):
+        from api.services.llm_client import extract_json
+        text = 'Here is the result:\n```json\n{"x": [1, 2]}\n```\nDone.'
+        assert extract_json(text) == {"x": [1, 2]}
+
+    def test_unfenced_code_block(self):
+        from api.services.llm_client import extract_json
+        text = '```\n{"y": "v"}\n```'
+        assert extract_json(text) == {"y": "v"}
+
+    def test_embedded_in_prose(self):
+        from api.services.llm_client import extract_json
+        text = 'Decision below.\n{"keep": true, "score": 0.9}\nThanks.'
+        assert extract_json(text) == {"keep": True, "score": 0.9}
+
+    def test_nested_braces(self):
+        from api.services.llm_client import extract_json
+        text = '{"outer": {"inner": 42}}'
+        assert extract_json(text) == {"outer": {"inner": 42}}
+
+    def test_raises_on_no_json(self):
+        from api.services.llm_client import extract_json
+        with pytest.raises(ValueError):
+            extract_json("no json here")
+
+
+@pytest.fixture
+def _routing_singleton_reset():
+    """Reset the routing-client singleton around each test so mutations don't leak."""
+    from api.services import llm_client as mod
+    prev = mod._routing_client
+    mod._routing_client = None
+    yield mod
+    mod._routing_client = prev
+
+
+class TestRoutingHelpers:
+    """Tests for ``generate_text``, ``generate_json``, and availability checks."""
+
+    @pytest.mark.asyncio
+    async def test_generate_text_calls_local_client(self, _routing_singleton_reset):
+        """generate_text should round-trip through LocalLLMClient.acreate()."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        fake_client = MagicMock()
+        fake_resp = MagicMock(text="result text")
+        fake_client.acreate = AsyncMock(return_value=fake_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
+            text = await mod.generate_text("hi", max_tokens=10, temperature=0.5)
+        assert text == "result text"
+        # Ensure it actually went through acreate with our params.
+        kwargs = fake_client.acreate.await_args.kwargs
+        assert kwargs["max_tokens"] == 10
+        assert kwargs["temperature"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_generate_json_extracts(self, _routing_singleton_reset):
+        """generate_json should parse the JSON object from the LLM response."""
+        from unittest.mock import AsyncMock
+        mod = _routing_singleton_reset
+
+        with patch.object(mod, "generate_text", AsyncMock(return_value='{"answer": 7}')):
+            result = await mod.generate_json("count please")
+        assert result == {"answer": 7}
+
+    @pytest.mark.asyncio
+    async def test_routing_helpers_use_local_singleton(self, _routing_singleton_reset):
+        """``_get_local_routing_client`` caches a LocalLLMClient even when backend=anthropic."""
+        mod = _routing_singleton_reset
+
+        with patch("api.services.llm_client.settings") as mock_settings:
+            mock_settings.llm_backend = "anthropic"
+            mock_settings.local_llm_url = "http://localhost:8080"
+            mock_settings.local_llm_timeout = 90
+            client = mod._get_local_routing_client()
+            assert isinstance(client, mod.LocalLLMClient)
+
+    def test_is_available_swallows_errors(self, _routing_singleton_reset):
+        """is_local_routing_llm_available returns False rather than propagating."""
+        from unittest.mock import MagicMock
+        mod = _routing_singleton_reset
+
+        bad_client = MagicMock()
+        bad_client.is_available.side_effect = RuntimeError("boom")
+        with patch.object(mod, "_get_local_routing_client", return_value=bad_client):
+            assert mod.is_local_routing_llm_available() is False
+
+
 class TestDataClasses:
     """Tests for LLMResponse and LLMUsage dataclasses."""
 

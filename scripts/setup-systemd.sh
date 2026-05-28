@@ -163,6 +163,9 @@ echo "  lifeos-watchdog.timer: $(systemctl is-active lifeos-watchdog.timer)"
 systemctl enable --now lifeos-server-watchdog.timer
 echo "  lifeos-server-watchdog.timer: $(systemctl is-active lifeos-server-watchdog.timer)"
 
+systemctl enable --now lifeos-gpu-watchdog.timer
+echo "  lifeos-gpu-watchdog.timer: $(systemctl is-active lifeos-gpu-watchdog.timer)"
+
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 

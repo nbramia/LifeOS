@@ -1,0 +1,9 @@
+[Unit]
+Description=LifeOS GPU VRAM Watchdog — alerts before VRAM exhaustion freezes the machine
+After=lifeos-llm.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/gpu-watchdog.sh

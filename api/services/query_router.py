@@ -1,8 +1,9 @@
 """
 Query Router for LifeOS.
 
-Routes user queries to appropriate data sources using local LLM.
-Falls back to keyword matching when Ollama is unavailable.
+Routes user queries to appropriate data sources using the local LLM
+(llama-server). Falls back to keyword matching when the local LLM is
+unavailable.
 
 v3 additions:
 - Populates relationship_context from CRM for person queries
@@ -16,7 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from api.services.ollama_client import OllamaClient, OllamaError
+from api.services.llm_client import (
+    generate_text,
+    is_local_routing_llm_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,18 +90,12 @@ class QueryRouter:
     """
     Routes queries to appropriate data sources.
 
-    Uses local Ollama LLM for intelligent routing with
+    Uses the local llama-server LLM for intelligent routing with a
     keyword-based fallback when unavailable.
     """
 
-    def __init__(self, ollama_client: Optional[OllamaClient] = None):
-        """
-        Initialize query router.
-
-        Args:
-            ollama_client: Optional custom Ollama client (default creates new one)
-        """
-        self.ollama_client = ollama_client or OllamaClient()
+    def __init__(self):
+        """Initialize query router."""
 
     def _extract_person_name(self, query: str) -> Optional[str]:
         """Extract person name from a people-related query."""
@@ -369,16 +367,19 @@ class QueryRouter:
         """
         start_time = time.time()
 
-        # Check if Ollama is available
-        if not self.ollama_client.is_available():
-            logger.info("Ollama unavailable, using keyword fallback")
+        # Check if the local LLM is available
+        if not is_local_routing_llm_available():
+            logger.info("Local LLM unavailable, using keyword fallback")
             result = self._keyword_fallback(query)
         else:
             # Try LLM routing
             try:
                 result = await self._llm_route(query)
-            except OllamaError as e:
-                logger.warning(f"Ollama error, using fallback: {e}")
+            except Exception as e:
+                # Any LLM-side failure (network, timeout, malformed response)
+                # falls through to the deterministic keyword router so a
+                # missing llama-server doesn't break the chat surface.
+                logger.warning(f"Local LLM routing failed, using fallback: {e}")
                 result = self._keyword_fallback(query)
         result.latency_ms = int((time.time() - start_time) * 1000)
 
@@ -416,7 +417,7 @@ class QueryRouter:
             RoutingResult from LLM decision
         """
         prompt = ROUTER_PROMPT.format(query=query)
-        response = await self.ollama_client.generate(prompt)
+        response = await generate_text(prompt)
 
         # Try to parse JSON from response
         try:

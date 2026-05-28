@@ -24,9 +24,8 @@ import random
 import re
 import sqlite3
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional, Any
 
 from config.settings import settings
@@ -1048,18 +1047,19 @@ class PersonFactExtractor:
         person_name: str,
     ) -> list[PersonFact]:
         """
-        Validate and deduplicate facts in a single batched Ollama call.
+        Validate and deduplicate facts in a single batched local-LLM call.
 
-        Sends all candidates + existing facts to Ollama, which returns
-        keep/reject/update decisions for each candidate. Falls back to
-        rule-based validation if Ollama is unavailable.
+        Sends all candidates + existing facts to the local llama-server,
+        which returns keep/reject/update decisions for each candidate. Falls
+        back to rule-based validation if the local LLM is unavailable.
         """
-        from api.services.ollama_client import OllamaClient
+        from api.services.llm_client import (
+            generate_json,
+            ais_local_routing_llm_available,
+        )
 
-        client = OllamaClient()
-
-        if not await client.is_available_async():
-            logger.warning("Ollama unavailable — using fallback validation")
+        if not await ais_local_routing_llm_available():
+            logger.warning("Local LLM unavailable — using fallback validation")
             return self._fallback_validate(new_facts, existing_facts)
 
         # Build existing facts list for the prompt
@@ -1136,8 +1136,8 @@ Check EVERY candidate against ALL existing facts AND all other candidates for ov
 Return ONLY valid JSON."""
 
         try:
-            result = await client.generate_json(
-                prompt=prompt,
+            result = await generate_json(
+                prompt,
                 max_tokens=2048,
                 timeout=30,
             )
@@ -1280,14 +1280,15 @@ Return ONLY valid JSON."""
         each candidate against existing facts and other candidates. This catches
         semantic duplicates that the main validation pass may have missed.
 
-        Falls back to keeping all candidates if Ollama is unavailable.
+        Falls back to keeping all candidates if the local LLM is unavailable.
         """
-        from api.services.ollama_client import OllamaClient
+        from api.services.llm_client import (
+            generate_json,
+            ais_local_routing_llm_available,
+        )
 
-        client = OllamaClient()
-
-        if not await client.is_available_async():
-            logger.warning("Ollama unavailable for semantic dedup — skipping")
+        if not await ais_local_routing_llm_available():
+            logger.warning("Local LLM unavailable for semantic dedup — skipping")
             return candidates
 
         # Build fact lists for the prompt
@@ -1334,8 +1335,8 @@ Compare every candidate against ALL existing facts and ALL other candidates. Be 
 Return ONLY valid JSON."""
 
         try:
-            result = await client.generate_json(
-                prompt=prompt,
+            result = await generate_json(
+                prompt,
                 max_tokens=1024,
                 timeout=15,
             )
