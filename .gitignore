@@ -86,8 +86,16 @@ config/launchd/*.plist
 # =============================================================================
 scripts/archive/
 tests/archive/
-docs/archive/
-docs/plans/
+
+# docs/archive/ and docs/plans/ are personal — only the meta-guidance
+# files (AGENTS.md / CLAUDE.md / INDEX.md) are tracked so future agents
+# landing in those directories know what they're for.
+docs/archive/*
+!docs/archive/INDEX.md
+docs/plans/*
+!docs/plans/AGENTS.md
+!docs/plans/CLAUDE.md
+docs/plans/archive/
 
 # =============================================================================
 # TESTING
