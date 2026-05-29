@@ -345,15 +345,15 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 @pytest.mark.unit
 def test_init_migrates_legacy_code_followup_rows_processed(tmp_path: Path):
-    """Schema cleanup (#277): legacy ``kind='code_followup'`` rows left over
-    from the retired ClaudeOrchestrator are unresumable after #276. The
-    SessionStore init sweep marks any open ones as ``processed=1`` +
-    ``timed_out=1`` so the worker's drain loop and the timeout sweeper
-    leave them alone instead of looping or nudging."""
+    """Legacy ``kind='code_followup'`` rows left over from the retired
+    ClaudeOrchestrator are unresumable. The SessionStore init sweep marks
+    any open ones as ``processed=1`` + ``timed_out=1`` so the worker's
+    drain loop and the timeout sweeper leave them alone instead of looping
+    or nudging."""
     from api.services.agent_worker.session_store import SessionStore
 
     # First open the DB and seed a legacy row directly — this mirrors what
-    # the production DB would contain post-#276 if a /code completion went
+    # the production DB would contain if a /code completion went
     # un-replied for a while.
     store = SessionStore(db_path=tmp_path / "s.db")
     qid = store.create_pending_question(
@@ -748,7 +748,7 @@ def test_operator_completion_skips_vault_mutations(tmp_path: Path):
 
 @pytest.mark.unit
 def test_worker_does_not_dispatch_for_legacy_code_followup_rows(tmp_path: Path):
-    """After #277, legacy ``code_followup`` rows are auto-closed by the
+    """Legacy ``code_followup`` rows are auto-closed by the
     SessionStore init migration. Even if one is created mid-flight (an
     extremely unlikely race with a downgrade) and answered, the worker
     never dispatches anything for it because the row is pre-marked

@@ -100,7 +100,8 @@ api/
 
 **Telegram & Scheduling:**
 - `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands, `chat_via_api_with_log` for execution metadata capture)
-- `claude_orchestrator.py` - Claude Code subprocess lifecycle, stream parsing, [NOTIFY] relay
+- `agent_worker/code_executor.py` - Claude Code subprocess lifecycle, stream parsing, `[NOTIFY]` relay (replaces the retired `claude_orchestrator.py`)
+- `agent_worker/code_spawn.py` - Creates a `routing='code'` session row for the worker to dispatch
 - `directory_resolver.py` - Maps task keywords to working directories for Claude Code
 - `scheduler_store.py` - Schedule store + scheduler. Markdown source of truth (`LifeOS/Scheduler/Inbox.md`), action dispatch (notify/prompt/endpoint/agent), retry, suppression, run history, and dashboard generation. `reminder_store.py` re-exports it under the legacy `Reminder*` names.
 - `scheduler_watcher.py` - Watchdog watcher that reindexes the Scheduler directory on external edits

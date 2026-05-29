@@ -154,7 +154,7 @@ class Worker:
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
         managed_executor=None,    # injectable ManagedExecutor for tests
-        code_executor=None,       # injectable CodeExecutor for tests (#274)
+        code_executor=None,       # injectable CodeExecutor for tests
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -182,7 +182,7 @@ class Worker:
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
-        self._code_executor = code_executor  # lazily instantiated on first /code task (#274)
+        self._code_executor = code_executor  # lazily instantiated on first /code task
         self._warn_deprecated_settings()
 
     @staticmethod
@@ -456,10 +456,7 @@ class Worker:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
             elif session.routing == "code":
-                # /code sessions (#274/#275). After #276 retired
-                # ClaudeOrchestrator this is the only dispatch path — the
-                # LIFEOS_CODE_ROUTING flag was dropped along with the
-                # legacy executor.
+                # /code sessions — operator-spawned via code_spawn.spawn_code_session.
                 self._dispatch_code_session(session, pending)
 
     def _poll_managed_sessions(self) -> None:
@@ -680,8 +677,8 @@ class Worker:
             return
 
         if session.routing == "code":
-            # /code follow-ups (#275). Hand the reply off as a fresh pending
-            # message so _dispatch_code_session drains it and resumes via
+            # /code follow-ups. Hand the reply off as a fresh pending message
+            # so _dispatch_code_session drains it and resumes via
             # CodeExecutor.resume(). Flipping status back to CLAIMED puts the
             # session in the same shape as a freshly-claimed one — the
             # dispatcher's resume branch keys on session.code_session_id
@@ -1037,7 +1034,7 @@ class Worker:
         return self._managed_executor
 
     def _dispatch_code_session(self, session, pending: list[dict]) -> None:
-        """Drive one ``routing='code'`` session through ``CodeExecutor`` (#275).
+        """Drive one ``routing='code'`` session through ``CodeExecutor``.
 
         Handles both the fresh-spawn case (``code_session_id`` is NULL — call
         ``execute()``) and the resume case (``code_session_id`` set — call
@@ -1159,7 +1156,7 @@ class Worker:
             self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
 
     def _get_code_executor(self):
-        """Lazy-construct the CodeExecutor for /code sessions (#274).
+        """Lazy-construct the CodeExecutor for /code sessions.
 
         Tests inject one via the constructor; production builds default
         a CodeExecutor wired to the worker's Telegram sender so [NOTIFY]

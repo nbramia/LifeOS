@@ -295,10 +295,7 @@ class TestMessageDedup:
 
         # First call — should process (but we mock the rest to avoid side effects)
         update = {"message": {"message_id": 1, "text": "hi", "chat": {"id": "123"}}}
-        with patch.object(listener, "_check_agent_approval", return_value=False), \
-             patch.object(listener, "_check_agent_clarification", return_value=False), \
-             patch.object(listener, "_check_code_followup", return_value=False), \
-             patch("api.services.telegram.settings") as mock_settings, \
+        with patch("api.services.telegram.settings") as mock_settings, \
              patch("api.services.telegram.send_typing_indicator"), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat, \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
@@ -368,9 +365,6 @@ class TestNoImplicitThreadResume:
         # ...but a plain (non-reply) message must still route to the chat pipeline.
         update = {"message": {"message_id": 7, "text": "what's the weather", "chat": {"id": "123"}}}
         with patch("api.services.agent_worker.session_store.SessionStore", return_value=store), \
-             patch.object(listener, "_check_agent_approval", return_value=False), \
-             patch.object(listener, "_check_agent_clarification", return_value=False), \
-             patch.object(listener, "_check_code_followup", new_callable=AsyncMock, return_value=False), \
              patch("api.services.telegram.settings") as mock_settings, \
              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \

@@ -1,4 +1,4 @@
-"""Tests for the /chat thread-view reconstruction of routing='code' sessions (#275)."""
+"""Tests for the /chat thread-view reconstruction of routing='code' sessions."""
 from __future__ import annotations
 
 import pytest

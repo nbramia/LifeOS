@@ -556,7 +556,7 @@ def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[
 
 
 def _reconstruct_code_conversation(events: list[dict]) -> list[dict]:
-    """Build /chat-friendly turns from a routing='code' transcript (#275).
+    """Build /chat-friendly turns from a routing='code' transcript.
 
     Events of interest:
       - ``code_user_prompt`` — operator prompt or threaded reply, starts a

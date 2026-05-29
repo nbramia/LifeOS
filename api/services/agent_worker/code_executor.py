@@ -4,8 +4,7 @@ Mirrors the executor surface used by `LocalExecutor` / `ManagedExecutor` so the
 worker can route `routing="code"` sessions uniformly. All session state — the
 CLI's session UUID, transcript events, status transitions — is persisted via
 `SessionStore` and `TranscriptStore`, so sessions survive worker restarts and
-surface in the `/agents` UI. After #276 retired ``ClaudeOrchestrator``, this is
-the only executor for ``/code``.
+surface in the `/agents` UI.
 """
 from __future__ import annotations
 
@@ -37,9 +36,6 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-# Heartbeat / [NOTIFY] / [CLARIFY] semantics carried over from the original
-# /code orchestrator (retired in #276) so the operator-facing surface is
-# unchanged.
 HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 
@@ -73,10 +69,7 @@ def _resolve_claude_binary() -> str:
 
 
 # The system prompt is the operator-facing contract for /code's behavior —
-# scope, clarification protocol, persistence, environment shape. Kept in sync
-# with the legacy orchestrator's prompt during the flag-gated rollout window
-# so behavior is identical between paths. #276 will delete the orchestrator
-# copy and this becomes the single source.
+# scope, clarification protocol, persistence, environment shape.
 _SYSTEM_PROMPT = """\
 You are being orchestrated by LifeOS on behalf of the user ({user_name}).
 The user sent this task via Telegram and cannot see your full output.
@@ -197,8 +190,7 @@ class CodeExecutor:
 
     Surface mirrors `LocalExecutor`: a single `execute(session, task)` call
     drives the subprocess to a terminal `ExecutorOutcome`. The worker's
-    `_dispatch_spawned_sessions` calls this when `session.routing == "code"`
-    (#276 retired the orchestrator path, so this is the only route).
+    `_dispatch_spawned_sessions` calls this when `session.routing == "code"`.
 
     Constructor injection points:
       - `notification_callback` — invoked with each [NOTIFY] body during the
@@ -262,8 +254,8 @@ class CodeExecutor:
         """Resume a previously-completed /code session by passing
         `-r <code_session_id>` to the CLI.
 
-        Stays here in #274 as a structural placeholder so #275 (Telegram +
-        /chat reply routing) has a single entry point to hand off to.
+        Used by the worker's follow-up reply path — the reply text becomes
+        the next user turn on the existing CLI session.
         """
         resume_id = session.code_session_id
         if not resume_id:
@@ -576,7 +568,7 @@ class CodeExecutor:
 
         if state.pending_clarification:
             # Agent asked a question — surface as BLOCKED outcome so the
-            # worker can register the question for #275's reply routing.
+            # worker can register the question for follow-up reply routing.
             state.awaiting_clarification = True
             state.terminal = True
             return

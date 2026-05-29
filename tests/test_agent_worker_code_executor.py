@@ -1,4 +1,4 @@
-"""Tests for the agent worker's CodeExecutor (#274).
+"""Tests for the agent worker's CodeExecutor.
 
 Drives the executor against a fake subprocess whose stdout emits a scripted
 sequence of stream-json events. No real Claude CLI is invoked. Exercises:
@@ -123,7 +123,7 @@ def _build_executor(tmp_path: Path, *, spawn_fn, notifications: list[str] | None
 
 def _seed_session(store: SessionStore, *, task_id: str = "task-1"):
     """Drop a routing='code' operator-origin session into the store, the
-    shape #275's spawn surface will produce.
+    shape the spawn surface produces.
     """
     return store.create(
         task_id=task_id,
@@ -337,7 +337,7 @@ def test_empty_prompt_returns_failed(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Resume entry point (structural — full reply routing lands in #275)
+# Resume entry point
 # ---------------------------------------------------------------------------
 
 
