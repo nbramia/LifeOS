@@ -77,8 +77,8 @@ class Session:
     # sessions even though they have no parent (#235).
     origin: str | None = None
     # Claude Code CLI session UUID, captured from the subprocess's init
-    # stream-json event. Set only for routing="code" sessions (#274) and used
-    # by CodeExecutor.resume() to invoke `claude -r <code_session_id>` so the
+    # stream-json event. Set only for routing="code" sessions and used by
+    # CodeExecutor.resume() to invoke `claude -r <code_session_id>` so the
     # CLI picks up its prior in-process state across worker restarts.
     code_session_id: str | None = None
 
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     managed_agent_session_id  TEXT,
     preset_class              TEXT,
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
-    code_session_id           TEXT   -- Claude Code CLI session UUID for routing="code" (#274)
+    code_session_id           TEXT   -- Claude Code CLI session UUID for routing="code"
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -298,17 +298,16 @@ class SessionStore:
             # Old rows stay NULL (treated as "agent").
             if "origin" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
-            # Idempotent migration for the Claude Code CLI session UUID (#274).
+            # Idempotent migration for the Claude Code CLI session UUID.
             # Set only for routing="code" sessions; NULL for everything else.
             if "code_session_id" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN code_session_id TEXT")
             # Idempotent cleanup of the legacy `code_followup` pending_question
-            # kind (#277). #237 used these rows to register a Claude Code
-            # completion against the in-memory ClaudeOrchestrator. After #276
-            # retired the orchestrator the rows are unresumable — mark any
-            # leftovers processed so the worker's clarification-answer loop
-            # doesn't try to drain them and the timeout sweeper doesn't keep
-            # nudging the operator.
+            # kind. The retired in-memory ClaudeOrchestrator used these rows
+            # to register a Claude Code completion; they're now unresumable.
+            # Mark any leftovers processed so the worker's clarification-answer
+            # loop doesn't try to drain them and the timeout sweeper doesn't
+            # keep nudging the operator.
             conn.execute(
                 "UPDATE pending_questions SET processed = 1, timed_out = 1 "
                 "WHERE kind = 'code_followup' AND processed = 0"

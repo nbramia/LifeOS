@@ -1,4 +1,4 @@
-"""Worker dispatch wiring for routing='code' sessions (#274).
+"""Worker dispatch wiring for routing='code' sessions.
 
 Verifies that ``_dispatch_spawned_sessions`` invokes the injected
 ``CodeExecutor`` for operator-origin sessions with ``routing='code'``.
@@ -60,7 +60,7 @@ def _seed_code_session(store: SessionStore, *, task_id: str = "code-1"):
         routing="code",
         origin="operator",
     )
-    # Mirror the spawn surface contract (#275): the prompt for the first
+    # Mirror the spawn surface contract: the prompt for the first
     # turn lives in pending_messages on the session row.
     store.enqueue_message(session.session_id, sender_id="operator", content="print hello")
     return session

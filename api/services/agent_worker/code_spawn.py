@@ -1,4 +1,4 @@
-"""Operator spawn for `routing='code'` agent-worker sessions (#275).
+"""Operator spawn for `routing='code'` agent-worker sessions.
 
 `/code` (Telegram + `/chat`) calls this helper to create a parentless,
 operator-origin session with routing pre-set to ``code``. The prompt and
@@ -10,9 +10,6 @@ to ``CodeExecutor.execute``.
 Mirrors ``operator_spawn.create_operator_session`` in shape, but skips
 preflight entirely — the route is explicit and the per-task budget reuses
 the existing Claude Code wall/cost knobs (``LIFEOS_CLAUDE_TIMEOUT`` etc.).
-
-After #276 retired ``ClaudeOrchestrator`` this is the only ``/code`` spawn
-entry point; the Telegram listener and `/code` HTTP route call it directly.
 """
 from __future__ import annotations
 

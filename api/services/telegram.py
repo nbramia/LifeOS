@@ -630,24 +630,12 @@ class TelegramBotListener:
             if handled:
                 return
 
-        # Check for agent approval/rejection (short keywords only)
-        if self._check_agent_approval(text):
-            await self._handle_agent_approval(text, chat_id)
-            return
-
-        # Check for clarification response (any non-command text)
-        if self._check_agent_clarification():
-            await self._handle_agent_clarification(text, chat_id)
-            return
-
-        # Check for follow-up to a recently completed Claude Code session
-        if await self._check_code_followup(text, chat_id):
-            return
-
-        # Agent-thread replies are resumed only via an explicit reply-to gesture
-        # (handled near the top of this method). A plain message is always a
-        # fresh chat query — no implicit "recent thread" capture — so unrelated
-        # questions never get silently swallowed into a finished agent thread.
+        # Plan approval, clarification, and /code follow-up are all routed
+        # through threaded replies (handled near the top of this method
+        # via _maybe_handle_code_reply / _maybe_deposit_agent_answer). A
+        # plain non-threaded message is always a fresh chat query, never
+        # an implicit follow-up — so unrelated questions never get
+        # silently swallowed into a finished agent or /code thread.
 
         # Send through chat pipeline (intent classification happens there)
         try:
@@ -760,29 +748,6 @@ class TelegramBotListener:
         "add a new", "create a new", "remove all", "delete all",
     ]
 
-    def _check_agent_approval(self, text: str) -> bool:
-        """Stub — kept for backward-compatible call sites until they're
-        retired in a follow-up. /code plan approval now flows entirely
-        through the threaded-reply path (#275), so there is never an
-        in-memory session to intercept here."""
-        return False
-
-    async def _handle_agent_approval(self, text: str, chat_id: str):
-        """Unreachable after #276 — ``_check_agent_approval`` always returns
-        False. Kept as a no-op placeholder so callers don't need to be
-        rewritten in this PR."""
-        return None
-
-    def _check_agent_clarification(self) -> bool:
-        """Stub — see ``_check_agent_approval``. Clarifications round-trip
-        through the threaded-reply path now."""
-        return False
-
-    async def _handle_agent_clarification(self, text: str, chat_id: str):
-        """Unreachable after #276 — ``_check_agent_clarification`` always
-        returns False."""
-        return None
-
     async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
         """If a reply targets a Claude Code completion message (any chunk),
         resume the linked agent-worker session.
@@ -813,12 +778,6 @@ class TelegramBotListener:
         await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
         return True
 
-    async def _check_code_followup(self, text: str, chat_id: str) -> bool:
-        """Stub — no implicit "recently completed" follow-up exists for the
-        worker-routed /code path. The operator must thread-reply to a
-        specific completion message so the main feed stays independent."""
-        return False
-
     def _should_use_plan_mode(self, task: str) -> bool:
         """Conservative heuristic: plan mode only for complex-sounding tasks."""
         task_lower = task.lower()
@@ -826,7 +785,7 @@ class TelegramBotListener:
 
     async def _handle_code_command(self, task: str, chat_id: str):
         """Spawn a /code session by writing a routing='code' row that the
-        agent worker dispatches on its next tick (#275)."""
+        agent worker dispatches on its next tick."""
         from api.services.agent_worker.code_spawn import spawn_code_session
         from api.services.agent_worker.session_store import SessionStore
         from api.services.directory_resolver import resolve_working_directory

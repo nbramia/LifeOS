@@ -1,4 +1,4 @@
-"""Worker integration tests for /code resume + BLOCKED flow (#275).
+"""Worker integration tests for /code resume + BLOCKED flow.
 
 Verifies:
 - ``_resume_as_followup`` treats a code-routed answer as a fresh pending
@@ -55,7 +55,7 @@ class _StubCodeExecutor:
 
 def _make_worker(tmp_path: Path, code_executor, monkeypatch=None):
     # monkeypatch retained as an optional arg for forward-compat with
-    # tests that still pass it; #276 removed the LIFEOS_CODE_ROUTING flag
+    # tests that still pass it; the LIFEOS_CODE_ROUTING flag was removed
     # so there's nothing to set anymore.
     del monkeypatch
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))

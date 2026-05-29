@@ -1,4 +1,4 @@
-"""Tests for the routing='code' operator-spawn helper (#275)."""
+"""Tests for the routing='code' operator-spawn helper."""
 from __future__ import annotations
 
 from pathlib import Path
