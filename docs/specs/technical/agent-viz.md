@@ -304,8 +304,8 @@ Response: `{spawned: true, pid, pane_id, command, cwd, inner_command, clipboard_
 ### Go To (`/focus`)
 
 1. Validate `cc:` prefix and the `LIFEOS_CC_RESUME_ENABLED` gate.
-2. **Cache lookup.** `CCWezTermStore.get(session_id)` — populated by Resume *and* by the SessionStart hook → `/cc-pane-bind` write path.
-3. **Probe fallback (cache miss).** Resolve the session's `transcript_path` via `discover_sessions(...)`, then call `cc_pane_locate.locate_pane_for_transcript(jsonl_path)`:
+2. **Cache lookup.** `CCWezTermStore.get(session_id)` — populated by Resume *and* by the SessionStart hook → `/cc-pane-bind` write path. Each row carries a `wezterm_pid` recorded at write time (the most-recently-modified `$XDG_RUNTIME_DIR/wezterm/gui-sock-<pid>`). If that pid is no longer in the live set, the mapping is discarded and the probe runs as if the cache had missed — pane ids reset when wezterm-gui restarts, so a pre-restart `pane_id=5` would otherwise silently activate an unrelated session's pane in the new wezterm. `wezterm_pid=0` (pre-#257 rows or writers that couldn't determine the live pid) is also treated as stale. Multi-mux caveat: the cache accepts *any* live wezterm pid, but `WEZTERM_UNIX_SOCKET` (set by `_resume_env`) targets the most-recently-modified mux. If two wezterm-gui processes are running and the cache was written under the non-primary one, activate-pane fails because that mux doesn't own the pane — the existing 410-then-reprobe path self-heals via a fresh FD probe against the currently-targeted mux.
+3. **Probe fallback (cache miss or boot-id stale).** Resolve the session's `transcript_path` via `discover_sessions(...)`, then call `cc_pane_locate.locate_pane_for_transcript(jsonl_path)`:
    - `lsof -t -- <jsonl_path>` → PIDs holding the file open.
    - For each PID, read `/proc/<pid>/fd/0` and keep entries that resolve to `/dev/pts/N` (interactive `claude` processes have fd 0 attached to their controlling pts).
    - `wezterm cli list --format json` → match `tty_name` to the holder's pts; first match wins. Wezterm's JSON output does not expose pane.pid in any supported version, but `tty_name` is reliable.
@@ -324,7 +324,7 @@ Response: `{focused: true, pane_id, cwd}`.
 1. Reject any request whose `request.client.host` is not in `{"127.0.0.1", "::1"}` with 403.
 2. `validate_session_id(body.session_id)` — strips any `cc:` prefix and rejects path-traversal characters; 400 on failure.
 3. Re-prefix unconditionally (`storage_id = f"cc:{bare}"`) so the keying matches `/resume`'s upsert convention.
-4. `CCWezTermStore.upsert(storage_id, body.pane_id, body.cwd or "")`. `pane_id` is validated by pydantic (`ge=0`).
+4. `CCWezTermStore.upsert(storage_id, body.pane_id, body.cwd or "", wezterm_pid=_current_wezterm_pid(xdg))`. `pane_id` is validated by pydantic (`ge=0`); `wezterm_pid` captures the live wezterm-gui pid so the focus path can invalidate after a restart.
 
 The hook script (`scripts/claude-session-pane.sh`) is invoked by Claude Code's SessionStart hook. It reads the standard SessionStart JSON payload (`{session_id, cwd, transcript_path, source}`) from stdin, picks up `$WEZTERM_PANE` from the env, and POSTs to this endpoint. No-ops gracefully if any of those are missing (non-wezterm terminal, `jq`/`curl` not installed, server unreachable) — never blocks `claude` startup.
 

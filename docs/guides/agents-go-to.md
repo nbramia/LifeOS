@@ -76,7 +76,7 @@ Open two wezterm panes in the same project directory, run `claude` in each, then
 If the toast says "Couldn't locate pane" — meaning the session isn't running where we can reach it, wezterm itself can't be queried, or no cached mapping exists — the most likely causes are:
 
 - The SessionStart hook isn't installed yet for sessions started *before* the hook landed. Restart the `claude` invocation; the hook will fire and bind on the new session.
-- WezTerm has been restarted since the session began. `wezterm cli list` can no longer see the original pane id, so the probe and any cached mapping are stale. Click **Resume** to open a fresh pane (this rewrites the mapping), or restart `claude` so the SessionStart hook re-binds.
+- WezTerm has been restarted since the session began *and* `claude` is no longer running. The Go To cache invalidates automatically when wezterm's pid changes, but the probe still needs a live `claude` process holding the session's transcript file open. Restart `claude` so the SessionStart hook re-binds, or click **Resume** to open a fresh pane.
 - WezTerm is unreachable (`wezterm cli list` errors, the gui-sock socket is gone, or the binary isn't on PATH).
 - `lsof` isn't on PATH (the probe fallback uses it).
 - The session is in a non-wezterm terminal — Go To only works for wezterm.

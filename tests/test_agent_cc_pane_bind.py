@@ -249,7 +249,11 @@ def test_focus_reprobes_when_cached_pane_is_stale_and_finds_new_one(
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     _, sid = synthetic_session
 
-    wezterm_store.upsert(sid, pane_id=17, cwd="/repo")
+    # Cache the mapping with the current wezterm boot id so #257's
+    # invalidation doesn't pre-empt the activate-then-stale flow this
+    # test exercises.
+    wezterm_store.upsert(sid, pane_id=17, cwd="/repo", wezterm_pid=99001)
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
 
     from api.services import cc_pane_locate
     monkeypatch.setattr(cc_pane_locate, "locate_pane_for_transcript",
@@ -305,7 +309,11 @@ def test_focus_410_when_cached_pane_stale_and_reprobe_finds_nothing(
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     _, sid = synthetic_session
 
-    wezterm_store.upsert(sid, pane_id=17, cwd="/repo")
+    # Same setup as the sibling test — cache the mapping under the live
+    # wezterm boot so we exercise the activate-then-stale flow rather
+    # than the boot-id invalidation.
+    wezterm_store.upsert(sid, pane_id=17, cwd="/repo", wezterm_pid=99001)
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
 
     from api.services import cc_pane_locate
     monkeypatch.setattr(cc_pane_locate, "locate_pane_for_transcript",
@@ -412,3 +420,167 @@ def test_focus_resolves_session_without_calling_discover_sessions(
 
     # The probe was handed the jsonl from the *target* project dir, not the decoy.
     assert captured_jsonl["path"] == str(proj_b / f"{sid_bare}.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# #257 — cache invalidation across wezterm restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_focus_invalidates_cache_when_wezterm_pid_no_longer_live(
+    client, wezterm_store, synthetic_session, monkeypatch,
+):
+    """The acceptance test for #257: a cached mapping written under one
+    wezterm boot must NOT be honored after a wezterm restart (pane ids
+    reset, so cached pane_id=5 could activate a different session's pane
+    in the new wezterm). The focus endpoint should drop the stale mapping
+    and re-probe instead.
+    """
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    _, sid = synthetic_session
+
+    # Pre-restart: mapping cached under wezterm boot pid 11111.
+    wezterm_store.upsert(sid, pane_id=5, cwd="/repo", wezterm_pid=11111)
+
+    # Post-restart: live wezterm pid is now 22222 (a different process).
+    # The cached pid is no longer in the live set → mapping is stale.
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {22222})
+
+    # Probe finds pane 7 in the new wezterm — the session has a fresh pane.
+    from api.services import cc_pane_locate
+    monkeypatch.setattr(cc_pane_locate, "locate_pane_for_transcript",
+                        lambda path, env=None, proc_root="/proc": 7)
+    # And pin the "current wezterm pid" the upsert path records.
+    monkeypatch.setattr("api.routes.agents._current_wezterm_pid", lambda xdg: 22222)
+
+    calls: list[list[str]] = []
+
+    class _OK:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def _fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _OK()
+
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    r = client.post(f"/api/agents/sessions/{sid}/focus")
+    assert r.status_code == 200, r.text
+    assert r.json()["pane_id"] == 7
+
+    # The stale cached pane (5) was NOT activated — only the freshly
+    # probed pane (7) was.
+    activate_calls = [argv for argv in calls if "activate-pane" in argv]
+    assert len(activate_calls) == 1
+    assert "7" in activate_calls[0]
+    assert "5" not in activate_calls[0]
+
+    # The mapping was refreshed with the new wezterm pid.
+    mapping = wezterm_store.get(sid)
+    assert mapping is not None
+    assert mapping.pane_id == 7
+    assert mapping.wezterm_pid == 22222
+
+
+@pytest.mark.unit
+def test_focus_invalidates_pre_257_rows_with_wezterm_pid_zero(
+    client, wezterm_store, synthetic_session, monkeypatch,
+):
+    """Mappings written before #257 lack a wezterm boot id (DEFAULT 0 on
+    migration). The focus endpoint treats wezterm_pid=0 as stale so the
+    first Go To after the upgrade re-probes and pins a real pid.
+    """
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    _, sid = synthetic_session
+
+    # wezterm_pid defaults to 0 — simulates a row migrated from pre-#257.
+    wezterm_store.upsert(sid, pane_id=5, cwd="/repo")
+    assert wezterm_store.get(sid).wezterm_pid == 0
+
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {33333})
+    monkeypatch.setattr("api.routes.agents._current_wezterm_pid", lambda xdg: 33333)
+
+    from api.services import cc_pane_locate
+    monkeypatch.setattr(cc_pane_locate, "locate_pane_for_transcript",
+                        lambda path, env=None, proc_root="/proc": 9)
+
+    class _OK:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: _OK())
+
+    r = client.post(f"/api/agents/sessions/{sid}/focus")
+    assert r.status_code == 200, r.text
+    assert r.json()["pane_id"] == 9
+
+    # Refreshed mapping now carries a real wezterm_pid.
+    mapping = wezterm_store.get(sid)
+    assert mapping.pane_id == 9
+    assert mapping.wezterm_pid == 33333
+
+
+@pytest.mark.unit
+def test_focus_honors_cache_when_wezterm_pid_matches_one_live_gui(
+    client, wezterm_store, synthetic_session, monkeypatch,
+):
+    """Multi-mux: several wezterm-gui instances running simultaneously.
+    The cache is valid if its recorded pid is in the live set (regardless
+    of which gui is "primary" right now).
+    """
+    from config.settings import settings
+    monkeypatch.setattr(settings, "cc_resume_enabled", True)
+    _, sid = synthetic_session
+
+    wezterm_store.upsert(sid, pane_id=12, cwd="/repo", wezterm_pid=11111)
+    # Two live wezterm-gui processes; the cache pid is one of them.
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids",
+                        lambda xdg: {11111, 99999})
+
+    class _OK:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+    calls: list[list[str]] = []
+    def _fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _OK()
+    monkeypatch.setattr("shutil.which",
+                        lambda name: f"/usr/bin/{name}" if name == "wezterm" else None)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    r = client.post(f"/api/agents/sessions/{sid}/focus")
+    assert r.status_code == 200, r.text
+    # Activate-pane was called with the cached pane — no probe needed.
+    assert any("activate-pane" in argv and "12" in argv for argv in calls)
+
+
+@pytest.mark.unit
+def test_cc_pane_bind_records_current_wezterm_pid(
+    client, wezterm_store, monkeypatch,
+):
+    """The SessionStart hook → /cc-pane-bind path captures the current
+    wezterm boot id so subsequent focus calls can validate against it.
+    """
+    monkeypatch.setattr("api.routes.agents._current_wezterm_pid", lambda xdg: 44444)
+
+    r = client.post("/api/agents/cc-pane-bind", json={
+        "session_id": "bind-target",
+        "pane_id": 3,
+        "cwd": "/x",
+    })
+    assert r.status_code == 200, r.text
+
+    mapping = wezterm_store.get("cc:bind-target")
+    assert mapping is not None
+    assert mapping.pane_id == 3
+    assert mapping.wezterm_pid == 44444
