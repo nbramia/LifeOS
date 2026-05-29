@@ -64,9 +64,13 @@ restart_server() {
 }
 
 # --- Check 1: Duplicate processes ---
-# Count distinct PIDs listening on port 8000 (avoids matching SSH/shell args).
-# Normal state: 1 master PID listening. >1 means conflicting server instances.
-LISTENER_COUNT=$(lsof -ti :8000 2>/dev/null | sort -u | wc -l | tr -d ' ')
+# Count distinct PIDs *listening* on port 8000. The -sTCP:LISTEN filter is
+# load-bearing: a bare `lsof -ti :8000` also matches client processes with
+# an established connection to the API (browser SSE tabs, MCP/agent HTTP
+# clients, the agent worker's poller), which made this fire a destructive
+# restart every 5 minutes. Normal state: 1 listening PID. >1 means a genuine
+# duplicate server (e.g. a stray `uvicorn` bound alongside the systemd one).
+LISTENER_COUNT=$(lsof -ti :8000 -sTCP:LISTEN 2>/dev/null | sort -u | wc -l | tr -d ' ')
 
 if [ "$LISTENER_COUNT" -gt 1 ]; then
     log "DUPLICATE DETECTED: $LISTENER_COUNT processes listening on :8000 — restarting"
