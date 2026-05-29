@@ -71,6 +71,11 @@ class Session:
     root_session_id: str | None = None
     spawn_depth: int = 0
     yield_waiting_for: list[str] | None = None
+    # Provenance of the session. NULL/"agent" = claimed from an #agent vault
+    # task; "operator" = root-spawned on demand from Telegram/chat with no
+    # backing task. The worker's spawned-session dispatch picks up operator
+    # sessions even though they have no parent (#235).
+    origin: str | None = None
 
 
 _SCHEMA = """
@@ -94,7 +99,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     spawn_depth               INTEGER NOT NULL DEFAULT 0,
     yield_waiting_for         TEXT,  -- JSON array of session_ids the agent is waiting on
     managed_agent_session_id  TEXT,
-    preset_class              TEXT
+    preset_class              TEXT,
+    origin                    TEXT   -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -282,6 +288,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN preset_class TEXT"
                 )
+            # Idempotent migration for the per-session origin column (#235).
+            # Old rows stay NULL (treated as "agent").
+            if "origin" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
             # Idempotent migrations for the runaway detection counters on
             # managed_cursor (#139 Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
@@ -313,6 +323,7 @@ class SessionStore:
         parent_session_id: str | None = None,
         root_session_id: str | None = None,
         spawn_depth: int = 0,
+        origin: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -320,6 +331,9 @@ class SessionStore:
         For root sessions (no parent), `root_session_id` defaults to the new
         session's own id. Children inherit the parent's `root_session_id` so
         lineage queries can find an entire family with one indexed lookup.
+
+        `origin="operator"` marks a root-spawned session (no #agent task) so
+        the worker's spawned-session dispatch claims it (#235).
         """
         sid = session_id or new_session_id()
         root_sid = root_session_id or sid
@@ -331,15 +345,15 @@ class SessionStore:
                     task_id, session_id, status, routing, budget_json,
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
-                    root_session_id, spawn_depth
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_session_id, spawn_depth, origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
                     json.dumps(budget) if budget else None,
                     now, now,
                     expected_output, parent_session_id,
-                    root_sid, spawn_depth,
+                    root_sid, spawn_depth, origin,
                 ),
             )
         return Session(
@@ -354,6 +368,7 @@ class SessionStore:
             parent_session_id=parent_session_id,
             root_session_id=root_sid,
             spawn_depth=spawn_depth,
+            origin=origin,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -1064,4 +1079,5 @@ class SessionStore:
                 if "yield_waiting_for" in row.keys() and row["yield_waiting_for"]
                 else None
             ),
+            origin=(row["origin"] if "origin" in row.keys() else None),
         )

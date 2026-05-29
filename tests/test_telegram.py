@@ -411,3 +411,80 @@ class TestAgentThreadResume:
 
         mock_resume.assert_awaited_once()
         mock_chat.assert_not_awaited()  # resume short-circuited the chat pipeline
+
+
+# =============================================================================
+# Operator agent spawn command (Issue #235)
+# =============================================================================
+
+
+class TestAgentSpawnCommand:
+    """`/agent [local|claude] <task>` operator spawn from Telegram."""
+
+    def _make_listener(self, tmp_path):
+        from api.services.telegram import TelegramBotListener
+        state_file = tmp_path / "telegram_state.json"
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            return TelegramBotListener()
+
+    @pytest.mark.asyncio
+    async def test_explicit_claude_routing_passed_through(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        spawn_result = {"ok": True, "routing": "claude", "needs_routing": False,
+                        "session_id": "s1", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result) as mock_spawn, \
+             patch("api.services.agent_worker.session_store.SessionStore"), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            await listener._handle_agent_spawn("claude refactor the parser", "123")
+
+        _, kwargs = mock_spawn.call_args
+        assert kwargs.get("explicit_routing") == "claude"
+        # Task text has the keyword stripped.
+        assert mock_spawn.call_args.args[1] == "refactor the parser"
+        assert "Spawned" in mock_send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_no_keyword_auto_routes(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        spawn_result = {"ok": True, "routing": "local", "needs_routing": False,
+                        "session_id": "s1", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result) as mock_spawn, \
+             patch("api.services.agent_worker.session_store.SessionStore"), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            await listener._handle_agent_spawn("summarize my week", "123")
+
+        _, kwargs = mock_spawn.call_args
+        assert kwargs.get("explicit_routing") is None
+        assert mock_spawn.call_args.args[1] == "summarize my week"
+
+    @pytest.mark.asyncio
+    async def test_empty_task_shows_usage(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            await listener._handle_agent_spawn("", "123")
+        assert "Usage:" in mock_send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_needs_routing_sends_clarification(self, tmp_path):
+        from api.services.agent_worker.session_store import SessionStore
+        listener = self._make_listener(tmp_path)
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        # A real (blocked, ask) operator session to attach the question to.
+        sess = store.create(
+            task_id="op_x", status="blocked", routing="ask", origin="operator",
+            budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+        )
+        spawn_result = {"ok": True, "routing": "ask", "needs_routing": True,
+                        "session_id": sess.session_id, "task_id": "op_x"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result), \
+             patch("api.services.agent_worker.session_store.SessionStore", return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids", return_value=[555]), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            await listener._handle_agent_spawn("do the thing", "123")
+
+        # A routing clarification was registered against the sent message id.
+        q = store.get_question_by_message_id(555)
+        assert q is not None and q["task_id"] == "op_x"

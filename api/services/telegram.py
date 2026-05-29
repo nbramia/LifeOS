@@ -548,6 +548,75 @@ class TelegramBotListener:
         await send_message_async(f'↪ continuing "{label}"', chat_id=chat_id)
         return True
 
+    async def _handle_agent_spawn(self, rest: str, chat_id: str):
+        """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
+
+        Explicit `local`/`claude` forces the model; otherwise preflight
+        auto-routes (and asks via the clarification flow when ambiguous). The
+        completion notification is replyable via the Phase 1 follow-up model.
+        """
+        explicit = None
+        parts = rest.split(maxsplit=1)
+        if parts and parts[0].lower() in ("local", "claude"):
+            explicit = parts[0].lower()
+            task = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            task = rest.strip()
+
+        if not task:
+            await send_message_async(
+                "Usage: /agent [local|claude] <task>\n"
+                "e.g. `/agent draft a reply to the landlord` (auto-routes), "
+                "or `/agent claude refactor the parser`.",
+                chat_id=chat_id,
+            )
+            return
+
+        try:
+            from api.services.agent_worker.operator_spawn import create_operator_session
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            result = await asyncio.to_thread(
+                create_operator_session, store, task, explicit_routing=explicit,
+            )
+        except Exception as exc:
+            logger.warning(f"operator spawn failed: {exc}")
+            await send_message_async(
+                f"Couldn't spawn agent: {str(exc)[:200]}", chat_id=chat_id,
+            )
+            return
+
+        if not result.get("ok"):
+            await send_message_async(
+                f"Couldn't spawn agent: {result.get('error')}", chat_id=chat_id,
+            )
+            return
+
+        if result.get("needs_routing"):
+            # Preflight couldn't pick a model — ask, and register the answer so
+            # the worker resolves routing and dispatches. Operator replies to
+            # this message (the reply-deposit hook matches it).
+            question = (
+                "Should I run this on the local Gemma model or on Claude? "
+                "Reply 'local' or 'claude'."
+            )
+            ids = send_message_capture_ids(question, chat_id)
+            if ids:
+                store.create_pending_question(
+                    session_id=result["session_id"], task_id=result["task_id"],
+                    question=question, sent_message_id=ids[0],
+                    sent_message_ids=ids, kind="clarification",
+                )
+            return
+
+        label = "Claude (cloud)" if result["routing"] == "claude" else "local Gemma"
+        await send_message_async(
+            f"🤖 Spawned {label} agent: {task[:120]}\n"
+            f"I'll send the result here when it's done — reply to it (or just message "
+            f"me within 30 min) to continue the thread.",
+            chat_id=chat_id,
+        )
+
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
         message = update.get("message")
@@ -678,6 +747,9 @@ class TelegramBotListener:
             else:
                 await self._handle_code_command(task, chat_id)
 
+        elif command == "/agent":
+            await self._handle_agent_spawn(text[len("/agent"):].strip(), chat_id)
+
         elif command in ("/code_status", "/codestatus"):
             await self._handle_code_status(chat_id)
 
@@ -695,6 +767,7 @@ class TelegramBotListener:
                 "/new or /clear - Start a new conversation\n"
                 "/status - Check LifeOS server health\n"
                 "/inspect - Show sources checked in last response\n"
+                "/agent [local|claude] <task> - Spawn an agent (auto-routes if no model given)\n"
                 "/code <task> - Run a task with Claude Code\n"
                 "/code\\_status - Check active Claude Code session\n"
                 "/code\\_cancel - Cancel active Claude Code session\n"
