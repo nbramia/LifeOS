@@ -781,10 +781,10 @@
     <span class="chip">recent <strong id="chip-recent">0</strong></span>
     <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
     <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API).">API spend <strong id="chip-spend">$0.00</strong></span>
-    <span class="chip legend" title="Node shapes: circle = LifeOS agent worker · square = Claude Code CLI · diamond = Task-tool subagent">
-      <span style="opacity:0.6">●</span> agent &nbsp;
-      <span style="opacity:0.6">■</span> cli &nbsp;
-      <span style="opacity:0.6">◆</span> sub
+    <span class="chip legend" title="Node shapes: circle = cloud agent (Claude) · diamond = local agent · square = Claude Code CLI">
+      <span style="opacity:0.6">●</span> cloud &nbsp;
+      <span style="opacity:0.6">◆</span> local &nbsp;
+      <span style="opacity:0.6">■</span> cli
     </span>
   </div>
 </header>
@@ -1078,7 +1078,7 @@
   }
 
   // Build the SVG content for a node group: shape + label. Shape varies by
-  // source (circle / rounded rect / diamond) but the per-frame transform
+  // routing (circle / rounded rect / diamond) but the per-frame transform
   // is handled by the simulation tick. Status color → fill; token volume →
   // size; recent activity (<60s) → `.pulsing` class for CSS keyframe.
   function nodeColors(d) {
@@ -1203,9 +1203,12 @@
   }
 
   function nodeShapeTag(d) {
-    if (d.is_subagent) return 'polygon';   // diamond
-    if (d.source === 'claude_code') return 'rect';  // rounded square
-    return 'circle';                       // dot
+    // Shape encodes where the agent runs — applied uniformly to top-level
+    // sessions and subagents. CLI = rounded square, local agent = diamond,
+    // cloud agent (Claude) = circle. Mirrors routingLabel()'s buckets.
+    if (d.source === 'claude_code' || d.routing === 'claude_code') return 'rect';
+    if (!d.routing || d.routing === 'local') return 'polygon';  // local: diamond
+    return 'circle';                       // cloud (Claude): dot
   }
 
   // Set shape-specific attrs (radius/width/points). Called on enter+update.
@@ -1318,7 +1321,7 @@
         }
         focusCcSession(d);
       });
-    // One shape element per node, type chosen by source.
+    // One shape element per node, type chosen by routing (see nodeShapeTag).
     entered.append(d => document.createElementNS('http://www.w3.org/2000/svg', nodeShapeTag(d)))
       .attr('class', 'node-shape');
     entered.append('title');
