@@ -3040,7 +3040,10 @@
         const THREAD_INITIAL_TURNS = 30;
         let threadRender = null;  // { conversation, earliestShown, loadBtn }
 
-        function renderThreadConversation(conversation) {
+        // preserveFrom: when re-rendering an already-open thread (e.g. a poll
+        // update appended new turns), keep at least as much history visible as
+        // the user had expanded, so "load earlier" scrollback isn't collapsed.
+        function renderThreadConversation(conversation, preserveFrom = null) {
             messagesEl.innerHTML = '';
             threadRender = null;
             const t = currentAgentThread || {};
@@ -3063,7 +3066,10 @@
                 return;
             }
 
-            const start = Math.max(0, conversation.length - THREAD_INITIAL_TURNS);
+            let start = Math.max(0, conversation.length - THREAD_INITIAL_TURNS);
+            if (preserveFrom != null) {
+                start = Math.min(start, Math.max(0, Math.min(preserveFrom, conversation.length)));
+            }
             threadRender = { conversation, earliestShown: start, loadBtn: null };
             if (start > 0) {
                 const btn = document.createElement('button');
@@ -3203,7 +3209,9 @@
                         currentAgentThread.convCount = conv.length;
                         currentAgentThread.resumable = !!thread.resumable;
                         currentAgentThread.status = (thread.status || '').toString();
-                        renderThreadConversation(conv);
+                        // Keep any history the user expanded via "load earlier".
+                        const keepFrom = threadRender ? threadRender.earliestShown : null;
+                        renderThreadConversation(conv, keepFrom);
                         updateThreadComposer();
                         scrollToBottom();
                         if (thread.resumable) { clearInterval(iv); loadAgentThreads(); }

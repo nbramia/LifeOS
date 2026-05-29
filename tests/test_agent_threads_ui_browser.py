@@ -217,3 +217,30 @@ class TestLargeThreadRendering:
         # Button removes itself once nothing is left to load.
         expect(page.locator(".thread-load-earlier")).to_have_count(0)
         expect(page.locator("#messages")).to_contain_text("user message 0")
+
+    def test_poll_rerender_preserves_expanded_history(self, page: Page):
+        # When new turns land on an active thread (the poll path re-renders),
+        # any history the user expanded via "load earlier" must not collapse
+        # back to the newest-N tail.
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        btn = page.locator(".thread-load-earlier")
+        expect(btn).to_be_visible(timeout=8000)
+        btn.click()  # 60 shown, earliestShown == 30
+        expect(page.locator("#messages .message")).to_have_count(60)
+        # Simulate the poll re-render: two new turns appended, re-rendered with
+        # the expanded depth preserved (exactly what pollThreadForUpdate does).
+        shown_after = page.evaluate(
+            """(n) => {
+                const conv = [];
+                for (let i = 0; i < n + 2; i++) {
+                    conv.push({ role: i % 2 ? 'assistant' : 'user', text: 'm' + i, tools: [] });
+                }
+                renderThreadConversation(conv, threadRender.earliestShown);
+                return document.querySelectorAll('#messages .message').length;
+            }""",
+            self.N_TURNS,
+        )
+        # Was showing turns [30, 92): the 60 already-visible plus the 2 new ones.
+        assert shown_after == 62, f"expected expansion preserved (62), got {shown_after}"
+        expect(page.locator("#messages")).to_contain_text("m30")
+        expect(page.locator("#messages")).not_to_contain_text("m29")
