@@ -961,7 +961,7 @@
     .force('charge', d3.forceManyBody().strength(-220).distanceMax(600))
     .force('center-y', d3.forceY(VIEW_H / 2).strength(0.12))
     .force('recency-x', d3.forceX(recencyTargetX).strength(0.18))
-    .force('collide', d3.forceCollide().radius(d => nodeRadius(d) + 14).strength(0.9))
+    .force('collide', d3.forceCollide().radius(d => collideRadius(d)).strength(0.9))
     .alphaDecay(0.025)
     .alphaMin(0.001)
     .velocityDecay(0.45);
@@ -1103,6 +1103,82 @@
     let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
     if (isCc && label === 'Claude Code') label = '?';
     return label;
+  }
+
+  // --- Label wrapping ---------------------------------------------------
+  // SVG <text> never wraps on its own, so long session labels used to run
+  // off in a single line and overlap neighbouring nodes. We word-wrap into
+  // multiple <tspan> lines and cap at LABEL_MAX_LINES (excess truncated with
+  // an ellipsis). Widths are estimated from character counts rather than
+  // measured with getComputedTextLength — deterministic, cheap per render,
+  // and avoids the 0-width result you get when the tab is backgrounded.
+  const LABEL_CHAR_W = 6.6;   // approx px per char at the 12px label font
+  const LABEL_MAX_W = 132;    // max line width in viewBox units before wrapping
+  const LABEL_MAX_CHARS = Math.floor(LABEL_MAX_W / LABEL_CHAR_W);  // ~20
+  const LABEL_LINE_H = 13;    // line height in viewBox units
+  const LABEL_MAX_LINES = 3;
+  const LABEL_GAP = 14;       // gap between node edge and first label baseline
+
+  // Greedy word-wrap to a character budget. Words longer than the budget are
+  // hard-broken so a single long token (e.g. a hyphen-free slug) still wraps.
+  function wrapLabelText(str, maxChars) {
+    const words = String(str).split(/\s+/).filter(Boolean);
+    const lines = [];
+    let line = '';
+    for (let w of words) {
+      // Hard-break any single word that can't fit on its own line.
+      while (w.length > maxChars) {
+        if (line) { lines.push(line); line = ''; }
+        lines.push(w.slice(0, maxChars));
+        w = w.slice(maxChars);
+      }
+      const candidate = line ? line + ' ' + w : w;
+      if (candidate.length > maxChars) {
+        if (line) lines.push(line);
+        line = w;
+      } else {
+        line = candidate;
+      }
+    }
+    if (line) lines.push(line);
+    return lines.length ? lines : [''];
+  }
+
+  // Render a node's (possibly multi-line) label into its <text> element and
+  // stash the resulting line count / pixel width on the datum so the collide
+  // force can reserve room for it. `this` is the <text> element.
+  function renderNodeLabel(d) {
+    const textEl = d3.select(this);
+    let lines = wrapLabelText(nodeLabel(d), LABEL_MAX_CHARS);
+    if (lines.length > LABEL_MAX_LINES) {
+      lines = lines.slice(0, LABEL_MAX_LINES);
+      let last = lines[LABEL_MAX_LINES - 1];
+      if (last.length >= LABEL_MAX_CHARS) last = last.slice(0, LABEL_MAX_CHARS - 1);
+      lines[LABEL_MAX_LINES - 1] = last.replace(/\s+$/, '') + '…';
+    }
+    textEl.attr('y', nodeRadius(d) + LABEL_GAP).text(null);
+    lines.forEach((ln, i) => {
+      textEl.append('tspan')
+        .attr('x', 0)
+        .attr('dy', i === 0 ? 0 : LABEL_LINE_H)
+        .text(ln);
+    });
+    d._labelLines = lines.length;
+    d._labelW = Math.max(...lines.map(l => l.length)) * LABEL_CHAR_W;
+  }
+
+  // Collision radius that encloses both the node shape and its label block so
+  // neither shapes nor labels overlap once the simulation settles. The label
+  // sits centred below the node; the farthest point is a bottom corner of its
+  // bounding box, so we use the hypotenuse from node centre to that corner.
+  // Scaled down slightly (corners are conservative) to avoid over-sparsing.
+  function collideRadius(d) {
+    const r = nodeRadius(d);
+    const lines = d._labelLines || 1;
+    const halfW = Math.max(r, (d._labelW || 0) / 2) + 6;
+    const labelBottom = r + LABEL_GAP + (lines - 1) * LABEL_LINE_H + LABEL_LINE_H * 0.5;
+    const enclose = Math.hypot(halfW, labelBottom) * 0.85;
+    return Math.max(r + 14, enclose);
   }
 
   function nodeTitle(d) {
@@ -1250,9 +1326,7 @@
 
     const all = entered.merge(sel);
     applyShapeAttrs(all.select('.node-shape'));
-    all.select('text.node-label')
-      .attr('y', d => nodeRadius(d) + 14)
-      .text(d => nodeLabel(d));
+    all.select('text.node-label').each(renderNodeLabel);
     all.select('title').text(d => nodeTitle(d));
 
     sel.exit().remove();
