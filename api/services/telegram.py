@@ -762,6 +762,12 @@ class TelegramBotListener:
 
     def _check_agent_approval(self, text: str) -> bool:
         """Check if text is a short approval/rejection for a pending plan."""
+        # When LIFEOS_CODE_ROUTING='worker', plan approval flows through the
+        # threaded-reply path (#275) — the worker registers a pending_question
+        # whose reply lands in _resume_as_followup. There is no active
+        # orchestrator session to consult in that mode, so short-circuit.
+        if settings.code_routing == "worker":
+            return False
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
         session = orch.get_active_session()
@@ -792,6 +798,10 @@ class TelegramBotListener:
 
     def _check_agent_clarification(self) -> bool:
         """Check if a session is waiting for a clarification response."""
+        # Worker route uses the threaded-reply path; no in-memory session to
+        # consult (see _check_agent_approval).
+        if settings.code_routing == "worker":
+            return False
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
         session = orch.get_active_session()
@@ -851,7 +861,15 @@ class TelegramBotListener:
 
     async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
         """If a reply targets a Claude Code completion message (any chunk),
-        resume that session via the orchestrator's existing resume path (#237).
+        resume that session.
+
+        Worker route (#275): rows are registered with kind='followup' against
+        a session_store row whose ``routing='code'``. Depositing the answer is
+        enough — the worker's ``_resume_as_followup`` picks it up on the next
+        tick and routes through ``CodeExecutor.resume``.
+
+        Legacy orchestrator route (#237): rows are kind='code_followup'; the
+        in-memory ``ClaudeOrchestrator`` handles resume directly.
 
         Returns True if the reply was consumed as a /code follow-up.
         """
@@ -862,10 +880,30 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"code reply lookup failed: {exc}")
             return False
-        if not q or q.get("kind") != "code_followup":
+        if not q:
+            return False
+        kind = q.get("kind")
+
+        # Worker-route follow-up: the pending_questions row already references
+        # a session_store row. Recognize it by kind='followup' + routing='code'
+        # on the linked session.
+        if kind == "followup":
+            session_id = q.get("session_id")
+            if not session_id:
+                return False
+            session = store.get_by_session_id(session_id)
+            if not session or session.routing != "code":
+                return False
+            # Deposit the answer; the worker tick drains it via
+            # _resume_as_followup → _dispatch_code_session → resume.
+            store.deposit_answer(reply_to_message_id, text)
+            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
+            return True
+
+        if kind != "code_followup":
             return False
 
-        # Close the row so neither the worker nor a duplicate reply reprocesses it.
+        # Legacy in-memory orchestrator path.
         store.deposit_answer(reply_to_message_id, text)
         store.mark_question_processed(q["id"])
 
@@ -889,6 +927,13 @@ class TelegramBotListener:
         Routes follow-ups to Claude Code via session resume so the context is preserved.
         Returns True if the message was handled as a follow-up.
         """
+        # Worker route (#275): no FOLLOWUP_WINDOW — the operator must
+        # thread-reply to a specific completion message. A bare non-threaded
+        # message is always a fresh chat query, never an implicit follow-up,
+        # so the main feed stays independent of any /code session.
+        if settings.code_routing == "worker":
+            return False
+
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
 
@@ -914,9 +959,36 @@ class TelegramBotListener:
 
     async def _handle_code_command(self, task: str, chat_id: str):
         """Spawn a Claude Code session for the given task."""
-        from api.services.claude_orchestrator import get_orchestrator
         from api.services.directory_resolver import resolve_working_directory
 
+        working_dir = resolve_working_directory(task)
+        plan_mode = self._should_use_plan_mode(task)
+        mode_label = " (plan mode)" if plan_mode else ""
+
+        if settings.code_routing == "worker":
+            # Worker route (#275): create a routing='code' session row and
+            # let the worker pick it up on the next tick. No in-memory
+            # lock — concurrency is bounded by the worker's tick loop.
+            from api.services.agent_worker.code_spawn import spawn_code_session
+            from api.services.agent_worker.session_store import SessionStore
+
+            await send_message_async(
+                f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
+                chat_id=chat_id,
+            )
+            result = spawn_code_session(
+                SessionStore(),
+                task,
+                working_dir=working_dir,
+                plan_mode=plan_mode,
+                chat_id=chat_id,
+            )
+            if not result.get("ok"):
+                await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
+            return
+
+        # Legacy in-memory orchestrator route.
+        from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
         if orch.is_busy():
             session = orch.get_active_session()
@@ -926,10 +998,6 @@ class TelegramBotListener:
             )
             return
 
-        working_dir = resolve_working_directory(task)
-        plan_mode = self._should_use_plan_mode(task)
-
-        mode_label = " (plan mode)" if plan_mode else ""
         await send_message_async(
             f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
             chat_id=chat_id,
@@ -947,6 +1015,9 @@ class TelegramBotListener:
 
     async def _handle_code_status(self, chat_id: str):
         """Report on the active Claude Code session."""
+        if settings.code_routing == "worker":
+            await self._handle_code_status_worker(chat_id)
+            return
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
         session = orch.get_active_session()
@@ -967,8 +1038,35 @@ class TelegramBotListener:
         )
         await send_message_async(status_text, chat_id=chat_id)
 
+    async def _handle_code_status_worker(self, chat_id: str):
+        """Worker-route /code_status: list non-terminal routing='code'
+        sessions from the agent worker's session store (#275)."""
+        from api.services.agent_worker.session_store import (
+            TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="code", limit=10)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+        lines = ["*Claude Code Sessions*"]
+        for s in active:
+            elapsed = max(0, int(time.time() - (s.started_at or 0)))
+            minutes, seconds = divmod(elapsed, 60)
+            lines.append(
+                f"- `{s.session_id[:8]}` status: {s.status} "
+                f"({minutes}m {seconds}s, ${s.total_dollars:.4f})"
+            )
+        await send_message_async("\n".join(lines), chat_id=chat_id)
+
     async def _handle_code_cancel(self, chat_id: str):
         """Cancel the active Claude Code session."""
+        if settings.code_routing == "worker":
+            await self._handle_code_cancel_worker(chat_id)
+            return
         from api.services.claude_orchestrator import get_orchestrator
         orch = get_orchestrator()
 
@@ -978,6 +1076,34 @@ class TelegramBotListener:
 
         orch.cancel()
         await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
+
+    async def _handle_code_cancel_worker(self, chat_id: str):
+        """Worker-route /code_cancel: mark non-terminal routing='code'
+        sessions as FAILED so the worker won't pick them up again.
+
+        Note: a subprocess already running in a worker tick keeps running
+        until it finishes or hits the watchdog — true mid-flight subprocess
+        kill requires a cross-process signal that the worker isn't wired for
+        in this PR. The status update is enough to prevent further dispatch
+        and to surface 'cancelled' in /agents.
+        """
+        from api.services.agent_worker.session_store import (
+            STATUS_FAILED, TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="code", limit=20)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+        for s in active:
+            store.update_status(s.task_id, STATUS_FAILED)
+        await send_message_async(
+            f"Marked {len(active)} Claude Code session(s) cancelled.",
+            chat_id=chat_id,
+        )
 
     async def _handle_inspect(self, chat_id: str):
         """Show sources checked and results from the last query."""

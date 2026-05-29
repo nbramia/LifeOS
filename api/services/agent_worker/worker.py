@@ -456,12 +456,13 @@ class Worker:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
             elif session.routing == "code":
-                # /code sessions (#274). Routed through the worker only when
-                # the operator opted into the new path via LIFEOS_CODE_ROUTING.
-                # While the default is "orchestrator", any session that lands
-                # here with the flag off was created by something other than
-                # the official spawn surface — leave it claimed so it can be
-                # picked up after the flag flips rather than silently fail.
+                # /code sessions (#274/#275). Routed through the worker only
+                # when the operator opted into the new path via
+                # LIFEOS_CODE_ROUTING. While the default is "orchestrator",
+                # any session that lands here with the flag off was created
+                # by something other than the official spawn surface — leave
+                # it claimed so it can be picked up after the flag flips
+                # rather than silently fail.
                 if settings.code_routing != "worker":
                     self.transcript_store.append(
                         session.session_id, "code_routing_disabled", {
@@ -469,23 +470,7 @@ class Worker:
                         },
                     )
                     continue
-                code = self._get_code_executor()
-                # #275 will attach `working_dir` / `plan_mode` to the task
-                # dict; for #274 they fall back to CodeExecutor defaults
-                # (cwd, plan_mode=False).
-                try:
-                    outcome = code.execute(session, task)
-                except Exception as exc:
-                    logger.exception("spawned code execute crashed for %s: %s", session.task_id, exc)
-                    self.session_store.update_status(session.task_id, STATUS_FAILED)
-                    continue
-                # BLOCKED outcomes mean the session is awaiting reply (plan
-                # approval or CLARIFY). #275 registers the reply hook; for
-                # now leave the session in BLOCKED and skip `_handle_outcome`
-                # (which would log a spurious "unhandled outcome" warning).
-                if outcome.status == STATUS_BLOCKED:
-                    continue
-                self._handle_outcome(session, task, outcome)
+                self._dispatch_code_session(session, pending)
 
     def _poll_managed_sessions(self) -> None:
         """Advance all in-flight Managed Agents sessions one polling step."""
@@ -708,6 +693,18 @@ class Worker:
                 return
             self.session_store.mark_question_processed(q["id"])
             self._handle_outcome(session, task, outcome)
+            return
+
+        if session.routing == "code":
+            # /code follow-ups (#275). Hand the reply off as a fresh pending
+            # message so _dispatch_code_session drains it and resumes via
+            # CodeExecutor.resume(). Flipping status back to CLAIMED puts the
+            # session in the same shape as a freshly-claimed one — the
+            # dispatcher's resume branch keys on session.code_session_id
+            # being set, so it knows this is a resume rather than first run.
+            self.session_store.enqueue_message(sid, "operator", answer)
+            self.session_store.update_status(task_id, STATUS_CLAIMED)
+            self.session_store.mark_question_processed(q["id"])
             return
 
         if session.routing == ROUTE_CLAUDE:
@@ -1056,6 +1053,128 @@ class Worker:
             model=settings.agent_managed_model_for_tests or settings.agent_managed_model,
         )
         return self._managed_executor
+
+    def _dispatch_code_session(self, session, pending: list[dict]) -> None:
+        """Drive one ``routing='code'`` session through ``CodeExecutor`` (#275).
+
+        Handles both the fresh-spawn case (``code_session_id`` is NULL — call
+        ``execute()``) and the resume case (``code_session_id`` set — call
+        ``resume(message)`` with the latest drained pending message). On a
+        BLOCKED outcome the operator-facing reply prompt is sent via the
+        id-capturing Telegram sender and registered in ``pending_questions``
+        so a threaded reply round-trips through ``_resume_as_followup``.
+        """
+        from api.services.agent_worker.code_executor import (
+            REASON_AWAITING_CLARIFICATION,
+            REASON_AWAITING_PLAN_APPROVAL,
+        )
+        from api.services.agent_worker.code_spawn import parse_code_spawn_payload
+
+        code = self._get_code_executor()
+        sid = session.session_id
+
+        # Build the task dict + resume message from drained pending messages.
+        # Fresh spawns carry the JSON payload produced by ``spawn_code_session``;
+        # resumes carry plain reply text (enqueued by ``_resume_as_followup``
+        # below or by the Telegram reply hook).
+        is_resume = bool(session.code_session_id)
+        if is_resume:
+            resume_message = pending[0]["content"] if pending else ""
+            task: dict = {"id": session.task_id, "description": resume_message}
+            self.transcript_store.append(sid, "code_user_prompt", {
+                "text": resume_message, "resume": True,
+            })
+            try:
+                outcome = code.resume(session, resume_message)
+            except Exception as exc:
+                logger.exception("code resume crashed for %s: %s", session.task_id, exc)
+                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                return
+        else:
+            payload = parse_code_spawn_payload(pending[0]["content"]) if pending else {
+                "prompt": "", "working_dir": None, "plan_mode": False, "chat_id": None,
+            }
+            task = {
+                "id": session.task_id,
+                "description": payload["prompt"],
+                "working_dir": payload["working_dir"],
+                "plan_mode": payload["plan_mode"],
+                "chat_id": payload["chat_id"],
+            }
+            self.transcript_store.append(sid, "code_user_prompt", {
+                "text": payload["prompt"], "resume": False,
+            })
+            try:
+                outcome = code.execute(session, task)
+            except Exception as exc:
+                logger.exception("code execute crashed for %s: %s", session.task_id, exc)
+                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                return
+
+        if outcome.status == STATUS_BLOCKED:
+            if outcome.reason == REASON_AWAITING_PLAN_APPROVAL:
+                prompt = "Plan ready — reply 'approve' to proceed, 'reject' to cancel, or send feedback to refine."
+            elif outcome.reason == REASON_AWAITING_CLARIFICATION:
+                prompt = "Awaiting your reply — answer the question above to continue."
+            else:
+                prompt = "Awaiting your reply to continue."
+            try:
+                sent_ids = self._telegram_send_with_id(prompt) or []
+            except Exception as exc:
+                logger.warning("code blocked reply prompt send failed: %s", exc)
+                sent_ids = []
+            if sent_ids:
+                # kind='followup' so _resume_as_followup picks the reply up
+                # alongside agent threads (unified routing model, #248). The
+                # session.routing == 'code' tells _resume_as_followup which
+                # executor branch to take.
+                self.session_store.create_pending_question(
+                    session_id=sid,
+                    task_id=session.task_id,
+                    question=prompt,
+                    sent_message_id=sent_ids[0],
+                    sent_message_ids=sent_ids,
+                    kind="followup",
+                )
+                self.transcript_store.append(sid, "code_block_prompt_registered", {
+                    "reason": outcome.reason, "message_ids": sent_ids,
+                })
+            return
+
+        if outcome.status == STATUS_COMPLETED:
+            # Send the final assistant text (if any) to Telegram with id
+            # capture so a threaded reply can resume the session via
+            # _resume_as_followup. [NOTIFY] bodies that already streamed
+            # during execution are stripped from final_text by the executor.
+            body = outcome.final_text.strip() if outcome.final_text else ""
+            if body:
+                try:
+                    sent_ids = self._telegram_send_with_id(body) or []
+                except Exception as exc:
+                    logger.warning("code completion send failed: %s", exc)
+                    sent_ids = []
+                if sent_ids:
+                    self.session_store.create_pending_question(
+                        session_id=sid,
+                        task_id=session.task_id,
+                        question=body[:200],
+                        sent_message_id=sent_ids[0],
+                        sent_message_ids=sent_ids,
+                        kind="followup",
+                    )
+            self.transcript_store.append(sid, "code_handled_completion", {
+                "final_chars": len(body),
+            })
+            return
+
+        # FAILED / BUDGET_EXCEEDED — surface a brief operator notification.
+        # Skip _handle_outcome (which assumes an #agent vault task) since
+        # /code sessions don't have one.
+        label = "Code session"
+        if outcome.status == STATUS_BUDGET_EXCEEDED:
+            self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
+        elif outcome.status == STATUS_FAILED:
+            self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
 
     def _get_code_executor(self):
         """Lazy-construct the CodeExecutor for /code sessions (#274).
