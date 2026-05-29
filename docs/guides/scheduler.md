@@ -157,6 +157,7 @@ See [API Reference § Scheduler & Telegram Endpoints](../specs/product/api-refer
 
 ## Related Documents
 
+- [Scheduler — Technical](../specs/technical/scheduler.md) — Engineering view: store, cache, watcher, firing internals
 - [Task Management](../specs/product/task-management.md) — Tasks system (the `agent` action writes `#agent` tasks)
 - [Agent Worker](../specs/product/agent-worker.md) — Runs `action:: agent` schedules
 - [API Reference](../specs/product/api-reference.md) — Scheduler API endpoint contracts
