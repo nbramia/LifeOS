@@ -13,6 +13,7 @@ Also covers `lifeos_agent_user_ask` (agent-initiated clarification) and the
 """
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -22,7 +23,9 @@ import pytest
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
+    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
+    STATUS_FAILED,
     STATUS_RUNNING,
     SessionStore,
 )
@@ -30,6 +33,10 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import (
     BLOCKED_TAG,
+    BUDGET_EXCEEDED_TAG,
+    COMPLETED_TAG,
+    FAILED_TAG,
+    RUNNING_TAG,
     Worker,
 )
 
@@ -79,16 +86,32 @@ class _StubExecutor:
         return self.outcome
 
 
+class _SequenceExecutor:
+    """Returns a queued outcome per call (last one repeats once exhausted)."""
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+    def execute(self, session, task):
+        self.calls.append((session.task_id, task.get("description")))
+        if len(self.calls) <= len(self.outcomes):
+            return self.outcomes[len(self.calls) - 1]
+        return self.outcomes[-1]
+
+
 def _make_worker(tmp_path, api, *, preflight_caller, local_executor):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
     sent_with_ids: list[tuple[int, str]] = []
     def _send_with_id(text):
+        # Mirror send_message_capture_ids: one id per ~4096-char chunk, all
+        # returned so a reply to any chunk can be matched.
         sent.append(text)
-        msg_id = 1000 + len(sent_with_ids)
-        sent_with_ids.append((msg_id, text))
-        return msg_id
+        n_chunks = max(1, -(-len(text) // 4096))
+        chunk_ids = [1000 + len(sent_with_ids) + i for i in range(n_chunks)]
+        for cid in chunk_ids:
+            sent_with_ids.append((cid, text))
+        return chunk_ids
     store = SessionStore(db_path=tmp_path / "sessions.db")
     w = Worker(
         api_base="http://api",
@@ -334,7 +357,7 @@ def test_lifeos_agent_user_ask_blocks_and_records_question(tmp_path: Path):
     def _send_with_id(text):
         msg_id = 5000 + len(sent_with_ids)
         sent_with_ids.append((msg_id, text))
-        return msg_id
+        return [msg_id]
 
     w = Worker(
         api_base="http://api",
@@ -409,3 +432,164 @@ def test_lifeos_agent_user_ask_fails_when_telegram_unavailable(tmp_path: Path):
     assert result["error"] == "telegram_unavailable"
     # Session NOT blocked (operator-facing failure mode).
     assert store.get("t").status == STATUS_RUNNING
+
+
+# =============================================================================
+# Replyable terminal states + any-chunk matching (Issue #234)
+# =============================================================================
+
+
+@pytest.mark.unit
+def test_failed_task_registers_followup_and_reply_resumes(tmp_path: Path):
+    """A FAILED task's notification is replyable: replying resumes the session,
+    swapping the failed tag back to running, and a clean completion follows."""
+    api = FakeApi([{"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]}])
+    executor = _SequenceExecutor([
+        ExecutorOutcome(status=STATUS_FAILED, reason="boom"),
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text="fixed it"),
+    ])
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+    w.tick()
+
+    # Parked at the failed tag, and a follow-up was registered against the
+    # terminal notification's message id (kind='followup', task title as label).
+    assert FAILED_TAG in api.tasks["t1"]["tags"]
+    msg_id, _ = w._sent_with_ids[-1]
+    q = w.session_store.get_question_by_message_id(msg_id)
+    assert q is not None
+    assert q["kind"] == "followup"
+    assert q["question"] == "do the thing"
+
+    # Operator replies → deposit → next tick resumes and completes.
+    assert w.session_store.deposit_answer(msg_id, "try again")
+    w.tick()
+    assert len(executor.calls) == 2, "executor should have been re-invoked on resume"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_budget_exceeded_task_registers_followup(tmp_path: Path):
+    """BUDGET_EXCEEDED notifications are replyable too."""
+    api = FakeApi([{"id": "t1", "description": "big job", "status": "todo", "tags": ["agent"]}])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason="out of budget"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+    w.tick()
+
+    assert BUDGET_EXCEEDED_TAG in api.tasks["t1"]["tags"]
+    msg_id, _ = w._sent_with_ids[-1]
+    q = w.session_store.get_question_by_message_id(msg_id)
+    assert q is not None and q["kind"] == "followup"
+
+
+@pytest.mark.unit
+def test_reply_to_non_first_chunk_matches_and_resumes(tmp_path: Path):
+    """A long terminal notification splits into multiple Telegram chunks;
+    replying to a non-first chunk still matches the follow-up and resumes.
+
+    Uses a long FAILED reason (the failure body isn't vault-spilled, so it
+    actually exceeds one 4096-char chunk)."""
+    api = FakeApi([{"id": "t1", "description": "task", "status": "todo", "tags": ["agent"]}])
+    long_reason = "y" * 9000  # forces the notification body across 3 chunks
+    executor = _SequenceExecutor([
+        ExecutorOutcome(status=STATUS_FAILED, reason=long_reason),
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text="done again"),
+    ])
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+    w.tick()
+
+    # The notification spanned multiple chunks.
+    followup = w.session_store.get_recent_resumable_followup(within_seconds=3600)
+    assert followup is not None
+    chunk_ids = json.loads(followup["sent_message_ids"])
+    assert len(chunk_ids) >= 2, "notification should have spanned multiple chunks"
+
+    # Reply lands on the LAST chunk (not the primary first-chunk id).
+    last_chunk = chunk_ids[-1]
+    assert last_chunk != followup["sent_message_id"]
+    assert w.session_store.deposit_answer(last_chunk, "more please")
+    w.tick()
+    assert len(executor.calls) == 2, "reply to a later chunk should resume"
+
+
+@pytest.mark.unit
+def test_get_recent_resumable_followup_window(tmp_path: Path):
+    """get_recent_resumable_followup honors the time window and open-state."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    sess = store.create(
+        task_id="t1", status=STATUS_COMPLETED, routing="local",
+        budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+    )
+    store.register_completion_followup(
+        session_id=sess.session_id, task_id="t1",
+        sent_message_ids=[500, 501], label="recent task",
+    )
+    # Within window → found.
+    row = store.get_recent_resumable_followup(within_seconds=1800)
+    assert row is not None and row["task_id"] == "t1"
+
+    # Once answered, it is no longer resumable via this path.
+    assert store.deposit_answer(500, "go")
+    assert store.get_recent_resumable_followup(within_seconds=1800) is None
+
+
+@pytest.mark.unit
+def test_get_recent_resumable_followup_excludes_clarifications(tmp_path: Path):
+    """Only kind='followup' rows count — open clarifications don't trigger the
+    plain-message resume path."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    sess = store.create(
+        task_id="t1", status=STATUS_BLOCKED, routing="local",
+        budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+    )
+    store.create_pending_question(
+        session_id=sess.session_id, task_id="t1",
+        question="which one?", sent_message_id=42,
+    )
+    assert store.get_recent_resumable_followup(within_seconds=1800) is None
+
+
+@pytest.mark.unit
+def test_get_recent_resumable_followup_respects_cutoff(tmp_path: Path):
+    """A follow-up older than the window is not returned (no surprise resume)."""
+    import sqlite3
+
+    db = tmp_path / "sessions.db"
+    store = SessionStore(db_path=db)
+    sess = store.create(
+        task_id="t1", status=STATUS_COMPLETED, routing="local",
+        budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+    )
+    qid = store.register_completion_followup(
+        session_id=sess.session_id, task_id="t1",
+        sent_message_ids=[700], label="old task",
+    )
+    # Backdate the notification 31 minutes.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE pending_questions SET sent_at = sent_at - ? WHERE id = ?",
+            (31 * 60, qid),
+        )
+    assert store.get_recent_resumable_followup(within_seconds=1800) is None
+    # A wider window still finds it.
+    assert store.get_recent_resumable_followup(within_seconds=3600) is not None
+
+
+@pytest.mark.unit
+def test_native_reply_targets_specific_older_thread(tmp_path: Path):
+    """A native reply to a specific (older) thread's message id targets THAT
+    thread, not merely the most recent one."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    budget = {"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100}
+    s_old = store.create(task_id="old", status=STATUS_COMPLETED, routing="local", budget=budget)
+    s_new = store.create(task_id="new", status=STATUS_COMPLETED, routing="local", budget=budget)
+    store.register_completion_followup(
+        session_id=s_old.session_id, task_id="old", sent_message_ids=[100], label="old",
+    )
+    store.register_completion_followup(
+        session_id=s_new.session_id, task_id="new", sent_message_ids=[200], label="new",
+    )
+    # Native reply to the OLD message id deposits into the OLD follow-up only.
+    assert store.deposit_answer(100, "revisit old")
+    assert store.get_question_by_message_id(100)["answer"] == "revisit old"
+    assert store.get_question_by_message_id(200)["answer"] is None
