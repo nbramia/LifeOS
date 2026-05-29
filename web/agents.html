@@ -1688,11 +1688,24 @@
     if (!s) return;
     renderPanelHeader(s);
     fetchSessionSummary(sessionId);
+    loadSessionEvents(sessionId, 0);
+  }
 
-    // Backfill then live tail.
+  // Backfill the transcript, then open the live SSE tail. The backfill is a
+  // one-shot fetch, so a transient failure — most often the server being
+  // bounced by another agent's commit/deploy hook — would otherwise leave a
+  // dead panel ("Failed to load events") until the operator re-clicks the
+  // node. Retry a few times with backoff to ride through a restart window,
+  // then fall back to a manual Retry link (mirrors the summary's recovery).
+  // The live SSE (opened only after a successful backfill) auto-reconnects on
+  // its own, so once the server is back the feed self-heals.
+  const _EVENTS_RETRY_DELAYS = [800, 1600, 3200];  // ms; ~5.6s before giving up
+  function loadSessionEvents(sessionId, attempt) {
     fetch(`/api/agents/sessions/${encodeURIComponent(sessionId)}/events?limit=200`)
-      .then(r => r.json())
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(payload => {
+        // Bail if the operator switched sessions while we were loading.
+        if (sessionId !== selectedSessionId) return;
         const events = payload.events || [];
         // Default kind-filter to user_message when any exist — most of the
         // time the operator just wants to skim the user prompts. If there
@@ -1700,6 +1713,8 @@
         if (events.some(ev => (ev.kind || '') === 'user_message')) {
           eventKindFilter = 'user_message';
         }
+        const container = document.getElementById('events');
+        if (container) container.innerHTML = '';  // clear any reconnect/error notice
         events.forEach(ev => appendEvent(ev, false));
         applyEventFilter();
         // Now open live SSE.
@@ -1712,8 +1727,24 @@
         es.onerror = () => {}; // browser auto-retries
       })
       .catch(err => {
-        const e = document.getElementById('events');
-        if (e) e.innerHTML = `<div class="event">Failed to load events: ${escapeHtml(String(err))}</div>`;
+        // Stale — the operator moved to another session; let that load win.
+        if (sessionId !== selectedSessionId) return;
+        const container = document.getElementById('events');
+        if (!container) return;
+        if (attempt < _EVENTS_RETRY_DELAYS.length) {
+          container.innerHTML = '<div class="event">Loading events… (reconnecting)</div>';
+          setTimeout(() => {
+            if (sessionId === selectedSessionId) loadSessionEvents(sessionId, attempt + 1);
+          }, _EVENTS_RETRY_DELAYS[attempt]);
+        } else {
+          container.innerHTML = `<div class="event">Failed to load events: ${escapeHtml(String(err))} <a href="#" data-action="retry-events" style="color:var(--accent)">Retry</a></div>`;
+          const retry = container.querySelector('[data-action="retry-events"]');
+          if (retry) retry.addEventListener('click', ev => {
+            ev.preventDefault();
+            container.innerHTML = '<div class="event">Loading events…</div>';
+            loadSessionEvents(sessionId, 0);
+          });
+        }
       });
   }
 
