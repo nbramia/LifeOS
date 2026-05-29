@@ -795,38 +795,36 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
-def _find_live_wezterm_socket(xdg_runtime_dir: str | None) -> str | None:
-    """Return the path to a wezterm-gui socket whose owning PID is alive.
+def _enumerate_live_wezterm_sockets(
+    xdg_runtime_dir: str | None,
+) -> list[tuple[float, str, int]]:
+    """List `(mtime, socket_path, pid)` for every live wezterm-gui process.
 
-    Scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*`. Each filename ends in
-    the wezterm-gui process's pid; we keep only sockets whose pid
-    responds to a `kill -0` liveness check (filters out stale sockets
-    left behind by crashed wezterm-gui processes). If multiple GUI
-    instances are running, pick the most-recently-modified socket
-    (the user's "current" wezterm typically being the one they just
-    interacted with).
+    Scans `$XDG_RUNTIME_DIR/wezterm/gui-sock-*`. Each filename ends in the
+    wezterm-gui process's pid; we keep only sockets whose pid responds to
+    a `kill -0` liveness check (filters out stale sockets left behind by
+    crashed wezterm-gui processes).
 
-    Returns None if no live socket exists, leaving wezterm cli to fall
-    back to its default discovery.
+    Returns an empty list if the runtime dir is missing or unreadable.
+    Sort by mtime descending to get the most-recently-active GUI first.
     """
     import os
 
     if not xdg_runtime_dir:
-        return None
+        return []
     sock_dir = os.path.join(xdg_runtime_dir, "wezterm")
     if not os.path.isdir(sock_dir):
-        return None
-    candidates: list[tuple[float, str]] = []
+        return []
     try:
         names = os.listdir(sock_dir)
     except OSError:
-        return None
+        return []
+    out: list[tuple[float, str, int]] = []
     for name in names:
         if not name.startswith("gui-sock-"):
             continue
-        pid_str = name[len("gui-sock-"):]
         try:
-            pid = int(pid_str)
+            pid = int(name[len("gui-sock-"):])
         except ValueError:
             continue
         try:
@@ -838,11 +836,48 @@ def _find_live_wezterm_socket(xdg_runtime_dir: str | None) -> str | None:
             mtime = os.stat(path).st_mtime
         except OSError:
             mtime = 0.0
-        candidates.append((mtime, path))
+        out.append((mtime, path, pid))
+    return out
+
+
+def _find_live_wezterm_socket(xdg_runtime_dir: str | None) -> str | None:
+    """Return the path to a wezterm-gui socket whose owning PID is alive.
+
+    If multiple GUI instances are running, pick the most-recently-modified
+    socket (the user's "current" wezterm typically being the one they just
+    interacted with). Returns None if no live socket exists, leaving
+    wezterm cli to fall back to its default discovery.
+    """
+    candidates = _enumerate_live_wezterm_sockets(xdg_runtime_dir)
     if not candidates:
         return None
     candidates.sort(reverse=True)
     return candidates[0][1]
+
+
+def _live_wezterm_pids(xdg_runtime_dir: str | None) -> set[int]:
+    """Return the set of PIDs of all currently-live wezterm-gui processes.
+
+    Used by /focus to validate a cached `session_id → pane_id` mapping: pane
+    ids reset on wezterm restart, so if the pid that wrote the mapping is
+    no longer in the live set, the cache entry is stale.
+    """
+    return {pid for _mtime, _path, pid in _enumerate_live_wezterm_sockets(xdg_runtime_dir)}
+
+
+def _current_wezterm_pid(xdg_runtime_dir: str | None) -> int:
+    """Return the PID of the user's "current" wezterm-gui process — the one
+    whose socket was modified most recently. Used at upsert time so the
+    cached mapping records which wezterm boot it belongs to.
+
+    Returns 0 if no live wezterm is reachable; the upsert path treats 0 as
+    "unknown" and the focus path treats it as stale (forces a re-probe).
+    """
+    candidates = _enumerate_live_wezterm_sockets(xdg_runtime_dir)
+    if not candidates:
+        return 0
+    candidates.sort(reverse=True)
+    return candidates[0][2]
 
 
 def _notify_dock(env: dict[str, str], summary: str, body: str) -> None:
@@ -1189,7 +1224,10 @@ async def resume_claude_code_session(
     if pane_id is not None:
         try:
             from api.services.cc_wezterm_store import get_default_store
-            get_default_store().upsert(session_id, pane_id, target.decoded_cwd)
+            wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
+            get_default_store().upsert(
+                session_id, pane_id, target.decoded_cwd, wezterm_pid=wezterm_pid,
+            )
         except Exception as exc:  # noqa: BLE001 — store failure is non-fatal
             logger.warning("cc_wezterm_store upsert failed for %s: %s", session_id, exc)
 
@@ -1331,7 +1369,18 @@ async def cc_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, A
     cwd = body.cwd or ""
 
     from api.services.cc_wezterm_store import get_default_store
-    mapping = get_default_store().upsert(storage_id, int(body.pane_id), cwd)
+    # Capture the live wezterm-gui pid so /focus can invalidate the mapping
+    # across wezterm restarts. The hook runs inside a wezterm pane so a
+    # live gui is expected; if none is discoverable (e.g. XDG_RUNTIME_DIR
+    # missing from the systemd env), wezterm_pid=0 makes the mapping
+    # invalidate on first focus, which falls through to the probe — still
+    # correct, just doesn't save the round trip.
+    import os
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    wezterm_pid = _current_wezterm_pid(xdg)
+    mapping = get_default_store().upsert(
+        storage_id, int(body.pane_id), cwd, wezterm_pid=wezterm_pid,
+    )
     return {
         "bound": True,
         "session_id": storage_id,
@@ -1401,11 +1450,22 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
         pane_id = cc_pane_locate.locate_pane_for_transcript(m.jsonl_path, env=env)
         if pane_id is None:
             return None
-        store.upsert(session_id, pane_id, m.decoded_cwd or "")
+        wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
+        store.upsert(session_id, pane_id, m.decoded_cwd or "", wezterm_pid=wezterm_pid)
         return pane_id
 
     mapping = store.get(session_id)
     probed_this_request = False
+
+    # Invalidate the cache across wezterm restarts. Pane ids reset when
+    # wezterm-gui restarts, so a cached pane_id from a dead wezterm could
+    # silently activate an unrelated session's pane in the new wezterm.
+    # `wezterm_pid=0` covers pre-#257 rows that have no boot id recorded.
+    if mapping is not None:
+        live_pids = _live_wezterm_pids(env.get("XDG_RUNTIME_DIR"))
+        if mapping.wezterm_pid == 0 or mapping.wezterm_pid not in live_pids:
+            store.delete(session_id)
+            mapping = None
 
     if mapping is None:
         # No cache → probe before giving up.

@@ -671,7 +671,10 @@ def test_focus_calls_activate_pane_when_mapping_exists(
 ):
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
-    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj")
+    # Pin a wezterm boot id so the post-#257 invalidation check accepts
+    # this cached mapping rather than discarding it as stale.
+    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj", wezterm_pid=99001)
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
 
     captured: dict[str, object] = {}
 
@@ -712,7 +715,10 @@ def test_focus_returns_410_and_clears_mapping_when_activate_fails(
     mapping and returns 410 so the UI can prompt for Resume."""
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
-    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj")
+    # Mark the cached mapping as belonging to the current wezterm boot so
+    # the #257 invalidation doesn't short-circuit before activate-pane runs.
+    wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj", wezterm_pid=99001)
+    monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
 
     class _Failed:
         returncode = 1

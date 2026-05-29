@@ -71,3 +71,68 @@ def test_db_path_parent_is_created(tmp_path):
     s = CCWezTermStore(db_path=nested)
     assert nested.parent.exists()
     s.close()
+
+
+# ---------------------------------------------------------------------------
+# #257 — wezterm_pid column + migration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_upsert_records_wezterm_pid(store):
+    m = store.upsert("cc:abc", pane_id=4, cwd="/x", wezterm_pid=12345)
+    assert m.wezterm_pid == 12345
+    fetched = store.get("cc:abc")
+    assert fetched.wezterm_pid == 12345
+
+
+@pytest.mark.unit
+def test_upsert_defaults_wezterm_pid_to_zero(store):
+    """Callers that don't know the boot id (or write paths where wezterm
+    isn't discoverable) still work — the focus endpoint will treat the
+    row as stale and re-probe on first access.
+    """
+    m = store.upsert("cc:abc", pane_id=4, cwd="/x")
+    assert m.wezterm_pid == 0
+
+
+@pytest.mark.unit
+def test_migration_adds_wezterm_pid_column_to_pre_257_db(tmp_path):
+    """Open a DB without the wezterm_pid column, then re-open with the
+    current store — the column must be added and existing rows default
+    to 0 (treated as stale at read time).
+    """
+    import sqlite3
+    db = tmp_path / "cc_wezterm.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE panes (
+            session_id  TEXT PRIMARY KEY,
+            pane_id     INTEGER NOT NULL,
+            cwd         TEXT NOT NULL,
+            created_at  INTEGER NOT NULL
+        );
+        INSERT INTO panes(session_id, pane_id, cwd, created_at)
+        VALUES ('cc:legacy', 7, '/old/repo', 100);
+    """)
+    conn.commit()
+    conn.close()
+
+    store = CCWezTermStore(db_path=db)
+    m = store.get("cc:legacy")
+    assert m is not None
+    assert m.pane_id == 7
+    assert m.wezterm_pid == 0  # DEFAULT 0 — invalidated on first focus
+    store.close()
+
+
+@pytest.mark.unit
+def test_migration_is_idempotent_on_already_current_schema(tmp_path):
+    """Opening the same DB twice does not error or duplicate the column."""
+    db = tmp_path / "cc_wezterm.db"
+    s1 = CCWezTermStore(db_path=db)
+    s1.upsert("cc:x", pane_id=1, cwd="/a", wezterm_pid=42)
+    s1.close()
+    s2 = CCWezTermStore(db_path=db)
+    assert s2.get("cc:x").wezterm_pid == 42
+    s2.close()
