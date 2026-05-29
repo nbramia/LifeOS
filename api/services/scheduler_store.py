@@ -73,6 +73,8 @@ class ScheduleEntry:
     last_triggered_at: Optional[str] = None
     next_trigger_at: Optional[str] = None
     timezone: str = ""  # resolved from settings.timezone when empty
+    last_status: str = ""  # outcome of the most recent fire (sent/suppressed/handed-off/failed)
+    last_result: str = ""  # short snippet of the most recent fire's result
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -448,8 +450,31 @@ class SchedulerStore:
             self._rewrite_line(entry)
             self._save()
 
+    def record_run(self, entry_id: str, status: str, result: str = ""):
+        """Record the outcome of the most recent fire for the dashboard.
+
+        ``last_status``/``last_result`` live only in the index cache (not the
+        markdown definition), so this just refreshes the cache and dashboard.
+        """
+        with self._lock:
+            entry = self._entries.get(entry_id)
+            if not entry:
+                return
+            entry.last_status = status
+            entry.last_result = (result or "")[:200]
+            self._save()
+
     def get_due_reminders(self) -> list[ScheduleEntry]:
-        """Return enabled schedules due to fire (90s cooldown to dedupe restarts)."""
+        """Return enabled schedules due to fire (90s cooldown to dedupe restarts).
+
+        Missed-fire policy — **run-once catch-up**: a schedule whose trigger
+        elapsed while the server was down is past-due on the next tick after
+        startup, so it fires exactly once (the 90s cooldown dedupes overlapping
+        restarts). Cron schedules then advance to their next future slot; a
+        missed one-off fires once and disables. We deliberately do not replay
+        every window missed during an outage — at most one catch-up per
+        schedule.
+        """
         now = datetime.now(timezone.utc)
         due = []
         for entry in self._entries.values():
@@ -537,6 +562,10 @@ class SchedulerStore:
             entry.created_at = prior.created_at
         if not entry.last_triggered_at:
             entry.last_triggered_at = prior.last_triggered_at
+        if not entry.last_status:
+            entry.last_status = prior.last_status
+        if not entry.last_result:
+            entry.last_result = prior.last_result
 
     # ------------------------------------------------------------------
     # Dashboard
@@ -610,13 +639,15 @@ class SchedulerStore:
         if fired:
             lines += [
                 "",
-                "| Name | Fired | Action |",
-                "|------|-------|--------|",
+                "| Name | Fired | Action | Outcome | Result |",
+                "|------|-------|--------|---------|--------|",
             ]
             for e in fired[:20]:
                 tz = e.timezone or settings.timezone
                 when = _format_dt_short(e.last_triggered_at, tz) if e.last_triggered_at else "never"
-                lines.append(f"| {e.name} | {when} | {self._action_label(e)} |")
+                outcome = e.last_status or "—"
+                result = (e.last_result or "").replace("|", "\\|").replace("\n", " ")[:80] or "—"
+                lines.append(f"| {e.name} | {when} | {self._action_label(e)} | {outcome} | {result} |")
         else:
             lines.append("\n_Nothing fired yet._")
         lines.append("")
@@ -633,11 +664,11 @@ class SchedulerScheduler:
     """
     Background thread that fires due schedules every 60 seconds.
 
-    Firing dispatch (notify/prompt/endpoint/agent generalisation) is refined in
-    #245; for now it preserves the legacy message_type behaviour:
-    - static  → send message_content via Telegram
-    - prompt  → run message_content through chat_via_api, send result
-    - endpoint→ call LifeOS API endpoint, send formatted result
+    Firing dispatches on ``entry.action`` (see ``_fire_entry``):
+    - notify   → send message_content via Telegram
+    - prompt   → run message_content through chat_via_api, send result
+    - endpoint → call LifeOS API endpoint, send formatted result
+    - agent    → write an #agent task for the agent worker to run
 
     Crash recovery:
     - Auto-restarts with exponential backoff (5s → 60s cap)
@@ -784,7 +815,7 @@ class SchedulerScheduler:
             try:
                 if self._read_control_file():
                     for entry in self.store.get_due_reminders():
-                        await self._fire_reminder(entry)
+                        await self._fire_entry(entry)
                 else:
                     logger.debug("Scheduler paused via control file")
             except Exception as e:
@@ -815,20 +846,41 @@ class SchedulerScheduler:
             logger.debug(f"Pre-meeting check failed, running pipeline: {e}")
             return False
 
-    async def _fire_reminder(self, entry: ScheduleEntry):
-        """Execute a single schedule with retry and execution logging."""
+    async def _fire_entry(self, entry: ScheduleEntry):
+        """Execute a single schedule, dispatching on ``entry.action``.
+
+        Actions:
+        - ``notify``   — send the static ``message_content`` via Telegram
+        - ``prompt``   — run ``message_content`` through the chat pipeline (with
+          retry) and send the result via Telegram
+        - ``endpoint`` — call a LifeOS API endpoint and send the formatted result
+        - ``agent``    — write an ``#agent`` task (carrying the executor tag) into
+          ``LifeOS/Tasks/Inbox.md`` so the existing agent worker runs it
+
+        For ``notify``/``prompt`` the Telegram message is suppressed when the
+        result is empty or a suppression sentinel (e.g. ``NO_MEETING``). Every
+        fire records ``last_status``/``last_result`` for the dashboard's
+        Recently-Fired section.
+        """
         import time as _time
-        logger.info(f"Firing schedule: {entry.name} ({entry.id})")
+        logger.info(f"Firing schedule: {entry.name} ({entry.id}, action={entry.action})")
 
         # Advance next_trigger_at BEFORE generating/sending to prevent
         # duplicate fires on server restart or scheduler re-entry.
         self.store.mark_triggered(entry.id)
 
-        if entry.message_type == "prompt" and self._should_skip_pre_meeting(entry):
+        if entry.action == "prompt" and self._should_skip_pre_meeting(entry):
+            self.store.record_run(entry.id, "skipped", "no upcoming meeting")
             return
 
         start = _time.monotonic()
         try:
+            if entry.action == "agent":
+                handoff = self._hand_off_to_agent(entry)
+                logger.info(f"Schedule {entry.name}: handed off to agent worker — {handoff}")
+                self.store.record_run(entry.id, "handed-off", handoff)
+                return
+
             message, exec_log = await self._generate_message(entry)
             elapsed = _time.monotonic() - start
 
@@ -841,14 +893,25 @@ class SchedulerScheduler:
                     f"{elapsed:.1f}s"
                 )
 
-            if message and not self._should_suppress(message):
+            # Generalised suppression: notify/prompt with empty or sentinel
+            # results produce no notification.
+            if entry.action in ("notify", "prompt") and (
+                not message or self._should_suppress(message)
+            ):
+                logger.info(f"Schedule {entry.name}: suppressed (no actionable content)")
+                self.store.record_run(entry.id, "suppressed", "")
+                return
+
+            if message:
                 from api.services.telegram import send_message_async
                 await send_message_async(f"*{entry.name}*\n\n{message}")
-            elif message and self._should_suppress(message):
-                logger.info(f"Schedule {entry.name}: suppressed (no actionable content)")
+                self.store.record_run(entry.id, "sent", message[:200])
+            else:
+                self.store.record_run(entry.id, "empty", "")
         except Exception as e:
             elapsed = _time.monotonic() - start
             logger.error(f"Failed to fire schedule {entry.id} after {elapsed:.1f}s: {e}")
+            self.store.record_run(entry.id, "failed", str(e)[:200])
             try:
                 from api.services.telegram import send_message_async
                 await send_message_async(
@@ -858,16 +921,36 @@ class SchedulerScheduler:
             except Exception:
                 logger.error(f"Failed to send error notification for schedule {entry.id}")
 
+    # Back-compat alias: the HTTP trigger route and older tests call _fire_reminder.
+    _fire_reminder = _fire_entry
+
+    def _hand_off_to_agent(self, entry: ScheduleEntry) -> str:
+        """Write an ``#agent`` task so the existing agent worker runs the prompt.
+
+        The schedule's executor tag (``local`` / ``cloud`` / ``cloud-haiku`` /
+        ``cloud-sonnet``) is passed straight through as a task tag — the agent
+        worker's preflight routes on it, so no new execution path is needed.
+        """
+        from api.services.task_manager import get_task_manager
+        tags = ["agent"]
+        if entry.executor:
+            tags.append(entry.executor.lstrip("#"))
+        task = get_task_manager().create(
+            description=entry.message_content or entry.name,
+            tags=tags,
+        )
+        return f"task {task.id} (tags: {', '.join('#' + t for t in tags)})"
+
     async def _generate_message(self, entry: ScheduleEntry) -> tuple[Optional[str], Optional[dict]]:
-        """Generate the message content for a schedule."""
-        if entry.message_type == "static":
+        """Generate the message content for a schedule, dispatching on action."""
+        if entry.action == "notify":
             return entry.message_content, None
-        elif entry.message_type == "prompt":
+        elif entry.action == "prompt":
             return await self._execute_prompt_reminder(entry)
-        elif entry.message_type == "endpoint":
+        elif entry.action == "endpoint":
             return await self._call_endpoint(entry.endpoint_config), None
         else:
-            logger.warning(f"Unknown message type: {entry.message_type}")
+            logger.warning(f"Unsupported action for message generation: {entry.action}")
             return None, None
 
     async def _execute_prompt_reminder(

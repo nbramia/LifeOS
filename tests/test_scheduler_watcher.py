@@ -102,11 +102,16 @@ class TestEndToEnd:
                                    on_change=store.reindex_file)
         watcher.start()
         try:
+            # Let the observer thread spin up before editing (it can be starved
+            # under heavy parallel test load, so give it a moment).
+            time.sleep(0.2)
             content = store.inbox_path.read_text(encoding="utf-8")
             patched = content.replace("[cron:: 0 9 * * *]", "[cron:: 0 10 * * *]")
             store.inbox_path.write_text(patched, encoding="utf-8")
 
-            for _ in range(50):
+            # Generous poll window (~6s) so the filesystem event + debounce can
+            # land even when CPUs are saturated by xdist workers.
+            for _ in range(120):
                 if store.get(entry.id).schedule_value == "0 10 * * *":
                     break
                 time.sleep(0.05)
