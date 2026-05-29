@@ -486,3 +486,76 @@ def test_no_content_live_session_not_cached(summary_db):
     # A live session may gain content later, so the fallback must NOT be
     # cached — the next access should retry.
     assert avs.get_cached_summary(sid, 1000.0, status=STATUS_RUNNING) is None
+
+
+# ---------------------------------------------------------------------------
+# Manual label overrides — a node name the operator pins by hand, overriding
+# the auto-derived label everywhere. Store + PUT endpoint + snapshot wiring.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def label_override_db(tmp_path: Path, monkeypatch):
+    """Point the label-override store at a temp DB."""
+    from api.services import agent_viz_label_override as alo
+
+    monkeypatch.setattr(alo, "_DB_PATH", str(tmp_path / "label_overrides.db"))
+    alo._init_db()
+    alo.reset_cache()
+    return alo
+
+
+@pytest.mark.unit
+def test_label_override_set_get_clear(label_override_db):
+    alo = label_override_db
+    assert alo.get_override("s1") is None
+    assert alo.set_override("s1", "  My Custom Name  ") == "My Custom Name"
+    assert alo.get_override("s1") == "My Custom Name"
+    # Empty / blank clears the override.
+    assert alo.set_override("s1", "   ") == ""
+    assert alo.get_override("s1") is None
+
+
+@pytest.mark.unit
+def test_label_override_persists_across_cache_reset(label_override_db):
+    alo = label_override_db
+    alo.set_override("s1", "Durable Label")
+    alo.reset_cache()  # forces a reload from disk
+    assert alo.get_override("s1") == "Durable Label"
+
+
+@pytest.mark.unit
+def test_label_override_clamps_length(label_override_db):
+    alo = label_override_db
+    stored = alo.set_override("s1", "x" * 500)
+    assert len(stored) == 120
+    assert stored.endswith("…")
+
+
+@pytest.mark.unit
+def test_put_label_sets_and_clears(client, stores, label_override_db):
+    session_store, _ = stores
+    s = session_store.create(task_id="t-rename", status=STATUS_RUNNING)
+
+    r = client.put(
+        f"/api/agents/sessions/{s.session_id}/label",
+        json={"label": "Renamed Session"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"session_id": s.session_id, "custom_label": "Renamed Session"}
+
+    # Snapshot surfaces the override so the node + panel can use it.
+    snap = client.get("/api/agents/snapshot").json()
+    sess = next(x for x in snap["sessions"] if x["session_id"] == s.session_id)
+    assert sess["custom_label"] == "Renamed Session"
+
+    # Empty label clears it (revert to auto-naming).
+    r2 = client.put(
+        f"/api/agents/sessions/{s.session_id}/label",
+        json={"label": ""},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["custom_label"] is None
+    snap2 = client.get("/api/agents/snapshot").json()
+    sess2 = next(x for x in snap2["sessions"] if x["session_id"] == s.session_id)
+    assert sess2["custom_label"] is None

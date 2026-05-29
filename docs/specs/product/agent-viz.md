@@ -121,7 +121,7 @@ Chips re-compute after every snapshot tick, so toggling `include finished` immed
 
 Clicking any node opens a panel on the right with that session's metadata header and a live-tailing event feed. The panel header carries:
 
-- **Label** — derived from the task description (LifeOS), or the first non-empty user message (Claude Code), or the session id as a fallback.
+- **Label** — derived from the task description (LifeOS), or the first non-empty user message (Claude Code), or the session id as a fallback. **Click it to rename:** the title becomes a text box prepopulated with the current name; Enter (or clicking away) saves, Escape cancels. A manual name is pinned durably and overrides the auto-derived label and the AI summary label everywhere the node is named (graph node, panel, search). Saving an empty value clears the override and reverts to auto-naming.
 - **cwd** — Claude Code only; the project directory the session was opened in.
 - **Status badge** — same status the node is colored by, with `(inferred)` if applicable.
 - **Source** — `LifeOS agent` or `Claude Code`.

@@ -23,6 +23,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services import agent_viz_summary
+from api.services import agent_viz_label_override
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,9 @@ def _session_to_dict(s: Session, transcript: TranscriptStore) -> dict[str, Any]:
         "short_label": _short_label_for_snapshot(
             s.session_id, s.last_activity_at or 0.0, s.status or "",
         ),
+        # Operator-pinned manual label. When set, the frontend uses it as the
+        # node name in preference to short_label and label.
+        "custom_label": agent_viz_label_override.get_override(s.session_id),
     }
 
 
@@ -244,14 +248,16 @@ def _build_snapshot() -> dict[str, Any]:
     # the short_label field — attach it the same way (cached-only, no LLM in
     # the snapshot path).
     for sd in cc_sessions:
+        sid = sd.get("session_id") or ""
         sd.setdefault(
             "short_label",
             _short_label_for_snapshot(
-                sd.get("session_id") or "",
+                sid,
                 sd.get("last_activity_at") or 0.0,
                 sd.get("status") or "",
             ),
         )
+        sd["custom_label"] = agent_viz_label_override.get_override(sid)
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
 
@@ -374,6 +380,23 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         status=status,
     )
     return {"session_id": session_id, **result.as_dict()}
+
+
+class LabelOverrideRequest(BaseModel):
+    """Body for PUT /api/agents/sessions/{id}/label."""
+    label: str = Field(default="", max_length=200)
+
+
+@router.put("/sessions/{session_id}/label")
+async def set_session_label(session_id: str, body: LabelOverrideRequest) -> dict[str, Any]:
+    """Set or clear an operator-pinned manual label for a session node.
+
+    A non-empty label overrides the auto-derived node name (AI short_label /
+    task description) everywhere it's shown. An empty label clears the
+    override and reverts the node to auto-naming. Durable across restarts.
+    """
+    custom = agent_viz_label_override.set_override(session_id, body.label)
+    return {"session_id": session_id, "custom_label": custom or None}
 
 
 @router.get("/search")
