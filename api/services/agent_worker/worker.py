@@ -456,20 +456,10 @@ class Worker:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
             elif session.routing == "code":
-                # /code sessions (#274/#275). Routed through the worker only
-                # when the operator opted into the new path via
-                # LIFEOS_CODE_ROUTING. While the default is "orchestrator",
-                # any session that lands here with the flag off was created
-                # by something other than the official spawn surface — leave
-                # it claimed so it can be picked up after the flag flips
-                # rather than silently fail.
-                if settings.code_routing != "worker":
-                    self.transcript_store.append(
-                        session.session_id, "code_routing_disabled", {
-                            "code_routing": settings.code_routing,
-                        },
-                    )
-                    continue
+                # /code sessions (#274/#275). After #276 retired
+                # ClaudeOrchestrator this is the only dispatch path — the
+                # LIFEOS_CODE_ROUTING flag was dropped along with the
+                # legacy executor.
                 self._dispatch_code_session(session, pending)
 
     def _poll_managed_sessions(self) -> None:

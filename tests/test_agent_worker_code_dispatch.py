@@ -1,13 +1,7 @@
 """Worker dispatch wiring for routing='code' sessions (#274).
 
-Verifies:
-  - `_dispatch_spawned_sessions` invokes the injected CodeExecutor for
-    operator-origin sessions with routing='code' when LIFEOS_CODE_ROUTING
-    is set to 'worker'.
-  - With the flag at its default 'orchestrator' value, the same session is
-    left in CLAIMED state and the executor is never called — i.e., the new
-    code path is dead and the legacy ClaudeOrchestrator continues to own
-    `/code` traffic.
+Verifies that ``_dispatch_spawned_sessions`` invokes the injected
+``CodeExecutor`` for operator-origin sessions with ``routing='code'``.
 """
 from __future__ import annotations
 
@@ -19,7 +13,6 @@ import pytest
 
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
-    STATUS_CLAIMED,
     STATUS_COMPLETED,
     SessionStore,
 )
@@ -73,35 +66,24 @@ def _seed_code_session(store: SessionStore, *, task_id: str = "code-1"):
     return session
 
 
-def test_dispatch_calls_code_executor_when_flag_is_worker(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("LIFEOS_CODE_ROUTING", "worker")
-    monkeypatch.setattr(
-        "api.services.agent_worker.worker.settings.code_routing", "worker"
-    )
+def test_dispatch_calls_code_executor(tmp_path: Path):
+    """``_dispatch_spawned_sessions`` invokes the injected CodeExecutor for
+    an operator-origin routing='code' session, draining the prompt from
+    ``pending_messages`` as the task description.
+
+    Status transitions are the executor's responsibility (the real
+    ``CodeExecutor`` calls ``update_status``; the stub doesn't, so we don't
+    assert on ``session.status`` here).
+    """
+    # The dispatch path expects the spawn payload (a JSON-encoded dict)
+    # produced by ``code_spawn.spawn_code_session``; the stub call's task
+    # description is the decoded ``prompt`` field.
     stub = _StubCodeExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done."))
     w = _make_worker(tmp_path, code_executor=stub)
     _seed_code_session(w.session_store, task_id="code-1")
 
     w._dispatch_spawned_sessions()
 
-    # Executor was invoked exactly once with the seeded prompt drained from
-    # pending_messages. Status transitions are the executor's responsibility
-    # (the real CodeExecutor calls update_status; the stub doesn't, which is
-    # why we don't assert on session.status here).
+    # The seeded pending message is the bare string "print hello"; the
+    # JSON-decode falls back to treating the whole content as the prompt.
     assert stub.calls == [("code-1", "print hello")]
-
-
-def test_dispatch_skips_code_executor_when_flag_is_orchestrator(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(
-        "api.services.agent_worker.worker.settings.code_routing", "orchestrator"
-    )
-    stub = _StubCodeExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done."))
-    w = _make_worker(tmp_path, code_executor=stub)
-    _seed_code_session(w.session_store, task_id="code-2")
-
-    w._dispatch_spawned_sessions()
-
-    assert stub.calls == []
-    refreshed = w.session_store.get("code-2")
-    # Left CLAIMED so a later flag flip can pick it up. No FAILED transition.
-    assert refreshed.status == STATUS_CLAIMED

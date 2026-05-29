@@ -1,12 +1,14 @@
 # Claude Code Orchestration Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-05-29
 > **Audience:** Operators
 
 Run Claude Code tasks remotely from Telegram. Send `/code <task>` and get results back as messages.
 
-> **For what `/code` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). **For implementation** (subprocess spawning, stream parsing, plan/clarification flow), see [Claude Code Orchestration — technical spec](../specs/technical/claude-code-orchestration.md). This file is the operator how-to.
+> **Architecture note (#276):** `/code` now runs through the unified agent worker (`api/services/agent_worker/code_executor.py`) rather than the retired in-memory `ClaudeOrchestrator`. Operator behavior is unchanged: `/code <task>`, threaded replies for follow-up, `/code_status`, `/code_cancel`. Sessions are now persisted, so a threaded reply still resumes a `/code` session after a server restart. The `LIFEOS_CLAUDE_*` env vars are still the budget knobs.
+
+> **For what `/code` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). This file is the operator how-to.
 
 ## Prerequisites
 

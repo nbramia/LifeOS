@@ -1,16 +1,11 @@
 """Drives a headless Claude Code CLI subprocess from inside the agent worker.
 
 Mirrors the executor surface used by `LocalExecutor` / `ManagedExecutor` so the
-worker can route `routing="code"` sessions uniformly. The subprocess machinery
-itself (CLI invocation, stream-json parsing, [NOTIFY]/[CLARIFY] extraction,
-heartbeat, watchdog) was lifted from `api/services/claude_orchestrator.py`;
-the difference here is that all session state — the CLI's session UUID,
-transcript events, status transitions — is persisted via `SessionStore` and
-`TranscriptStore` rather than held in module-level dicts, so sessions survive
-worker restarts and surface in the `/agents` UI.
-
-This module is dead code on the live path until `settings.code_routing` is
-flipped to "worker" (default is "orchestrator"). See #248 for the rollout plan.
+worker can route `routing="code"` sessions uniformly. All session state — the
+CLI's session UUID, transcript events, status transitions — is persisted via
+`SessionStore` and `TranscriptStore`, so sessions survive worker restarts and
+surface in the `/agents` UI. After #276 retired ``ClaudeOrchestrator``, this is
+the only executor for ``/code``.
 """
 from __future__ import annotations
 
@@ -42,9 +37,9 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-# Heartbeat / [NOTIFY] / [CLARIFY] semantics match claude_orchestrator's
-# observed behavior so /code's surface stays identical between the legacy and
-# worker paths during the rollout window.
+# Heartbeat / [NOTIFY] / [CLARIFY] semantics carried over from the original
+# /code orchestrator (retired in #276) so the operator-facing surface is
+# unchanged.
 HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 
@@ -203,7 +198,7 @@ class CodeExecutor:
     Surface mirrors `LocalExecutor`: a single `execute(session, task)` call
     drives the subprocess to a terminal `ExecutorOutcome`. The worker's
     `_dispatch_spawned_sessions` calls this when `session.routing == "code"`
-    and `settings.code_routing == "worker"`.
+    (#276 retired the orchestrator path, so this is the only route).
 
     Constructor injection points:
       - `notification_callback` — invoked with each [NOTIFY] body during the

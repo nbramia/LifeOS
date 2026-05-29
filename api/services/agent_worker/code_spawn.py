@@ -11,10 +11,8 @@ Mirrors ``operator_spawn.create_operator_session`` in shape, but skips
 preflight entirely — the route is explicit and the per-task budget reuses
 the existing Claude Code wall/cost knobs (``LIFEOS_CLAUDE_TIMEOUT`` etc.).
 
-This helper does not check ``settings.code_routing``. The caller (the
-Telegram listener or ``/code`` HTTP route) is responsible for flag-gating
-so the legacy ``ClaudeOrchestrator`` path remains the default until
-``#276`` flips the switch and ``#276`` retires this module's sibling.
+After #276 retired ``ClaudeOrchestrator`` this is the only ``/code`` spawn
+entry point; the Telegram listener and `/code` HTTP route call it directly.
 """
 from __future__ import annotations
 
