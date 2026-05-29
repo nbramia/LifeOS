@@ -128,3 +128,119 @@ class TestAgentThreadsUI:
         page.wait_for_timeout(500)
         assert self.state["replies"], "reply POST should have fired"
         assert self.state["replies"][0]["text"] == "also CC the property manager"
+
+    def test_small_thread_renders_without_load_earlier(self, page: Page):
+        # The 2-turn fixture is below the cap, so no "load earlier" control
+        # appears and both turns render — small threads stay unchanged (#270).
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        expect(page.locator(".agent-thread-banner")).to_be_visible(timeout=8000)
+        expect(page.locator(".thread-load-earlier")).to_have_count(0)
+        expect(page.locator("#messages .message")).to_have_count(2)
+
+    def test_tool_details_pre_is_built_lazily(self, page: Page):
+        # The collapsed <details> exists but its <pre> is only built on expand,
+        # so a thread with many tool calls doesn't serialize every input up-front.
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        expect(page.locator(".agent-tool-details summary")).to_contain_text("lifeos_gmail_draft")
+        expect(page.locator(".agent-tool-details pre")).to_have_count(0)
+        page.locator(".agent-tool-details summary").first.click()
+        expect(page.locator(".agent-tool-details pre")).to_contain_text("landlord@example.com")
+
+
+def _large_conversation(n_turns: int):
+    """Alternating user/assistant turns; assistant turns carry a tool call."""
+    conv = []
+    for i in range(n_turns):
+        if i % 2 == 0:
+            conv.append({"role": "user", "text": f"user message {i}", "tools": []})
+        else:
+            conv.append({"role": "assistant", "text": f"assistant message {i}",
+                         "tools": [{"name": "lifeos_search", "input": {"q": f"query {i}"}}]})
+    return conv
+
+
+class TestLargeThreadRendering:
+    """#270 — a thread with a very large transcript must render bounded, not
+    freeze the renderer, while keeping full history reachable."""
+
+    N_TURNS = 90  # well above THREAD_INITIAL_TURNS (30)
+
+    @pytest.fixture(autouse=True)
+    def setup(self, page: Page):
+        page.set_viewport_size(DESKTOP_VIEWPORT)
+        conv = _large_conversation(self.N_TURNS)
+        self.state = {
+            "threads": [{
+                "session_id": "sess_big", "task_id": "op_big",
+                "parent_session_id": None, "status": "completed",
+                "label": "huge transcript", "resumable": True,
+                "routing": "claude", "model_label": "Sonnet",
+            }],
+            "detail": {
+                "thread": {"session_id": "sess_big", "task_id": "op_big", "status": "completed",
+                           "label": "huge transcript", "resumable": True,
+                           "routing": "claude", "model_label": "Sonnet"},
+                "conversation": conv,
+            },
+            "spawned": [], "replies": [],
+        }
+        _install_agent_mocks(page, self.state)
+        page.goto("http://localhost:8000")
+        page.wait_for_selector("#agentsPanel")
+
+    def test_initial_render_is_capped_to_newest_turns(self, page: Page):
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        expect(page.locator(".agent-thread-banner")).to_be_visible(timeout=8000)
+        # Only the newest 30 turns render initially, not all 90.
+        expect(page.locator("#messages .message")).to_have_count(30)
+        # The newest turn is present; an early (hidden) turn is not.
+        expect(page.locator("#messages")).to_contain_text(f"message {self.N_TURNS - 1}")
+        expect(page.locator("#messages")).not_to_contain_text("user message 0")
+
+    def test_load_earlier_control_reveals_hidden_turns(self, page: Page):
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        btn = page.locator(".thread-load-earlier")
+        expect(btn).to_be_visible(timeout=8000)
+        expect(btn).to_contain_text("60 hidden")  # 90 - 30 shown
+        btn.click()
+        # Another chunk of 30 loads in; 60 turns now shown, 30 still hidden.
+        expect(page.locator("#messages .message")).to_have_count(60)
+        expect(btn).to_contain_text("30 hidden")
+
+    def test_full_history_reachable_via_repeated_load(self, page: Page):
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        btn = page.locator(".thread-load-earlier")
+        expect(btn).to_be_visible(timeout=8000)
+        btn.click()  # 60 shown
+        btn.click()  # 90 shown — all loaded
+        expect(page.locator("#messages .message")).to_have_count(self.N_TURNS)
+        # Button removes itself once nothing is left to load.
+        expect(page.locator(".thread-load-earlier")).to_have_count(0)
+        expect(page.locator("#messages")).to_contain_text("user message 0")
+
+    def test_poll_rerender_preserves_expanded_history(self, page: Page):
+        # When new turns land on an active thread (the poll path re-renders),
+        # any history the user expanded via "load earlier" must not collapse
+        # back to the newest-N tail.
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        btn = page.locator(".thread-load-earlier")
+        expect(btn).to_be_visible(timeout=8000)
+        btn.click()  # 60 shown, earliestShown == 30
+        expect(page.locator("#messages .message")).to_have_count(60)
+        # Simulate the poll re-render: two new turns appended, re-rendered with
+        # the expanded depth preserved (exactly what pollThreadForUpdate does).
+        shown_after = page.evaluate(
+            """(n) => {
+                const conv = [];
+                for (let i = 0; i < n + 2; i++) {
+                    conv.push({ role: i % 2 ? 'assistant' : 'user', text: 'm' + i, tools: [] });
+                }
+                renderThreadConversation(conv, threadRender.earliestShown);
+                return document.querySelectorAll('#messages .message').length;
+            }""",
+            self.N_TURNS,
+        )
+        # Was showing turns [30, 92): the 60 already-visible plus the 2 new ones.
+        assert shown_after == 62, f"expected expansion preserved (62), got {shown_after}"
+        expect(page.locator("#messages")).to_contain_text("m30")
+        expect(page.locator("#messages")).not_to_contain_text("m29")

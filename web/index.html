@@ -2509,6 +2509,8 @@
         .agent-thread-banner { font-size: 0.85rem; padding: 0.6rem 0.8rem; margin-bottom: 0.8rem; border-radius: 8px; background: rgba(45,95,163,0.15); border: 1px solid rgba(45,95,163,0.4); }
         .agent-thread-exit { margin-left: 0.5rem; font-size: 0.74rem; padding: 0.15rem 0.5rem; border-radius: 6px; border: none; cursor: pointer; background: #2d5fa3; color: #fff; }
         .agent-thread-empty { opacity: 0.6; font-size: 0.85rem; padding: 0.5rem 0.2rem; }
+        .thread-load-earlier { display: block; width: 100%; margin: 0 0 0.8rem; font-size: 0.8rem; padding: 0.45rem 0.6rem; border-radius: 8px; cursor: pointer; border: 1px solid rgba(45,95,163,0.4); background: rgba(45,95,163,0.12); color: inherit; }
+        .thread-load-earlier:hover { background: rgba(45,95,163,0.22); }
         .agent-tool-details { margin: -0.4rem 0 0.8rem 0.5rem; }
         .agent-tool-details details { font-size: 0.76rem; margin-bottom: 0.2rem; }
         .agent-tool-details summary { cursor: pointer; opacity: 0.75; }
@@ -3030,8 +3032,20 @@
             scrollToBottom();
         }
 
-        function renderThreadConversation(conversation) {
+        // Cap how many turns the thread view builds up-front. Sessions with
+        // hundreds of turns (each potentially emitting large tool inputs) would
+        // otherwise produce a massive DOM in one synchronous pass and freeze the
+        // renderer (#270). Older turns stay reachable via the "load earlier"
+        // control.
+        const THREAD_INITIAL_TURNS = 30;
+        let threadRender = null;  // { conversation, earliestShown, loadBtn }
+
+        // preserveFrom: when re-rendering an already-open thread (e.g. a poll
+        // update appended new turns), keep at least as much history visible as
+        // the user had expanded, so "load earlier" scrollback isn't collapsed.
+        function renderThreadConversation(conversation, preserveFrom = null) {
             messagesEl.innerHTML = '';
+            threadRender = null;
             const t = currentAgentThread || {};
             const banner = document.createElement('div');
             banner.className = 'agent-thread-banner';
@@ -3049,19 +3063,66 @@
                 empty.className = 'agent-thread-empty';
                 empty.textContent = 'No conversation recorded yet for this thread.';
                 messagesEl.appendChild(empty);
+                return;
             }
-            conversation.forEach(turn => {
+
+            let start = Math.max(0, conversation.length - THREAD_INITIAL_TURNS);
+            if (preserveFrom != null) {
+                start = Math.min(start, Math.max(0, Math.min(preserveFrom, conversation.length)));
+            }
+            threadRender = { conversation, earliestShown: start, loadBtn: null };
+            if (start > 0) {
+                const btn = document.createElement('button');
+                btn.className = 'thread-load-earlier';
+                btn.onclick = loadEarlierThreadTurns;
+                messagesEl.appendChild(btn);
+                threadRender.loadBtn = btn;
+            }
+            // Build the visible tail into a fragment so the whole batch lands in
+            // one reflow (and without per-turn smooth-scroll thrash).
+            messagesEl.appendChild(renderThreadTurns(conversation, start, conversation.length));
+            updateLoadEarlierLabel();
+        }
+
+        // Render conversation[from, to) into a detached fragment.
+        function renderThreadTurns(conversation, from, to) {
+            const frag = document.createDocumentFragment();
+            for (let i = from; i < to; i++) {
+                const turn = conversation[i];
                 const role = turn.role === 'user' ? 'user' : 'assistant';
                 const body = (turn.text || '').trim()
                     || ((turn.tools && turn.tools.length) ? '_(ran tools — see below)_' : '');
-                addMessage(body, role);
+                addMessage(body, role, [], null, frag);
                 if (role === 'assistant' && turn.tools && turn.tools.length) {
-                    appendToolDetails(turn.tools);
+                    appendToolDetails(turn.tools, frag);
                 }
-            });
+            }
+            return frag;
         }
 
-        function appendToolDetails(tools) {
+        function updateLoadEarlierLabel() {
+            const st = threadRender;
+            if (!st || !st.loadBtn) return;
+            const remaining = st.earliestShown;
+            if (remaining <= 0) { st.loadBtn.remove(); st.loadBtn = null; return; }
+            const chunk = Math.min(THREAD_INITIAL_TURNS, remaining);
+            st.loadBtn.textContent =
+                '⬆ Load ' + chunk + ' earlier message' + (chunk === 1 ? '' : 's') +
+                ' (' + remaining + ' hidden)';
+        }
+
+        function loadEarlierThreadTurns() {
+            const st = threadRender;
+            if (!st || !st.loadBtn) return;
+            const newStart = Math.max(0, st.earliestShown - THREAD_INITIAL_TURNS);
+            const frag = renderThreadTurns(st.conversation, newStart, st.earliestShown);
+            st.loadBtn.after(frag);  // insert the older turns right below the button
+            st.earliestShown = newStart;
+            updateLoadEarlierLabel();
+        }
+
+        function appendToolDetails(tools, target) {
+            const container = target || messagesEl;
             const wrap = document.createElement('div');
             wrap.className = 'agent-tool-details';
             tools.forEach(tl => {
@@ -3069,15 +3130,22 @@
                 const sum = document.createElement('summary');
                 sum.textContent = '🔧 ' + (tl.name || 'tool');
                 det.appendChild(sum);
-                const pre = document.createElement('pre');
-                let inputStr;
-                try { inputStr = JSON.stringify(tl.input, null, 2); }
-                catch (e) { inputStr = String(tl.input); }
-                pre.textContent = inputStr;
-                det.appendChild(pre);
+                // Serialize the tool input lazily, only on first expand. Building
+                // a <pre> for every tool call up-front is what hangs large
+                // threads (#270); collapsed details stay cheap.
+                det.addEventListener('toggle', () => {
+                    if (!det.open || det.dataset.built) return;
+                    det.dataset.built = '1';
+                    const pre = document.createElement('pre');
+                    let inputStr;
+                    try { inputStr = JSON.stringify(tl.input, null, 2); }
+                    catch (e) { inputStr = String(tl.input); }
+                    pre.textContent = inputStr;
+                    det.appendChild(pre);
+                });
                 wrap.appendChild(det);
             });
-            messagesEl.appendChild(wrap);
+            container.appendChild(wrap);
         }
 
         function updateThreadComposer() {
@@ -3141,7 +3209,9 @@
                         currentAgentThread.convCount = conv.length;
                         currentAgentThread.resumable = !!thread.resumable;
                         currentAgentThread.status = (thread.status || '').toString();
-                        renderThreadConversation(conv);
+                        // Keep any history the user expanded via "load earlier".
+                        const keepFrom = threadRender ? threadRender.earliestShown : null;
+                        renderThreadConversation(conv, keepFrom);
                         updateThreadComposer();
                         scrollToBottom();
                         if (thread.resumable) { clearInterval(iv); loadAgentThreads(); }
@@ -3648,7 +3718,7 @@
             sendMessage();
         }
 
-        function addMessage(content, type, sources = [], messageId = null) {
+        function addMessage(content, type, sources = [], messageId = null, target = null) {
             // Remove welcome message if exists
             const welcome = messagesEl.querySelector('.welcome');
             if (welcome) welcome.remove();
@@ -3701,8 +3771,11 @@
             }
 
             msg.innerHTML = html;
-            messagesEl.appendChild(msg);
-            scrollToBottom();
+            // When rendering into a detached target (e.g. bulk thread render),
+            // append there and skip the per-message scroll; the caller scrolls
+            // once after the batch lands.
+            (target || messagesEl).appendChild(msg);
+            if (!target) scrollToBottom();
 
             return msg;
         }
