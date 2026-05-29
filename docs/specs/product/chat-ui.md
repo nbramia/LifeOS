@@ -183,7 +183,7 @@ The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable vi
 
 ## Email Composition
 
-### P7.1: Email Drafting
+### P7.1: Email Drafting & Sending
 
 **Status:** Complete
 
@@ -192,6 +192,7 @@ The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable vi
 - Creates Gmail draft with proper formatting
 - Returns link to open draft in Gmail
 - Supports both personal and work accounts
+- **Gated sending:** even a request phrased as "send an email to X" always drafts first, presents the draft, and waits for explicit confirmation. Only after the user confirms in a later turn is the draft sent. A draft created in the current turn cannot be sent in that same turn (enforced structurally, not just by prompt).
 
 ---
 
