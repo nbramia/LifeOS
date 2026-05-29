@@ -9,7 +9,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `google-oauth.md` — Google OAuth setup for Gmail and Calendar
 - `slack-integration.md` — Slack workspace integration
 - `launchd-setup.md` — macOS launchd service configuration
-- `reminders.md` — Reminder system setup and management
+- `scheduler.md` — Scheduler (triggers + actions): cron/one-off, notify/prompt/endpoint/agent
 - `scripts.md` — Available scripts and their usage
 - `troubleshooting.md` — Common issues and solutions
 - `claude-code-orchestration.md` — Claude Code multi-agent orchestration patterns

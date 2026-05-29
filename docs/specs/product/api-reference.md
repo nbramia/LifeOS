@@ -24,7 +24,7 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two
 9. [People Endpoints](#people-endpoints)
 10. [Photos Endpoints](#photos-endpoints)
 11. [Task Endpoints](#task-endpoints)
-12. [Reminders & Telegram Endpoints](#reminders--telegram-endpoints)
+12. [Scheduler & Telegram Endpoints](#scheduler--telegram-endpoints)
 13. [Monarch Money Endpoints](#monarch-money-endpoints)
 14. [Job Queue Endpoints](#job-queue-endpoints)
 15. [Performance Trace Endpoints](#performance-trace-endpoints)
@@ -90,7 +90,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `person_info` | Lookup or briefing (action: lookup/briefing) |
 | `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
-| `manage_reminders` | Create or list reminders (action: create/list) |
+| `manage_schedules` | Create or list schedules (action: create/list; schedule_action: notify/prompt/endpoint/agent). `manage_reminders` kept as a deprecated alias |
 | `create_email_draft` | Gmail draft |
 | `create_calendar_event` | Create a Google Calendar event |
 | `update_calendar_event` | Update a Google Calendar event |
@@ -509,35 +509,37 @@ Delete a task.
 
 ---
 
-## Reminders & Telegram Endpoints
+## Scheduler & Telegram Endpoints
 
-Reminders can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Reminders Guide](../guides/REMINDERS.md).
+Schedules can also be created, edited, listed, and deleted via natural language through the chat interface (`POST /api/ask/stream`). See [Scheduler Guide](../guides/scheduler.md).
 
-### POST /api/reminders
+> The legacy `/api/reminders*` endpoints remain mounted as deprecation-logged aliases over the same store.
 
-Create a scheduled reminder. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `message_type` of `static`, `prompt` (runs through chat pipeline), or `endpoint` (calls a LifeOS API endpoint).
+### POST /api/scheduler
 
-### GET /api/reminders
+Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `action` of `notify` (static text), `prompt` (runs through the chat pipeline), `endpoint` (calls a LifeOS API endpoint), or `agent` (hands off to the agent worker via an `#agent` task, with `executor` = `local`/`cloud`/`cloud-haiku`/`cloud-sonnet`).
 
-List all reminders.
+### GET /api/scheduler
 
-### GET /api/reminders/{id}
+List all schedules.
 
-Get a specific reminder.
+### GET /api/scheduler/{id}
 
-### PUT /api/reminders/{id}
+Get a specific schedule.
 
-Update a reminder.
+### PUT /api/scheduler/{id}
 
-### DELETE /api/reminders/{id}
+Update a schedule.
 
-Delete a reminder.
+### DELETE /api/scheduler/{id}
 
-### POST /api/reminders/{id}/trigger
+Delete a schedule.
 
-Manually trigger a reminder (for testing).
+### POST /api/scheduler/{id}/trigger
 
-### POST /api/reminders/send
+Manually fire a schedule (for testing).
+
+### POST /api/scheduler/send
 
 Send an ad-hoc message via Telegram.
 
@@ -613,7 +615,7 @@ Cancel a pending job. Only pending jobs can be cancelled.
 
 ### GET /health
 
-Basic health check. Verifies API key and reminder scheduler status.
+Basic health check. Verifies API key and scheduler status.
 
 ### GET /health/full
 

@@ -73,7 +73,7 @@ Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference:
 | [Installation](docs/guides/installation.md) | [Google OAuth](docs/guides/google-oauth.md) | [API Reference](docs/specs/product/api-reference.md) |
 | [Configuration](docs/guides/configuration.md) | [Slack Integration](docs/guides/slack-integration.md) | [Scripts](docs/guides/scripts.md) |
 | [First Run](docs/guides/first-run.md) | [Task Management](docs/specs/product/task-management.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
-|  | [Reminders](docs/guides/reminders.md) | [Agent Worker](docs/specs/product/agent-worker.md) |
+|  | [Scheduler](docs/guides/scheduler.md) | [Agent Worker](docs/specs/product/agent-worker.md) |
 |  | [Launchd Setup](docs/guides/launchd-setup.md) (macOS) | |
 |  | [Agent Worker Setup](docs/guides/agent-worker-setup.md) | |
 
@@ -161,7 +161,7 @@ The orchestrator LLM defaults to Claude Haiku via the Anthropic API (`LIFEOS_LLM
 - **General knowledge**: "What's the capital of France?" → orchestrator answers directly without calling tools
 - **Web search**: "What's the weather in NYC?" → orchestrator calls `search_web`
 - **Personal data**: "What did I discuss with John last week?" → orchestrator calls `search_vault` / `search_email` / `search_calendar`
-- **Compound**: "Look up the trash schedule and remind me the night before" → orchestrator chains `search_web` + `manage_reminders`
+- **Compound**: "Look up the trash schedule and remind me the night before" → orchestrator chains `search_web` + `manage_schedules`
 
 ### CRM UI
 
