@@ -2497,6 +2497,9 @@
         .agent-thread.active { background: rgba(45,95,163,0.25); outline: 1px solid #2d5fa3; }
         .agent-thread-top { display: flex; align-items: center; gap: 0.4rem; }
         .agent-thread-label { flex: 1; font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .agent-route { font-size: 0.62rem; padding: 0.1rem 0.4rem; border-radius: 999px; white-space: nowrap; }
+        .agent-route.cloud { background: #2a2140; color: #c4a7ff; }
+        .agent-route.local { background: #1f3a33; color: #7fe0c4; }
         .agent-badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
         .agent-badge.running { background: #1e3a5f; color: #7fb4ff; }
         .agent-badge.completed { background: #1e4620; color: #7ad17f; }
@@ -2956,6 +2959,17 @@
             } catch (e) { /* worker/API offline — leave the panel as-is */ }
         }
 
+        // Local (Gemma) vs cloud (Claude/Managed Agents) indicator for an agent
+        // thread, derived from its routing. `model_label` (Sonnet/Opus/…) is the
+        // tooltip. Returns '' for unknown routing.
+        function routeBadgeHtml(routing, modelLabel) {
+            const r = (routing || '').toString();
+            const tip = escapeHtml((modelLabel || (r === 'claude' ? 'Cloud' : 'Local')).toString());
+            if (r === 'claude') return '<span class="agent-route cloud" title="' + tip + '">☁ cloud</span>';
+            if (r === 'local') return '<span class="agent-route local" title="' + tip + '">🖥 local</span>';
+            return '';
+        }
+
         function renderAgentThreads(threads) {
             const list = document.getElementById('agentsThreadsList');
             if (!list) return;
@@ -2979,6 +2993,7 @@
                 div.innerHTML =
                     '<div class="agent-thread-top">' +
                         '<span class="agent-thread-label" title="' + labelAttr + '">' + label + '</span>' +
+                        routeBadgeHtml(t.routing, t.model_label) +
                         '<span class="agent-badge ' + escapeHtml(status) + '">' + (escapeHtml(status) || '?') + '</span>' +
                     '</div>';
                 list.appendChild(div);
@@ -3003,6 +3018,8 @@
                 resumable: !!thread.resumable,
                 label: (thread.label || sessionId).toString(),
                 status: (thread.status || '').toString(),
+                routing: (thread.routing || '').toString(),
+                modelLabel: (thread.model_label || '').toString(),
                 convCount: conversation.length,
             };
             chatTitle.textContent = '🧵 ' + currentAgentThread.label;
@@ -3022,7 +3039,8 @@
                 ? 'Replies below continue this thread.'
                 : 'This thread is ' + escapeHtml(t.status || '') + ' — read-only until it finishes.';
             banner.innerHTML =
-                '🧵 Agent thread · <strong>' + escapeHtml(t.label || '') + '</strong> — ' + cont +
+                '🧵 Agent thread ' + routeBadgeHtml(t.routing, t.modelLabel) +
+                ' · <strong>' + escapeHtml(t.label || '') + '</strong> — ' + cont +
                 ' <button class="agent-thread-exit" onclick="exitAgentThread()">Exit to chat</button>';
             messagesEl.appendChild(banner);
 
