@@ -344,28 +344,37 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_timeout_closes_code_followup_without_nudge(tmp_path: Path):
-    """A stale code_followup row (#237) is timed out (closed) but does NOT get
-    the agent-worker 'still waiting / re-tag with #agent' nudge — it points at a
-    Claude Code session, not an #agent task."""
-    api = FakeApi([])
-    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
-    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+def test_init_migrates_legacy_code_followup_rows_processed(tmp_path: Path):
+    """Schema cleanup (#277): legacy ``kind='code_followup'`` rows left over
+    from the retired ClaudeOrchestrator are unresumable after #276. The
+    SessionStore init sweep marks any open ones as ``processed=1`` +
+    ``timed_out=1`` so the worker's drain loop and the timeout sweeper
+    leave them alone instead of looping or nudging."""
+    from api.services.agent_worker.session_store import SessionStore
 
-    qid = w.session_store.create_pending_question(
-        session_id="claude_xyz", task_id="code_claude_xyz",
+    # First open the DB and seed a legacy row directly — this mirrors what
+    # the production DB would contain post-#276 if a /code completion went
+    # un-replied for a while.
+    store = SessionStore(db_path=tmp_path / "s.db")
+    qid = store.create_pending_question(
+        session_id="claude_legacy", task_id="code_claude_legacy",
         question="fix the bug", sent_message_id=77, kind="code_followup",
     )
-    with w.session_store._connect() as conn:
+    # Force the row open even though create_pending_question stores
+    # processed=0 by default — we want to assert the migration handles
+    # genuinely-open rows.
+    with store._connect() as conn:
         conn.execute(
-            "UPDATE pending_questions SET sent_at = ? WHERE id = ?",
-            (int(time.time()) - 4 * 86400, qid),
+            "UPDATE pending_questions SET processed = 0, timed_out = 0 WHERE id = ?",
+            (qid,),
         )
-
-    w._timeout_stale_clarifications()
-
-    assert w.session_store.get_question_by_message_id(77)["timed_out"] == 1
-    assert not any("still waiting on your reply" in s for s in w._sent)
+    # Re-open the store; _init_db's migration runs again on the second open
+    # and should mark the row closed.
+    store2 = SessionStore(db_path=tmp_path / "s.db")
+    del store2  # silence unused-binding lint; the constructor was the point
+    row = store.get_question_by_message_id(77)
+    assert row["processed"] == 1
+    assert row["timed_out"] == 1
 
 
 @pytest.mark.unit
@@ -738,10 +747,12 @@ def test_operator_completion_skips_vault_mutations(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_worker_skips_code_followup_rows(tmp_path: Path):
-    """code_followup rows (#237) point at a Claude Code session, not an
-    agent-worker session — the worker must skip them (mark processed) without
-    crashing or dispatching anything."""
+def test_worker_does_not_dispatch_for_legacy_code_followup_rows(tmp_path: Path):
+    """After #277, legacy ``code_followup`` rows are auto-closed by the
+    SessionStore init migration. Even if one is created mid-flight (an
+    extremely unlikely race with a downgrade) and answered, the worker
+    never dispatches anything for it because the row is pre-marked
+    processed and ``list_answered_unprocessed_questions`` skips it."""
     api = FakeApi([])
     executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="x"))
     w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
@@ -750,9 +761,12 @@ def test_worker_skips_code_followup_rows(tmp_path: Path):
         session_id="claude_xyz", task_id="code_claude_xyz", question="t",
         sent_message_id=50, kind="code_followup",
     )
-    assert w.session_store.deposit_answer(50, "answer")
+    # Re-init the store to trigger the cleanup migration on the existing row.
+    from api.services.agent_worker.session_store import SessionStore
+    SessionStore(db_path=w.session_store.db_path)
+    w.session_store.deposit_answer(50, "answer")
 
-    w.tick()  # must not crash on the code_followup row
+    w.tick()  # must not crash and must not dispatch anything for the legacy row
 
     assert w.session_store.get_question_by_message_id(50)["processed"] == 1
-    assert executor.calls == []  # nothing dispatched for a /code row
+    assert executor.calls == []

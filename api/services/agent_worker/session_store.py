@@ -302,6 +302,17 @@ class SessionStore:
             # Set only for routing="code" sessions; NULL for everything else.
             if "code_session_id" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN code_session_id TEXT")
+            # Idempotent cleanup of the legacy `code_followup` pending_question
+            # kind (#277). #237 used these rows to register a Claude Code
+            # completion against the in-memory ClaudeOrchestrator. After #276
+            # retired the orchestrator the rows are unresumable — mark any
+            # leftovers processed so the worker's clarification-answer loop
+            # doesn't try to drain them and the timeout sweeper doesn't keep
+            # nudging the operator.
+            conn.execute(
+                "UPDATE pending_questions SET processed = 1, timed_out = 1 "
+                "WHERE kind = 'code_followup' AND processed = 0"
+            )
             # Idempotent migrations for the runaway detection counters on
             # managed_cursor (#139 Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
@@ -1062,8 +1073,8 @@ class SessionStore:
         `sent_message_id` matches — on any chunk — or None.
 
         Read-only sibling of `deposit_answer`: lets a caller inspect the matched
-        row's `kind` and route the reply (e.g. a `code_followup` resumes Claude
-        Code rather than the agent worker) before recording an answer.
+        row's `kind` before recording an answer (e.g. so the Telegram listener
+        can recognize a ``routing='code'`` follow-up).
         """
         with self._connect() as conn:
             row = conn.execute(
