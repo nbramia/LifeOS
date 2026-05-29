@@ -86,11 +86,16 @@ class SendMessageRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Routes (static paths MUST come before {reminder_id} to avoid capture)
+#
+# DEPRECATED: this surface is an alias kept for back-compat. New code should
+# use /api/scheduler (see api/routes/scheduler.py). It shares the same
+# underlying store, so reminders and schedules are the same records.
 # ---------------------------------------------------------------------------
 
 @router.post("", response_model=ReminderResponse)
 async def create_reminder(request: CreateReminderRequest):
-    """Create a new scheduled reminder."""
+    """Create a new scheduled reminder. DEPRECATED — use POST /api/scheduler."""
+    logger.warning("DEPRECATED /api/reminders POST — use /api/scheduler instead")
     if request.schedule_type not in ("once", "cron"):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
     if request.message_type not in ("static", "prompt", "endpoint"):

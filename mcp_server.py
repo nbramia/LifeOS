@@ -204,6 +204,30 @@ CURATED_ENDPOINTS = {
         "method": "DELETE",
         "path": "/api/reminders/{reminder_id}"
     },
+    "/api/scheduler:POST": {
+        "name": "lifeos_schedule_create",
+        "description": "Create a schedule. schedule_type=once|cron; action=notify|prompt|endpoint|agent (agent writes an #agent task, executor=local|cloud|cloud-haiku|cloud-sonnet).",
+        "method": "POST",
+        "path": "/api/scheduler"
+    },
+    "/api/scheduler:GET": {
+        "name": "lifeos_schedule_list",
+        "description": "List all schedules with their action, status, next trigger time, and last outcome.",
+        "method": "GET",
+        "path": "/api/scheduler"
+    },
+    "/api/scheduler/{schedule_id}:PUT": {
+        "name": "lifeos_schedule_update",
+        "description": "Update a schedule by schedule_id (from lifeos_schedule_list). Only provided fields change.",
+        "method": "PUT",
+        "path": "/api/scheduler/{schedule_id}"
+    },
+    "/api/scheduler/{schedule_id}:DELETE": {
+        "name": "lifeos_schedule_delete",
+        "description": "Delete a schedule by ID. Use lifeos_schedule_list first to find the ID.",
+        "method": "DELETE",
+        "path": "/api/scheduler/{schedule_id}"
+    },
     "/api/reminders/send": {
         "name": "lifeos_telegram_send",
         "description": "Send an immediate message via Telegram. Use for ad-hoc notifications or testing. Requires Telegram to be configured.",
@@ -674,6 +698,46 @@ class LifeOSMCPServer:
                     "reminder_id": {"type": "string", "description": "ID of the reminder to delete (from lifeos_reminder_list)"}
                 },
                 "required": ["reminder_id"]
+            },
+            "lifeos_schedule_create": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable name for the schedule"},
+                    "schedule_type": {"type": "string", "description": "'once' (ISO datetime) or 'cron' (cron expression)"},
+                    "schedule_value": {"type": "string", "description": "ISO datetime (e.g., 2026-06-03T15:05:00) or cron expression (e.g., 0 9 * * 6)"},
+                    "action": {"type": "string", "description": "'notify' (static text), 'prompt' (run chat pipeline), 'endpoint' (call API), or 'agent' (hand off to the agent worker)"},
+                    "message_content": {"type": "string", "description": "Static text, natural-language prompt, or agent task description"},
+                    "endpoint_config": {"type": "object", "description": "For action=endpoint: {endpoint, method, params}"},
+                    "executor": {"type": "string", "description": "For action=agent: 'local', 'cloud', 'cloud-haiku', or 'cloud-sonnet'"},
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True}
+                },
+                "required": ["name", "schedule_type", "schedule_value", "action"]
+            },
+            "lifeos_schedule_list": {
+                "type": "object",
+                "properties": {}
+            },
+            "lifeos_schedule_update": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": {"type": "string", "description": "Schedule ID from lifeos_schedule_list"},
+                    "name": {"type": "string", "description": "Display name"},
+                    "schedule_type": {"type": "string", "description": "'once' or 'cron'"},
+                    "schedule_value": {"type": "string", "description": "ISO datetime or cron expression"},
+                    "action": {"type": "string", "description": "'notify', 'prompt', 'endpoint', or 'agent'"},
+                    "message_content": {"type": "string", "description": "Message text, prompt, or task description"},
+                    "executor": {"type": "string", "description": "For action=agent: local | cloud | cloud-haiku | cloud-sonnet"},
+                    "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active"}
+                },
+                "required": ["schedule_id"]
+            },
+            "lifeos_schedule_delete": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": {"type": "string", "description": "ID of the schedule to delete (from lifeos_schedule_list)"}
+                },
+                "required": ["schedule_id"]
             },
             "lifeos_sync_trigger": {
                 "type": "object",
@@ -1553,6 +1617,39 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_reminder_delete":
             return f"Reminder deleted: {data.get('id', 'unknown')}"
+
+        elif tool_name in ("lifeos_schedule_create", "lifeos_schedule_update"):
+            name = data.get("name", "")
+            verb = "created" if tool_name.endswith("create") else "updated"
+            action = data.get("action", "")
+            executor = data.get("executor", "")
+            label = f"{action} (#{executor})" if action == "agent" and executor else action
+            next_trigger = data.get("next_trigger_at", "not scheduled")
+            return (f"Schedule {verb}: **{name}** (ID: {data.get('id', '')})\n"
+                    f"Action: {label} | Next: {next_trigger}")
+
+        elif tool_name == "lifeos_schedule_delete":
+            return f"Schedule deleted: {data.get('id', 'unknown')}"
+
+        elif tool_name == "lifeos_schedule_list":
+            schedules = data.get("schedules", [])
+            if not schedules:
+                return "No schedules configured."
+            text = f"Found {len(schedules)} schedules:\n\n"
+            for s in schedules:
+                status = "enabled" if s.get("enabled") else "disabled"
+                emoji = "🗓️" if s.get("enabled") else "🔕"
+                action = s.get("action", "")
+                executor = s.get("executor", "")
+                label = f"{action} (#{executor})" if action == "agent" and executor else action
+                text += f"{emoji} **{s.get('name', 'Untitled')}** ({status})\n"
+                text += f"  Action: {label} | Schedule: {s.get('schedule_type', '')} `{s.get('schedule_value', '')}`\n"
+                if s.get("next_trigger_at"):
+                    text += f"  Next: {s['next_trigger_at']}\n"
+                if s.get("last_status"):
+                    text += f"  Last outcome: {s['last_status']}\n"
+                text += f"  ID: {s.get('id', '')}\n\n"
+            return text
 
         elif tool_name == "lifeos_sync_trigger":
             return f"Sync triggered: {data.get('message', data.get('status', 'started'))}"
