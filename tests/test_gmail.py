@@ -354,6 +354,23 @@ class TestGmailServiceDraft:
 
         assert draft is None
 
+    def test_sends_draft(self, gmail_service):
+        """Should send an existing draft by ID and return the message ID."""
+        gmail_service._service.users().drafts().send().execute.return_value = {"id": "sent-msg-1"}
+
+        message_id = gmail_service.send_draft("draft123")
+
+        assert message_id == "sent-msg-1"
+        gmail_service._service.users().drafts().send.assert_called()
+
+    def test_send_draft_handles_error(self, gmail_service):
+        """Should return None when the send fails."""
+        gmail_service._service.users().drafts().send().execute.side_effect = Exception("API Error")
+
+        message_id = gmail_service.send_draft("draft123")
+
+        assert message_id is None
+
 
 class TestGmailDraftAPI:
     """Test Gmail draft API endpoint."""
@@ -466,3 +483,46 @@ class TestGmailDraftAPI:
             )
 
             assert response.status_code == 200
+
+    def test_send_draft_endpoint(self, mock_gmail_service):
+        """Should send a draft via the send endpoint."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_gmail_service.send_draft.return_value = "sent-msg-1"
+
+        with patch('api.routes.gmail.get_gmail_service', return_value=mock_gmail_service):
+            client = TestClient(app)
+            response = client.post(
+                "/api/gmail/send",
+                json={"draft_id": "draft123"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["message_id"] == "sent-msg-1"
+            mock_gmail_service.send_draft.assert_called_once_with("draft123")
+
+    def test_send_draft_requires_draft_id(self, mock_gmail_service):
+        """Should reject a send with a missing/blank draft_id."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        with patch('api.routes.gmail.get_gmail_service', return_value=mock_gmail_service):
+            client = TestClient(app)
+            response = client.post("/api/gmail/send", json={"draft_id": "   "})
+
+            assert response.status_code == 400
+
+    def test_send_draft_failure_returns_500(self, mock_gmail_service):
+        """Should return 500 when the underlying send fails."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_gmail_service.send_draft.return_value = None
+
+        with patch('api.routes.gmail.get_gmail_service', return_value=mock_gmail_service):
+            client = TestClient(app)
+            response = client.post("/api/gmail/send", json={"draft_id": "draft123"})
+
+            assert response.status_code == 500

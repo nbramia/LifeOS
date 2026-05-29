@@ -58,6 +58,17 @@ class DraftResponse(BaseModel):
     gmail_url: str = Field(..., description="URL to open draft in Gmail")
 
 
+class DraftSendRequest(BaseModel):
+    """Request model for sending an existing draft."""
+    draft_id: str = Field(..., description="The Gmail draft ID to send (from a prior create-draft call)")
+
+
+class SendResponse(BaseModel):
+    """Response model for a sent message."""
+    message_id: str = Field(..., description="ID of the sent message")
+    source_account: str
+
+
 def _message_to_response(msg: EmailMessage) -> EmailResponse:
     """Convert EmailMessage to API response."""
     return EmailResponse(
@@ -228,3 +239,47 @@ async def create_draft(
         raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create draft: {e}")
+
+
+@router.post("/send", response_model=SendResponse)
+async def send_draft(
+    request: DraftSendRequest,
+    account: str = Query(default="personal", description="Account: personal or work"),
+):
+    """
+    **Send an existing Gmail draft.**
+
+    Sends a draft previously created via `POST /api/gmail/drafts`, identified by
+    its `draft_id`. The exact draft is sent — there is no compose-and-send
+    shortcut — which keeps a review step in front of every outbound email.
+
+    SAFETY: Only send after the user has reviewed the draft and explicitly
+    confirmed. Never send a draft in the same step that created it.
+
+    Example:
+    ```json
+    {"draft_id": "r-9153471483221163155"}
+    ```
+    """
+    if not request.draft_id or not request.draft_id.strip():
+        raise HTTPException(status_code=400, detail="draft_id is required")
+
+    try:
+        account_type = resolve_account(account)
+        service = get_gmail_service(account_type)
+
+        message_id = service.send_draft(request.draft_id.strip())
+        if not message_id:
+            raise HTTPException(status_code=500, detail="Failed to send draft")
+
+        return SendResponse(
+            message_id=message_id,
+            source_account=account_type.value,
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send draft: {e}")

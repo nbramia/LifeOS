@@ -77,6 +77,7 @@ _CLASS_SPECIALTIES: dict[str, tuple[str, ...]] = {
     PRESET_CLASS_PERSONAL_COMM: (
         "lifeos_gmail_search",
         "lifeos_gmail_draft",
+        "lifeos_gmail_send",
         "lifeos_calendar_create",
         "lifeos_calendar_update",
         "lifeos_calendar_delete",
@@ -86,6 +87,7 @@ _CLASS_SPECIALTIES: dict[str, tuple[str, ...]] = {
         "lifeos_slack_search",
         "lifeos_gmail_search",
         "lifeos_gmail_draft",
+        "lifeos_gmail_send",
         "lifeos_calendar_create",
         "lifeos_calendar_update",
         "lifeos_calendar_delete",
