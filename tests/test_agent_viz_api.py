@@ -332,3 +332,105 @@ def test_model_label_claude_routing_derives_from_settings(client, stores, monkey
     monkeypatch.setattr(settings_mod.settings, "agent_managed_model", "claude-opus-4-7")
     sess = client.get("/api/agents/snapshot").json()["sessions"][0]
     assert sess["model_label"] == "Opus"
+
+
+# ---------------------------------------------------------------------------
+# Summary search (issue #252) — GET /api/agents/search + the cache-only
+# search_cached_summaries helper. Seeds the disk cache directly so no LLM runs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def summary_db(tmp_path: Path, monkeypatch):
+    """Point the summary cache at a temp DB and return a seeding helper."""
+    from api.services import agent_viz_summary as avs
+
+    monkeypatch.setattr(avs, "_DB_PATH", str(tmp_path / "summaries.db"))
+    avs._init_db()
+    avs.reset_cache()
+
+    def seed(session_id: str, short_label: str, summary: str,
+             last_activity_at: float = 1_000_000.0):
+        avs._disk_put(
+            session_id,
+            last_activity_at,
+            avs.SummaryResult(short_label=short_label, summary=summary),
+        )
+
+    return seed
+
+
+@pytest.mark.unit
+def test_search_matches_short_label(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    summary_db("s1", "Fix Login Bug", "Resolved an auth regression.")
+    summary_db("s2", "Refactor Search", "Cleaned up the indexer.")
+
+    matches = avs.search_cached_summaries("login")
+    assert len(matches) == 1
+    assert matches[0]["session_id"] == "s1"
+    assert matches[0]["field"] == "short_label"
+    assert "Login" in matches[0]["snippet"]
+
+
+@pytest.mark.unit
+def test_search_matches_summary_when_short_label_misses(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    summary_db("s1", "Fix Login Bug", "Resolved an auth regression in the indexer.")
+
+    matches = avs.search_cached_summaries("indexer")
+    assert len(matches) == 1
+    assert matches[0]["field"] == "summary"
+    assert "indexer" in matches[0]["snippet"]
+
+
+@pytest.mark.unit
+def test_search_is_case_insensitive(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    summary_db("s1", "Fix Login Bug", "Auth work.")
+    assert [m["session_id"] for m in avs.search_cached_summaries("LOGIN")] == ["s1"]
+
+
+@pytest.mark.unit
+def test_search_no_match_returns_empty(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    summary_db("s1", "Fix Login Bug", "Auth work.")
+    assert avs.search_cached_summaries("nonexistent") == []
+    assert avs.search_cached_summaries("   ") == []
+
+
+@pytest.mark.unit
+def test_search_treats_like_wildcards_literally(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    summary_db("s1", "100% Coverage", "Hit the goal.")
+    summary_db("s2", "1000 Lines", "Big refactor.")
+
+    # "00%" must match only the literal "100%" — not behave as a SQL wildcard
+    # that would also sweep in "1000".
+    matches = avs.search_cached_summaries("00%")
+    assert [m["session_id"] for m in matches] == ["s1"]
+
+
+@pytest.mark.unit
+def test_search_endpoint_returns_matches(client, summary_db):
+    summary_db("s1", "Fix Login Bug", "Resolved an auth regression.")
+
+    r = client.get("/api/agents/search", params={"q": "login"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["query"] == "login"
+    assert len(body["matches"]) == 1
+    assert body["matches"][0]["session_id"] == "s1"
+    assert body["matches"][0]["field"] == "short_label"
+
+
+@pytest.mark.unit
+def test_search_endpoint_requires_query(client, summary_db):
+    # The app maps RequestValidationError to 400 (see api/main.py).
+    assert client.get("/api/agents/search").status_code == 400
+    assert client.get("/api/agents/search", params={"q": ""}).status_code == 400
