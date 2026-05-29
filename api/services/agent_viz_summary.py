@@ -458,6 +458,75 @@ def get_cached_summary(session_id: str, last_activity_at: float, status: str = "
     return None
 
 
+_LIKE_SPECIAL = re.compile(r"([\\%_])")
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards so a query like `100%` matches that literal text
+    instead of acting as a `match-anything` pattern."""
+    return _LIKE_SPECIAL.sub(r"\\\1", s)
+
+
+def _make_snippet(text: str, query_lower: str, width: int = 72) -> str:
+    """A short, whitespace-collapsed window around the first case-insensitive
+    match of `query_lower` in `text`, with ellipses when truncated."""
+    collapsed = " ".join(text.split())
+    idx = collapsed.lower().find(query_lower)
+    if idx < 0:
+        return collapsed[:width] + ("…" if len(collapsed) > width else "")
+    half = max(0, (width - len(query_lower)) // 2)
+    start = max(0, idx - half)
+    end = min(len(collapsed), start + width)
+    snippet = collapsed[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(collapsed):
+        snippet = snippet + "…"
+    return snippet
+
+
+def search_cached_summaries(query: str, limit: int = 200) -> list[dict[str, str]]:
+    """Substring-search cached `short_label` + `summary` rows. No LLM, no network.
+
+    Case-insensitive. Returns at most `limit` matches as
+    ``{session_id, field, snippet}`` where ``field`` is ``"short_label"`` when
+    the short label matched, else ``"summary"``. Only rows already in the disk
+    cache are searched — sessions without a generated summary are not covered
+    (the client's label tier handles those). Reads only; never re-summarizes.
+    """
+    q = query.strip()
+    if not q:
+        return []
+    q_lower = q.lower()
+    pattern = f"%{_escape_like(q_lower)}%"
+    try:
+        with sqlite3.connect(_resolve_db_path()) as conn:
+            rows = conn.execute(
+                "SELECT session_id, short_label, summary FROM agent_viz_summary "
+                "WHERE short_label LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' "
+                "ORDER BY last_activity_at DESC LIMIT ?",
+                (pattern, pattern, int(limit)),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.debug("summary search failed for %r: %s", query, exc)
+        return []
+    results: list[dict[str, str]] = []
+    for session_id, short_label, summary in rows:
+        if short_label and q_lower in short_label.lower():
+            results.append({
+                "session_id": session_id,
+                "field": "short_label",
+                "snippet": _make_snippet(short_label, q_lower),
+            })
+        elif summary and q_lower in summary.lower():
+            results.append({
+                "session_id": session_id,
+                "field": "summary",
+                "snippet": _make_snippet(summary, q_lower),
+            })
+    return results
+
+
 def reset_cache() -> None:
     """Clear in-process cache only. Use for tests; disk cache survives."""
     _cache.clear()

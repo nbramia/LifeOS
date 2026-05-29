@@ -120,6 +120,91 @@
     padding: 0.25rem 0.5rem;
     font-size: 0.8rem;
   }
+  /* Search box + live results dropdown (issue #252). The wrapper is the
+     positioning context for the absolutely-placed results list. */
+  .search-wrap { position: relative; }
+  .search-wrap input {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+    width: 200px;
+  }
+  .search-wrap input:focus { outline: none; border-color: var(--accent); }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    width: 360px;
+    max-height: 50vh;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    padding: 0.25rem 0;
+    z-index: 50;
+  }
+  .search-results[hidden] { display: none; }
+  .search-group-label {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    padding: 0.4rem 0.6rem 0.2rem;
+  }
+  .search-result {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    padding: 0.3rem 0.6rem;
+    cursor: pointer;
+  }
+  .search-result:hover,
+  .search-result.active { background: var(--bg-primary); }
+  .search-result .sr-title {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+  }
+  .search-result .sr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .search-result .sr-badge {
+    flex: none;
+    margin-left: auto;
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0 0.35rem;
+  }
+  .search-result .sr-snippet {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    margin-top: 0.1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .search-result mark {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+  .search-group.hidden-group .search-result { opacity: 0.5; }
+  .search-empty {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
   main {
     display: grid;
     grid-template-columns: 1fr var(--panel-width, 360px);
@@ -698,6 +783,11 @@
   </div>
 </header>
 <div class="filters">
+  <div class="search-wrap" id="search-wrap">
+    <input type="search" id="search-input" placeholder="Search sessions…" autocomplete="off" spellcheck="false"
+           title="Search session names and summaries. Matches in visible nodes rank above filtered-out ones; click a result to highlight it." />
+    <div class="search-results" id="search-results" hidden></div>
+  </div>
   <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
   <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
     <select id="filter-recency">
@@ -1940,6 +2030,8 @@
     // re-centered around the recency rail + center-y forces.
     svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
     renderGraph(allSessions, allEdges);
+    // Keep the search dropdown's visible/hidden split in sync with the filters.
+    if (searchQuery.trim()) renderSearchResults();
   }
   filterTerminalEl.addEventListener('change', () => {
     applyRecencyDefault();
@@ -1954,6 +2046,246 @@
   [filterRouteEl, filterStatusEl, filterCwdEl].filter(Boolean).forEach(el =>
     el.addEventListener('change', onFilterChange)
   );
+
+  // --- Search (issue #252) ---
+  // A live, ranked dropdown over session names + cached summaries. The label
+  // tier is matched client-side (every session carries a label); the summary
+  // tiers (short_label / paragraph summary) come from /api/agents/search,
+  // which reads only the cached-summary DB so a keystroke never costs an LLM
+  // call. Results rank visible-before-hidden, then label > short_label >
+  // summary. Clicking a result highlights the node (reusing openPanel +
+  // applySelectionStyles) and pans to it; a filtered-out result first relaxes
+  // only the filter predicates that were hiding it.
+  const searchInputEl = document.getElementById('search-input');
+  const searchResultsEl = document.getElementById('search-results');
+  const searchWrapEl = document.getElementById('search-wrap');
+  let searchQuery = '';
+  let summaryMatches = new Map();   // session_id -> { field, snippet } from backend
+  let searchSeq = 0;                // guards against out-of-order fetch responses
+  let searchActiveIndex = -1;       // keyboard-highlighted row
+  let searchDebounceTimer = null;
+
+  const SEARCH_TIER = { label: 0, short_label: 1, summary: 2 };
+  // Distinct badge per matched field so the operator can tell which tier hit:
+  // the task name, the node's short label, or the paragraph summary.
+  const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
+
+  function sessionDisplayName(s) {
+    return s.short_label || s.label || s.session_id.slice(0, 8);
+  }
+
+  // Escape, then wrap the first case-insensitive occurrence of `q` in <mark>.
+  function highlightMatch(text, q) {
+    const t = String(text || '');
+    if (!q) return escapeHtml(t);
+    const idx = t.toLowerCase().indexOf(q.toLowerCase());
+    if (idx < 0) return escapeHtml(t);
+    return escapeHtml(t.slice(0, idx))
+      + '<mark>' + escapeHtml(t.slice(idx, idx + q.length)) + '</mark>'
+      + escapeHtml(t.slice(idx + q.length));
+  }
+
+  // Merge the local label matches with the backend summary matches into a
+  // single ranked list. Each session appears once at its best (lowest) tier.
+  function buildSearchResults() {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+    const visibleIds = new Set(applyFilters(allSessions).map(s => s.session_id));
+    const byId = new Map(allSessions.map(s => [s.session_id, s]));
+    const entries = new Map();
+
+    function consider(sessionId, field, snippet) {
+      const s = byId.get(sessionId);
+      if (!s) return;  // a summary match for a session no longer in the snapshot
+      const prev = entries.get(sessionId);
+      if (prev && SEARCH_TIER[prev.field] <= SEARCH_TIER[field]) return;
+      entries.set(sessionId, { session: s, field, snippet, visible: visibleIds.has(sessionId) });
+    }
+
+    // Tier 0: label — client-side, covers every session.
+    for (const s of allSessions) {
+      if ((s.label || '').toLowerCase().includes(q)) consider(s.session_id, 'label', s.label);
+    }
+    // Tiers 1/2: short_label / paragraph summary — from the backend.
+    for (const [sid, m] of summaryMatches) consider(sid, m.field, m.snippet);
+
+    return [...entries.values()].sort((a, b) => {
+      if (a.visible !== b.visible) return a.visible ? -1 : 1;
+      if (SEARCH_TIER[a.field] !== SEARCH_TIER[b.field]) return SEARCH_TIER[a.field] - SEARCH_TIER[b.field];
+      return sessionDisplayName(a.session).localeCompare(sessionDisplayName(b.session));
+    });
+  }
+
+  function renderSearchResults() {
+    const q = searchQuery.trim();
+    if (!q) { hideSearchResults(); return; }
+    searchActiveIndex = -1;
+    const results = buildSearchResults();
+    if (results.length === 0) {
+      searchResultsEl.innerHTML = '<div class="search-empty">No matches</div>';
+      searchResultsEl.hidden = false;
+      return;
+    }
+    const visible = results.filter(r => r.visible);
+    const hidden = results.filter(r => !r.visible);
+    let html = '';
+    const renderGroup = (items, groupClass, labelText) => {
+      if (items.length === 0) return;
+      if (labelText) html += `<div class="search-group-label">${labelText}</div>`;
+      html += `<div class="search-group ${groupClass}">`;
+      for (const r of items) {
+        // Title shows the text where the match actually landed so the
+        // highlighted query is always visible: the label for a label hit, the
+        // short label for a short_label hit, else the session's display name.
+        const titleText = r.field === 'label' ? (r.session.label || sessionDisplayName(r.session))
+          : r.field === 'short_label' ? (r.session.short_label || sessionDisplayName(r.session))
+          : sessionDisplayName(r.session);
+        // A summary hit's query lives in the paragraph, not the title — surface
+        // it in the snippet line. Title/short_label hits are self-evident.
+        const snippetHtml = r.field === 'summary'
+          ? `<div class="sr-snippet">${highlightMatch(r.snippet, q)}</div>`
+          : '';
+        html += `<button class="search-result" type="button" data-session="${escapeHtml(r.session.session_id)}">`
+          + `<div class="sr-title"><span class="sr-name">${highlightMatch(titleText, q)}</span>`
+          + `<span class="sr-badge">${SEARCH_BADGE[r.field]}</span></div>`
+          + snippetHtml + `</button>`;
+      }
+      html += `</div>`;
+    };
+    renderGroup(visible, 'visible-group', null);
+    renderGroup(hidden, 'hidden-group', 'Hidden by filters');
+    searchResultsEl.innerHTML = html;
+    searchResultsEl.hidden = false;
+  }
+
+  function hideSearchResults() {
+    searchResultsEl.hidden = true;
+    searchResultsEl.innerHTML = '';
+    searchActiveIndex = -1;
+  }
+
+  // Flip only the filter controls that currently exclude `s`, so a hidden
+  // search hit can be revealed with the least disruption to the operator's
+  // other filter choices.
+  function relaxFiltersFor(s) {
+    const nowSec = Date.now() / 1000;
+    if (!filterTerminalEl.checked && TERMINAL.has(s.status)) filterTerminalEl.checked = true;
+    if (filterRecencyEl && filterRecencyEl.value !== 'all' && s.last_activity_at) {
+      const age = nowSec - s.last_activity_at;
+      if (age > Number(filterRecencyEl.value)) {
+        // Smallest recency window that still includes this session (options are
+        // ordered ascending in the DOM; 'all' is the catch-all at the end).
+        const fit = [...filterRecencyEl.options]
+          .map(o => o.value)
+          .find(v => v === 'all' || age <= Number(v));
+        filterRecencyEl.value = fit || 'all';
+        recencyManuallySet = true;
+      }
+    }
+    if (filterCwdEl && filterCwdEl.value !== 'all' && s.decoded_cwd !== filterCwdEl.value) {
+      filterCwdEl.value = 'all';
+    }
+    if (filterRouteEl.value !== 'all' && (s.routing || 'local') !== filterRouteEl.value) {
+      filterRouteEl.value = 'all';
+    }
+    if (filterStatusEl.value !== 'all' && s.status !== filterStatusEl.value) {
+      filterStatusEl.value = 'all';
+    }
+  }
+
+  // Center the viewport on a node, preserving the current zoom scale (min 1x).
+  // `delay` lets a just-revealed node's simulation settle before we pan.
+  function panToNode(sessionId, delay) {
+    const run = () => {
+      let target = null;
+      nodeLayer.selectAll('.node').each(function(d) { if (d.session_id === sessionId) target = d; });
+      if (!target || target.x == null || target.y == null) return;
+      const k = Math.max(d3.zoomTransform(svg.node()).k, 1);
+      const tx = VIEW_W / 2 - k * target.x;
+      const ty = VIEW_H / 2 - k * target.y;
+      svg.transition().duration(450)
+        .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+    };
+    if (delay) setTimeout(run, delay); else run();
+  }
+
+  function selectSearchResult(sessionId) {
+    const s = allSessions.find(x => x.session_id === sessionId);
+    if (!s) return;
+    const visibleIds = new Set(applyFilters(allSessions).map(x => x.session_id));
+    const wasHidden = !visibleIds.has(sessionId);
+    if (wasHidden) {
+      relaxFiltersFor(s);
+      releasePins();
+      renderGraph(allSessions, allEdges);
+    }
+    hideSearchResults();
+    openPanel(sessionId);  // sets selectedSessionId → applySelectionStyles highlights it
+    panToNode(sessionId, wasHidden ? 400 : 0);
+  }
+
+  async function fetchSummaryMatches(q) {
+    const seq = ++searchSeq;
+    try {
+      const r = await fetch('/api/agents/search?q=' + encodeURIComponent(q));
+      if (!r.ok) return;
+      const data = await r.json();
+      // Drop stale responses: a newer keystroke fired, or the box moved on.
+      if (seq !== searchSeq || searchQuery.trim() !== q) return;
+      summaryMatches = new Map((data.matches || []).map(m => [m.session_id, m]));
+      renderSearchResults();
+    } catch (_) { /* network blip — the label tier still works offline */ }
+  }
+
+  function onSearchInput() {
+    searchQuery = searchInputEl.value;
+    const q = searchQuery.trim();
+    clearTimeout(searchDebounceTimer);
+    // Invalidate prior summary matches; the debounced fetch refills them. The
+    // label tier renders instantly below regardless.
+    summaryMatches = new Map();
+    if (q.length >= 2) {
+      searchDebounceTimer = setTimeout(() => fetchSummaryMatches(q), 180);
+    }
+    renderSearchResults();
+  }
+
+  if (searchInputEl) {
+    searchInputEl.addEventListener('input', onSearchInput);
+    searchInputEl.addEventListener('focus', () => { if (searchQuery.trim()) renderSearchResults(); });
+    searchInputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        searchInputEl.value = ''; searchQuery = ''; summaryMatches = new Map();
+        hideSearchResults(); searchInputEl.blur();
+        return;
+      }
+      const btns = [...searchResultsEl.querySelectorAll('.search-result')];
+      if (!btns.length) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        searchActiveIndex = Math.min(searchActiveIndex + 1, btns.length - 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        searchActiveIndex = Math.max(searchActiveIndex - 1, 0);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const pick = searchActiveIndex >= 0 ? btns[searchActiveIndex] : btns[0];
+        if (pick) selectSearchResult(pick.dataset.session);
+        return;
+      } else {
+        return;
+      }
+      btns.forEach((b, i) => b.classList.toggle('active', i === searchActiveIndex));
+      if (searchActiveIndex >= 0) btns[searchActiveIndex].scrollIntoView({ block: 'nearest' });
+    });
+    searchResultsEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('.search-result');
+      if (btn) selectSearchResult(btn.dataset.session);
+    });
+    document.addEventListener('click', (e) => {
+      if (searchWrapEl && !searchWrapEl.contains(e.target)) hideSearchResults();
+    });
+  }
 
   // --- Side panel resize ---
   // Drag handle on the left edge of aside.panel resizes the panel width.
