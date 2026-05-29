@@ -272,6 +272,58 @@ def test_parse_session_sums_tokens_and_cost(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Label precedence (session /rename → custom-title)
+# ---------------------------------------------------------------------------
+
+
+def test_label_prefers_custom_title_from_rename(tmp_path: Path):
+    """A user `/rename` (custom-title record) wins over ai-title and prompt."""
+    proj = tmp_path / "-home-syn-Code-A"
+    path = proj / "s-rename.jsonl"
+    _write_jsonl(path, [
+        _user_event("debug the flaky payment webhook for a while"),
+        {"type": "ai-title", "aiTitle": "Payment webhook debugging", "sessionId": "x"},
+        {"type": "custom-title", "customTitle": "chat-integration", "sessionId": "x"},
+    ])
+    meta, _ = cc.parse_session(cc.discover_sessions(projects_dir=tmp_path)[0])
+    assert meta.label == "chat-integration"
+
+
+def test_label_falls_back_to_ai_title(tmp_path: Path):
+    """With no /rename, the CLI's ai-title beats the raw last prompt."""
+    proj = tmp_path / "-home-syn-Code-A"
+    path = proj / "s-aititle.jsonl"
+    _write_jsonl(path, [
+        _user_event("debug the flaky payment webhook for a while"),
+        {"type": "ai-title", "aiTitle": "Payment webhook debugging", "sessionId": "x"},
+    ])
+    meta, _ = cc.parse_session(cc.discover_sessions(projects_dir=tmp_path)[0])
+    assert meta.label == "Payment webhook debugging"
+
+
+def test_label_latest_custom_title_wins(tmp_path: Path):
+    """A later /rename overrides an earlier one."""
+    proj = tmp_path / "-home-syn-Code-A"
+    path = proj / "s-rerename.jsonl"
+    _write_jsonl(path, [
+        {"type": "custom-title", "customTitle": "first name", "sessionId": "x"},
+        _user_event("hello"),
+        {"type": "custom-title", "customTitle": "second name", "sessionId": "x"},
+    ])
+    meta, _ = cc.parse_session(cc.discover_sessions(projects_dir=tmp_path)[0])
+    assert meta.label == "second name"
+
+
+def test_label_falls_back_to_last_prompt_without_titles(tmp_path: Path):
+    """Unchanged behavior when there are no title records."""
+    proj = tmp_path / "-home-syn-Code-A"
+    path = proj / "s-plain.jsonl"
+    _write_jsonl(path, [_user_event("summarize my unread emails")])
+    meta, _ = cc.parse_session(cc.discover_sessions(projects_dir=tmp_path)[0])
+    assert meta.label == "summarize my unread emails"
+
+
+# ---------------------------------------------------------------------------
 # Status inference
 # ---------------------------------------------------------------------------
 
