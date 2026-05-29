@@ -168,10 +168,16 @@ run_foreground() {
     log_info "ChromaDB: Running"
     log_info "Launching uvicorn on $HOST:$PORT (foreground)..."
 
-    # Exec replaces this process — systemd manages the lifecycle
+    # Exec replaces this process — systemd manages the lifecycle.
+    # timeout_graceful_shutdown caps how long uvicorn waits for in-flight
+    # connections to drain on SIGTERM before force-closing them. Without it,
+    # long-lived connections (the /agents SSE streams, the Telegram
+    # getUpdates long-poll) keep the old process alive until systemd's
+    # 90s TimeoutStopSec fires a SIGKILL — a ~90s window where the dying
+    # process still holds :8000 and every request is connection-refused.
     exec "$HOME/.venvs/lifeos/bin/python" -c "
 import uvicorn
-uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info')
+uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info', timeout_graceful_shutdown=10)
 "
 }
 
@@ -201,7 +207,7 @@ start_server() {
     log_info "Launching uvicorn on $HOST:$PORT..."
     nohup "$HOME/.venvs/lifeos/bin/python" -c "
 import uvicorn
-uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info')
+uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info', timeout_graceful_shutdown=10)
 " >> "$LOG_FILE" 2>&1 &
 
     local pid=$!
