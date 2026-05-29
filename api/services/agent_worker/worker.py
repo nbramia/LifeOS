@@ -154,6 +154,7 @@ class Worker:
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
         managed_executor=None,    # injectable ManagedExecutor for tests
+        code_executor=None,       # injectable CodeExecutor for tests (#274)
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -181,6 +182,7 @@ class Worker:
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
+        self._code_executor = code_executor  # lazily instantiated on first /code task (#274)
         self._warn_deprecated_settings()
 
     @staticmethod
@@ -453,6 +455,37 @@ class Worker:
                 if outcome.status == STATUS_FAILED:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
+            elif session.routing == "code":
+                # /code sessions (#274). Routed through the worker only when
+                # the operator opted into the new path via LIFEOS_CODE_ROUTING.
+                # While the default is "orchestrator", any session that lands
+                # here with the flag off was created by something other than
+                # the official spawn surface — leave it claimed so it can be
+                # picked up after the flag flips rather than silently fail.
+                if settings.code_routing != "worker":
+                    self.transcript_store.append(
+                        session.session_id, "code_routing_disabled", {
+                            "code_routing": settings.code_routing,
+                        },
+                    )
+                    continue
+                code = self._get_code_executor()
+                # #275 will attach `working_dir` / `plan_mode` to the task
+                # dict; for #274 they fall back to CodeExecutor defaults
+                # (cwd, plan_mode=False).
+                try:
+                    outcome = code.execute(session, task)
+                except Exception as exc:
+                    logger.exception("spawned code execute crashed for %s: %s", session.task_id, exc)
+                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                    continue
+                # BLOCKED outcomes mean the session is awaiting reply (plan
+                # approval or CLARIFY). #275 registers the reply hook; for
+                # now leave the session in BLOCKED and skip `_handle_outcome`
+                # (which would log a spurious "unhandled outcome" warning).
+                if outcome.status == STATUS_BLOCKED:
+                    continue
+                self._handle_outcome(session, task, outcome)
 
     def _poll_managed_sessions(self) -> None:
         """Advance all in-flight Managed Agents sessions one polling step."""
@@ -1023,6 +1056,23 @@ class Worker:
             model=settings.agent_managed_model_for_tests or settings.agent_managed_model,
         )
         return self._managed_executor
+
+    def _get_code_executor(self):
+        """Lazy-construct the CodeExecutor for /code sessions (#274).
+
+        Tests inject one via the constructor; production builds default
+        a CodeExecutor wired to the worker's Telegram sender so [NOTIFY]
+        bodies stream live during the subprocess run.
+        """
+        if self._code_executor is not None:
+            return self._code_executor
+        from api.services.agent_worker.code_executor import CodeExecutor
+        self._code_executor = CodeExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+            notification_callback=self._telegram_send,
+        )
+        return self._code_executor
 
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
         try:
