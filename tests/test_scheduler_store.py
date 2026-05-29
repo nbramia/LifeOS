@@ -7,7 +7,7 @@ the auto-generated dashboard.
 """
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 from api.services.scheduler_store import (
     SchedulerStore,
@@ -413,3 +413,140 @@ class TestFormatHelpers:
 
     def test_format_dt_short_handles_garbage(self):
         assert _format_dt_short("not-a-date") == "not-a-date"
+
+
+class TestActionDispatch:
+    """#245 — _fire_entry dispatches on action, records run history, hands off agents."""
+
+    @pytest.fixture
+    def scheduler(self, store):
+        return SchedulerScheduler(store)
+
+    @pytest.mark.asyncio
+    async def test_notify_sends_static_message(self, scheduler):
+        entry = scheduler.store.create(
+            name="Water plants", schedule_type="cron", schedule_value="0 18 * * *",
+            action="notify", message_type="static", message_content="hydrate the ferns",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry)
+        mock_send.assert_called_once()
+        assert "hydrate the ferns" in mock_send.call_args[0][0]
+        assert scheduler.store.get(entry.id).last_status == "sent"
+
+    @pytest.mark.asyncio
+    async def test_notify_suppressed_when_empty(self, scheduler):
+        entry = scheduler.store.create(
+            name="Empty", schedule_type="cron", schedule_value="0 9 * * *",
+            action="notify", message_type="static", message_content="",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock) as mock_send:
+            await scheduler._fire_entry(entry)
+        mock_send.assert_not_called()
+        assert scheduler.store.get(entry.id).last_status == "suppressed"
+
+    @pytest.mark.asyncio
+    async def test_prompt_suppressed_on_sentinel(self, scheduler):
+        entry = scheduler.store.create(
+            name="Meeting prep", schedule_type="cron", schedule_value="0 9 * * *",
+            action="prompt", message_type="prompt", message_content="check calendar",
+        )
+        mock_result = {"answer": "NO_MEETING", "tool_statuses": [], "cost_usd": 0,
+                       "model": "claude", "input_tokens": 1, "output_tokens": 1}
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, return_value=mock_result):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock) as mock_send:
+                await scheduler._fire_entry(entry)
+        mock_send.assert_not_called()
+        assert scheduler.store.get(entry.id).last_status == "suppressed"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_creates_tagged_task(self, scheduler):
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+        )
+        fake_task = MagicMock(id="task42")
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = fake_task
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock) as mock_send:
+                await scheduler._fire_entry(entry)
+        # The agent worker discovers #agent tasks; the executor tag rides along.
+        fake_tm.create.assert_called_once()
+        kwargs = fake_tm.create.call_args.kwargs
+        assert kwargs["description"] == "Draft my weekly review"
+        assert kwargs["tags"] == ["agent", "cloud"]
+        # No Telegram for an agent hand-off; the worker reports through its channel.
+        mock_send.assert_not_called()
+        refreshed = scheduler.store.get(entry.id)
+        assert refreshed.last_status == "handed-off"
+        assert "task42" in refreshed.last_result
+
+    @pytest.mark.asyncio
+    async def test_agent_action_local_executor_tag(self, scheduler):
+        entry = scheduler.store.create(
+            name="Local job", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", executor="local", message_content="summarize inbox",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="t1")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["agent", "local"]
+
+    @pytest.mark.asyncio
+    async def test_run_history_surfaced_in_dashboard(self, scheduler):
+        entry = scheduler.store.create(
+            name="Briefing", schedule_type="cron", schedule_value="0 9 * * *",
+            action="notify", message_type="static", message_content="Good morning",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            await scheduler._fire_entry(entry)
+        dashboard = (scheduler.store.scheduler_dir / "Dashboard.md").read_text(encoding="utf-8")
+        rf = dashboard.split("## Recently Fired", 1)[1]
+        assert "Briefing" in rf
+        assert "sent" in rf  # outcome column
+
+    @pytest.mark.asyncio
+    async def test_failed_fire_records_failure(self, scheduler):
+        entry = scheduler.store.create(
+            name="Breaks", schedule_type="cron", schedule_value="0 9 * * *",
+            action="prompt", message_type="prompt", message_content="x",
+        )
+        with patch.object(scheduler, "_generate_message",
+                          new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock, return_value=True) as mock_send:
+                await scheduler._fire_entry(entry)
+        assert scheduler.store.get(entry.id).last_status == "failed"
+        assert "(failed)" in mock_send.call_args[0][0]
+
+    def test_fire_reminder_alias_exists(self, scheduler):
+        # Back-compat: the HTTP trigger route still calls _fire_reminder.
+        assert scheduler._fire_reminder == scheduler._fire_entry
+
+
+class TestMissedFire:
+    """Run-once catch-up: a missed trigger fires once, then advances."""
+
+    def test_missed_cron_is_due_once_then_advances(self, store):
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        entry = store.create(name="Missed", schedule_type="cron", schedule_value="0 9 * * *",
+                             action="notify", message_type="static", message_content="x")
+        entry.next_trigger_at = past  # simulate a window missed while down
+        # First tick after startup: due exactly once.
+        due = store.get_due_reminders()
+        assert [e.id for e in due] == [entry.id]
+        # Firing advances the trigger into the future and stamps last_triggered.
+        store.mark_triggered(entry.id)
+        refreshed = store.get(entry.id)
+        assert refreshed.next_trigger_at is not None
+        assert datetime.fromisoformat(refreshed.next_trigger_at) > datetime.now(timezone.utc)
+        # No duplicate catch-up: not due again (advanced + within cooldown).
+        assert store.get_due_reminders() == []
