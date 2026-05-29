@@ -8,8 +8,6 @@ everything internal runs for real.
 These tests are designed to find gaps between what the audit review claims
 and what actually works in practice.
 """
-import asyncio
-import json
 import time
 from pathlib import Path
 import pytest
@@ -292,7 +290,7 @@ class TestJobQueueE2E:
 
     @pytest.fixture
     def queue(self, tmp_path):
-        from api.services.job_queue import JobQueue, register_job_handler, _JOB_HANDLERS
+        from api.services.job_queue import JobQueue, _JOB_HANDLERS
         # Save and clean handlers
         saved = dict(_JOB_HANDLERS)
         db = str(tmp_path / "e2e_jobs.db")
@@ -334,7 +332,6 @@ class TestJobQueueE2E:
     def test_concurrent_enqueue_during_processing(self, queue):
         """Enqueuing new jobs while worker is processing should work."""
         from api.services.job_queue import register_job_handler, COMPLETED
-        import threading
 
         processed = []
 
@@ -344,15 +341,15 @@ class TestJobQueueE2E:
             return {"n": params["n"]}
 
         register_job_handler("slow_job", slow_handler)
-        id1 = queue.enqueue("slow_job", params={"n": 1})
+        queue.enqueue("slow_job", params={"n": 1})
 
         queue.start_worker()
         # Wait for first job to start
         time.sleep(0.2)
 
         # Enqueue more while worker is busy
-        id2 = queue.enqueue("slow_job", params={"n": 2})
-        id3 = queue.enqueue("slow_job", params={"n": 3})
+        queue.enqueue("slow_job", params={"n": 2})
+        queue.enqueue("slow_job", params={"n": 3})
 
         for _ in range(100):
             jobs = queue.list_jobs(status=COMPLETED)
@@ -680,7 +677,7 @@ class TestPersonEntitySQLite:
         from api.services.person_entity import PersonEntityStore
 
         db_path = str(tmp_path / "test_crm.db")
-        store = PersonEntityStore(db_path=db_path)
+        PersonEntityStore(db_path=db_path)
 
         conn = sqlite3.connect(db_path)
         tables = conn.execute(
@@ -697,7 +694,7 @@ class TestPersonEntitySQLite:
         from api.services.person_entity import PersonEntityStore
 
         db_path = str(tmp_path / "test_crm_wal.db")
-        store = PersonEntityStore(db_path=db_path)
+        PersonEntityStore(db_path=db_path)
 
         conn = sqlite3.connect(db_path)
         result = conn.execute("PRAGMA journal_mode").fetchone()
@@ -737,21 +734,18 @@ class TestMCPWriteTools:
 
     def test_curated_endpoints_include_write_tools(self):
         """MCP server should have all 6 claimed write tools."""
-        from scripts import seed_proactive_reminders  # just to verify importable
         # We need to check the mcp_server curated endpoints
         import importlib.util
-        import sys
 
         # Load mcp_server module manually since it's not in the api package
         spec = importlib.util.spec_from_file_location(
             "mcp_server",
             f"{_PROJECT_ROOT}/mcp_server.py"
         )
-        mcp_mod = importlib.util.module_from_spec(spec)
+        importlib.util.module_from_spec(spec)
 
         # The module tries to connect to the API on import; we just need CURATED_ENDPOINTS
         # Read it from source instead
-        import ast
         with open(f"{_PROJECT_ROOT}/mcp_server.py") as f:
             source = f.read()
 
@@ -803,7 +797,7 @@ class TestEndpointReminderFixed:
 
     def test_httpx_imported_in_reminder_store(self):
         """reminder_store.py must import httpx for _call_endpoint."""
-        with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/services/scheduler_store.py") as f:
             source = f.read()
 
         import_lines = [line for line in source.split("\n") if line.startswith("import ") or line.startswith("from ")]
@@ -846,16 +840,16 @@ class TestSchedulerCrashRecovery:
 
         with tempfile.TemporaryDirectory() as tmp:
             store = ReminderStore(file_path=f"{tmp}/daemon_test.json")
-            scheduler = ReminderScheduler(store)
+            ReminderScheduler(store)
             # Check that the thread would be created as daemon
             # (we can't start it without Telegram, but we can verify the code)
-            with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
+            with open(f"{_PROJECT_ROOT}/api/services/scheduler_store.py") as f:
                 source = f.read()
             assert "daemon=True" in source
 
     def test_scheduler_logs_crash(self):
         """Scheduler crash should be logged (even if not alerted)."""
-        with open(f"{_PROJECT_ROOT}/api/services/reminder_store.py") as f:
+        with open(f"{_PROJECT_ROOT}/api/services/scheduler_store.py") as f:
             source = f.read()
         assert "scheduler crashed" in source.lower() or "Reminder scheduler crashed" in source
 
@@ -916,7 +910,6 @@ class TestSchedulerCrashRecoveryBatch1:
         """Scheduler should attempt restart after crash."""
         crash_count = [0]
 
-        original_schedule_loop = scheduler._schedule_loop
 
         async def crashing_loop():
             crash_count[0] += 1
@@ -951,43 +944,31 @@ class TestSchedulerCrashRecoveryBatch1:
         assert scheduler._crash_count >= 2
         assert any("DOWN" in a for a in alerts)
 
-    def test_scheduler_reads_control_file_enabled(self, scheduler, tmp_path):
-        """Scheduler should read enabled: true from control file."""
-        from config.settings import settings
-        vault = tmp_path / "vault"
-        vault.mkdir()
-        control_dir = vault / "LifeOS" / "Reminders"
-        control_dir.mkdir(parents=True)
-        control_file = control_dir / "Scheduler.md"
+    def test_scheduler_reads_control_file_enabled(self, scheduler):
+        """Scheduler should read enabled: true from the control file."""
+        control_file = scheduler.store.scheduler_dir / "Scheduler.md"
+        control_file.parent.mkdir(parents=True, exist_ok=True)
         control_file.write_text("---\nenabled: true\n---\n# Scheduler\n")
 
-        with patch.object(settings, "vault_path", vault):
-            assert scheduler._read_control_file() is True
+        assert scheduler._read_control_file() is True
 
-    def test_scheduler_reads_control_file_disabled(self, scheduler, tmp_path):
-        """Scheduler should read enabled: false from control file."""
-        from config.settings import settings
-        vault = tmp_path / "vault"
-        vault.mkdir()
-        control_dir = vault / "LifeOS" / "Reminders"
-        control_dir.mkdir(parents=True)
-        control_file = control_dir / "Scheduler.md"
+    def test_scheduler_reads_control_file_disabled(self, scheduler):
+        """Scheduler should read enabled: false from the control file."""
+        control_file = scheduler.store.scheduler_dir / "Scheduler.md"
+        control_file.parent.mkdir(parents=True, exist_ok=True)
         control_file.write_text("---\nenabled: false\n---\n# Scheduler\n")
 
-        with patch.object(settings, "vault_path", vault):
-            assert scheduler._read_control_file() is False
+        assert scheduler._read_control_file() is False
 
-    def test_missing_control_file_creates_one(self, scheduler, tmp_path):
+    def test_missing_control_file_creates_one(self, scheduler):
         """Missing control file should be created with enabled: true."""
-        from config.settings import settings
-        vault = tmp_path / "vault"
-        vault.mkdir()
+        control_file = scheduler.store.scheduler_dir / "Scheduler.md"
+        if control_file.exists():
+            control_file.unlink()
 
-        with patch.object(settings, "vault_path", vault):
-            result = scheduler._read_control_file()
+        result = scheduler._read_control_file()
 
         assert result is True
-        control_file = vault / "LifeOS" / "Reminders" / "Scheduler.md"
         assert control_file.exists()
         assert "enabled: true" in control_file.read_text()
 
@@ -1292,7 +1273,6 @@ class TestAdminReindexE2E:
     def test_admin_reindex_enqueues_job(self):
         """POST /api/admin/reindex should create a job in the queue."""
         from fastapi.testclient import TestClient
-        from api.services.job_queue import get_job_queue, _instance, _lock
         import api.services.job_queue as jq_mod
 
         # Use a temp queue to avoid modifying production
