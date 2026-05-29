@@ -172,5 +172,5 @@ The dashboard uses Obsidian Tasks plugin queries and updates automatically as ta
 ## Related Documents
 
 - [API Reference](api-reference.md) -- Task API endpoint contracts
-- [Reminders Guide](../../guides/reminders.md) -- Reminder system (task-reminder linking)
+- [Scheduler Guide](../../guides/scheduler.md) -- Schedules; the `agent` action writes `#agent` tasks here
 - [Agent Worker](agent-worker.md) -- Tasks tagged `#agent` are picked up by the autonomous worker for hands-free completion

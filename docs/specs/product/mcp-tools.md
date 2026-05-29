@@ -88,16 +88,18 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_task_complete` | Mark a task as done |
 | `lifeos_task_delete` | Delete a task |
 
-### Reminders & Telegram Tools
+### Scheduler & Telegram Tools
 
-Reminders can also be managed via natural language chat. See [Reminders Guide](../../guides/reminders.md).
+Schedules can also be managed via natural language chat. See [Scheduler Guide](../../guides/scheduler.md).
 
 | Tool | Description |
 |------|-------------|
-| `lifeos_reminder_create` | Create a scheduled reminder (cron or one-time) |
-| `lifeos_reminder_list` | List all reminders |
-| `lifeos_reminder_delete` | Delete a reminder |
+| `lifeos_schedule_create` | Create a schedule (cron or one-time; action notify/prompt/endpoint/agent) |
+| `lifeos_schedule_list` | List all schedules |
+| `lifeos_schedule_delete` | Delete a schedule |
 | `lifeos_telegram_send` | Send an ad-hoc Telegram message |
+
+The legacy `lifeos_reminder_*` tools remain registered as deprecated aliases.
 
 ### Photos Tools
 | Tool | Description |
@@ -135,7 +137,7 @@ Reminders can also be managed via natural language chat. See [Reminders Guide](.
 | `lifeos_memories_create` | Save a memory |
 | `lifeos_memories_search` | Search saved memories |
 | `lifeos_conversations_list` | List chat conversations |
-| `lifeos_reminder_update` | Update an existing reminder |
+| `lifeos_schedule_update` | Update an existing schedule (`lifeos_reminder_update` kept as a deprecated alias) |
 | `lifeos_sync_trigger` | Trigger data sync for a source |
 | `lifeos_health` | Check service health |
 

@@ -35,7 +35,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | Embeddings | sentence-transformers (GPU via ROCm/CUDA) |
 | Frontend | Vanilla HTML/JS (no build step) |
 | Job Queue | SQLite-backed background workers |
-| Reminders | SQLite + cron scheduler |
+| Scheduler | Markdown source of truth (`LifeOS/Scheduler/Inbox.md`) + rebuildable index cache; 60s cron tick |
 | Service Management | systemd (Linux) / launchd (macOS) |
 
 ## Documentation Structure
@@ -64,6 +64,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What does `#agent` do? | [specs/product/agent-worker.md](docs/specs/product/agent-worker.md) |
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
+| How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
 | What does `/agents` show? | [specs/product/agent-viz.md](docs/specs/product/agent-viz.md) |
 | How does the `/agents` page work internally? | [specs/technical/agent-viz.md](docs/specs/technical/agent-viz.md) |
 | What does the CRM do (overview)? | [specs/product/crm-ui.md](docs/specs/product/crm-ui.md) |
