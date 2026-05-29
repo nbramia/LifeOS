@@ -524,6 +524,13 @@ def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[
                     turns.append({"role": "assistant", "text": text, "tools": tools})
         return turns
 
+    # /code sessions: turns are reconstructed from the dedicated `code_*`
+    # transcript events (the CLI doesn't write to the `messages` table).
+    # Detect by event-kind shape rather than by routing so unit-test fixtures
+    # work without a session row.
+    if any(ev.get("kind", "").startswith("code_") for ev in events):
+        return _reconstruct_code_conversation(events)
+
     # Managed (cloud) sessions: turns live in the transcript, not the DB.
     pending_tools: list[dict] = []
     for ev in events:
@@ -545,6 +552,61 @@ def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[
                 pending_tools = []
     if pending_tools:
         turns.append({"role": "assistant", "text": "", "tools": pending_tools})
+    return turns
+
+
+def _reconstruct_code_conversation(events: list[dict]) -> list[dict]:
+    """Build /chat-friendly turns from a routing='code' transcript.
+
+    Events of interest:
+      - ``code_user_prompt`` — operator prompt or threaded reply, starts a
+        new user turn
+      - ``code_notify`` / ``code_clarify`` — assistant body, accumulated
+        into the current assistant turn
+      - ``code_tool_use`` — attached to the current assistant turn
+    Everything else (init, completion markers, failure events) is metadata
+    that the events panel already surfaces, so it's skipped here.
+    """
+    turns: list[dict] = []
+    cur_assistant: dict | None = None
+
+    def _flush():
+        nonlocal cur_assistant
+        if cur_assistant and (cur_assistant["text"] or cur_assistant["tools"]):
+            turns.append(cur_assistant)
+        cur_assistant = None
+
+    for ev in events:
+        kind = ev.get("kind", "")
+        payload = ev.get("payload") or {}
+        if kind == "code_user_prompt":
+            _flush()
+            text = (payload.get("text") or "").strip()
+            if text:
+                turns.append({"role": "user", "text": text, "tools": []})
+            continue
+        if kind in ("code_notify", "code_clarify"):
+            body = (payload.get("body") or payload.get("text") or "").strip()
+            if not body:
+                # The executor stores `body_chars` for these events to keep the
+                # transcript small; the full body lives in messages streamed to
+                # Telegram. /chat falls back to the cardinal label.
+                body = "(notification)" if kind == "code_notify" else "(clarification)"
+            if cur_assistant is None:
+                cur_assistant = {"role": "assistant", "text": body, "tools": []}
+            else:
+                cur_assistant["text"] = (cur_assistant["text"] + "\n\n" + body).strip()
+            continue
+        if kind == "code_tool_use":
+            if cur_assistant is None:
+                cur_assistant = {"role": "assistant", "text": "", "tools": []}
+            cur_assistant["tools"].append({
+                "name": payload.get("name") or "tool",
+                "input": payload.get("input") or {},
+            })
+            continue
+
+    _flush()
     return turns
 
 

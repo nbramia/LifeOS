@@ -558,7 +558,6 @@ class Settings(BaseSettings):
         alias="LIFEOS_CLAUDE_MAX_COST",
         description="Max cost in USD per Claude Code session. Session cancelled if exceeded."
     )
-
     @property
     def telegram_enabled(self) -> bool:
         """Check if Telegram bot is configured."""

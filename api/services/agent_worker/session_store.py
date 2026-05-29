@@ -76,6 +76,11 @@ class Session:
     # backing task. The worker's spawned-session dispatch picks up operator
     # sessions even though they have no parent (#235).
     origin: str | None = None
+    # Claude Code CLI session UUID, captured from the subprocess's init
+    # stream-json event. Set only for routing="code" sessions and used by
+    # CodeExecutor.resume() to invoke `claude -r <code_session_id>` so the
+    # CLI picks up its prior in-process state across worker restarts.
+    code_session_id: str | None = None
 
 
 _SCHEMA = """
@@ -100,7 +105,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     yield_waiting_for         TEXT,  -- JSON array of session_ids the agent is waiting on
     managed_agent_session_id  TEXT,
     preset_class              TEXT,
-    origin                    TEXT   -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
+    origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
+    code_session_id           TEXT   -- Claude Code CLI session UUID for routing="code"
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -292,6 +298,20 @@ class SessionStore:
             # Old rows stay NULL (treated as "agent").
             if "origin" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
+            # Idempotent migration for the Claude Code CLI session UUID.
+            # Set only for routing="code" sessions; NULL for everything else.
+            if "code_session_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN code_session_id TEXT")
+            # Idempotent cleanup of the legacy `code_followup` pending_question
+            # kind. The retired in-memory ClaudeOrchestrator used these rows
+            # to register a Claude Code completion; they're now unresumable.
+            # Mark any leftovers processed so the worker's clarification-answer
+            # loop doesn't try to drain them and the timeout sweeper doesn't
+            # keep nudging the operator.
+            conn.execute(
+                "UPDATE pending_questions SET processed = 1, timed_out = 1 "
+                "WHERE kind = 'code_followup' AND processed = 0"
+            )
             # Idempotent migrations for the runaway detection counters on
             # managed_cursor (#139 Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
@@ -425,6 +445,21 @@ class SessionStore:
                 tuple(TERMINAL_STATUSES),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
+
+    def set_code_session_id(self, task_id: str, code_session_id: str) -> None:
+        """Persist the Claude Code CLI's session UUID for a routing='code'
+        session. Called by CodeExecutor as soon as the subprocess emits its
+        init event, so resume after a worker restart can pass `-r <uuid>`.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET code_session_id = ?, last_activity_at = ?
+                WHERE task_id = ?
+                """,
+                (code_session_id, _now(), task_id),
+            )
 
     def set_routing_and_budget(
         self,
@@ -1037,8 +1072,8 @@ class SessionStore:
         `sent_message_id` matches — on any chunk — or None.
 
         Read-only sibling of `deposit_answer`: lets a caller inspect the matched
-        row's `kind` and route the reply (e.g. a `code_followup` resumes Claude
-        Code rather than the agent worker) before recording an answer.
+        row's `kind` before recording an answer (e.g. so the Telegram listener
+        can recognize a ``routing='code'`` follow-up).
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -1132,4 +1167,7 @@ class SessionStore:
                 else None
             ),
             origin=(row["origin"] if "origin" in row.keys() else None),
+            code_session_id=(
+                row["code_session_id"] if "code_session_id" in row.keys() else None
+            ),
         )

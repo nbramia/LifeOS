@@ -630,24 +630,12 @@ class TelegramBotListener:
             if handled:
                 return
 
-        # Check for agent approval/rejection (short keywords only)
-        if self._check_agent_approval(text):
-            await self._handle_agent_approval(text, chat_id)
-            return
-
-        # Check for clarification response (any non-command text)
-        if self._check_agent_clarification():
-            await self._handle_agent_clarification(text, chat_id)
-            return
-
-        # Check for follow-up to a recently completed Claude Code session
-        if await self._check_code_followup(text, chat_id):
-            return
-
-        # Agent-thread replies are resumed only via an explicit reply-to gesture
-        # (handled near the top of this method). A plain message is always a
-        # fresh chat query — no implicit "recent thread" capture — so unrelated
-        # questions never get silently swallowed into a finished agent thread.
+        # Plan approval, clarification, and /code follow-up are all routed
+        # through threaded replies (handled near the top of this method
+        # via _maybe_handle_code_reply / _maybe_deposit_agent_answer). A
+        # plain non-threaded message is always a fresh chat query, never
+        # an implicit follow-up — so unrelated questions never get
+        # silently swallowed into a finished agent or /code thread.
 
         # Send through chat pipeline (intent classification happens there)
         try:
@@ -760,98 +748,14 @@ class TelegramBotListener:
         "add a new", "create a new", "remove all", "delete all",
     ]
 
-    def _check_agent_approval(self, text: str) -> bool:
-        """Check if text is a short approval/rejection for a pending plan."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        session = orch.get_active_session()
-        if not session or session.status != "awaiting_approval":
-            return False
-        # Only intercept short messages (likely approval keywords)
-        normalized = text.strip().lower().rstrip(".")
-        return normalized in self._APPROVAL_KEYWORDS | self._REJECTION_KEYWORDS
-
-    async def _handle_agent_approval(self, text: str, chat_id: str):
-        """Approve or reject a pending Claude Code plan."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        normalized = text.strip().lower().rstrip(".")
-
-        if normalized in self._APPROVAL_KEYWORDS:
-            session = orch.approve_plan()
-            if session:
-                await send_message_async("Plan approved. Implementing...", chat_id=chat_id)
-            else:
-                await send_message_async("No plan pending approval.", chat_id=chat_id)
-        else:
-            session = orch.reject_plan()
-            if session:
-                await send_message_async("Plan rejected. Session closed.", chat_id=chat_id)
-            else:
-                await send_message_async("No plan pending approval.", chat_id=chat_id)
-
-    def _check_agent_clarification(self) -> bool:
-        """Check if a session is waiting for a clarification response."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        session = orch.get_active_session()
-        return session is not None and session.status == "awaiting_clarification"
-
-    async def _handle_agent_clarification(self, text: str, chat_id: str):
-        """Forward the user's response to a pending clarification question."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-
-        # Pass all responses through as answers — "no" is a valid answer to
-        # yes/no clarification questions. Use /code_cancel to cancel instead.
-        session = orch.respond_to_clarification(text)
-        if session:
-            await send_message_async("Got it. Resuming...", chat_id=chat_id)
-        else:
-            await send_message_async("No session waiting for clarification.", chat_id=chat_id)
-
-    def _code_callbacks(self, chat_id: str):
-        """Build the (notify, on_complete) callbacks for a Claude Code session.
-
-        `notify` sends each message via the id-capturing sender and remembers
-        the last message's chunk ids; `on_complete` registers those ids in the
-        shared follow-up table so a reply to the completion message resumes the
-        session uniformly with #agent threads (#237).
-        """
-        last_ids: list[int] = []
-
-        def notify(msg: str):
-            ids = send_message_capture_ids(msg, chat_id)
-            if ids:
-                last_ids[:] = ids
-
-        def on_complete(session):
-            self._register_code_followup(session, list(last_ids))
-
-        return notify, on_complete
-
-    def _register_code_followup(self, session, ids: list[int]) -> None:
-        """Register a completed Claude Code session in the shared follow-up
-        table (kind='code_followup') keyed to its completion message id(s)."""
-        session_id = getattr(session, "session_id", None)
-        if not ids or not session_id:
-            return
-        try:
-            from api.services.agent_worker.session_store import SessionStore
-            SessionStore().create_pending_question(
-                session_id=session_id,
-                task_id=f"code_{session_id}",
-                question=(getattr(session, "task", "") or "")[:200],
-                sent_message_id=ids[0],
-                sent_message_ids=ids,
-                kind="code_followup",
-            )
-        except Exception as exc:
-            logger.warning(f"register code followup failed: {exc}")
-
     async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
         """If a reply targets a Claude Code completion message (any chunk),
-        resume that session via the orchestrator's existing resume path (#237).
+        resume the linked agent-worker session.
+
+        Rows are registered with ``kind='followup'`` against a session_store
+        row whose ``routing='code'``. Depositing the answer is enough — the
+        worker's ``_resume_as_followup`` picks it up on the next tick and
+        routes through ``CodeExecutor.resume``.
 
         Returns True if the reply was consumed as a /code follow-up.
         """
@@ -862,50 +766,17 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"code reply lookup failed: {exc}")
             return False
-        if not q or q.get("kind") != "code_followup":
+        if not q or q.get("kind") != "followup":
             return False
-
-        # Close the row so neither the worker nor a duplicate reply reprocesses it.
+        session_id = q.get("session_id")
+        if not session_id:
+            return False
+        session = store.get_by_session_id(session_id)
+        if not session or session.routing != "code":
+            return False
         store.deposit_answer(reply_to_message_id, text)
-        store.mark_question_processed(q["id"])
-
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        notify, on_complete = self._code_callbacks(chat_id)
-        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
-        if resumed:
-            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
-        else:
-            await send_message_async(
-                "That Claude Code session can't be resumed (it expired or another "
-                "session is active). Start a fresh one with /code.",
-                chat_id=chat_id,
-            )
+        await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
         return True
-
-    async def _check_code_followup(self, text: str, chat_id: str) -> bool:
-        """Check if this message is a follow-up to a recently completed Claude Code session.
-
-        Routes follow-ups to Claude Code via session resume so the context is preserved.
-        Returns True if the message was handled as a follow-up.
-        """
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-
-        # Don't intercept if Claude Code is already busy
-        if orch.is_busy():
-            return False
-
-        session = orch.get_recent_completed_session()
-        if not session:
-            return False
-
-        notify, on_complete = self._code_callbacks(chat_id)
-        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
-        if resumed:
-            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
-            return True
-        return False
 
     def _should_use_plan_mode(self, task: str) -> bool:
         """Conservative heuristic: plan mode only for complex-sounding tasks."""
@@ -913,71 +784,80 @@ class TelegramBotListener:
         return any(kw in task_lower for kw in self._PLAN_MODE_KEYWORDS)
 
     async def _handle_code_command(self, task: str, chat_id: str):
-        """Spawn a Claude Code session for the given task."""
-        from api.services.claude_orchestrator import get_orchestrator
+        """Spawn a /code session by writing a routing='code' row that the
+        agent worker dispatches on its next tick."""
+        from api.services.agent_worker.code_spawn import spawn_code_session
+        from api.services.agent_worker.session_store import SessionStore
         from api.services.directory_resolver import resolve_working_directory
-
-        orch = get_orchestrator()
-        if orch.is_busy():
-            session = orch.get_active_session()
-            await send_message_async(
-                f"Claude Code is busy: {session.task[:100]}\nUse /code_cancel to cancel.",
-                chat_id=chat_id,
-            )
-            return
 
         working_dir = resolve_working_directory(task)
         plan_mode = self._should_use_plan_mode(task)
-
         mode_label = " (plan mode)" if plan_mode else ""
+
         await send_message_async(
             f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
             chat_id=chat_id,
         )
-
-        notify, on_complete = self._code_callbacks(chat_id)
-
-        try:
-            orch.run_task(
-                task, working_dir, plan_mode=plan_mode,
-                notification_callback=notify, on_complete=on_complete,
-            )
-        except RuntimeError as e:
-            await send_message_async(f"Error: {e}", chat_id=chat_id)
+        result = spawn_code_session(
+            SessionStore(),
+            task,
+            working_dir=working_dir,
+            plan_mode=plan_mode,
+            chat_id=chat_id,
+        )
+        if not result.get("ok"):
+            await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
 
     async def _handle_code_status(self, chat_id: str):
-        """Report on the active Claude Code session."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
-        session = orch.get_active_session()
-
-        if not session:
+        """List non-terminal routing='code' sessions from the session_store."""
+        from api.services.agent_worker.session_store import (
+            TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="code", limit=10)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
             await send_message_async("No active Claude Code session.", chat_id=chat_id)
             return
-
-        elapsed = int(time.time() - session.started_at)
-        minutes, seconds = divmod(elapsed, 60)
-        status_text = (
-            f"*Claude Code Session*\n"
-            f"Task: {session.task[:200]}\n"
-            f"Directory: `{session.working_dir}`\n"
-            f"Status: {session.status}\n"
-            f"Duration: {minutes}m {seconds}s\n"
-            f"Cost: ${session.cost_usd:.4f}"
-        )
-        await send_message_async(status_text, chat_id=chat_id)
+        lines = ["*Claude Code Sessions*"]
+        for s in active:
+            elapsed = max(0, int(time.time() - (s.started_at or 0)))
+            minutes, seconds = divmod(elapsed, 60)
+            lines.append(
+                f"- `{s.session_id[:8]}` status: {s.status} "
+                f"({minutes}m {seconds}s, ${s.total_dollars:.4f})"
+            )
+        await send_message_async("\n".join(lines), chat_id=chat_id)
 
     async def _handle_code_cancel(self, chat_id: str):
-        """Cancel the active Claude Code session."""
-        from api.services.claude_orchestrator import get_orchestrator
-        orch = get_orchestrator()
+        """Mark non-terminal routing='code' sessions as FAILED so the
+        worker won't dispatch them again.
 
-        if not orch.is_busy():
+        A subprocess already running in a worker tick keeps running until
+        it finishes or hits the watchdog — true mid-flight subprocess kill
+        requires a cross-process signal that isn't wired here. The status
+        update is enough to prevent further dispatch and surface
+        'cancelled' in /agents.
+        """
+        from api.services.agent_worker.session_store import (
+            STATUS_FAILED, TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="code", limit=20)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
             await send_message_async("No active Claude Code session.", chat_id=chat_id)
             return
-
-        orch.cancel()
-        await send_message_async("Claude Code session cancelled.", chat_id=chat_id)
+        for s in active:
+            store.update_status(s.task_id, STATUS_FAILED)
+        await send_message_async(
+            f"Marked {len(active)} Claude Code session(s) cancelled.",
+            chat_id=chat_id,
+        )
 
     async def _handle_inspect(self, chat_id: str):
         """Show sources checked and results from the last query."""

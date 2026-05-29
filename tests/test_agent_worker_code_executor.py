@@ -1,0 +1,373 @@
+"""Tests for the agent worker's CodeExecutor.
+
+Drives the executor against a fake subprocess whose stdout emits a scripted
+sequence of stream-json events. No real Claude CLI is invoked. Exercises:
+  * init event → CLI session UUID captured + persisted
+  * [NOTIFY] events → notification callback fired, transcript appended
+  * [CLARIFY] events → BLOCKED outcome, session status updated
+  * plan-mode result → BLOCKED outcome (awaiting approval)
+  * happy-path result → COMPLETED outcome with final text
+  * cost-cap exceeded → BUDGET_EXCEEDED outcome
+  * non-zero exit without terminal event → FAILED outcome
+  * binary not found → FAILED outcome with a stable reason code
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Iterable
+
+import pytest
+
+from api.services.agent_worker.code_executor import (
+    REASON_AWAITING_CLARIFICATION,
+    REASON_AWAITING_PLAN_APPROVAL,
+    REASON_BINARY_NOT_FOUND,
+    REASON_COST_CAP_EXCEEDED,
+    CodeExecutor,
+)
+from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_BUDGET_EXCEEDED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    SessionStore,
+)
+from api.services.agent_worker.transcript_store import TranscriptStore
+
+
+pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeStdout:
+    """Iterable that yields scripted stream-json lines, then EOFs."""
+
+    def __init__(self, events: Iterable[dict]):
+        self._lines = [json.dumps(e) + "\n" for e in events]
+        self._idx = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._idx >= len(self._lines):
+            raise StopIteration
+        line = self._lines[self._idx]
+        self._idx += 1
+        return line
+
+
+class _FakeStderr:
+    def __init__(self, payload: str = ""):
+        self._payload = payload
+
+    def read(self) -> str:
+        return self._payload
+
+
+class _FakeProc:
+    """Stand-in for `subprocess.Popen` with predetermined stdout + returncode."""
+
+    def __init__(self, events: Iterable[dict], returncode: int = 0, stderr: str = ""):
+        self.stdout = _FakeStdout(events)
+        self.stderr = _FakeStderr(stderr)
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _spawn_with(events, returncode: int = 0, stderr: str = ""):
+    """Build a `spawn_fn` callable that returns a fresh _FakeProc per call."""
+
+    def _spawn_fn(*_args, **_kwargs):
+        return _FakeProc(events, returncode=returncode, stderr=stderr)
+
+    return _spawn_fn
+
+
+def _build_executor(tmp_path: Path, *, spawn_fn, notifications: list[str] | None = None):
+    db_path = tmp_path / "sessions.db"
+    transcript_dir = tmp_path / "transcripts"
+    store = SessionStore(db_path=db_path)
+    transcripts = TranscriptStore(transcripts_dir=transcript_dir)
+
+    notify = (lambda msg: notifications.append(msg)) if notifications is not None else None
+    executor = CodeExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        notification_callback=notify,
+        spawn_fn=spawn_fn,
+        binary_resolver=lambda: "/usr/bin/true",
+        timeout_seconds=30,
+        heartbeat_interval=3600,
+    )
+    return executor, store, transcripts
+
+
+def _seed_session(store: SessionStore, *, task_id: str = "task-1"):
+    """Drop a routing='code' operator-origin session into the store, the
+    shape the spawn surface produces.
+    """
+    return store.create(
+        task_id=task_id,
+        routing="code",
+        origin="operator",
+    )
+
+
+def _read_transcript(transcripts: TranscriptStore, session_id: str) -> list[dict]:
+    return transcripts.read(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Happy path
+# ---------------------------------------------------------------------------
+
+
+def test_init_event_captures_and_persists_cli_session_id(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-abc"},
+        {"type": "result", "session_id": "cli-sess-abc", "total_cost_usd": 0.01, "result": "All set."},
+    ]
+    executor, store, transcripts = _build_executor(tmp_path, spawn_fn=_spawn_with(events))
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "Print a haiku"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.final_text == "All set."
+    refreshed = store.get(session.task_id)
+    assert refreshed is not None
+    assert refreshed.code_session_id == "cli-sess-abc"
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "code_init" in kinds
+    assert "code_completed" in kinds
+
+
+def test_notify_invokes_callback_and_records_transcript(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Read the file."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Done."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.05, "result": "[NOTIFY] Done."},
+    ]
+    notifications: list[str] = []
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "Read the file"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert notifications == ["Read the file.", "Done."]
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert kinds.count("code_notify") == 2
+    # When the assistant emits only [NOTIFY] blocks (no narrative prose), the
+    # bodies are already streamed via the callback and final_text stays empty
+    # so the worker won't repeat the same content in a terminal summary.
+    assert outcome.final_text == ""
+
+
+def test_assistant_narrative_outside_notify_is_kept_as_final_text(tmp_path: Path):
+    """Mixed narrative + [NOTIFY] preserves the narrative for the summary."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Found a typo.\n[NOTIFY] Fixed it."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "fix the typo"})
+    assert outcome.status == STATUS_COMPLETED
+    assert "Found a typo." in outcome.final_text
+    assert "NOTIFY" not in outcome.final_text
+    assert notifications == ["Fixed it."]
+
+
+def test_tool_use_records_transcript_event(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/x.md"}}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "done"},
+    ]
+    executor, store, transcripts = _build_executor(tmp_path, spawn_fn=_spawn_with(events))
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "do a thing"})
+    assert outcome.status == STATUS_COMPLETED
+    events = _read_transcript(transcripts, session.session_id)
+    tool_events = [e for e in events if e["kind"] == "code_tool_use"]
+    assert tool_events and tool_events[0]["payload"]["name"] == "Read"
+
+
+# ---------------------------------------------------------------------------
+# Blocked-on-input outcomes
+# ---------------------------------------------------------------------------
+
+
+def test_clarify_returns_blocked_with_question(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[CLARIFY] Which file did you mean?"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "edit the file"})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_CLARIFICATION
+    assert outcome.final_text == "Which file did you mean?"
+    assert notifications == ["Which file did you mean?"]
+    assert store.get(session.task_id).status == STATUS_BLOCKED
+
+
+def test_plan_mode_result_returns_blocked_with_plan(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Step 1. Step 2."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.02, "result": ""},
+    ]
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with(events))
+    session = _seed_session(store)
+
+    outcome = executor.execute(
+        session, {"description": "refactor X", "plan_mode": True},
+    )
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_PLAN_APPROVAL
+    assert "Step 1" in outcome.final_text
+    assert store.get(session.task_id).status == STATUS_BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Failure modes
+# ---------------------------------------------------------------------------
+
+
+def test_cost_cap_exceeded_returns_budget_exceeded(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "api.services.agent_worker.code_executor.settings.claude_max_cost_usd",
+        0.10,
+    )
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.99, "result": "x"},
+    ]
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with(events))
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "expensive task"})
+    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.reason == REASON_COST_CAP_EXCEEDED
+    assert store.get(session.task_id).status == STATUS_BUDGET_EXCEEDED
+
+
+def test_binary_not_found_returns_failed(tmp_path: Path):
+    def _raise_fnf(*_args, **_kwargs):
+        raise FileNotFoundError("claude")
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_raise_fnf)
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "anything"})
+    assert outcome.status == STATUS_FAILED
+    assert outcome.reason == REASON_BINARY_NOT_FOUND
+
+
+def test_nonzero_exit_without_terminal_returns_failed(tmp_path: Path):
+    # No init / result events — stdout just closes; subprocess exits 2.
+    events: list[dict] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events, returncode=2, stderr="boom"),
+    )
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "broken thing"})
+    assert outcome.status == STATUS_FAILED
+    assert "exited with code 2" in outcome.reason
+
+
+def test_empty_prompt_returns_failed(tmp_path: Path):
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with([]))
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "   "})
+    assert outcome.status == STATUS_FAILED
+    assert "empty prompt" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# Resume entry point
+# ---------------------------------------------------------------------------
+
+
+def test_resume_without_code_session_id_returns_failed(tmp_path: Path):
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with([]))
+    session = _seed_session(store)
+    outcome = executor.resume(session, "follow-up message")
+    assert outcome.status == STATUS_FAILED
+    assert "no code_session_id" in outcome.reason
+
+
+def test_resume_passes_session_id_via_resume_flag(tmp_path: Path):
+    captured: dict = {}
+
+    def _spawn_capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc(
+            [
+                {"type": "system", "subtype": "init", "session_id": "cli-1"},
+                {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "ok"},
+            ],
+        )
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
+    session = _seed_session(store)
+    store.set_code_session_id(session.task_id, "cli-original")
+    session = store.get(session.task_id)
+
+    outcome = executor.resume(session, "what about edge cases?")
+
+    assert outcome.status == STATUS_COMPLETED
+    assert "-r" in captured["cmd"]
+    assert "cli-original" in captured["cmd"]
