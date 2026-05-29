@@ -66,10 +66,12 @@ class TestAgentThreadsUI:
                 "session_id": "sess_done", "task_id": "op_done",
                 "parent_session_id": None, "status": "completed",
                 "label": "draft the landlord email", "resumable": True,
+                "routing": "claude", "model_label": "Sonnet",
             }],
             "detail": {
                 "thread": {"session_id": "sess_done", "task_id": "op_done", "status": "completed",
-                           "label": "draft the landlord email", "resumable": True},
+                           "label": "draft the landlord email", "resumable": True,
+                           "routing": "claude", "model_label": "Sonnet"},
                 "conversation": [
                     {"role": "user", "text": "draft the landlord email", "tools": []},
                     {"role": "assistant", "text": "Here's a draft for you.",
@@ -86,6 +88,14 @@ class TestAgentThreadsUI:
         expect(page.locator("#agentsThreadsList .agent-thread")).to_have_count(1)
         expect(page.locator(".agent-badge.completed")).to_be_visible()
         expect(page.locator(".agent-thread-label")).to_contain_text("landlord")
+
+    def test_thread_shows_cloud_local_route_indicator(self, page: Page):
+        # routing="claude" → a cloud badge in the panel.
+        expect(page.locator("#agentsThreadsList .agent-route.cloud")).to_be_visible()
+        expect(page.locator("#agentsThreadsList .agent-route.cloud")).to_contain_text("cloud")
+        # And in the thread banner once opened.
+        page.locator("#agentsThreadsList .agent-thread").first.click()
+        expect(page.locator(".agent-thread-banner .agent-route.cloud")).to_be_visible(timeout=8000)
 
     def test_composer_has_run_as_agent_controls(self, page: Page):
         expect(page.locator("#agentRouting")).to_be_visible()
