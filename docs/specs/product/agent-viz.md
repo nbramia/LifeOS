@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-27
+> **Last Updated:** 2026-05-29
 
 LifeOS exposes a single live page at `/agents` that shows every agent session running on the box — both LifeOS agent worker tasks (`#agent`-tagged) and local Claude Code CLI sessions discovered on the filesystem. The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any Claude Code session straight from the page.
 
@@ -31,15 +31,17 @@ The page is a force-directed graph of sessions, laid out left-to-right by recenc
 
 | Encoding | Meaning |
 |---|---|
-| **Shape — circle** | LifeOS agent worker session |
-| **Shape — rounded square** | Claude Code CLI session |
-| **Shape — diamond** | Claude Code subagent (Task/Agent tool-use) |
+| **Shape — circle** | Cloud agent — routed to Claude (`routing: claude`) |
+| **Shape — diamond** | Local agent — routed to local Gemma (`routing: local`) |
+| **Shape — rounded square** | Claude Code CLI session (`routing: claude_code`) |
 | **Color** | Status — green running, blue claimed, amber blocked / paused, grey done, red failed |
 | **Size** | Log-scaled by total tokens (input + output + cache). A 100k-token session is roughly 2× a 1k-token session, not 100×. Capped so one fat node can't dominate the canvas. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
 | **Edge** | Spawn relationship — parent → subagent |
 | **X position** | Last-activity recency. Most recent sessions to the right, ≥24h old pinned to the left. The recency rail compresses around center when few nodes are visible — one filtered-down node ends up centered, two sit on a narrow band — and stretches to the full width as more nodes appear. |
 | **Edge styling** | Plain curved paths (no arrowheads) between parents and subagents. When a node is selected, edges adjacent to it brighten to white. |
+
+Shape encodes *where the agent runs*, not whether it is a subagent — a Task/Agent-tool subagent takes the same shape as any other session with its routing (a Claude Code subagent is a rounded square, like its parent). Subagents are distinguished by the spawn edge connecting them to their parent, not by shape.
 
 The simulation converges in ~8 seconds and then stops, so the graph stops jittering once it settles. New snapshots arrive every 2 seconds and only nudge nodes whose positions are now misleading.
 

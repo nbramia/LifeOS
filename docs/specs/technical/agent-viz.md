@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-28
+> **Last Updated:** 2026-05-29
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -227,7 +227,7 @@ setTimeout(() => simulation.alpha(0).stop(), 8000);  // 8s convergence backstop
 | `forceCollide radius = nodeRadius + 14, strength 0.9` | Hard guarantee that token-based-sized nodes never overlap. |
 | `velocityDecay 0.45`, `alphaDecay 0.025` | Settles in ~6s; the 8s `alpha(0).stop()` is a backstop in case extreme node counts prevent natural convergence. |
 
-Node shape varies by source — `circle` (LifeOS), `rect` (Claude Code, `rx`/`ry` rounded), `polygon` (subagent diamond). The simulation tick re-positions whichever element is bound to each datum; size and color are re-applied on every snapshot tick via `applyShapeAttrs`. The actively-writing pulse (white border, 1.4s ease-in-out) is a CSS keyframe applied via the `.pulsing` class — far simpler than the previous vis-network `DataSet.update` polling.
+Node shape varies by routing (`nodeShapeTag`) — `rect` (Claude Code CLI, `rx`/`ry` rounded; `source`/`routing` = `claude_code`), `polygon` (local-agent diamond; `routing` local/unset), `circle` (cloud-agent dot; routed to Claude). Subagents follow the same routing rule rather than getting a dedicated shape. The simulation tick re-positions whichever element is bound to each datum; size and color are re-applied on every snapshot tick via `applyShapeAttrs`. The actively-writing pulse (white border, 1.4s ease-in-out) is a CSS keyframe applied via the `.pulsing` class — far simpler than the previous vis-network `DataSet.update` polling.
 
 The `viewBox` is `1600 × 1100` with `preserveAspectRatio="xMidYMid meet"` and `overflow: visible` so collision-pushed nodes don't get clipped at the edges.
 
@@ -290,7 +290,7 @@ All three opt-in via `LIFEOS_CC_RESUME_ENABLED` (except `/cc-pane-bind`, which i
 
 ### Resume
 
-1. Validate the session id (must start with `cc:`, must pass `validate_session_id`). Strip a `:agent:...` suffix if present — operator clicks on a subagent diamond mean "resume the parent terminal".
+1. Validate the session id (must start with `cc:`, must pass `validate_session_id`). Strip a `:agent:...` suffix if present — operator clicks on a subagent node mean "resume the parent terminal".
 2. Look up the meta via `discover_sessions(...)` with a widened 365-day lookback (resume is fine on old sessions). 404 if not found or no `decoded_cwd`.
 3. Render `LIFEOS_CC_RESUME_INNER_CMD` with `{session_id}` / `{cwd}` first, then render `LIFEOS_CC_RESUME_CMD` with the same substitutions plus `{session_id_url}` / `{cwd_url}` (URL-encoded for legacy URI-scheme launchers) and `{inner_command}` (which expands to the rendered inner command's argv tokens, picked apart by `shlex.split`).
 4. `shlex.split(rendered)` — no `shell=True`, ever.
