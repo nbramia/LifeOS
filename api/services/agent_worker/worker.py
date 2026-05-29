@@ -149,7 +149,7 @@ class Worker:
         spend_tracker: SpendTracker | None = None,
         poll_seconds: float | None = None,
         telegram_send=None,  # injectable for tests
-        telegram_send_with_id=None,  # injectable; returns sent message_id (or None)
+        telegram_send_with_id=None,  # injectable; returns list of sent chunk message_ids
         http_client: httpx.Client | None = None,
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
@@ -171,7 +171,7 @@ class Worker:
         def _noop_telegram(text, chat_id=None):
             return False
         def _noop_with_id(text):
-            return None
+            return []
         self._telegram_send = telegram_send if telegram_send is not None else _noop_telegram
         self._telegram_send_with_id = (
             telegram_send_with_id if telegram_send_with_id is not None else _noop_with_id
@@ -416,10 +416,11 @@ class Worker:
         """
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
-            # Skip top-level claimed sessions (those came from the tick claim
-            # path and will be dispatched by _dispatch). Spawned children have
-            # a parent_session_id set.
-            if not session.parent_session_id:
+            # Skip top-level claimed sessions from the #agent tick claim path
+            # (those are dispatched by _dispatch). Pick up spawned children
+            # (parent set) and operator root-spawns (#235, no parent but
+            # origin='operator').
+            if not session.parent_session_id and session.origin != "operator":
                 continue
             # The first pending message is the prompt from the parent — drain
             # it so the executor's seeded user turn picks it up.
@@ -511,6 +512,12 @@ class Worker:
         for q in answered:
             session_id = q["session_id"]
             task_id = q["task_id"]
+            # `code_followup` rows (#237) point at a Claude Code session, not an
+            # agent-worker session — the Telegram listener resumes those itself.
+            # Skip them here so the worker doesn't treat them as agent threads.
+            if q.get("kind") == "code_followup":
+                self.session_store.mark_question_processed(q["id"])
+                continue
             session = self.session_store.get_by_session_id(session_id)
             if session is None:
                 # Stale — session was deleted? Mark processed so we don't loop.
@@ -549,6 +556,18 @@ class Worker:
                 self.transcript_store.append(session_id, "routing_resolved", {
                     "from": "ask", "to": resolved,
                 })
+                if session.origin == "operator":
+                    # Operator root-spawn: flip back to CLAIMED so the
+                    # spawned-session dispatch picks it up next tick (it drains
+                    # the enqueued prompt as the task description). The #agent
+                    # inline path below would look up a non-existent vault task
+                    # and lose the prompt.
+                    self.session_store.update_status(task_id, STATUS_CLAIMED)
+                    self.session_store.mark_question_processed(q["id"])
+                    self.transcript_store.append(
+                        session_id, "operator_routing_resolved", {"to": resolved},
+                    )
+                    continue
                 # Refresh the session view so downstream code sees the new routing.
                 session = self.session_store.get_by_session_id(session_id)
 
@@ -624,8 +643,15 @@ class Worker:
         sid = session.session_id
         task_id = session.task_id
 
-        self._swap_tag(task_id, COMPLETED_TAG, RUNNING_TAG)
-        self._set_task_status(task_id, "in_progress")
+        # The task may be parked at any terminal tag — completed, failed, or
+        # budget-exceeded are all replyable now. Swap whichever is current
+        # back to running. Operator root-spawns (#235) have no backing vault
+        # task, so skip the tag/status mutations (they would 404).
+        if session.origin != "operator":
+            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+                if self._swap_tag(task_id, terminal_tag, RUNNING_TAG):
+                    break
+            self._set_task_status(task_id, "in_progress")
         self.session_store.update_status(task_id, STATUS_RUNNING)
         self.transcript_store.append(sid, "followup_received", {
             "question_id": q["id"], "answer_chars": len(answer),
@@ -724,7 +750,16 @@ class Worker:
         cutoff = int(time.time()) - timeout_seconds
         stale = self.session_store.list_timed_out_questions(cutoff)
         for q in stale:
+            # Close every stale row, but only nudge for actual clarifications
+            # (agent BLOCKED awaiting input). Completion follow-ups —
+            # kind='followup' (#234) and kind='code_followup' (#237) — are just
+            # replyable notifications; a "re-tag with #agent to retry" nudge is
+            # wrong for them (and a code_followup points at a Claude Code
+            # session with no #agent task at all). Marking them timed out also
+            # keeps stale follow-up rows from accumulating.
             self.session_store.mark_question_timed_out(q["id"])
+            if (q.get("kind") or "clarification") != "clarification":
+                continue
             self.transcript_store.append(q["session_id"], "clarification_timed_out", {
                 "question_id": q["id"],
             })
@@ -750,23 +785,25 @@ class Worker:
         — caller should mark the session blocked anyway since we can't ask).
         """
         try:
-            sent_id = self._telegram_send_with_id(question)
+            sent_ids = self._telegram_send_with_id(question) or []
         except Exception as exc:
             logger.warning(f"ask_user_via_telegram failed: {exc}")
             return None
-        if sent_id is None:
+        if not sent_ids:
             return None
         self.session_store.create_pending_question(
             session_id=session_id,
             task_id=task_id,
             question=question,
-            sent_message_id=sent_id,
+            sent_message_id=sent_ids[0],
+            sent_message_ids=sent_ids,
         )
         self.transcript_store.append(session_id, "clarification_sent", {
-            "sent_message_id": sent_id,
+            "sent_message_id": sent_ids[0],
+            "sent_message_ids": sent_ids,
             "question_chars": len(question),
         })
-        return sent_id
+        return sent_ids[0]
 
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""
@@ -1127,6 +1164,11 @@ class Worker:
         # leaks to the operator with the parent's internal prompt as
         # the "task description" — confusing and operator-irrelevant.
         is_spawned = bool(session.parent_session_id)
+        # Operator root-spawns (#235) are root sessions (no parent) so they DO
+        # notify the operator, but they have no backing #agent vault task — the
+        # vault mutations (complete / swap-tag / set-status) would 404. Gate
+        # those on `has_vault_task`; notifications + follow-up still fire.
+        has_vault_task = not is_spawned and session.origin != "operator"
 
         if outcome.status == STATUS_COMPLETED:
             # Guard against silent "I gave up" completions. When the agent
@@ -1154,47 +1196,34 @@ class Worker:
                 and not self._had_side_effect_tool_use(sid)
                 and spent < 0.05
             ):
-                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
                 recovered = self._recover_result_from_transcript(sid) or (
                     "no tool calls or final text recovered"
                 )
-                self._notify(
+                self._notify_terminal(
+                    session,
                     f"⚠️ {_worker_label(session.routing)}: task '{title}' returned "
                     f"empty result with no side-effect tool use — marking failed. "
                     f"What the agent did:\n\n{recovered}\n\n"
-                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`",
+                    label=title,
                 )
                 return
             if not is_spawned:
-                self._complete_task(session.task_id)  # mark `done` in the vault
-                # Swap the tag so the task surfaces as #agent-completed for symmetry
-                # with the failed / budget-exceeded / blocked terminal tags. Failure
-                # of the swap is non-critical — _swap_tag logs and the task is
-                # already marked done in the vault.
-                self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
+                if has_vault_task:
+                    self._complete_task(session.task_id)  # mark `done` in the vault
+                    # Swap the tag so the task surfaces as #agent-completed for symmetry
+                    # with the failed / budget-exceeded / blocked terminal tags. Failure
+                    # of the swap is non-critical — _swap_tag logs and the task is
+                    # already marked done in the vault.
+                    self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
                 # Send via the with-id sender so we can match a future Telegram
                 # reply to this completion message and resume the task as a
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
-                # When the with-id sender returns None (bot not configured, or
-                # a test stub that doesn't capture ids) fall back to the plain
-                # _notify path so the operator at least sees the result.
                 body = self._completion_summary(session, task, outcome)
-                sent_id = self._telegram_send_with_id(body)
-                if sent_id is None:
-                    self._notify(body)
-                else:
-                    try:
-                        self.session_store.register_completion_followup(
-                            session_id=sid,
-                            task_id=session.task_id,
-                            sent_message_id=sent_id,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "register_completion_followup failed for %s: %s",
-                            session.task_id, exc,
-                        )
+                self._notify_terminal(session, body, label=title)
             else:
                 # Child completion — record only; parent picks it up via yield_until.
                 self.transcript_store.append(sid, "child_completed_internal", {
@@ -1206,11 +1235,14 @@ class Worker:
         label = _worker_label(session.routing)
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             if not is_spawned:
-                self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
-                self._notify(
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
+                self._notify_terminal(
+                    session,
                     f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
-                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`",
+                    label=title,
                 )
             else:
                 self.transcript_store.append(sid, "child_budget_exceeded_internal", {
@@ -1221,11 +1253,14 @@ class Worker:
 
         if outcome.status == STATUS_FAILED:
             if not is_spawned:
-                self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
-                self._set_task_status(session.task_id, "cancelled")
-                self._notify(
+                if has_vault_task:
+                    self._swap_tag(session.task_id, RUNNING_TAG, FAILED_TAG)
+                    self._set_task_status(session.task_id, "cancelled")
+                self._notify_terminal(
+                    session,
                     f"⚠️ {label}: task '{title}' failed: {outcome.reason}. "
-                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`"
+                    f"Transcript: `data/agent_transcripts/{sid}.jsonl`",
+                    label=title,
                 )
             else:
                 self.transcript_store.append(sid, "child_failed_internal", {
@@ -1715,6 +1750,37 @@ class Worker:
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("telegram notify failed: %s", exc)
 
+    def _notify_terminal(self, session: Session, body: str, label: str) -> None:
+        """Send a terminal-state notification (completed / failed / budget) and
+        register a follow-up so a reply — to any chunk — resumes the session.
+
+        Sends via the with-id sender so every chunk's message_id is captured;
+        a reply landing on any of them (or a plain message within the 30-min
+        window) reopens the session as a follow-up turn. Falls back to the
+        plain one-way `_notify` when the with-id sender is unavailable (bot not
+        configured, or a test stub that captures no ids).
+        """
+        sent_ids: list[int] = []
+        try:
+            sent_ids = self._telegram_send_with_id(body) or []
+        except Exception as exc:
+            logger.warning("terminal notify (with id) failed for %s: %s", session.task_id, exc)
+        if not sent_ids:
+            self._notify(body)
+            return
+        try:
+            self.session_store.register_completion_followup(
+                session_id=session.session_id,
+                task_id=session.task_id,
+                sent_message_ids=sent_ids,
+                label=label,
+            )
+        except Exception as exc:
+            logger.warning(
+                "register_completion_followup failed for %s: %s",
+                session.task_id, exc,
+            )
+
 
 def main() -> None:
     logging.basicConfig(
@@ -1728,9 +1794,9 @@ def main() -> None:
     telegram_send = None
     telegram_send_with_id = None
     try:
-        from api.services.telegram import send_message, send_message_capture_id
+        from api.services.telegram import send_message, send_message_capture_ids
         telegram_send = send_message
-        telegram_send_with_id = send_message_capture_id
+        telegram_send_with_id = send_message_capture_ids
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("Telegram module not importable; running with no-op senders: %s", exc)
     worker = Worker(

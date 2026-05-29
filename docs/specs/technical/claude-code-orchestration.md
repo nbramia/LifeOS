@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** Orchestrator
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-05-28
 
 Implementation view of `api/services/claude_orchestrator.py` — how the Telegram `/code` command spawns and supervises a `claude` CLI subprocess. For the consumer view (`/code` command, plan mode, clarifications, budgets) see [product/claude-code-orchestration.md](../product/claude-code-orchestration.md). For operator setup see [guides/claude-code-orchestration.md](../../guides/claude-code-orchestration.md).
 
@@ -146,6 +146,18 @@ If Claude emits `[CLARIFY] <question>` mid-session, the orchestrator:
 5. State returns to `RUNNING`.
 
 If the operator wants to cancel during a clarification, they send `/code_cancel`. The orchestrator distinguishes commands from clarification answers by the leading slash.
+
+---
+
+## Replyable completions (#237)
+
+A reply to a `/code` completion message resumes that session, uniform with `#agent` thread replies. The mechanism reuses the shared `pending_questions` follow-up table rather than a `/code`-specific path:
+
+1. `run_task` / `followup` accept an `on_complete(session)` callback, fired once from `_cleanup` when a session completes successfully (status `completed`, `session_id` known) — after the final notification is sent.
+2. The Telegram listener's `_code_callbacks(chat_id)` builds the notify callback (which captures each sent message's chunk ids via `send_message_capture_ids`) plus an `on_complete` that registers a `pending_questions` row with `kind='code_followup'`, keyed to the completion message's chunk ids and storing the Claude `session_id`.
+3. On an incoming reply, `_maybe_handle_code_reply` looks up the open row (any-chunk match, `get_open_question_by_message_id`); if `kind='code_followup'` it closes the row and resumes via the orchestrator's existing `followup()` → `resume_session_id` path. The agent worker skips `code_followup` rows (they point at a Claude Code session, not an agent-worker session).
+
+This is **option A** (light build): reply *matching* is unified, but `/code` still runs as a separate session model and resume is bound to the orchestrator's `_last_completed` + `FOLLOWUP_WINDOW`. The deeper merge (routing `/code` through the unified worker, persisting the session id so resume survives restarts) is tracked as option B in #248.
 
 ---
 

@@ -330,3 +330,161 @@ class TestMessageDedup:
         listener._processed_ids.append(TelegramBotListener._DEDUP_WINDOW)
         assert 0 not in listener._processed_ids
         assert TelegramBotListener._DEDUP_WINDOW in listener._processed_ids
+
+
+# =============================================================================
+# Plain-message agent-thread resume (Issue #234, Phase 1)
+# =============================================================================
+
+
+class TestAgentThreadResume:
+    """A plain (non-reply) message within the window resumes the most recent
+    completed/failed agent thread instead of starting a fresh chat query."""
+
+    def _make_listener(self, tmp_path):
+        from api.services.telegram import TelegramBotListener
+        state_file = tmp_path / "telegram_state.json"
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            return TelegramBotListener()
+
+    def _store_with_followup(self, tmp_path, *, label="email Bob", msg_ids=(900,)):
+        from api.services.agent_worker.session_store import (
+            STATUS_COMPLETED,
+            SessionStore,
+        )
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        sess = store.create(
+            task_id="t1", status=STATUS_COMPLETED, routing="local",
+            budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+        )
+        store.register_completion_followup(
+            session_id=sess.session_id, task_id="t1",
+            sent_message_ids=list(msg_ids), label=label,
+        )
+        return store
+
+    @pytest.mark.asyncio
+    async def test_plain_message_within_window_resumes(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        store = self._store_with_followup(tmp_path, label="email Bob")
+
+        with patch("api.services.agent_worker.session_store.SessionStore", return_value=store), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            handled = await listener._maybe_resume_recent_agent_thread("also CC Jane", "123")
+
+        assert handled is True
+        # The message was deposited into the follow-up (now no longer resumable).
+        assert store.get_recent_resumable_followup(within_seconds=1800) is None
+        # A visible continuation prefix was sent.
+        mock_send.assert_awaited_once()
+        assert 'continuing "email Bob"' in mock_send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_no_recent_thread_falls_through(self, tmp_path):
+        from api.services.agent_worker.session_store import SessionStore
+        listener = self._make_listener(tmp_path)
+        empty_store = SessionStore(db_path=tmp_path / "sessions.db")  # no follow-ups
+
+        with patch("api.services.agent_worker.session_store.SessionStore", return_value=empty_store), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            handled = await listener._maybe_resume_recent_agent_thread("hello there", "123")
+
+        assert handled is False
+        mock_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_update_routes_plain_message_to_resume(self, tmp_path):
+        """Integration: a plain message with a resumable thread short-circuits
+        the chat pipeline."""
+        listener = self._make_listener(tmp_path)
+        update = {"message": {"message_id": 7, "text": "and add a PS", "chat": {"id": "123"}}}
+
+        with patch.object(listener, "_check_agent_approval", return_value=False), \
+             patch.object(listener, "_check_agent_clarification", return_value=False), \
+             patch.object(listener, "_check_code_followup", new_callable=AsyncMock, return_value=False), \
+             patch.object(listener, "_maybe_resume_recent_agent_thread", new_callable=AsyncMock, return_value=True) as mock_resume, \
+             patch("api.services.telegram.settings") as mock_settings, \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_settings.telegram_chat_id = "123"
+            await listener._handle_update(update)
+
+        mock_resume.assert_awaited_once()
+        mock_chat.assert_not_awaited()  # resume short-circuited the chat pipeline
+
+
+# =============================================================================
+# Operator agent spawn command (Issue #235)
+# =============================================================================
+
+
+class TestAgentSpawnCommand:
+    """`/agent [local|claude] <task>` operator spawn from Telegram."""
+
+    def _make_listener(self, tmp_path):
+        from api.services.telegram import TelegramBotListener
+        state_file = tmp_path / "telegram_state.json"
+        with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
+            return TelegramBotListener()
+
+    @pytest.mark.asyncio
+    async def test_explicit_claude_routing_passed_through(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        spawn_result = {"ok": True, "routing": "claude", "needs_routing": False,
+                        "session_id": "s1", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result) as mock_spawn, \
+             patch("api.services.agent_worker.session_store.SessionStore"), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            await listener._handle_agent_spawn("claude refactor the parser", "123")
+
+        _, kwargs = mock_spawn.call_args
+        assert kwargs.get("explicit_routing") == "claude"
+        # Task text has the keyword stripped.
+        assert mock_spawn.call_args.args[1] == "refactor the parser"
+        assert "Spawned" in mock_send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_no_keyword_auto_routes(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        spawn_result = {"ok": True, "routing": "local", "needs_routing": False,
+                        "session_id": "s1", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result) as mock_spawn, \
+             patch("api.services.agent_worker.session_store.SessionStore"), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            await listener._handle_agent_spawn("summarize my week", "123")
+
+        _, kwargs = mock_spawn.call_args
+        assert kwargs.get("explicit_routing") is None
+        assert mock_spawn.call_args.args[1] == "summarize my week"
+
+    @pytest.mark.asyncio
+    async def test_empty_task_shows_usage(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send:
+            await listener._handle_agent_spawn("", "123")
+        assert "Usage:" in mock_send.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_needs_routing_sends_clarification(self, tmp_path):
+        from api.services.agent_worker.session_store import SessionStore
+        listener = self._make_listener(tmp_path)
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        # A real (blocked, ask) operator session to attach the question to.
+        sess = store.create(
+            task_id="op_x", status="blocked", routing="ask", origin="operator",
+            budget={"max_dollars": 1.0, "wall_seconds": 60, "max_tokens": 100},
+        )
+        spawn_result = {"ok": True, "routing": "ask", "needs_routing": True,
+                        "session_id": sess.session_id, "task_id": "op_x"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result), \
+             patch("api.services.agent_worker.session_store.SessionStore", return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids", return_value=[555]), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            await listener._handle_agent_spawn("do the thing", "123")
+
+        # A routing clarification was registered against the sent message id.
+        q = store.get_question_by_message_id(555)
+        assert q is not None and q["task_id"] == "op_x"

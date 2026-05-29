@@ -97,3 +97,75 @@ class TestImperativeFollowupRegex:
         ]
         for q in should_not_match:
             assert not _IMPERATIVE_FOLLOWUP_RE.search(q), f"Should not match: {q!r}"
+
+
+# =============================================================================
+# Operator agent spawn from chat (Issue #235, AC6)
+# =============================================================================
+
+
+class TestAgentSlashChat:
+    """`/agent ...` operator spawn from the web chat orchestrator."""
+
+    class _FakeStore:
+        def __init__(self):
+            self.msgs = []
+        def add_message(self, cid, role, content):
+            self.msgs.append((role, content))
+
+    @staticmethod
+    def _reassemble(events):
+        """Join the 'content' fields from the SSE stream (the assistant message
+        is streamed char-by-char)."""
+        import json
+        out = []
+        for ev in events:
+            try:
+                data = json.loads(ev[len("data: "):].strip())
+            except ValueError:
+                continue
+            if data.get("type") == "content":
+                out.append(data["content"])
+        return "".join(out)
+
+    @pytest.mark.asyncio
+    async def test_agent_slash_spawns_and_confirms(self):
+        from unittest.mock import patch
+        from api.routes.chat import _handle_agent_slash
+
+        store = self._FakeStore()
+        spawn_result = {"ok": True, "routing": "claude", "needs_routing": False,
+                        "session_id": "s", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result) as mock_spawn, \
+             patch("api.services.agent_worker.session_store.SessionStore"):
+            events = [ev async for ev in _handle_agent_slash("/agent claude refactor x", "c1", store)]
+
+        assert mock_spawn.call_args.kwargs.get("explicit_routing") == "claude"
+        assert mock_spawn.call_args.args[1] == "refactor x"
+        assert "Spawned" in self._reassemble(events)
+        assert any(role == "assistant" for role, _ in store.msgs)
+        assert events[-1].strip().endswith('{"type": "done"}')
+
+    @pytest.mark.asyncio
+    async def test_agent_slash_empty_shows_usage(self):
+        from api.routes.chat import _handle_agent_slash
+        store = self._FakeStore()
+        events = [ev async for ev in _handle_agent_slash("/agent", "c1", store)]
+        assert "Usage:" in self._reassemble(events)
+
+    @pytest.mark.asyncio
+    async def test_agent_slash_ask_prompts_for_explicit_model(self):
+        from unittest.mock import patch
+        from api.routes.chat import _handle_agent_slash
+
+        store = self._FakeStore()
+        spawn_result = {"ok": True, "routing": "ask", "needs_routing": True,
+                        "session_id": "s", "task_id": "op_1"}
+        with patch("api.services.agent_worker.operator_spawn.create_operator_session",
+                   return_value=spawn_result), \
+             patch("api.services.agent_worker.session_store.SessionStore"):
+            events = [ev async for ev in _handle_agent_slash("/agent do the thing", "c1", store)]
+
+        body = self._reassemble(events)
+        assert "/agent local" in body and "/agent claude" in body

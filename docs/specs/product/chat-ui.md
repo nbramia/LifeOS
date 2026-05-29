@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-05-28
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -194,6 +194,16 @@ The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable vi
 - Supports both personal and work accounts
 
 ---
+
+## Agent Threads
+
+**Status:** Complete
+
+Web `/chat` speaks to the same agent-thread model as Telegram (#236, Phase 3 of #233):
+
+- **Threads panel** (sidebar) — lists recent/resumable agent sessions (root sessions only) with a status badge (running / completed / failed / budget / blocked). Backed by `GET /api/agents/threads`; polled for live-ish updates (the `/agents` page uses the `/api/agents/stream` SSE for the full graph).
+- **Reply** — completed/failed threads show a reply box; sending it (`POST /api/agents/threads/{id}/reply`) reopens the session as a follow-up turn via the shared follow-up table — the same path a Telegram reply takes.
+- **Run as agent** — the composer has a model selector (auto / local / cloud) and a spawn button; it sends the composer text to `POST /api/agents/spawn` (Phase 2's `create_operator_session`), and the new thread appears in the panel. `auto` routes via preflight.
 
 ## Implementation Details
 

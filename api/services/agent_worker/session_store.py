@@ -71,6 +71,11 @@ class Session:
     root_session_id: str | None = None
     spawn_depth: int = 0
     yield_waiting_for: list[str] | None = None
+    # Provenance of the session. NULL/"agent" = claimed from an #agent vault
+    # task; "operator" = root-spawned on demand from Telegram/chat with no
+    # backing task. The worker's spawned-session dispatch picks up operator
+    # sessions even though they have no parent (#235).
+    origin: str | None = None
 
 
 _SCHEMA = """
@@ -94,7 +99,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     spawn_depth               INTEGER NOT NULL DEFAULT 0,
     yield_waiting_for         TEXT,  -- JSON array of session_ids the agent is waiting on
     managed_agent_session_id  TEXT,
-    preset_class              TEXT
+    preset_class              TEXT,
+    origin                    TEXT   -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -140,7 +146,13 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     answered_at       INTEGER,
     processed         INTEGER NOT NULL DEFAULT 0,
     timed_out         INTEGER NOT NULL DEFAULT 0,
-    kind              TEXT NOT NULL DEFAULT 'clarification'
+    kind              TEXT NOT NULL DEFAULT 'clarification',
+    -- JSON array of every Telegram chunk id for this notification. Long
+    -- completions split across multiple 4096-char messages; a reply can land
+    -- on any chunk, so `deposit_answer` matches membership in this list (not
+    -- just the first chunk in `sent_message_id`). NULL for legacy rows, which
+    -- still match via `sent_message_id`.
+    sent_message_ids  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
 CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
@@ -247,6 +259,14 @@ class SessionStore:
                     "ALTER TABLE pending_questions ADD COLUMN kind TEXT "
                     "NOT NULL DEFAULT 'clarification'"
                 )
+            # Idempotent migration for `pending_questions.sent_message_ids` —
+            # the full chunk-id list so a reply to any chunk of a split
+            # notification matches. Legacy rows stay NULL and match on
+            # `sent_message_id`.
+            if "sent_message_ids" not in pq_cols:
+                conn.execute(
+                    "ALTER TABLE pending_questions ADD COLUMN sent_message_ids TEXT"
+                )
             # Idempotent migration for the prompt-cache token buckets on
             # `sessions`. Old rows stay at zero — we don't backfill historical
             # sessions, the raw event payloads in transcripts still have the
@@ -268,6 +288,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN preset_class TEXT"
                 )
+            # Idempotent migration for the per-session origin column (#235).
+            # Old rows stay NULL (treated as "agent").
+            if "origin" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
             # Idempotent migrations for the runaway detection counters on
             # managed_cursor (#139 Section 5).
             mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(managed_cursor)")}
@@ -299,6 +323,7 @@ class SessionStore:
         parent_session_id: str | None = None,
         root_session_id: str | None = None,
         spawn_depth: int = 0,
+        origin: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -306,6 +331,9 @@ class SessionStore:
         For root sessions (no parent), `root_session_id` defaults to the new
         session's own id. Children inherit the parent's `root_session_id` so
         lineage queries can find an entire family with one indexed lookup.
+
+        `origin="operator"` marks a root-spawned session (no #agent task) so
+        the worker's spawned-session dispatch claims it (#235).
         """
         sid = session_id or new_session_id()
         root_sid = root_session_id or sid
@@ -317,15 +345,15 @@ class SessionStore:
                     task_id, session_id, status, routing, budget_json,
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
-                    root_session_id, spawn_depth
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_session_id, spawn_depth, origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
                     json.dumps(budget) if budget else None,
                     now, now,
                     expected_output, parent_session_id,
-                    root_sid, spawn_depth,
+                    root_sid, spawn_depth, origin,
                 ),
             )
         return Session(
@@ -340,6 +368,7 @@ class SessionStore:
             parent_session_id=parent_session_id,
             root_session_id=root_sid,
             spawn_depth=spawn_depth,
+            origin=origin,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -865,15 +894,27 @@ class SessionStore:
         question: str,
         sent_message_id: int,
         kind: str = "clarification",
+        sent_message_ids: list[int] | None = None,
     ) -> int:
+        """Record a pending question / follow-up keyed by Telegram message id.
+
+        `sent_message_id` is the first (matchable) chunk id; `sent_message_ids`
+        is the full chunk list for a split notification (defaults to just the
+        first chunk). `deposit_answer` matches a reply to any chunk in the list.
+        """
+        ids = sent_message_ids or [int(sent_message_id)]
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO pending_questions (
-                    session_id, task_id, question, sent_message_id, sent_at, kind
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    session_id, task_id, question, sent_message_id, sent_at,
+                    kind, sent_message_ids
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, task_id, question, int(sent_message_id), _now(), kind),
+                (
+                    session_id, task_id, question, int(sent_message_id), _now(),
+                    kind, json.dumps([int(i) for i in ids]),
+                ),
             )
         return cur.lastrowid
 
@@ -881,35 +922,46 @@ class SessionStore:
         self,
         session_id: str,
         task_id: str,
-        sent_message_id: int,
+        sent_message_ids: list[int],
+        label: str = "",
     ) -> int:
-        """Register a completion-message Telegram msg_id so an operator
-        reply to that message reopens the session as a follow-up turn.
+        """Register a terminal-notification's Telegram msg_id(s) so an operator
+        reply to any chunk reopens the session as a follow-up turn.
 
-        The row goes into `pending_questions` with kind='followup' and
-        an empty `question` body — `deposit_answer` matches on
-        `sent_message_id` regardless of kind, and the worker tick
-        branches on `kind` when processing.
+        Used for COMPLETED, FAILED, and BUDGET_EXCEEDED notifications — every
+        terminal state is replyable. The row goes into `pending_questions` with
+        kind='followup'; `label` (the task description) is stored in `question`
+        so the resume path can show a `↪ continuing "<task>"` prefix. The worker
+        tick branches on `kind` when processing.
         """
+        if not sent_message_ids:
+            raise ValueError("register_completion_followup requires at least one message id")
         return self.create_pending_question(
             session_id=session_id,
             task_id=task_id,
-            question="",
-            sent_message_id=sent_message_id,
+            question=label,
+            sent_message_id=sent_message_ids[0],
             kind="followup",
+            sent_message_ids=sent_message_ids,
         )
 
     def deposit_answer(self, sent_message_id: int, answer: str) -> bool:
         """Record an answer for an open question, keyed by Telegram message_id.
 
-        Returns True if a matching open question was found and updated; False
-        otherwise (so the listener can fall through to the chat pipeline).
+        Matches a reply landing on any chunk of a split notification: the id is
+        checked against both the primary `sent_message_id` and membership in the
+        `sent_message_ids` JSON list. Returns True if a matching open question
+        was found and updated; False otherwise (so the listener can fall through
+        to the chat pipeline).
         """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT id FROM pending_questions "
-                "WHERE sent_message_id = ? AND answered_at IS NULL AND timed_out = 0",
-                (int(sent_message_id),),
+                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?))) "
+                "ORDER BY id ASC LIMIT 1",
+                (int(sent_message_id), int(sent_message_id)),
             ).fetchone()
             if not row:
                 return False
@@ -920,11 +972,85 @@ class SessionStore:
             )
         return True
 
+    def delete_session(self, session_id: str) -> None:
+        """Hard-delete a session and its queued messages/questions/turns.
+
+        Used to clean up an operator spawn that couldn't be routed (preflight
+        returned `ask` but the calling surface has no clarification flow), so it
+        doesn't linger as a permanently-blocked thread.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM pending_questions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    def enqueue_web_followup(self, session_id: str, task_id: str, answer: str) -> int:
+        """Queue a follow-up turn from a non-Telegram surface (web /chat, #236).
+
+        Inserts a pre-answered `kind='followup'` row so the worker's
+        `_process_clarification_answers` tick picks it up and reopens the
+        session via `_resume_as_followup` — the same path a Telegram reply
+        takes. There's no Telegram message to match, so `sent_message_id` is a
+        sentinel 0 (web follow-ups are created already-answered, so they never
+        participate in reply-id matching via `deposit_answer`).
+        """
+        now = _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pending_questions (
+                    session_id, task_id, question, sent_message_id, sent_at,
+                    kind, answer, answered_at
+                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?)
+                """,
+                (session_id, task_id, now, answer, now),
+            )
+        return cur.lastrowid
+
+    def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
+        """Return the most recent open follow-up whose notification was sent
+        within `within_seconds`, or None.
+
+        Powers the "plain message resumes the last agent thread" path: a
+        non-reply Telegram message within the window resumes the most recently
+        completed/failed thread without requiring the native reply gesture.
+        """
+        cutoff = _now() - int(within_seconds)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE kind = 'followup' AND answered_at IS NULL "
+                "AND processed = 0 AND timed_out = 0 AND sent_at >= ? "
+                "ORDER BY sent_at DESC, id DESC LIMIT 1",
+                (cutoff,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_question_by_message_id(self, sent_message_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_questions WHERE sent_message_id = ?",
                 (int(sent_message_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_open_question_by_message_id(self, sent_message_id: int) -> dict | None:
+        """Return the open (unanswered, not-timed-out) question a reply to
+        `sent_message_id` matches — on any chunk — or None.
+
+        Read-only sibling of `deposit_answer`: lets a caller inspect the matched
+        row's `kind` and route the reply (e.g. a `code_followup` resumes Claude
+        Code rather than the agent worker) before recording an answer.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?))) "
+                "ORDER BY id ASC LIMIT 1",
+                (int(sent_message_id), int(sent_message_id)),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1008,4 +1134,5 @@ class SessionStore:
                 if "yield_waiting_for" in row.keys() and row["yield_waiting_for"]
                 else None
             ),
+            origin=(row["origin"] if "origin" in row.keys() else None),
         )

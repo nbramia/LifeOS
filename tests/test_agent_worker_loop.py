@@ -108,10 +108,11 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
     # returns a deterministic message_id so reply-threading can be tested.
     sent_with_ids: list[tuple[int, str]] = []
     def _fake_send_with_id(text):
+        # Mirror send_message_capture_ids: return a list of chunk ids.
         sent.append(text)
         msg_id = len(sent_with_ids) + 1000
         sent_with_ids.append((msg_id, text))
-        return msg_id
+        return [msg_id]
     w = Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
@@ -370,10 +371,11 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     sent: list[str] = []
     sent_ids: list[tuple[int, str]] = []
     def _fake_with_id(text):
+        # Mirror send_message_capture_ids: return a list of chunk ids.
         sent.append(text)
         msg_id = len(sent_ids) + 2000
         sent_ids.append((msg_id, text))
-        return msg_id
+        return [msg_id]
     managed = _StubManagedExecutor()
     w = Worker(
         api_base="http://api",

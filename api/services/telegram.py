@@ -112,20 +112,21 @@ class TypingIndicator:
                 pass
 
 
-def send_message_capture_id(text: str, chat_id: str = None) -> int | None:
-    """Send a message and return its Telegram `message_id` (or None on failure).
+def send_message_capture_ids(text: str, chat_id: str = None) -> list[int]:
+    """Send a message and return the Telegram `message_id` of every chunk sent.
 
-    Used by the agent worker to track clarification questions so reply-
-    threaded answers can be matched back to the right pending question.
-    Falls back to plain text if Markdown parse fails. Returns the id from
-    the first sent chunk so reply-threading lands on the start of the
-    question.
+    Used by the agent worker to track clarification questions and terminal-state
+    notifications so reply-threaded answers can be matched back to the right
+    pending question. Long messages split across multiple 4096-char chunks; a
+    reply can land on *any* chunk, so we capture them all (not just the first).
+    Falls back to plain text if Markdown parse fails. Returns an empty list when
+    Telegram is disabled or every send failed.
     """
     if not settings.telegram_enabled:
-        return None
+        return []
     chat_id = chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
-    first_id: int | None = None
+    ids: list[int] = []
     for part in _split_message(text):
         try:
             resp = httpx.post(
@@ -139,14 +140,15 @@ def send_message_capture_id(text: str, chat_id: str = None) -> int | None:
                     json={"chat_id": chat_id, "text": part},
                     timeout=30.0,
                 )
-            if resp.status_code == 200 and first_id is None:
-                payload = resp.json()
-                first_id = (payload.get("result") or {}).get("message_id")
-            elif resp.status_code != 200:
+            if resp.status_code == 200:
+                msg_id = (resp.json().get("result") or {}).get("message_id")
+                if msg_id is not None:
+                    ids.append(int(msg_id))
+            else:
                 logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
-    return first_id
+    return ids
 
 
 def send_message(text: str, chat_id: str = None) -> bool:
@@ -382,6 +384,10 @@ class TelegramBotListener:
 
     _STATE_FILE = Path("data/telegram_state.json")
     _DEDUP_WINDOW = 1000  # Track last N message IDs for deduplication
+    # A plain (non-reply) message within this window of an agent thread's
+    # terminal notification resumes that thread instead of starting a fresh
+    # chat query. Beyond it, plain messages route to the chat pipeline.
+    _AGENT_THREAD_RESUME_WINDOW_SECONDS = 30 * 60
 
     def __init__(self):
         self._stop_event = threading.Event()
@@ -509,6 +515,108 @@ class TelegramBotListener:
             logger.warning(f"agent-worker deposit_answer failed: {exc}")
             return False
 
+    async def _maybe_resume_recent_agent_thread(self, text: str, chat_id: str) -> bool:
+        """Resume the most recent completed/failed agent thread when a plain
+        (non-reply) message arrives within the resume window.
+
+        Deposits the message into that thread's open follow-up so the worker
+        reopens the session as a new user turn, then shows a visible
+        continuation prefix. Returns True if the message was consumed as a
+        resume; False to fall through to the chat pipeline.
+
+        Like the native reply-deposit path (`_maybe_deposit_agent_answer`),
+        this hands off to the agent worker via the shared `pending_questions`
+        table; if that process is down the deposited turn waits until it comes
+        back rather than running immediately. Accepted edge — both deposit
+        paths share this property.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            row = store.get_recent_resumable_followup(
+                within_seconds=self._AGENT_THREAD_RESUME_WINDOW_SECONDS,
+            )
+            if not row:
+                return False
+            if not store.deposit_answer(row["sent_message_id"], text):
+                return False
+        except Exception as exc:
+            logger.warning(f"agent-thread resume check failed: {exc}")
+            return False
+
+        label = (row.get("question") or "").strip() or "your last agent task"
+        await send_message_async(f'↪ continuing "{label}"', chat_id=chat_id)
+        return True
+
+    async def _handle_agent_spawn(self, rest: str, chat_id: str):
+        """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
+
+        Explicit `local`/`claude` forces the model; otherwise preflight
+        auto-routes (and asks via the clarification flow when ambiguous). The
+        completion notification is replyable via the Phase 1 follow-up model.
+        """
+        explicit = None
+        parts = rest.split(maxsplit=1)
+        if parts and parts[0].lower() in ("local", "claude"):
+            explicit = parts[0].lower()
+            task = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            task = rest.strip()
+
+        if not task:
+            await send_message_async(
+                "Usage: /agent [local|claude] <task>\n"
+                "e.g. `/agent draft a reply to the landlord` (auto-routes), "
+                "or `/agent claude refactor the parser`.",
+                chat_id=chat_id,
+            )
+            return
+
+        try:
+            from api.services.agent_worker.operator_spawn import create_operator_session
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            result = await asyncio.to_thread(
+                create_operator_session, store, task, explicit_routing=explicit,
+            )
+        except Exception as exc:
+            logger.warning(f"operator spawn failed: {exc}")
+            await send_message_async(
+                f"Couldn't spawn agent: {str(exc)[:200]}", chat_id=chat_id,
+            )
+            return
+
+        if not result.get("ok"):
+            await send_message_async(
+                f"Couldn't spawn agent: {result.get('error')}", chat_id=chat_id,
+            )
+            return
+
+        if result.get("needs_routing"):
+            # Preflight couldn't pick a model — ask, and register the answer so
+            # the worker resolves routing and dispatches. Operator replies to
+            # this message (the reply-deposit hook matches it).
+            question = (
+                "Should I run this on the local Gemma model or on Claude? "
+                "Reply 'local' or 'claude'."
+            )
+            ids = send_message_capture_ids(question, chat_id)
+            if ids:
+                store.create_pending_question(
+                    session_id=result["session_id"], task_id=result["task_id"],
+                    question=question, sent_message_id=ids[0],
+                    sent_message_ids=ids, kind="clarification",
+                )
+            return
+
+        label = "Claude (cloud)" if result["routing"] == "claude" else "local Gemma"
+        await send_message_async(
+            f"🤖 Spawned {label} agent: {task[:120]}\n"
+            f"I'll send the result here when it's done — reply to it (or just message "
+            f"me within 30 min) to continue the thread.",
+            chat_id=chat_id,
+        )
+
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
         message = update.get("message")
@@ -539,7 +647,13 @@ class TelegramBotListener:
         # the answer and short-circuit — don't route to the chat pipeline.
         reply_to = message.get("reply_to_message")
         if reply_to and reply_to.get("message_id"):
-            if self._maybe_deposit_agent_answer(int(reply_to["message_id"]), text):
+            reply_to_id = int(reply_to["message_id"])
+            # A reply to a /code completion resumes that Claude Code session
+            # (#237) — checked before the agent-worker deposit since both use
+            # the shared follow-up table but resume different subsystems.
+            if await self._maybe_handle_code_reply(reply_to_id, text, chat_id):
+                return
+            if self._maybe_deposit_agent_answer(reply_to_id, text):
                 return
 
         logger.info(f"Telegram message: {text[:100]}")
@@ -565,6 +679,14 @@ class TelegramBotListener:
 
         # Check for follow-up to a recently completed Claude Code session
         if await self._check_code_followup(text, chat_id):
+            return
+
+        # Plain message (no native reply gesture) within the resume window:
+        # resume the most recent completed/failed agent thread so a quick
+        # "actually, also do X" continues the conversation instead of
+        # silently starting a fresh chat query. Native reply-to (handled
+        # above) still targets a specific, possibly older, thread.
+        if await self._maybe_resume_recent_agent_thread(text, chat_id):
             return
 
         # Send through chat pipeline (intent classification happens there)
@@ -631,6 +753,9 @@ class TelegramBotListener:
             else:
                 await self._handle_code_command(task, chat_id)
 
+        elif command == "/agent":
+            await self._handle_agent_spawn(text[len("/agent"):].strip(), chat_id)
+
         elif command in ("/code_status", "/codestatus"):
             await self._handle_code_status(chat_id)
 
@@ -648,6 +773,7 @@ class TelegramBotListener:
                 "/new or /clear - Start a new conversation\n"
                 "/status - Check LifeOS server health\n"
                 "/inspect - Show sources checked in last response\n"
+                "/agent [local|claude] <task> - Spawn an agent (auto-routes if no model given)\n"
                 "/code <task> - Run a task with Claude Code\n"
                 "/code\\_status - Check active Claude Code session\n"
                 "/code\\_cancel - Cancel active Claude Code session\n"
@@ -724,6 +850,79 @@ class TelegramBotListener:
         else:
             await send_message_async("No session waiting for clarification.", chat_id=chat_id)
 
+    def _code_callbacks(self, chat_id: str):
+        """Build the (notify, on_complete) callbacks for a Claude Code session.
+
+        `notify` sends each message via the id-capturing sender and remembers
+        the last message's chunk ids; `on_complete` registers those ids in the
+        shared follow-up table so a reply to the completion message resumes the
+        session uniformly with #agent threads (#237).
+        """
+        last_ids: list[int] = []
+
+        def notify(msg: str):
+            ids = send_message_capture_ids(msg, chat_id)
+            if ids:
+                last_ids[:] = ids
+
+        def on_complete(session):
+            self._register_code_followup(session, list(last_ids))
+
+        return notify, on_complete
+
+    def _register_code_followup(self, session, ids: list[int]) -> None:
+        """Register a completed Claude Code session in the shared follow-up
+        table (kind='code_followup') keyed to its completion message id(s)."""
+        session_id = getattr(session, "session_id", None)
+        if not ids or not session_id:
+            return
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            SessionStore().create_pending_question(
+                session_id=session_id,
+                task_id=f"code_{session_id}",
+                question=(getattr(session, "task", "") or "")[:200],
+                sent_message_id=ids[0],
+                sent_message_ids=ids,
+                kind="code_followup",
+            )
+        except Exception as exc:
+            logger.warning(f"register code followup failed: {exc}")
+
+    async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
+        """If a reply targets a Claude Code completion message (any chunk),
+        resume that session via the orchestrator's existing resume path (#237).
+
+        Returns True if the reply was consumed as a /code follow-up.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            q = store.get_open_question_by_message_id(reply_to_message_id)
+        except Exception as exc:
+            logger.warning(f"code reply lookup failed: {exc}")
+            return False
+        if not q or q.get("kind") != "code_followup":
+            return False
+
+        # Close the row so neither the worker nor a duplicate reply reprocesses it.
+        store.deposit_answer(reply_to_message_id, text)
+        store.mark_question_processed(q["id"])
+
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        notify, on_complete = self._code_callbacks(chat_id)
+        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
+        if resumed:
+            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
+        else:
+            await send_message_async(
+                "That Claude Code session can't be resumed (it expired or another "
+                "session is active). Start a fresh one with /code.",
+                chat_id=chat_id,
+            )
+        return True
+
     async def _check_code_followup(self, text: str, chat_id: str) -> bool:
         """Check if this message is a follow-up to a recently completed Claude Code session.
 
@@ -741,10 +940,8 @@ class TelegramBotListener:
         if not session:
             return False
 
-        def notify(msg: str):
-            send_message(msg, chat_id=chat_id)
-
-        resumed = orch.followup(text, notification_callback=notify)
+        notify, on_complete = self._code_callbacks(chat_id)
+        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
         if resumed:
             await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
             return True
@@ -778,11 +975,13 @@ class TelegramBotListener:
             chat_id=chat_id,
         )
 
-        def notify(msg: str):
-            send_message(msg, chat_id=chat_id)
+        notify, on_complete = self._code_callbacks(chat_id)
 
         try:
-            orch.run_task(task, working_dir, plan_mode=plan_mode, notification_callback=notify)
+            orch.run_task(
+                task, working_dir, plan_mode=plan_mode,
+                notification_callback=notify, on_complete=on_complete,
+            )
         except RuntimeError as e:
             await send_message_async(f"Error: {e}", chat_id=chat_id)
 
