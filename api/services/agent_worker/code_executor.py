@@ -540,7 +540,7 @@ class CodeExecutor:
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
                         self.transcript_store.append(sid, "code_clarify", {
-                            "body_chars": len(body),
+                            "body": body, "body_chars": len(body),
                         })
                 for match in _NOTIFY_RE.finditer(text):
                     body = match.group(1).strip()
@@ -553,7 +553,7 @@ class CodeExecutor:
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning("notification callback raised: %s", exc)
                     self.transcript_store.append(sid, "code_notify", {
-                        "body_chars": len(body),
+                        "body": body, "body_chars": len(body),
                     })
                     if state.plan_mode and not state.awaiting_approval:
                         state.plan_text += body + "\n"
@@ -562,7 +562,7 @@ class CodeExecutor:
                 tool_input = block.get("input", {}) or {}
                 state.last_activity = _summarize_tool_call(tool_name, tool_input)
                 self.transcript_store.append(sid, "code_tool_use", {
-                    "name": tool_name,
+                    "name": tool_name, "input": tool_input,
                 })
 
     def _handle_result_event(self, event: dict, session, state: _RunState) -> None:
