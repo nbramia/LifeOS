@@ -335,7 +335,13 @@
     font-size: 0.95rem;
     font-weight: 600;
     word-break: break-word;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 1px 4px;
+    margin: -1px -4px;
+    transition: background 0.12s;
   }
+  .panel-header .label:hover { background: var(--bg-elev); }
   .panel-header .meta {
     color: var(--text-secondary);
     font-size: 0.75rem;
@@ -1090,6 +1096,8 @@
     // operator what the session is actually about, which is far more useful
     // than knowing it ran on Opus vs. Sonnet. Falls back to the model badge
     // until the summary is fetched (lazy, on panel open).
+    // An operator-pinned manual label wins over everything else.
+    if (d.custom_label) return d.custom_label;
     if (d.short_label) return d.short_label;
     const isCc = d.source === 'claude_code';
     let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
@@ -1380,7 +1388,7 @@
         ${showKill ? '<button class="panel-kill" id="panel-kill">Kill</button>' : ''}
         ${showResume ? '<button class="panel-resume" id="panel-resume" title="Open a new wezterm tab and run claude --resume">Resume</button>' : ''}
         ${showGoTo ? '<button class="panel-focus" id="panel-focus" title="Jump to the existing wezterm pane for this session (or run Resume if there isn\'t one). Double-clicking the node does the same. Wayland disallows cross-app window raise — click the wezterm dock icon to bring it forward; it will already be on the right pane.">Go To</button>' : ''}
-        <div class="label" data-field="label">${escapeHtml(s.label || s.session_id)}</div>
+        <div class="label" data-field="label" title="Click to rename this session">${escapeHtml(s.custom_label || s.label || s.session_id)}</div>
         <div class="cwd-hint" data-field="cwd-hint" style="font-size:0.7rem;color:var(--text-dim);margin-top:0.15rem;word-break:break-all">${s.decoded_cwd ? escapeHtml(s.decoded_cwd) : ''}</div>
         <div class="meta" data-field="meta">
           <span data-field="live-dot">${live ? '<span class="live-dot" title="live"></span>' : ''}</span>
@@ -1400,6 +1408,8 @@
       <div class="events" id="events"></div>
     `;
     document.getElementById('panel-close').onclick = closePanel;
+    const labelEl = panelEl.querySelector('[data-field="label"]');
+    if (labelEl) labelEl.onclick = () => startLabelEdit(s);
     if (showKill) {
       document.getElementById('panel-kill').onclick = () => openKillModal(s);
     }
@@ -1528,7 +1538,10 @@
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     const isClaudeCode = (s.source === 'claude_code');
     const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
-    setText('label', s.label || s.session_id);
+    // Don't overwrite the title while the operator is mid-rename.
+    if (!panelEl.querySelector('#label-edit-input')) {
+      setText('label', s.custom_label || s.label || s.session_id);
+    }
     setText('status', s.status + inferredHint);
     setText('source', sourceLabel);
     setText('routing', routingLabel(s.routing));
@@ -1707,6 +1720,80 @@
   // Track the in-flight summary fetch so a new openPanel can abort the old
   // one — otherwise stale long-running fetches pile up behind Gemma.
   let summaryAbort = null;
+
+  // Turn the panel title into an inline text box prepopulated with the
+  // current label. Enter (or blur) saves, Escape cancels. An empty save
+  // clears the override and reverts the node to auto-naming.
+  function startLabelEdit(s) {
+    if (!panelEl) return;
+    const labelEl = panelEl.querySelector('[data-field="label"]');
+    if (!labelEl || labelEl.querySelector('#label-edit-input')) return;
+    const current = s.custom_label || s.label || '';
+    const input = document.createElement('input');
+    input.id = 'label-edit-input';
+    input.type = 'text';
+    input.maxLength = 120;
+    input.value = current;
+    input.style.cssText =
+      'width:100%;box-sizing:border-box;font:inherit;font-weight:600;' +
+      'color:var(--text-primary,#fff);background:var(--bg-elev);' +
+      'border:1px solid var(--accent);border-radius:4px;padding:2px 6px';
+    labelEl.textContent = '';
+    labelEl.appendChild(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = (save) => {
+      if (done) return;
+      done = true;
+      if (save) {
+        saveLabelEdit(s, input.value);
+      } else {
+        labelEl.textContent = s.custom_label || s.label || s.session_id;
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
+  // Persist a manual label (durably, server-side) and reflect it immediately
+  // on the open panel and the graph node so the operator doesn't wait for the
+  // next snapshot tick.
+  async function saveLabelEdit(s, rawValue) {
+    const labelEl = panelEl ? panelEl.querySelector('[data-field="label"]') : null;
+    const fallback = () => { if (labelEl) labelEl.textContent = s.custom_label || s.label || s.session_id; };
+    try {
+      const r = await fetch(
+        `/api/agents/sessions/${encodeURIComponent(s.session_id)}/label`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: (rawValue || '').trim() }),
+        },
+      );
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      const custom = data.custom_label || null;
+      s.custom_label = custom;
+      // Keep the canonical in-memory copy in sync so snapshot ticks agree.
+      const canonical = allSessions.find(x => x.session_id === s.session_id);
+      if (canonical) canonical.custom_label = custom;
+      if (labelEl) labelEl.textContent = custom || s.label || s.session_id;
+      // Nudge the node label immediately (custom_label || short_label || …).
+      nodeLayer.selectAll('.node')
+        .filter(d => d.session_id === s.session_id)
+        .each(function(d) { d.custom_label = custom; })
+        .select('text.node-label')
+        .text(d => nodeLabel(d));
+    } catch (err) {
+      console.warn('label save failed', err);
+      fallback();
+    }
+  }
 
   // Fetch and render the LLM-generated session summary. Decoupled from the
   // event stream — slow LLM calls won't block transcript display. The panel
@@ -2109,7 +2196,7 @@
   const SEARCH_BADGE = { label: 'name', short_label: 'label', summary: 'summary' };
 
   function sessionDisplayName(s) {
-    return s.short_label || s.label || s.session_id.slice(0, 8);
+    return s.custom_label || s.short_label || s.label || s.session_id.slice(0, 8);
   }
 
   // Escape, then wrap the first case-insensitive occurrence of `q` in <mark>.
@@ -2140,9 +2227,11 @@
       entries.set(sessionId, { session: s, field, snippet, visible: visibleIds.has(sessionId) });
     }
 
-    // Tier 0: label — client-side, covers every session.
+    // Tier 0: label — client-side, covers every session. Matches the
+    // displayed name, so an operator-pinned custom label is findable too.
     for (const s of allSessions) {
-      if ((s.label || '').toLowerCase().includes(q)) consider(s.session_id, 'label', s.label);
+      const name = s.custom_label || s.label || '';
+      if (name.toLowerCase().includes(q)) consider(s.session_id, 'label', name);
     }
     // Tiers 1/2: short_label / paragraph summary — from the backend.
     for (const [sid, m] of summaryMatches) consider(sid, m.field, m.snippet);

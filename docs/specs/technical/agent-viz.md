@@ -69,6 +69,7 @@ All under `/api/agents`. Local-network only — the kill and resume endpoints mu
 | `GET /sessions/{id}/events?limit=N` | Last N transcript events (default 200, max 2000). Dispatches by `cc:` prefix to the Claude Code ingest path. |
 | `GET /sessions/{id}/stream?backfill=N` | Per-session SSE: backfill last N events (default 50, max 500), then live-tail. Closes cleanly when the session reaches terminal status (LifeOS) or after 5 min idle (Claude Code). |
 | `POST /sessions/{id}/kill` | Operator kill — body `{reason: ""}`. LifeOS sessions only. Cascades to descendants in the subtree. |
+| `PUT /sessions/{id}/label` | Set or clear an operator-pinned manual label — body `{label: ""}`. Non-empty pins a custom node name that overrides the auto-derived label and AI summary label everywhere it's shown; empty clears it. Durable in `data/agent_viz_label_overrides.db` (in-process cache, lazy-loaded). Works for both LifeOS and `cc:` sessions. |
 | `POST /sessions/{id}/resume` | Resume a Claude Code session — body `{extra_env: {}}`. `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Spawns a WezTerm tab via `wezterm cli spawn`, captures the pane id from stdout, and stores `session_id → pane_id` in `data/cc_wezterm.db` so Focus can target it later. |
 | `POST /sessions/{id}/focus` | Activate the WezTerm pane for this session (Go To). `cc:`-prefixed ids only. Gated on `LIFEOS_CC_RESUME_ENABLED`. Resolves the pane id from the cached mapping first, then falls back to an FD probe (lsof + /proc + wezterm cli list) so it works for sessions never opened via Resume. 404 only when both the cache *and* the probe come up empty; 410 when the pane existed but is gone and no replacement is found. |
 | `POST /cc-pane-bind` | Localhost-only endpoint called by the Claude Code SessionStart hook. Body `{session_id, pane_id, cwd}`. Upserts the mapping in `cc_wezterm.db` so Go To can target newly-started `claude` invocations without a probe. 403 from non-loopback callers. |
@@ -107,6 +108,7 @@ One session row, unified shape (both sources):
 | `total_active_seconds` | float | LifeOS wall-time accounting. Always 0 for Claude Code (no wall meter). |
 | `expected_output` | str \| null | LifeOS preflight classification — `text` / `file` / `external_action` / `structured`. |
 | `label` | str | Display name. Cached per session id. |
+| `custom_label` | str \| null | Operator-pinned manual label (via `PUT /sessions/{id}/label`). When set, the frontend uses it as the node name in preference to the AI `short_label` and `label`. |
 | `model_label` | str | Short badge — `Local` / `Haiku` / `Sonnet` / `Opus` / `Claude Code`. |
 | `last_event_kind` | str | Most recent transcript event kind — drives the side-panel "last" tooltip. |
 | `tool_call_count`, `error_count` | int | Summed across the transcript tail (last 100 events). |
