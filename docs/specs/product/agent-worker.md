@@ -186,6 +186,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The other autonomous-work system in LifeOS; triggered from Telegram `/code` rather than `#agent` tags
 - [Agent Viz](agent-viz.md) — Live `/agents` page showing in-flight and recently-finished worker sessions
 - [Task Management](task-management.md) — How `#agent` tasks live alongside regular tasks in the Obsidian Tasks plugin
+- [Scheduler Guide](../../guides/scheduler.md) — A schedule's `agent` action writes the `#agent` tasks this worker runs
 - [MCP Tools](mcp-tools.md) — The `lifeos_agent_*` family for inter-agent coordination
 - [API Reference](api-reference.md) — `POST /api/tasks/{id}/swap-tag` and other task endpoints the worker uses
 - [Architecture](../technical/architecture.md) — Where the worker fits in the broader code structure

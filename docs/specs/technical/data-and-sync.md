@@ -162,7 +162,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
 | iMessage | `data/imessage.db` | Message export cache | iMessage sync |
 | Task Index | `data/task_index.json` | Parsed task cache | Task CRUD, file watcher |
-| Reminders | `~/.lifeos/reminders.json` | Scheduled reminders | Reminder CRUD, scheduler |
+| Scheduler | `LifeOS/Scheduler/Inbox.md` (source) + `data/scheduler_index.json` (cache) | Schedules (trigger + action) | Scheduler store, file watcher |
 | Memories | `~/.lifeos/memories.json` | User-saved memories | Memory CRUD |
 | Job Queue | `data/jobs.db` | Background job tracking | Job queue worker |
 

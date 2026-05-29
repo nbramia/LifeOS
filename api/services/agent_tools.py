@@ -301,7 +301,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "manage_reminders",
-        "description": "Manage timed reminders: create or list.",
+        "description": "DEPRECATED — use manage_schedules. Manage timed reminders: create or list.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -326,6 +326,52 @@ TOOL_DEFINITIONS = [
                 "message_content": {
                     "type": "string",
                     "description": "The reminder message to send (for create).",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_schedules",
+        "description": (
+            "Manage schedules: create or list. A schedule binds a trigger "
+            "(once/cron) to an action (notify/prompt/endpoint/agent). Use "
+            "action='agent' to run autonomous work on a schedule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "list"],
+                    "description": "Operation to perform.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Short schedule name/title (for create).",
+                },
+                "schedule_type": {
+                    "type": "string",
+                    "enum": ["once", "cron"],
+                    "description": "'once' for one-time, 'cron' for recurring (for create).",
+                },
+                "schedule_value": {
+                    "type": "string",
+                    "description": "ISO datetime for 'once', or cron expression for 'cron' (for create).",
+                },
+                "schedule_action": {
+                    "type": "string",
+                    "enum": ["notify", "prompt", "endpoint", "agent"],
+                    "description": "What fires: notify (static text), prompt (run chat), endpoint (call API), agent (hand off to the agent worker).",
+                },
+                "message_content": {
+                    "type": "string",
+                    "description": "Static text, natural-language prompt, or agent task description (for create).",
+                },
+                "executor": {
+                    "type": "string",
+                    "enum": ["local", "cloud", "cloud-haiku", "cloud-sonnet"],
+                    "description": "For schedule_action='agent': which executor the spawned #agent task targets.",
                 },
             },
             "required": ["action"],
@@ -563,7 +609,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -1030,12 +1076,59 @@ def _reminder_list(inp: dict) -> str:
 
 
 def _tool_manage_reminders(inp: dict):
+    # DEPRECATED alias for manage_schedules — kept for back-compat.
     action = inp["action"]
     if action == "create":
         return _reminder_create(inp)
     elif action == "list":
         return _reminder_list(inp)
     return f"Error: Unknown manage_reminders action '{action}'"
+
+
+# -- Schedule helpers --
+
+def _schedule_create(inp: dict) -> str:
+    from api.services.scheduler_store import get_scheduler_store
+    store = get_scheduler_store()
+    # `action` is the manage_schedules operation (create/list); the schedule's
+    # own action is passed as `schedule_action`.
+    action = inp.get("schedule_action") or "notify"
+    entry = store.create(
+        name=inp["name"],
+        schedule_type=inp["schedule_type"],
+        schedule_value=inp["schedule_value"],
+        action=action,
+        message_type=inp.get("message_type", "static" if action == "notify" else action),
+        message_content=inp.get("message_content", ""),
+        executor=inp.get("executor", ""),
+    )
+    label = f"{action} (#{entry.executor})" if action == "agent" and entry.executor else action
+    return (f"Schedule created: \"{entry.name}\" (id: {entry.id}, action: {label}, "
+            f"next: {entry.next_trigger_at})")
+
+
+def _schedule_list(inp: dict) -> str:
+    from api.services.scheduler_store import get_scheduler_store
+    store = get_scheduler_store()
+    entries = store.list_all()
+    if not entries:
+        return "No active schedules."
+    lines = []
+    for e in entries:
+        status = "enabled" if e.enabled else "disabled"
+        label = f"{e.action} (#{e.executor})" if e.action == "agent" and e.executor else e.action
+        lines.append(f"- \"{e.name}\" ({e.schedule_type}: {e.schedule_value}) "
+                     f"[{label}] [{status}] [id:{e.id}]")
+    return "\n".join(lines)
+
+
+def _tool_manage_schedules(inp: dict):
+    action = inp["action"]
+    if action == "create":
+        return _schedule_create(inp)
+    elif action == "list":
+        return _schedule_list(inp)
+    return f"Error: Unknown manage_schedules action '{action}'"
 
 
 async def _tool_create_email_draft(inp: dict) -> str:
@@ -1258,6 +1351,7 @@ _TOOL_HANDLERS = {
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
     "manage_reminders": _tool_manage_reminders,
+    "manage_schedules": _tool_manage_schedules,
     "search_finances": _tool_search_finances,
     "create_email_draft": _tool_create_email_draft,
     "create_calendar_event": _tool_create_calendar_event,
@@ -1289,6 +1383,9 @@ TOOL_STATUS_MESSAGES = {
     "manage_reminders": "Managing reminders...",
     "manage_reminders.create": "Setting reminder...",
     "manage_reminders.list": "Loading reminders...",
+    "manage_schedules": "Managing schedules...",
+    "manage_schedules.create": "Setting schedule...",
+    "manage_schedules.list": "Loading schedules...",
     "search_finances": "Checking finances...",
     "search_finances.accounts": "Loading account balances...",
     "search_finances.transactions": "Searching transactions...",

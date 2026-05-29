@@ -33,7 +33,8 @@ api/
 │   ├── imessage.py            # iMessage search
 │   ├── memories.py            # Memory store
 │   ├── people.py              # Simple people lookup
-│   ├── reminders.py           # Reminder CRUD endpoints
+│   ├── scheduler.py           # Schedule CRUD endpoints (/api/scheduler)
+│   ├── reminders.py           # Deprecated /api/reminders alias
 │   ├── search.py              # Vector search
 │   ├── slack.py               # Slack integration
 │   └── tasks.py               # Task CRUD endpoints
@@ -58,7 +59,8 @@ api/
 | crm.py | ~5,100 | 57 | Personal CRM API |
 | chat.py | ~1,800 | 1 | Streaming chat with agentic pipeline |
 | tasks.py | ~180 | 6 | Task CRUD API |
-| reminders.py | ~150 | 6 | Reminder CRUD API |
+| scheduler.py | ~230 | 7 | Schedule CRUD API (/api/scheduler) |
+| reminders.py | ~180 | 6 | Deprecated /api/reminders alias |
 | calendar.py | ~400 | 8 | Google Calendar |
 | gmail.py | ~350 | 6 | Gmail integration |
 | slack.py | ~500 | 10 | Slack integration |
@@ -100,8 +102,9 @@ api/
 - `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands, `chat_via_api_with_log` for execution metadata capture)
 - `claude_orchestrator.py` - Claude Code subprocess lifecycle, stream parsing, [NOTIFY] relay
 - `directory_resolver.py` - Maps task keywords to working directories for Claude Code
-- `reminder_store.py` - Reminder CRUD, persistence, scheduler (with retry, execution logging, suppression), and dashboard generation
-- `time_parser.py` - Natural language time parsing for reminders
+- `scheduler_store.py` - Schedule store + scheduler. Markdown source of truth (`LifeOS/Scheduler/Inbox.md`), action dispatch (notify/prompt/endpoint/agent), retry, suppression, run history, and dashboard generation. `reminder_store.py` re-exports it under the legacy `Reminder*` names.
+- `scheduler_watcher.py` - Watchdog watcher that reindexes the Scheduler directory on external edits
+- `time_parser.py` - Natural language time parsing for schedules
 
 **Search & Retrieval:**
 - `vectorstore.py` - ChromaDB wrapper
@@ -116,7 +119,7 @@ api/
 **Chat & Query Processing:**
 - `chat_helpers.py` - Query parsing, intent classification (ambiguous task/reminder, code), date extraction. Uses LLM-based classification (local LLM → pattern fallback). Compose/task/reminder intents now flow through the agentic loop.
 - `agent_loop.py` - Agentic chat loop: multi-turn conversation where Claude autonomously calls tools. Async generator yielding streamed text, tool status, and final result with cost tracking. Supports prompt caching.
-- `agent_tools.py` - Tool definitions and handlers for 15 tools. Tool format translation (Anthropic ↔ OpenAI) handled by `llm_client.py`. Consolidated tools: `manage_tasks`, `manage_reminders`, `person_info`. Includes `read_vault_file` for full-file reads, `save_memory` and `search_memories` for agent memory.
+- `agent_tools.py` - Tool definitions and handlers. Tool format translation (Anthropic ↔ OpenAI) handled by `llm_client.py`. Consolidated tools: `manage_tasks`, `manage_schedules` (`manage_reminders` kept as a deprecated alias), `person_info`. Includes `read_vault_file` for full-file reads, `save_memory` and `search_memories` for agent memory.
 - `agent_system_prompt.py` - System prompt builder. Returns cached static block + dynamic datetime block. Prompt caching is Anthropic-specific (used when `LIFEOS_LLM_BACKEND=anthropic`).
 - `query_router.py` - LLM-based query routing with person name extraction (used by non-agentic paths)
 - `conversation_context.py` - Tracks context across follow-up queries (person, reminder, topics)

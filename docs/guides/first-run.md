@@ -133,7 +133,7 @@ Available tools include:
 - `lifeos_meeting_prep` - Meeting briefings
 - `lifeos_people_search` - CRM search
 - `lifeos_task_create` / `lifeos_task_list` - Task management
-- `lifeos_reminder_create` / `lifeos_reminder_list` - Reminders
+- `lifeos_schedule_create` / `lifeos_schedule_list` - Schedules (triggers + actions)
 
 See [MCP Tools](../specs/product/mcp-tools.md) for full tool list.
 
@@ -162,7 +162,7 @@ Run this checklist to ensure everything is working:
 | Search works | Search via UI | Returns results |
 | Index populated | `curl localhost:8000/api/search -d '{"query":"test"}'` | Non-empty results |
 | Tasks API | `curl localhost:8000/api/tasks` | `{"tasks":[],"total":0}` |
-| Reminders API | `curl localhost:8000/api/reminders` | `{"reminders":[...]}` |
+| Scheduler API | `curl localhost:8000/api/scheduler` | `{"schedules":[...]}` |
 
 ---
 
