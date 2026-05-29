@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 ROUTE_LOCAL = "local"
 ROUTE_CLAUDE = "claude"
 ROUTE_ASK = "ask"
+# `code` is an explicit route — preflight never emits it. Sessions arrive with
+# routing="code" pre-set when spawned by the `/code` surface (#274/#275), so
+# preflight is skipped entirely for them. Listed here as the canonical name
+# so callers (worker, router, tests) share one constant.
+ROUTE_CODE = "code"
 
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
