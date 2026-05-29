@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
 from api.services.agent_system_prompt import build_system_prompt
-from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel
+from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage
@@ -96,6 +96,11 @@ async def run_agent_loop(
     """
     client = get_local_llm()
     system_prompt = build_system_prompt()
+
+    # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
+    # sending any draft created during this same turn — sends require the user
+    # to confirm in a later turn (draft → confirm → send).
+    begin_email_send_turn()
 
     # Inject relevant memories into system prompt (with token budget)
     with trace_span("memory_inject"):

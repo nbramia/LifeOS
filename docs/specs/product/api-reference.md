@@ -91,7 +91,8 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
 | `manage_schedules` | Create or list schedules (action: create/list; schedule_action: notify/prompt/endpoint/agent). `manage_reminders` kept as a deprecated alias |
-| `create_email_draft` | Gmail draft |
+| `create_email_draft` | Gmail draft (returns a draft_id; never sends) |
+| `send_email_draft` | Send an existing Gmail draft by draft_id (gated: only after the user confirms in a later turn — a draft created this turn cannot be sent) |
 | `create_calendar_event` | Create a Google Calendar event |
 | `update_calendar_event` | Update a Google Calendar event |
 | `delete_calendar_event` | Delete a Google Calendar event |
@@ -209,6 +210,26 @@ Create a Gmail draft.
 {
   "draft_id": "draft-id",
   "gmail_url": "https://mail.google.com/..."
+}
+```
+
+### POST /api/gmail/send
+
+Send an existing draft (created via `POST /api/gmail/drafts`) by its `draft_id`. The exact draft is sent — there is no compose-and-send shortcut, which keeps a review step in front of every outbound email. Only send after the user has reviewed the draft and explicitly confirmed.
+
+**Request:**
+```json
+{
+  "draft_id": "draft-id"
+}
+```
+Query param: `account` (personal or work; must match where the draft was created).
+
+**Response:**
+```json
+{
+  "message_id": "sent-message-id",
+  "source_account": "personal"
 }
 ```
 

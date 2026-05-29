@@ -61,6 +61,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 |------|-------------|
 | `lifeos_gmail_search` | Search emails (includes body for top 5) |
 | `lifeos_gmail_draft` | Create Gmail draft |
+| `lifeos_gmail_send` | Send an existing Gmail draft by draft_id (confirm first) |
 | `lifeos_drive_search` | Search Google Drive files |
 | `lifeos_imessage_search` | Search iMessage/SMS history |
 | `lifeos_slack_search` | Semantic search Slack messages |
@@ -242,6 +243,18 @@ Create a draft email in Gmail.
 | account | string | No | Account: personal or work |
 
 **Returns:** Draft ID and Gmail URL to open draft.
+
+### lifeos_gmail_send
+
+Send an existing Gmail draft (created via `lifeos_gmail_draft`) by its draft ID. Sends the exact draft — there is no compose-and-send shortcut. **Only send after the user has reviewed the draft and explicitly confirmed; never send a draft in the same turn it was created.**
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| draft_id | string | Yes | The draft ID returned by lifeos_gmail_draft |
+| account | string | No | Account: personal or work (must match where the draft was created) |
+
+**Returns:** The sent message ID and source account.
 
 ### lifeos_drive_search
 

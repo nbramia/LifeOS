@@ -107,6 +107,11 @@ CURATED_ENDPOINTS = {
         "description": "Create a Gmail draft (NOT sent — user reviews). Returns draft ID + URL. Required: to, subject, body. Optional: cc, bcc, account.",
         "method": "POST"
     },
+    "/api/gmail/send": {
+        "name": "lifeos_gmail_send",
+        "description": "Send an existing Gmail draft (from lifeos_gmail_draft) by draft_id. SAFETY: only after the user reviews and confirms; never send a draft created this same turn. Required: draft_id. Optional: account.",
+        "method": "POST"
+    },
     "/api/slack/search": {
         "name": "lifeos_slack_search",
         "description": "Semantic search across Slack DMs, group DMs, and channels. Returns channel, user, content.",

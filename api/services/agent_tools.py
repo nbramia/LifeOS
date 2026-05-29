@@ -5,6 +5,7 @@ Each tool wraps an existing service. Tool definitions follow the Anthropic
 tool-use schema. execute_tool() dispatches by name and returns a string result.
 """
 import asyncio
+import contextvars
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -13,6 +14,37 @@ from api.services.google_auth import resolve_account, get_configured_accounts
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Email send gate (draft → confirm → send)
+# ---------------------------------------------------------------------------
+# Per-turn set of draft IDs created during the current agent turn. The agent
+# loop binds a fresh set at the start of each user turn (begin_email_send_turn);
+# create_email_draft adds to it and send_email_draft refuses to send anything
+# in it. This makes "draft first, get confirmation, then send" a STRUCTURAL
+# guarantee rather than a prompt-only instruction — a freshly drafted email
+# cannot be sent in the same turn even if the model tries to. A ContextVar
+# (not a module global) keeps concurrent requests on the shared API isolated:
+# each request runs in its own task/context with its own set.
+_drafts_created_this_turn: contextvars.ContextVar = contextvars.ContextVar(
+    "drafts_created_this_turn", default=None
+)
+
+
+def begin_email_send_turn() -> None:
+    """Bind a fresh per-turn draft set. Call once at the start of each agent turn."""
+    _drafts_created_this_turn.set(set())
+
+
+def _mark_draft_created_this_turn(draft_id: str) -> None:
+    drafts = _drafts_created_this_turn.get()
+    if drafts is not None and draft_id:
+        drafts.add(draft_id)
+
+
+def _draft_created_this_turn(draft_id: str) -> bool:
+    drafts = _drafts_created_this_turn.get()
+    return bool(drafts) and draft_id in drafts
 
 # The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
 # America/New_York). Used to format message timestamps in tool output.
@@ -433,7 +465,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "create_email_draft",
-        "description": "Create a Gmail draft email.",
+        "description": (
+            "Create a Gmail draft email. This NEVER sends — it only drafts. "
+            "Always the FIRST step for any email request, even one phrased as "
+            "\"send an email to X\": draft it, show it to the user, and wait for "
+            "their explicit confirmation before sending with send_email_draft. "
+            "Returns the draft_id you'll need to send it later."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -456,6 +494,33 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["to", "subject", "body"],
+        },
+    },
+    {
+        "name": "send_email_draft",
+        "description": (
+            "Send a Gmail draft that was already created with create_email_draft, "
+            "by its draft_id. SAFETY GATE: only use this AFTER you have shown the "
+            "user the draft and they have EXPLICITLY confirmed — in a later message "
+            "— that they want it sent. NEVER send a draft in the same turn you "
+            "created it: draft first, ask for confirmation, then send only once the "
+            "user says yes. A draft created in the current turn cannot be sent and "
+            "will be rejected."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "draft_id": {
+                    "type": "string",
+                    "description": "The draft_id returned by create_email_draft.",
+                },
+                "account": {
+                    "type": "string",
+                    "description": "'personal' or 'work'. Must match the account the draft was created in. Default: 'personal'.",
+                    "enum": ["personal", "work"],
+                },
+            },
+            "required": ["draft_id"],
         },
     },
     {
@@ -1141,9 +1206,44 @@ async def _tool_create_email_draft(inp: dict) -> str:
         subject=inp["subject"],
         body=inp["body"],
     )
-    if draft:
-        return f"Draft created in {account_str} Gmail: \"{inp['subject']}\" to {inp['to']}"
-    return "Error: Failed to create email draft."
+    if not draft:
+        return "Error: Failed to create email draft."
+    # Record this draft as created in the current turn so the send gate refuses
+    # to send it until the user confirms in a later turn.
+    _mark_draft_created_this_turn(draft.draft_id)
+    return (
+        f"Draft created in {account_str} Gmail (draft_id={draft.draft_id}): "
+        f"\"{inp['subject']}\" to {inp['to']}. "
+        f"Do NOT send it yet — show the draft to the user and wait for their "
+        f"explicit confirmation, then call send_email_draft with draft_id="
+        f"{draft.draft_id} and account={account_str}."
+    )
+
+
+async def _tool_send_email_draft(inp: dict) -> str:
+    from api.services.gmail import GmailService
+    draft_id = (inp.get("draft_id") or "").strip()
+    if not draft_id:
+        return "Error: draft_id is required to send a draft. Create the draft first with create_email_draft."
+    # SAFETY GATE: never send a draft that was created in this same turn. Sends
+    # are only allowed for drafts created in a prior turn, giving the user a
+    # chance to review and explicitly confirm before anything goes out.
+    if _draft_created_this_turn(draft_id):
+        return (
+            "Error: This draft was just created in the current turn, so it cannot be sent yet. "
+            "Show the draft to the user and ask them to confirm. Only call send_email_draft "
+            "after they explicitly say yes in a later message."
+        )
+    account_str = inp.get("account", "personal")
+    account = resolve_account(account_str)
+    gmail = GmailService(account)
+    message_id = gmail.send_draft(draft_id)
+    if message_id:
+        return f"Email sent from {account_str} Gmail (message_id={message_id})."
+    return (
+        "Error: Failed to send draft. Verify the draft_id is correct and that the "
+        "account matches where the draft was created."
+    )
 
 
 def _tool_create_calendar_event(inp: dict) -> str:
@@ -1354,6 +1454,7 @@ _TOOL_HANDLERS = {
     "manage_schedules": _tool_manage_schedules,
     "search_finances": _tool_search_finances,
     "create_email_draft": _tool_create_email_draft,
+    "send_email_draft": _tool_send_email_draft,
     "create_calendar_event": _tool_create_calendar_event,
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
@@ -1392,6 +1493,7 @@ TOOL_STATUS_MESSAGES = {
     "search_finances.cashflow": "Loading cashflow summary...",
     "search_finances.budgets": "Checking budgets...",
     "create_email_draft": "Drafting email...",
+    "send_email_draft": "Sending email...",
     "create_calendar_event": "Creating calendar event...",
     "update_calendar_event": "Updating calendar event...",
     "delete_calendar_event": "Deleting calendar event...",

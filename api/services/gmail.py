@@ -578,6 +578,38 @@ class GmailService:
             logger.error(f"Failed to create draft to {to}: {e}")
             return None
 
+    def send_draft(self, draft_id: str) -> Optional[str]:
+        """
+        Send an existing draft by its draft ID.
+
+        Sends the exact draft that was created (rather than recomposing the
+        message), so the email that goes out is byte-for-byte what the user
+        reviewed and confirmed. This is the only send path — there is no
+        compose-and-send shortcut — which keeps a draft/review step in front
+        of every outbound email.
+
+        Args:
+            draft_id: The Gmail draft ID returned by create_draft.
+
+        Returns:
+            Sent message ID if successful, None otherwise.
+        """
+        try:
+            self._rate_limit()
+
+            result = self.service.users().drafts().send(
+                userId="me",
+                body={"id": draft_id},
+            ).execute()
+
+            message_id = result.get("id", "")
+            logger.info(f"Sent draft {draft_id} (message_id={message_id})")
+            return message_id
+
+        except Exception as e:
+            logger.error(f"Failed to send draft {draft_id}: {e}")
+            return None
+
 
 # Singleton services per account
 _gmail_services: dict[GoogleAccount, GmailService] = {}

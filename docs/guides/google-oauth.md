@@ -12,7 +12,7 @@ Step-by-step guide for setting up Google OAuth for Calendar, Gmail, and Drive in
 
 LifeOS uses Google OAuth to access:
 - **Google Calendar** - Upcoming events, meeting prep
-- **Gmail** - Email search, draft creation
+- **Gmail** - Email search, draft creation, and sending (gated on confirmation)
 - **Google Drive** - File search
 
 You can configure separate credentials for personal and work accounts.
