@@ -65,8 +65,17 @@ class CCWezTermStore:
     def _migrate_add_column(self, column: str, decl: str) -> None:
         cur = self._conn.execute("PRAGMA table_info(panes)")
         existing = {row["name"] for row in cur.fetchall()}
-        if column not in existing:
+        if column in existing:
+            return
+        # Race-safe: another process / worker may have added the column
+        # between the PRAGMA read and the ALTER. SQLite raises
+        # OperationalError("duplicate column name") in that case; treat as
+        # idempotent success.
+        try:
             self._conn.execute(f"ALTER TABLE panes ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
     def get(self, session_id: str) -> Optional[PaneMapping]:
         cur = self._conn.execute(

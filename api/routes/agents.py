@@ -795,6 +795,23 @@ def _copy_to_clipboard(text: str, env: dict[str, str]) -> bool:
     return False
 
 
+def _xdg_runtime_dir(env: dict[str, str] | None = None) -> str:
+    """Resolve XDG_RUNTIME_DIR with the standard `/run/user/<uid>` fallback.
+
+    Single source of truth for the convention used by /resume (via
+    `_resume_env`), /cc-pane-bind, and /focus when probing for live
+    wezterm-gui sockets. systemd's lifeos-api unit env usually lacks
+    XDG_RUNTIME_DIR, so the fallback is the load-bearing branch in
+    production.
+    """
+    import os
+    src = env if env is not None else os.environ
+    value = src.get("XDG_RUNTIME_DIR")
+    if value:
+        return value
+    return f"/run/user/{os.getuid()}"
+
+
 def _enumerate_live_wezterm_sockets(
     xdg_runtime_dir: str | None,
 ) -> list[tuple[float, str, int]]:
@@ -1375,9 +1392,7 @@ async def cc_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, A
     # missing from the systemd env), wezterm_pid=0 makes the mapping
     # invalidate on first focus, which falls through to the probe — still
     # correct, just doesn't save the round trip.
-    import os
-    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    wezterm_pid = _current_wezterm_pid(xdg)
+    wezterm_pid = _current_wezterm_pid(_xdg_runtime_dir())
     mapping = get_default_store().upsert(
         storage_id, int(body.pane_id), cwd, wezterm_pid=wezterm_pid,
     )
