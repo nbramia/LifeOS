@@ -558,18 +558,6 @@ class Settings(BaseSettings):
         alias="LIFEOS_CLAUDE_MAX_COST",
         description="Max cost in USD per Claude Code session. Session cancelled if exceeded."
     )
-    # Gates the new `/code` execution path (#248). "orchestrator" preserves the
-    # legacy in-memory ClaudeOrchestrator surface; "worker" routes through the
-    # agent worker's CodeExecutor (persisted session, restart-safe resume,
-    # /agents visibility). Default is "orchestrator" while the new path lands —
-    # #275 wires the spawn + reply flow, #276 flips the default and retires
-    # claude_orchestrator.
-    code_routing: str = Field(
-        default="orchestrator",
-        alias="LIFEOS_CODE_ROUTING",
-        description="`/code` dispatch target: 'orchestrator' (legacy) or 'worker' (unified agent worker)."
-    )
-
     @property
     def telegram_enabled(self) -> bool:
         """Check if Telegram bot is configured."""

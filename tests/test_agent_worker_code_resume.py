@@ -53,10 +53,11 @@ class _StubCodeExecutor:
         return self.resume_outcome or self.execute_outcome
 
 
-def _make_worker(tmp_path: Path, code_executor, monkeypatch):
-    monkeypatch.setattr(
-        "api.services.agent_worker.worker.settings.code_routing", "worker"
-    )
+def _make_worker(tmp_path: Path, code_executor, monkeypatch=None):
+    # monkeypatch retained as an optional arg for forward-compat with
+    # tests that still pass it; #276 removed the LIFEOS_CODE_ROUTING flag
+    # so there's nothing to set anymore.
+    del monkeypatch
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
