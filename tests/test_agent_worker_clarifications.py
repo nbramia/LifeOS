@@ -344,6 +344,31 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_timeout_closes_code_followup_without_nudge(tmp_path: Path):
+    """A stale code_followup row (#237) is timed out (closed) but does NOT get
+    the agent-worker 'still waiting / re-tag with #agent' nudge — it points at a
+    Claude Code session, not an #agent task."""
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    qid = w.session_store.create_pending_question(
+        session_id="claude_xyz", task_id="code_claude_xyz",
+        question="fix the bug", sent_message_id=77, kind="code_followup",
+    )
+    with w.session_store._connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET sent_at = ? WHERE id = ?",
+            (int(time.time()) - 4 * 86400, qid),
+        )
+
+    w._timeout_stale_clarifications()
+
+    assert w.session_store.get_question_by_message_id(77)["timed_out"] == 1
+    assert not any("still waiting on your reply" in s for s in w._sent)
+
+
+@pytest.mark.unit
 def test_lifeos_agent_user_ask_blocks_and_records_question(tmp_path: Path):
     """An agent calling `lifeos_agent_user_ask` should park the session and record
     a pending_question that the user can reply-thread to."""
@@ -710,3 +735,24 @@ def test_operator_completion_skips_vault_mutations(tmp_path: Path):
     assert not any(tid == op_task_id for _, tid in vault_calls), vault_calls
     # The completion still registered a replyable follow-up.
     assert w.session_store.get_recent_resumable_followup(within_seconds=3600) is not None
+
+
+@pytest.mark.unit
+def test_worker_skips_code_followup_rows(tmp_path: Path):
+    """code_followup rows (#237) point at a Claude Code session, not an
+    agent-worker session — the worker must skip them (mark processed) without
+    crashing or dispatching anything."""
+    api = FakeApi([])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="x"))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    w.session_store.create_pending_question(
+        session_id="claude_xyz", task_id="code_claude_xyz", question="t",
+        sent_message_id=50, kind="code_followup",
+    )
+    assert w.session_store.deposit_answer(50, "answer")
+
+    w.tick()  # must not crash on the code_followup row
+
+    assert w.session_store.get_question_by_message_id(50)["processed"] == 1
+    assert executor.calls == []  # nothing dispatched for a /code row

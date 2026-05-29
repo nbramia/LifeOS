@@ -512,6 +512,12 @@ class Worker:
         for q in answered:
             session_id = q["session_id"]
             task_id = q["task_id"]
+            # `code_followup` rows (#237) point at a Claude Code session, not an
+            # agent-worker session — the Telegram listener resumes those itself.
+            # Skip them here so the worker doesn't treat them as agent threads.
+            if q.get("kind") == "code_followup":
+                self.session_store.mark_question_processed(q["id"])
+                continue
             session = self.session_store.get_by_session_id(session_id)
             if session is None:
                 # Stale — session was deleted? Mark processed so we don't loop.
@@ -744,7 +750,16 @@ class Worker:
         cutoff = int(time.time()) - timeout_seconds
         stale = self.session_store.list_timed_out_questions(cutoff)
         for q in stale:
+            # Close every stale row, but only nudge for actual clarifications
+            # (agent BLOCKED awaiting input). Completion follow-ups —
+            # kind='followup' (#234) and kind='code_followup' (#237) — are just
+            # replyable notifications; a "re-tag with #agent to retry" nudge is
+            # wrong for them (and a code_followup points at a Claude Code
+            # session with no #agent task at all). Marking them timed out also
+            # keeps stale follow-up rows from accumulating.
             self.session_store.mark_question_timed_out(q["id"])
+            if (q.get("kind") or "clarification") != "clarification":
+                continue
             self.transcript_store.append(q["session_id"], "clarification_timed_out", {
                 "question_id": q["id"],
             })

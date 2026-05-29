@@ -647,7 +647,13 @@ class TelegramBotListener:
         # the answer and short-circuit — don't route to the chat pipeline.
         reply_to = message.get("reply_to_message")
         if reply_to and reply_to.get("message_id"):
-            if self._maybe_deposit_agent_answer(int(reply_to["message_id"]), text):
+            reply_to_id = int(reply_to["message_id"])
+            # A reply to a /code completion resumes that Claude Code session
+            # (#237) — checked before the agent-worker deposit since both use
+            # the shared follow-up table but resume different subsystems.
+            if await self._maybe_handle_code_reply(reply_to_id, text, chat_id):
+                return
+            if self._maybe_deposit_agent_answer(reply_to_id, text):
                 return
 
         logger.info(f"Telegram message: {text[:100]}")
@@ -844,6 +850,79 @@ class TelegramBotListener:
         else:
             await send_message_async("No session waiting for clarification.", chat_id=chat_id)
 
+    def _code_callbacks(self, chat_id: str):
+        """Build the (notify, on_complete) callbacks for a Claude Code session.
+
+        `notify` sends each message via the id-capturing sender and remembers
+        the last message's chunk ids; `on_complete` registers those ids in the
+        shared follow-up table so a reply to the completion message resumes the
+        session uniformly with #agent threads (#237).
+        """
+        last_ids: list[int] = []
+
+        def notify(msg: str):
+            ids = send_message_capture_ids(msg, chat_id)
+            if ids:
+                last_ids[:] = ids
+
+        def on_complete(session):
+            self._register_code_followup(session, list(last_ids))
+
+        return notify, on_complete
+
+    def _register_code_followup(self, session, ids: list[int]) -> None:
+        """Register a completed Claude Code session in the shared follow-up
+        table (kind='code_followup') keyed to its completion message id(s)."""
+        session_id = getattr(session, "session_id", None)
+        if not ids or not session_id:
+            return
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            SessionStore().create_pending_question(
+                session_id=session_id,
+                task_id=f"code_{session_id}",
+                question=(getattr(session, "task", "") or "")[:200],
+                sent_message_id=ids[0],
+                sent_message_ids=ids,
+                kind="code_followup",
+            )
+        except Exception as exc:
+            logger.warning(f"register code followup failed: {exc}")
+
+    async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
+        """If a reply targets a Claude Code completion message (any chunk),
+        resume that session via the orchestrator's existing resume path (#237).
+
+        Returns True if the reply was consumed as a /code follow-up.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            q = store.get_open_question_by_message_id(reply_to_message_id)
+        except Exception as exc:
+            logger.warning(f"code reply lookup failed: {exc}")
+            return False
+        if not q or q.get("kind") != "code_followup":
+            return False
+
+        # Close the row so neither the worker nor a duplicate reply reprocesses it.
+        store.deposit_answer(reply_to_message_id, text)
+        store.mark_question_processed(q["id"])
+
+        from api.services.claude_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        notify, on_complete = self._code_callbacks(chat_id)
+        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
+        if resumed:
+            await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
+        else:
+            await send_message_async(
+                "That Claude Code session can't be resumed (it expired or another "
+                "session is active). Start a fresh one with /code.",
+                chat_id=chat_id,
+            )
+        return True
+
     async def _check_code_followup(self, text: str, chat_id: str) -> bool:
         """Check if this message is a follow-up to a recently completed Claude Code session.
 
@@ -861,10 +940,8 @@ class TelegramBotListener:
         if not session:
             return False
 
-        def notify(msg: str):
-            send_message(msg, chat_id=chat_id)
-
-        resumed = orch.followup(text, notification_callback=notify)
+        notify, on_complete = self._code_callbacks(chat_id)
+        resumed = orch.followup(text, notification_callback=notify, on_complete=on_complete)
         if resumed:
             await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
             return True
@@ -898,11 +975,13 @@ class TelegramBotListener:
             chat_id=chat_id,
         )
 
-        def notify(msg: str):
-            send_message(msg, chat_id=chat_id)
+        notify, on_complete = self._code_callbacks(chat_id)
 
         try:
-            orch.run_task(task, working_dir, plan_mode=plan_mode, notification_callback=notify)
+            orch.run_task(
+                task, working_dir, plan_mode=plan_mode,
+                notification_callback=notify, on_complete=on_complete,
+            )
         except RuntimeError as e:
             await send_message_async(f"Error: {e}", chat_id=chat_id)
 
