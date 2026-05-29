@@ -121,6 +121,17 @@ def test_unsafe_preflight_rejected(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_delete_session_removes_row_and_queued_message(tmp_path: Path):
+    store = SessionStore(db_path=tmp_path / "s.db")
+    res = create_operator_session(store, "do X", explicit_routing="local")
+    sid = res["session_id"]
+    assert store.get_by_session_id(sid) is not None
+    store.delete_session(sid)
+    assert store.get_by_session_id(sid) is None
+    assert store.drain_pending_messages(sid) == []
+
+
+@pytest.mark.unit
 def test_operator_budget_defaults_applied(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "s.db")
     result = create_operator_session(store, "do X", explicit_routing="local")

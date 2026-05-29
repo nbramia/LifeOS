@@ -972,6 +972,42 @@ class SessionStore:
             )
         return True
 
+    def delete_session(self, session_id: str) -> None:
+        """Hard-delete a session and its queued messages/questions/turns.
+
+        Used to clean up an operator spawn that couldn't be routed (preflight
+        returned `ask` but the calling surface has no clarification flow), so it
+        doesn't linger as a permanently-blocked thread.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM pending_questions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+    def enqueue_web_followup(self, session_id: str, task_id: str, answer: str) -> int:
+        """Queue a follow-up turn from a non-Telegram surface (web /chat, #236).
+
+        Inserts a pre-answered `kind='followup'` row so the worker's
+        `_process_clarification_answers` tick picks it up and reopens the
+        session via `_resume_as_followup` — the same path a Telegram reply
+        takes. There's no Telegram message to match, so `sent_message_id` is a
+        sentinel 0 (web follow-ups are created already-answered, so they never
+        participate in reply-id matching via `deposit_answer`).
+        """
+        now = _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pending_questions (
+                    session_id, task_id, question, sent_message_id, sent_at,
+                    kind, answer, answered_at
+                ) VALUES (?, ?, '', 0, ?, 'followup', ?, ?)
+                """,
+                (session_id, task_id, now, answer, now),
+            )
+        return cur.lastrowid
+
     def get_recent_resumable_followup(self, within_seconds: int) -> dict | None:
         """Return the most recent open follow-up whose notification was sent
         within `within_seconds`, or None.

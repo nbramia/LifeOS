@@ -2480,6 +2480,32 @@
             margin-bottom: 1rem;
             opacity: 0.5;
         }
+
+        /* Agent threads panel (#236) */
+        .agents-panel { border-top: 1px solid var(--border, #2a2a2a); margin-top: auto; }
+        .agents-panel-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0.6rem 1rem; font-size: 0.8rem; font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7;
+        }
+        .agents-refresh { background: none; border: none; color: inherit; cursor: pointer; font-size: 1rem; opacity: 0.7; }
+        .agents-refresh:hover { opacity: 1; }
+        .agents-threads-list { max-height: 38vh; overflow-y: auto; padding: 0 0.5rem 0.5rem; }
+        .agent-thread { padding: 0.5rem 0.6rem; border-radius: 8px; margin-bottom: 0.35rem; background: rgba(255,255,255,0.03); }
+        .agent-thread-top { display: flex; align-items: center; gap: 0.4rem; }
+        .agent-thread-label { flex: 1; font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .agent-badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .agent-badge.running { background: #1e3a5f; color: #7fb4ff; }
+        .agent-badge.completed { background: #1e4620; color: #7ad17f; }
+        .agent-badge.failed, .agent-badge.budget_exceeded { background: #4a1e1e; color: #ff9d9d; }
+        .agent-badge.blocked, .agent-badge.yielded { background: #4a3a1e; color: #ffd27f; }
+        .agent-reply-row { display: none; gap: 0.3rem; margin-top: 0.4rem; }
+        .agent-reply-row.open { display: flex; }
+        .agent-reply-row input { flex: 1; font-size: 0.78rem; padding: 0.3rem 0.45rem; border-radius: 6px; border: 1px solid var(--border, #2a2a2a); background: rgba(0,0,0,0.2); color: inherit; }
+        .agent-reply-row button { font-size: 0.74rem; padding: 0.3rem 0.5rem; border-radius: 6px; border: none; cursor: pointer; background: #2d5fa3; color: #fff; }
+        .agent-routing-select { font-size: 0.78rem; border-radius: 8px; border: 1px solid var(--border, #2a2a2a); background: rgba(0,0,0,0.2); color: inherit; padding: 0 0.3rem; }
+        .agent-spawn-btn { background: none; border: none; cursor: pointer; font-size: 1.15rem; opacity: 0.75; }
+        .agent-spawn-btn:hover { opacity: 1; }
     </style>
 </head>
 <body>
@@ -2497,6 +2523,16 @@
         </div>
         <div class="conversations-list" id="conversationsList">
             <div class="empty-conversations">No conversations yet</div>
+        </div>
+        <!-- Agent threads (#236): in-flight + completed agent sessions, replyable -->
+        <div class="agents-panel" id="agentsPanel">
+            <div class="agents-panel-header">
+                <span>Agent threads</span>
+                <button class="agents-refresh" onclick="loadAgentThreads()" title="Refresh">⟳</button>
+            </div>
+            <div class="agents-threads-list" id="agentsThreadsList">
+                <div class="empty-conversations">No agent threads</div>
+            </div>
         </div>
     </aside>
 
@@ -2560,6 +2596,12 @@
                 <input type="file" id="fileInput" class="file-input" multiple
                        accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
                 <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files">📎</button>
+                <select id="agentRouting" class="agent-routing-select" title="Agent model (run-as-agent)">
+                    <option value="auto">🤖 auto</option>
+                    <option value="local">local</option>
+                    <option value="claude">cloud</option>
+                </select>
+                <button class="agent-spawn-btn" id="agentSpawnBtn" onclick="spawnAgentFromComposer()" title="Run the composer text as an agent">⚙</button>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
             </div>
         </footer>
@@ -2885,7 +2927,108 @@
             inputField.focus();
             setupScrollListener();
             setupAttachmentHandlers();
+            loadAgentThreads();
+            // Light polling for live-ish status; the /api/agents/stream SSE
+            // already drives the dedicated /agents page.
+            setInterval(loadAgentThreads, 5000);
         });
+
+        // --- Agent threads panel (#236) ---
+        async function loadAgentThreads() {
+            const list = document.getElementById('agentsThreadsList');
+            if (!list) return;
+            try {
+                const resp = await fetch('/api/agents/threads?limit=25');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                renderAgentThreads(data.threads || []);
+            } catch (e) { /* worker/API offline — leave the panel as-is */ }
+        }
+
+        function renderAgentThreads(threads) {
+            const list = document.getElementById('agentsThreadsList');
+            if (!list) return;
+            if (!threads.length) {
+                list.innerHTML = '<div class="empty-conversations">No agent threads</div>';
+                return;
+            }
+            list.innerHTML = '';
+            threads.forEach(t => {
+                const label = escapeHtml((t.label || t.task_id || t.session_id || 'agent').toString());
+                // escapeHtml leaves double-quotes intact; escape them for the
+                // title="…" attribute context to prevent attribute breakout.
+                const labelAttr = label.replace(/"/g, '&quot;');
+                const status = (t.status || '').toString();
+                const sid = t.session_id;
+                const div = document.createElement('div');
+                div.className = 'agent-thread';
+                div.innerHTML =
+                    '<div class="agent-thread-top">' +
+                        '<span class="agent-thread-label" title="' + labelAttr + '">' + label + '</span>' +
+                        '<span class="agent-badge ' + escapeHtml(status) + '">' + (escapeHtml(status) || '?') + '</span>' +
+                        (t.resumable ? '<button class="agents-refresh" title="Reply" onclick="toggleAgentReply(\'' + sid + '\')">↩</button>' : '') +
+                    '</div>' +
+                    '<div class="agent-reply-row" id="reply-' + sid + '">' +
+                        '<input type="text" placeholder="Reply to continue…" ' +
+                        'onkeydown="if(event.key===\'Enter\'){sendAgentReply(\'' + sid + '\')}">' +
+                        '<button onclick="sendAgentReply(\'' + sid + '\')">Send</button>' +
+                    '</div>';
+                list.appendChild(div);
+            });
+        }
+
+        function toggleAgentReply(sessionId) {
+            const row = document.getElementById('reply-' + sessionId);
+            if (!row) return;
+            row.classList.toggle('open');
+            const inp = row.querySelector('input');
+            if (inp && row.classList.contains('open')) inp.focus();
+        }
+
+        async function sendAgentReply(sessionId) {
+            const row = document.getElementById('reply-' + sessionId);
+            if (!row) return;
+            const inp = row.querySelector('input');
+            const text = ((inp && inp.value) || '').trim();
+            if (!text) return;
+            try {
+                const resp = await fetch('/api/agents/threads/' + encodeURIComponent(sessionId) + '/reply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text }),
+                });
+                if (resp.ok) {
+                    inp.value = '';
+                    row.classList.remove('open');
+                    setTimeout(loadAgentThreads, 500);
+                } else {
+                    const e = await resp.json().catch(() => ({}));
+                    alert('Reply failed: ' + (e.detail || resp.status));
+                }
+            } catch (e) { alert('Reply failed: ' + e); }
+        }
+
+        async function spawnAgentFromComposer() {
+            const prompt = (inputField.value || '').trim();
+            if (!prompt) { inputField.focus(); return; }
+            const sel = document.getElementById('agentRouting');
+            const routing = (sel && sel.value) || 'auto';
+            try {
+                const resp = await fetch('/api/agents/spawn', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt, routing }),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok) {
+                    inputField.value = '';
+                    inputField.style.height = 'auto';
+                    setTimeout(loadAgentThreads, 500);
+                } else {
+                    alert('Spawn failed: ' + (data.detail || resp.status));
+                }
+            } catch (e) { alert('Spawn failed: ' + e); }
+        }
 
         // Sidebar toggle
         function toggleSidebar() {
