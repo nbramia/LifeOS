@@ -16,6 +16,7 @@ trivially restartable and lets the API enforce its own locking.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -27,6 +28,8 @@ import httpx
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
+    ROUTE_CLAUDE_CODE,
+    ROUTE_CODEX,
     ROUTE_LOCAL,
     PreflightResult,
     run_preflight,
@@ -154,7 +157,8 @@ class Worker:
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
         managed_executor=None,    # injectable ManagedExecutor for tests
-        code_executor=None,       # injectable CodeExecutor for tests
+        claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
+        codex_executor=None,        # injectable CodexExecutor for tests
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -182,7 +186,8 @@ class Worker:
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
-        self._code_executor = code_executor  # lazily instantiated on first /code task
+        self._claude_code_executor = claude_code_executor  # lazily instantiated on first /claude task
+        self._codex_executor = codex_executor  # lazily instantiated on first /codex task
         self._warn_deprecated_settings()
 
     @staticmethod
@@ -455,9 +460,12 @@ class Worker:
                 if outcome.status == STATUS_FAILED:
                     self._handle_outcome(session, task, outcome)
                 # On RUNNING, let _poll_managed_sessions handle the rest.
-            elif session.routing == "code":
-                # /code sessions — operator-spawned via code_spawn.spawn_code_session.
-                self._dispatch_code_session(session, pending)
+            elif session.routing == "claude_code":
+                # /claude sessions — operator-spawned via claude_code_spawn.spawn_claude_code_session.
+                self._dispatch_claude_code_session(session, pending)
+            elif session.routing == "codex":
+                # /codex sessions — operator-spawned via codex_spawn.spawn_codex_session.
+                self._dispatch_codex_session(session, pending)
 
     def _poll_managed_sessions(self) -> None:
         """Advance all in-flight Managed Agents sessions one polling step."""
@@ -676,13 +684,22 @@ class Worker:
             self._handle_outcome(session, task, outcome)
             return
 
-        if session.routing == "code":
-            # /code follow-ups. Hand the reply off as a fresh pending message
-            # so _dispatch_code_session drains it and resumes via
-            # CodeExecutor.resume(). Flipping status back to CLAIMED puts the
-            # session in the same shape as a freshly-claimed one — the
-            # dispatcher's resume branch keys on session.code_session_id
+        if session.routing == "claude_code":
+            # /claude follow-ups. Hand the reply off as a fresh pending
+            # message so _dispatch_claude_code_session drains it and resumes
+            # via ClaudeCodeExecutor.resume(). Flipping status back to CLAIMED
+            # puts the session in the same shape as a freshly-claimed one —
+            # the dispatcher's resume branch keys on session.claude_code_session_id
             # being set, so it knows this is a resume rather than first run.
+            self.session_store.enqueue_message(sid, "operator", answer)
+            self.session_store.update_status(task_id, STATUS_CLAIMED)
+            self.session_store.mark_question_processed(q["id"])
+            return
+
+        if session.routing == "codex":
+            # /codex follow-ups — same pattern as /claude. CodexExecutor.resume()
+            # uses the persisted claude_code_session_id (reused column) to invoke
+            # `codex exec resume <id>`.
             self.session_store.enqueue_message(sid, "operator", answer)
             self.session_store.update_status(task_id, STATUS_CLAIMED)
             self.session_store.mark_question_processed(q["id"])
@@ -1033,44 +1050,44 @@ class Worker:
         )
         return self._managed_executor
 
-    def _dispatch_code_session(self, session, pending: list[dict]) -> None:
-        """Drive one ``routing='code'`` session through ``CodeExecutor``.
+    def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
+        """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
 
-        Handles both the fresh-spawn case (``code_session_id`` is NULL — call
-        ``execute()``) and the resume case (``code_session_id`` set — call
-        ``resume(message)`` with the latest drained pending message). On a
-        BLOCKED outcome the operator-facing reply prompt is sent via the
+        Handles both the fresh-spawn case (``claude_code_session_id`` is NULL
+        — call ``execute()``) and the resume case (``claude_code_session_id``
+        set — call ``resume(message)`` with the latest drained pending message).
+        On a BLOCKED outcome the operator-facing reply prompt is sent via the
         id-capturing Telegram sender and registered in ``pending_questions``
         so a threaded reply round-trips through ``_resume_as_followup``.
         """
-        from api.services.agent_worker.code_executor import (
+        from api.services.agent_worker.claude_code_executor import (
             REASON_AWAITING_CLARIFICATION,
             REASON_AWAITING_PLAN_APPROVAL,
         )
-        from api.services.agent_worker.code_spawn import parse_code_spawn_payload
+        from api.services.agent_worker.claude_code_spawn import parse_claude_code_spawn_payload
 
-        code = self._get_code_executor()
+        claude_code = self._get_claude_code_executor()
         sid = session.session_id
 
         # Build the task dict + resume message from drained pending messages.
-        # Fresh spawns carry the JSON payload produced by ``spawn_code_session``;
-        # resumes carry plain reply text (enqueued by ``_resume_as_followup``
+        # Fresh spawns carry the JSON payload produced by spawn_claude_code_session;
+        # resumes carry plain reply text (enqueued by `_resume_as_followup`
         # below or by the Telegram reply hook).
-        is_resume = bool(session.code_session_id)
+        is_resume = bool(session.claude_code_session_id)
         if is_resume:
             resume_message = pending[0]["content"] if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
-            self.transcript_store.append(sid, "code_user_prompt", {
+            self.transcript_store.append(sid, "claude_code_user_prompt", {
                 "text": resume_message, "resume": True,
             })
             try:
-                outcome = code.resume(session, resume_message)
+                outcome = claude_code.resume(session, resume_message)
             except Exception as exc:
-                logger.exception("code resume crashed for %s: %s", session.task_id, exc)
+                logger.exception("claude_code resume crashed for %s: %s", session.task_id, exc)
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
         else:
-            payload = parse_code_spawn_payload(pending[0]["content"]) if pending else {
+            payload = parse_claude_code_spawn_payload(pending[0]["content"]) if pending else {
                 "prompt": "", "working_dir": None, "plan_mode": False, "chat_id": None,
             }
             task = {
@@ -1080,13 +1097,13 @@ class Worker:
                 "plan_mode": payload["plan_mode"],
                 "chat_id": payload["chat_id"],
             }
-            self.transcript_store.append(sid, "code_user_prompt", {
+            self.transcript_store.append(sid, "claude_code_user_prompt", {
                 "text": payload["prompt"], "resume": False,
             })
             try:
-                outcome = code.execute(session, task)
+                outcome = claude_code.execute(session, task)
             except Exception as exc:
-                logger.exception("code execute crashed for %s: %s", session.task_id, exc)
+                logger.exception("claude_code execute crashed for %s: %s", session.task_id, exc)
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
 
@@ -1148,29 +1165,116 @@ class Worker:
 
         # FAILED / BUDGET_EXCEEDED — surface a brief operator notification.
         # Skip _handle_outcome (which assumes an #agent vault task) since
-        # /code sessions don't have one.
+        # /claude sessions don't have one.
         label = "Code session"
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
             self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
 
-    def _get_code_executor(self):
-        """Lazy-construct the CodeExecutor for /code sessions.
+    def _get_claude_code_executor(self):
+        """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
 
         Tests inject one via the constructor; production builds default
-        a CodeExecutor wired to the worker's Telegram sender so [NOTIFY]
+        a ClaudeCodeExecutor wired to the worker's Telegram sender so [NOTIFY]
         bodies stream live during the subprocess run.
         """
-        if self._code_executor is not None:
-            return self._code_executor
-        from api.services.agent_worker.code_executor import CodeExecutor
-        self._code_executor = CodeExecutor(
+        if self._claude_code_executor is not None:
+            return self._claude_code_executor
+        from api.services.agent_worker.claude_code_executor import ClaudeCodeExecutor
+        self._claude_code_executor = ClaudeCodeExecutor(
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=self._telegram_send,
         )
-        return self._code_executor
+        return self._claude_code_executor
+
+    def _dispatch_codex_session(self, session, pending: list[dict]) -> None:
+        """Drive one ``routing='codex'`` session through ``CodexExecutor``.
+
+        Mirrors ``_dispatch_claude_code_session`` but without plan-mode /
+        [CLARIFY] branches — Codex doesn't have those conventions. A
+        completed session relays its final agent message to the operator's
+        chat and registers it as a follow-up anchor so a threaded reply
+        resumes the session.
+        """
+        from api.services.agent_worker.codex_spawn import parse_codex_spawn_payload
+
+        codex = self._get_codex_executor()
+        sid = session.session_id
+
+        is_resume = bool(session.claude_code_session_id)
+        if is_resume:
+            resume_message = pending[0]["content"] if pending else ""
+            task: dict = {"id": session.task_id, "description": resume_message}
+            self.transcript_store.append(sid, "codex_user_prompt", {
+                "text": resume_message, "resume": True,
+            })
+            try:
+                outcome = codex.resume(session, resume_message)
+            except Exception as exc:
+                logger.exception("codex resume crashed for %s: %s", session.task_id, exc)
+                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                return
+        else:
+            payload = parse_codex_spawn_payload(pending[0]["content"]) if pending else {
+                "prompt": "", "working_dir": None, "chat_id": None,
+            }
+            task = {
+                "id": session.task_id,
+                "description": payload["prompt"],
+                "working_dir": payload["working_dir"],
+                "chat_id": payload["chat_id"],
+            }
+            self.transcript_store.append(sid, "codex_user_prompt", {
+                "text": payload["prompt"], "resume": False,
+            })
+            try:
+                outcome = codex.execute(session, task)
+            except Exception as exc:
+                logger.exception("codex execute crashed for %s: %s", session.task_id, exc)
+                self.session_store.update_status(session.task_id, STATUS_FAILED)
+                return
+
+        if outcome.status == STATUS_COMPLETED:
+            body = outcome.final_text.strip() if outcome.final_text else ""
+            if body:
+                try:
+                    sent_ids = self._telegram_send_with_id(body) or []
+                except Exception as exc:
+                    logger.warning("codex completion send failed: %s", exc)
+                    sent_ids = []
+                if sent_ids:
+                    self.session_store.create_pending_question(
+                        session_id=sid,
+                        task_id=session.task_id,
+                        question=body[:200],
+                        sent_message_id=sent_ids[0],
+                        sent_message_ids=sent_ids,
+                        kind="followup",
+                    )
+            self.transcript_store.append(sid, "codex_handled_completion", {
+                "final_chars": len(body),
+            })
+            return
+
+        label = "Codex session"
+        if outcome.status == STATUS_BUDGET_EXCEEDED:
+            self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
+        elif outcome.status == STATUS_FAILED:
+            self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+
+    def _get_codex_executor(self):
+        """Lazy-construct the CodexExecutor for /codex sessions."""
+        if self._codex_executor is not None:
+            return self._codex_executor
+        from api.services.agent_worker.codex_executor import CodexExecutor
+        self._codex_executor = CodexExecutor(
+            session_store=self.session_store,
+            transcript_store=self.transcript_store,
+            notification_callback=self._telegram_send,
+        )
+        return self._codex_executor
 
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
         try:
@@ -1294,6 +1398,30 @@ class Worker:
             # `_poll_managed_sessions` in the next tick will pick it up.
             if outcome.status == STATUS_FAILED:
                 self._handle_outcome(session, task, outcome)
+            return
+
+        # CLI routes (#claude → Claude Code, #codex → Codex). Synthesize the
+        # pending-message payload that _dispatch_*_session expects so the
+        # operator-/claude-style entry path can be reused unchanged. The task
+        # title is the prompt; working_dir is picked from the description so
+        # the CLI runs inside the relevant project.
+        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            from api.services.directory_resolver import resolve_working_directory
+            working_dir = resolve_working_directory(title)
+            payload = {
+                "prompt": title,
+                "working_dir": working_dir,
+                # No originating chat — progress/notify goes via the worker's
+                # default Telegram sender like cloud-routed #agent tasks.
+                "chat_id": None,
+            }
+            pending = [{"content": json.dumps(payload)}]
+            if pre.routing == ROUTE_CLAUDE_CODE:
+                payload["plan_mode"] = False  # /claude expects this key
+                pending[0]["content"] = json.dumps(payload)
+                self._dispatch_claude_code_session(session, pending)
+            else:
+                self._dispatch_codex_session(session, pending)
             return
 
         # Should not reach here — routing was validated in preflight.

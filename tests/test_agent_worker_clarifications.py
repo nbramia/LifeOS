@@ -353,7 +353,7 @@ def test_init_migrates_legacy_code_followup_rows_processed(tmp_path: Path):
     from api.services.agent_worker.session_store import SessionStore
 
     # First open the DB and seed a legacy row directly — this mirrors what
-    # the production DB would contain if a /code completion went
+    # the production DB would contain if a /claude completion went
     # un-replied for a while.
     store = SessionStore(db_path=tmp_path / "s.db")
     qid = store.create_pending_question(

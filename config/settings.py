@@ -209,6 +209,52 @@ class Settings(BaseSettings):
                     "within this many days. Keeps the snapshot lean — older "
                     "transcripts can still be opened on demand by direct id."
     )
+    codex_viz_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_CODEX_VIZ_ENABLED",
+        description="When true, the /agents page also surfaces local Codex "
+                    "CLI sessions discovered under "
+                    "$LIFEOS_CODEX_SESSIONS_DIR (default ~/.codex/sessions). "
+                    "Read-only. Set false to omit Codex sessions from the viz."
+    )
+    codex_sessions_dir: str = Field(
+        default="~/.codex/sessions",
+        alias="LIFEOS_CODEX_SESSIONS_DIR",
+        description="Filesystem root containing Codex CLI rollout files, "
+                    "organized as `<year>/<month>/<day>/rollout-*.jsonl`. "
+                    "One JSONL per session."
+    )
+    codex_lookback_days: int = Field(
+        default=7,
+        alias="LIFEOS_CODEX_LOOKBACK_DAYS",
+        description="Only ingest Codex rollout files modified within this many "
+                    "days. Older transcripts can still be opened on demand by "
+                    "direct id via the events endpoint."
+    )
+    codex_resume_enabled: bool = Field(
+        default=False,
+        alias="LIFEOS_CODEX_RESUME_ENABLED",
+        description="When true, the /agents UI exposes a 'Resume' button on "
+                    "terminal-state Codex sessions that spawns a local "
+                    "terminal running the configured resume command. Opt-in "
+                    "because spawning GUI terminals from a systemd service "
+                    "depends on the operator's desktop environment."
+    )
+    codex_resume_cmd: str = Field(
+        default="wezterm cli spawn --cwd {cwd} -- {inner_command}",
+        alias="LIFEOS_CODEX_RESUME_CMD",
+        description="Launcher command for resuming a Codex session. Same "
+                    "substitution surface as LIFEOS_CC_RESUME_CMD: "
+                    "`{session_id}`, `{cwd}`, `{inner_command}`, URL-encoded "
+                    "`{session_id_url}` / `{cwd_url}`. Parsed with shlex.split."
+    )
+    codex_resume_inner_cmd: str = Field(
+        default="codex resume {session_id}",
+        alias="LIFEOS_CODEX_RESUME_INNER_CMD",
+        description="Command run *inside* the spawned terminal — the actual "
+                    "`codex resume` invocation. Substitutions: `{session_id}`, "
+                    "`{cwd}`. Set to empty to skip the inner command."
+    )
     cc_resume_enabled: bool = Field(
         default=False,
         alias="LIFEOS_CC_RESUME_ENABLED",

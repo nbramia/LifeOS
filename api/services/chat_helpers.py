@@ -713,7 +713,7 @@ _TEMPORAL_MARKERS = re.compile(
 )
 
 
-def _is_code_intent(query: str) -> bool:
+def _is_claude_intent(query: str) -> bool:
     """Return True if the query asks for an action on the filesystem, terminal,
     or browser (i.e. needs Claude Code), as opposed to a question about code.
     """
@@ -739,8 +739,8 @@ async def classify_action_intent(query: str, conversation_history: list = None) 
     """Pre-agent intent dispatch — return one of two outcomes that change the
     code path downstream in :func:`api.routes.chat.ask_stream`:
 
-    - ``ActionIntent("code", None)`` — query needs Claude Code (terminal,
-      filesystem, browser). ``ask_stream`` emits a ``code_intent`` SSE event
+    - ``ActionIntent("claude", None)`` — query needs Claude Code (terminal,
+      filesystem, browser). ``ask_stream`` emits a ``claude_intent`` SSE event
       and returns, so the Telegram bot can spawn a Claude Code subprocess.
     - ``ActionIntent("ambiguous_task_reminder", None)`` — query reads as
       "task or timed reminder?" without an explicit time. ``ask_stream``
@@ -757,8 +757,8 @@ async def classify_action_intent(query: str, conversation_history: list = None) 
     cases ("both", "the second one") are handled by the pending-selection
     machinery elsewhere in ``ask_stream``.
     """
-    if _is_code_intent(query):
-        return ActionIntent("code", None)
+    if _is_claude_intent(query):
+        return ActionIntent("claude", None)
     if _is_ambiguous_task_reminder(query):
         return ActionIntent("ambiguous_task_reminder", None)
     return None

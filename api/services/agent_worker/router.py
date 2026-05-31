@@ -12,7 +12,7 @@ import logging
 from typing import Any, Callable
 
 from api.services.agent_worker.local_executor import ExecutorOutcome, LocalExecutor
-from api.services.agent_worker.preflight import ROUTE_CLAUDE, ROUTE_CODE, ROUTE_LOCAL
+from api.services.agent_worker.preflight import ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_LOCAL
 
 
 logger = logging.getLogger(__name__)
@@ -40,13 +40,13 @@ def dispatch(
             on_claude_unavailable()
         return None
 
-    if routing == ROUTE_CODE:
-        # Code sessions skip preflight entirely (they're created with
-        # routing="code" pre-set by the /code spawn surface) and are
-        # dispatched from `_dispatch_spawned_sessions`, not from the
-        # preflight-driven `_dispatch`. Reaching this branch would mean a
-        # preflight emitted "code", which it doesn't.
-        logger.warning("router: ROUTE_CODE is dispatched from the spawned-session path, not preflight")
+    if routing == ROUTE_CLAUDE_CODE:
+        # claude_code sessions skip preflight entirely (they're created with
+        # routing="claude_code" pre-set by the /claude spawn surface or the
+        # #claude tag handler in preflight) and are dispatched from
+        # `_dispatch_spawned_sessions` or `_dispatch`'s CLI branch, not
+        # from this router.
+        logger.warning("router: ROUTE_CLAUDE_CODE is dispatched from the spawned-session path, not preflight")
         return None
 
     logger.warning("router: unknown routing %r — skipping", routing)

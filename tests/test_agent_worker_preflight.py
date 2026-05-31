@@ -298,6 +298,51 @@ def test_tag_precedence_accepts_hash_prefix_form():
     assert result.model == pf.MODEL_HAIKU
 
 
+@pytest.mark.unit
+def test_claude_tag_routes_to_claude_code_cli():
+    """`#claude` forces routing=claude_code (Claude Code CLI, subscription-billed)."""
+    result = pf.run_preflight("clean up the logs",
+                              tags=["agent", "claude"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+    assert "#claude tag present" in result.routing_reason
+    # No per-token cost gating for CLI routes — billed via subscription.
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_codex_tag_routes_to_codex_cli():
+    """`#codex` forces routing=codex (Codex CLI, subscription-billed)."""
+    result = pf.run_preflight("rename a class",
+                              tags=["agent", "codex"],
+                              caller=_stub_caller(routing="local"))
+    assert result.routing == pf.ROUTE_CODEX
+    assert "#codex tag present" in result.routing_reason
+    assert result.estimated_cost_dollars == 0.0
+    assert result.needs_cost_confirmation is False
+
+
+@pytest.mark.unit
+def test_local_tag_beats_claude_tag():
+    """`#local` is checked first; combining with `#claude` keeps the task
+    on Gemma. Documents the precedence ladder."""
+    result = pf.run_preflight("anything",
+                              tags=["agent", "claude", "local"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_LOCAL
+
+
+@pytest.mark.unit
+def test_claude_tag_beats_codex_tag():
+    """`#claude` is checked before `#codex`; if both are present, Claude wins.
+    Documents the precedence ladder."""
+    result = pf.run_preflight("anything",
+                              tags=["agent", "codex", "claude"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+
+
 # ---------------------------------------------------------------------------
 # Preset class tag detection (#139 §3 wiring)
 # ---------------------------------------------------------------------------

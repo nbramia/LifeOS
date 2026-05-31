@@ -77,10 +77,12 @@ class Session:
     # sessions even though they have no parent (#235).
     origin: str | None = None
     # Claude Code CLI session UUID, captured from the subprocess's init
-    # stream-json event. Set only for routing="code" sessions and used by
-    # CodeExecutor.resume() to invoke `claude -r <code_session_id>` so the
-    # CLI picks up its prior in-process state across worker restarts.
-    code_session_id: str | None = None
+    # stream-json event. Set only for routing="claude_code" sessions and used
+    # by ClaudeCodeExecutor.resume() to invoke `claude -r <id>` so the CLI
+    # picks up its prior in-process state across worker restarts.
+    # NB: codex sessions reuse this column too (CodexExecutor stores the
+    # codex thread id here); routing disambiguates.
+    claude_code_session_id: str | None = None
 
 
 _SCHEMA = """
@@ -106,7 +108,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     managed_agent_session_id  TEXT,
     preset_class              TEXT,
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
-    code_session_id           TEXT   -- Claude Code CLI session UUID for routing="code"
+    claude_code_session_id    TEXT   -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -299,9 +301,30 @@ class SessionStore:
             if "origin" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT")
             # Idempotent migration for the Claude Code CLI session UUID.
-            # Set only for routing="code" sessions; NULL for everything else.
-            if "code_session_id" not in sess_cols:
-                conn.execute("ALTER TABLE sessions ADD COLUMN code_session_id TEXT")
+            # Set for routing="claude_code" (Claude Code) and "codex" sessions;
+            # NULL for everything else.
+            if "claude_code_session_id" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_session_id TEXT")
+                # Migrate data from the legacy column if it existed (pre-rename
+                # databases). The legacy column is dropped below.
+                if "code_session_id" in sess_cols:
+                    conn.execute(
+                        "UPDATE sessions SET claude_code_session_id = code_session_id "
+                        "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
+                    )
+            # Migrate legacy routing tag: 'code' was the pre-rename name for
+            # what is now 'claude_code'. Idempotent — only flips rows that
+            # still carry the old value.
+            conn.execute(
+                "UPDATE sessions SET routing = 'claude_code' WHERE routing = 'code'"
+            )
+            # Drop the legacy code_session_id column after data has been
+            # migrated to claude_code_session_id. Idempotent — only fires if
+            # the column still exists. Requires SQLite 3.35+ (Linux/macOS
+            # builds since 2021 all qualify).
+            sess_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "code_session_id" in sess_cols:
+                conn.execute("ALTER TABLE sessions DROP COLUMN code_session_id")
             # Idempotent cleanup of the legacy `code_followup` pending_question
             # kind. The retired in-memory ClaudeOrchestrator used these rows
             # to register a Claude Code completion; they're now unresumable.
@@ -446,19 +469,20 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
-    def set_code_session_id(self, task_id: str, code_session_id: str) -> None:
-        """Persist the Claude Code CLI's session UUID for a routing='code'
-        session. Called by CodeExecutor as soon as the subprocess emits its
-        init event, so resume after a worker restart can pass `-r <uuid>`.
+    def set_claude_code_session_id(self, task_id: str, claude_code_session_id: str) -> None:
+        """Persist the CLI's session UUID for a routing='claude_code' or
+        routing='codex' session. Called by ClaudeCodeExecutor / CodexExecutor
+        as soon as the subprocess emits its init event, so resume after a
+        worker restart can pass `-r <uuid>` (or `codex resume <uuid>`).
         """
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET code_session_id = ?, last_activity_at = ?
+                SET claude_code_session_id = ?, last_activity_at = ?
                 WHERE task_id = ?
                 """,
-                (code_session_id, _now(), task_id),
+                (claude_code_session_id, _now(), task_id),
             )
 
     def set_routing_and_budget(
@@ -1167,7 +1191,7 @@ class SessionStore:
                 else None
             ),
             origin=(row["origin"] if "origin" in row.keys() else None),
-            code_session_id=(
-                row["code_session_id"] if "code_session_id" in row.keys() else None
+            claude_code_session_id=(
+                row["claude_code_session_id"] if "claude_code_session_id" in row.keys() else None
             ),
         )

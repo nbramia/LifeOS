@@ -99,10 +99,13 @@ api/
 - `job_queue.py` - SQLite-backed job queue with worker thread (reindex, sync)
 
 **Telegram & Scheduling:**
-- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/code` commands, `chat_via_api_with_log` for execution metadata capture)
-- `agent_worker/code_executor.py` - Claude Code subprocess lifecycle, stream parsing, `[NOTIFY]` relay (replaces the retired `claude_orchestrator.py`)
-- `agent_worker/code_spawn.py` - Creates a `routing='code'` session row for the worker to dispatch
-- `directory_resolver.py` - Maps task keywords to working directories for Claude Code
+- `telegram.py` - Telegram bot (message sending, bot listener, internal chat client, `/claude` and `/codex` commands, `chat_via_api_with_log` for execution metadata capture)
+- `agent_worker/claude_code_executor.py` - Claude Code subprocess lifecycle, stream parsing, `[NOTIFY]` relay (replaces the retired `claude_orchestrator.py`)
+- `agent_worker/claude_code_spawn.py` - Creates a `routing='claude_code'` session row for the worker to dispatch
+- `agent_worker/codex_executor.py` - Codex CLI subprocess lifecycle (`codex exec --json`), captures final message via `--output-last-message`, persists thread id for resume
+- `agent_worker/codex_spawn.py` - Sibling of `claude_code_spawn.py` for `routing='codex'`
+- `codex/session_ingest.py` - Read-only adapter for the `/agents` viz: walks `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`, normalizes events, prices via OpenAI rates (gpt-5.5, gpt-5.4, gpt-5.3-codex)
+- `directory_resolver.py` - Maps task keywords to working directories for the CLI executors
 - `scheduler_store.py` - Schedule store + scheduler. Markdown source of truth (`LifeOS/Scheduler/Inbox.md`), action dispatch (notify/prompt/endpoint/agent), retry, suppression, run history, and dashboard generation. `reminder_store.py` re-exports it under the legacy `Reminder*` names.
 - `scheduler_watcher.py` - Watchdog watcher that reindexes the Scheduler directory on external edits
 - `time_parser.py` - Natural language time parsing for schedules
