@@ -4,7 +4,7 @@
 > **Owner:** Agent Worker
 > **Last Updated:** 2026-05-29
 
-LifeOS exposes a single live page at `/agents` that shows every agent session running on the box — both LifeOS agent worker tasks (`#agent`-tagged) and local Claude Code CLI sessions discovered on the filesystem. The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any Claude Code session straight from the page.
+LifeOS exposes a single live page at `/agents` that shows every agent session running on the box — LifeOS agent worker tasks (`#agent`-tagged), plus local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`). The graph updates every 2 seconds, clicking a node opens that session's transcript in a resizable side panel, and the operator can kill any in-flight LifeOS agent or relaunch any CLI session straight from the page.
 
 The point is one place to see what your machine is doing on your behalf: whether the agent worker is making progress on the task you left in your vault, whether a Claude Code session you forgot about is still burning tokens, whether two parallel agents have collided on the same project.
 
@@ -33,7 +33,7 @@ The page is a force-directed graph of sessions, laid out left-to-right by recenc
 |---|---|
 | **Shape — circle** | Cloud agent — routed to Claude (`routing: claude`) |
 | **Shape — diamond** | Local agent — routed to local Gemma (`routing: local`) |
-| **Shape — rounded square** | Claude Code CLI session (`routing: claude_code`) |
+| **Shape — rounded square** | CLI session — Claude Code (`source: claude_code`, ids prefixed `cc:`) or Codex (`source: codex`, ids prefixed `cx:`). Tell them apart via the `source` badge in the side panel or the `model_label` chip on the node. |
 | **Color** | Status — green running, blue claimed, amber blocked / paused, grey done, red failed |
 | **Size** | Log-scaled by total tokens (input + output + cache). A 100k-token session is roughly 2× a 1k-token session, not 100×. Capped so one fat node can't dominate the canvas. |
 | **White pulsing border** | Session is `running` AND has written to its transcript in the last 60 seconds (i.e. *actively producing output right now*) |
@@ -62,13 +62,15 @@ Between filter operations the simulation **freezes after settling** (~6s). Snaps
 
 ## Two sources, one graph
 
-The page unions two ingest paths into one rendered surface:
+The page unions three ingest paths into one rendered surface:
 
 1. **LifeOS agent worker** — every `#agent` task the worker has claimed, plus its sleeps, yields, terminal outcomes, and any spawned children. This is the same data covered by [product/agent-worker.md](agent-worker.md); the viz is the read-side view of it.
 
-2. **Claude Code CLI** — every transcript jsonl under `~/.claude/projects/`, scanned every snapshot tick (with a 30s cache so the disk isn't hammered). Each `.jsonl` file is one session; subagents spawned via the Task/Agent tool appear as separate nodes attached by spawn edges. Read-only: LifeOS never writes to Claude Code's data.
+2. **Claude Code CLI** — every transcript jsonl under `~/.claude/projects/`, scanned every snapshot tick (with a 30s cache so the disk isn't hammered). Each `.jsonl` file is one session; subagents spawned via the Task/Agent tool appear as separate nodes attached by spawn edges. Read-only.
 
-Both sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on either kind of session. Disable the Claude Code half by setting `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` if you only want to see worker tasks.
+3. **Codex CLI** — every rollout jsonl under `~/.codex/sessions/<year>/<month>/<day>/`, ingested the same way. One JSONL per session, `cx:`-prefixed in the snapshot. Read-only.
+
+All three sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on each kind of session. Disable an ingest path with `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` or `LIFEOS_CODEX_VIZ_ENABLED=false` if you only want a subset.
 
 ---
 
@@ -76,9 +78,9 @@ Both sources are normalized to the same shape before rendering, so filters, chip
 
 A node's color is its status. The set is slightly different per source — same broad categories, different precise meaning:
 
-| Status | LifeOS agent worker | Claude Code CLI |
+| Status | LifeOS agent worker | CLI (Claude Code or Codex) |
 |---|---|---|
-| **running** | Currently executing tool calls or LLM turns. | A live `claude` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
+| **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
 | **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
 | **yielded** | Paused waiting for spawned children to finish. | n/a |
 | **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
@@ -87,7 +89,7 @@ A node's color is its status. The set is slightly different per source — same 
 | **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
 | **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
 
-A small `(inferred)` hint appears next to the status on Claude Code sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
+A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
 
 ---
 
@@ -102,7 +104,7 @@ The top toolbar has five filter controls and four count chips. **Filters are AND
 | `include finished` checkbox | off | Off → completed / failed / budget_exceeded are hidden. On → everything shows, and the default recency window widens from 30 min to 7 days. |
 | `recency` dropdown | last 30 min (60 min, 6h, 24h, 7d, all) | Filters by `last_activity_at`. Re-defaults to a wider window when `include finished` is enabled, unless the operator has set it manually. |
 | `cwd` dropdown | all | Only Claude Code sessions are scoped to a cwd. Dropdown lists every unique cwd present in the current snapshot; auto-hides when empty (no Claude Code sessions visible). |
-| `route` dropdown | all (local / claude / claude_code) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, or Claude Code CLI. |
+| `route` dropdown | all (local / claude / claude_code / codex) | Filters by where the session ran — operator's local LLM, Managed Agents cloud, Claude Code CLI, or Codex CLI. |
 | `status` dropdown | all | Hard-filter by the status column from the table above. |
 
 ### Chips
@@ -112,8 +114,8 @@ The top toolbar has five filter controls and four count chips. **Filters are AND
 | `running` | Visible sessions with status `running`. |
 | `blocked` | Visible sessions waiting on Telegram clarification. |
 | `recent` | Visible sessions with status `completed`. |
-| `cc` | Visible Claude Code sessions. |
-| `API spend` | Sum of `total_dollars` across visible **LifeOS** sessions. Claude Code is intentionally excluded — that's billed to your Anthropic subscription, not metered API tokens, so adding it would distort the chip's meaning. |
+| `cc` | Visible CLI sessions (Claude Code and Codex rolled together). |
+| `API spend` | Sum of `total_dollars` across visible **LifeOS** sessions. Both CLIs are intentionally excluded — they're billed against your Claude Pro / ChatGPT subscriptions, not metered API tokens, so adding them would distort the chip's meaning. The per-session dollar columns on CLI nodes still show the equivalent API cost as a relative-cost signal. |
 
 Chips re-compute after every snapshot tick, so toggling `include finished` immediately bumps the API-spend number to include the finished sessions' final cost.
 
@@ -155,25 +157,25 @@ A kill takes down the target session **and every descendant in its subtree** —
 - If the target was a Managed Agents (cloud) session, the worker process also tears down the remote session via the Anthropic API so you stop being billed for idle session-hours.
 - The task in your vault transitions to whatever the worker writes as the post-kill tag (typically `#agent-failed`).
 
-Claude Code sessions do not get a Kill button — the page has no safe primitive for terminating a Claude Code CLI process from outside its own terminal. If you need to stop one, do it in the terminal where it's running, or via `kill` on the underlying PID.
+CLI sessions (Claude Code and Codex) do not get a Kill button — the page has no safe primitive for terminating a CLI process from outside its own terminal. If you need to stop one, do it in the terminal where it's running, or via `kill` on the underlying PID.
 
 ---
 
 ## Operator controls — resume and Go To
 
-Claude Code sessions get up to two buttons:
+CLI sessions (Claude Code AND Codex) get up to two buttons:
 
-**Resume** (shown on terminal / `inactive` / `yielded` sessions) opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id.
+**Resume** (shown on terminal / `inactive` / `yielded` sessions) opens a new WezTerm tab at the session's working directory and launches `claude --resume <session_id>` or `codex resume <session_id>` in it. WezTerm prints the new pane id; LifeOS stores it in a sidecar SQLite mapping (`data/cc_wezterm.db`) keyed by session id (`cc:` or `cx:` prefix disambiguates).
 
-**Go To** (shown on every non-subagent Claude Code session, including live ones) jumps focus to the existing WezTerm pane for that session. Double-clicking the node in the graph does the same thing. The endpoint resolves the pane id in three steps:
+**Go To** (shown on every non-subagent CLI session, including live ones) jumps focus to the existing WezTerm pane for that session. Double-clicking the node in the graph does the same thing. The endpoint resolves the pane id in three steps:
 
-1. **Cached mapping** — first checks `data/cc_wezterm.db`, populated by either a prior Resume click *or* the optional [SessionStart hook](../../guides/agents-go-to.md) which binds every new `claude` start to its wezterm pane. The cache is auto-invalidated when wezterm restarts: each mapping records the wezterm-gui pid it was written under, and a fresh wezterm boot drops the entry rather than blindly activating a stale `pane_id` (which could now belong to an unrelated session).
+1. **Cached mapping** — first checks `data/cc_wezterm.db`, populated by either a prior Resume click *or* the optional SessionStart hooks (`scripts/claude-session-pane.sh` for Claude Code, `scripts/codex-session-pane.sh` for Codex) which bind every new CLI start to its wezterm pane via `/api/agents/cc-pane-bind` and `/api/agents/cx-pane-bind` respectively. The cache is auto-invalidated when wezterm restarts: each mapping records the wezterm-gui pid it was written under, and a fresh wezterm boot drops the entry rather than blindly activating a stale `pane_id` (which could now belong to an unrelated session).
 2. **FD probe** — if the cache misses, `lsof` finds which process holds the session's transcript file open; the holder's controlling TTY is matched against `wezterm cli list --format json`'s `tty_name`. Cwd is not enough to disambiguate when multiple panes share a project; the transcript file is. The result is cached for the next click.
 3. **Activate-pane** — once a pane id is known, `wezterm cli activate-pane --pane-id <id>` switches focus. If WezTerm is the focused window the tab switches immediately; if it's hidden, the pane is selected in the background and a `notify-send` urgency hint pulses the dock icon. The OS-level window-raise across applications is restricted by Wayland compositors (no programmatic foreground steal); WezTerm under XWayland can be raised via `wmctrl`/`xdotool` if the operator needs it.
 
 If a cached pane has gone stale (typical: user closed the tab), the activate-pane call fails, the mapping is cleared, and the probe runs once more — the session may have been resumed in a fresh pane. Only when both the cache *and* a fresh probe come up empty does Go To return 404 (toast: "Couldn't locate pane — install the SessionStart hook if claude is running in wezterm"); when a pane existed but is gone and no replacement can be found it returns 410.
 
-Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` (the same flag also gates Go To). Customize the launcher (`LIFEOS_CC_RESUME_CMD`) if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
+Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` for Claude Code sessions and `LIFEOS_CODEX_RESUME_ENABLED=true` for Codex; each flag also gates Go To for its respective source. Customize launchers via `LIFEOS_CC_RESUME_CMD` / `LIFEOS_CODEX_RESUME_CMD` if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
 
 ---
 
@@ -199,6 +201,12 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 | `LIFEOS_CC_RESUME_CMD` | Launcher command. Substitutions: `{session_id}`, `{cwd}`, `{session_id_url}`, `{cwd_url}`, `{inner_command}`. The default uses WezTerm's CLI to open a tab AND run the resume in one shot. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
 | `LIFEOS_CC_RESUME_INNER_CMD` | The command run *inside* the spawned terminal — the actual `claude --resume` invocation. Substituted into `{inner_command}` of the launcher template. | `claude --dangerously-skip-permissions --resume {session_id}` |
 | `LIFEOS_CC_RESUME_ENV_FILE` | Optional `key=value` file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. | `` (inherit systemd env) |
+| `LIFEOS_CODEX_VIZ_ENABLED` | Surface Codex CLI sessions alongside the other sources. | `true` |
+| `LIFEOS_CODEX_SESSIONS_DIR` | Where to find Codex rollout JSONLs. | `~/.codex/sessions` |
+| `LIFEOS_CODEX_LOOKBACK_DAYS` | Discovery window for Codex rollouts. | `7` |
+| `LIFEOS_CODEX_RESUME_ENABLED` | Enable Resume + Go To for `cx:` sessions. | `false` |
+| `LIFEOS_CODEX_RESUME_CMD` | Codex launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. | `wezterm cli spawn --cwd {cwd} -- {inner_command}` |
+| `LIFEOS_CODEX_RESUME_INNER_CMD` | Inner command inside the spawned terminal — the actual `codex resume` invocation. | `codex resume {session_id}` |
 
 ---
 

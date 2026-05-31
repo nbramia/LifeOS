@@ -1093,11 +1093,11 @@ async def ask_stream(request: AskStreamRequest):
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
-            elif action_intent and action_intent.category == "code":
-                # ---- CODE: requires Claude Code (terminal/filesystem/browser) ----
-                print("DETECTED CODE INTENT - delegating to Claude Code")
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'code_intent', 'task': request.question})}\n\n"
+            elif action_intent and action_intent.category == "claude":
+                # ---- CLAUDE CODE: requires terminal/filesystem/browser ----
+                print("DETECTED CLAUDE INTENT - delegating to Claude Code")
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
