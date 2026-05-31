@@ -149,7 +149,7 @@ def generate_summary(
             "model": "local",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 75,
+            "max_tokens": 512,
             "stream": False,
         }
 
