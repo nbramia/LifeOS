@@ -204,6 +204,60 @@ def mock_settings(test_vault_path, test_data_path, monkeypatch):
     return mock
 
 
+@pytest.fixture(autouse=True)
+def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
+    """Stop tests from wiping the production vault index.
+
+    ``IndexerService.index_all()`` treats every path in its state file that is
+    absent from the current vault as "deleted" and purges it from the Chroma +
+    BM25 stores. Tests (test_people, test_integration, test_indexer) build a
+    tiny tmp vault and call ``index_all()``; with the real stores attached that
+    purge deletes every production note from the ``lifeos_vault`` collection and
+    ``data/bm25_index.db``, then rewrites ``data/vault_index_state.json`` with
+    the tmp paths. This silently destroyed the live vault index on every test
+    run. Redirect the indexer's three stores to throwaway, per-test locations so
+    no test can touch production data. The indexer's own ``vector_store`` /
+    ``bm25_index`` are reused for the post-index search assertions, so the tests
+    stay self-consistent and green.
+    """
+    import re
+
+    import api.services.indexer as indexer_mod
+    from api.services.bm25_index import BM25Index
+    from api.services.vectorstore import VectorStore
+
+    monkeypatch.setattr(
+        indexer_mod.IndexerService,
+        "INDEX_STATE_FILE",
+        str(tmp_path / "vault_index_state.json"),
+    )
+
+    bm25_db = str(tmp_path / "bm25_index.db")
+    monkeypatch.setattr(
+        indexer_mod, "BM25Index", lambda *a, **k: BM25Index(db_path=bm25_db)
+    )
+
+    collection = "test_vault_" + re.sub(r"[^A-Za-z0-9]", "_", tmp_path.name)[:400]
+    created: list = []
+
+    def _isolated_vector_store(*args, **kwargs):
+        kwargs["collection_name"] = collection
+        store = VectorStore(*args, **kwargs)
+        created.append(store)
+        return store
+
+    monkeypatch.setattr(indexer_mod, "VectorStore", _isolated_vector_store)
+
+    yield
+
+    # Drop the throwaway collection from the ChromaDB server (best effort).
+    if created:
+        try:
+            created[0]._client.delete_collection(collection)
+        except Exception:
+            pass
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """
