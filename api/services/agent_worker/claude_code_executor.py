@@ -1,10 +1,10 @@
 """Drives a headless Claude Code CLI subprocess from inside the agent worker.
 
-Mirrors the executor surface used by `LocalExecutor` / `ManagedExecutor` so the
-worker can route `routing="code"` sessions uniformly. All session state — the
-CLI's session UUID, transcript events, status transitions — is persisted via
-`SessionStore` and `TranscriptStore`, so sessions survive worker restarts and
-surface in the `/agents` UI.
+Mirrors the executor surface used by `LocalExecutor` / `ManagedExecutor` so
+the worker can route `routing="claude_code"` sessions uniformly. All session
+state — the CLI's session UUID, transcript events, status transitions — is
+persisted via `SessionStore` and `TranscriptStore`, so sessions survive
+worker restarts and surface in the `/agents` UI.
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def _resolve_claude_binary() -> str:
     return configured  # caller surfaces the FileNotFoundError on spawn
 
 
-# The system prompt is the operator-facing contract for /code's behavior —
+# The system prompt is the operator-facing contract for /claude's behavior —
 # scope, clarification protocol, persistence, environment shape.
 _SYSTEM_PROMPT = """\
 You are being orchestrated by LifeOS on behalf of the user ({user_name}).
@@ -185,12 +185,12 @@ NotificationCallback = Callable[[str], None]
 SpawnFn = Callable[..., subprocess.Popen]
 
 
-class CodeExecutor:
+class ClaudeCodeExecutor:
     """Run one Claude Code CLI session synchronously and persist its state.
 
     Surface mirrors `LocalExecutor`: a single `execute(session, task)` call
     drives the subprocess to a terminal `ExecutorOutcome`. The worker's
-    `_dispatch_spawned_sessions` calls this when `session.routing == "code"`.
+    `_dispatch_spawned_sessions` calls this when `session.routing == "claude_code"`.
 
     Constructor injection points:
       - `notification_callback` — invoked with each [NOTIFY] body during the
@@ -226,7 +226,7 @@ class CodeExecutor:
     # ------------------------------------------------------------------
 
     def execute(self, session, task: dict) -> ExecutorOutcome:
-        """Drive a fresh /code session.
+        """Drive a fresh /claude session.
 
         Reads the prompt from `task["description"]`. `task["working_dir"]`
         and `task["plan_mode"]` are optional; defaults follow the legacy
@@ -234,7 +234,7 @@ class CodeExecutor:
         """
         prompt = (task.get("description") or "").strip()
         if not prompt:
-            self.transcript_store.append(session.session_id, "code_no_prompt", {})
+            self.transcript_store.append(session.session_id, "claude_code_no_prompt", {})
             return ExecutorOutcome(status=STATUS_FAILED, reason="empty prompt")
 
         plan_mode = bool(task.get("plan_mode"))
@@ -251,18 +251,18 @@ class CodeExecutor:
         )
 
     def resume(self, session, message: str, working_dir: Optional[str] = None) -> ExecutorOutcome:
-        """Resume a previously-completed /code session by passing
-        `-r <code_session_id>` to the CLI.
+        """Resume a previously-completed /claude session by passing
+        `-r <claude_code_session_id>` to the CLI.
 
         Used by the worker's follow-up reply path — the reply text becomes
         the next user turn on the existing CLI session.
         """
-        resume_id = session.code_session_id
+        resume_id = session.claude_code_session_id
         if not resume_id:
             self.transcript_store.append(
-                session.session_id, "code_resume_no_session_id", {},
+                session.session_id, "claude_code_resume_no_session_id", {},
             )
-            return ExecutorOutcome(status=STATUS_FAILED, reason="no code_session_id on record")
+            return ExecutorOutcome(status=STATUS_FAILED, reason="no claude_code_session_id on record")
         wd = working_dir or os.getcwd()
         return self._run(
             session=session,
@@ -322,7 +322,7 @@ class CodeExecutor:
         cmd = self._build_command(prompt, resume_session_id)
         sid = session.session_id
 
-        self.transcript_store.append(sid, "code_spawn", {
+        self.transcript_store.append(sid, "claude_code_spawn", {
             "resume": bool(resume_session_id),
             "plan_mode": plan_mode,
             "working_dir": working_dir,
@@ -338,7 +338,7 @@ class CodeExecutor:
                 env=self._clean_env(),
             )
         except FileNotFoundError as exc:
-            self.transcript_store.append(sid, "code_binary_not_found", {"error": str(exc)})
+            self.transcript_store.append(sid, "claude_code_binary_not_found", {"error": str(exc)})
             return ExecutorOutcome(
                 status=STATUS_FAILED,
                 reason=REASON_BINARY_NOT_FOUND,
@@ -382,14 +382,14 @@ class CodeExecutor:
 
         if timed_out.is_set():
             self.session_store.update_status(session.task_id, STATUS_FAILED)
-            self.transcript_store.append(sid, "code_timeout", {
+            self.transcript_store.append(sid, "claude_code_timeout", {
                 "timeout_seconds": self._timeout,
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
         if state.cost_cap_exceeded:
             self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
-            self.transcript_store.append(sid, "code_cost_cap_exceeded", {
+            self.transcript_store.append(sid, "claude_code_cost_cap_exceeded", {
                 "cost_usd": state.cost_usd,
                 "cap_usd": settings.claude_max_cost_usd,
             })
@@ -401,7 +401,7 @@ class CodeExecutor:
 
         if state.awaiting_clarification:
             self.session_store.update_status(session.task_id, STATUS_BLOCKED)
-            self.transcript_store.append(sid, "code_awaiting_clarification", {
+            self.transcript_store.append(sid, "claude_code_awaiting_clarification", {
                 "question_chars": len(state.pending_clarification),
             })
             return ExecutorOutcome(
@@ -412,7 +412,7 @@ class CodeExecutor:
 
         if state.awaiting_approval:
             self.session_store.update_status(session.task_id, STATUS_BLOCKED)
-            self.transcript_store.append(sid, "code_awaiting_plan_approval", {
+            self.transcript_store.append(sid, "claude_code_awaiting_plan_approval", {
                 "plan_chars": len(state.plan_text),
             })
             return ExecutorOutcome(
@@ -423,7 +423,7 @@ class CodeExecutor:
 
         if proc.returncode == 0 or state.terminal:
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
-            self.transcript_store.append(sid, "code_completed", {
+            self.transcript_store.append(sid, "claude_code_completed", {
                 "cost_usd": state.cost_usd,
                 "notifications_sent": state.notifications_sent,
                 "final_chars": len(state.final_text),
@@ -441,7 +441,7 @@ class CodeExecutor:
         except Exception:
             pass
         self.session_store.update_status(session.task_id, STATUS_FAILED)
-        self.transcript_store.append(sid, "code_failed", {
+        self.transcript_store.append(sid, "claude_code_failed", {
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
@@ -469,7 +469,7 @@ class CodeExecutor:
             if state.terminal:
                 # Drain the rest of stdout without re-processing so the
                 # subprocess can flush and exit. Without this we'd keep
-                # appending duplicate `code_assistant_text` events that
+                # appending duplicate `claude_code_assistant_text` events that
                 # arrived after the result.
                 for _ in proc.stdout:
                     pass
@@ -484,10 +484,10 @@ class CodeExecutor:
             if cli_session_id:
                 state.session_id = cli_session_id
                 # Persist immediately so a worker crash mid-session still
-                # leaves enough state to resume via `-r <code_session_id>`.
-                self.session_store.set_code_session_id(session.task_id, cli_session_id)
-                self.transcript_store.append(sid, "code_init", {
-                    "code_session_id": cli_session_id,
+                # leaves enough state to resume via `-r <claude_code_session_id>`.
+                self.session_store.set_claude_code_session_id(session.task_id, cli_session_id)
+                self.transcript_store.append(sid, "claude_code_init", {
+                    "claude_code_session_id": cli_session_id,
                 })
             return
 
@@ -526,7 +526,7 @@ class CodeExecutor:
                             self._notify(body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
-                        self.transcript_store.append(sid, "code_clarify", {
+                        self.transcript_store.append(sid, "claude_code_clarify", {
                             "body": body, "body_chars": len(body),
                         })
                 for match in _NOTIFY_RE.finditer(text):
@@ -539,7 +539,7 @@ class CodeExecutor:
                         self._notify(body)
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning("notification callback raised: %s", exc)
-                    self.transcript_store.append(sid, "code_notify", {
+                    self.transcript_store.append(sid, "claude_code_notify", {
                         "body": body, "body_chars": len(body),
                     })
                     if state.plan_mode and not state.awaiting_approval:
@@ -548,7 +548,7 @@ class CodeExecutor:
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {}) or {}
                 state.last_activity = _summarize_tool_call(tool_name, tool_input)
-                self.transcript_store.append(sid, "code_tool_use", {
+                self.transcript_store.append(sid, "claude_code_tool_use", {
                     "name": tool_name, "input": tool_input,
                 })
 
@@ -557,7 +557,7 @@ class CodeExecutor:
         cli_session_id = event.get("session_id") or state.session_id
         if cli_session_id and cli_session_id != state.session_id:
             state.session_id = cli_session_id
-            self.session_store.set_code_session_id(session.task_id, cli_session_id)
+            self.session_store.set_claude_code_session_id(session.task_id, cli_session_id)
 
         state.cost_usd = float(event.get("total_cost_usd") or 0.0)
         cap = float(settings.claude_max_cost_usd or 0.0)

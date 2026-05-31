@@ -4,9 +4,11 @@
 **Owner:** Orchestrator
 **Last Updated:** 2026-05-27
 
-LifeOS spawns a **Claude Code** subprocess from Telegram when the operator sends `/code <task>` (or when a natural-language message is classified as requiring terminal / filesystem / browser access). The subprocess runs the task on the server, streams progress back as Telegram messages, and terminates. The operator can monitor (`/code_status`) and cancel (`/code_cancel`) the active session.
+LifeOS spawns a **Claude Code** subprocess from Telegram when the operator sends `/claude <task>` (or when a natural-language message is classified as requiring terminal / filesystem / browser access). The subprocess runs the task on the server, streams progress back as Telegram messages, and terminates. The operator can monitor (`/claude_status`) and cancel (`/claude_cancel`) the active session.
 
 This spec covers the consumer view — what the operator sees and controls. For implementation see [technical/claude-code-orchestration.md](../technical/claude-code-orchestration.md). For operator setup (binary install, `setup-token`, troubleshooting) see [guides/claude-code-orchestration.md](../../guides/claude-code-orchestration.md).
+
+> **Codex sibling.** `/codex <task>` is the same surface for the OpenAI Codex CLI. Commands (`/codex`, `/codex_status`, `/codex_cancel`), Telegram reply-to-resume flow, and `/agents` integration mirror `/claude` exactly — only the executor (`codex_executor.py`) and the underlying CLI (`codex exec --json`) differ. Codex runs against your ChatGPT plan; everything in this document applies with `/claude` → `/codex` and `claude` → `codex` substituted, with two caveats: Codex isn't trained on the `[NOTIFY]`/`[CLARIFY]` protocol (final-message-only relay), and there's no plan-mode equivalent.
 
 ---
 
@@ -32,7 +34,7 @@ LifeOS has two related-but-distinct ways to run autonomous work on the operator'
 
 | | Claude Code orchestrator (this spec) | Agent worker ([agent-worker.md](agent-worker.md)) |
 |---|---|---|
-| **Trigger** | Telegram `/code <task>` (or auto-detect) | `#agent`-tagged Obsidian task |
+| **Trigger** | Telegram `/claude <task>` (or auto-detect) | `#agent`-tagged Obsidian task |
 | **Runtime** | Local `claude` CLI subprocess on the server | Stand-alone Python worker hitting llama-server or Anthropic Managed Agents |
 | **State** | In-process; no persistent SessionStore | SQLite SessionStore + JSONL transcript per session |
 | **Concurrency** | One session at a time | Many concurrent sessions, bounded by config caps |
@@ -47,15 +49,15 @@ Both surface on the `/agents` page side-by-side. They share the visualization la
 
 The operator gets a Claude Code session through one of two paths:
 
-1. **Explicit `/code` command in Telegram.** The Telegram bot dispatches the body of the message to the orchestrator. Examples:
+1. **Explicit `/claude` command in Telegram**. The Telegram bot dispatches the body of the message to the orchestrator. Examples:
    ```
-   /code create a file called test.txt with "hello world" on the Desktop
-   /code write a backup script for the LifeOS data directory
-   /code add "integrate weather alerts" to the backlog
-   /code create a cron job that runs backup.sh daily at 2am
+   /claude create a file called test.txt with "hello world" on the Desktop
+   /claude write a backup script for the LifeOS data directory
+   /claude add "integrate weather alerts" to the backlog
+   /claude create a cron job that runs backup.sh daily at 2am
    ```
 
-2. **Auto-detected via the chat intent classifier.** If the operator sends a natural-language message that the classifier tags as "code intent" (terminal, filesystem, or browser work), the chat pipeline yields a `code_intent` event and Telegram handles it identically to `/code`. The plan mode, clarification, and notification flow are the same.
+2. **Auto-detected via the chat intent classifier.** If the operator sends a natural-language message that the classifier tags as "claude intent" (terminal, filesystem, or browser work), the chat pipeline yields a `claude_intent` event and Telegram handles it identically to `/claude`. The plan mode, clarification, and notification flow are the same.
 
 ---
 
@@ -77,7 +79,7 @@ COMPLETED  (subprocess exited; final summary sent to Telegram)
 FAILED / TIMEOUT / CANCELLED   (operator-visible terminal state with reason)
 ```
 
-Only one session runs at a time. Sending `/code` while a session is active returns an error message naming the current task plus a hint to use `/code_cancel`.
+Only one session runs at a time. Sending `/claude` while a session is active returns an error message naming the current task plus a hint to use `/claude_cancel`.
 
 ---
 
@@ -87,7 +89,7 @@ Tasks containing words like `refactor`, `implement`, `rewrite`, `overhaul`, `bui
 
 **Flow:**
 
-1. Operator: `/code implement a new health check endpoint`
+1. Operator: `/claude implement a new health check endpoint`
 2. Claude presents a plan via Telegram.
 3. Claude asks: "Reply 'approve' to proceed or 'reject' to cancel."
 4. Operator replies: `approve` (or `yes`, `go`, `ok`, `proceed`)
@@ -105,14 +107,14 @@ If a task is vague or ambiguous, Claude asks a clarifying question instead of gu
 
 **Flow:**
 
-1. Operator: `/code add this to the backlog`
+1. Operator: `/claude add this to the backlog`
 2. Claude: "The backlog has two sections (Work and Personal). Which one?"
 3. Operator: `Work`
 4. Claude resumes with the answer and completes the task.
 
-While a clarification is pending, all non-command Telegram messages route as the answer. The operator uses `/code_cancel` if they want to chat normally instead.
+While a clarification is pending, all non-command Telegram messages route as the answer. The operator uses `/claude_cancel` if they want to chat normally instead.
 
-**Note:** `no` is treated as an answer to yes/no questions, not as a cancellation. Use `/code_cancel` to actually cancel.
+**Note:** `no` is treated as an answer to yes/no questions, not as a cancellation. Use `/claude_cancel` to actually cancel.
 
 ---
 
@@ -134,11 +136,11 @@ Only `[NOTIFY]` and `[CLARIFY]` lines are relayed. All other output (tool calls,
 
 | Command | Behavior |
 |---------|----------|
-| `/code <task>` | Spawn a new Claude Code session with the given task. Returns an ack with resolved cwd. |
-| `/code_status` | Shows task description, working directory, current status, elapsed duration, cost-so-far. |
-| `/code_cancel` | Terminate the active session immediately. Sends a cancellation notification. |
+| `/claude <task>` | Spawn a new Claude Code session with the given task. Returns an ack with resolved cwd. |
+| `/claude_status` | Shows task description, working directory, current status, elapsed duration, cost-so-far. |
+| `/claude_cancel` | Terminate the active session immediately. Sends a cancellation notification. |
 
-`/code_status` and `/code_cancel` operate on the single active session (if any). If no session is active, they return a message saying so.
+`/claude_status` and `/claude_cancel` operate on the single active session (if any). If no session is active, they return a message saying so.
 
 ---
 
@@ -184,7 +186,7 @@ If the resolution is wrong, the operator makes the task more explicit (e.g., "ed
 
 ### What the orchestrator can't do
 
-- Run two sessions in parallel — operator must `/code_cancel` first.
+- Run two sessions in parallel — operator must `/claude_cancel` first.
 - Stream every line of output to Telegram — operator gets `[NOTIFY]` checkpoints, not real-time stdout.
 - Persist conversation state across runs — each session is one-shot. (Resume via `/agents` is a separate UI; see below.)
 - Exceed the configured budgets — wall, turns, and cost caps are enforced externally.

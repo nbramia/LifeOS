@@ -242,7 +242,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     POSTs to the local /api/ask/stream endpoint and collects SSE events.
 
     Returns:
-        {"answer": str, "conversation_id": str, "code_intent": bool, "task": str|None}
+        {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None}
     """
     port = settings.port
     body: dict = {"question": question}
@@ -251,7 +251,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
 
     full_text = ""
     conv_id = conversation_id
-    code_intent = False
+    claude_intent = False
     task = None
     sources = []
     statuses = []
@@ -280,8 +280,8 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                     full_text = ""
                 elif etype == "conversation_id":
                     conv_id = event.get("conversation_id", conv_id)
-                elif etype == "code_intent":
-                    code_intent = True
+                elif etype == "claude_intent":
+                    claude_intent = True
                     task = event.get("task", question)
                 elif etype == "status":
                     statuses.append(event.get("message", ""))
@@ -297,7 +297,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     return {
         "answer": full_text,
         "conversation_id": conv_id,
-        "code_intent": code_intent,
+        "claude_intent": claude_intent,
         "task": task,
         "sources": sources,
         "statuses": statuses,
@@ -611,10 +611,10 @@ class TelegramBotListener:
         reply_to = message.get("reply_to_message")
         if reply_to and reply_to.get("message_id"):
             reply_to_id = int(reply_to["message_id"])
-            # A reply to a /code completion resumes that Claude Code session
+            # A reply to a /claude completion resumes that Claude Code session
             # (#237) — checked before the agent-worker deposit since both use
             # the shared follow-up table but resume different subsystems.
-            if await self._maybe_handle_code_reply(reply_to_id, text, chat_id):
+            if await self._maybe_handle_claude_code_reply(reply_to_id, text, chat_id):
                 return
             if self._maybe_deposit_agent_answer(reply_to_id, text):
                 return
@@ -630,12 +630,12 @@ class TelegramBotListener:
             if handled:
                 return
 
-        # Plan approval, clarification, and /code follow-up are all routed
+        # Plan approval, clarification, and /claude follow-up are all routed
         # through threaded replies (handled near the top of this method
-        # via _maybe_handle_code_reply / _maybe_deposit_agent_answer). A
+        # via _maybe_handle_claude_code_reply / _maybe_deposit_agent_answer). A
         # plain non-threaded message is always a fresh chat query, never
         # an implicit follow-up — so unrelated questions never get
-        # silently swallowed into a finished agent or /code thread.
+        # silently swallowed into a finished agent or /claude thread.
 
         # Send through chat pipeline (intent classification happens there)
         try:
@@ -646,10 +646,12 @@ class TelegramBotListener:
                 self._last_result = result
 
             # Check if the chat pipeline detected a "code" intent
-            if result.get("code_intent"):
+            if result.get("claude_intent"):
+                # Natural-language intent classifier flagged this as a
+                # Claude Code task (terminal / filesystem / browser work).
                 task = result.get("task", text)
-                logger.info(f"Code intent detected, invoking Claude Code: {task[:50]}...")
-                await self._handle_code_command(task, chat_id)
+                logger.info(f"Claude intent detected, invoking Claude Code: {task[:50]}...")
+                await self._handle_claude_command(task, chat_id)
                 return
 
             answer = result["answer"]
@@ -694,21 +696,34 @@ class TelegramBotListener:
                     chat_id=chat_id,
                 )
 
-        elif command == "/code":
-            task = text[len("/code"):].strip()
+        elif command == "/codex":
+            task = text[len("/codex"):].strip()
             if not task:
-                await send_message_async("Usage: /code <task description>", chat_id=chat_id)
+                await send_message_async("Usage: /codex <task description>", chat_id=chat_id)
             else:
-                await self._handle_code_command(task, chat_id)
+                await self._handle_codex_command(task, chat_id)
+
+        elif command == "/claude":
+            task = text[len("/claude"):].strip()
+            if not task:
+                await send_message_async("Usage: /claude <task description>", chat_id=chat_id)
+            else:
+                await self._handle_claude_command(task, chat_id)
 
         elif command == "/agent":
             await self._handle_agent_spawn(text[len("/agent"):].strip(), chat_id)
 
-        elif command in ("/code_status", "/codestatus"):
-            await self._handle_code_status(chat_id)
+        elif command in ("/claude_status", "/claudestatus"):
+            await self._handle_claude_status(chat_id)
 
-        elif command in ("/code_cancel", "/codecancel"):
-            await self._handle_code_cancel(chat_id)
+        elif command in ("/claude_cancel", "/claudecancel"):
+            await self._handle_claude_cancel(chat_id)
+
+        elif command in ("/codex_status", "/codexstatus"):
+            await self._handle_codex_status(chat_id)
+
+        elif command in ("/codex_cancel", "/codexcancel"):
+            await self._handle_codex_cancel(chat_id)
 
         elif command == "/inspect":
             await self._handle_inspect(chat_id)
@@ -722,9 +737,12 @@ class TelegramBotListener:
                 "/status - Check LifeOS server health\n"
                 "/inspect - Show sources checked in last response\n"
                 "/agent [local|claude] <task> - Spawn an agent (auto-routes if no model given)\n"
-                "/code <task> - Run a task with Claude Code\n"
-                "/code\\_status - Check active Claude Code session\n"
-                "/code\\_cancel - Cancel active Claude Code session\n"
+                "/claude <task> - Run a task with Claude Code\n"
+                "/claude\\_status - Check active Claude Code session\n"
+                "/claude\\_cancel - Cancel active Claude Code session\n"
+                "/codex <task> - Run a task with Codex\n"
+                "/codex\\_status - Check active Codex session\n"
+                "/codex\\_cancel - Cancel active Codex session\n"
                 "/help - Show this message"
             )
             await send_message_async(help_text, chat_id=chat_id)
@@ -748,23 +766,23 @@ class TelegramBotListener:
         "add a new", "create a new", "remove all", "delete all",
     ]
 
-    async def _maybe_handle_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
-        """If a reply targets a Claude Code completion message (any chunk),
+    async def _maybe_handle_claude_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
+        """If a reply targets a CLI (Claude Code or Codex) completion message,
         resume the linked agent-worker session.
 
         Rows are registered with ``kind='followup'`` against a session_store
-        row whose ``routing='code'``. Depositing the answer is enough — the
-        worker's ``_resume_as_followup`` picks it up on the next tick and
-        routes through ``CodeExecutor.resume``.
+        row whose ``routing='claude_code'`` or ``routing='codex'``. Depositing
+        the answer is enough — the worker's ``_resume_as_followup`` picks it
+        up on the next tick and routes through the right executor's resume().
 
-        Returns True if the reply was consumed as a /code follow-up.
+        Returns True if the reply was consumed as a CLI follow-up.
         """
         try:
             from api.services.agent_worker.session_store import SessionStore
             store = SessionStore()
             q = store.get_open_question_by_message_id(reply_to_message_id)
         except Exception as exc:
-            logger.warning(f"code reply lookup failed: {exc}")
+            logger.warning(f"cli reply lookup failed: {exc}")
             return False
         if not q or q.get("kind") != "followup":
             return False
@@ -772,10 +790,11 @@ class TelegramBotListener:
         if not session_id:
             return False
         session = store.get_by_session_id(session_id)
-        if not session or session.routing != "code":
+        if not session or session.routing not in ("claude_code", "codex"):
             return False
         store.deposit_answer(reply_to_message_id, text)
-        await send_message_async("Resuming Claude Code session...", chat_id=chat_id)
+        label = "Codex" if session.routing == "codex" else "Claude Code"
+        await send_message_async(f"Resuming {label} session...", chat_id=chat_id)
         return True
 
     def _should_use_plan_mode(self, task: str) -> bool:
@@ -783,10 +802,10 @@ class TelegramBotListener:
         task_lower = task.lower()
         return any(kw in task_lower for kw in self._PLAN_MODE_KEYWORDS)
 
-    async def _handle_code_command(self, task: str, chat_id: str):
-        """Spawn a /code session by writing a routing='code' row that the
-        agent worker dispatches on its next tick."""
-        from api.services.agent_worker.code_spawn import spawn_code_session
+    async def _handle_claude_command(self, task: str, chat_id: str):
+        """Spawn a /claude session by writing a routing='claude_code' row
+        that the agent worker dispatches on its next tick."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
         from api.services.agent_worker.session_store import SessionStore
         from api.services.directory_resolver import resolve_working_directory
 
@@ -798,7 +817,7 @@ class TelegramBotListener:
             f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
             chat_id=chat_id,
         )
-        result = spawn_code_session(
+        result = spawn_claude_code_session(
             SessionStore(),
             task,
             working_dir=working_dir,
@@ -808,14 +827,14 @@ class TelegramBotListener:
         if not result.get("ok"):
             await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
 
-    async def _handle_code_status(self, chat_id: str):
-        """List non-terminal routing='code' sessions from the session_store."""
+    async def _handle_claude_status(self, chat_id: str):
+        """List non-terminal routing='claude_code' sessions from the session_store."""
         from api.services.agent_worker.session_store import (
             TERMINAL_STATUSES, SessionStore,
         )
         store = SessionStore()
         active = [
-            s for s in store.list_sessions(routing="code", limit=10)
+            s for s in store.list_sessions(routing="claude_code", limit=10)
             if s.status not in TERMINAL_STATUSES
         ]
         if not active:
@@ -831,8 +850,8 @@ class TelegramBotListener:
             )
         await send_message_async("\n".join(lines), chat_id=chat_id)
 
-    async def _handle_code_cancel(self, chat_id: str):
-        """Mark non-terminal routing='code' sessions as FAILED so the
+    async def _handle_claude_cancel(self, chat_id: str):
+        """Mark non-terminal routing='claude_code' sessions as FAILED so the
         worker won't dispatch them again.
 
         A subprocess already running in a worker tick keeps running until
@@ -846,7 +865,7 @@ class TelegramBotListener:
         )
         store = SessionStore()
         active = [
-            s for s in store.list_sessions(routing="code", limit=20)
+            s for s in store.list_sessions(routing="claude_code", limit=20)
             if s.status not in TERMINAL_STATUSES
         ]
         if not active:
@@ -856,6 +875,77 @@ class TelegramBotListener:
             store.update_status(s.task_id, STATUS_FAILED)
         await send_message_async(
             f"Marked {len(active)} Claude Code session(s) cancelled.",
+            chat_id=chat_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Codex orchestration — mirrors the /claude handlers above
+    # ------------------------------------------------------------------
+
+    async def _handle_codex_command(self, task: str, chat_id: str):
+        """Spawn a /codex session by writing a routing='codex' row that the
+        agent worker dispatches on its next tick."""
+        from api.services.agent_worker.codex_spawn import spawn_codex_session
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.directory_resolver import resolve_working_directory
+
+        working_dir = resolve_working_directory(task)
+
+        await send_message_async(
+            f"Starting Codex...\nDirectory: `{working_dir}`",
+            chat_id=chat_id,
+        )
+        result = spawn_codex_session(
+            SessionStore(),
+            task,
+            working_dir=working_dir,
+            chat_id=chat_id,
+        )
+        if not result.get("ok"):
+            await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
+
+    async def _handle_codex_status(self, chat_id: str):
+        """List non-terminal routing='codex' sessions from the session_store."""
+        from api.services.agent_worker.session_store import (
+            TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="codex", limit=10)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Codex session.", chat_id=chat_id)
+            return
+        lines = ["*Codex Sessions*"]
+        for s in active:
+            elapsed = max(0, int(time.time() - (s.started_at or 0)))
+            minutes, seconds = divmod(elapsed, 60)
+            lines.append(
+                f"- `{s.session_id[:8]}` status: {s.status} "
+                f"({minutes}m {seconds}s, ${s.total_dollars:.4f})"
+            )
+        await send_message_async("\n".join(lines), chat_id=chat_id)
+
+    async def _handle_codex_cancel(self, chat_id: str):
+        """Mark non-terminal routing='codex' sessions as FAILED — same
+        contract as /claude_cancel (status flip, not a real subprocess kill).
+        """
+        from api.services.agent_worker.session_store import (
+            STATUS_FAILED, TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="codex", limit=20)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Codex session.", chat_id=chat_id)
+            return
+        for s in active:
+            store.update_status(s.task_id, STATUS_FAILED)
+        await send_message_async(
+            f"Marked {len(active)} Codex session(s) cancelled.",
             chat_id=chat_id,
         )
 

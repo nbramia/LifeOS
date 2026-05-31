@@ -882,11 +882,11 @@ class TestChatPipelineUnification:
             source = f.read()
         assert "ambiguous_task_reminder" in source
 
-    def test_code_handler_still_exists(self):
-        """The code intent handler should still exist."""
+    def test_claude_handler_still_exists(self):
+        """The claude intent handler should still exist."""
         with open(f"{_PROJECT_ROOT}/api/routes/chat.py") as f:
             source = f.read()
-        assert "code_intent" in source
+        assert "claude_intent" in source
 
 
 # ---------------------------------------------------------------------------

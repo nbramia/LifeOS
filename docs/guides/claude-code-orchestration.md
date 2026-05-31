@@ -4,11 +4,13 @@
 > **Last Updated:** 2026-05-29
 > **Audience:** Operators
 
-Run Claude Code tasks remotely from Telegram. Send `/code <task>` and get results back as messages.
+Run Claude Code tasks remotely from Telegram. Send `/claude <task>` (alias: `/claude`) and get results back as messages.
 
-`/code` runs through the agent worker's `CodeExecutor` (`api/services/agent_worker/code_executor.py`). Sessions are persisted, so a threaded reply still resumes a `/code` session after a server restart. The `LIFEOS_CLAUDE_*` env vars are the budget knobs.
+`/claude` runs through the agent worker's `ClaudeCodeExecutor` (`api/services/agent_worker/claude_code_executor.py`). Sessions are persisted, so a threaded reply still resumes a `/claude` session after a server restart. The `LIFEOS_CLAUDE_*` env vars are the budget knobs.
 
-> **For what `/code` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). For the worker internals see [`api/services/agent_worker/AGENTS.md`](../../api/services/agent_worker/AGENTS.md). This file is the operator how-to.
+> **For what `/claude` does and how the operator interaction works**, see [Claude Code Orchestration — product spec](../specs/product/claude-code-orchestration.md). For the worker internals see [`api/services/agent_worker/AGENTS.md`](../../api/services/agent_worker/AGENTS.md). This file is the operator how-to.
+
+> **`/codex` is the sibling surface for the Codex CLI.** Same setup pattern: install the binary (`npm i -g @openai/codex`), authenticate (`codex login`), set `LIFEOS_CODEX_RESUME_ENABLED=true` to enable Resume + Go To from `/agents`. Telegram commands are `/codex`, `/codex_status`, `/codex_cancel`. The agent-worker route is `routing='codex'`; the `#codex` task tag flips a `#agent` task to that surface. See the [Codex section in agent-viz](../specs/product/agent-viz.md#operator-controls--resume-and-go-to) and the [`LIFEOS_CODEX_*` env vars](configuration.md#codex-viz-agents-ingest-of-codex-sessions).
 
 ## Prerequisites
 
@@ -65,24 +67,24 @@ ssh <your-user>@<your-tailscale-ip> "cd ~/Code/LifeOS && ./scripts/server.sh res
 
 ### Automatic Detection
 
-You don't always need `/code`. If you send a natural language message that requires terminal, filesystem, or browser access, the chat pipeline's intent classifier detects it and automatically routes to Claude Code. For example:
+You don't always need `/claude`. If you send a natural language message that requires terminal, filesystem, or browser access, the chat pipeline's intent classifier detects it and automatically routes to Claude Code. For example:
 
 ```
 "create a backup script for the data directory"
 "fix the bug in the sync pipeline"
 ```
 
-These are handled identically to `/code <task>` — the Telegram handler spawns a Claude Code session with the same plan mode, clarification, and notification flow.
+These are handled identically to `/claude <task>` — the Telegram handler spawns a Claude Code session with the same plan mode, clarification, and notification flow.
 
-### Explicit `/code` Command
+### Explicit `/claude` Command
 
-Send `/code` followed by your task description:
+Send `/claude` followed by your task description:
 
 ```
-/code create a file called test.txt with "hello world" on the Desktop
-/code write a backup script for the LifeOS data directory
-/code add "integrate weather alerts" to the backlog
-/code create a cron job that runs backup.sh daily at 2am
+/claude create a file called test.txt with "hello world" on the Desktop
+/claude write a backup script for the LifeOS data directory
+/claude add "integrate weather alerts" to the backlog
+/claude create a cron job that runs backup.sh daily at 2am
 ```
 
 You'll receive:
@@ -107,7 +109,7 @@ The orchestrator picks the working directory based on keywords in your task:
 For complex tasks, Claude will present a plan before implementing. This triggers automatically for tasks containing words like "refactor", "implement", "rewrite", "overhaul", "build a", "set up a", "add a new", "create a new", "remove all", "delete all", "migrate", "replace", "restructure", or "integrate".
 
 **Flow:**
-1. You send: `/code implement a new health check endpoint`
+1. You send: `/claude implement a new health check endpoint`
 2. Claude presents a plan via Telegram
 3. Claude asks: "Reply 'approve' to proceed or 'reject' to cancel."
 4. You reply: `approve` (or `yes`, `go`, `ok`, `proceed`)
@@ -122,23 +124,23 @@ While a plan is pending, you can still send normal messages to LifeOS chat — o
 If a task is vague or ambiguous, Claude will ask you a clarifying question instead of guessing. The question is relayed via Telegram, and the session pauses until you respond.
 
 **Flow:**
-1. You send: `/code add this to the backlog`
+1. You send: `/claude add this to the backlog`
 2. Claude asks: "The backlog has two sections (Work and Personal). Which one?"
 3. You reply: `Work`
 4. Claude resumes with your answer and completes the task
 
-**Important:** "no" is treated as an answer to yes/no questions, not a cancellation. Use `/code_cancel` to cancel instead.
+**Important:** "no" is treated as an answer to yes/no questions, not a cancellation. Use `/claude_cancel` to cancel instead.
 
-While a clarification is pending, all non-command messages are routed as responses. Use `/code_cancel` if you want to chat normally instead.
+While a clarification is pending, all non-command messages are routed as responses. Use `/claude_cancel` if you want to chat normally instead.
 
 ### Monitoring and Control
 
 ```
-/code_status    — Shows: task, directory, status, duration, cost
-/code_cancel    — Terminates the active session
+/claude_status    — Shows: task, directory, status, duration, cost
+/claude_cancel    — Terminates the active session
 ```
 
-Only one session runs at a time. If you send `/code` while a session is active, you'll get an error with the current task description and a hint to use `/code_cancel`.
+Only one session runs at a time. If you send `/claude` while a session is active, you'll get an error with the current task description and a hint to use `/claude_cancel`.
 
 ---
 
@@ -180,8 +182,8 @@ ssh <your-user>@<your-tailscale-ip> \
 
 Check status and cancel if needed:
 ```
-/code_status
-/code_cancel
+/claude_status
+/claude_cancel
 ```
 
 Sessions timeout automatically after 10 minutes.
@@ -200,13 +202,13 @@ If Claude is working in the wrong directory, make your task description more exp
 - **One session at a time** — serial execution only; cancel before starting a new one
 - **No interactive input** — Claude runs with `--dangerously-skip-permissions` (no approval prompts)
 - **No streaming to Telegram** — you get `[NOTIFY]` checkpoints, not real-time output
-- **File sync lag** — if you edit a file and immediately ask Claude to read it via `/code`, there may be a brief sync delay
+- **File sync lag** — if you edit a file and immediately ask Claude to read it via `/claude`, there may be a brief sync delay
 
 ---
 
 ## Related Documents
 
-- [Claude Code Orchestration — Product](../specs/product/claude-code-orchestration.md) -- What `/code` does (consumer view); plan mode; clarifications; budgets
+- [Claude Code Orchestration — Product](../specs/product/claude-code-orchestration.md) -- What `/claude` does (consumer view); plan mode; clarifications; budgets
 - [Claude Code Orchestration — Technical](../specs/technical/claude-code-orchestration.md) -- Implementation: subprocess, stream parsing, system prompt, cancellation
 - [Configuration](configuration.md) -- `LIFEOS_CLAUDE_*` env vars
 - [MCP Tools](../specs/product/mcp-tools.md) -- MCP tools available to Claude Code sessions

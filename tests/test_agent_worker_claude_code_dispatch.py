@@ -1,7 +1,7 @@
-"""Worker dispatch wiring for routing='code' sessions.
+"""Worker dispatch wiring for routing='claude_code' sessions.
 
 Verifies that ``_dispatch_spawned_sessions`` invokes the injected
-``CodeExecutor`` for operator-origin sessions with ``routing='code'``.
+``ClaudeCodeExecutor`` for operator-origin sessions with ``routing='claude_code'``.
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ pytestmark = pytest.mark.unit
 
 
 @dataclass
-class _StubCodeExecutor:
-    """Minimal CodeExecutor stand-in: records calls + returns a canned outcome."""
+class _StubClaudeCodeExecutor:
+    """Minimal ClaudeCodeExecutor stand-in: records calls + returns a canned outcome."""
     outcome: ExecutorOutcome
     calls: list = field(default_factory=list)
 
@@ -35,7 +35,7 @@ class _StubCodeExecutor:
         return self.outcome
 
 
-def _make_worker(tmp_path: Path, code_executor):
+def _make_worker(tmp_path: Path, claude_code_executor):
     # No #agent task pickup happens in these tests — the worker only runs
     # spawned-session dispatch. A 404-everywhere transport is enough so the
     # `list_agent_tasks` and `_fetch_task` calls don't raise.
@@ -50,14 +50,14 @@ def _make_worker(tmp_path: Path, code_executor):
         telegram_send=lambda text, chat_id=None: True,
         telegram_send_with_id=lambda text: [1],
         http_client=client,
-        code_executor=code_executor,
+        claude_code_executor=claude_code_executor,
     )
 
 
 def _seed_code_session(store: SessionStore, *, task_id: str = "code-1"):
     session = store.create(
         task_id=task_id,
-        routing="code",
+        routing="claude_code",
         origin="operator",
     )
     # Mirror the spawn surface contract: the prompt for the first
@@ -66,20 +66,20 @@ def _seed_code_session(store: SessionStore, *, task_id: str = "code-1"):
     return session
 
 
-def test_dispatch_calls_code_executor(tmp_path: Path):
-    """``_dispatch_spawned_sessions`` invokes the injected CodeExecutor for
-    an operator-origin routing='code' session, draining the prompt from
+def test_dispatch_calls_claude_code_executor(tmp_path: Path):
+    """``_dispatch_spawned_sessions`` invokes the injected ClaudeCodeExecutor for
+    an operator-origin routing='claude_code' session, draining the prompt from
     ``pending_messages`` as the task description.
 
     Status transitions are the executor's responsibility (the real
-    ``CodeExecutor`` calls ``update_status``; the stub doesn't, so we don't
+    ``ClaudeCodeExecutor`` calls ``update_status``; the stub doesn't, so we don't
     assert on ``session.status`` here).
     """
     # The dispatch path expects the spawn payload (a JSON-encoded dict)
-    # produced by ``code_spawn.spawn_code_session``; the stub call's task
+    # produced by ``claude_code_spawn.spawn_claude_code_session``; the stub call's task
     # description is the decoded ``prompt`` field.
-    stub = _StubCodeExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done."))
-    w = _make_worker(tmp_path, code_executor=stub)
+    stub = _StubClaudeCodeExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done."))
+    w = _make_worker(tmp_path, claude_code_executor=stub)
     _seed_code_session(w.session_store, task_id="code-1")
 
     w._dispatch_spawned_sessions()

@@ -1,4 +1,4 @@
-"""Tests for the agent worker's CodeExecutor.
+"""Tests for the agent worker's ClaudeCodeExecutor.
 
 Drives the executor against a fake subprocess whose stdout emits a scripted
 sequence of stream-json events. No real Claude CLI is invoked. Exercises:
@@ -19,12 +19,12 @@ from typing import Iterable
 
 import pytest
 
-from api.services.agent_worker.code_executor import (
+from api.services.agent_worker.claude_code_executor import (
     REASON_AWAITING_CLARIFICATION,
     REASON_AWAITING_PLAN_APPROVAL,
     REASON_BINARY_NOT_FOUND,
     REASON_COST_CAP_EXCEEDED,
-    CodeExecutor,
+    ClaudeCodeExecutor,
 )
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -109,7 +109,7 @@ def _build_executor(tmp_path: Path, *, spawn_fn, notifications: list[str] | None
     transcripts = TranscriptStore(transcripts_dir=transcript_dir)
 
     notify = (lambda msg: notifications.append(msg)) if notifications is not None else None
-    executor = CodeExecutor(
+    executor = ClaudeCodeExecutor(
         session_store=store,
         transcript_store=transcripts,
         notification_callback=notify,
@@ -122,12 +122,12 @@ def _build_executor(tmp_path: Path, *, spawn_fn, notifications: list[str] | None
 
 
 def _seed_session(store: SessionStore, *, task_id: str = "task-1"):
-    """Drop a routing='code' operator-origin session into the store, the
+    """Drop a routing='claude_code' operator-origin session into the store, the
     shape the spawn surface produces.
     """
     return store.create(
         task_id=task_id,
-        routing="code",
+        routing="claude_code",
         origin="operator",
     )
 
@@ -155,10 +155,10 @@ def test_init_event_captures_and_persists_cli_session_id(tmp_path: Path):
     assert outcome.final_text == "All set."
     refreshed = store.get(session.task_id)
     assert refreshed is not None
-    assert refreshed.code_session_id == "cli-sess-abc"
+    assert refreshed.claude_code_session_id == "cli-sess-abc"
     kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
-    assert "code_init" in kinds
-    assert "code_completed" in kinds
+    assert "claude_code_init" in kinds
+    assert "claude_code_completed" in kinds
 
 
 def test_notify_invokes_callback_and_records_transcript(tmp_path: Path):
@@ -185,7 +185,7 @@ def test_notify_invokes_callback_and_records_transcript(tmp_path: Path):
     assert outcome.status == STATUS_COMPLETED
     assert notifications == ["Read the file.", "Done."]
     kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
-    assert kinds.count("code_notify") == 2
+    assert kinds.count("claude_code_notify") == 2
     # When the assistant emits only [NOTIFY] blocks (no narrative prose), the
     # bodies are already streamed via the callback and final_text stays empty
     # so the worker won't repeat the same content in a terminal summary.
@@ -228,7 +228,7 @@ def test_tool_use_records_transcript_event(tmp_path: Path):
     outcome = executor.execute(session, {"description": "do a thing"})
     assert outcome.status == STATUS_COMPLETED
     events = _read_transcript(transcripts, session.session_id)
-    tool_events = [e for e in events if e["kind"] == "code_tool_use"]
+    tool_events = [e for e in events if e["kind"] == "claude_code_tool_use"]
     assert tool_events and tool_events[0]["payload"]["name"] == "Read"
 
 
@@ -290,7 +290,7 @@ def test_plan_mode_result_returns_blocked_with_plan(tmp_path: Path):
 
 def test_cost_cap_exceeded_returns_budget_exceeded(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        "api.services.agent_worker.code_executor.settings.claude_max_cost_usd",
+        "api.services.agent_worker.claude_code_executor.settings.claude_max_cost_usd",
         0.10,
     )
     events = [
@@ -346,7 +346,7 @@ def test_resume_without_code_session_id_returns_failed(tmp_path: Path):
     session = _seed_session(store)
     outcome = executor.resume(session, "follow-up message")
     assert outcome.status == STATUS_FAILED
-    assert "no code_session_id" in outcome.reason
+    assert "no claude_code_session_id" in outcome.reason
 
 
 def test_resume_passes_session_id_via_resume_flag(tmp_path: Path):
@@ -363,7 +363,7 @@ def test_resume_passes_session_id_via_resume_flag(tmp_path: Path):
 
     executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
     session = _seed_session(store)
-    store.set_code_session_id(session.task_id, "cli-original")
+    store.set_claude_code_session_id(session.task_id, "cli-original")
     session = store.get(session.task_id)
 
     outcome = executor.resume(session, "what about edge cases?")

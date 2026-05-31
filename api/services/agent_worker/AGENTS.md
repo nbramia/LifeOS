@@ -15,8 +15,8 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 | `local_executor.py` | Local-Gemma agent loop (synchronous, single in-process LLM client) |
 | `managed_executor.py` | Anthropic Managed Agents driver — `start()` + `poll()` for remote sessions |
 | `managed_driver.py` | HTTP client for the Managed Agents API |
-| `code_executor.py` | Claude Code CLI driver (subprocess spawn, stream-json parse, `[NOTIFY]`/`[CLARIFY]` extraction) for `routing='code'` sessions |
-| `code_spawn.py` | Helper that creates a parentless `routing='code'`, `origin='operator'` session row for a fresh `/code` task |
+| `claude_code_executor.py` | Claude Code CLI driver (subprocess spawn, stream-json parse, `[NOTIFY]`/`[CLARIFY]` extraction) for `routing='claude_code'` sessions |
+| `claude_code_spawn.py` | Helper that creates a parentless `routing='claude_code'`, `origin='operator'` session row for a fresh `/claude` task |
 | `operator_spawn.py` | Same pattern for non-code operator-initiated agent spawns from Telegram or `/chat` |
 | `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage |
 | `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication |
@@ -30,8 +30,9 @@ The `sessions.routing` column drives dispatch. Values come from preflight (for `
 | `routing` | Executor | How sessions are created |
 |-----------|----------|--------------------------|
 | `local` | `LocalExecutor` | Preflight or `#local` tag |
-| `claude` | `ManagedExecutor` | Preflight or `#cloud[-haiku\|-sonnet]` tag |
-| `code` | `CodeExecutor` | `code_spawn.spawn_code_session()` — preflight is skipped, route is explicit |
+| `claude` | `ManagedExecutor` | Preflight or `#cloud[-haiku\|-sonnet]` tag (Anthropic API, per-token) |
+| `claude_code` | `ClaudeCodeExecutor` | `claude_code_spawn.spawn_claude_code_session()` (`/claude`) or `#claude` tag (Claude Code CLI, subscription-billed) |
+| `codex` | `CodexExecutor` | `codex_spawn.spawn_codex_session()` (`/codex`) or `#codex` tag (Codex CLI, subscription-billed) |
 | `ask` | — | Preflight couldn't decide; worker blocks the session and asks the operator |
 
 ## Lifecycle
@@ -46,7 +47,7 @@ poll → can_start_task(default_budget)?
      → handle terminal outcome + Telegram notify
 ```
 
-Parallel to the `#agent` claim path, `_dispatch_spawned_sessions` picks up sessions that arrive already-claimed with an explicit routing — operator spawns (`/agent`, `/code`) and `lifeos_agent_spawn` children. `routing='code'` sessions are handled by a dedicated `_dispatch_code_session` that picks `execute()` vs `resume()` based on whether the CLI session UUID has been captured yet.
+Parallel to the `#agent` claim path, `_dispatch_spawned_sessions` picks up sessions that arrive already-claimed with an explicit routing — operator spawns (`/agent`, `/claude`) and `lifeos_agent_spawn` children. `routing='claude_code'` sessions are handled by a dedicated `_dispatch_claude_code_session` that picks `execute()` vs `resume()` based on whether the CLI session UUID has been captured yet.
 
 ## Terminal tags (#agent path)
 
@@ -69,7 +70,7 @@ A Telegram reply to a session's completion message — or a reply from the web `
 2. The reply hook deposits the answer (Telegram listener) or enqueues it directly (`/chat` reply endpoint).
 3. `_process_clarification_answers` picks up the answered row; `_resume_as_followup` dispatches to the executor branch for the session's routing.
 
-For `routing='code'` sessions specifically, `_resume_as_followup` queues the reply as a `pending_message` and flips status back to `CLAIMED`, so the next tick's `_dispatch_code_session` calls `CodeExecutor.resume(message)` with the persisted CLI session UUID — resume survives worker restarts and arbitrary time gaps.
+For `routing='claude_code'` sessions specifically, `_resume_as_followup` queues the reply as a `pending_message` and flips status back to `CLAIMED`, so the next tick's `_dispatch_claude_code_session` calls `CodeExecutor.resume(message)` with the persisted CLI session UUID — resume survives worker restarts and arbitrary time gaps.
 
 ## Open-source guardrails
 
@@ -81,5 +82,5 @@ For `routing='code'` sessions specifically, `_resume_as_followup` queues the rep
 ## Related Documents
 
 - [`docs/guides/agent-worker-setup.md`](../../../docs/guides/agent-worker-setup.md) — operator setup
-- [`docs/guides/claude-code-orchestration.md`](../../../docs/guides/claude-code-orchestration.md) — operator how-to for `/code`
+- [`docs/guides/claude-code-orchestration.md`](../../../docs/guides/claude-code-orchestration.md) — operator how-to for `/claude`
 - [`api/services/AGENTS.md`](../AGENTS.md) — sibling services

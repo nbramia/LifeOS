@@ -55,9 +55,13 @@ Optional sub-tags steer routing:
 |-----|--------|
 | `#agent` | Required. Marks the task as eligible for autonomous execution. |
 | `#local` | Forces routing to your local LLM (Gemma by default). No API spend. Subject to local model capability. |
-| `#cloud` | Forces routing to Anthropic Managed Agents (Claude). Required for tasks that need cloud connectors. |
+| `#cloud` | Forces routing to Anthropic Managed Agents (Claude). Required for tasks that need cloud connectors. Per-token API billing. |
+| `#claude` | Forces routing to Claude Code CLI (the same surface as `/claude`). Billed against your Claude Pro subscription rather than per-token. Good for code/filesystem/browser work where the cloud connectors aren't needed. |
+| `#codex` | Forces routing to Codex CLI (the same surface as `/codex`). Billed against your ChatGPT subscription. Same caveat as `#claude`. |
 
-Without `#local` or `#cloud`, the preflight infers routing from the title. Phrases like "draft an email", "check my calendar", "search my gmail" infer cloud (those need connectors). Phrases like "with local agent" or "using gemma" force local. If the title gives no signal, the worker pauses the task at `#agent-blocked` and asks you on Telegram which model to use.
+Without an explicit routing tag, the preflight infers routing from the title. Phrases like "draft an email", "check my calendar", "search my gmail" infer cloud (those need connectors). Phrases like "with local agent" or "using gemma" force local. If the title gives no signal, the worker pauses the task at `#agent-blocked` and asks you on Telegram which model to use.
+
+Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed; per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
 
 ---
 
@@ -183,7 +187,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 - [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Why local + cloud, how routing is decided, cost model
 - [Agent Worker — Technical](../technical/agent-worker.md) — Architecture, executors, prompts, state machine, restart resumability
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup (Gemma swap, MCP HTTP transport, Vault provisioning, agent preset)
-- [Claude Code Orchestration (product)](claude-code-orchestration.md) — The other autonomous-work system in LifeOS; triggered from Telegram `/code` rather than `#agent` tags
+- [Claude Code Orchestration (product)](claude-code-orchestration.md) — The other autonomous-work system in LifeOS; triggered from Telegram `/claude` rather than `#agent` tags
 - [Agent Viz](agent-viz.md) — Live `/agents` page showing in-flight and recently-finished worker sessions
 - [Task Management](task-management.md) — How `#agent` tasks live alongside regular tasks in the Obsidian Tasks plugin
 - [Scheduler Guide](../../guides/scheduler.md) — A schedule's `agent` action writes the `#agent` tasks this worker runs

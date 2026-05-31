@@ -22,7 +22,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_PORT` | int | `8000` | API server port. |
 | `LIFEOS_CHROMA_URL` | str | `http://localhost:8001` | ChromaDB server endpoint the API connects to. |
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
-| `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/code` orchestrator path resolution. |
+| `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/claude` orchestrator path resolution. |
 | `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
 
 ## LLM Backend — Synthesis and Orchestration
@@ -133,7 +133,27 @@ Operator-side controls for re-opening a Claude Code session from the `/agents` U
 | `LIFEOS_CC_RESUME_INNER_CMD` | str | — | Inner command run inside the relaunched terminal (the `claude --resume <id>` invocation). |
 | `LIFEOS_CC_RESUME_ENV_FILE` | path | — | Optional `key=value` env file pinning `DISPLAY` / `XAUTHORITY` / `WAYLAND_DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` for the spawned terminal. |
 
-## Claude Code Orchestration (`/code` Telegram command)
+## Codex Viz (`/agents` ingest of Codex sessions)
+
+Read-only ingest of the Codex CLI's per-session JSONL rollouts. Same model as the Claude Code adapter above, but rooted at `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`. Sessions appear in `/agents` with `cx:`-prefixed ids.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CODEX_VIZ_ENABLED` | bool | `true` | Master switch. `false` disables the entire Codex ingest path. |
+| `LIFEOS_CODEX_SESSIONS_DIR` | path | `~/.codex/sessions` | Where to read Codex rollout JSONLs from. |
+| `LIFEOS_CODEX_LOOKBACK_DAYS` | int | `7` | How far back to scan rollouts. |
+
+## Codex Resume (`/agents` operator-controlled re-launch)
+
+Mirror of the Claude Code resume controls for Codex sessions. Drives `POST /api/agents/sessions/cx:<id>/resume` (which spawns `codex resume <id>` in a wezterm pane by default).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_CODEX_RESUME_ENABLED` | bool | `false` | Gates the resume UI and route for `cx:` sessions. |
+| `LIFEOS_CODEX_RESUME_CMD` | str | `wezterm cli spawn --cwd {cwd} -- {inner_command}` | Outer launcher template. Same substitution surface as `LIFEOS_CC_RESUME_CMD`. |
+| `LIFEOS_CODEX_RESUME_INNER_CMD` | str | `codex resume {session_id}` | Inner command run inside the spawned terminal. |
+
+## Claude Code Orchestration (`/claude` Telegram command)
 
 Subprocess orchestration triggered from Telegram. See [claude-code-orchestration.md](claude-code-orchestration.md) for the operator flow.
 
@@ -221,9 +241,12 @@ When both are set, Telegram becomes a conversational client (full chat pipeline)
 |---|---|
 | `/new` | Start a new conversation (clears context). |
 | `/status` | Check LifeOS server health. |
-| `/code <task>` | Run a task with Claude Code orchestrator (see [claude-code-orchestration.md](claude-code-orchestration.md)). |
-| `/code_status` | Check active Claude Code session. |
-| `/code_cancel` | Cancel active Claude Code session. |
+| `/claude <task>` (alias `/claude`) | Run a task with Claude Code orchestrator (see [claude-code-orchestration.md](claude-code-orchestration.md)). |
+| `/claude_status` | Check active Claude Code session. |
+| `/claude_cancel` | Cancel active Claude Code session. |
+| `/codex <task>` | Run a task with the Codex CLI (sibling surface, ChatGPT-plan billed). |
+| `/codex_status` | Check active Codex session. |
+| `/codex_cancel` | Cancel active Codex session. |
 | `/help` | Show available commands. |
 
 Natural-language messages run through the chat pipeline (search, synthesis, tools).
@@ -299,7 +322,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Installation](installation.md) — Initial setup; points back here for env-var reference.
 - [First Run](first-run.md) — Post-install verification.
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
-- [Claude Code Orchestration](claude-code-orchestration.md) — `/code` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
+- [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.

@@ -39,8 +39,8 @@ class TestCodeIntent:
     async def test_code_action_detected(self, message):
         from api.services.chat_helpers import classify_action_intent
         result = await classify_action_intent(message, [])
-        assert result is not None, f"Expected code intent for: {message}"
-        assert result.category == "code", f"Got {result.category} for: {message}"
+        assert result is not None, f"Expected claude intent for: {message}"
+        assert result.category == "claude", f"Got {result.category} for: {message}"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("message", [

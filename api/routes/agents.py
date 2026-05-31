@@ -227,6 +227,31 @@ def _claude_code_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]
         return [], []
 
 
+def _codex_enabled() -> bool:
+    try:
+        from config.settings import settings
+        return bool(getattr(settings, "codex_viz_enabled", True))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _codex_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Discover + parse Codex sessions for the snapshot. Cached."""
+    if not _codex_enabled():
+        return [], []
+    try:
+        from config.settings import settings
+        from api.services.codex import session_ingest as cx
+
+        return cx.build_snapshot(
+            sessions_dir=settings.codex_sessions_dir,
+            lookback_days=int(getattr(settings, "codex_lookback_days", 7)),
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the LifeOS snapshot if cx ingest fails
+        logger.warning("codex snapshot failed: %s", exc)
+        return [], []
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -260,6 +285,21 @@ def _build_snapshot() -> dict[str, Any]:
         sd["custom_label"] = agent_viz_label_override.get_override(sid)
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
+
+    cx_sessions, cx_edges = _codex_snapshot()
+    for sd in cx_sessions:
+        sid = sd.get("session_id") or ""
+        sd.setdefault(
+            "short_label",
+            _short_label_for_snapshot(
+                sid,
+                sd.get("last_activity_at") or 0.0,
+                sd.get("status") or "",
+            ),
+        )
+        sd["custom_label"] = agent_viz_label_override.get_override(sid)
+    session_dicts.extend(cx_sessions)
+    edges.extend(cx_edges)
 
     return {
         "sessions": session_dicts,
@@ -315,6 +355,19 @@ async def get_session_events(
         tail = events[-limit:] if len(events) > limit else events
         return {"session_id": session_id, "events": tail, "total": len(events)}
 
+    if session_id.startswith("cx:"):
+        if not _codex_enabled():
+            raise HTTPException(status_code=404, detail="codex viz disabled")
+        try:
+            from config.settings import settings
+            from api.services.codex import session_ingest as cx
+
+            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        tail = events[-limit:] if len(events) > limit else events
+        return {"session_id": session_id, "events": tail, "total": len(events)}
+
     transcript_store = _get_transcript_store()
     try:
         events = transcript_store.read(session_id)
@@ -354,6 +407,23 @@ async def get_session_summary(session_id: str) -> dict[str, Any]:
         # Find this CC session in the cached snapshot to pull label + activity.
         cc_sessions, _ = _claude_code_snapshot()
         match = next((s for s in cc_sessions if s.get("session_id") == session_id), None)
+        if match:
+            label = str(match.get("label") or session_id)
+            last_activity = float(match.get("last_activity_at") or 0.0)
+            status = str(match.get("status") or "")
+    elif session_id.startswith("cx:"):
+        if not _codex_enabled():
+            raise HTTPException(status_code=404, detail="codex viz disabled")
+        try:
+            from config.settings import settings
+            from api.services.codex import session_ingest as cx
+
+            events = cx.read_normalized_events(session_id, settings.codex_sessions_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        cx_sessions, _ = _codex_snapshot()
+        match = next((s for s in cx_sessions if s.get("session_id") == session_id), None)
         if match:
             label = str(match.get("label") or session_id)
             last_activity = float(match.get("last_activity_at") or 0.0)
@@ -524,12 +594,12 @@ def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[
                     turns.append({"role": "assistant", "text": text, "tools": tools})
         return turns
 
-    # /code sessions: turns are reconstructed from the dedicated `code_*`
-    # transcript events (the CLI doesn't write to the `messages` table).
-    # Detect by event-kind shape rather than by routing so unit-test fixtures
-    # work without a session row.
-    if any(ev.get("kind", "").startswith("code_") for ev in events):
-        return _reconstruct_code_conversation(events)
+    # /claude sessions: turns are reconstructed from the dedicated
+    # `claude_code_*` transcript events (the CLI doesn't write to the
+    # `messages` table). Detect by event-kind shape rather than by routing
+    # so unit-test fixtures work without a session row.
+    if any(ev.get("kind", "").startswith("claude_code_") for ev in events):
+        return _reconstruct_claude_code_conversation(events)
 
     # Managed (cloud) sessions: turns live in the transcript, not the DB.
     pending_tools: list[dict] = []
@@ -555,15 +625,15 @@ def _reconstruct_conversation(messages: list[dict], events: list[dict]) -> list[
     return turns
 
 
-def _reconstruct_code_conversation(events: list[dict]) -> list[dict]:
-    """Build /chat-friendly turns from a routing='code' transcript.
+def _reconstruct_claude_code_conversation(events: list[dict]) -> list[dict]:
+    """Build /chat-friendly turns from a routing='claude_code' transcript.
 
     Events of interest:
-      - ``code_user_prompt`` — operator prompt or threaded reply, starts a
-        new user turn
-      - ``code_notify`` / ``code_clarify`` — assistant body, accumulated
-        into the current assistant turn
-      - ``code_tool_use`` — attached to the current assistant turn
+      - ``claude_code_user_prompt`` — operator prompt or threaded reply,
+        starts a new user turn
+      - ``claude_code_notify`` / ``claude_code_clarify`` — assistant body,
+        accumulated into the current assistant turn
+      - ``claude_code_tool_use`` — attached to the current assistant turn
     Everything else (init, completion markers, failure events) is metadata
     that the events panel already surfaces, so it's skipped here.
     """
@@ -579,25 +649,25 @@ def _reconstruct_code_conversation(events: list[dict]) -> list[dict]:
     for ev in events:
         kind = ev.get("kind", "")
         payload = ev.get("payload") or {}
-        if kind == "code_user_prompt":
+        if kind == "claude_code_user_prompt":
             _flush()
             text = (payload.get("text") or "").strip()
             if text:
                 turns.append({"role": "user", "text": text, "tools": []})
             continue
-        if kind in ("code_notify", "code_clarify"):
+        if kind in ("claude_code_notify", "claude_code_clarify"):
             body = (payload.get("body") or payload.get("text") or "").strip()
             if not body:
                 # The executor stores `body_chars` for these events to keep the
                 # transcript small; the full body lives in messages streamed to
                 # Telegram. /chat falls back to the cardinal label.
-                body = "(notification)" if kind == "code_notify" else "(clarification)"
+                body = "(notification)" if kind == "claude_code_notify" else "(clarification)"
             if cur_assistant is None:
                 cur_assistant = {"role": "assistant", "text": body, "tools": []}
             else:
                 cur_assistant["text"] = (cur_assistant["text"] + "\n\n" + body).strip()
             continue
-        if kind == "code_tool_use":
+        if kind == "claude_code_tool_use":
             if cur_assistant is None:
                 cur_assistant = {"role": "assistant", "text": "", "tools": []}
             cur_assistant["tools"].append({
@@ -1152,22 +1222,183 @@ def _resume_env() -> dict[str, str]:
     return env
 
 
+async def _resume_codex_session(
+    session_id: str,
+    body: "CCResumeRequest | None",
+) -> dict[str, Any]:
+    """Codex sibling of resume_claude_code_session.
+
+    Reuses the same env / wezterm pane injection / clipboard / dock
+    machinery; only the lookup, settings, and inner command differ.
+    """
+    import shlex
+    import subprocess
+    import urllib.parse
+
+    try:
+        from config.settings import settings
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"settings unavailable: {exc}") from exc
+
+    if not getattr(settings, "codex_resume_enabled", False):
+        raise HTTPException(status_code=400, detail="codex resume disabled — set LIFEOS_CODEX_RESUME_ENABLED=true")
+    template = (settings.codex_resume_cmd or "").strip()
+    if not template:
+        raise HTTPException(status_code=400, detail="LIFEOS_CODEX_RESUME_CMD is empty")
+
+    from api.services.codex import session_ingest as cx
+
+    try:
+        bare = cx.validate_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Widen lookback for resume so older sessions are still resolvable.
+    metas = cx.discover_sessions(
+        sessions_dir=settings.codex_sessions_dir,
+        lookback_days=max(int(settings.codex_lookback_days), 365),
+    )
+    target = next((m for m in metas if m.raw_session_id == bare), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+    # Codex stores cwd inside session_meta, populated by parse_session. The
+    # snapshot prepopulates it but on a fresh resume call we may need to
+    # re-parse to recover it (cheap — one jsonl read).
+    if not target.decoded_cwd:
+        target, _ = cx.parse_session(target)
+    if not target.decoded_cwd:
+        raise HTTPException(status_code=404, detail=f"session {session_id} has no cwd")
+
+    inner_template = (settings.codex_resume_inner_cmd or "").strip()
+    inner_rendered = (
+        inner_template
+        .replace("{session_id}", bare)
+        .replace("{cwd}", target.decoded_cwd)
+    )
+
+    rendered = (
+        template
+        .replace("{session_id_url}", urllib.parse.quote(bare, safe=""))
+        .replace("{cwd_url}", urllib.parse.quote(target.decoded_cwd, safe=""))
+        .replace("{session_id}", bare)
+        .replace("{cwd}", target.decoded_cwd)
+        .replace("{inner_command}", inner_rendered)
+    )
+    try:
+        argv = shlex.split(rendered)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"codex_resume_cmd parse failed: {exc}") from exc
+    if not argv:
+        raise HTTPException(status_code=400, detail="codex_resume_cmd resolved to an empty argv")
+
+    env = _resume_env()
+    if body and body.extra_env:
+        env.update(body.extra_env)
+
+    if "wezterm" in argv[0]:
+        _inject_wezterm_pane(env)
+
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — argv only, no shell=True
+            argv,
+            cwd=target.decoded_cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"resume binary not found: {exc}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"resume spawn failed: {exc}") from exc
+
+    clipboard_text = ""
+    if inner_rendered:
+        clipboard_text = (
+            f"cd {shlex.quote(target.decoded_cwd)} && {inner_rendered}"
+            if target.decoded_cwd else inner_rendered
+        )
+    clipboard_copied = False
+    if clipboard_text:
+        clipboard_copied = _copy_to_clipboard(clipboard_text, env)
+
+    pane_id: int | None = None
+    stdout_bytes = b""
+    stderr_bytes = b""
+    try:
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        return {
+            "spawned": True,
+            "pid": proc.pid,
+            "pane_id": None,
+            "command": argv,
+            "cwd": target.decoded_cwd,
+            "inner_command": clipboard_text or inner_rendered,
+            "clipboard_copied": clipboard_copied,
+        }
+
+    if proc.returncode != 0:
+        detail = (stderr_bytes.decode("utf-8", errors="replace").strip()
+                  or f"resume process exited rc={proc.returncode}")
+        raise HTTPException(status_code=500, detail=detail)
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    if stdout_text:
+        first_token = stdout_text.split()[0]
+        try:
+            pane_id = int(first_token)
+        except ValueError:
+            pane_id = None
+
+    if pane_id is not None:
+        try:
+            from api.services.cc_wezterm_store import get_default_store
+            wezterm_pid = _current_wezterm_pid(env.get("XDG_RUNTIME_DIR"))
+            # Reuse the same store — keys are cx:-prefixed, no collision with cc:.
+            get_default_store().upsert(
+                session_id, pane_id, target.decoded_cwd, wezterm_pid=wezterm_pid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cc_wezterm_store upsert failed for %s: %s", session_id, exc)
+
+    pane_label = f"pane {pane_id}" if pane_id is not None else "new tab"
+    _notify_dock(
+        env,
+        "Codex session resumed",
+        f"Wezterm opened {pane_label} in {shlex.quote(target.decoded_cwd)}",
+    )
+
+    return {
+        "spawned": True,
+        "pid": proc.pid,
+        "pane_id": pane_id,
+        "command": argv,
+        "cwd": target.decoded_cwd,
+        "inner_command": clipboard_text or inner_rendered,
+        "clipboard_copied": clipboard_copied,
+    }
+
+
 @router.post("/sessions/{session_id}/resume")
 async def resume_claude_code_session(
     session_id: str,
     body: CCResumeRequest | None = None,
 ) -> dict[str, Any]:
-    """Spawn a local terminal that re-opens a Claude Code session.
+    """Spawn a local terminal that re-opens a Claude Code or Codex session.
 
-    Only valid for `cc:`-prefixed sessions. Opt-in via
-    `LIFEOS_CC_RESUME_ENABLED`. Local-network only — do not expose via
-    Tailscale Funnel or the public MCP HTTP transport.
+    Valid for `cc:`- and `cx:`-prefixed sessions. Each source is opt-in
+    via its own flag (`LIFEOS_CC_RESUME_ENABLED` / `LIFEOS_CODEX_RESUME_ENABLED`).
+    Local-network only — do not expose via Tailscale Funnel or the
+    public MCP HTTP transport.
     """
     import shlex
     import subprocess
 
+    if session_id.startswith("cx:"):
+        return await _resume_codex_session(session_id, body)
     if not session_id.startswith("cc:"):
-        raise HTTPException(status_code=400, detail="resume is only available for Claude Code sessions")
+        raise HTTPException(status_code=400, detail="resume is only available for Claude Code or Codex sessions")
 
     try:
         from config.settings import settings
@@ -1409,6 +1640,33 @@ def _lookup_cc_session_meta(session_id: str):
     raise HTTPException(status_code=404, detail=f"session {session_id} not found")
 
 
+def _lookup_cx_session_meta(session_id: str):
+    """Resolve a `cx:`-prefixed session id to a minimal SessionMeta.
+
+    Returns a meta with `jsonl_path` + `decoded_cwd` populated — enough
+    for the focus FD probe. Raises HTTPException with an appropriate
+    status on failure.
+    """
+    from api.services.codex import session_ingest as cx
+    from config.settings import settings
+
+    try:
+        bare = cx.validate_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    metas = cx.discover_sessions(
+        sessions_dir=settings.codex_sessions_dir,
+        lookback_days=max(int(settings.codex_lookback_days), 365),
+    )
+    target = next((m for m in metas if m.raw_session_id == bare), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} not found")
+    if not target.decoded_cwd:
+        target, _ = cx.parse_session(target)
+    return target
+
+
 def _activate_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
     """Run `wezterm cli activate-pane --pane-id <id>`. Returns (success, detail).
 
@@ -1438,6 +1696,43 @@ def _activate_pane(pane_id: int, env: dict[str, str]) -> tuple[bool, str]:
         return True, ""
     return False, (proc.stderr.decode("utf-8", errors="replace").strip()
                    or f"wezterm activate-pane exited rc={proc.returncode}")
+
+
+@router.post("/cx-pane-bind")
+async def cx_pane_bind(request: Request, body: CCPaneBindRequest) -> dict[str, Any]:
+    """Localhost-only endpoint called by the Codex SessionStart hook.
+
+    Mirror of /cc-pane-bind for Codex: the script at
+    `scripts/codex-session-pane.sh` posts here every time `codex` starts in
+    a wezterm pane, so /agents Focus / Go To can hit the pane authoritatively
+    without the FD-probe fallback. Storage key is `cx:`-prefixed; no
+    collision with cc: rows.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="cx-pane-bind is localhost-only")
+
+    from api.services.codex import session_ingest as cx
+
+    try:
+        bare = cx.validate_session_id(body.session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    storage_id = f"cx:{bare}"
+    cwd = body.cwd or ""
+
+    from api.services.cc_wezterm_store import get_default_store
+    wezterm_pid = _current_wezterm_pid(_xdg_runtime_dir())
+    mapping = get_default_store().upsert(
+        storage_id, int(body.pane_id), cwd, wezterm_pid=wezterm_pid,
+    )
+    return {
+        "bound": True,
+        "session_id": storage_id,
+        "pane_id": mapping.pane_id,
+        "cwd": mapping.cwd,
+    }
 
 
 @router.post("/cc-pane-bind")
@@ -1514,16 +1809,23 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     """
     import shlex
 
-    if not session_id.startswith("cc:"):
-        raise HTTPException(status_code=400, detail="focus is only available for Claude Code sessions")
+    is_cx = session_id.startswith("cx:")
+    if not session_id.startswith("cc:") and not is_cx:
+        raise HTTPException(status_code=400, detail="focus is only available for Claude Code or Codex sessions")
 
     try:
         from config.settings import settings
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"settings unavailable: {exc}") from exc
 
-    if not getattr(settings, "cc_resume_enabled", False):
-        raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
+    # Each source has its own resume-enabled gate; focus reuses the same
+    # wezterm machinery so we require the matching gate to be on.
+    if is_cx:
+        if not getattr(settings, "codex_resume_enabled", False):
+            raise HTTPException(status_code=400, detail="codex resume disabled — set LIFEOS_CODEX_RESUME_ENABLED=true")
+    else:
+        if not getattr(settings, "cc_resume_enabled", False):
+            raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
 
     from api.services.cc_wezterm_store import get_default_store
     from api.services import cc_pane_locate
@@ -1537,7 +1839,10 @@ async def focus_claude_code_session(session_id: str) -> dict[str, Any]:
     def _meta():
         nonlocal meta
         if meta is None:
-            meta, _ = _lookup_cc_session_meta(session_id)
+            if is_cx:
+                meta = _lookup_cx_session_meta(session_id)
+            else:
+                meta, _ = _lookup_cc_session_meta(session_id)
         return meta
 
     def _probe_and_store() -> int | None:

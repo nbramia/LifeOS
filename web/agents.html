@@ -815,6 +815,7 @@
       <option value="local">local</option>
       <option value="claude">claude</option>
       <option value="claude_code">claude code</option>
+      <option value="codex">codex</option>
     </select>
   </label>
   <label>status
@@ -1042,7 +1043,8 @@
 
   function routingLabel(routing) {
     if (!routing || routing === 'local') return 'Local';
-    if (routing === 'claude_code') return 'Claude Code';
+    if (routing === 'claude_code' || routing === 'code') return 'Claude Code';
+    if (routing === 'codex') return 'Codex';
     return 'Claude';
   }
 
@@ -1099,9 +1101,10 @@
     // An operator-pinned manual label wins over everything else.
     if (d.custom_label) return d.custom_label;
     if (d.short_label) return d.short_label;
-    const isCc = d.source === 'claude_code';
+    const isCli = d.source === 'claude_code' || d.source === 'codex';
     let label = d.model_label || routingLabel(d.routing) || d.session_id.slice(0, 8);
-    if (isCc && label === 'Claude Code') label = '?';
+    // Generic CLI fallbacks aren't informative — replace with a placeholder.
+    if (isCli && (label === 'Claude Code' || label === 'Codex')) label = '?';
     return label;
   }
 
@@ -1181,12 +1184,19 @@
     return Math.max(r + 14, enclose);
   }
 
+  // Human-readable source label. Codex and Claude Code are both CLI surfaces;
+  // anything else is the LifeOS agent worker.
+  function sourceLabelFor(d) {
+    if (d.source === 'claude_code') return 'Claude Code CLI';
+    if (d.source === 'codex') return 'Codex CLI';
+    return 'LifeOS agent';
+  }
+
   function nodeTitle(d) {
-    const isCc = d.source === 'claude_code';
     return [
       d.label,
       d.decoded_cwd ? `cwd: ${d.decoded_cwd}` : null,
-      `source: ${isCc ? 'Claude Code CLI' : 'LifeOS agent'}`,
+      `source: ${sourceLabelFor(d)}`,
       `status: ${d.status}`,
       `routing: ${routingLabel(d.routing)}`,
       `tokens: ${d.total_input_tokens} in / ${d.total_output_tokens} out`,
@@ -1204,9 +1214,11 @@
 
   function nodeShapeTag(d) {
     // Shape encodes where the agent runs — applied uniformly to top-level
-    // sessions and subagents. CLI = rounded square, local agent = diamond,
-    // cloud agent (Claude) = circle. Mirrors routingLabel()'s buckets.
-    if (d.source === 'claude_code' || d.routing === 'claude_code') return 'rect';
+    // sessions and subagents. CLI = rounded square (Claude Code OR Codex),
+    // local agent = diamond, cloud agent (Claude API) = circle. Mirrors
+    // routingLabel()'s buckets.
+    if (d.source === 'claude_code' || d.source === 'codex'
+        || d.routing === 'claude_code' || d.routing === 'codex') return 'rect';
     if (!d.routing || d.routing === 'local') return 'polygon';  // local: diamond
     return 'circle';                       // cloud (Claude): dot
   }
@@ -1306,11 +1318,11 @@
         }, 220);
       })
       .on('dblclick', (event, d) => {
-        // Double-click = Go To. Only handled for Claude Code sessions
-        // (non-subagent) since the backend endpoint is cc-only — for
-        // anything else, let the deferred single-click panel toggle run
-        // normally rather than silently swallowing it.
-        if (d.source !== 'claude_code' || d.is_subagent) {
+        // Double-click = Go To. Handled for both CLI sources (Claude Code
+        // and Codex) since /focus dispatches by prefix; for anything else,
+        // let the deferred single-click panel toggle run normally.
+        const isCli = d.source === 'claude_code' || d.source === 'codex';
+        if (!isCli || d.is_subagent) {
           return;
         }
         event.preventDefault();
@@ -1407,17 +1419,21 @@
     const running = sessions.filter(s => s.status === 'running').length;
     const blocked = sessions.filter(s => s.status === 'blocked').length;
     const recent = sessions.filter(s => s.status === 'completed').length;
-    const cc = sessions.filter(s => s.source === 'claude_code').length;
-    // API spend = LifeOS agent worker sessions only. Claude Code CLI is paid
-    // via the user's subscription, not metered API tokens, so its dollar
-    // numbers would distort what the chip is meant to surface (real cost).
+    // CLI-sourced sessions (both Claude Code and Codex) share the chip —
+    // both are subscription-billed surfaces sitting outside the LifeOS
+    // agent worker. Renaming the chip would be a bigger UI change; for
+    // now the count rolls them together.
+    const cli = sessions.filter(s => s.source === 'claude_code' || s.source === 'codex').length;
+    // API spend = LifeOS agent worker sessions only. Claude Code and Codex
+    // CLI both bill against flat subscriptions, not metered API tokens,
+    // so their dollar numbers would distort the chip's "real cost" intent.
     const apiSpend = sessions
-      .filter(s => s.source !== 'claude_code')
+      .filter(s => s.source !== 'claude_code' && s.source !== 'codex')
       .reduce((acc, s) => acc + (s.total_dollars || 0), 0);
     document.getElementById('chip-running').textContent = running;
     document.getElementById('chip-blocked').textContent = blocked;
     document.getElementById('chip-recent').textContent = recent;
-    document.getElementById('chip-cc').textContent = cc;
+    document.getElementById('chip-cc').textContent = cli;
     document.getElementById('chip-spend').textContent = '$' + apiSpend.toFixed(2);
   }
 
@@ -1443,21 +1459,22 @@
   function renderPanelHeader(s) {
     const live = !TERMINAL.has(s.status);
     const safeStatus = escapeAttr(s.status);
-    const isClaudeCode = (s.source === 'claude_code');
+    const isCli = (s.source === 'claude_code' || s.source === 'codex');
     const isSubagent = !!s.is_subagent;
-    // No kill button for Claude Code sessions — we don't have a safe primitive
-    // to terminate them from outside the terminal.
-    const showKill = live && !isClaudeCode;
-    // Resume button: only for terminal-state Claude Code sessions (not subagents).
+    // No kill button for CLI sessions — we don't have a safe primitive to
+    // terminate them from outside the terminal.
+    const showKill = live && !isCli;
+    // Resume button: only for terminal-state CLI sessions (not subagents).
     // Whether the backend will actually accept the click depends on
-    // LIFEOS_CC_RESUME_ENABLED on the server; if disabled, click → toast error.
-    const showResume = isClaudeCode && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
-    // Go To button: any non-subagent CC session, including live ones. The
+    // LIFEOS_CC_RESUME_ENABLED / LIFEOS_CODEX_RESUME_ENABLED on the server;
+    // if disabled, click → toast error.
+    const showResume = isCli && !isSubagent && (TERMINAL.has(s.status) || s.status === 'inactive' || s.status === 'yielded');
+    // Go To button: any non-subagent CLI session, including live ones. The
     // backend uses a stored mapping (set by Resume or by the SessionStart
     // hook) and falls back to an FD probe so this works for sessions
     // started organically in wezterm.
-    const showGoTo = isClaudeCode && !isSubagent;
-    const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
+    const showGoTo = isCli && !isSubagent;
+    const sourceLabel = sourceLabelFor(s);
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
     panelEl.innerHTML = `
       <div class="panel-header">
@@ -1613,8 +1630,7 @@
       if (el) el.innerHTML = html;
     };
     const inferredHint = s.status_inferred ? ' (inferred)' : '';
-    const isClaudeCode = (s.source === 'claude_code');
-    const sourceLabel = isClaudeCode ? 'Claude Code' : 'LifeOS agent';
+    const sourceLabel = sourceLabelFor(s);
     // Don't overwrite the title while the operator is mid-rename.
     if (!panelEl.querySelector('#label-edit-input')) {
       setText('label', s.custom_label || s.label || s.session_id);
