@@ -934,6 +934,35 @@ class Worker:
             logger.warning("set_task_status(%s, %s) failed: %s", task_id, status, exc)
             return False
 
+    def _reconcile_vault_terminal(self, session, status: str) -> None:
+        """Update the backing #agent vault task when a CLI session ends.
+
+        The ``claude_code`` / ``codex`` dispatch paths don't go through
+        ``_handle_outcome`` (which owns vault reconciliation for the local
+        and managed routes), so terminal outcomes there must reconcile the
+        vault themselves — otherwise a vault-routed ``#agent #claude`` /
+        ``#codex`` task is stranded at ``[/]`` / ``#agent-running`` forever
+        even though the agent finished.
+
+        Operator-spawned sessions (``origin='operator'``) and spawned
+        children (``parent_session_id`` set) have no backing #agent vault
+        row, so the complete / swap-tag / set-status calls would 404 — skip
+        them. This mirrors ``has_vault_task`` in ``_handle_outcome``.
+        """
+        has_vault_task = session.origin != "operator" and not session.parent_session_id
+        if not has_vault_task:
+            return
+        task_id = session.task_id
+        if status == STATUS_COMPLETED:
+            self._complete_task(task_id)  # mark `done` ([x]) in the vault
+            self._swap_tag(task_id, RUNNING_TAG, COMPLETED_TAG)
+        elif status == STATUS_BUDGET_EXCEEDED:
+            self._swap_tag(task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
+            self._set_task_status(task_id, "cancelled")
+        elif status == STATUS_FAILED:
+            self._swap_tag(task_id, RUNNING_TAG, FAILED_TAG)
+            self._set_task_status(task_id, "cancelled")
+
     # ------------------------------------------------------------------
     # Claim + dispatch
     # ------------------------------------------------------------------
@@ -1161,16 +1190,19 @@ class Worker:
             self.transcript_store.append(sid, "code_handled_completion", {
                 "final_chars": len(body),
             })
+            self._reconcile_vault_terminal(session, STATUS_COMPLETED)
             return
 
         # FAILED / BUDGET_EXCEEDED — surface a brief operator notification.
-        # Skip _handle_outcome (which assumes an #agent vault task) since
-        # /claude sessions don't have one.
+        # Skip _handle_outcome here (it owns the local/managed routes), but a
+        # vault-routed #claude task still needs its tag/checkbox reconciled —
+        # operator-spawned /claude sessions have no vault row and are no-ops.
         label = "Code session"
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
             self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+        self._reconcile_vault_terminal(session, outcome.status)
 
     def _get_claude_code_executor(self):
         """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
@@ -1256,6 +1288,7 @@ class Worker:
             self.transcript_store.append(sid, "codex_handled_completion", {
                 "final_chars": len(body),
             })
+            self._reconcile_vault_terminal(session, STATUS_COMPLETED)
             return
 
         label = "Codex session"
@@ -1263,6 +1296,7 @@ class Worker:
             self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
             self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+        self._reconcile_vault_terminal(session, outcome.status)
 
     def _get_codex_executor(self):
         """Lazy-construct the CodexExecutor for /codex sessions."""
