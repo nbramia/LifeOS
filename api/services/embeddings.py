@@ -88,6 +88,7 @@ class EmbeddingService:
                     model_name_or_path=self.model_name,
                     cache_folder=self.cache_dir,
                     model_kwargs={"dtype": torch.float16},
+                    local_files_only=True,
                 )
                 if self._force_cpu:
                     load_kwargs["device"] = "cpu"
@@ -105,6 +106,7 @@ class EmbeddingService:
                             model_name_or_path=self.model_name,
                             cache_folder=self.cache_dir,
                             device="cpu",
+                            local_files_only=True,
                         )
                         self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
                         self._force_cpu = True
