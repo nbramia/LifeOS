@@ -66,6 +66,67 @@ def _seed_code_session(store: SessionStore, *, task_id: str = "code-1"):
     return session
 
 
+def _recording_worker(tmp_path: Path, claude_code_executor):
+    """Like ``_make_worker`` but records the vault-mutating HTTP calls so a
+    test can assert the task was completed + tag-swapped (or not)."""
+    calls: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, req.url.path))
+        if req.url.path.endswith("/swap-tag"):
+            return httpx.Response(200, json={"swapped": True})
+        return httpx.Response(200, json={"tasks": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: True,
+        telegram_send_with_id=lambda text: [1],
+        http_client=client,
+        claude_code_executor=claude_code_executor,
+    )
+    return worker, calls
+
+
+def test_vault_claude_task_marked_complete_on_finish(tmp_path: Path):
+    """A vault-routed ``#agent #claude`` task (origin != 'operator', no parent)
+    must be reconciled in the vault when the Claude Code session completes:
+    PUT .../complete and a #agent-running → #agent-completed swap. Regression
+    for CLI tasks stranded at ``[/]`` / ``#agent-running`` forever (the CLI
+    dispatch path bypasses ``_handle_outcome``)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    # origin defaults to None → vault-backed task (not an operator spawn).
+    session = worker.session_store.create(task_id="vault-1", routing="claude_code")
+
+    worker._dispatch_claude_code_session(session, [{"content": "print hello"}])
+
+    assert ("PUT", "/api/tasks/vault-1/complete") in calls
+    assert ("POST", "/api/tasks/vault-1/swap-tag") in calls
+
+
+def test_operator_spawn_does_not_touch_vault_on_finish(tmp_path: Path):
+    """Operator-spawned /claude sessions have no backing #agent vault row, so
+    completion must NOT issue complete / swap-tag calls (they would 404)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    session = worker.session_store.create(
+        task_id="spawn-1", routing="claude_code", origin="operator"
+    )
+
+    worker._dispatch_claude_code_session(session, [{"content": "print hello"}])
+
+    assert not any(path.endswith(("/complete", "/swap-tag")) for _, path in calls)
+
+
 def test_dispatch_calls_claude_code_executor(tmp_path: Path):
     """``_dispatch_spawned_sessions`` invokes the injected ClaudeCodeExecutor for
     an operator-origin routing='claude_code' session, draining the prompt from
