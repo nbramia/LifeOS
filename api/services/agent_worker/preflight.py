@@ -30,10 +30,14 @@ logger = logging.getLogger(__name__)
 ROUTE_LOCAL = "local"
 ROUTE_CLAUDE = "claude"
 ROUTE_ASK = "ask"
-# `code` is an explicit route — preflight never emits it. Sessions arrive with
-# routing="code" pre-set when spawned by the `/code` surface (see
-# `agent_worker/code_spawn.py`), so preflight is skipped entirely for them.
-ROUTE_CODE = "code"
+# `claude_code` is an explicit route — preflight never emits it. Sessions
+# arrive with routing="claude_code" pre-set when spawned by the `/claude`
+# surface (see `agent_worker/claude_code_spawn.py`) or via the `#claude` tag.
+ROUTE_CLAUDE_CODE = "claude_code"
+# `codex` is the sibling explicit route for `/codex` (see
+# `agent_worker/codex_spawn.py`). Same semantics as ROUTE_CLAUDE_CODE —
+# preflight never emits it directly except via the `#codex` tag.
+ROUTE_CODEX = "codex"
 
 # Allowed expected-output shapes. Used to phrase the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
@@ -217,7 +221,7 @@ def parse_preflight_response(text: str) -> PreflightResult:
     )
 
     routing = raw.get("routing", ROUTE_ASK)
-    if routing not in (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_ASK):
+    if routing not in (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_ASK):
         routing = ROUTE_ASK
 
     expected_output = raw.get("expected_output", "text")
@@ -300,6 +304,8 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
 
     Tag precedence (a tag always wins over preflight's LLM choice):
       `#local`        → routing=local, model=local
+      `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
+      `#codex`        → routing=codex  (Codex CLI, subscription-billed)
       `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
       `#cloud-sonnet` → routing=claude, model=claude-sonnet-4-6
       `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
@@ -312,6 +318,21 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
         result.routing = ROUTE_LOCAL
         result.routing_reason = "#local tag present"
         result.model = MODEL_LOCAL
+        return result
+    if "claude" in normalized:
+        # Claude Code CLI route — dispatched through ClaudeCodeExecutor like
+        # /claude. Billed against the operator's Claude Pro subscription
+        # rather than per-token Anthropic API rates, so cost-gating is skipped.
+        result.routing = ROUTE_CLAUDE_CODE
+        result.routing_reason = "#claude tag present"
+        result.model = ""  # CLI picks its own model from settings
+        return result
+    if "codex" in normalized:
+        # Codex CLI route — dispatched through CodexExecutor like /codex.
+        # Billed against the operator's ChatGPT plan.
+        result.routing = ROUTE_CODEX
+        result.routing_reason = "#codex tag present"
+        result.model = ""  # CLI picks its own model from ~/.codex/config.toml
         return result
     if "cloud-haiku" in normalized:
         result.routing = ROUTE_CLAUDE
@@ -371,6 +392,10 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     Local-routed tasks always set the estimate to 0 and never trigger
     confirmation.
     """
+    # Only the Anthropic-API route (ROUTE_CLAUDE / Managed Agents) is gated.
+    # ROUTE_CLAUDE_CODE / ROUTE_CODEX bill against a flat subscription; ROUTE_LOCAL
+    # is free. Per-session $ rollups for CLI routes still populate via the
+    # rollout ingest (cc:/cx: sources in /agents).
     if result.routing != ROUTE_CLAUDE:
         result.estimated_cost_dollars = 0.0
         result.needs_cost_confirmation = False

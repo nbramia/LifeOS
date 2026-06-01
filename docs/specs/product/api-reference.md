@@ -66,13 +66,13 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `status` | `message` | Tool execution status (e.g. "Searching notes...") |
 | `content` | `content` | Streamed response text chunk |
 | `sources` | `sources` | Data sources used (vault, calendar, gmail, etc.) |
-| `code_intent` | `task` | Query requires Claude Code (terminal/filesystem) |
+| `claude_intent` | `task` | Query requires Claude Code (terminal/filesystem) |
 | `usage` | `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` | Token usage and cost |
 | `done` | — | Stream complete |
 
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
-2. **Code intent** — terminal, filesystem, browser tasks. Yields `code_intent` event for Telegram to spawn Claude Code.
+2. **Claude intent** — terminal, filesystem, browser tasks. Yields `claude_intent` event for Telegram to spawn Claude Code.
 3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 18 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list.
 
 **Agentic loop tools (18):**

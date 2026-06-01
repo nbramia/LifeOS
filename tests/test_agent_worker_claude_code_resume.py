@@ -1,11 +1,11 @@
-"""Worker integration tests for /code resume + BLOCKED flow.
+"""Worker integration tests for /claude resume + BLOCKED flow.
 
 Verifies:
 - ``_resume_as_followup`` treats a code-routed answer as a fresh pending
   message that flips the session back to CLAIMED (so the spawned-session
-  dispatch picks it up on the next tick and calls ``CodeExecutor.resume``).
-- ``_dispatch_code_session`` calls ``resume()`` (not ``execute()``) when
-  ``session.code_session_id`` is set.
+  dispatch picks it up on the next tick and calls ``ClaudeCodeExecutor.resume``).
+- ``_dispatch_claude_code_session`` calls ``resume()`` (not ``execute()``) when
+  ``session.claude_code_session_id`` is set.
 - ``BLOCKED`` outcomes send a reply prompt with ID capture and register a
   ``kind='followup'`` row keyed to those IDs.
 - ``COMPLETED`` outcomes with non-empty ``final_text`` register a followup row.
@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from api.services.agent_worker.code_executor import (
+from api.services.agent_worker.claude_code_executor import (
     REASON_AWAITING_CLARIFICATION,
     REASON_AWAITING_PLAN_APPROVAL,
 )
@@ -38,7 +38,7 @@ pytestmark = pytest.mark.unit
 
 
 @dataclass
-class _StubCodeExecutor:
+class _StubClaudeCodeExecutor:
     execute_outcome: ExecutorOutcome
     resume_outcome: ExecutorOutcome | None = None
     execute_calls: list = field(default_factory=list)
@@ -53,7 +53,7 @@ class _StubCodeExecutor:
         return self.resume_outcome or self.execute_outcome
 
 
-def _make_worker(tmp_path: Path, code_executor, monkeypatch=None):
+def _make_worker(tmp_path: Path, claude_code_executor, monkeypatch=None):
     # monkeypatch retained as an optional arg for forward-compat with
     # tests that still pass it; the LIFEOS_CODE_ROUTING flag was removed
     # so there's nothing to set anymore.
@@ -77,7 +77,7 @@ def _make_worker(tmp_path: Path, code_executor, monkeypatch=None):
         telegram_send=lambda text, chat_id=None: sent.append(text) or True,
         telegram_send_with_id=_send_with_id,
         http_client=client,
-        code_executor=code_executor,
+        claude_code_executor=claude_code_executor,
     )
     w._sent = sent  # type: ignore[attr-defined]
     w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
@@ -85,9 +85,9 @@ def _make_worker(tmp_path: Path, code_executor, monkeypatch=None):
 
 
 def _seed_fresh_code_session(store: SessionStore, *, task_id="code-1"):
-    """Mirror what spawn_code_session writes."""
-    from api.services.agent_worker.code_spawn import spawn_code_session
-    result = spawn_code_session(store, "print hello", chat_id="123")
+    """Mirror what spawn_claude_code_session writes."""
+    from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+    result = spawn_claude_code_session(store, "print hello", chat_id="123")
     assert result["ok"]
     # Patch the auto-generated task_id to the deterministic one tests use.
     # Simpler: just return what we got.
@@ -95,7 +95,7 @@ def _seed_fresh_code_session(store: SessionStore, *, task_id="code-1"):
 
 
 def test_blocked_outcome_sends_prompt_and_registers_followup(tmp_path: Path, monkeypatch):
-    stub = _StubCodeExecutor(execute_outcome=ExecutorOutcome(
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
         status=STATUS_BLOCKED,
         reason=REASON_AWAITING_PLAN_APPROVAL,
         final_text="step 1; step 2",
@@ -116,7 +116,7 @@ def test_blocked_outcome_sends_prompt_and_registers_followup(tmp_path: Path, mon
 
 
 def test_clarification_block_sends_specific_prompt(tmp_path: Path, monkeypatch):
-    stub = _StubCodeExecutor(execute_outcome=ExecutorOutcome(
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
         status=STATUS_BLOCKED,
         reason=REASON_AWAITING_CLARIFICATION,
         final_text="which file?",
@@ -128,7 +128,7 @@ def test_clarification_block_sends_specific_prompt(tmp_path: Path, monkeypatch):
 
 
 def test_completed_outcome_registers_followup_for_reply(tmp_path: Path, monkeypatch):
-    stub = _StubCodeExecutor(execute_outcome=ExecutorOutcome(
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="Here is the result.",
     ))
     w = _make_worker(tmp_path, stub, monkeypatch)
@@ -141,16 +141,16 @@ def test_completed_outcome_registers_followup_for_reply(tmp_path: Path, monkeypa
 
 
 def test_resume_dispatch_calls_resume_not_execute(tmp_path: Path, monkeypatch):
-    stub = _StubCodeExecutor(
+    stub = _StubClaudeCodeExecutor(
         execute_outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"),
         resume_outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="resumed"),
     )
     w = _make_worker(tmp_path, stub, monkeypatch)
     session = _seed_fresh_code_session(w.session_store)
-    # Drain the spawn payload, mark a code_session_id (as the executor would),
+    # Drain the spawn payload, mark a claude_code_session_id (as the executor would),
     # then enqueue a reply.
     w.session_store.drain_pending_messages(session.session_id)
-    w.session_store.set_code_session_id(session.task_id, "cli-abc")
+    w.session_store.set_claude_code_session_id(session.task_id, "cli-abc")
     w.session_store.enqueue_message(session.session_id, "operator", "follow up please")
 
     w._dispatch_spawned_sessions()
@@ -161,17 +161,17 @@ def test_resume_dispatch_calls_resume_not_execute(tmp_path: Path, monkeypatch):
 
 def test_resume_as_followup_for_code_session_flips_to_claimed(tmp_path: Path, monkeypatch):
     """Telegram reply hook deposits answer → worker.tick processes the
-    answered question → _resume_as_followup for routing='code' just
+    answered question → _resume_as_followup for routing='claude_code' just
     re-claims the session and queues the reply as a pending message."""
-    stub = _StubCodeExecutor(execute_outcome=ExecutorOutcome(
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="completed",
     ))
     w = _make_worker(tmp_path, stub, monkeypatch)
     session = _seed_fresh_code_session(w.session_store)
     # Pretend the first dispatch ran and completed: drain the prompt, mark
-    # code_session_id, then a followup row was created on completion.
+    # claude_code_session_id, then a followup row was created on completion.
     w.session_store.drain_pending_messages(session.session_id)
-    w.session_store.set_code_session_id(session.task_id, "cli-xyz")
+    w.session_store.set_claude_code_session_id(session.task_id, "cli-xyz")
     # Park the session at COMPLETED to mirror the post-run state.
     w.session_store.update_status(session.task_id, STATUS_COMPLETED)
     w.session_store.create_pending_question(

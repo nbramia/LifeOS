@@ -74,8 +74,8 @@ async def simulate_telegram(question: str, port: int = 8000):
                     print(f"\n  [{elapsed:5.1f}s] ERROR: {event.get('message')}")
                 elif etype == "done":
                     pass
-                elif etype == "code_intent":
-                    print(f"  [{elapsed:5.1f}s] code_intent: {event.get('task')}")
+                elif etype == "claude_intent":
+                    print(f"  [{elapsed:5.1f}s] claude_intent: {event.get('task')}")
                 else:
                     print(f"  [{elapsed:5.1f}s] {etype}: {json.dumps(event)[:200]}")
 
@@ -84,7 +84,7 @@ async def simulate_telegram(question: str, port: int = 8000):
     print(f"TOTAL TIME: {elapsed:.1f}s")
     print(f"ANSWER LENGTH: {len(full_text)} chars")
     print(f"{'='*60}")
-    print(f"\nFINAL ANSWER (what Telegram sends):")
+    print("\nFINAL ANSWER (what Telegram sends):")
     print(f"{'─'*40}")
     print(full_text or "(empty)")
     print(f"{'─'*40}")

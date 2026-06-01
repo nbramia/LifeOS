@@ -300,7 +300,7 @@ class TestMessageDedup:
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat, \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
             mock_settings.telegram_chat_id = "123"
-            mock_chat.return_value = {"answer": "response", "conversation_id": "c1", "code_intent": False}
+            mock_chat.return_value = {"answer": "response", "conversation_id": "c1", "claude_intent": False}
 
             await listener._handle_update(update)
             assert mock_chat.call_count == 1
@@ -370,7 +370,7 @@ class TestNoImplicitThreadResume:
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             mock_settings.telegram_chat_id = "123"
-            mock_chat.return_value = {"answer": "sunny", "conversation_id": "c1", "code_intent": False}
+            mock_chat.return_value = {"answer": "sunny", "conversation_id": "c1", "claude_intent": False}
             await listener._handle_update(update)
 
         # Routed to chat, NOT swallowed into the agent thread.

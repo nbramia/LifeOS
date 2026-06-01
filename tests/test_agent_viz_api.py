@@ -31,10 +31,11 @@ def stores(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
     # Clear the label cache so labels are recomputed against the test fixtures.
     agents_route._label_cache.clear()
-    # Disable the Claude Code union so these tests only exercise the LifeOS
-    # agent path — otherwise the snapshot would mix in real CC sessions from
-    # ~/.claude/projects/ on the test machine.
+    # Disable the Claude Code and Codex unions so these tests only exercise the
+    # LifeOS agent path — otherwise the snapshot would mix in real CC sessions
+    # from ~/.claude/projects/ and Codex sessions from the test machine.
     monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
+    monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
     yield session_store, transcript_store
     agents_route._label_cache.clear()
 
