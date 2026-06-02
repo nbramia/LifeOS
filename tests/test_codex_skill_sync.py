@@ -62,6 +62,54 @@ def test_transform_raises_without_frontmatter():
         transform_skill("# No frontmatter here\n")
 
 
+_FOLDED = """\
+---
+name: draft-issue
+description: >
+  Draft and create a GitHub issue from a description or investigation.
+  Use when a problem is too large for a quick fix, or the user says
+  "file an issue".
+argument-hint: <issue description>
+---
+
+# Draft Issue
+
+Body.
+"""
+
+
+def test_transform_preserves_folded_scalar_description():
+    """A multi-line `description: >` must survive — Codex uses description for
+    skill triggering, so an empty one makes the skill undiscoverable."""
+    out = transform_skill(_FOLDED)
+    assert "Draft and create a GitHub issue" in out
+    assert 'file an issue' in out
+    # No dangling YAML folded-scalar marker, no argument-hint.
+    assert "description: >" not in out
+    assert "argument-hint" not in out
+
+
+def test_transform_raises_on_empty_description():
+    text = "---\nname: x\ndescription:\nargument-hint: y\n---\nbody\n"
+    with pytest.raises(ValueError):
+        transform_skill(text)
+
+
+def test_real_portable_skills_convert_with_nonempty_description():
+    """Guard against silently shipping an untriggerable skill: every portable
+    skill in the repo must convert with a non-empty description line."""
+    repo_skills = Path(__file__).resolve().parent.parent / ".claude" / "skills"
+    for name in PORTABLE_SKILLS:
+        src = repo_skills / name / "SKILL.md"
+        if not src.is_file():
+            continue
+        out = transform_skill(src.read_text(encoding="utf-8"))
+        desc_line = next(
+            (ln for ln in out.splitlines() if ln.startswith("description:")), ""
+        )
+        assert len(desc_line) > len("description: ") + 10, f"{name} has a thin description"
+
+
 def test_install_skills_writes_portable_set(tmp_path: Path):
     claude_dir = tmp_path / "claude_skills"
     codex_dir = tmp_path / "codex_skills"

@@ -23,6 +23,8 @@ import os
 import re
 from pathlib import Path
 
+import yaml
+
 
 # Engine-agnostic skills safe to expose to Codex (verified free of Claude
 # subagent-orchestration references). Keep this list conservative — when in
@@ -41,35 +43,52 @@ PORTABLE_SKILLS = (
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _BASH_INJECT_RE = re.compile(r"!`([^`]+)`")
+# `argument-hint` values use Claude's bracket dialect (e.g. `[hours] [me|others]`)
+# which isn't valid YAML, and we drop the key anyway — strip it before parsing.
+_ARGUMENT_HINT_RE = re.compile(r"(?m)^argument-hint:.*\n?")
 
 
 def transform_skill(text: str) -> str:
     """Convert one Claude `SKILL.md` body to Codex's format.
 
     - Keep only `name` and `description` in the frontmatter (drop
-      `argument-hint`, which Codex doesn't use).
-    - Replace `$ARGUMENTS` with prose, since Codex skills aren't parameterized
-      the same way — the user's request *is* the argument.
+      `argument-hint`, which Codex doesn't use). The frontmatter is parsed as
+      YAML so multi-line `description: >` / `description: |` folded scalars
+      survive — re-emitted as a single (possibly long) line.
     - Rewrite `` !`cmd` `` bash-injection into an explicit "run this" hint;
       Codex has shell access and runs the command itself rather than having it
-      pre-expanded.
+      pre-expanded. Done before the `$ARGUMENTS` swap so a command containing
+      `$ARGUMENTS` isn't corrupted mid-rewrite.
+    - Replace `$ARGUMENTS` with prose, since Codex skills aren't parameterized
+      the same way — the user's request *is* the argument.
 
-    Raises ValueError if the input has no parseable frontmatter.
+    Raises ValueError if the input has no parseable frontmatter or is missing
+    the required `name` / `description` keys.
     """
     match = _FRONTMATTER_RE.match(text)
     if not match:
         raise ValueError("SKILL.md has no YAML frontmatter")
     frontmatter, body = match.group(1), match.group(2)
 
-    kept = [
-        line for line in frontmatter.splitlines()
-        if line.startswith("name:") or line.startswith("description:")
-    ]
+    # Drop argument-hint first: its bracket dialect isn't valid YAML and would
+    # break the parse. name/description are the only keys Codex needs.
+    frontmatter = _ARGUMENT_HINT_RE.sub("", frontmatter)
+    meta = yaml.safe_load(frontmatter) or {}
+    name, description = meta.get("name"), meta.get("description")
+    if not name or not description:
+        raise ValueError("SKILL.md frontmatter is missing name or description")
 
-    body = body.replace("$ARGUMENTS", "the request you were given")
+    # Re-emit as valid YAML; width=inf keeps the (possibly long folded)
+    # description on one line instead of re-wrapping it.
+    new_frontmatter = yaml.safe_dump(
+        {"name": name, "description": description},
+        sort_keys=False, allow_unicode=True, width=float("inf"),
+    ).strip()
+
     body = _BASH_INJECT_RE.sub(r"(run `\1` to get this)", body)
+    body = body.replace("$ARGUMENTS", "the request you were given")
 
-    return "---\n" + "\n".join(kept) + "\n---\n" + body
+    return "---\n" + new_frontmatter + "\n---\n" + body
 
 
 def _codex_skills_dir() -> Path:
