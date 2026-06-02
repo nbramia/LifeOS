@@ -117,11 +117,11 @@ NOTIFICATIONS — use [NOTIFY] for:
 
 DELEGATION:
 - Your LifeOS agent session id is {session_id}.
-- If a task needs a capability you lack, delegate it to another engine with
-  the `lifeos_agent_spawn` MCP tool (pass caller_session_id={session_id}).
-  Use model="codex" for tasks that suit Codex's native computer use, or
-  model="local"/"claude" for background research. Monitor the child with
-  `lifeos_agent_check` and read its result with `lifeos_agent_transcript_read`.
+- You already have a browser (--chrome), filesystem, and shell. If you want to
+  run background work in parallel, delegate it with the `lifeos_agent_spawn`
+  MCP tool (pass caller_session_id={session_id}, model="local" or "claude").
+  Monitor the child with `lifeos_agent_check` and read its result with
+  `lifeos_agent_transcript_read`.
 """
 
 

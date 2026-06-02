@@ -439,23 +439,33 @@ skills (`/implement`, `/review-pr`, `/address-review`, `/mine-for-ideas`, `/tune
 are intentionally **not** ported — they drive Claude's subagent loop or the
 LifeOS orchestrator internals and have no Codex equivalent.
 
-### Codex computer use
+### Codex computer use — NOT available to the worker (use delegation)
 
-Codex ships native computer use — `computer_use`, `browser_use`,
-`browser_use_external`, and `in_app_browser` are stable and enabled by default
-(check with `codex features list`). The worker runs Codex with
-`--dangerously-bypass-approvals-and-sandbox`, so nothing in the executor
-suppresses these features. Whether they function under headless `codex exec`
-(no TTY, possibly no display) depends on the host; verify with a real `#codex`
-task that needs the browser before relying on it.
+`codex features list` shows `computer_use` / `browser_use` / `in_app_browser`
+as `stable`+`true`, but those are **capability flags, not runtime availability**.
+Verified empirically (a forced-browser `codex exec` task returns "BROWSER
+UNAVAILABLE") and confirmed against OpenAI's docs — Codex computer use and the
+in-app browser are **Codex *desktop app* features**, not CLI/`exec` features:
 
-**Fallback:** if Codex can't drive the browser headlessly on your host, it can
-delegate to the browser-enabled Claude Code CLI. Every `#codex` (and `#claude`)
-agent is told its LifeOS session id and can call `lifeos_agent_spawn` with
-`model="claude_code"` (for `--chrome`) or `model="codex"` (for native computer
-use) to hand a sub-task to the other engine, then monitor it with
-`lifeos_agent_check`. This bidirectional delegation means either engine can get
-a job done even when its own tool surface falls short.
+- They are documented only under the [Codex **app**](https://developers.openai.com/codex/app/computer-use),
+  and the browser is *in-app* — hosted by the desktop/TUI runtime. Headless
+  `codex exec` (how the worker runs Codex) has no app, so the tool is never
+  registered.
+- Computer use is **macOS/Windows only** — this worker runs on **Linux**, where
+  it isn't offered at all.
+- It also requires a Computer Use **plugin** installed via Codex settings, an
+  active desktop session, and OS screen-recording/accessibility permissions —
+  none of which exist for a background `codex exec` subprocess.
+
+This is an upstream constraint, not a LifeOS misconfiguration — there's no flag
+that makes it work in the worker.
+
+**So browser/GUI work routes to Claude Code instead.** Every `#codex` (and
+`#claude`) agent is told its LifeOS session id and can call `lifeos_agent_spawn`
+with `model="claude_code"` to hand a browser sub-task to the `--chrome`-enabled
+Claude Code CLI (which *does* work headless on Linux), then monitor it with
+`lifeos_agent_check`. This delegation is the supported path for any task that
+needs a real browser.
 
 ## Cost-aware iteration
 
