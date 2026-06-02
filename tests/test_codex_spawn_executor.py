@@ -150,10 +150,167 @@ def test_executor_handles_full_stream(stores, monkeypatch, tmp_path):
     outcome = executor.execute(session, {"description": "say hi", "working_dir": str(tmp_path)})
     assert outcome.status == STATUS_COMPLETED
     assert outcome.final_text == "Hello world"
-    assert notifications == ["Hello world"]
+    # The executor no longer streams agent messages to Telegram — the worker
+    # sends the final message once on completion. Only heartbeats (suppressed
+    # here) would reach the callback mid-run, so it stays empty.
+    assert notifications == []
     # Thread id persisted for future resume.
     reloaded = sess_store.get_by_session_id(session.session_id)
     assert reloaded.claude_code_session_id == "thread-abc"
+
+
+@pytest.mark.unit
+def test_executor_prepends_capabilities_preamble(stores, monkeypatch, tmp_path):
+    """A fresh /codex turn carries the LifeOS capabilities briefing so the
+    agent has the same situational awareness as the managed/local routes."""
+    from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
+
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_pre", session_id="sess_pre", status="claimed", routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text", origin="operator",
+    )
+
+    captured: dict = {}
+
+    def fake_spawn(cmd, **kwargs):
+        captured["cmd"] = cmd
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("ok\n")
+        return _FakeProc([{"type": "session.completed"}], returncode=0)
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=fake_spawn, binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    executor.execute(session, {"description": "what's on my calendar?", "working_dir": str(tmp_path)})
+
+    # The prompt is the last positional arg of the codex command.
+    prompt_arg = captured["cmd"][-1]
+    assert "=== LIFEOS BRIEFING" in prompt_arg
+    assert prompt_arg.endswith("what's on my calendar?")
+    assert CAPABILITIES_PREAMBLE in prompt_arg
+
+
+@pytest.mark.unit
+def test_resume_does_not_prepend_preamble(stores, tmp_path):
+    """Resume reloads the Codex thread (which already holds the preamble from
+    the opening turn), so the follow-up message must NOT re-inject it."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_res", session_id="sess_res", status="claimed", routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text", origin="operator",
+    )
+    sess_store.set_claude_code_session_id("t_res", "thread-xyz")
+    session = sess_store.get_by_session_id("sess_res")
+
+    captured: dict = {}
+
+    def fake_spawn(cmd, **kwargs):
+        captured["cmd"] = cmd
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("ok\n")
+        return _FakeProc([{"type": "session.completed"}], returncode=0)
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=fake_spawn, binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    executor.resume(session, "and tomorrow?", working_dir=str(tmp_path))
+
+    prompt_arg = captured["cmd"][-1]
+    assert "=== LIFEOS BRIEFING" not in prompt_arg
+    assert prompt_arg == "and tomorrow?"
+    assert "resume" in captured["cmd"]
+
+
+@pytest.mark.unit
+def test_executor_does_not_stream_intermediate_messages(stores, tmp_path):
+    """Codex narrates before each tool call; those agent messages must not be
+    forwarded to Telegram (the flood the issue describes). The callback only
+    ever sees heartbeats, which are suppressed in tests — so it stays empty,
+    while final_text tracks the last message for the worker to send once."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_flood", session_id="sess_flood", status="claimed", routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text", origin="operator",
+    )
+
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-f"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "Let me search."}},
+        {"type": "item.completed", "item": {"type": "command_executed", "command": "grep"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "Now I'll check email."}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "Final answer: 3 events."}},
+        {"type": "session.completed"},
+    ]
+
+    def fake_spawn(cmd, **kwargs):
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("Final answer: 3 events.\n")
+        return _FakeProc(lines, returncode=0)
+
+    notifications: list[str] = []
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        notification_callback=notifications.append,
+        spawn_fn=fake_spawn, binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    outcome = executor.execute(session, {"description": "events?", "working_dir": str(tmp_path)})
+
+    assert notifications == []  # no intermediate flooding
+    assert outcome.final_text == "Final answer: 3 events."
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "config_body, expect_warning",
+    [
+        ("", True),  # no config at all
+        ("model = \"gpt-5.5\"\n", True),  # config but no MCP servers
+        ('[mcp_servers.other]\ncommand = "x"\n', True),  # a different MCP server only
+        ('[mcp_servers.lifeos]\ncommand = "py"\n', False),  # lifeos configured
+    ],
+)
+def test_warn_if_mcp_missing_keys_on_lifeos(
+    stores, tmp_path, monkeypatch, caplog, config_body, expect_warning
+):
+    """The dispatch warning fires unless the *lifeos* MCP server specifically
+    is configured — an unrelated server leaves LifeOS just as unreachable."""
+    import logging
+
+    sess_store, tr_store = stores
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(config_body)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        binary_resolver=lambda: "/usr/bin/true", heartbeat_interval=9999,
+    )
+    with caplog.at_level(logging.WARNING):
+        executor._warn_if_mcp_missing()
+
+    warned = any("no [mcp_servers.lifeos]" in r.getMessage() for r in caplog.records)
+    assert warned is expect_warning
+    # Gated to once per process — a second call never re-warns.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        executor._warn_if_mcp_missing()
+    assert not any("mcp_servers.lifeos" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.unit

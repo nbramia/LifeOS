@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
@@ -110,7 +111,6 @@ class _RunState:
     cost_cap_exceeded: bool = False
     tool_call_count: int = 0
     last_activity: str = ""
-    notifications_sent: int = 0
     last_usage: dict = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     last_notify_at: float = field(default_factory=time.time)
@@ -151,6 +151,7 @@ class CodexExecutor:
         # to need a different budget.
         self._timeout = timeout_seconds if timeout_seconds is not None else settings.claude_timeout_seconds
         self._heartbeat_interval = heartbeat_interval
+        self._mcp_warned = False  # gate the missing-MCP warning to once per process
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,9 +165,18 @@ class CodexExecutor:
             return ExecutorOutcome(status=STATUS_FAILED, reason="empty prompt")
 
         working_dir = task.get("working_dir") or os.getcwd()
+        # Warn (once per process) if Codex can't reach the lifeos MCP server —
+        # without it the agent is context-blind to personal data. See
+        # docs/guides/agent-worker-setup.md § Codex for the config block.
+        self._warn_if_mcp_missing()
+        # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
+        # the same situational awareness as the managed/local routes. Only on
+        # the opening turn — resume() reloads the thread, which already carries
+        # the preamble from this first prompt.
+        full_prompt = f"{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._run(
             session=session,
-            prompt=prompt,
+            prompt=full_prompt,
             working_dir=working_dir,
             resume_session_id=None,
         )
@@ -217,6 +227,36 @@ class CodexExecutor:
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
+
+    def _warn_if_mcp_missing(self) -> None:
+        """Best-effort check that Codex has the lifeos MCP server configured.
+
+        Codex reaches LifeOS data only through an ``[mcp_servers.lifeos]`` block
+        in ``~/.codex/config.toml`` (or ``$CODEX_HOME/config.toml``). Unlike
+        Claude Code — which inherits the ``lifeos`` server from ``~/.claude.json``
+        — a fresh Codex install has none, leaving the agent context-blind. We
+        check for the lifeos server specifically (not just any MCP block), since
+        an unrelated server would leave LifeOS just as unreachable. We can't fix
+        per-machine config from the repo, so we surface it loudly in logs once
+        per process. Never raises: a config we can't read is not fatal.
+        """
+        if self._mcp_warned:
+            return
+        self._mcp_warned = True
+        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        config_path = os.path.join(codex_home, "config.toml")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                contents = f.read()
+        except OSError:
+            contents = ""
+        if "[mcp_servers.lifeos]" not in contents:
+            logger.warning(
+                "Codex has no [mcp_servers.lifeos] in %s — the agent cannot reach "
+                "lifeos_* tools and will be blind to personal data. See "
+                "docs/guides/agent-worker-setup.md § Codex MCP setup.",
+                config_path,
+            )
 
     @staticmethod
     def _clean_env() -> dict:
@@ -403,13 +443,16 @@ class CodexExecutor:
             if itype == "agent_message":
                 text = (item.get("text") or "").strip()
                 if text:
+                    # Record the message as the running final_text and surface
+                    # a short preview in the heartbeat, but do NOT stream it to
+                    # Telegram. Codex emits a narration message before most tool
+                    # calls; forwarding each one floods the chat. The worker
+                    # sends the final agent message exactly once on completion
+                    # (and registers it as the reply-thread anchor), so the
+                    # operator sees meaningful progress (heartbeats) + the
+                    # result, mirroring Claude's [NOTIFY] selectivity.
                     state.final_text = text
-                    state.notifications_sent += 1
-                    state.last_notify_at = time.time()
-                    try:
-                        self._notify(text)
-                    except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("notification callback raised: %s", exc)
+                    state.last_activity = text[:40]
                     self.transcript_store.append(sid, "codex_assistant_text", {
                         "text": text, "chars": len(text),
                     })
