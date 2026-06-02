@@ -121,15 +121,88 @@ def should_escalate(conversation_history, question: str) -> bool:
     return bool(_PUSHBACK_PATTERNS.search(question or ""))
 
 
+# User-directed escalation (#305). Tier words the operator can name in a chat
+# message map to concrete Anthropic model ids. Update the opus id here if the
+# account is pinned to a different opus release.
+_MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-8",
+}
+# A directive verb immediately followed by a tier word: "escalate to opus",
+# "use sonnet", "with claude opus", "switch to haiku", "retry on opus".
+_DIRECTIVE_MODEL_RE = re.compile(
+    r"(?i)\b(?:escalate(?:\s+to)?|use|using|with|switch\s+to|retry\s+(?:with|on)|try\s+(?:with|on))\s+"
+    r"(?:claude\s+)?(opus|sonnet|haiku)\b"
+)
+# A generic "use a stronger model" directive with no tier named → fall back to
+# the configured escalation model. Requires an explicit model reference so a
+# bare "escalate this ticket to the team" doesn't trigger a model swap.
+_DIRECTIVE_SMARTER_RE = re.compile(
+    r"(?i)("
+    r"(?:use|using|try|switch\s+to|escalate\s+to)\s+(?:a\s+)?"
+    r"(?:smarter|stronger|better|bigger|more\s+capable)\s+(?:model|llm)"
+    r"|escalate\s+the\s+(?:model|response|answer)"
+    r")"
+)
+# A directive negated or posed as a meta-question is NOT a request to switch.
+# Negation anywhere in the run-up to the directive ("don't … use opus",
+# "I didn't ask you to use opus") cancels it; question framing about a model
+# ("why did you use sonnet?", "can you use opus?") is likewise not a directive.
+# Only true negations — NOT "instead of"/"rather than", which contrast options
+# and leave the *named* model as the desired one ("instead of haiku, use opus").
+_NEGATION_BEFORE_RE = re.compile(
+    r"(?i)\b(don'?t|do not|didn'?t|did not|never|no need to|without)\b"
+)
+_META_QUESTION_RE = re.compile(
+    r"(?i)\b(why|can|could|should|would|do|did|are)\s+(?:you|i|we|they)?\s*"
+    r"(?:use|using|used|switch(?:ing)?|escalate)\b"
+)
+# Engines that aren't an inline model swap (handoff is deferred — #305 part b).
+# Naming one must NOT silently fall through to the generic-model escalation.
+_UNSUPPORTED_ENGINE_RE = re.compile(r"(?i)\b(codex|claude\s*code|gpt|gemini)\b")
+
+
+def _parse_escalation_directive(question: str, escalation_model: str) -> str:
+    """Return the model id the user explicitly asked for, or ''.
+
+    A named tier ("use opus") resolves to that model even when auto-escalation
+    is unconfigured — explicit intent. A generic "use a smarter model" falls
+    back to ``escalation_model`` (which may be ''). Negated/meta-question
+    framing and unsupported-engine names ("escalate to codex") return ''.
+    """
+    q = question or ""
+    # Don't escalate to a model when the user named an engine we can't hand off
+    # to yet, or framed the model mention as a question.
+    if _UNSUPPORTED_ENGINE_RE.search(q) or _META_QUESTION_RE.search(q):
+        return ""
+    m = _DIRECTIVE_MODEL_RE.search(q)
+    if m:
+        # A negation before the matched directive cancels it.
+        if _NEGATION_BEFORE_RE.search(q[:m.start()]):
+            return ""
+        return _MODEL_ALIASES.get(m.group(1).lower(), "")
+    if _DIRECTIVE_SMARTER_RE.search(q):
+        return escalation_model
+    return ""
+
+
 def resolve_orchestrator_model(
     conversation_history, question: str, base_model: str, escalation_model: str
 ) -> tuple[str, bool]:
     """Pick the model for this turn. Returns (model, escalated).
 
-    Escalates to ``escalation_model`` only when it's configured, differs from
-    ``base_model``, and the refuse→pushback pattern is present. Otherwise returns
-    ``base_model`` unchanged.
+    Precedence:
+      1. An explicit user directive ("escalate to opus", "use sonnet", or a
+         generic "use a smarter model") — honored regardless of the heuristic,
+         since the intent is unambiguous. A named tier works even when
+         ``escalation_model`` is unset.
+      2. The auto-heuristic: refuse→pushback retries on ``escalation_model``.
+    Otherwise returns ``base_model`` unchanged.
     """
+    directed = _parse_escalation_directive(question, escalation_model)
+    if directed and directed != base_model:
+        return directed, True
     if escalation_model and escalation_model != base_model and should_escalate(conversation_history, question):
         return escalation_model, True
     return base_model, False
