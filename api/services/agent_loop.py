@@ -24,6 +24,7 @@ from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage
 from api.services.resilience import is_retryable_api_error
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,91 @@ def _looks_like_giving_up(text: str) -> bool:
     return bool(_GIVE_UP_PATTERNS.search(text))
 
 
+# Cross-turn escalation (#303). A weak orchestrator sometimes declares something
+# impossible / unavailable / "not released" from stale training and won't budge.
+# When the PRIOR assistant turn refused like that AND the user's NEW message pushes
+# back, we retry the turn on a stronger model rather than re-refusing.
+# Scoped to the *stale-knowledge / world-fact* refusal class — claims that
+# something about the current world isn't released/announced/scheduled/known.
+# A stronger model + web search fixes these. Deliberately NOT matching generic
+# data-lookup negatives ("I can't find any emails from Sarah", "no such
+# contact", "that file doesn't exist") — those are usually correct, and a
+# pricier model can't find data that isn't there. The give-up patterns
+# (knowledge-cutoff / can't-access-live) are also treated as refusals (see
+# should_escalate).
+_REFUSAL_PATTERNS = re.compile(
+    r"(?i)("
+    r"(hasn'?t|has not|haven'?t|have not)\s+(yet\s+)?(been\s+)?"
+    r"(released|announced|published|scheduled|finalized|determined|set|made public|come out)"
+    r"|not\s+(yet\s+)?(been\s+)?(released|announced|published|scheduled|finalized|determined|available|out)"
+    r"|isn'?t\s+(yet\s+)?(available|out|released|published|finalized)"
+    r"|aren'?t\s+(yet\s+)?(available|released|published)"
+    r")"
+)
+_PUSHBACK_PATTERNS = re.compile(
+    r"(?i)("
+    r"do (the )?research|do more research"
+    r"|you'?re wrong|that'?s wrong|that'?s (not|in)correct|that'?s not (true|right)"
+    r"|look it up|search (for it|again|the web|online)|try again|check again"
+    r"|it should be possible|it is possible|yes it (has|is|did|does)"
+    r"|i'?m telling you|i know (it|they|you|for a fact)"
+    r"|that'?s not true|actually,? (it|that|they|the)"
+    r"|they have been|it has been (released|announced|published)"
+    r")"
+)
+
+
+def _last_assistant_text(conversation_history) -> str:
+    """Return the most recent assistant message's text, or '' if none."""
+    for msg in reversed(conversation_history or []):
+        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+        if role == "assistant":
+            content = getattr(msg, "content", None)
+            if content is None and isinstance(msg, dict):
+                content = msg.get("content")
+            return content or ""
+    return ""
+
+
+def should_escalate(conversation_history, question: str) -> bool:
+    """True when the prior assistant turn refused/claimed-impossible AND the
+    current user message pushes back — the signal to retry on a stronger model."""
+    prior = _last_assistant_text(conversation_history)
+    if not prior:
+        return False
+    # Refusal = a stale-knowledge world-fact negative OR a give-up phrase
+    # (knowledge cutoff / "can't access live data") — both are fixable by a
+    # stronger model + web search.
+    refused = _REFUSAL_PATTERNS.search(prior) or _GIVE_UP_PATTERNS.search(prior)
+    if not refused:
+        return False
+    return bool(_PUSHBACK_PATTERNS.search(question or ""))
+
+
+def resolve_orchestrator_model(
+    conversation_history, question: str, base_model: str, escalation_model: str
+) -> tuple[str, bool]:
+    """Pick the model for this turn. Returns (model, escalated).
+
+    Escalates to ``escalation_model`` only when it's configured, differs from
+    ``base_model``, and the refuse→pushback pattern is present. Otherwise returns
+    ``base_model`` unchanged.
+    """
+    if escalation_model and escalation_model != base_model and should_escalate(conversation_history, question):
+        return escalation_model, True
+    return base_model, False
+
+
+def _select_client(model: str = ""):
+    """Pick the LLM client for a turn. With a per-turn `model` on the Anthropic
+    backend (escalation, #303), build a dedicated client for that model;
+    otherwise use the shared singleton. The local backend ignores `model`."""
+    if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
+        from api.services.llm_client import AnthropicLLMClient
+        return AnthropicLLMClient(model=model)
+    return get_local_llm()
+
+
 @dataclass
 class AgentResult:
     """Result of an agentic chat loop run."""
@@ -78,6 +164,7 @@ async def run_agent_loop(
     attachments: list[dict] | None = None,
     model_tier: str = "sonnet",
     max_tool_rounds: int = 5,
+    model: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -90,11 +177,15 @@ async def run_agent_loop(
         attachments: Optional file attachments (list of dicts with filename, media_type, data).
         model_tier: "haiku", "sonnet", or "opus" (ignored for local model, kept for API compat).
         max_tool_rounds: Max number of tool-use rounds before forcing a text response.
+        model: Optional Anthropic model id override for this turn (escalation, #303).
+            When set on the Anthropic backend, the turn runs on a dedicated
+            AnthropicLLMClient with this model instead of the default singleton.
+            Ignored on the local backend.
 
     Yields:
         Dicts with "type" key: "text", "status", or "result".
     """
-    client = get_local_llm()
+    client = _select_client(model)
     system_prompt = build_system_prompt()
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
