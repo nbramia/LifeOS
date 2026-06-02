@@ -20,7 +20,9 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -141,6 +143,22 @@ BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 AGENT_PICKUP_STATUSES = ("todo", "urgent")
 
 
+class _SynchronousPool:
+    """A ``submit()``-compatible pool that runs work inline.
+
+    The default CLI dispatch pool is a real ``ThreadPoolExecutor``; tests inject
+    this instead so spawned-child dispatch stays deterministic (the work runs
+    before ``submit`` returns, so assertions don't race a background thread).
+    """
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+        return None
+
+    def shutdown(self, wait: bool = True) -> None:  # noqa: D401 - parity with executor API
+        pass
+
+
 class Worker:
     """Single-process poll loop. One instance per process."""
 
@@ -159,6 +177,7 @@ class Worker:
         managed_executor=None,    # injectable ManagedExecutor for tests
         claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
         codex_executor=None,        # injectable CodexExecutor for tests
+        cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -188,6 +207,18 @@ class Worker:
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
         self._claude_code_executor = claude_code_executor  # lazily instantiated on first /claude task
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
+        # Spawned CLI children (claude_code/codex) are long-running subprocesses.
+        # Running them off the tick keeps the poll loop free to claim new tasks
+        # and dispatch siblings. Bounded so concurrent subprocesses stay capped;
+        # tests inject a _SynchronousPool for deterministic dispatch. `_cli_inflight`
+        # guards against the next tick re-dispatching a child that's been submitted
+        # but hasn't yet flipped CLAIMED→RUNNING.
+        self._cli_pool = cli_pool or ThreadPoolExecutor(
+            max_workers=max(2, 2 * settings.agent_max_concurrent_managed),
+            thread_name_prefix="cli-dispatch",
+        )
+        self._cli_inflight: set[str] = set()
+        self._cli_lock = threading.Lock()
         self._warn_deprecated_settings()
 
     @staticmethod
@@ -223,6 +254,9 @@ class Worker:
     def stop(self) -> None:
         """Mark the loop for graceful shutdown. Safe to call from a signal."""
         self._stop = True
+        # Don't block shutdown on in-flight CLI children; any left RUNNING are
+        # reconciled by resume_pending() on the next start (SIGKILL-safe path).
+        self._cli_pool.shutdown(wait=False)
 
     def run(self) -> None:
         """Main loop. Runs until `stop()` is called or the process is killed."""
@@ -417,9 +451,10 @@ class Worker:
         """Pick up sessions created via lifeos_agent_spawn that have no #agent
         task backing — they show up with status=claimed and an explicit routing.
 
-        Synchronous in this MVP: a long-running local child blocks the tick
-        loop. Acceptable while local concurrency cap = 1; a future PR could
-        move to a worker pool.
+        CLI children (claude_code/codex) are long-running subprocesses, so they
+        run on the bounded `_cli_pool` rather than blocking the tick (#299). The
+        `local` route stays inline — it's in-process, GPU-bound, and capped at
+        one concurrent session, so a pool wouldn't buy real parallelism.
         """
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
@@ -462,10 +497,39 @@ class Worker:
                 # On RUNNING, let _poll_managed_sessions handle the rest.
             elif session.routing == "claude_code":
                 # /claude sessions — operator-spawned via claude_code_spawn.spawn_claude_code_session.
-                self._dispatch_claude_code_session(session, pending)
+                self._submit_cli_dispatch(session, pending, self._dispatch_claude_code_session)
             elif session.routing == "codex":
                 # /codex sessions — operator-spawned via codex_spawn.spawn_codex_session.
-                self._dispatch_codex_session(session, pending)
+                self._submit_cli_dispatch(session, pending, self._dispatch_codex_session)
+
+    def _submit_cli_dispatch(self, session, pending, dispatch_fn) -> None:
+        """Run a CLI child's dispatch on the pool instead of inline.
+
+        Guards with `_cli_inflight` so a re-scan on the next tick doesn't submit
+        the same session twice in the window between submission and the
+        executor flipping the row CLAIMED→RUNNING. The session_id is cleared
+        when the dispatch finishes (success or failure).
+        """
+        sid = session.session_id
+        with self._cli_lock:
+            if sid in self._cli_inflight:
+                return
+            self._cli_inflight.add(sid)
+
+        def _run() -> None:
+            try:
+                dispatch_fn(session, pending)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.exception("async CLI dispatch crashed for %s: %s", session.task_id, exc)
+                try:
+                    self.session_store.update_status(session.task_id, STATUS_FAILED)
+                except Exception:
+                    logger.exception("failed to mark %s failed after dispatch crash", session.task_id)
+            finally:
+                with self._cli_lock:
+                    self._cli_inflight.discard(sid)
+
+        self._cli_pool.submit(_run)
 
     def _poll_managed_sessions(self) -> None:
         """Advance all in-flight Managed Agents sessions one polling step."""

@@ -18,7 +18,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
-from api.services.agent_worker.worker import Worker
+from api.services.agent_worker.worker import Worker, _SynchronousPool
 
 
 pytestmark = pytest.mark.unit
@@ -51,6 +51,7 @@ def _make_worker(tmp_path: Path, claude_code_executor):
         telegram_send_with_id=lambda text: [1],
         http_client=client,
         claude_code_executor=claude_code_executor,
+        cli_pool=_SynchronousPool(),
     )
 
 
@@ -88,6 +89,7 @@ def _recording_worker(tmp_path: Path, claude_code_executor):
         telegram_send_with_id=lambda text: [1],
         http_client=client,
         claude_code_executor=claude_code_executor,
+        cli_pool=_SynchronousPool(),
     )
     return worker, calls
 

@@ -31,7 +31,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
-from api.services.agent_worker.worker import Worker
+from api.services.agent_worker.worker import Worker, _SynchronousPool
 
 
 pytestmark = pytest.mark.unit
@@ -78,6 +78,7 @@ def _make_worker(tmp_path: Path, claude_code_executor, monkeypatch=None):
         telegram_send_with_id=_send_with_id,
         http_client=client,
         claude_code_executor=claude_code_executor,
+        cli_pool=_SynchronousPool(),
     )
     w._sent = sent  # type: ignore[attr-defined]
     w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
