@@ -139,10 +139,10 @@ def _with_caller(props: dict, required: list[str]) -> dict:
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lifeos_agent_spawn",
-        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` or `codex` to delegate work that needs a capability your own engine lacks — e.g. spawn `claude_code` for browser/GUI automation, or `codex` for its native computer use.",
+        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here).",
         "input_schema": _with_caller({
             "prompt": {"type": "string", "description": "Task description for the child agent"},
-            "model": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"], "description": "Which executor to run the child on. claude=Managed Agents (cloud API), local=Gemma, claude_code=Claude Code CLI (has --chrome browser), codex=Codex CLI (native computer use)."},
+            "model": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"], "description": "Which executor to run the child on. claude=Managed Agents (cloud API), local=Gemma, claude_code=Claude Code CLI (has a working --chrome browser), codex=Codex CLI (code/general tasks; no browser in headless mode)."},
             "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
             "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
             "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
