@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Stub — expanded by later issues in the agent-worker series (#98)
-> **Last Updated:** 2026-05-26
+> **Last Updated:** 2026-06-01
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude Opus (Anthropic Managed Agents) or a local Gemma model. This guide covers **prerequisites only** — the worker itself ships in later issues.
@@ -381,6 +381,44 @@ The Haiku preflight sanity-check is the only guard against destructive-shaped ta
 
 ---
 
+## Codex MCP setup (`#codex` path)
+
+`#agent #codex` tasks (and `/codex`) run the Codex CLI through `CodexExecutor`.
+Unlike Claude Code — which inherits the `lifeos` MCP server from
+`~/.claude.json` automatically — Codex only reaches LifeOS data through an
+`[mcp_servers.*]` block in its own config. A fresh Codex install has none, so
+the agent is **context-blind to personal data**: it can edit files and run
+shell commands, but `lifeos_search`, `lifeos_ask`, `lifeos_calendar_search`,
+etc. don't exist for it.
+
+The worker prepends the same capabilities briefing it gives the managed/local
+routes, so Codex *knows* these tools should exist — but the tools only work
+once the MCP server is wired. Add this to `~/.codex/config.toml` (or
+`$CODEX_HOME/config.toml`):
+
+```toml
+[mcp_servers.lifeos]
+command = "<repo>/.venvs/lifeos/bin/python"   # your lifeos venv python
+args = ["<repo>/LifeOS/mcp_server.py"]         # absolute path to mcp_server.py
+```
+
+`mcp_server.py` already serves stdio for CLI agents (the same entry point
+Claude Code uses), so no extra process or port is involved — Codex spawns it
+on demand.
+
+**Verify** the server is registered:
+
+```bash
+codex mcp list                          # lifeos should appear in the list
+# or, if your codex build has no `mcp` subcommand:
+grep -A2 'mcp_servers.lifeos' ~/.codex/config.toml
+```
+
+If the block is missing, the agent worker logs a one-time warning on the first
+`#codex` dispatch (`Codex has no [mcp_servers.*] …`) so a misconfigured machine
+surfaces in `logs/lifeos-api-error.log` rather than silently producing
+context-blind runs.
+
 ## Cost-aware iteration
 
 Iterating on cloud `#agent` prompts has a hidden tax: every fresh managed
@@ -422,6 +460,7 @@ suggestions to keep iteration cheap:
 | `llama-server` starts but `/v1/models` returns `503 Loading model` or `404`, log shows "sha256 mismatch" + "HEAD failed, status: 404" | Upstream HF model was updated; local cache fails llama.cpp's integrity check and the redownload 404s, leaving the server in router mode with no model loaded | Point at the local GGUF directly: set `LIFEOS_LLM_MODEL_PATH=/absolute/path/to/cached.gguf` (and `LIFEOS_LLM_MMPROJ_PATH` for vision models) in `.env`, then re-run `sudo ./scripts/setup-systemd.sh` |
 | Agent worker logs "daily spend cap reached" | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` is 0 or already exceeded today | Raise the cap or wait until local midnight |
 | Worker doesn't pick up a `#agent` task | Task isn't `status=todo`, or worker isn't enabled | `systemctl status lifeos-agent-worker`; `curl 'http://localhost:8000/api/tasks?status=todo&tag=agent'` |
+| `#codex` agent can't find personal data / doesn't call `lifeos_*` tools | No `[mcp_servers.lifeos]` in `~/.codex/config.toml` | Add the block (see [Codex MCP setup](#codex-mcp-setup-codex-path)); confirm with `codex mcp list` |
 | Managed Agents session stuck running | Worker can't reach the API, or the remote session is genuinely long | Find the `managed_agent_session_id` in `data/agent_sessions.db` (`SELECT task_id, session_id, managed_agent_session_id FROM sessions WHERE status='running'`). Cancel via the Anthropic console, or `curl -X DELETE -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: managed-agents-2026-04-01" https://api.anthropic.com/v1/sessions/<remote_id>`. The worker's next poll sees a 404 (mapped to `cancelled`) and finalizes. |
 
 ---

@@ -1,6 +1,6 @@
 # Agent Worker
 
-External long-running worker that picks up `#agent`-tagged tasks, executes them via Claude (Managed Agents), local Gemma (llama-server), or the Claude Code CLI, and notifies via Telegram. Lives outside the FastAPI process — talks to LifeOS over HTTP via `/api/tasks`.
+External long-running worker that picks up `#agent`-tagged tasks, executes them via Claude (Managed Agents), local Gemma (llama-server), the Claude Code CLI, or the Codex CLI, and notifies via Telegram. Lives outside the FastAPI process — talks to LifeOS over HTTP via `/api/tasks`.
 
 ## Files in this package
 
@@ -17,11 +17,13 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 | `managed_driver.py` | HTTP client for the Managed Agents API |
 | `claude_code_executor.py` | Claude Code CLI driver (subprocess spawn, stream-json parse, `[NOTIFY]`/`[CLARIFY]` extraction) for `routing='claude_code'` sessions |
 | `claude_code_spawn.py` | Helper that creates a parentless `routing='claude_code'`, `origin='operator'` session row for a fresh `/claude` task |
+| `codex_executor.py` | Codex CLI driver (subprocess spawn, `--json` stream parse, `-o` final-message capture) for `routing='codex'` sessions. Prepends `CAPABILITIES_PREAMBLE` on the opening turn; suppresses intermediate-message streaming so only heartbeats + the final result reach Telegram |
+| `codex_spawn.py` | Helper that creates a parentless `routing='codex'`, `origin='operator'` session row for a fresh `/codex` task |
 | `operator_spawn.py` | Same pattern for non-code operator-initiated agent spawns from Telegram or `/chat` |
 | `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage |
 | `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication |
 | `pricing.py` | Per-model token rates + session-hour overhead for cost accounting |
-| `capabilities_preamble.py` | Static `<lifeos>` capabilities block prepended to every managed-session user turn |
+| `capabilities_preamble.py` | Static LifeOS capabilities briefing prepended to the opening user turn on the managed, local, and `codex` routes (Claude Code gets the equivalent via `--append-system-prompt`) |
 
 ## Routing destinations
 
@@ -70,7 +72,7 @@ A Telegram reply to a session's completion message — or a reply from the web `
 2. The reply hook deposits the answer (Telegram listener) or enqueues it directly (`/chat` reply endpoint).
 3. `_process_clarification_answers` picks up the answered row; `_resume_as_followup` dispatches to the executor branch for the session's routing.
 
-For `routing='claude_code'` sessions specifically, `_resume_as_followup` queues the reply as a `pending_message` and flips status back to `CLAIMED`, so the next tick's `_dispatch_claude_code_session` calls `CodeExecutor.resume(message)` with the persisted CLI session UUID — resume survives worker restarts and arbitrary time gaps.
+For `routing='claude_code'` sessions specifically, `_resume_as_followup` queues the reply as a `pending_message` and flips status back to `CLAIMED`, so the next tick's `_dispatch_claude_code_session` calls `CodeExecutor.resume(message)` with the persisted CLI session UUID — resume survives worker restarts and arbitrary time gaps. `routing='codex'` works the same way via `_dispatch_codex_session` → `CodexExecutor.resume()`. The anchor is registered only on the **final** completion message; because `CodexExecutor` no longer streams intermediate narration to Telegram, the operator's reply lands on that registered message rather than an un-anchored mid-run chunk.
 
 ## Open-source guardrails
 
