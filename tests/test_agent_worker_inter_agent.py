@@ -101,6 +101,42 @@ def test_spawn_rejects_invalid_model(ctx):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("model", ["claude_code", "codex"])
+def test_spawn_cli_child_for_capability_fallback(ctx, store, parent, model):
+    """An agent can delegate to a CLI engine (claude_code/codex) — the child is
+    created with that routing so the worker's spawned-dispatcher runs it."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "open the dashboard and screenshot it", "model": model,
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.routing == model
+    assert child.parent_session_id == parent.session_id
+    assert child.status == STATUS_CLAIMED
+    # Plain-string prompt — the codex/claude_code payload parsers fall back to
+    # treating it as the prompt, so no JSON wrapping is required.
+    pending = store.drain_pending_messages(child.session_id)
+    assert pending[0]["content"] == "open the dashboard and screenshot it"
+
+
+@pytest.mark.unit
+def test_spawn_cli_child_skips_dollar_ceiling(store, transcript):
+    """CLI routes are subscription-billed, so a CLI child spawns even when the
+    parent has no remaining per-token dollar budget."""
+    broke_parent = store.create(
+        task_id="broke", status=STATUS_RUNNING, routing="codex",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 0.0},
+        expected_output="text",
+    )
+    ctx = InterAgentContext(
+        session_store=store, transcript_store=transcript,
+        caller_session_id=broke_parent.session_id, caps=Caps(),
+    )
+    result = dispatch(ctx, "lifeos_agent_spawn", {"prompt": "x", "model": "claude_code"})
+    assert result["ok"]  # would be budget_exceeded for a managed child
+
+
+@pytest.mark.unit
 def test_spawn_rejects_at_depth_cap(store, transcript, parent):
     # Build a chain parent → grandchild already at depth 3 — next spawn from
     # grandchild would exceed depth cap.

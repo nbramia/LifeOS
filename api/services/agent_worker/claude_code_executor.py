@@ -114,6 +114,14 @@ NOTIFICATIONS — use [NOTIFY] for:
 - Progress updates on significant milestones
 - Errors that block progress after you've tried to resolve them
 - Plans before large changes
+
+DELEGATION:
+- Your LifeOS agent session id is {session_id}.
+- If a task needs a capability you lack, delegate it to another engine with
+  the `lifeos_agent_spawn` MCP tool (pass caller_session_id={session_id}).
+  Use model="codex" for tasks that suit Codex's native computer use, or
+  model="local"/"claude" for background research. Monitor the child with
+  `lifeos_agent_check` and read its result with `lifeos_agent_transcript_read`.
 """
 
 
@@ -276,7 +284,7 @@ class ClaudeCodeExecutor:
     # Internal lifecycle
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str, resume_session_id: Optional[str]) -> list[str]:
+    def _build_command(self, prompt: str, resume_session_id: Optional[str], session_id: str = "") -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
             if platform.system() == "Linux"
@@ -296,6 +304,7 @@ class ClaudeCodeExecutor:
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
+                session_id=session_id,
             ),
         ]
         if resume_session_id:
@@ -319,8 +328,8 @@ class ClaudeCodeExecutor:
         resume_session_id: Optional[str],
         plan_mode: bool,
     ) -> ExecutorOutcome:
-        cmd = self._build_command(prompt, resume_session_id)
         sid = session.session_id
+        cmd = self._build_command(prompt, resume_session_id, session_id=sid)
 
         self.transcript_store.append(sid, "claude_code_spawn", {
             "resume": bool(resume_session_id),

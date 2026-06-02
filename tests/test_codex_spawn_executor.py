@@ -197,6 +197,40 @@ def test_executor_prepends_capabilities_preamble(stores, monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_executor_injects_delegation_header_with_session_id(stores, tmp_path):
+    """The opening Codex turn tells the agent its session id and how to
+    delegate work it can't do (e.g. browser) to a claude_code child."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_del", session_id="sess_del", status="claimed", routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text", origin="operator",
+    )
+
+    captured: dict = {}
+
+    def fake_spawn(cmd, **kwargs):
+        captured["cmd"] = cmd
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("ok\n")
+        return _FakeProc([{"type": "session.completed"}], returncode=0)
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=fake_spawn, binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    executor.execute(session, {"description": "do a thing", "working_dir": str(tmp_path)})
+
+    prompt_arg = captured["cmd"][-1]
+    assert "sess_del" in prompt_arg
+    assert "lifeos_agent_spawn" in prompt_arg
+    assert 'model="claude_code"' in prompt_arg
+
+
+@pytest.mark.unit
 def test_resume_does_not_prepend_preamble(stores, tmp_path):
     """Resume reloads the Codex thread (which already holds the preamble from
     the opening turn), so the follow-up message must NOT re-inject it."""

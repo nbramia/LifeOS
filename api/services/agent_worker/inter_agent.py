@@ -47,6 +47,15 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 logger = logging.getLogger(__name__)
 
 
+# Engines an in-flight agent may spawn a child on. `claude`/`local` are the
+# in-process routes (Managed Agents API / Gemma); `claude_code`/`codex` are the
+# CLI routes, used for capability fallback (browser/GUI, native computer use).
+# CLI routes are subscription-billed, so they skip the per-token dollar ceiling
+# and reuse the managed concurrency cap.
+CLI_ROUTINGS = ("claude_code", "codex")
+SPAWN_MODELS = ("claude", "local", *CLI_ROUTINGS)
+
+
 # Caps enforced on spawn. Operator overrides via settings (see `Caps` dataclass).
 DEFAULT_MAX_SPAWN_DEPTH = 3
 DEFAULT_MAX_DESCENDANTS_PER_ROOT = 50
@@ -130,10 +139,10 @@ def _with_caller(props: dict, required: list[str]) -> dict:
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lifeos_agent_spawn",
-        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget.",
+        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` or `codex` to delegate work that needs a capability your own engine lacks — e.g. spawn `claude_code` for browser/GUI automation, or `codex` for its native computer use.",
         "input_schema": _with_caller({
             "prompt": {"type": "string", "description": "Task description for the child agent"},
-            "model": {"type": "string", "enum": ["claude", "local"], "description": "Which executor to run the child on"},
+            "model": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"], "description": "Which executor to run the child on. claude=Managed Agents (cloud API), local=Gemma, claude_code=Claude Code CLI (has --chrome browser), codex=Codex CLI (native computer use)."},
             "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
             "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
             "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
@@ -184,7 +193,7 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": "List recent agent sessions, optionally filtered by status / routing / parent.",
         "input_schema": _with_caller({
             "status": {"type": "string"},
-            "routing": {"type": "string", "enum": ["claude", "local"]},
+            "routing": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"]},
             "parent_session_id": {"type": "string"},
             "limit": {"type": "integer"},
         }, required=[]),
@@ -211,8 +220,11 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
     if not prompt:
         return _err("prompt is required", code="invalid_arg")
     model = args.get("model")
-    if model not in ("claude", "local"):
-        return _err("model must be 'claude' or 'local'", code="invalid_arg")
+    if model not in SPAWN_MODELS:
+        return _err(
+            "model must be one of 'claude', 'local', 'claude_code', 'codex'",
+            code="invalid_arg",
+        )
 
     caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
     if caller is None:
@@ -249,23 +261,30 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
                 code="cap_concurrency_local",
             )
     else:
-        active = ctx.session_store.count_active_by_routing("claude") - caller_excluded
+        # claude (managed) and the CLI routes (claude_code/codex) share the
+        # managed concurrency cap, counted per their own routing.
+        active = ctx.session_store.count_active_by_routing(model) - caller_excluded
         if active >= ctx.caps.max_concurrent_managed:
             return _err(
-                f"{active} managed sessions already running (cap {ctx.caps.max_concurrent_managed})",
+                f"{active} {model} sessions already running (cap {ctx.caps.max_concurrent_managed})",
                 code="cap_concurrency_managed",
             )
 
-    # Budget: child's max_dollars cannot exceed parent's remaining.
+    # Budget: child's max_dollars cannot exceed parent's remaining. CLI routes
+    # are subscription-billed (no per-token draw), so they skip the ceiling —
+    # mirrors the worker's cost-gate skip for claude_code/codex.
     parent_budget = caller.budget or {}
     spent = caller.total_dollars or 0.0
     parent_remaining = (parent_budget.get("max_dollars", 0.0) or 0.0) - spent
-    requested_dollars = float(args.get("max_dollars") or parent_remaining)
-    if requested_dollars > parent_remaining + 1e-6:
-        return _err(
-            f"requested ${requested_dollars:.2f} exceeds parent remaining ${parent_remaining:.2f}",
-            code="budget_exceeded",
-        )
+    if model in CLI_ROUTINGS:
+        requested_dollars = max(0.0, float(args.get("max_dollars") or parent_remaining or 0.0))
+    else:
+        requested_dollars = float(args.get("max_dollars") or parent_remaining)
+        if requested_dollars > parent_remaining + 1e-6:
+            return _err(
+                f"requested ${requested_dollars:.2f} exceeds parent remaining ${parent_remaining:.2f}",
+                code="budget_exceeded",
+            )
 
     child_budget = {
         "wall_seconds": int(args.get("wall_seconds") or parent_budget.get("wall_seconds", 14400)),

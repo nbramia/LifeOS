@@ -88,6 +88,20 @@ def _resolve_codex_binary() -> str:
     return configured  # caller surfaces FileNotFoundError on spawn
 
 
+def _delegation_header(session_id: str) -> str:
+    """Per-session preamble line telling Codex its LifeOS session id and how to
+    hand off work it can't do (e.g. browser automation) to another engine."""
+    return (
+        f"=== YOUR SESSION ===\n"
+        f"Your LifeOS agent session id is {session_id}. If a task needs a "
+        f"capability you lack — e.g. browser/GUI automation you can't perform "
+        f"headlessly — delegate it with the `lifeos_agent_spawn` MCP tool "
+        f"(caller_session_id={session_id}, model=\"claude_code\" for the "
+        f"browser-enabled Claude Code CLI). Monitor with `lifeos_agent_check` "
+        f"and read the result with `lifeos_agent_transcript_read`."
+    )
+
+
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_COST_CAP_EXCEEDED = "cost_cap_exceeded"
 REASON_TIMEOUT = "timeout"
@@ -170,10 +184,13 @@ class CodexExecutor:
         # docs/guides/agent-worker-setup.md § Codex for the config block.
         self._warn_if_mcp_missing()
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
-        # the same situational awareness as the managed/local routes. Only on
-        # the opening turn — resume() reloads the thread, which already carries
-        # the preamble from this first prompt.
-        full_prompt = f"{CAPABILITIES_PREAMBLE}\n{prompt}"
+        # the same situational awareness as the managed/local routes, plus a
+        # per-session delegation header so the agent can hand off work it can't
+        # do (e.g. browser automation → a claude_code child). Only on the
+        # opening turn — resume() reloads the thread, which already carries
+        # this from the first prompt.
+        delegation = _delegation_header(session.session_id)
+        full_prompt = f"{delegation}\n{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._run(
             session=session,
             prompt=full_prompt,

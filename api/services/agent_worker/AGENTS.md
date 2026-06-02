@@ -20,7 +20,8 @@ External long-running worker that picks up `#agent`-tagged tasks, executes them 
 | `codex_executor.py` | Codex CLI driver (subprocess spawn, `--json` stream parse, `-o` final-message capture) for `routing='codex'` sessions. Prepends `CAPABILITIES_PREAMBLE` on the opening turn; suppresses intermediate-message streaming so only heartbeats + the final result reach Telegram |
 | `codex_spawn.py` | Helper that creates a parentless `routing='codex'`, `origin='operator'` session row for a fresh `/codex` task |
 | `operator_spawn.py` | Same pattern for non-code operator-initiated agent spawns from Telegram or `/chat` |
-| `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage |
+| `inter_agent.py` | Tool surface that lets agents spawn / message / yield-until peers in the same lineage. `lifeos_agent_spawn` accepts `claude`/`local`/`claude_code`/`codex` — the CLI routes enable cross-engine capability fallback (e.g. delegate browser work to a `claude_code` child) |
+| `codex_skill_sync.py` | Converts engine-agnostic `.claude/skills/` into Codex's `SKILL.md` format; installed into `~/.codex/skills/` by `scripts/install_codex_skills.py` |
 | `tools.py`, `tool_filter.py`, `tool_result_cache.py` | LifeOS-MCP tool catalog, per-preset filtering, repeat-call de-duplication |
 | `pricing.py` | Per-model token rates + session-hour overhead for cost accounting |
 | `capabilities_preamble.py` | Static LifeOS capabilities briefing prepended to the opening user turn on the managed, local, and `codex` routes (Claude Code gets the equivalent via `--append-system-prompt`) |

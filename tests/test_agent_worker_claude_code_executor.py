@@ -371,3 +371,30 @@ def test_resume_passes_session_id_via_resume_flag(tmp_path: Path):
     assert outcome.status == STATUS_COMPLETED
     assert "-r" in captured["cmd"]
     assert "cli-original" in captured["cmd"]
+
+
+def test_system_prompt_carries_session_id_for_delegation(tmp_path: Path):
+    """The appended system prompt tells the agent its LifeOS session id and how
+    to delegate (so it can pass caller_session_id to lifeos_agent_spawn)."""
+    captured: dict = {}
+
+    def _spawn_capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc(
+            [
+                {"type": "system", "subtype": "init", "session_id": "cli-1"},
+                {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "ok"},
+            ],
+        )
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
+    session = _seed_session(store)
+    store.enqueue_message(session.session_id, "operator", "do a thing")
+
+    executor.execute(session, {"id": session.task_id, "description": "do a thing"})
+
+    # The --append-system-prompt value is the arg right after the flag.
+    cmd = captured["cmd"]
+    appended = cmd[cmd.index("--append-system-prompt") + 1]
+    assert session.session_id in appended
+    assert "lifeos_agent_spawn" in appended
