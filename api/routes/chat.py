@@ -1137,21 +1137,18 @@ async def ask_stream(request: AskStreamRequest):
             # in perf_traces.db is `model_tier` — but the value is now a model id
             # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
             orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
-            # Escalation (#303): if the prior turn refused/claimed-impossible and
-            # this message pushes back, retry on a stronger model. Only on the
-            # Anthropic backend, only when LIFEOS_AGENT_ESCALATION_MODEL is set.
-            escalation_model = (
-                getattr(settings, "agent_escalation_model", "") or ""
-                if getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
-                else ""
-            )
-            orchestrator_model, escalated = resolve_orchestrator_model(
-                conversation_history, request.question, orchestrator_model, escalation_model
-            )
-            if escalated:
-                logger.info(
-                    "escalating chat turn to %s (refusal+pushback detected)", orchestrator_model
+            # Escalation: pick a stronger model for this turn either because the
+            # user explicitly asked ("escalate to opus", #305) or because the
+            # prior turn refused and this message pushes back (#303). Anthropic
+            # backend only — the local backend can't honor a per-turn model.
+            escalated = False
+            if getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
+                escalation_model = getattr(settings, "agent_escalation_model", "") or ""
+                orchestrator_model, escalated = resolve_orchestrator_model(
+                    conversation_history, request.question, orchestrator_model, escalation_model
                 )
+            if escalated:
+                logger.info("escalating chat turn to %s (user-directed or refusal+pushback)", orchestrator_model)
             _trace = _current_trace.get()
             if _trace:
                 _trace.model_tier = orchestrator_model

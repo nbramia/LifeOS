@@ -155,6 +155,84 @@ def test_resolve_no_escalation_when_not_triggered():
 
 
 # ---------------------------------------------------------------------------
+# user-directed escalation (#305)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question, expected", [
+    ("escalate to opus", "claude-opus-4-8"),
+    ("use opus please", "claude-opus-4-8"),
+    ("with claude opus", "claude-opus-4-8"),
+    ("retry on opus", "claude-opus-4-8"),
+    ("use sonnet", "claude-sonnet-4-6"),
+    ("switch to sonnet", "claude-sonnet-4-6"),
+    ("use haiku for this", "claude-haiku-4-5"),
+])
+def test_named_tier_directive_selects_that_model(question, expected):
+    # No history / no refusal — the directive alone drives the choice. Base is a
+    # model different from the target so escalation is observable.
+    base = "claude-haiku-4-5" if expected != "claude-haiku-4-5" else "claude-sonnet-4-6"
+    model, escalated = resolve_orchestrator_model([], question, base_model=base, escalation_model="")
+    assert (model, escalated) == (expected, True)
+
+
+def test_named_tier_works_without_escalation_model_configured():
+    """An explicit 'use opus' must work even when auto-escalation is unconfigured."""
+    model, escalated = resolve_orchestrator_model(
+        [], "use opus", base_model="claude-haiku-4-5", escalation_model=""
+    )
+    assert (model, escalated) == ("claude-opus-4-8", True)
+
+
+@pytest.mark.parametrize("question", [
+    "escalate",
+    "use a smarter model",
+    "try a stronger model",
+    "use a more capable model",
+])
+def test_generic_directive_falls_back_to_configured_model(question):
+    model, escalated = resolve_orchestrator_model(
+        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+    )
+    assert (model, escalated) == ("claude-sonnet-4-6", True)
+
+
+def test_generic_directive_noops_when_unconfigured():
+    model, escalated = resolve_orchestrator_model(
+        [], "use a smarter model", base_model="claude-haiku-4-5", escalation_model=""
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_directive_to_base_model_is_noop():
+    model, escalated = resolve_orchestrator_model(
+        [], "use haiku", base_model="claude-haiku-4-5", escalation_model="claude-opus-4-8"
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_directive_beats_auto_heuristic_without_refusal():
+    """A named directive escalates even with no refusal+pushback in history."""
+    model, escalated = resolve_orchestrator_model(
+        [FakeMessage("assistant", "Here are your three games.")],
+        "actually, use opus",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert (model, escalated) == ("claude-opus-4-8", True)
+
+
+@pytest.mark.parametrize("question", [
+    "summarize my notes about the opus project",
+    "find the sonnet I wrote for Taylor",
+    "what's on my calendar today",
+])
+def test_non_directive_mentions_do_not_escalate(question):
+    model, escalated = resolve_orchestrator_model(
+        [], question, base_model="claude-haiku-4-5", escalation_model="claude-opus-4-8"
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+# ---------------------------------------------------------------------------
 # _select_client
 # ---------------------------------------------------------------------------
 
