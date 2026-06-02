@@ -64,17 +64,21 @@ def _looks_like_giving_up(text: str) -> bool:
 # impossible / unavailable / "not released" from stale training and won't budge.
 # When the PRIOR assistant turn refused like that AND the user's NEW message pushes
 # back, we retry the turn on a stronger model rather than re-refusing.
+# Scoped to the *stale-knowledge / world-fact* refusal class — claims that
+# something about the current world isn't released/announced/scheduled/known.
+# A stronger model + web search fixes these. Deliberately NOT matching generic
+# data-lookup negatives ("I can't find any emails from Sarah", "no such
+# contact", "that file doesn't exist") — those are usually correct, and a
+# pricier model can't find data that isn't there. The give-up patterns
+# (knowledge-cutoff / can't-access-live) are also treated as refusals (see
+# should_escalate).
 _REFUSAL_PATTERNS = re.compile(
     r"(?i)("
-    r"hasn'?t (yet )?(been )?(released|announced|published|come out|happened|finalized)"
-    r"|haven'?t (yet )?(been )?(released|announced|published)"
-    r"|not (yet )?(been )?(released|announced|available|published|out|finalized)"
-    r"|isn'?t (yet )?(available|out|released)|aren'?t (yet )?available"
-    r"|hasn'?t been (set|scheduled|determined)"
-    r"|doesn'?t exist|does not exist|no such"
-    r"|not possible|isn'?t possible|impossible"
-    r"|I can'?t (add|create|do|find|provide)|I cannot (add|create|do|find|provide)"
-    r"|I'?m unable to|I am unable to"
+    r"(hasn'?t|has not|haven'?t|have not)\s+(yet\s+)?(been\s+)?"
+    r"(released|announced|published|scheduled|finalized|determined|set|made public|come out)"
+    r"|not\s+(yet\s+)?(been\s+)?(released|announced|published|scheduled|finalized|determined|available|out)"
+    r"|isn'?t\s+(yet\s+)?(available|out|released|published|finalized)"
+    r"|aren'?t\s+(yet\s+)?(available|released|published)"
     r")"
 )
 _PUSHBACK_PATTERNS = re.compile(
@@ -106,7 +110,13 @@ def should_escalate(conversation_history, question: str) -> bool:
     """True when the prior assistant turn refused/claimed-impossible AND the
     current user message pushes back — the signal to retry on a stronger model."""
     prior = _last_assistant_text(conversation_history)
-    if not prior or not _REFUSAL_PATTERNS.search(prior):
+    if not prior:
+        return False
+    # Refusal = a stale-knowledge world-fact negative OR a give-up phrase
+    # (knowledge cutoff / "can't access live data") — both are fixable by a
+    # stronger model + web search.
+    refused = _REFUSAL_PATTERNS.search(prior) or _GIVE_UP_PATTERNS.search(prior)
+    if not refused:
         return False
     return bool(_PUSHBACK_PATTERNS.search(question or ""))
 

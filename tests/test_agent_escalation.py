@@ -93,6 +93,31 @@ def test_various_pushback_phrasings(pushback):
     assert should_escalate(history, pushback) is True
 
 
+@pytest.mark.parametrize("correct_negative", [
+    "I couldn't find any emails from Sarah in your inbox.",
+    "There's no such contact named Bob in your CRM.",
+    "That file doesn't exist in your vault.",
+    "I can't find a calendar event matching that.",
+])
+def test_correct_data_lookup_negatives_do_not_escalate(correct_negative):
+    """A true 'not in your data' answer must NOT escalate on pushback — a
+    stronger model can't find data that isn't there (only wastes the spend)."""
+    history = [FakeMessage("assistant", correct_negative)]
+    assert should_escalate(history, "you're wrong, look it up again") is False
+
+
+@pytest.mark.parametrize("giveup", [
+    "I can't access live data, so I don't know the current standings.",
+    "Based on my knowledge cutoff, I can't provide real-time results.",
+    "I don't have access to up-to-date information on that.",
+])
+def test_giveup_phrases_count_as_refusal(giveup):
+    """Knowledge-cutoff / can't-access-live phrasing is a stale-knowledge refusal
+    that escalation should also catch."""
+    history = [FakeMessage("assistant", giveup)]
+    assert should_escalate(history, "do research") is True
+
+
 # ---------------------------------------------------------------------------
 # resolve_orchestrator_model
 # ---------------------------------------------------------------------------
