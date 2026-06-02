@@ -17,15 +17,33 @@ import mcp_server
 def server(monkeypatch, tmp_path: Path):
     """A LifeOSMCPServer with the agent stack pointed at a temp DB.
 
-    SessionStore reads `DEFAULT_DB_PATH` only at function-default-binding
-    time, so monkeypatching the module attribute doesn't redirect new
-    instances. We chdir into tmp_path instead so the relative default
-    `data/agent_sessions.db` lands inside the test sandbox.
+    `_handle_inter_agent` anchors its SessionStore/TranscriptStore to the
+    repo-root constants (`AGENT_SESSIONS_DB` / `AGENT_TRANSCRIPTS_DIR`) so it
+    works regardless of the cwd the MCP server was spawned with. We point those
+    constants at the sandbox, and also chdir so a bare `SessionStore()` in a
+    test resolves to the same place.
     """
     monkeypatch.setenv("LIFEOS_AGENT_VAULT_ID", "")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp_server, "AGENT_SESSIONS_DB", tmp_path / "data" / "agent_sessions.db")
+    monkeypatch.setattr(mcp_server, "AGENT_TRANSCRIPTS_DIR", tmp_path / "data" / "agent_transcripts")
     srv = mcp_server.LifeOSMCPServer()
     return srv
+
+
+@pytest.mark.unit
+def test_inter_agent_stores_anchored_to_repo_not_cwd(monkeypatch, tmp_path: Path):
+    """Regression: the MCP server is spawned by CLI agents with the agent's
+    `-C` dir as cwd, so inter-agent tools must NOT resolve the session store
+    relative to cwd (that opened a phantom empty DB → every call failed
+    'no_caller'). The anchored paths must be absolute and repo-rooted even when
+    cwd is elsewhere."""
+    monkeypatch.chdir(tmp_path)
+    assert mcp_server.AGENT_SESSIONS_DB.is_absolute()
+    assert mcp_server.AGENT_SESSIONS_DB == mcp_server._REPO_ROOT / "data" / "agent_sessions.db"
+    assert mcp_server.AGENT_TRANSCRIPTS_DIR == mcp_server._REPO_ROOT / "data" / "agent_transcripts"
+    # The anchor is the repo root (where mcp_server.py lives), not the cwd.
+    assert mcp_server._REPO_ROOT != Path(tmp_path)
 
 
 @pytest.mark.unit

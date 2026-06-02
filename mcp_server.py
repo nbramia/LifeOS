@@ -16,6 +16,7 @@ import sys
 import httpx
 import logging
 import os
+from pathlib import Path
 
 # Configure logging to stderr (stdout is for MCP protocol)
 logging.basicConfig(
@@ -24,6 +25,17 @@ logging.basicConfig(
     stream=sys.stderr
 )
 logger = logging.getLogger(__name__)
+
+# Repo-anchored agent-worker store locations. This server is spawned as a
+# stdio MCP child by CLI agents (codex / claude_code) with the agent's `-C`
+# working dir as cwd — NOT the repo — so the stores' default cwd-relative
+# paths would open a phantom empty DB and every inter-agent call would fail
+# with "no_caller". Anchoring to this file's directory (the repo root) keeps
+# inter-agent tools pointed at the real worker store regardless of cwd. Tests
+# monkeypatch these to sandbox.
+_REPO_ROOT = Path(__file__).resolve().parent
+AGENT_SESSIONS_DB = _REPO_ROOT / "data" / "agent_sessions.db"
+AGENT_TRANSCRIPTS_DIR = _REPO_ROOT / "data" / "agent_transcripts"
 
 API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
@@ -962,9 +974,12 @@ class LifeOSMCPServer:
         except Exception as exc:
             logger.warning("inter-agent: managed_driver init failed: %s", exc)
 
+        # Anchor the stores to the repo's data/ dir (see AGENT_SESSIONS_DB) so
+        # inter-agent tools hit the real worker store regardless of the cwd this
+        # MCP server was spawned with.
         ctx = InterAgentContext(
-            session_store=SessionStore(),
-            transcript_store=TranscriptStore(),
+            session_store=SessionStore(db_path=AGENT_SESSIONS_DB),
+            transcript_store=TranscriptStore(transcripts_dir=AGENT_TRANSCRIPTS_DIR),
             caller_session_id=caller_session_id,
             caps=Caps(
                 max_spawn_depth=_settings.agent_max_spawn_depth,
