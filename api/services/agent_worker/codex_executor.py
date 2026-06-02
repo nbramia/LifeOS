@@ -229,14 +229,16 @@ class CodexExecutor:
         return [binary, "exec", *common, prompt]
 
     def _warn_if_mcp_missing(self) -> None:
-        """Best-effort check that Codex has an MCP server configured.
+        """Best-effort check that Codex has the lifeos MCP server configured.
 
-        Codex reaches LifeOS data only through an ``[mcp_servers.*]`` block in
-        ``~/.codex/config.toml`` (or ``$CODEX_HOME/config.toml``). Unlike Claude
-        Code — which inherits the ``lifeos`` server from ``~/.claude.json`` — a
-        fresh Codex install has none, leaving the agent context-blind. We can't
-        fix per-machine config from the repo, so we surface it loudly in logs
-        once per process. Never raises: a config we can't read is not fatal.
+        Codex reaches LifeOS data only through an ``[mcp_servers.lifeos]`` block
+        in ``~/.codex/config.toml`` (or ``$CODEX_HOME/config.toml``). Unlike
+        Claude Code — which inherits the ``lifeos`` server from ``~/.claude.json``
+        — a fresh Codex install has none, leaving the agent context-blind. We
+        check for the lifeos server specifically (not just any MCP block), since
+        an unrelated server would leave LifeOS just as unreachable. We can't fix
+        per-machine config from the repo, so we surface it loudly in logs once
+        per process. Never raises: a config we can't read is not fatal.
         """
         if self._mcp_warned:
             return
@@ -248,9 +250,9 @@ class CodexExecutor:
                 contents = f.read()
         except OSError:
             contents = ""
-        if "[mcp_servers" not in contents:
+        if "[mcp_servers.lifeos]" not in contents:
             logger.warning(
-                "Codex has no [mcp_servers.*] in %s — the agent cannot reach "
+                "Codex has no [mcp_servers.lifeos] in %s — the agent cannot reach "
                 "lifeos_* tools and will be blind to personal data. See "
                 "docs/guides/agent-worker-setup.md § Codex MCP setup.",
                 config_path,

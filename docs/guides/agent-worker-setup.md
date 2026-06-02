@@ -398,8 +398,8 @@ once the MCP server is wired. Add this to `~/.codex/config.toml` (or
 
 ```toml
 [mcp_servers.lifeos]
-command = "<repo>/.venvs/lifeos/bin/python"   # your lifeos venv python
-args = ["<repo>/LifeOS/mcp_server.py"]         # absolute path to mcp_server.py
+command = "<venv>/bin/python"            # your lifeos venv python, e.g. ~/.venvs/lifeos/bin/python
+args = ["<lifeos-repo>/mcp_server.py"]   # absolute path to mcp_server.py in your LifeOS checkout
 ```
 
 `mcp_server.py` already serves stdio for CLI agents (the same entry point

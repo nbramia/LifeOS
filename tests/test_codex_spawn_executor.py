@@ -275,6 +275,45 @@ def test_executor_does_not_stream_intermediate_messages(stores, tmp_path):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "config_body, expect_warning",
+    [
+        ("", True),  # no config at all
+        ("model = \"gpt-5.5\"\n", True),  # config but no MCP servers
+        ('[mcp_servers.other]\ncommand = "x"\n', True),  # a different MCP server only
+        ('[mcp_servers.lifeos]\ncommand = "py"\n', False),  # lifeos configured
+    ],
+)
+def test_warn_if_mcp_missing_keys_on_lifeos(
+    stores, tmp_path, monkeypatch, caplog, config_body, expect_warning
+):
+    """The dispatch warning fires unless the *lifeos* MCP server specifically
+    is configured — an unrelated server leaves LifeOS just as unreachable."""
+    import logging
+
+    sess_store, tr_store = stores
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(config_body)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        binary_resolver=lambda: "/usr/bin/true", heartbeat_interval=9999,
+    )
+    with caplog.at_level(logging.WARNING):
+        executor._warn_if_mcp_missing()
+
+    warned = any("no [mcp_servers.lifeos]" in r.getMessage() for r in caplog.records)
+    assert warned is expect_warning
+    # Gated to once per process — a second call never re-warns.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        executor._warn_if_mcp_missing()
+    assert not any("mcp_servers.lifeos" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
 def test_executor_binary_not_found(stores, tmp_path):
     sess_store, tr_store = stores
     session = sess_store.create(
