@@ -1109,7 +1109,7 @@ async def ask_stream(request: AskStreamRequest):
             # =============================================================
             # Agentic synthesis path: Claude decides what to fetch
             # =============================================================
-            from api.services.agent_loop import run_agent_loop
+            from api.services.agent_loop import run_agent_loop, resolve_orchestrator_model
 
             # Expand follow-up queries with conversation context
             with trace_span("query_expand"):
@@ -1137,6 +1137,21 @@ async def ask_stream(request: AskStreamRequest):
             # in perf_traces.db is `model_tier` — but the value is now a model id
             # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
             orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            # Escalation (#303): if the prior turn refused/claimed-impossible and
+            # this message pushes back, retry on a stronger model. Only on the
+            # Anthropic backend, only when LIFEOS_AGENT_ESCALATION_MODEL is set.
+            escalation_model = (
+                getattr(settings, "agent_escalation_model", "") or ""
+                if getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
+                else ""
+            )
+            orchestrator_model, escalated = resolve_orchestrator_model(
+                conversation_history, request.question, orchestrator_model, escalation_model
+            )
+            if escalated:
+                logger.info(
+                    "escalating chat turn to %s (refusal+pushback detected)", orchestrator_model
+                )
             _trace = _current_trace.get()
             if _trace:
                 _trace.model_tier = orchestrator_model
@@ -1158,7 +1173,11 @@ async def ask_stream(request: AskStreamRequest):
                     for att in request.attachments
                 ]
 
-            yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': f'Agentic loop ({orchestrator_model})', 'latency_ms': 0})}\n\n"
+            _routing_reason = (
+                f'Agentic loop — escalated to {orchestrator_model}'
+                if escalated else f'Agentic loop ({orchestrator_model})'
+            )
+            yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': _routing_reason, 'latency_ms': 0})}\n\n"
 
             # Consume the async generator from the agent loop
             agent_result = None
@@ -1168,6 +1187,7 @@ async def ask_stream(request: AskStreamRequest):
                 attachments=attachments_for_api,
                 model_tier=orchestrator_model,
                 max_tool_rounds=5,
+                model=orchestrator_model if escalated else "",
             ):
                 if event["type"] == "text":
                     yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"

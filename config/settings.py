@@ -167,6 +167,17 @@ class Settings(BaseSettings):
                     "This only changes client-side dollar accounting; the "
                     "actual remote model is still the agent preset's setting."
     )
+    agent_escalation_model: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ESCALATION_MODEL",
+        description="Anthropic model the chat orchestrator retries a turn on when "
+                    "it detects a refusal/impossibility claim followed by the user "
+                    "pushing back ('do research', 'you're wrong'). Empty (default) "
+                    "disables escalation — safe for fresh clones and the local "
+                    "backend. Set to a stronger model than LIFEOS_ANTHROPIC_MODEL "
+                    "(e.g. claude-sonnet-4-6 or claude-opus-4-8) to enable. Only "
+                    "applies to the Anthropic backend."
+    )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,
         alias="LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS",
