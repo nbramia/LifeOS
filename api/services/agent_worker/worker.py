@@ -155,7 +155,7 @@ class _SynchronousPool:
         fn(*args, **kwargs)
         return None
 
-    def shutdown(self, wait: bool = True) -> None:  # noqa: D401 - parity with executor API
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:  # noqa: D401 - parity with executor API
         pass
 
 
@@ -254,9 +254,13 @@ class Worker:
     def stop(self) -> None:
         """Mark the loop for graceful shutdown. Safe to call from a signal."""
         self._stop = True
-        # Don't block shutdown on in-flight CLI children; any left RUNNING are
-        # reconciled by resume_pending() on the next start (SIGKILL-safe path).
-        self._cli_pool.shutdown(wait=False)
+        # Drop any *queued* CLI dispatches and don't block the caller. Children
+        # already running aren't force-killed here — their own watchdog times
+        # them out, and on a hard stop systemd's TimeoutStopSec SIGKILLs the
+        # process; either way resume_pending() reconciles them on next start.
+        # (Pool threads are non-daemon, so a still-running child can delay a
+        # natural interpreter exit until its watchdog fires.)
+        self._cli_pool.shutdown(wait=False, cancel_futures=True)
 
     def run(self) -> None:
         """Main loop. Runs until `stop()` is called or the process is killed."""
@@ -464,6 +468,13 @@ class Worker:
             # origin='operator').
             if not session.parent_session_id and session.origin != "operator":
                 continue
+            # CLI children already handed to the pool: skip BEFORE draining, so a
+            # re-scan in the CLAIMED→RUNNING window doesn't consume (and discard)
+            # the session's pending messages while the running dispatch skips them.
+            if session.routing in ("claude_code", "codex"):
+                with self._cli_lock:
+                    if session.session_id in self._cli_inflight:
+                        continue
             # The first pending message is the prompt from the parent — drain
             # it so the executor's seeded user turn picks it up.
             pending = self.session_store.drain_pending_messages(session.session_id)
@@ -516,6 +527,9 @@ class Worker:
                 return
             self._cli_inflight.add(sid)
 
+        # The closure captures the tick-time `session` snapshot; the dispatch
+        # only reads immutable fields (ids, routing) and re-reads mutable state
+        # from the store, so the snapshot going stale is harmless.
         def _run() -> None:
             try:
                 dispatch_fn(session, pending)
