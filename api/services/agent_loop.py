@@ -136,25 +136,51 @@ _DIRECTIVE_MODEL_RE = re.compile(
     r"(?:claude\s+)?(opus|sonnet|haiku)\b"
 )
 # A generic "use a stronger model" directive with no tier named → fall back to
-# the configured escalation model. Bare "escalate" alone also counts.
+# the configured escalation model. Requires an explicit model reference so a
+# bare "escalate this ticket to the team" doesn't trigger a model swap.
 _DIRECTIVE_SMARTER_RE = re.compile(
     r"(?i)("
-    r"\bescalate\b"
-    r"|(?:use|using|try|switch\s+to)\s+(?:a\s+)?(?:smarter|stronger|better|bigger|more\s+capable)\s+(?:model|llm)"
+    r"(?:use|using|try|switch\s+to|escalate\s+to)\s+(?:a\s+)?"
+    r"(?:smarter|stronger|better|bigger|more\s+capable)\s+(?:model|llm)"
+    r"|escalate\s+the\s+(?:model|response|answer)"
     r")"
 )
+# A directive negated or posed as a meta-question is NOT a request to switch.
+# Negation anywhere in the run-up to the directive ("don't … use opus",
+# "I didn't ask you to use opus") cancels it; question framing about a model
+# ("why did you use sonnet?", "can you use opus?") is likewise not a directive.
+# Only true negations — NOT "instead of"/"rather than", which contrast options
+# and leave the *named* model as the desired one ("instead of haiku, use opus").
+_NEGATION_BEFORE_RE = re.compile(
+    r"(?i)\b(don'?t|do not|didn'?t|did not|never|no need to|without)\b"
+)
+_META_QUESTION_RE = re.compile(
+    r"(?i)\b(why|can|could|should|would|do|did|are)\s+(?:you|i|we|they)?\s*"
+    r"(?:use|using|used|switch(?:ing)?|escalate)\b"
+)
+# Engines that aren't an inline model swap (handoff is deferred — #305 part b).
+# Naming one must NOT silently fall through to the generic-model escalation.
+_UNSUPPORTED_ENGINE_RE = re.compile(r"(?i)\b(codex|claude\s*code|gpt|gemini)\b")
 
 
 def _parse_escalation_directive(question: str, escalation_model: str) -> str:
     """Return the model id the user explicitly asked for, or ''.
 
     A named tier ("use opus") resolves to that model even when auto-escalation
-    is unconfigured — explicit intent. A generic "escalate" / "use a smarter
-    model" falls back to ``escalation_model`` (which may be '').
+    is unconfigured — explicit intent. A generic "use a smarter model" falls
+    back to ``escalation_model`` (which may be ''). Negated/meta-question
+    framing and unsupported-engine names ("escalate to codex") return ''.
     """
     q = question or ""
+    # Don't escalate to a model when the user named an engine we can't hand off
+    # to yet, or framed the model mention as a question.
+    if _UNSUPPORTED_ENGINE_RE.search(q) or _META_QUESTION_RE.search(q):
+        return ""
     m = _DIRECTIVE_MODEL_RE.search(q)
     if m:
+        # A negation before the matched directive cancels it.
+        if _NEGATION_BEFORE_RE.search(q[:m.start()]):
+            return ""
         return _MODEL_ALIASES.get(m.group(1).lower(), "")
     if _DIRECTIVE_SMARTER_RE.search(q):
         return escalation_model

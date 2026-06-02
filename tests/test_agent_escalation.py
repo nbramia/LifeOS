@@ -184,14 +184,42 @@ def test_named_tier_works_without_escalation_model_configured():
 
 
 @pytest.mark.parametrize("question", [
-    "escalate",
     "use a smarter model",
     "try a stronger model",
     "use a more capable model",
+    "escalate to a stronger model",
+    "escalate the model",
 ])
 def test_generic_directive_falls_back_to_configured_model(question):
     model, escalated = resolve_orchestrator_model(
         [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+    )
+    assert (model, escalated) == ("claude-sonnet-4-6", True)
+
+
+@pytest.mark.parametrize("question", [
+    "don't use opus, stick with haiku",
+    "I didn't ask you to use opus",
+    "why did you use sonnet?",
+    "can you use opus or sonnet?",
+    "should I use opus for this?",
+    "escalate to codex",                   # deferred engine — must NOT become sonnet
+    "use codex instead",
+    "escalate this ticket to the team",    # 'escalate' about a ticket, not the model
+])
+def test_negated_question_and_engine_directives_do_not_escalate(question):
+    """Negations, meta-questions, unsupported-engine names, and non-model uses of
+    'escalate' must not trigger a model swap."""
+    model, escalated = resolve_orchestrator_model(
+        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_contrastive_directive_still_honors_named_model():
+    """'instead of'/'rather than' contrast options — the named model is desired."""
+    model, escalated = resolve_orchestrator_model(
+        [], "use sonnet instead of opus", base_model="claude-haiku-4-5", escalation_model=""
     )
     assert (model, escalated) == ("claude-sonnet-4-6", True)
 
