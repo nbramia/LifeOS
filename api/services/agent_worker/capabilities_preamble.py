@@ -52,6 +52,17 @@ DATA YOU CAN REACH (via the `lifeos` MCP server):
     lifeos_reminder_create, lifeos_memories_create,
     lifeos_telegram_send
 
+SHELL TOOLS (if you have a shell): the `gws` CLI is the Google Workspace
+CLI — direct Drive / Gmail / Sheets / Calendar access via the user's
+authenticated account. Useful when you need raw API access the `lifeos_*`
+tools don't wrap (e.g. creating a Sheet, downloading a Drive file by id):
+  gws drive files list --params '{"pageSize": 10}'
+  gws gmail users messages list --params '{"userId": "me"}'
+  gws sheets spreadsheets get --params '{"spreadsheetId": "..."}'
+  gws schema <service.resource.method>   # discover params for any call
+Prefer `lifeos_*` for search/synthesis; reach for `gws` for direct,
+typed Google API calls.
+
 SEARCH TIPS (recall can be uneven):
   - If the first search returns scores near 0.02 and irrelevant titles,
     re-query with broader OR narrower terms — both, not one. Try the

@@ -1,0 +1,105 @@
+"""Materialize engine-agnostic LifeOS skills into Codex's skill format.
+
+LifeOS skills live in `.claude/skills/<name>/SKILL.md` and are authored in
+Claude Code's slash-command dialect: YAML frontmatter with `argument-hint`, a
+`$ARGUMENTS` placeholder, and `` !`cmd` `` bash-injection blocks in the Context
+section. Codex discovers skills only from `$CODEX_HOME/skills` (or
+`~/.codex/skills`) — there is no project-level `.codex/skills` — and its
+`SKILL.md` format is a plain prompt doc with no `$ARGUMENTS` / bash injection.
+
+This module converts the portable subset (no Claude subagent orchestration)
+to Codex's format and installs them. It is import-safe and side-effect-free
+until `install_skills()` is called, so the transform can be unit-tested without
+touching the filesystem.
+
+Only engine-agnostic skills are ported. The Claude-orchestration skills
+(`implement`, `review-pr`, `address-review`, `mine-for-ideas`) drive Claude's
+`Task`/`Skill` subagent loop and are deliberately left Claude-only; `tune`
+edits the LifeOS Claude-orchestrator internals and is also excluded.
+"""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+
+# Engine-agnostic skills safe to expose to Codex (verified free of Claude
+# subagent-orchestration references). Keep this list conservative — when in
+# doubt, leave a skill Claude-only rather than hand Codex instructions that
+# reference primitives it doesn't have.
+PORTABLE_SKILLS = (
+    "standup",
+    "catchup",
+    "stale",
+    "sync-health",
+    "draft-issue",
+    "pr-check",
+    "merge-pr",
+    "remove-worktree",
+)
+
+_FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+_BASH_INJECT_RE = re.compile(r"!`([^`]+)`")
+
+
+def transform_skill(text: str) -> str:
+    """Convert one Claude `SKILL.md` body to Codex's format.
+
+    - Keep only `name` and `description` in the frontmatter (drop
+      `argument-hint`, which Codex doesn't use).
+    - Replace `$ARGUMENTS` with prose, since Codex skills aren't parameterized
+      the same way — the user's request *is* the argument.
+    - Rewrite `` !`cmd` `` bash-injection into an explicit "run this" hint;
+      Codex has shell access and runs the command itself rather than having it
+      pre-expanded.
+
+    Raises ValueError if the input has no parseable frontmatter.
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        raise ValueError("SKILL.md has no YAML frontmatter")
+    frontmatter, body = match.group(1), match.group(2)
+
+    kept = [
+        line for line in frontmatter.splitlines()
+        if line.startswith("name:") or line.startswith("description:")
+    ]
+
+    body = body.replace("$ARGUMENTS", "the request you were given")
+    body = _BASH_INJECT_RE.sub(r"(run `\1` to get this)", body)
+
+    return "---\n" + "\n".join(kept) + "\n---\n" + body
+
+
+def _codex_skills_dir() -> Path:
+    """Codex's skill discovery directory: $CODEX_HOME/skills, else ~/.codex/skills."""
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    return Path(codex_home) / "skills"
+
+
+def install_skills(
+    claude_skills_dir: Path | str,
+    codex_skills_dir: Path | str | None = None,
+    skills: tuple[str, ...] = PORTABLE_SKILLS,
+) -> list[str]:
+    """Write the portable skills into Codex's skill directory.
+
+    Returns the list of skill names installed. Skips any allowlisted skill
+    that has no source `SKILL.md` (rather than failing the whole run), so a
+    partial `.claude/skills` checkout still installs what it can.
+    """
+    claude_dir = Path(claude_skills_dir)
+    codex_dir = Path(codex_skills_dir) if codex_skills_dir is not None else _codex_skills_dir()
+
+    installed: list[str] = []
+    for name in skills:
+        src = claude_dir / name / "SKILL.md"
+        if not src.is_file():
+            continue
+        converted = transform_skill(src.read_text(encoding="utf-8"))
+        dest_dir = codex_dir / name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / "SKILL.md").write_text(converted, encoding="utf-8")
+        installed.append(name)
+    return installed

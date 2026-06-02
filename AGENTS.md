@@ -350,6 +350,19 @@ curl "http://localhost:8000/api/tasks?status=todo" | jq
 curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
 ```
 
+### Google Workspace CLI (`gws`)
+
+`gws` is the Google Workspace CLI — direct, typed access to Drive, Gmail, Sheets, and Calendar via the user's authenticated account. Useful for raw API calls the `lifeos_*` tools don't wrap (creating a Sheet, downloading a Drive file by id). Available to any agent with shell access (Claude Code, Codex).
+
+```bash
+gws drive files list --params '{"pageSize": 10}'
+gws gmail users messages list --params '{"userId": "me"}'
+gws sheets spreadsheets get --params '{"spreadsheetId": "..."}'
+gws schema drive.files.list          # discover params for any call
+```
+
+Prefer `lifeos_*` tools for search/synthesis; reach for `gws` for direct Google API calls.
+
 ---
 
 ## Apple Data Agent (optional, macOS only)

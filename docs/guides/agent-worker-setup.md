@@ -415,9 +415,47 @@ grep -A2 'mcp_servers.lifeos' ~/.codex/config.toml
 ```
 
 If the block is missing, the agent worker logs a one-time warning on the first
-`#codex` dispatch (`Codex has no [mcp_servers.*] …`) so a misconfigured machine
-surfaces in `logs/lifeos-api-error.log` rather than silently producing
+`#codex` dispatch (`Codex has no [mcp_servers.lifeos] …`) so a misconfigured
+machine surfaces in `logs/lifeos-api-error.log` rather than silently producing
 context-blind runs.
+
+### Codex skills (`#codex` parity with `#claude`)
+
+The engine-agnostic LifeOS workflow skills (`/standup`, `/catchup`, `/stale`,
+`/sync-health`, `/draft-issue`, `/pr-check`, `/merge-pr`, `/remove-worktree`)
+can be installed for Codex. Codex discovers skills only from
+`~/.codex/skills/` (or `$CODEX_HOME/skills`) — there's no project-level skills
+dir — so this is a machine-local install, like the MCP block above:
+
+```bash
+~/.venvs/lifeos/bin/python scripts/install_codex_skills.py
+# Restart Codex to pick them up.
+```
+
+The script converts each skill from Claude Code's slash-command dialect
+(`$ARGUMENTS`, `` !`cmd` `` injection) into Codex's `SKILL.md` format. Re-run
+after editing the source skills under `.claude/skills/`. The Claude-orchestration
+skills (`/implement`, `/review-pr`, `/address-review`, `/mine-for-ideas`, `/tune`)
+are intentionally **not** ported — they drive Claude's subagent loop or the
+LifeOS orchestrator internals and have no Codex equivalent.
+
+### Codex computer use
+
+Codex ships native computer use — `computer_use`, `browser_use`,
+`browser_use_external`, and `in_app_browser` are stable and enabled by default
+(check with `codex features list`). The worker runs Codex with
+`--dangerously-bypass-approvals-and-sandbox`, so nothing in the executor
+suppresses these features. Whether they function under headless `codex exec`
+(no TTY, possibly no display) depends on the host; verify with a real `#codex`
+task that needs the browser before relying on it.
+
+**Fallback:** if Codex can't drive the browser headlessly on your host, it can
+delegate to the browser-enabled Claude Code CLI. Every `#codex` (and `#claude`)
+agent is told its LifeOS session id and can call `lifeos_agent_spawn` with
+`model="claude_code"` (for `--chrome`) or `model="codex"` (for native computer
+use) to hand a sub-task to the other engine, then monitor it with
+`lifeos_agent_check`. This bidirectional delegation means either engine can get
+a job done even when its own tool surface falls short.
 
 ## Cost-aware iteration
 
