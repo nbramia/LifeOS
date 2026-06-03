@@ -101,7 +101,10 @@ Orchestration and synthesis can run against the Claude API (default) or a local 
 
 To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_URL` at a running llama-server. See the [Configuration Guide](docs/guides/configuration.md) for details.
 
-`LIFEOS_ANTHROPIC_MODEL` is the single orchestrator-model knob: every chat round, every intent-classification call, and every per-tool synthesis hop uses it. There is no per-query model tiering today — if you want a heavier model for harder questions, set it here and it applies to all traffic.
+`LIFEOS_ANTHROPIC_MODEL` is the **base** orchestrator model (every chat round, intent-classification call, and per-tool synthesis hop uses it by default). On top of that, per-query **escalation** lets a turn run on a stronger model or hand off to a CLI engine — Anthropic backend only, off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set:
+
+- **User-directed:** "escalate to opus" / "use sonnet" runs that turn on the named model; "use codex" / "use claude code" hands the task to that CLI worker session.
+- **Automatic:** when a turn refuses and you push back ("do research", "you're wrong"), LifeOS retries on `LIFEOS_AGENT_ESCALATION_MODEL`, then — on a second pushback — hands off to Claude Code. Tune the rungs with `LIFEOS_AGENT_ESCALATION_LADDER`.
 
 ---
 

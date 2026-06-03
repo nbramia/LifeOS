@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-06-03
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -67,7 +67,14 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 
 ## Query Routing
 
-The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable via `LIFEOS_LLM_BACKEND` / `LIFEOS_ANTHROPIC_MODEL`) chooses which tools to call. A lightweight intent classifier runs first to short-circuit two special cases — Claude Code tasks and ambiguous task/reminder phrasing — and everything else flows through the agentic loop where the model picks tools per query.
+The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable via `LIFEOS_LLM_BACKEND` / `LIFEOS_ANTHROPIC_MODEL`) chooses which tools to call. A lightweight intent classifier runs first to short-circuit a few special cases — Claude Code tasks, ambiguous task/reminder phrasing, and explicit engine handoffs (below) — and everything else flows through the agentic loop where the model picks tools per query.
+
+**Per-query escalation & engine handoff.** On the Anthropic backend, a turn can run on a stronger model or hand off to a CLI engine instead of answering inline (off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set):
+
+- **User-directed** (imperative, leading or trailing): "escalate to opus" / "use sonnet" runs that turn on the named model via the API; "use codex" / "use claude code" (also "add the games using codex") hands the task to that CLI worker session. Negations and questions ("why did you use codex?") don't trigger it.
+- **Automatic ladder:** when a turn refuses ("hasn't been released") and the user pushes back ("do research", "you're wrong"), the next turn climbs the escalation ladder — the escalation model on the 1st pushback, a Claude Code handoff on the 2nd (tunable via `LIFEOS_AGENT_ESCALATION_LADDER`). The handoff forwards the *original* request, not the pushback.
+
+CLI handoffs run as async worker sessions and report results via Telegram and `/agents`; on Telegram and the web chat the trigger is the same.
 
 | Source | Content | Example Queries |
 |--------|---------|-----------------|
