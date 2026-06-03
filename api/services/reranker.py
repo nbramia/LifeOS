@@ -21,6 +21,7 @@ like negation, specificity, and contextual relevance.
     reranked = reranker.rerank(query, results, top_k=10)
 """
 import logging
+import threading
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -47,14 +48,21 @@ class RerankerService:
         """
         self.model_name = model_name
         self._model: Optional["CrossEncoder"] = None
+        # Serialize lazy loads — re-ranking is invoked from search tools that
+        # run concurrently in threads, and a racing CrossEncoder init can leave
+        # params on the meta device ("Cannot copy out of meta tensor"). Loading
+        # once under a lock removes the race. See EmbeddingService for context.
+        self._load_lock = threading.Lock()
 
     def _get_model(self) -> "CrossEncoder":
         """Lazy-load cross-encoder model."""
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-            logger.info(f"Loading cross-encoder model: {self.model_name}")
-            self._model = CrossEncoder(self.model_name)
-            logger.info("Cross-encoder model loaded")
+            with self._load_lock:
+                if self._model is None:
+                    from sentence_transformers import CrossEncoder
+                    logger.info(f"Loading cross-encoder model: {self.model_name}")
+                    self._model = CrossEncoder(self.model_name)
+                    logger.info("Cross-encoder model loaded")
         return self._model
 
     def rerank(
