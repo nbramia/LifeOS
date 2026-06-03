@@ -67,6 +67,35 @@ class TestRerankerService:
         reranker = RerankerService(model_name="cross-encoder/ms-marco-MiniLM-L12-v2")
         assert reranker.model_name == "cross-encoder/ms-marco-MiniLM-L12-v2"
 
+    def test_concurrent_first_access_loads_model_once(self):
+        """Parallel threads hitting the lazy load must construct the CrossEncoder
+        exactly once — an unsynchronized load races the meta-device init the same
+        way the embedding model did ('Cannot copy out of meta tensor')."""
+        import threading
+        import time
+        from unittest.mock import MagicMock, patch
+        from api.services.reranker import RerankerService
+
+        def slow_construct(*args, **kwargs):
+            time.sleep(0.05)  # widen the race window
+            return MagicMock()
+
+        with patch("sentence_transformers.CrossEncoder", side_effect=slow_construct) as mock_ce:
+            svc = RerankerService(model_name="test-model")
+            start = threading.Barrier(8)
+
+            def access():
+                start.wait()
+                svc._get_model()
+
+            threads = [threading.Thread(target=access) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert mock_ce.call_count == 1
+
 
 class TestRerankerSingleton:
     """Test the get_reranker singleton."""
@@ -189,7 +218,7 @@ class TestHybridSearchWithReranker:
     def test_search_accepts_reranker_parameters(self):
         """Should accept use_reranker and rerank_candidates parameters."""
         from api.services.hybrid_search import HybridSearch
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         mock_vector_store = MagicMock()
         mock_vector_store.search.return_value = []

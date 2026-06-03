@@ -9,6 +9,7 @@ This allows tests to import this module without loading the ML library.
 """
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Any
 
 from config.settings import settings
@@ -75,57 +76,70 @@ class EmbeddingService:
         self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
         self._force_cpu: bool = False
+        # Serialize lazy loads. Searches run through execute_tool_parallel →
+        # asyncio.to_thread, so concurrent first-use from multiple tool threads
+        # would otherwise race the (meta-device) model init and leave params on
+        # the meta device — surfacing as "Cannot copy out of meta tensor" when
+        # SentenceTransformer.__init__ calls self.to(device). Loading once under
+        # a lock removes the race.
+        self._load_lock = threading.Lock()
 
     @property
     def model(self) -> "SentenceTransformer":
         """Lazy-load the model, falling back to CPU if GPU fails."""
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._load_lock:
+                if self._model is None:
+                    self._load_model()
+        return self._model
 
-            try:
-                import torch
-                load_kwargs = dict(
-                    model_name_or_path=self.model_name,
-                    cache_folder=self.cache_dir,
-                    model_kwargs={"dtype": torch.float16},
-                    local_files_only=True,
-                )
-                if self._force_cpu:
-                    load_kwargs["device"] = "cpu"
+    def _load_model(self) -> None:
+        """Construct the SentenceTransformer (caller holds ``self._load_lock``)."""
+        from sentence_transformers import SentenceTransformer
 
-                self._model = self._load_with_offline_retry(SentenceTransformer, load_kwargs)
-                from api.services.service_health import mark_service_healthy
-                mark_service_healthy("embedding_model")
-            except RuntimeError as e:
-                # GPU errors (HIP OOM, GPU hang, invalid device) — fall back to CPU
-                error_msg = str(e).lower()
-                if any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
-                    logger.warning(f"GPU embedding load failed ({e}), falling back to CPU")
-                    try:
-                        cpu_kwargs = dict(
-                            model_name_or_path=self.model_name,
-                            cache_folder=self.cache_dir,
-                            device="cpu",
-                            local_files_only=True,
-                        )
-                        self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
-                        self._force_cpu = True
-                        from api.services.service_health import mark_service_healthy
-                        mark_service_healthy("embedding_model")
-                    except Exception as cpu_err:
-                        from api.services.service_health import mark_service_failed, Severity
-                        mark_service_failed("embedding_model", f"CPU fallback also failed: {cpu_err}", Severity.CRITICAL)
-                        raise
-                else:
+        try:
+            import torch
+            load_kwargs = dict(
+                model_name_or_path=self.model_name,
+                cache_folder=self.cache_dir,
+                model_kwargs={"dtype": torch.float16},
+                local_files_only=True,
+            )
+            if self._force_cpu:
+                load_kwargs["device"] = "cpu"
+
+            self._model = self._load_with_offline_retry(SentenceTransformer, load_kwargs)
+            from api.services.service_health import mark_service_healthy
+            mark_service_healthy("embedding_model")
+        except RuntimeError as e:
+            # GPU errors (HIP OOM, GPU hang, invalid device) — fall back to CPU
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
+                logger.warning(f"GPU embedding load failed ({e}), falling back to CPU")
+                try:
+                    cpu_kwargs = dict(
+                        model_name_or_path=self.model_name,
+                        cache_folder=self.cache_dir,
+                        device="cpu",
+                        local_files_only=True,
+                    )
+                    self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
+                    self._force_cpu = True
+                    from api.services.service_health import mark_service_healthy
+                    mark_service_healthy("embedding_model")
+                except Exception as cpu_err:
                     from api.services.service_health import mark_service_failed, Severity
-                    mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
+                    mark_service_failed("embedding_model", f"CPU fallback also failed: {cpu_err}", Severity.CRITICAL)
                     raise
-            except Exception as e:
-                # Non-GPU errors — no fallback
+            else:
                 from api.services.service_health import mark_service_failed, Severity
                 mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
                 raise
-        return self._model
+        except Exception as e:
+            # Non-GPU errors — no fallback
+            from api.services.service_health import mark_service_failed, Severity
+            mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
+            raise
 
     def _load_with_offline_retry(self, st_cls, load_kwargs: dict):
         """Load the SentenceTransformer, retrying with HF_HUB_OFFLINE=1 on network errors.
@@ -138,11 +152,9 @@ class EmbeddingService:
         behaviour is to skip the network probe entirely.
 
         Thread safety: mutates ``os.environ`` for the duration of the retry.
-        ``EmbeddingService`` is a process-wide singleton loaded lazily on
-        first access (typically the background sync worker), so concurrent
-        loads don't happen in practice. The try/finally restores the env
-        before any other code can observe it. If a future caller starts
-        triggering loads from multiple threads at once, wrap this in a lock.
+        This runs inside ``EmbeddingService._load_lock`` (the ``model`` property
+        serializes lazy loads), so the env swap can't race a concurrent load,
+        and the try/finally restores it before the lock is released.
         """
         try:
             return st_cls(**load_kwargs)
