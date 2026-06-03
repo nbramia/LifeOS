@@ -266,14 +266,20 @@ def test_non_directive_mentions_do_not_escalate(question):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("question, engine, task", [
+    # Leading imperative.
     ("use codex to add the world cup games", "codex", "add the world cup games"),
     ("use claude code to refactor the parser", "claude_code", "refactor the parser"),
     ("with codex, summarize the repo", "codex", "summarize the repo"),
     ("hand this to codex: fix the failing test", "codex", "fix the failing test"),
     ("please use codex to deploy", "codex", "deploy"),
+    # Trailing imperative ("<task> using codex").
+    ("add the games using codex", "codex", "add the games"),
+    ("fix the bug with claude code", "claude_code", "fix the bug"),
+    ("deploy the app via codex", "codex", "deploy the app"),
+    ("run the report with codex", "codex", "run the report"),
 ])
 def test_engine_directive_routes_and_cleans_task(question, engine, task):
-    # Directive must LEAD the message (imperative). It's stripped to leave the task.
+    # A command — leading or trailing — routes; the directive phrase is stripped.
     assert parse_engine_directive(question) == (engine, task)
 
 
@@ -295,8 +301,9 @@ def test_engine_directive_strips_trailing_model_token():
     "what time do I usually use codex at night",
     "I want to use codex eventually",
     "summarize my notes about how to use codex effectively",
-    "run the report with codex",
-    "add the games using codex",               # trailing form — not imperative-leading
+    # Statements ending in "with codex" — not commands.
+    "I have been working with codex",
+    "the report should run with codex",
     # Negations / questions / non-engine.
     "don't use codex",
     "why use codex?",

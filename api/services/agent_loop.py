@@ -164,17 +164,31 @@ _META_QUESTION_RE = re.compile(
 # are recognized only to keep them out of the model-escalation path.)
 _UNSUPPORTED_ENGINE_RE = re.compile(r"(?i)\b(codex|claude\s*code|gpt|gemini)\b")
 
-# An engine handoff directive must be IMPERATIVE — anchored at the start of the
-# message ("use codex to …", "with claude code, …", "hand this to codex: …"),
-# the way the /codex and /claude slash commands are unambiguous. Anchoring
-# avoids spawning a real worker subprocess on an incidental mid-sentence mention
-# ("remind me to use codex tomorrow", "what time do I usually use codex").
-_ENGINE_DIRECTIVE_RE = re.compile(
+# An engine handoff is an IMPERATIVE command, recognized in two shapes:
+#   - LEADING:  "use codex to add X", "with claude code, …", "hand this to codex: …"
+#   - TRAILING: "add the games using codex", "fix the bug with claude code"
+# Both are anchored (start / end), so an incidental mid-sentence mention
+# ("remind me to use codex tomorrow", "what time do I usually use codex") never
+# spawns a worker subprocess.
+_ENGINE_DIRECTIVE_LEAD_RE = re.compile(
     r"(?i)^\s*(?:please\s+|ok,?\s+|hey,?\s+)?"
     r"(?:use|using|with|via|escalate\s+to|hand\s+(?:this\s+|it\s+)?(?:to|off\s+to)"
     r"|switch\s+to|run\s+(?:this\s+|it\s+)?(?:with|on|in))\s+(codex|claude\s*code)\b"
 )
-# Strips a leading connector left after removing the directive ("...to add X").
+# Trailing: the engine phrase ends the message ("<task> using codex").
+_ENGINE_DIRECTIVE_TRAIL_RE = re.compile(
+    r"(?i)\b(?:using|with|via|through)\s+(codex|claude\s*code)\s*[.!?]*$"
+)
+# A message starting with one of these is a statement/question, NOT an imperative
+# command — so a trailing "with codex" shouldn't route ("I've been working with
+# codex", "the report should run with codex"). Leading-form handoffs are exempt
+# (they begin with the directive verb itself).
+_NON_COMMAND_LEAD_RE = re.compile(
+    r"(?i)^\s*(i|i'?m|i'?ve|i'?d|i'?ll|you|we|my|me|what|what'?s|why|how|when|where|who"
+    r"|is|are|was|were|do|does|did|can|could|would|should|has|have|had|the|a|an|there"
+    r"|it|that|this|maybe|perhaps)\b"
+)
+# Strips a leading connector left after removing a leading directive ("...to add X").
 _LEADING_CONNECTOR_RE = re.compile(r"(?i)^(?:to|and|please)\s+")
 # Strips a trailing model phrase so "use codex with opus" doesn't leak "with
 # opus" into the spawned task (the CLI engine picks its own model).
@@ -185,23 +199,35 @@ def parse_engine_directive(question: str) -> tuple[str, str]:
     """Detect an explicit CLI-engine handoff directive (#305 part b).
 
     Returns ``(engine, task)`` where engine is "codex" / "claude_code" / "".
-    The directive must lead the message (imperative); an incidental mention
-    mid-sentence does not route (it would spawn a real worker subprocess).
-    ``task`` is the request with the directive phrase removed, falling back to
-    the full question if stripping leaves nothing. Negations ("don't use codex")
-    and meta-questions ("why use codex?") return ("", question).
+    Two imperative shapes route — leading ("use codex to add X") and trailing
+    ("add the games using codex"); a mid-sentence mention or a statement
+    ("I've been working with codex") does not. ``task`` is the request with the
+    directive phrase removed, falling back to the full question if stripping
+    leaves nothing. Negations ("don't use codex") and meta-questions ("why use
+    codex?") return ("", question).
     """
     q = question or ""
     if _META_QUESTION_RE.search(q):
         return "", q
-    m = _ENGINE_DIRECTIVE_RE.search(q)
-    if not m or _NEGATION_BEFORE_RE.search(q[:m.start()]):
-        return "", q
-    engine = "codex" if "codex" in m.group(1).lower() else "claude_code"
-    cleaned = q[m.end():].strip(" ,.:;-\t")
-    cleaned = _LEADING_CONNECTOR_RE.sub("", cleaned).strip(" ,.:;-")
-    cleaned = _TRAILING_MODEL_RE.sub("", cleaned).strip(" ,.:;-")
-    return engine, (cleaned or q)
+
+    # Leading imperative: directive at the start, task follows.
+    m = _ENGINE_DIRECTIVE_LEAD_RE.search(q)
+    if m and not _NEGATION_BEFORE_RE.search(q[:m.start()]):
+        engine = "codex" if "codex" in m.group(1).lower() else "claude_code"
+        cleaned = q[m.end():].strip(" ,.:;-\t")
+        cleaned = _LEADING_CONNECTOR_RE.sub("", cleaned).strip(" ,.:;-")
+        cleaned = _TRAILING_MODEL_RE.sub("", cleaned).strip(" ,.:;-")
+        return engine, (cleaned or q)
+
+    # Trailing: "<task> using codex" — only when the message reads as a command
+    # (doesn't start with a pronoun/question/copula word).
+    mt = _ENGINE_DIRECTIVE_TRAIL_RE.search(q)
+    if mt and not _NON_COMMAND_LEAD_RE.search(q) and not _NEGATION_BEFORE_RE.search(q[:mt.start()]):
+        engine = "codex" if "codex" in mt.group(1).lower() else "claude_code"
+        cleaned = q[:mt.start()].strip(" ,.:;-\t")
+        return engine, (cleaned or q)
+
+    return "", q
 
 
 def _parse_escalation_directive(question: str, escalation_model: str) -> str:
