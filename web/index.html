@@ -3933,6 +3933,31 @@
                                 } else if (data.type === 'usage') {
                                     sessionCost += data.cost_usd || 0;
                                     sessionCostEl.textContent = '$' + sessionCost.toFixed(3);
+                                } else if (data.type === 'claude_intent') {
+                                    // Engine handoff (#305b/c): the orchestrator
+                                    // delegated to a CLI worker. Spawn it via the
+                                    // handoff endpoint and reflect it in the thread.
+                                    const engine = data.engine || 'claude_code';
+                                    const label = engine === 'codex' ? 'Codex' : 'Claude Code';
+                                    fullContent = '🤝 Handing off to ' + label + '…';
+                                    updateMessage(msgId, fullContent);
+                                    fetch('/api/chat/handoff', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            engine: engine,
+                                            task: data.task || '',
+                                            conversation_id: currentConversationId,
+                                        }),
+                                    }).then(r => r.json()).then(d => {
+                                        fullContent = (d && d.message)
+                                            ? d.message
+                                            : '⚠️ Handoff to ' + label + ' failed.';
+                                        updateMessage(msgId, fullContent);
+                                    }).catch(() => {
+                                        fullContent = '⚠️ Handoff to ' + label + ' failed.';
+                                        updateMessage(msgId, fullContent);
+                                    });
                                 } else if (data.type === 'done') {
                                     // Add sources and meta to message
                                     const msgEl = document.getElementById(msgId);
