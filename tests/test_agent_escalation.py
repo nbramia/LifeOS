@@ -262,6 +262,74 @@ def test_non_directive_mentions_do_not_escalate(question):
 
 
 # ---------------------------------------------------------------------------
+# multi-tier escalation ladder (#305 part c)
+# ---------------------------------------------------------------------------
+
+def _refusal_history(n):
+    """n consecutive assistant refusals, each followed by a user pushback."""
+    h = []
+    for _ in range(n):
+        h.append(FakeMessage("assistant", _REFUSAL))
+        h.append(FakeMessage("user", _PUSHBACK))
+    return h
+
+
+@pytest.mark.parametrize("n_refusals, expected", [
+    (1, "claude-sonnet-4-6"),   # rung 0 — the escalation model
+    (2, "claude-opus-4-8"),     # rung 1 — opus
+    (3, "claude_code"),         # rung 2 — engine handoff
+    (4, "claude_code"),         # capped at the top rung
+])
+def test_ladder_climbs_with_each_refusal(n_refusals, expected):
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(n_refusals), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert (model, escalated) == (expected, True)
+
+
+def test_ladder_disabled_when_escalation_model_unset():
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(3), _PUSHBACK, base_model="claude-haiku-4-5", escalation_model=""
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_user_directive_overrides_ladder_rung():
+    # Even three deep into the ladder, an explicit "use sonnet" wins.
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(3), "use sonnet",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert (model, escalated) == ("claude-sonnet-4-6", True)
+
+
+def test_count_consecutive_refusals_stops_at_non_refusal():
+    from api.services.agent_loop import _count_consecutive_refusals
+    history = [
+        FakeMessage("assistant", _REFUSAL),          # older refusal (not counted — broken by below)
+        FakeMessage("user", "ok"),
+        FakeMessage("assistant", "Here is the answer."),  # non-refusal stops the count
+        FakeMessage("user", _PUSHBACK),
+        FakeMessage("assistant", _REFUSAL),          # most recent refusal
+    ]
+    assert _count_consecutive_refusals(history) == 1
+
+
+def test_explicit_ladder_setting_overrides_default(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "claude-sonnet-4-6,claude-opus-4-8", raising=False,
+    )
+    # Custom ladder has no engine rung — 3rd refusal caps at opus.
+    model, _ = resolve_orchestrator_model(
+        _refusal_history(3), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert model == "claude-opus-4-8"
+
+
+# ---------------------------------------------------------------------------
 # engine handoff directives (#305 part b)
 # ---------------------------------------------------------------------------
 

@@ -178,6 +178,17 @@ class Settings(BaseSettings):
                     "(e.g. claude-sonnet-4-6 or claude-opus-4-8) to enable. Only "
                     "applies to the Anthropic backend."
     )
+    agent_escalation_ladder: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ESCALATION_LADDER",
+        description="Ordered, comma-separated escalation rungs climbed on each "
+                    "successive refusal+pushback cycle (#305c). Each rung is a "
+                    "model id or an engine name (codex / claude_code, which hand "
+                    "off to a worker session). Empty (default) derives a ladder "
+                    "from LIFEOS_AGENT_ESCALATION_MODEL: that model, then "
+                    "claude-opus-4-8, then claude_code. Example override: "
+                    "'claude-sonnet-4-6,claude-opus-4-8'."
+    )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,
         alias="LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS",

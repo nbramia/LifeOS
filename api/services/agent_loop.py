@@ -106,19 +106,58 @@ def _last_assistant_text(conversation_history) -> str:
     return ""
 
 
+def _is_refusal(text: str) -> bool:
+    """A stale-knowledge world-fact negative OR a give-up phrase — both fixable
+    by a stronger model + web search."""
+    return bool(_REFUSAL_PATTERNS.search(text or "") or _GIVE_UP_PATTERNS.search(text or ""))
+
+
 def should_escalate(conversation_history, question: str) -> bool:
     """True when the prior assistant turn refused/claimed-impossible AND the
     current user message pushes back — the signal to retry on a stronger model."""
     prior = _last_assistant_text(conversation_history)
-    if not prior:
-        return False
-    # Refusal = a stale-knowledge world-fact negative OR a give-up phrase
-    # (knowledge cutoff / "can't access live data") — both are fixable by a
-    # stronger model + web search.
-    refused = _REFUSAL_PATTERNS.search(prior) or _GIVE_UP_PATTERNS.search(prior)
-    if not refused:
+    if not prior or not _is_refusal(prior):
         return False
     return bool(_PUSHBACK_PATTERNS.search(question or ""))
+
+
+def _count_consecutive_refusals(conversation_history) -> int:
+    """Count trailing consecutive *assistant* turns that refused. User turns are
+    transparent; the first non-refusing assistant turn stops the count. Drives
+    the escalation rung (#305c) — each refusal climbs one rung."""
+    n = 0
+    for msg in reversed(conversation_history or []):
+        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+        if role != "assistant":
+            continue
+        content = getattr(msg, "content", None)
+        if content is None and isinstance(msg, dict):
+            content = msg.get("content")
+        if _is_refusal(content or ""):
+            n += 1
+        else:
+            break
+    return n
+
+
+def _escalation_ladder(escalation_model: str) -> list[str]:
+    """Ordered escalation rungs. Uses settings.agent_escalation_ladder if set
+    (comma-separated model ids / engine names), else derives a default from
+    ``escalation_model``: [escalation_model, opus, claude_code]. Empty when
+    escalation isn't configured. Deduped, order preserved."""
+    raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
+    if raw:
+        rungs = [r.strip() for r in raw.split(",") if r.strip()]
+    elif escalation_model:
+        rungs = [escalation_model, _MODEL_ALIASES["opus"], "claude_code"]
+    else:
+        return []
+    seen, out = set(), []
+    for r in rungs:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
 
 
 # User-directed escalation (#305). Tier words the operator can name in a chat
@@ -264,14 +303,23 @@ def resolve_orchestrator_model(
          generic "use a smarter model") — honored regardless of the heuristic,
          since the intent is unambiguous. A named tier works even when
          ``escalation_model`` is unset.
-      2. The auto-heuristic: refuse→pushback retries on ``escalation_model``.
+      2. The auto-escalation ladder (#305c): on refuse→pushback, climb to the
+         rung matching how many times the model has consecutively refused
+         (1st → rung 0, 2nd → rung 1, …). The returned model may be an engine
+         name (codex / claude_code) for the top rung — the caller hands that
+         off to a worker session rather than running the loop on it.
     Otherwise returns ``base_model`` unchanged.
     """
     directed = _parse_escalation_directive(question, escalation_model)
     if directed and directed != base_model:
         return directed, True
-    if escalation_model and escalation_model != base_model and should_escalate(conversation_history, question):
-        return escalation_model, True
+    if should_escalate(conversation_history, question):
+        ladder = _escalation_ladder(escalation_model)
+        if ladder:
+            rung = min(max(_count_consecutive_refusals(conversation_history) - 1, 0), len(ladder) - 1)
+            target = ladder[rung]
+            if target != base_model:
+                return target, True
     return base_model, False
 
 
