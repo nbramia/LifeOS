@@ -94,15 +94,21 @@ _PUSHBACK_PATTERNS = re.compile(
 )
 
 
+def _role_content(msg) -> tuple[str, str]:
+    """Extract (role, content) from a Message object or dict; '' for missing."""
+    role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    return (role or ""), (content if isinstance(content, str) else "")
+
+
 def _last_assistant_text(conversation_history) -> str:
     """Return the most recent assistant message's text, or '' if none."""
     for msg in reversed(conversation_history or []):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+        role, content = _role_content(msg)
         if role == "assistant":
-            content = getattr(msg, "content", None)
-            if content is None and isinstance(msg, dict):
-                content = msg.get("content")
-            return content or ""
+            return content
     return ""
 
 
@@ -121,23 +127,38 @@ def should_escalate(conversation_history, question: str) -> bool:
     return bool(_PUSHBACK_PATTERNS.search(question or ""))
 
 
-def _count_consecutive_refusals(conversation_history) -> int:
-    """Count trailing consecutive *assistant* turns that refused. User turns are
-    transparent; the first non-refusing assistant turn stops the count. Drives
-    the escalation rung (#305c) — each refusal climbs one rung."""
-    n = 0
+def _count_escalation_cycles(conversation_history) -> int:
+    """Count *completed* refusal→pushback cycles in the trailing chain (#305c).
+
+    The current (in-flight) pushback isn't in history; this counts how many
+    times the user already pushed back against a refusal in the immediately
+    preceding alternating chain (… R P R P R). It is NOT a raw refusal count —
+    refusals the user never pushed back on (e.g. an earlier topic) don't inflate
+    the rung. The chain breaks at the first normal exchange (a non-refusing
+    assistant turn or a non-pushback user turn). rung = this count.
+    """
+    cycles = 0
     for msg in reversed(conversation_history or []):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        if role != "assistant":
-            continue
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, dict):
-            content = msg.get("content")
-        if _is_refusal(content or ""):
-            n += 1
-        else:
-            break
-    return n
+        role, content = _role_content(msg)
+        if role == "assistant":
+            if not _is_refusal(content):
+                break
+        elif role == "user":
+            if not _PUSHBACK_PATTERNS.search(content):
+                break
+            cycles += 1
+    return cycles
+
+
+def _original_request(conversation_history, fallback: str) -> str:
+    """The user's original ask before the pushback chain — the most recent user
+    turn that ISN'T a pushback. Used so an engine handoff at the top of the
+    ladder gets the real task, not the bare pushback that triggered it."""
+    for msg in reversed(conversation_history or []):
+        role, content = _role_content(msg)
+        if role == "user" and not _PUSHBACK_PATTERNS.search(content):
+            return content or fallback
+    return fallback
 
 
 def _escalation_ladder(escalation_model: str) -> list[str]:
@@ -314,12 +335,17 @@ def resolve_orchestrator_model(
     if directed and directed != base_model:
         return directed, True
     if should_escalate(conversation_history, question):
-        ladder = _escalation_ladder(escalation_model)
-        if ladder:
-            rung = min(max(_count_consecutive_refusals(conversation_history) - 1, 0), len(ladder) - 1)
-            target = ladder[rung]
-            if target != base_model:
-                return target, True
+        # Auto-escalation is on when an explicit ladder is configured, or when
+        # escalation_model is set to something other than base (the #304 gate —
+        # escalation_model == base means "no stronger model", i.e. disabled).
+        explicit_ladder = bool((getattr(settings, "agent_escalation_ladder", "") or "").strip())
+        if explicit_ladder or (escalation_model and escalation_model != base_model):
+            # Drop base_model from the ladder so a mid-ladder base doesn't stop
+            # the climb (rung==base would otherwise read as "no escalation").
+            ladder = [r for r in _escalation_ladder(escalation_model) if r != base_model]
+            if ladder:
+                rung = min(_count_escalation_cycles(conversation_history), len(ladder) - 1)
+                return ladder[rung], True
     return base_model, False
 
 

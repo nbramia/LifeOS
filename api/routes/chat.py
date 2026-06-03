@@ -1167,8 +1167,13 @@ async def ask_stream(request: AskStreamRequest):
             if escalated and orchestrator_model in ("codex", "claude_code"):
                 _label = "Codex" if orchestrator_model == "codex" else "Claude Code"
                 logger.info("escalation ladder reached engine handoff → %s", _label)
+                # Hand off the ORIGINAL request, not the bare pushback that
+                # triggered the climb ("you're wrong") — the worker has no chat
+                # context.
+                from api.services.agent_loop import _original_request
+                _handoff_task = _original_request(conversation_history, request.question)
                 yield f"data: {json.dumps({'type': 'routing', 'sources': [orchestrator_model], 'reasoning': f'Escalation ladder → {_label}', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': orchestrator_model})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': _handoff_task, 'engine': orchestrator_model})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
             if escalated:
