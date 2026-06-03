@@ -766,12 +766,6 @@ class TelegramBotListener:
 
     _APPROVAL_KEYWORDS = {"approve", "approved", "yes", "go", "proceed", "ok"}
     _REJECTION_KEYWORDS = {"reject", "rejected", "no", "cancel", "stop"}
-    _PLAN_MODE_KEYWORDS = [
-        "refactor", "implement", "redesign", "migrate",
-        "integrate", "build a", "set up a",
-        "rewrite", "overhaul", "replace", "restructure",
-        "add a new", "create a new", "remove all", "delete all",
-    ]
 
     async def _maybe_handle_claude_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
         """If a reply targets a CLI (Claude Code or Codex) completion message,
@@ -805,9 +799,10 @@ class TelegramBotListener:
         return True
 
     def _should_use_plan_mode(self, task: str) -> bool:
-        """Conservative heuristic: plan mode only for complex-sounding tasks."""
-        task_lower = task.lower()
-        return any(kw in task_lower for kw in self._PLAN_MODE_KEYWORDS)
+        """Conservative heuristic: plan mode only for complex-sounding tasks.
+        Delegates to the shared helper so Telegram and web-chat stay in sync."""
+        from api.services.agent_worker.claude_code_spawn import should_use_plan_mode
+        return should_use_plan_mode(task)
 
     async def _handle_claude_command(self, task: str, chat_id: str):
         """Spawn a /claude session by writing a routing='claude_code' row

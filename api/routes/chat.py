@@ -1486,8 +1486,14 @@ async def chat_handoff(request: HandoffRequest):
         from api.services.agent_worker.codex_spawn import spawn_codex_session
         result = spawn_codex_session(SessionStore(), task, working_dir=working_dir, chat_id=chat_id)
     else:
-        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
-        result = spawn_claude_code_session(SessionStore(), task, working_dir=working_dir, chat_id=chat_id)
+        from api.services.agent_worker.claude_code_spawn import (
+            spawn_claude_code_session,
+            should_use_plan_mode,
+        )
+        result = spawn_claude_code_session(
+            SessionStore(), task, working_dir=working_dir,
+            plan_mode=should_use_plan_mode(task), chat_id=chat_id,
+        )
 
     if not result.get("ok"):
         raise HTTPException(status_code=500, detail=result.get("error", "engine spawn failed"))

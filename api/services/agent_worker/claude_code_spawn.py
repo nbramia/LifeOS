@@ -24,6 +24,24 @@ from .session_store import STATUS_CLAIMED, SessionStore, new_session_id
 logger = logging.getLogger(__name__)
 
 
+# Tasks that warrant plan mode (Claude Code presents a plan for approval before
+# making large changes). Shared by every surface that spawns /claude — the
+# Telegram command and the web-chat engine handoff — so the heuristic stays
+# consistent.
+_PLAN_MODE_KEYWORDS = (
+    "refactor", "implement", "redesign", "migrate",
+    "integrate", "build a", "set up a",
+    "rewrite", "overhaul", "replace", "restructure",
+    "add a new", "create a new", "remove all", "delete all",
+)
+
+
+def should_use_plan_mode(task: str) -> bool:
+    """Conservative heuristic: plan mode only for complex-sounding tasks."""
+    t = (task or "").lower()
+    return any(kw in t for kw in _PLAN_MODE_KEYWORDS)
+
+
 def _claude_code_budget() -> dict:
     """Per-session budget. Reuses the Claude wall/cost knobs so operators
     don't have to dual-configure a separate ``LIFEOS_CLAUDE_CODE_*`` set."""
