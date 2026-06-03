@@ -158,30 +158,38 @@ _META_QUESTION_RE = re.compile(
     r"(?i)\b(why|can|could|should|would|do|did|are)\s+(?:you|i|we|they)?\s*"
     r"(?:use|using|used|switch(?:ing)?|escalate)\b"
 )
-# Engine names. Naming one is a handoff request (parse_engine_directive), NOT an
-# inline model swap — _parse_escalation_directive returns '' for these so they
-# never become a model escalation.
+# Engine names that aren't an inline model swap — _parse_escalation_directive
+# returns '' for these so naming one never becomes a model escalation. (codex /
+# claude code ARE wired for a handoff via parse_engine_directive; gpt / gemini
+# are recognized only to keep them out of the model-escalation path.)
 _UNSUPPORTED_ENGINE_RE = re.compile(r"(?i)\b(codex|claude\s*code|gpt|gemini)\b")
 
-# A directive verb followed by a CLI engine name: "use codex", "with claude code",
-# "hand this to codex", "run it with claude code". gpt/gemini aren't wired, so
-# only codex / claude code resolve to a handoff.
+# An engine handoff directive must be IMPERATIVE — anchored at the start of the
+# message ("use codex to …", "with claude code, …", "hand this to codex: …"),
+# the way the /codex and /claude slash commands are unambiguous. Anchoring
+# avoids spawning a real worker subprocess on an incidental mid-sentence mention
+# ("remind me to use codex tomorrow", "what time do I usually use codex").
 _ENGINE_DIRECTIVE_RE = re.compile(
-    r"(?i)\b(?:use|using|with|via|escalate\s+to|hand\s+(?:this\s+|it\s+)?(?:to|off\s+to)"
+    r"(?i)^\s*(?:please\s+|ok,?\s+|hey,?\s+)?"
+    r"(?:use|using|with|via|escalate\s+to|hand\s+(?:this\s+|it\s+)?(?:to|off\s+to)"
     r"|switch\s+to|run\s+(?:this\s+|it\s+)?(?:with|on|in))\s+(codex|claude\s*code)\b"
 )
 # Strips a leading connector left after removing the directive ("...to add X").
 _LEADING_CONNECTOR_RE = re.compile(r"(?i)^(?:to|and|please)\s+")
+# Strips a trailing model phrase so "use codex with opus" doesn't leak "with
+# opus" into the spawned task (the CLI engine picks its own model).
+_TRAILING_MODEL_RE = re.compile(r"(?i)\b(?:with|using|on)\s+(?:claude\s+)?(?:opus|sonnet|haiku)\s*$")
 
 
 def parse_engine_directive(question: str) -> tuple[str, str]:
     """Detect an explicit CLI-engine handoff directive (#305 part b).
 
     Returns ``(engine, task)`` where engine is "codex" / "claude_code" / "".
-    ``task`` is the request with the directive phrase removed (so the spawned
-    session gets the actual ask, not "use codex to ..."), falling back to the
-    full question if stripping leaves nothing. Negations ("don't use codex") and
-    meta-questions ("why use codex?") return ("", question).
+    The directive must lead the message (imperative); an incidental mention
+    mid-sentence does not route (it would spawn a real worker subprocess).
+    ``task`` is the request with the directive phrase removed, falling back to
+    the full question if stripping leaves nothing. Negations ("don't use codex")
+    and meta-questions ("why use codex?") return ("", question).
     """
     q = question or ""
     if _META_QUESTION_RE.search(q):
@@ -190,8 +198,9 @@ def parse_engine_directive(question: str) -> tuple[str, str]:
     if not m or _NEGATION_BEFORE_RE.search(q[:m.start()]):
         return "", q
     engine = "codex" if "codex" in m.group(1).lower() else "claude_code"
-    cleaned = (q[:m.start()] + " " + q[m.end():]).strip(" ,.:;-\t")
+    cleaned = q[m.end():].strip(" ,.:;-\t")
     cleaned = _LEADING_CONNECTOR_RE.sub("", cleaned).strip(" ,.:;-")
+    cleaned = _TRAILING_MODEL_RE.sub("", cleaned).strip(" ,.:;-")
     return engine, (cleaned or q)
 
 
