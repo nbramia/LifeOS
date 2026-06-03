@@ -152,11 +152,9 @@ class EmbeddingService:
         behaviour is to skip the network probe entirely.
 
         Thread safety: mutates ``os.environ`` for the duration of the retry.
-        ``EmbeddingService`` is a process-wide singleton loaded lazily on
-        first access (typically the background sync worker), so concurrent
-        loads don't happen in practice. The try/finally restores the env
-        before any other code can observe it. If a future caller starts
-        triggering loads from multiple threads at once, wrap this in a lock.
+        This runs inside ``EmbeddingService._load_lock`` (the ``model`` property
+        serializes lazy loads), so the env swap can't race a concurrent load,
+        and the try/finally restores it before the lock is released.
         """
         try:
             return st_cls(**load_kwargs)
