@@ -275,3 +275,52 @@ class TestComposeIntentDetection:
         assert not detect_compose_intent("what's on my calendar")
         assert not detect_compose_intent("tell me about Kevin")
         assert not detect_compose_intent("search my notes for project updates")
+
+
+class TestHandoffEndpoint:
+    """Test the /api/chat/handoff engine-handoff endpoint (#305b/c, web surface)."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    def test_handoff_spawns_codex(self, client):
+        with patch(
+            "api.services.agent_worker.codex_spawn.spawn_codex_session",
+            return_value={"ok": True, "session_id": "sess_codex_abc123"},
+        ) as m:
+            r = client.post("/api/chat/handoff", json={"engine": "codex", "task": "add the world cup games"})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["ok"] is True
+        assert d["engine"] == "codex"
+        assert d["session_id"] == "sess_codex_abc123"
+        assert m.called
+        # The real task (not a directive phrase) was forwarded.
+        assert m.call_args.args[1] == "add the world cup games"
+
+    def test_handoff_spawns_claude_code(self, client):
+        with patch(
+            "api.services.agent_worker.claude_code_spawn.spawn_claude_code_session",
+            return_value={"ok": True, "session_id": "sess_cc_xyz"},
+        ) as m:
+            r = client.post("/api/chat/handoff", json={"engine": "claude_code", "task": "refactor the parser"})
+        assert r.status_code == 200
+        assert r.json()["engine"] == "claude_code"
+        assert m.called
+
+    def test_handoff_rejects_unknown_engine(self, client):
+        r = client.post("/api/chat/handoff", json={"engine": "gpt", "task": "x"})
+        assert r.status_code == 400
+
+    def test_handoff_rejects_empty_task(self, client):
+        r = client.post("/api/chat/handoff", json={"engine": "codex", "task": "   "})
+        assert r.status_code == 400
+
+    def test_handoff_surfaces_spawn_failure(self, client):
+        with patch(
+            "api.services.agent_worker.codex_spawn.spawn_codex_session",
+            return_value={"ok": False, "error": "no prompt"},
+        ):
+            r = client.post("/api/chat/handoff", json={"engine": "codex", "task": "do a thing"})
+        assert r.status_code == 500

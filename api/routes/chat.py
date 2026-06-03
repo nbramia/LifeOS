@@ -1448,3 +1448,76 @@ async def save_to_vault(request: SaveToVaultRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save: {e}")
+
+
+class HandoffRequest(BaseModel):
+    """Web-chat → CLI-engine handoff (#305b/c)."""
+    engine: str  # "codex" | "claude_code"
+    task: str
+    conversation_id: Optional[str] = None
+
+
+@router.post("/chat/handoff")
+async def chat_handoff(request: HandoffRequest):
+    """Spawn a CLI engine worker session from the web chat.
+
+    The web UI calls this when the orchestrator emits a `claude_intent` event it
+    can't act on inline (an explicit "use codex" handoff, or the top rung of the
+    escalation ladder). The session runs in the agent worker and reports its
+    result via Telegram and `/agents`; we record an acknowledgment in the
+    conversation thread so the web UI reflects the handoff.
+    """
+    engine = (request.engine or "").strip()
+    task = (request.task or "").strip()
+    if engine not in ("codex", "claude_code"):
+        raise HTTPException(status_code=400, detail="engine must be 'codex' or 'claude_code'")
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+
+    from api.services.directory_resolver import resolve_working_directory
+    from api.services.agent_worker.session_store import SessionStore
+
+    working_dir = resolve_working_directory(task)
+    # Route the worker's completion notification to the operator's Telegram (the
+    # web thread can't receive an async result yet). None if Telegram isn't set.
+    chat_id = getattr(settings, "telegram_chat_id", "") or None
+
+    if engine == "codex":
+        from api.services.agent_worker.codex_spawn import spawn_codex_session
+        result = spawn_codex_session(SessionStore(), task, working_dir=working_dir, chat_id=chat_id)
+    else:
+        from api.services.agent_worker.claude_code_spawn import (
+            spawn_claude_code_session,
+            should_use_plan_mode,
+        )
+        result = spawn_claude_code_session(
+            SessionStore(), task, working_dir=working_dir,
+            plan_mode=should_use_plan_mode(task), chat_id=chat_id,
+        )
+
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error", "engine spawn failed"))
+
+    label = "Codex" if engine == "codex" else "Claude Code"
+    session_id = result.get("session_id", "")
+    ack = (
+        f"🤝 Handed off to **{label}** — running in the background "
+        f"(session `{session_id[:12]}`). The result will arrive via Telegram and "
+        f"appear on the /agents page."
+    )
+    if request.conversation_id:
+        try:
+            get_store().add_message(
+                request.conversation_id, "assistant", ack,
+                routing={"reasoning": f"engine handoff → {label}", "sources": [engine]},
+            )
+        except Exception:
+            logger.warning("failed to record handoff acknowledgment", exc_info=True)
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "engine": engine,
+        "working_dir": working_dir,
+        "message": ack,
+    }
