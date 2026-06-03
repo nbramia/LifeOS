@@ -94,31 +94,91 @@ _PUSHBACK_PATTERNS = re.compile(
 )
 
 
+def _role_content(msg) -> tuple[str, str]:
+    """Extract (role, content) from a Message object or dict; '' for missing."""
+    role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    return (role or ""), (content if isinstance(content, str) else "")
+
+
 def _last_assistant_text(conversation_history) -> str:
     """Return the most recent assistant message's text, or '' if none."""
     for msg in reversed(conversation_history or []):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+        role, content = _role_content(msg)
         if role == "assistant":
-            content = getattr(msg, "content", None)
-            if content is None and isinstance(msg, dict):
-                content = msg.get("content")
-            return content or ""
+            return content
     return ""
+
+
+def _is_refusal(text: str) -> bool:
+    """A stale-knowledge world-fact negative OR a give-up phrase — both fixable
+    by a stronger model + web search."""
+    return bool(_REFUSAL_PATTERNS.search(text or "") or _GIVE_UP_PATTERNS.search(text or ""))
 
 
 def should_escalate(conversation_history, question: str) -> bool:
     """True when the prior assistant turn refused/claimed-impossible AND the
     current user message pushes back — the signal to retry on a stronger model."""
     prior = _last_assistant_text(conversation_history)
-    if not prior:
-        return False
-    # Refusal = a stale-knowledge world-fact negative OR a give-up phrase
-    # (knowledge cutoff / "can't access live data") — both are fixable by a
-    # stronger model + web search.
-    refused = _REFUSAL_PATTERNS.search(prior) or _GIVE_UP_PATTERNS.search(prior)
-    if not refused:
+    if not prior or not _is_refusal(prior):
         return False
     return bool(_PUSHBACK_PATTERNS.search(question or ""))
+
+
+def _count_escalation_cycles(conversation_history) -> int:
+    """Count *completed* refusal→pushback cycles in the trailing chain (#305c).
+
+    The current (in-flight) pushback isn't in history; this counts how many
+    times the user already pushed back against a refusal in the immediately
+    preceding alternating chain (… R P R P R). It is NOT a raw refusal count —
+    refusals the user never pushed back on (e.g. an earlier topic) don't inflate
+    the rung. The chain breaks at the first normal exchange (a non-refusing
+    assistant turn or a non-pushback user turn). rung = this count.
+    """
+    cycles = 0
+    for msg in reversed(conversation_history or []):
+        role, content = _role_content(msg)
+        if role == "assistant":
+            if not _is_refusal(content):
+                break
+        elif role == "user":
+            if not _PUSHBACK_PATTERNS.search(content):
+                break
+            cycles += 1
+    return cycles
+
+
+def _original_request(conversation_history, fallback: str) -> str:
+    """The user's original ask before the pushback chain — the most recent user
+    turn that ISN'T a pushback. Used so an engine handoff at the top of the
+    ladder gets the real task, not the bare pushback that triggered it."""
+    for msg in reversed(conversation_history or []):
+        role, content = _role_content(msg)
+        if role == "user" and not _PUSHBACK_PATTERNS.search(content):
+            return content or fallback
+    return fallback
+
+
+def _escalation_ladder(escalation_model: str) -> list[str]:
+    """Ordered escalation rungs. Uses settings.agent_escalation_ladder if set
+    (comma-separated model ids / engine names), else derives a default from
+    ``escalation_model``: [escalation_model, opus, claude_code]. Empty when
+    escalation isn't configured. Deduped, order preserved."""
+    raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
+    if raw:
+        rungs = [r.strip() for r in raw.split(",") if r.strip()]
+    elif escalation_model:
+        rungs = [escalation_model, _MODEL_ALIASES["opus"], "claude_code"]
+    else:
+        return []
+    seen, out = set(), []
+    for r in rungs:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
 
 
 # User-directed escalation (#305). Tier words the operator can name in a chat
@@ -264,14 +324,28 @@ def resolve_orchestrator_model(
          generic "use a smarter model") — honored regardless of the heuristic,
          since the intent is unambiguous. A named tier works even when
          ``escalation_model`` is unset.
-      2. The auto-heuristic: refuse→pushback retries on ``escalation_model``.
+      2. The auto-escalation ladder (#305c): on refuse→pushback, climb to the
+         rung matching how many times the model has consecutively refused
+         (1st → rung 0, 2nd → rung 1, …). The returned model may be an engine
+         name (codex / claude_code) for the top rung — the caller hands that
+         off to a worker session rather than running the loop on it.
     Otherwise returns ``base_model`` unchanged.
     """
     directed = _parse_escalation_directive(question, escalation_model)
     if directed and directed != base_model:
         return directed, True
-    if escalation_model and escalation_model != base_model and should_escalate(conversation_history, question):
-        return escalation_model, True
+    if should_escalate(conversation_history, question):
+        # Auto-escalation is on when an explicit ladder is configured, or when
+        # escalation_model is set to something other than base (the #304 gate —
+        # escalation_model == base means "no stronger model", i.e. disabled).
+        explicit_ladder = bool((getattr(settings, "agent_escalation_ladder", "") or "").strip())
+        if explicit_ladder or (escalation_model and escalation_model != base_model):
+            # Drop base_model from the ladder so a mid-ladder base doesn't stop
+            # the climb (rung==base would otherwise read as "no escalation").
+            ladder = [r for r in _escalation_ladder(escalation_model) if r != base_model]
+            if ladder:
+                rung = min(_count_escalation_cycles(conversation_history), len(ladder) - 1)
+                return ladder[rung], True
     return base_model, False
 
 

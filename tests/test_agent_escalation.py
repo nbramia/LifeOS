@@ -262,6 +262,120 @@ def test_non_directive_mentions_do_not_escalate(question):
 
 
 # ---------------------------------------------------------------------------
+# multi-tier escalation ladder (#305 part c)
+# ---------------------------------------------------------------------------
+
+def _refusal_history(n):
+    """The history the store holds when the user is about to send their n-th
+    pushback: n refusals with (n-1) interleaved pushbacks, ending in a refusal.
+    The n-th pushback itself is the (separate) current `question`."""
+    h = []
+    for i in range(n):
+        if i > 0:
+            h.append(FakeMessage("user", _PUSHBACK))
+        h.append(FakeMessage("assistant", _REFUSAL))
+    return h
+
+
+@pytest.mark.parametrize("n_refusals, expected", [
+    (1, "claude-sonnet-4-6"),   # rung 0 — the escalation model
+    (2, "claude-opus-4-8"),     # rung 1 — opus
+    (3, "claude_code"),         # rung 2 — engine handoff
+    (4, "claude_code"),         # capped at the top rung
+])
+def test_ladder_climbs_with_each_refusal(n_refusals, expected):
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(n_refusals), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert (model, escalated) == (expected, True)
+
+
+def test_ladder_disabled_when_escalation_model_unset():
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(3), _PUSHBACK, base_model="claude-haiku-4-5", escalation_model=""
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_user_directive_overrides_ladder_rung():
+    # Even three deep into the ladder, an explicit "use sonnet" wins.
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(3), "use sonnet",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert (model, escalated) == ("claude-sonnet-4-6", True)
+
+
+def test_escalation_cycles_breaks_on_normal_exchange():
+    from api.services.agent_loop import _count_escalation_cycles
+    # An earlier refusal the user never pushed back on (a normal question follows)
+    # must NOT inflate the count — the chain breaks at that normal exchange.
+    history = [
+        FakeMessage("assistant", _REFUSAL),               # earlier topic refusal
+        FakeMessage("user", "ok, different question"),    # NOT a pushback → breaks chain
+        FakeMessage("assistant", _REFUSAL),               # fresh refusal
+    ]
+    assert _count_escalation_cycles(history) == 0  # only the fresh refusal, no prior cycle
+
+
+def test_escalation_cycles_counts_pushback_chain():
+    from api.services.agent_loop import _count_escalation_cycles
+    # R, P, R, P, R  → two completed cycles (two prior pushbacks).
+    assert _count_escalation_cycles(_refusal_history(3)) == 2
+
+
+def test_stale_refusals_do_not_jump_to_engine_rung():
+    """Regression (#309 review): refusals on an earlier topic the user never
+    pushed back on must not catapult the first fresh pushback to the engine."""
+    history = [
+        FakeMessage("user", "question one"),
+        FakeMessage("assistant", _REFUSAL),
+        FakeMessage("user", "question two"),    # moved on — no pushback
+        FakeMessage("assistant", _REFUSAL),     # fresh refusal, user about to push back
+    ]
+    model, escalated = resolve_orchestrator_model(
+        history, _PUSHBACK, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+    )
+    assert (model, escalated) == ("claude-sonnet-4-6", True)  # rung 0, not the engine
+
+
+def test_engine_handoff_recovers_original_request():
+    from api.services.agent_loop import _original_request
+    history = [
+        FakeMessage("user", "add the world cup games to my calendar"),
+        FakeMessage("assistant", _REFUSAL),
+        FakeMessage("user", _PUSHBACK),
+        FakeMessage("assistant", _REFUSAL),
+    ]
+    assert _original_request(history, "fallback") == "add the world cup games to my calendar"
+
+
+def test_base_model_filtered_from_ladder():
+    # base=opus is mid-ladder ([sonnet, opus, claude_code]); filtering opus keeps
+    # the climb going instead of stalling on the rung that equals base.
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(2), _PUSHBACK,
+        base_model="claude-opus-4-8", escalation_model="claude-sonnet-4-6",
+    )
+    # ladder after filtering opus = [sonnet, claude_code]; cycles=1 → rung 1.
+    assert (model, escalated) == ("claude_code", True)
+
+
+def test_explicit_ladder_setting_overrides_default(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "claude-sonnet-4-6,claude-opus-4-8", raising=False,
+    )
+    # Custom ladder has no engine rung — 3rd refusal caps at opus.
+    model, _ = resolve_orchestrator_model(
+        _refusal_history(3), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+    )
+    assert model == "claude-opus-4-8"
+
+
+# ---------------------------------------------------------------------------
 # engine handoff directives (#305 part b)
 # ---------------------------------------------------------------------------
 

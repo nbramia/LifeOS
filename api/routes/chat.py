@@ -1161,6 +1161,21 @@ async def ask_stream(request: AskStreamRequest):
                 orchestrator_model, escalated = resolve_orchestrator_model(
                     conversation_history, request.question, orchestrator_model, escalation_model
                 )
+            # Top of the escalation ladder (#305c): when repeated refusals exhaust
+            # the model rungs, resolve returns an engine name — hand off to that
+            # worker session instead of running the loop on a non-model.
+            if escalated and orchestrator_model in ("codex", "claude_code"):
+                _label = "Codex" if orchestrator_model == "codex" else "Claude Code"
+                logger.info("escalation ladder reached engine handoff → %s", _label)
+                # Hand off the ORIGINAL request, not the bare pushback that
+                # triggered the climb ("you're wrong") — the worker has no chat
+                # context.
+                from api.services.agent_loop import _original_request
+                _handoff_task = _original_request(conversation_history, request.question)
+                yield f"data: {json.dumps({'type': 'routing', 'sources': [orchestrator_model], 'reasoning': f'Escalation ladder → {_label}', 'latency_ms': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': _handoff_task, 'engine': orchestrator_model})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
             if escalated:
                 logger.info("escalating chat turn to %s (user-directed or refusal+pushback)", orchestrator_model)
             _trace = _current_trace.get()
