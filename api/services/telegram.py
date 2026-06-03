@@ -253,6 +253,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     conv_id = conversation_id
     claude_intent = False
     task = None
+    engine = "claude_code"
     sources = []
     statuses = []
     perf_trace = None
@@ -283,6 +284,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
                 elif etype == "claude_intent":
                     claude_intent = True
                     task = event.get("task", question)
+                    engine = event.get("engine", "claude_code")
                 elif etype == "status":
                     statuses.append(event.get("message", ""))
                 elif etype == "sources":
@@ -299,6 +301,7 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
         "conversation_id": conv_id,
         "claude_intent": claude_intent,
         "task": task,
+        "engine": engine,
         "sources": sources,
         "statuses": statuses,
         "perf_trace": perf_trace,
@@ -645,13 +648,17 @@ class TelegramBotListener:
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 
-            # Check if the chat pipeline detected a "code" intent
+            # Check if the chat pipeline detected a code intent or an explicit
+            # engine handoff ("use codex" / "use claude code", #305b).
             if result.get("claude_intent"):
-                # Natural-language intent classifier flagged this as a
-                # Claude Code task (terminal / filesystem / browser work).
                 task = result.get("task", text)
-                logger.info(f"Claude intent detected, invoking Claude Code: {task[:50]}...")
-                await self._handle_claude_command(task, chat_id)
+                engine = result.get("engine", "claude_code")
+                if engine == "codex":
+                    logger.info(f"Engine handoff → Codex: {task[:50]}...")
+                    await self._handle_codex_command(task, chat_id)
+                else:
+                    logger.info(f"Engine handoff → Claude Code: {task[:50]}...")
+                    await self._handle_claude_command(task, chat_id)
                 return
 
             answer = result["answer"]

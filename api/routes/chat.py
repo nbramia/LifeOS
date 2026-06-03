@@ -1074,6 +1074,20 @@ async def ask_stream(request: AskStreamRequest):
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
+            # Explicit engine handoff (#305 part b): the user named a CLI engine
+            # ("use codex", "use claude code"). Hand the task off to that worker
+            # session rather than answering inline — the surface (Telegram) spawns
+            # it and reports back. Explicit intent, so it precedes classification
+            # and the agentic loop.
+            from api.services.agent_loop import parse_engine_directive
+            _engine, _engine_task = parse_engine_directive(request.question)
+            if _engine:
+                _label = "Codex" if _engine == "codex" else "Claude Code"
+                yield f"data: {json.dumps({'type': 'routing', 'sources': [_engine], 'reasoning': f'User-directed handoff to {_label}', 'latency_ms': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': _engine_task, 'engine': _engine})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
             # Intent classification for special dispatch cases only.
             # Compose, task, and reminder intents now flow through the agentic
             # loop which has dedicated tools (create_email_draft, manage_tasks,
@@ -1097,7 +1111,7 @@ async def ask_stream(request: AskStreamRequest):
                 # ---- CLAUDE CODE: requires terminal/filesystem/browser ----
                 print("DETECTED CLAUDE INTENT - delegating to Claude Code")
                 yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 

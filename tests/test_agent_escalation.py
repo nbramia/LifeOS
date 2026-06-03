@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import pytest
 
 from api.services.agent_loop import (
+    parse_engine_directive,
     resolve_orchestrator_model,
     should_escalate,
     _select_client,
@@ -258,6 +259,48 @@ def test_non_directive_mentions_do_not_escalate(question):
         [], question, base_model="claude-haiku-4-5", escalation_model="claude-opus-4-8"
     )
     assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+# ---------------------------------------------------------------------------
+# engine handoff directives (#305 part b)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question, engine, task", [
+    ("use codex to add the world cup games", "codex", "add the world cup games"),
+    ("use claude code to refactor the parser", "claude_code", "refactor the parser"),
+    ("with codex, summarize the repo", "codex", "summarize the repo"),
+    ("add the games using codex", "codex", "add the games"),
+    ("hand this to codex: fix the failing test", "codex", "fix the failing test"),
+])
+def test_engine_directive_routes_and_cleans_task(question, engine, task):
+    assert parse_engine_directive(question) == (engine, task)
+
+
+def test_engine_directive_distinguishes_codex_from_claude_code():
+    assert parse_engine_directive("use codex")[0] == "codex"
+    assert parse_engine_directive("use claude code")[0] == "claude_code"
+
+
+@pytest.mark.parametrize("question", [
+    "don't use codex",
+    "why use codex?",
+    "can you use claude code?",
+    "summarize my codex integration notes",   # 'my codex' — no directive verb
+    "use opus",                                 # a model, not an engine
+    "what's on my calendar today",
+])
+def test_non_engine_directives_return_no_engine(question):
+    engine, task = parse_engine_directive(question)
+    assert engine == ""
+    assert task == question  # task falls back to the original question
+
+
+def test_engine_directive_with_no_task_falls_back_to_question():
+    # The directive is the whole message — nothing to clean to, so the spawned
+    # session gets the original text rather than an empty prompt.
+    engine, task = parse_engine_directive("use codex")
+    assert engine == "codex"
+    assert task == "use codex"
 
 
 # ---------------------------------------------------------------------------
