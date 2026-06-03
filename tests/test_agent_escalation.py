@@ -278,10 +278,9 @@ def _refusal_history(n):
 
 
 @pytest.mark.parametrize("n_refusals, expected", [
-    (1, "claude-sonnet-4-6"),   # rung 0 — the escalation model
-    (2, "claude-opus-4-8"),     # rung 1 — opus
-    (3, "claude_code"),         # rung 2 — engine handoff
-    (4, "claude_code"),         # capped at the top rung
+    (1, "claude-sonnet-4-6"),   # rung 0 — the escalation model (1st pushback)
+    (2, "claude_code"),         # rung 1 — engine handoff (2nd pushback)
+    (3, "claude_code"),         # capped at the top rung
 ])
 def test_ladder_climbs_with_each_refusal(n_refusals, expected):
     model, escalated = resolve_orchestrator_model(
@@ -351,9 +350,13 @@ def test_engine_handoff_recovers_original_request():
     assert _original_request(history, "fallback") == "add the world cup games to my calendar"
 
 
-def test_base_model_filtered_from_ladder():
-    # base=opus is mid-ladder ([sonnet, opus, claude_code]); filtering opus keeps
-    # the climb going instead of stalling on the rung that equals base.
+def test_base_model_filtered_from_ladder(monkeypatch):
+    # Explicit 3-rung ladder with base=opus mid-ladder; filtering opus keeps the
+    # climb going instead of stalling on the rung that equals base.
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "claude-sonnet-4-6,claude-opus-4-8,claude_code", raising=False,
+    )
     model, escalated = resolve_orchestrator_model(
         _refusal_history(2), _PUSHBACK,
         base_model="claude-opus-4-8", escalation_model="claude-sonnet-4-6",

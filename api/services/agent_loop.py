@@ -164,13 +164,16 @@ def _original_request(conversation_history, fallback: str) -> str:
 def _escalation_ladder(escalation_model: str) -> list[str]:
     """Ordered escalation rungs. Uses settings.agent_escalation_ladder if set
     (comma-separated model ids / engine names), else derives a default from
-    ``escalation_model``: [escalation_model, opus, claude_code]. Empty when
-    escalation isn't configured. Deduped, order preserved."""
+    ``escalation_model``: [escalation_model, claude_code] — so the engine
+    handoff lands on the 2nd pushback (1st → stronger model, 2nd → Claude Code).
+    Set the env var to e.g. 'claude-sonnet-4-6,claude-opus-4-8,claude_code' to
+    insert an opus rung in between. Empty when escalation isn't configured.
+    Deduped, order preserved."""
     raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
     if raw:
         rungs = [r.strip() for r in raw.split(",") if r.strip()]
     elif escalation_model:
-        rungs = [escalation_model, _MODEL_ALIASES["opus"], "claude_code"]
+        rungs = [escalation_model, "claude_code"]
     else:
         return []
     seen, out = set(), []

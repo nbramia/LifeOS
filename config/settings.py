@@ -185,9 +185,10 @@ class Settings(BaseSettings):
                     "successive refusal+pushback cycle (#305c). Each rung is a "
                     "model id or an engine name (codex / claude_code, which hand "
                     "off to a worker session). Empty (default) derives a ladder "
-                    "from LIFEOS_AGENT_ESCALATION_MODEL: that model, then "
-                    "claude-opus-4-8, then claude_code. Example override: "
-                    "'claude-sonnet-4-6,claude-opus-4-8'."
+                    "from LIFEOS_AGENT_ESCALATION_MODEL: [that model, claude_code] "
+                    "— so the Claude Code handoff lands on the 2nd pushback. "
+                    "Override to insert rungs, e.g. "
+                    "'claude-sonnet-4-6,claude-opus-4-8,claude_code'."
     )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,
