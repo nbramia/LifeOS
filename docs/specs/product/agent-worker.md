@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-05-28
+> **Last Updated:** 2026-06-03
 
 LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -88,7 +88,7 @@ You can put a budget in the task title. The preflight parses natural-language hi
 | `max $0.50` / `budget $1.00` | `max_dollars` |
 | `10k tokens` / `50000 tokens` | `max_tokens` |
 
-If no budget appears in the title, defaults from `.env` apply (default `$5.00`, `~4 hours wall`, `500k tokens`). The worker enforces all three caps externally — it kills the session when any is breached and the task lands at `#agent-budget-exceeded`.
+If no budget appears in the title, defaults from `.env` apply (default `$5.00`, `~4 hours wall`, `500k tokens`). The worker enforces the wall and token caps externally for every route — it kills the session when either is breached and the task lands at `#agent-budget-exceeded`. The **dollar cap is enforced only on the cloud Claude (Managed Agents / API) route**, the only one with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never stops the task.
 
 There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost crosses the cap, the worker stops claiming new tasks until the next local midnight. Tasks already running aren't killed.
 

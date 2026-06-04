@@ -160,6 +160,62 @@ def test_executor_handles_full_stream(stores, monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_high_cost_does_not_cap_subscription_route(stores, monkeypatch, tmp_path):
+    """Codex is subscription-billed — a high reported cost must NOT cap the task.
+    Only the managed/API route enforces a dollar cap. Here the turn reports
+    2M+2M tokens (~$70 rolled up) against a $0.001 cap; under the old behavior
+    that was BUDGET_EXCEEDED, now it completes (cost is tracked, not enforced)."""
+    monkeypatch.setattr(
+        "api.services.agent_worker.codex_executor.settings.claude_max_cost_usd",
+        0.001,
+    )
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_cost",
+        session_id="sess_codex_cost",
+        status="claimed",
+        routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text",
+        origin="operator",
+    )
+
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-cost"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 2_000_000, "cached_input_tokens": 0,
+                "output_tokens": 2_000_000, "reasoning_output_tokens": 0,
+            },
+        },
+    ]
+    fake_proc = _FakeProc(lines, returncode=0)
+
+    def fake_spawn(cmd, **kwargs):
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("done\n")
+        return fake_proc
+
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        notification_callback=lambda _m: None,
+        spawn_fn=fake_spawn,
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "expensive", "working_dir": str(tmp_path)})
+    assert outcome.status == STATUS_COMPLETED
+    assert sess_store.get(session.task_id).status == STATUS_COMPLETED
+
+
+@pytest.mark.unit
 def test_executor_prepends_capabilities_preamble(stores, monkeypatch, tmp_path):
     """A fresh /codex turn carries the LifeOS capabilities briefing so the
     agent has the same situational awareness as the managed/local routes."""

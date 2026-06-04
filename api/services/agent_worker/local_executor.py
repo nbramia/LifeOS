@@ -385,8 +385,10 @@ class LocalExecutor:
             tokens_used = (updated.total_input_tokens or 0) + (updated.total_output_tokens or 0)
             if budget.get("max_tokens") and tokens_used >= budget["max_tokens"]:
                 return self._finalize_budget_exceeded(session, "max_tokens")
-            if budget.get("max_dollars") is not None and (updated.total_dollars or 0) >= budget["max_dollars"]:
-                return self._finalize_budget_exceeded(session, "max_dollars")
+            # No per-session dollar cap on the local route — local inference is
+            # free, so total_dollars is always 0. (max_tokens + wall_seconds still
+            # bound runaway sessions; the lineage guard below still caps a family
+            # whose *root* is a paid managed session.)
 
             # Lineage budget — for sessions with descendants, the *root* budget
             # caps the total spend across the family. When breached we cascade-
