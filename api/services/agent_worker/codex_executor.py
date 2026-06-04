@@ -34,7 +34,6 @@ from typing import Callable, Optional
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
-    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -103,7 +102,6 @@ def _delegation_header(session_id: str) -> str:
 
 
 # Reason codes returned in ``ExecutorOutcome.reason``.
-REASON_COST_CAP_EXCEEDED = "cost_cap_exceeded"
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
 
@@ -122,7 +120,6 @@ class _RunState:
     model: str = "gpt-5.5"
     final_text: str = ""
     cost_usd: float = 0.0
-    cost_cap_exceeded: bool = False
     tool_call_count: int = 0
     last_activity: str = ""
     last_usage: dict = field(default_factory=dict)
@@ -364,18 +361,6 @@ class CodexExecutor:
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
-        if state.cost_cap_exceeded:
-            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
-            self.transcript_store.append(sid, "codex_cost_cap_exceeded", {
-                "cost_usd": state.cost_usd,
-                "cap_usd": settings.claude_max_cost_usd,
-            })
-            return ExecutorOutcome(
-                status=STATUS_BUDGET_EXCEEDED,
-                reason=REASON_COST_CAP_EXCEEDED,
-                final_text=state.final_text,
-            )
-
         if proc.returncode == 0 or state.terminal:
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(sid, "codex_completed", {
@@ -491,12 +476,11 @@ class CodexExecutor:
             usage = event.get("usage") or {}
             if usage:
                 state.last_usage = usage
+                # Track cost for /agents reporting, but DON'T cap it — the Codex
+                # route is subscription-billed, so there's no marginal per-task
+                # cost to cap. Only the managed/API route enforces max_dollars.
+                # Wall-clock and the CLI's own limits still bound runaway sessions.
                 state.cost_usd = _cost_from_usage(usage, state.model)
-                cap = float(settings.claude_max_cost_usd or 0.0)
-                if cap > 0 and state.cost_usd > cap:
-                    state.cost_cap_exceeded = True
-                    state.terminal = True
-                    return
             return
 
         if etype in ("session.completed", "exec.completed"):

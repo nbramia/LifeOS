@@ -23,12 +23,10 @@ from api.services.agent_worker.claude_code_executor import (
     REASON_AWAITING_CLARIFICATION,
     REASON_AWAITING_PLAN_APPROVAL,
     REASON_BINARY_NOT_FOUND,
-    REASON_COST_CAP_EXCEEDED,
     ClaudeCodeExecutor,
 )
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
-    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     SessionStore,
@@ -288,21 +286,24 @@ def test_plan_mode_result_returns_blocked_with_plan(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_cost_cap_exceeded_returns_budget_exceeded(tmp_path: Path, monkeypatch):
+def test_high_cost_does_not_cap_subscription_route(tmp_path: Path, monkeypatch):
+    """Claude Code is subscription-billed — a high reported cost must NOT cap the
+    task. Only the managed/API route enforces a dollar cap. Even with a tiny
+    claude_max_cost_usd, a $0.99 turn completes normally (cost is still tracked
+    for /agents reporting, just not enforced)."""
     monkeypatch.setattr(
         "api.services.agent_worker.claude_code_executor.settings.claude_max_cost_usd",
         0.10,
     )
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
-        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.99, "result": "x"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.99, "result": "done"},
     ]
     executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with(events))
     session = _seed_session(store)
     outcome = executor.execute(session, {"description": "expensive task"})
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
-    assert outcome.reason == REASON_COST_CAP_EXCEEDED
-    assert store.get(session.task_id).status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_COMPLETED
+    assert store.get(session.task_id).status == STATUS_COMPLETED
 
 
 def test_binary_not_found_returns_failed(tmp_path: Path):

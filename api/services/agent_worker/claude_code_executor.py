@@ -23,7 +23,6 @@ from typing import Callable, Optional
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
-    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -138,7 +137,6 @@ The user will review and approve the plan before you proceed.
 # to discriminate without parsing prose.
 REASON_AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
 REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
-REASON_COST_CAP_EXCEEDED = "cost_cap_exceeded"
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
 
@@ -156,7 +154,6 @@ class _RunState:
     awaiting_approval: bool = False   # plan-mode result event reached
     awaiting_clarification: bool = False
     cost_usd: float = 0.0
-    cost_cap_exceeded: bool = False
     last_activity: str = ""
     notifications_sent: int = 0
     started_at: float = field(default_factory=time.time)
@@ -396,18 +393,6 @@ class ClaudeCodeExecutor:
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
-        if state.cost_cap_exceeded:
-            self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
-            self.transcript_store.append(sid, "claude_code_cost_cap_exceeded", {
-                "cost_usd": state.cost_usd,
-                "cap_usd": settings.claude_max_cost_usd,
-            })
-            return ExecutorOutcome(
-                status=STATUS_BUDGET_EXCEEDED,
-                reason=REASON_COST_CAP_EXCEEDED,
-                final_text=state.final_text,
-            )
-
         if state.awaiting_clarification:
             self.session_store.update_status(session.task_id, STATUS_BLOCKED)
             self.transcript_store.append(sid, "claude_code_awaiting_clarification", {
@@ -568,12 +553,11 @@ class ClaudeCodeExecutor:
             state.session_id = cli_session_id
             self.session_store.set_claude_code_session_id(session.task_id, cli_session_id)
 
+        # Track cost for /agents reporting, but DON'T cap it — the Claude Code
+        # route is subscription-billed, so there's no marginal per-task cost to
+        # cap. Only the managed/API route enforces max_dollars. Wall-clock and
+        # the CLI's own limits still bound runaway sessions.
         state.cost_usd = float(event.get("total_cost_usd") or 0.0)
-        cap = float(settings.claude_max_cost_usd or 0.0)
-        if cap > 0 and state.cost_usd > cap:
-            state.cost_cap_exceeded = True
-            state.terminal = True
-            return
 
         if state.pending_clarification:
             # Agent asked a question — surface as BLOCKED outcome so the

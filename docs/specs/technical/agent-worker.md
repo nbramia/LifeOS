@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-06-02
+> **Last Updated:** 2026-06-03
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -179,7 +179,7 @@ Hardening: response is parsed defensively (handles `` ```json `` fences, partial
 
 Per-turn flow:
 
-1. Check budgets at top-of-loop — kill with `STATUS_BUDGET_EXCEEDED` if `total_tokens >= max_tokens` OR `total_dollars >= max_dollars` OR `wall_seconds_elapsed >= wall_seconds` OR lineage budget breached. Cascade-kill descendants on lineage breach.
+1. Check budgets at top-of-loop — kill with `STATUS_BUDGET_EXCEEDED` if `total_tokens >= max_tokens` OR `wall_seconds_elapsed >= wall_seconds` OR lineage budget breached. Cascade-kill descendants on lineage breach. There is no per-session dollar cap on the local route (local inference is free, so `total_dollars` is always 0); the lineage check still enforces an ancestor's `max_dollars` for a mixed family rooted at a paid managed session.
 2. Build the message list (system prompt + prior user/assistant/tool_result turns).
 3. Call the local LLM with the tool catalog (`STANDARD_HANDLERS` + `lifeos_agent_*` inter-agent tools + LifeOS MCP tools, all in OpenAI format).
 4. Parse response — handles both OpenAI `{"function": {"name", "arguments"}}` and Anthropic `{"name", "input"}` shapes via `_normalize_tool_calls`.
@@ -288,7 +288,7 @@ Spawned `claude_code` / `codex` children are long-running subprocesses. `_dispat
 Four overlapping layers, executed in this order:
 
 1. **Daily $-cap** — `SpendTracker.can_start_task(estimated)` short-circuits to False when `daily_cap_dollars <= 0` (operator pause). Otherwise blocks new claims when accumulated day spend ≥ cap.
-2. **Per-task token / wall / dollar caps** — checked at the top of every executor turn (local) or every poll (managed).
+2. **Per-task token / wall caps** — checked at the top of every executor turn (local) or every poll (managed). The **dollar cap (`max_dollars`) is enforced only on the managed/API route** — the only route with marginal per-task cost. The Claude Code and Codex CLI routes are subscription-billed and the local route is free, so none of them enforce a per-task dollar cap (they track cost for `/agents` reporting but never stop on it).
 3. **Lineage caps** — for child sessions, the entire lineage's combined spend is checked against any ancestor's `max_dollars`. Breach cascade-kills the lineage.
 4. **Remote (cloud only)** — when the worker detects a mid-flight breach for a managed session, it calls `DELETE /v1/sessions/{id}` to stop Anthropic-side billing immediately.
 
