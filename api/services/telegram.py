@@ -686,10 +686,20 @@ class TelegramBotListener:
                 self._last_result = result
 
             # Check if the chat pipeline detected a code intent or an explicit
-            # engine handoff ("use codex" / "use claude code", #305b).
+            # engine handoff ("use codex" / "use claude code", #305b). Engine
+            # handoffs spawn background sessions whose follow-ups route to the
+            # primary bot, so only the primary honors them. A specialized bot
+            # redirects instead of falling through to a possibly-empty answer.
             if result.get("claude_intent"):
                 task = result.get("task", text)
                 engine = result.get("engine", "claude_code")
+                if not self._is_primary:
+                    await send_message_async(
+                        "That looks like a coding/agent task — send it to your main "
+                        "LifeOS bot, which runs Claude Code and Codex.",
+                        chat_id=chat_id,
+                    )
+                    return
                 if engine == "codex":
                     logger.info(f"Engine handoff → Codex: {task[:50]}...")
                     await self._handle_codex_command(task, chat_id)
@@ -710,9 +720,28 @@ class TelegramBotListener:
                 chat_id=chat_id,
             )
 
+    # Commands that spawn agent-worker / Claude Code / Codex sessions. Their
+    # completion notices and clarification questions are sent later from a
+    # background thread (where the active-bot token is unset → primary), and the
+    # reply-thread hooks only run on the primary listener. So these belong to the
+    # primary bot only; specialized bots are pure chat surfaces and redirect.
+    _PRIMARY_ONLY_COMMANDS = frozenset({
+        "/agent", "/claude", "/codex",
+        "/claude_status", "/claudestatus", "/claude_cancel", "/claudecancel",
+        "/codex_status", "/codexstatus", "/codex_cancel", "/codexcancel",
+    })
+
     async def _handle_command(self, text: str, chat_id: str) -> bool:
         """Handle known bot commands. Returns True if handled, False to fall through to chat."""
         command = text.split()[0].lower()
+
+        if not self._is_primary and command in self._PRIMARY_ONLY_COMMANDS:
+            await send_message_async(
+                "Agent and Claude Code/Codex commands run on your main LifeOS bot — "
+                "send this there.",
+                chat_id=chat_id,
+            )
+            return True
 
         if command in ("/new", "/clear"):
             self._conversations.pop(chat_id, None)
@@ -1056,13 +1085,3 @@ def get_telegram_listeners() -> list[TelegramBotListener]:
             listeners.append(TelegramBotListener(bot))
         _telegram_listeners = listeners
     return _telegram_listeners
-
-
-def get_telegram_listener() -> TelegramBotListener:
-    """Get or create the primary TelegramBotListener (back-compat singleton)."""
-    for listener in get_telegram_listeners():
-        if listener._is_primary:
-            return listener
-    # No primary configured — return a standalone primary instance so callers
-    # relying on this accessor still get a usable (if inert) listener.
-    return TelegramBotListener(settings.telegram_primary_bot)

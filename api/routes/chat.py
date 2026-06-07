@@ -850,6 +850,15 @@ class AskStreamRequest(BaseModel):
     attachments: Optional[list[Attachment]] = None
     persona: Optional[str] = None
 
+    @field_validator("persona")
+    @classmethod
+    def validate_persona(cls, v):
+        # Per-bot preamble injected into the system prompt. Bounded as cheap
+        # defense-in-depth — personas are short profiles, not documents.
+        if v is not None and len(v) > 8000:
+            raise ValueError(f"persona exceeds 8000 chars (got {len(v)})")
+        return v
+
     @field_validator("attachments")
     @classmethod
     def validate_attachments(cls, v):

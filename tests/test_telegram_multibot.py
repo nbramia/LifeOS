@@ -221,6 +221,66 @@ class TestHandleUpdate:
         mock_chat.assert_not_called()
 
 
+class TestPrimaryOnlyCommands:
+    """Agent/Claude-Code/Codex commands belong to the primary bot only."""
+
+    def _listener(self, name, chat_id):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        return TelegramBotListener(TelegramBotConfig(name=name, token="TOK", chat_id=chat_id))
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_redirects_agent_command(self):
+        listener = self._listener("fitness", "999")
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch.object(listener, "_handle_agent_spawn", new_callable=AsyncMock) as mock_spawn:
+            handled = await listener._handle_command("/agent do a thing", "999")
+        assert handled is True
+        mock_spawn.assert_not_called()
+        mock_send.assert_awaited_once()
+        assert "main LifeOS bot" in mock_send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_primary_bot_allows_agent_command(self):
+        listener = self._listener("primary", "999")
+        with patch.object(listener, "_handle_agent_spawn", new_callable=AsyncMock) as mock_spawn:
+            handled = await listener._handle_command("/agent do a thing", "999")
+        assert handled is True
+        mock_spawn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_redirects_on_engine_handoff(self):
+        listener = self._listener("fitness", "999")
+        update = {"message": {"text": "use claude code to fix x", "chat": {"id": 999}, "message_id": 5}}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat, \
+             patch.object(listener, "_handle_claude_command", new_callable=AsyncMock) as mock_claude:
+            mock_chat.return_value = {
+                "answer": "", "conversation_id": "c1",
+                "claude_intent": True, "engine": "claude_code", "task": "fix x",
+            }
+            await listener._handle_update(update)
+        # No background session spawned; a redirect was sent instead.
+        mock_claude.assert_not_called()
+        assert any(
+            c.args and "main" in c.args[0].lower() for c in mock_send.call_args_list
+        )
+
+
+class TestPersonaValidation:
+    def test_persona_within_cap_accepted(self):
+        from api.routes.chat import AskStreamRequest
+        req = AskStreamRequest(question="hi", persona="x" * 8000)
+        assert len(req.persona) == 8000
+
+    def test_persona_over_cap_rejected(self):
+        from api.routes.chat import AskStreamRequest
+        with pytest.raises(ValueError):
+            AskStreamRequest(question="hi", persona="x" * 8001)
+
+
 # ---------------------------------------------------------------------------
 # Persona threads through chat_via_api into the request body
 # ---------------------------------------------------------------------------
