@@ -663,14 +663,18 @@ TOOL_DEFINITIONS = [
             "- 'metrics': list a metric over time (e.g. body_weight trend).\n"
             "- 'get_profile' / 'set_profile': read or set the training profile "
             "(keys: goals, injuries, equipment, experience, schedule, constraints, "
-            "preferences)."
+            "preferences).\n"
+            "- 'readiness': one-call snapshot for recommendations — recent volume, "
+            "available recovery signals (body weight now; sleep/HR via Apple "
+            "Health later), and the training profile. Call this before giving "
+            "trainer-style advice so it's grounded in the user's real data."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["log", "update", "list", "history", "summary", "log_metric", "metrics", "get_profile", "set_profile"],
+                    "enum": ["log", "update", "list", "history", "summary", "log_metric", "metrics", "get_profile", "set_profile", "readiness"],
                     "description": "Action to perform.",
                 },
                 "sets": {
@@ -1556,6 +1560,54 @@ def _workout_set_profile(inp: dict) -> str:
     return f"Training profile updated: {key} = {value}"
 
 
+# Recovery metrics worth citing for a readiness read (manual + Apple Health #323).
+_RECOVERY_METRICS = ("body_weight", "resting_hr", "hrv", "sleep_hours")
+
+
+def _workout_readiness(inp: dict) -> str:
+    """One-call snapshot for trainer recommendations: recent volume + recovery
+    signals + profile. Degrades gracefully when little data exists (e.g. before
+    Apple Health #323 lands, only manual metrics like body weight are present).
+    """
+    from datetime import date, timedelta
+    from api.services.fitness_store import get_fitness_store, _today
+    store = get_fitness_store()
+
+    today = date.fromisoformat(_today())
+    since14 = (today - timedelta(days=14)).isoformat()
+    since30 = (today - timedelta(days=30)).isoformat()
+
+    recent = store.list_sessions(date_start=since14, limit=50)
+    vol = store.volume_summary(date_start=since30)
+
+    lines = ["Readiness snapshot:"]
+    if recent:
+        lines.append(f"- Sessions (14d): {len(recent)} — most recent {recent[0].date}")
+    else:
+        lines.append("- Sessions (14d): none logged")
+    lines.append(
+        f"- Volume (30d): {vol['sessions']} sessions, {vol['sets']} sets, "
+        f"{vol['reps']} reps, tonnage {_fmt_num(vol['tonnage'])}"
+    )
+
+    have_recovery = []
+    for metric in _RECOVERY_METRICS:
+        latest = store.latest_metric(metric)
+        if latest:
+            have_recovery.append(metric)
+            unit = f" {latest.unit}" if latest.unit else ""
+            lines.append(f"- {metric.replace('_', ' ')}: {_fmt_num(latest.value)}{unit} (latest {latest.start_at[:10]})")
+    if not have_recovery:
+        lines.append("- Recovery metrics: none yet (sleep/HR/HRV arrive with Apple Health; log body weight to start)")
+
+    profile = store.get_profile()
+    if profile:
+        lines.append("- Profile: " + "; ".join(f"{k}={v}" for k, v in profile.items()))
+    else:
+        lines.append("- Profile: not set (ask the user for goals/injuries/equipment)")
+    return "\n".join(lines)
+
+
 def _tool_manage_workouts(inp: dict) -> str:
     action = inp.get("action")
     handlers = {
@@ -1568,6 +1620,7 @@ def _tool_manage_workouts(inp: dict) -> str:
         "metrics": _workout_metrics,
         "get_profile": _workout_get_profile,
         "set_profile": _workout_set_profile,
+        "readiness": _workout_readiness,
     }
     handler = handlers.get(action)
     if not handler:
@@ -1756,6 +1809,7 @@ TOOL_STATUS_MESSAGES = {
     "manage_workouts.summary": "Tallying volume...",
     "manage_workouts.log_metric": "Recording metric...",
     "manage_workouts.metrics": "Loading metrics...",
+    "manage_workouts.readiness": "Checking training readiness...",
     "search_finances": "Checking finances...",
     "search_finances.accounts": "Loading account balances...",
     "search_finances.transactions": "Searching transactions...",
