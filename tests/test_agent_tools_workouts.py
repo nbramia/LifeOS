@@ -107,6 +107,31 @@ class TestDispatch:
         assert _tool_manage_workouts({"action": "bogus"}).startswith("Error")
 
 
+class TestReadiness:
+    def test_readiness_empty_degrades_gracefully(self, temp_store):
+        out = _tool_manage_workouts({"action": "readiness"})
+        assert "Readiness snapshot" in out
+        assert "none logged" in out          # no sessions
+        assert "none yet" in out             # no recovery metrics
+        assert "not set" in out              # no profile
+
+    def test_readiness_aggregates_volume_metrics_profile(self, temp_store):
+        from api.services.fitness_store import _today
+        _tool_manage_workouts({"action": "log", "sets": [{"exercise": "squats", "reps": 5, "weight": 185, "count": 3}], "date": _today()})
+        _tool_manage_workouts({"action": "log_metric", "metric_type": "body_weight", "value": "178.4", "unit": "lb"})
+        _tool_manage_workouts({"action": "set_profile", "key": "goals", "value": "strength"})
+        out = _tool_manage_workouts({"action": "readiness"})
+        assert "Sessions (14d): 1" in out
+        assert "3 sets" in out               # volume
+        assert "body weight: 178.4 lb" in out
+        assert "goals=strength" in out
+
+    def test_readiness_includes_recovery_when_present(self, temp_store):
+        _tool_manage_workouts({"action": "log_metric", "metric_type": "resting_hr", "value": "54", "unit": "bpm"})
+        out = _tool_manage_workouts({"action": "readiness"})
+        assert "resting hr: 54" in out
+
+
 class TestSummaryFormatting:
     def test_groups_identical_sets(self):
         session = WorkoutSession(id="x", date="2026-06-07", sets=[
