@@ -792,7 +792,14 @@ class LifeOSMCPServer:
             "lifeos_telegram_send": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "Message text to send via Telegram"}
+                    "text": {"type": "string", "description": "Message text to send via Telegram"},
+                    "bot": {
+                        "type": "string",
+                        "description": (
+                            "Optional bot to send from. Use 'fitness' to send from the fitness bot, "
+                            "'therapy' for the therapy bot. Omit to send from the primary bot."
+                        ),
+                    },
                 },
                 "required": ["text"]
             },

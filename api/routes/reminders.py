@@ -82,6 +82,11 @@ class ReminderListResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Message text to send via Telegram")
+    bot: Optional[str] = Field(
+        default=None,
+        description="Optional bot name to send from (e.g. 'fitness', 'therapy'). "
+                    "Falls back to the primary bot if unset or unrecognised.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +140,7 @@ async def send_adhoc_message(request: SendMessageRequest):
     if not settings.telegram_enabled:
         raise HTTPException(status_code=400, detail="Telegram not configured")
 
-    success = await send_message_async(request.text)
+    success = await send_message_async(request.text, bot=request.bot)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send Telegram message")
     return {"status": "sent"}

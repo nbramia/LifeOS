@@ -38,6 +38,29 @@ _active_bot_token: ContextVar[Optional[str]] = ContextVar("active_bot_token", de
 
 
 # ---------------------------------------------------------------------------
+# Bot token resolution
+# ---------------------------------------------------------------------------
+
+def _token_for_bot(bot: Optional[str]) -> Optional[str]:
+    """Resolve a bot name to its token.
+
+    Looks up ``bot`` in the primary bot and the specialized-bot registry.
+    Returns the matching token, or ``None`` if unresolved (callers then fall
+    back to the primary). Unknown or empty names are silently ignored so a
+    misconfigured caller doesn't break the send path.
+    """
+    if not bot:
+        return None
+    if bot == "primary":
+        return settings.telegram_bot_token or None
+    for cfg in settings.telegram_bots:
+        if cfg.name == bot:
+            return cfg.token or None
+    logger.warning(f"Telegram bot '{bot}' not found in registry, falling back to primary")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Message sending
 # ---------------------------------------------------------------------------
 
@@ -122,7 +145,7 @@ class TypingIndicator:
                 pass
 
 
-def send_message_capture_ids(text: str, chat_id: str = None) -> list[int]:
+def send_message_capture_ids(text: str, chat_id: str = None, bot: str = None) -> list[int]:
     """Send a message and return the Telegram `message_id` of every chunk sent.
 
     Used by the agent worker to track clarification questions and terminal-state
@@ -131,22 +154,27 @@ def send_message_capture_ids(text: str, chat_id: str = None) -> list[int]:
     reply can land on *any* chunk, so we capture them all (not just the first).
     Falls back to plain text if Markdown parse fails. Returns an empty list when
     Telegram is disabled or every send failed.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
     """
     if not settings.telegram_enabled:
         return []
+    token = _token_for_bot(bot)
     chat_id = chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
     ids: list[int] = []
     for part in _split_message(text):
         try:
             resp = httpx.post(
-                _telegram_url("sendMessage"),
+                _telegram_url("sendMessage", token),
                 json={"chat_id": chat_id, "text": part, "parse_mode": "Markdown"},
                 timeout=30.0,
             )
             if resp.status_code != 200:
                 resp = httpx.post(
-                    _telegram_url("sendMessage"),
+                    _telegram_url("sendMessage", token),
                     json={"chat_id": chat_id, "text": part},
                     timeout=30.0,
                 )
@@ -161,17 +189,22 @@ def send_message_capture_ids(text: str, chat_id: str = None) -> list[int]:
     return ids
 
 
-def send_message(text: str, chat_id: str = None) -> bool:
+def send_message(text: str, chat_id: str = None, bot: str = None) -> bool:
     """
     Send a message via Telegram (synchronous).
 
     Use from background threads (scheduler, alerts).
     Falls back to plain text if Markdown parse fails.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
     """
     if not settings.telegram_enabled:
         logger.debug("Telegram not configured, skipping send")
         return False
 
+    token = _token_for_bot(bot)
     chat_id = chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
 
@@ -179,7 +212,7 @@ def send_message(text: str, chat_id: str = None) -> bool:
     for part in _split_message(text):
         try:
             resp = httpx.post(
-                _telegram_url("sendMessage"),
+                _telegram_url("sendMessage", token),
                 json={
                     "chat_id": chat_id,
                     "text": part,
@@ -190,7 +223,7 @@ def send_message(text: str, chat_id: str = None) -> bool:
             if resp.status_code != 200:
                 # Retry without parse_mode (plain text fallback)
                 resp = httpx.post(
-                    _telegram_url("sendMessage"),
+                    _telegram_url("sendMessage", token),
                     json={"chat_id": chat_id, "text": part},
                     timeout=30.0,
                 )
@@ -203,15 +236,20 @@ def send_message(text: str, chat_id: str = None) -> bool:
     return success
 
 
-async def send_message_async(text: str, chat_id: str = None) -> bool:
+async def send_message_async(text: str, chat_id: str = None, bot: str = None) -> bool:
     """
     Send a message via Telegram (async).
 
     Use from FastAPI routes.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
     """
     if not settings.telegram_enabled:
         return False
 
+    token = _token_for_bot(bot)
     chat_id = chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
 
@@ -220,7 +258,7 @@ async def send_message_async(text: str, chat_id: str = None) -> bool:
         for part in _split_message(text):
             try:
                 resp = await client.post(
-                    _telegram_url("sendMessage"),
+                    _telegram_url("sendMessage", token),
                     json={
                         "chat_id": chat_id,
                         "text": part,
@@ -229,7 +267,7 @@ async def send_message_async(text: str, chat_id: str = None) -> bool:
                 )
                 if resp.status_code != 200:
                     resp = await client.post(
-                        _telegram_url("sendMessage"),
+                        _telegram_url("sendMessage", token),
                         json={"chat_id": chat_id, "text": part},
                     )
                 if resp.status_code != 200:
