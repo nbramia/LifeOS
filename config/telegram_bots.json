@@ -1,0 +1,8 @@
+[
+  {
+    "name": "fitness",
+    "token_env": "TELEGRAM_FITNESS_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_FITNESS_CHAT_ID",
+    "persona_file": "config/personas/fitness.md"
+  }
+]

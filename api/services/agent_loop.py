@@ -382,6 +382,7 @@ async def run_agent_loop(
     model_tier: str = "sonnet",
     max_tool_rounds: int = 5,
     model: str = "",
+    persona: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -398,12 +399,14 @@ async def run_agent_loop(
             When set on the Anthropic backend, the turn runs on a dedicated
             AnthropicLLMClient with this model instead of the default singleton.
             Ignored on the local backend.
+        persona: Optional per-bot system-prompt preamble (e.g. the fitness bot).
+            Empty for the default chat surface.
 
     Yields:
         Dicts with "type" key: "text", "status", or "result".
     """
     client = _select_client(model)
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(persona=persona)
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
     # sending any draft created during this same turn — sends require the user

@@ -81,3 +81,28 @@ def test_task_manager_failure_is_silent(monkeypatch):
 
 def test_existing_tags_block_helper_returns_none_when_empty(tm):
     assert agent_system_prompt._existing_tags_block() is None
+
+
+def test_no_persona_block_by_default(tm):
+    prompt = build_system_prompt()
+    assert "FITNESS-PERSONA-MARKER" not in "\n".join(_text_blocks(prompt))
+
+
+def test_persona_injected_after_static_block(tm):
+    persona = "FITNESS-PERSONA-MARKER: you are the fitness bot."
+    prompt = build_system_prompt(persona=persona)
+    texts = _text_blocks(prompt)
+    # Persona present...
+    assert any("FITNESS-PERSONA-MARKER" in t for t in texts)
+    # ...and placed AFTER the static block so the static cache prefix is shared.
+    assert prompt[0].get("cache_control") == {"type": "ephemeral"}
+    assert "FITNESS-PERSONA-MARKER" not in prompt[0]["text"]
+    assert "FITNESS-PERSONA-MARKER" in prompt[1]["text"]
+    # Persona block itself is not cached.
+    assert "cache_control" not in prompt[1]
+
+
+def test_blank_persona_adds_no_block(tm):
+    base = build_system_prompt()
+    spaced = build_system_prompt(persona="   ")
+    assert len(spaced) == len(base)

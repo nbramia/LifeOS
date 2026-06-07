@@ -848,6 +848,16 @@ class AskStreamRequest(BaseModel):
     include_sources: bool = True
     conversation_id: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
+    persona: Optional[str] = None
+
+    @field_validator("persona")
+    @classmethod
+    def validate_persona(cls, v):
+        # Per-bot preamble injected into the system prompt. Bounded as cheap
+        # defense-in-depth — personas are short profiles, not documents.
+        if v is not None and len(v) > 8000:
+            raise ValueError(f"persona exceeds 8000 chars (got {len(v)})")
+        return v
 
     @field_validator("attachments")
     @classmethod
@@ -1214,6 +1224,7 @@ async def ask_stream(request: AskStreamRequest):
                 model_tier=orchestrator_model,
                 max_tool_rounds=5,
                 model=orchestrator_model if escalated else "",
+                persona=request.persona or "",
             ):
                 if event["type"] == "text":
                     yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"
