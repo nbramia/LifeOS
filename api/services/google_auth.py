@@ -4,7 +4,6 @@ Google OAuth authentication service for LifeOS.
 Handles OAuth 2.0 flow for both personal and work Google accounts
 with separate credentials and token storage.
 """
-import json
 import logging
 import os
 import sys
@@ -23,7 +22,9 @@ SCOPES_PERSONAL = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    # Read+write: the fitness Sheet mirror (#321) writes rows. Bumped from
+    # spreadsheets.readonly — requires re-running the OAuth flow to re-consent.
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 # Scopes for work account (read-only except gmail which needs modify for drafts)
@@ -214,12 +215,12 @@ class GoogleAuthService:
             return False
 
 
-def resolve_account(account: str) -> GoogleAccount:
+def resolve_account(account: str) -> GoogleAccount:  # noqa: F811 (pre-existing duplicate; see PR #327 note)
     """Resolve a string account name ('personal'/'work') to a GoogleAccount enum."""
     return GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
 
 
-def get_configured_accounts() -> list[GoogleAccount]:
+def get_configured_accounts() -> list[GoogleAccount]:  # noqa: F811 (pre-existing duplicate; see PR #327 note)
     """Return the list of configured Google account types."""
     return [GoogleAccount.WORK, GoogleAccount.PERSONAL]
 
