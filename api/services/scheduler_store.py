@@ -68,6 +68,7 @@ class ScheduleEntry:
     message_content: str = ""  # static text or natural-language prompt
     endpoint_config: Optional[dict] = None  # {endpoint, method, params}
     executor: str = ""  # agent executor tag without '#': local / cloud / cloud-haiku ...
+    bot: str = ""  # Telegram bot name for outbound sends (e.g. "fitness", "therapy"); empty = primary
     enabled: bool = True
     created_at: str = ""
     last_triggered_at: Optional[str] = None
@@ -206,6 +207,8 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[tz:: {entry.timezone}]")
     parts.append(f"[action:: {entry.action}]")
     parts.append(f"[mtype:: {entry.message_type}]")
+    if entry.bot:
+        parts.append(f"[bot:: {entry.bot}]")
     if entry.executor:
         parts.append(f"#{entry.executor}")
     if entry.created_at:
@@ -257,6 +260,7 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         action=action,
         message_type=message_type,
         executor=executor,
+        bot=fields.get("bot", ""),
         enabled=(symbol == " "),
         created_at=fields.get("created", ""),
         last_triggered_at=fields.get("last") or None,
@@ -904,7 +908,7 @@ class SchedulerScheduler:
 
             if message:
                 from api.services.telegram import send_message_async
-                await send_message_async(f"*{entry.name}*\n\n{message}")
+                await send_message_async(f"*{entry.name}*\n\n{message}", bot=entry.bot or None)
                 self.store.record_run(entry.id, "sent", message[:200])
             else:
                 self.store.record_run(entry.id, "empty", "")
@@ -916,7 +920,8 @@ class SchedulerScheduler:
                 from api.services.telegram import send_message_async
                 await send_message_async(
                     f"*{entry.name}* (failed)\n\n"
-                    f"Schedule could not execute: {str(e)[:200]}"
+                    f"Schedule could not execute: {str(e)[:200]}",
+                    bot=entry.bot or None,
                 )
             except Exception:
                 logger.error(f"Failed to send error notification for schedule {entry.id}")

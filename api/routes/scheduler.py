@@ -41,6 +41,7 @@ class CreateScheduleRequest(BaseModel):
     message_content: str = Field(default="", description="Static text or natural-language prompt")
     endpoint_config: Optional[dict] = Field(default=None, description="For endpoint action: {endpoint, method, params}")
     executor: str = Field(default="", description="For agent action: local | cloud | cloud-haiku | cloud-sonnet")
+    bot: str = Field(default="", description="Telegram bot to notify from (e.g. 'fitness', 'therapy'); empty = primary")
     enabled: bool = Field(default=True)
     timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone for the schedule")
 
@@ -54,6 +55,7 @@ class UpdateScheduleRequest(BaseModel):
     message_content: Optional[str] = None
     endpoint_config: Optional[dict] = None
     executor: Optional[str] = None
+    bot: Optional[str] = None
     enabled: Optional[bool] = None
     timezone: Optional[str] = None
 
@@ -68,6 +70,7 @@ class ScheduleResponse(BaseModel):
     message_content: str
     endpoint_config: Optional[dict]
     executor: str
+    bot: str
     enabled: bool
     created_at: str
     last_triggered_at: Optional[str]
@@ -87,6 +90,7 @@ class ScheduleResponse(BaseModel):
             message_content=e.message_content,
             endpoint_config=e.endpoint_config,
             executor=e.executor,
+            bot=e.bot,
             enabled=e.enabled,
             created_at=e.created_at or "",
             last_triggered_at=e.last_triggered_at,
@@ -103,6 +107,11 @@ class ScheduleListResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Message text to send via Telegram")
+    bot: Optional[str] = Field(
+        default=None,
+        description="Optional bot name to send from (e.g. 'fitness', 'therapy'). "
+                    "Falls back to the primary bot if unset or unrecognised.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +148,7 @@ async def create_schedule(request: CreateScheduleRequest):
         message_content=request.message_content,
         endpoint_config=request.endpoint_config,
         executor=request.executor,
+        bot=request.bot,
         enabled=request.enabled,
         timezone=request.timezone,
     )
@@ -164,7 +174,7 @@ async def send_adhoc_message(request: SendMessageRequest):
     if not settings.telegram_enabled:
         raise HTTPException(status_code=400, detail="Telegram not configured")
 
-    success = await send_message_async(request.text)
+    success = await send_message_async(request.text, bot=request.bot)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send Telegram message")
     return {"status": "sent"}
