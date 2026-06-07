@@ -15,25 +15,35 @@ import re
 import threading
 import time
 from collections import deque
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
 import httpx
 
-from config.settings import settings
+from config.settings import settings, TelegramBotConfig
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
 MAX_MESSAGE_LENGTH = 4096
 
+# The bot token for the message currently being handled. A listener sets this
+# once at the top of _handle_update so every outbound send during that update —
+# of which there are many, scattered across command handlers — goes out from the
+# right bot without threading a token through each call. Unset (None) means the
+# primary bot, which is also the default for non-listener callers (agent worker,
+# reminders, scheduler).
+_active_bot_token: ContextVar[Optional[str]] = ContextVar("active_bot_token", default=None)
+
 
 # ---------------------------------------------------------------------------
 # Message sending
 # ---------------------------------------------------------------------------
 
-def _telegram_url(method: str) -> str:
-    return f"{TELEGRAM_API}/bot{settings.telegram_bot_token}/{method}"
+def _telegram_url(method: str, token: Optional[str] = None) -> str:
+    token = token or _active_bot_token.get() or settings.telegram_bot_token
+    return f"{TELEGRAM_API}/bot{token}/{method}"
 
 
 def _split_message(text: str) -> list[str]:
@@ -235,11 +245,15 @@ async def send_message_async(text: str, chat_id: str = None) -> bool:
 # Internal chat client (consumes SSE from /api/ask/stream)
 # ---------------------------------------------------------------------------
 
-async def chat_via_api(question: str, conversation_id: str = None) -> dict:
+async def chat_via_api(question: str, conversation_id: str = None, persona: str = None) -> dict:
     """
     Run a question through the full LifeOS chat pipeline (non-streaming).
 
     POSTs to the local /api/ask/stream endpoint and collects SSE events.
+
+    Args:
+        persona: Optional per-bot system-prompt preamble (e.g. the fitness bot),
+            forwarded to the orchestrator so its replies are domain-primed.
 
     Returns:
         {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None}
@@ -248,6 +262,8 @@ async def chat_via_api(question: str, conversation_id: str = None) -> dict:
     body: dict = {"question": question}
     if conversation_id:
         body["conversation_id"] = conversation_id
+    if persona:
+        body["persona"] = persona
 
     full_text = ""
     conv_id = conversation_id
@@ -388,11 +404,24 @@ class TelegramBotListener:
     _STATE_FILE = Path("data/telegram_state.json")
     _DEDUP_WINDOW = 1000  # Track last N message IDs for deduplication
 
-    def __init__(self):
+    def __init__(self, bot: Optional[TelegramBotConfig] = None):
+        # bot=None means the primary bot (legacy behavior). The primary keeps the
+        # legacy state file so its update offset survives this upgrade; named bots
+        # get their own offset file so concurrent pollers don't clobber each other.
+        self._bot = bot or settings.telegram_primary_bot
+        self._is_primary = self._bot.name == "primary"
+        self._token = self._bot.token
+        self._chat_id = self._bot.chat_id
+        self._persona = self._bot.persona
+        self._state_file = (
+            self._STATE_FILE if self._is_primary
+            else Path(f"data/telegram_state_{self._bot.name}.json")
+        )
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Conversation state: chat_id -> conversation_id
+        # Conversation state: chat_id -> conversation_id (per-instance, so each
+        # bot's threads stay isolated from the others')
         self._conversations: dict[str, str] = {}
         self._last_result: dict | None = None  # Last chat result for /inspect
         self._last_update_id = self._load_last_update_id()
@@ -401,13 +430,13 @@ class TelegramBotListener:
     def _load_last_update_id(self) -> int:
         """Load persisted update_id from disk, or 0 if unavailable."""
         try:
-            if self._STATE_FILE.exists():
-                data = json.loads(self._STATE_FILE.read_text())
+            if self._state_file.exists():
+                data = json.loads(self._state_file.read_text())
                 update_id = data.get("last_update_id", 0)
                 if not isinstance(update_id, int) or update_id < 0:
                     logger.warning(f"Invalid update_id in state file: {update_id!r}, resetting to 0")
                     return 0
-                logger.info(f"Restored Telegram update offset: {update_id}")
+                logger.info(f"Restored Telegram update offset for '{self._bot.name}': {update_id}")
                 return update_id
         except Exception as e:
             logger.warning(f"Could not load Telegram state: {e}")
@@ -416,26 +445,26 @@ class TelegramBotListener:
     def _save_last_update_id(self):
         """Persist current update_id to disk (atomic write)."""
         try:
-            self._STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._STATE_FILE.with_suffix(".tmp")
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_file.with_suffix(".tmp")
             tmp.write_text(json.dumps({"last_update_id": self._last_update_id}))
-            tmp.rename(self._STATE_FILE)
+            tmp.rename(self._state_file)
         except Exception as e:
             logger.warning(f"Could not save Telegram state: {e}")
 
     def start(self):
-        if not settings.telegram_enabled:
-            logger.info("Telegram not configured, bot listener not started")
+        if not (self._token and self._chat_id):
+            logger.info(f"Telegram bot '{self._bot.name}' not configured, listener not started")
             return
 
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
-            name="TelegramBotListener",
+            name=f"TelegramBotListener-{self._bot.name}",
         )
         self._thread.start()
-        logger.info("Telegram bot listener started")
+        logger.info(f"Telegram bot listener started: {self._bot.name}")
 
     def stop(self):
         self._stop_event.set()
@@ -473,7 +502,7 @@ class TelegramBotListener:
         try:
             async with httpx.AsyncClient(timeout=35.0) as client:
                 resp = await client.get(
-                    _telegram_url("getUpdates"),
+                    _telegram_url("getUpdates", self._token),
                     params={
                         "offset": self._last_update_id + 1,
                         "timeout": 30,
@@ -585,6 +614,10 @@ class TelegramBotListener:
 
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
+        # Route every outbound send during this update through this bot's token.
+        # Set once here so the many send sites below need no per-call token.
+        _active_bot_token.set(self._token)
+
         message = update.get("message")
         if not message:
             return
@@ -593,7 +626,7 @@ class TelegramBotListener:
         chat_id = str(message["chat"]["id"])
 
         # Auth check first — don't let unauthorized chats pollute the dedup window
-        if chat_id != settings.telegram_chat_id:
+        if chat_id != self._chat_id:
             logger.warning(f"Ignoring message from unauthorized chat: {chat_id}")
             return
 
@@ -611,8 +644,12 @@ class TelegramBotListener:
         # Agent-worker clarification hook (Issue F). If this message is a
         # reply-thread to a previously-sent clarification question, deposit
         # the answer and short-circuit — don't route to the chat pipeline.
+        # Only the primary bot owns these agent/Claude-Code reply threads:
+        # Telegram message_ids are unique per chat (per bot), so a specialized
+        # bot must not match a reply against the shared follow-up table or it
+        # could collide with the primary's ids. Specialized bots are pure chat.
         reply_to = message.get("reply_to_message")
-        if reply_to and reply_to.get("message_id"):
+        if self._is_primary and reply_to and reply_to.get("message_id"):
             reply_to_id = int(reply_to["message_id"])
             # A reply to a /claude completion resumes that Claude Code session
             # (#237) — checked before the agent-worker deposit since both use
@@ -644,7 +681,7 @@ class TelegramBotListener:
         try:
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
-                result = await chat_via_api(text, conversation_id=conv_id)
+                result = await chat_via_api(text, conversation_id=conv_id, persona=self._persona)
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 
@@ -1000,12 +1037,32 @@ class TelegramBotListener:
 # Singleton
 # ---------------------------------------------------------------------------
 
-_telegram_listener: Optional[TelegramBotListener] = None
+_telegram_listeners: Optional[list[TelegramBotListener]] = None
+
+
+def get_telegram_listeners() -> list[TelegramBotListener]:
+    """Get or create the listeners for the primary bot plus any specialized bots.
+
+    The primary is included only when configured; specialized bots come from the
+    registry (``settings.telegram_bots``), which already drops any whose token is
+    unset — so a fresh clone with no extra tokens yields just the primary.
+    """
+    global _telegram_listeners
+    if _telegram_listeners is None:
+        listeners: list[TelegramBotListener] = []
+        if settings.telegram_enabled:
+            listeners.append(TelegramBotListener(settings.telegram_primary_bot))
+        for bot in settings.telegram_bots:
+            listeners.append(TelegramBotListener(bot))
+        _telegram_listeners = listeners
+    return _telegram_listeners
 
 
 def get_telegram_listener() -> TelegramBotListener:
-    """Get or create TelegramBotListener singleton."""
-    global _telegram_listener
-    if _telegram_listener is None:
-        _telegram_listener = TelegramBotListener()
-    return _telegram_listener
+    """Get or create the primary TelegramBotListener (back-compat singleton)."""
+    for listener in get_telegram_listeners():
+        if listener._is_primary:
+            return listener
+    # No primary configured — return a standalone primary instance so callers
+    # relying on this accessor still get a usable (if inert) listener.
+    return TelegramBotListener(settings.telegram_primary_bot)

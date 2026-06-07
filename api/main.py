@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Background services (initialized on startup)
 _calendar_indexer = None
-_telegram_listener = None
+_telegram_listeners = []
 _reminder_scheduler = None
 _scheduler_watcher = None
 _job_queue = None
@@ -54,7 +54,7 @@ _task_watcher = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _telegram_listener, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher
+    global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher
 
     # Startup: Recover any incomplete merge operations
     try:
@@ -80,13 +80,14 @@ async def lifespan(app: FastAPI):
     # Health monitoring (previously an in-process 2:30/7:00 scheduler) now runs
     # out-of-band in nbramia/local-processing via the lifeos_health watcher.
 
-    # Startup: Start Telegram bot listener
+    # Startup: Start Telegram bot listeners (primary + any specialized bots)
     try:
-        from api.services.telegram import get_telegram_listener
-        _telegram_listener = get_telegram_listener()
-        _telegram_listener.start()
+        from api.services.telegram import get_telegram_listeners
+        _telegram_listeners = get_telegram_listeners()
+        for _listener in _telegram_listeners:
+            _listener.start()
     except Exception as e:
-        logger.error(f"Failed to start Telegram bot listener: {e}")
+        logger.error(f"Failed to start Telegram bot listeners: {e}")
 
     # Startup: Start the scheduler (cron/one-off triggers → actions) and watch
     # LifeOS/Scheduler/ for external edits (e.g. via Obsidian). Markdown is the
@@ -148,9 +149,10 @@ async def lifespan(app: FastAPI):
         _calendar_indexer.stop_scheduler()
         logger.info("Calendar indexer stopped")
 
-    if _telegram_listener:
-        _telegram_listener.stop()
-        logger.info("Telegram bot listener stopped")
+    for _listener in _telegram_listeners:
+        _listener.stop()
+    if _telegram_listeners:
+        logger.info("Telegram bot listeners stopped")
 
     if _reminder_scheduler:
         _reminder_scheduler.stop()

@@ -292,6 +292,8 @@ class TestMessageDedup:
 
         with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
             listener = TelegramBotListener()
+        # Authorized chat is now per-listener state (captured at construction).
+        listener._chat_id = "123"
 
         # First call — should process (but we mock the rest to avoid side effects)
         update = {"message": {"message_id": 1, "text": "hi", "chat": {"id": "123"}}}
@@ -350,6 +352,8 @@ class TestNoImplicitThreadResume:
         state_file = tmp_path / "telegram_state.json"
         with patch.object(TelegramBotListener, "_STATE_FILE", state_file):
             listener = TelegramBotListener()
+        # Authorized chat is now per-listener state (captured at construction).
+        listener._chat_id = "123"
 
         # A resumable agent thread exists in the store...
         store = SessionStore(db_path=tmp_path / "sessions.db")

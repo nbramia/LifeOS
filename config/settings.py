@@ -1,9 +1,36 @@
 """
 LifeOS Configuration Settings
 """
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
+from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+
+logger = logging.getLogger(__name__)
+
+# Registry of specialized Telegram bots (beyond the primary). Committed, no
+# secrets — each entry references the env var holding its token.
+_TELEGRAM_BOTS_FILE = Path("config/telegram_bots.json")
+_BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+@dataclass(frozen=True)
+class TelegramBotConfig:
+    """A single Telegram bot surface: its token, authorized chat, and persona.
+
+    ``name`` doubles as the per-bot state-file suffix, so it must be filesystem
+    safe. ``persona`` is a system-prompt preamble injected for this bot's chats
+    (empty for the primary bot).
+    """
+    name: str
+    token: str
+    chat_id: str
+    persona: str = ""
 
 
 class Settings(BaseSettings):
@@ -631,6 +658,77 @@ class Settings(BaseSettings):
     def telegram_enabled(self) -> bool:
         """Check if Telegram bot is configured."""
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def telegram_primary_bot(self) -> "TelegramBotConfig":
+        """The default Telegram bot, driven by TELEGRAM_BOT_TOKEN/CHAT_ID.
+
+        Named "primary" so its update-offset file stays the legacy
+        ``data/telegram_state.json`` and existing behavior is unchanged.
+        """
+        return TelegramBotConfig(
+            name="primary",
+            token=self.telegram_bot_token,
+            chat_id=self.telegram_chat_id,
+            persona="",
+        )
+
+    @property
+    def telegram_bots(self) -> list["TelegramBotConfig"]:
+        """Specialized Telegram bots beyond the primary, from the registry file.
+
+        Each registry entry names an env var holding the bot's token; entries
+        whose token is unset are skipped (logged) so a fresh clone with no extra
+        tokens simply runs the primary bot. Persona text is loaded from the
+        entry's ``persona_file``. ``chat_id_env`` is optional and defaults to the
+        primary ``TELEGRAM_CHAT_ID`` (in Telegram DMs the chat id is your user
+        id, identical across bots).
+        """
+        if not _TELEGRAM_BOTS_FILE.exists():
+            return []
+        try:
+            entries = json.loads(_TELEGRAM_BOTS_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Could not read {_TELEGRAM_BOTS_FILE}: {e}")
+            return []
+        if not isinstance(entries, list):
+            logger.warning(f"{_TELEGRAM_BOTS_FILE} must contain a JSON list, ignoring")
+            return []
+
+        # pydantic-settings loads .env into the model but does NOT export to
+        # os.environ, so resolve token/chat-id env vars from the .env file too
+        # (real environment wins over .env on conflict).
+        env_file = self.model_config.get("env_file", ".env")
+        env: dict = {**dotenv_values(env_file), **os.environ}
+
+        bots: list[TelegramBotConfig] = []
+        seen: set[str] = set()
+        for entry in entries:
+            name = (entry.get("name") or "").strip().lower()
+            if not name or not _BOT_NAME_RE.match(name):
+                logger.warning(f"Skipping Telegram bot with invalid name: {entry.get('name')!r}")
+                continue
+            if name in ("primary",) or name in seen:
+                logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
+                continue
+            token = (env.get(entry.get("token_env", "")) or "").strip()
+            if not token:
+                logger.info(
+                    f"Telegram bot '{name}' skipped: env var "
+                    f"{entry.get('token_env')!r} is unset"
+                )
+                continue
+            chat_id = (env.get(entry.get("chat_id_env", "")) or "").strip() or self.telegram_chat_id
+            persona = ""
+            persona_file = entry.get("persona_file")
+            if persona_file:
+                try:
+                    persona = Path(persona_file).read_text().strip()
+                except OSError as e:
+                    logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
+            seen.add(name)
+            bots.append(TelegramBotConfig(name=name, token=token, chat_id=chat_id, persona=persona))
+        return bots
 
     @property
     def photos_db_path(self) -> str:

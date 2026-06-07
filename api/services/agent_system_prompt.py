@@ -164,11 +164,16 @@ def _existing_tags_block() -> str | None:
     )
 
 
-def build_system_prompt() -> list[dict]:
+def build_system_prompt(persona: str | None = None) -> list[dict]:
     """Build the system prompt for the agentic loop.
 
     Returns a list of content blocks for the Anthropic ``system`` parameter.
     The first block is static and cached; the rest are dynamic per-request.
+
+    Args:
+        persona: Optional per-bot preamble (e.g. the fitness bot). Injected as an
+            uncached block *after* the static block so the large shared prompt
+            stays a common cache prefix across all bots.
     """
     tz = ZoneInfo(settings.timezone)
     now = datetime.now(tz)
@@ -180,11 +185,17 @@ def build_system_prompt() -> list[dict]:
             "text": _STATIC_PROMPT,
             "cache_control": {"type": "ephemeral"},
         },
+    ]
+
+    if persona and persona.strip():
+        blocks.append({"type": "text", "text": persona.strip()})
+
+    blocks.append(
         {
             "type": "text",
             "text": f"Current date/time: {current_dt}\nTimezone: {settings.timezone}",
-        },
-    ]
+        }
+    )
 
     tags_block = _existing_tags_block()
     if tags_block:
