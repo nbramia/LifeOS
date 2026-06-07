@@ -614,6 +614,13 @@ class Settings(BaseSettings):
         description="Telegram chat ID for receiving messages"
     )
 
+    # Fitness
+    fitness_sheet_id: str = Field(
+        default="",
+        alias="LIFEOS_FITNESS_SHEET_ID",
+        description="Google Sheet ID to mirror the workout log into (optional; mirror is off if unset)"
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

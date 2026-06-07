@@ -1572,7 +1572,16 @@ def _tool_manage_workouts(inp: dict) -> str:
     handler = handlers.get(action)
     if not handler:
         return f"Error: Unknown manage_workouts action '{action}'"
-    return handler(inp)
+    result = handler(inp)
+    # Mirror to the Google Sheet (if configured) after a mutating action.
+    # Non-blocking and best-effort — never let a mirror issue affect logging.
+    if action in ("log", "update", "log_metric") and not result.startswith("Error"):
+        try:
+            from api.services.fitness_sheet_mirror import trigger_mirror
+            trigger_mirror()
+        except Exception as e:
+            logger.debug(f"Fitness sheet mirror trigger skipped: {e}")
+    return result
 
 
 # Handler dispatch table

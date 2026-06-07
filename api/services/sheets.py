@@ -4,7 +4,6 @@ Google Sheets API service for LifeOS.
 Provides read access to Google Sheets for syncing data to the vault.
 """
 import logging
-from typing import Optional
 
 from googleapiclient.discovery import build
 
@@ -81,7 +80,7 @@ class SheetsService:
         values = self.get_values(spreadsheet_id, range)
 
         if len(values) < 2:
-            logger.info(f"Sheet has fewer than 2 rows, returning empty list")
+            logger.info("Sheet has fewer than 2 rows, returning empty list")
             return []
 
         headers = values[0]
@@ -94,6 +93,46 @@ class SheetsService:
             rows.append(row_dict)
 
         return rows
+
+    def update_values(self, spreadsheet_id: str, range: str, values: list[list]) -> dict:
+        """Overwrite a range with `values` (RAW input). Returns the API result."""
+        return self.service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range,
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute()
+
+    def append_values(self, spreadsheet_id: str, range: str, values: list[list]) -> dict:
+        """Append rows after the last row of `range` (RAW input)."""
+        return self.service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=range,
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+
+    def clear_values(self, spreadsheet_id: str, range: str) -> dict:
+        """Clear all cell values in `range` (keeps formatting)."""
+        return self.service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=range,
+            body={},
+        ).execute()
+
+    def ensure_sheets(self, spreadsheet_id: str, titles: list[str]) -> None:
+        """Create any of `titles` that don't already exist as tabs."""
+        existing = set(self.get_spreadsheet_info(spreadsheet_id)["sheets"])
+        requests = [
+            {"addSheet": {"properties": {"title": t}}}
+            for t in titles if t not in existing
+        ]
+        if requests:
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests},
+            ).execute()
 
     def get_spreadsheet_info(self, spreadsheet_id: str) -> dict:
         """
