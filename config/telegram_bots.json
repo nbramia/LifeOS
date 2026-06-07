@@ -6,9 +6,9 @@
     "persona_file": "config/personas/fitness.md"
   },
   {
-    "name": "therapy",
-    "token_env": "TELEGRAM_THERAPY_BOT_TOKEN",
-    "chat_id_env": "TELEGRAM_THERAPY_CHAT_ID",
-    "persona_file": "config/personas/therapy.md"
+    "name": "therapist",
+    "token_env": "TELEGRAM_THERAPIST_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_THERAPIST_CHAT_ID",
+    "persona_file": "config/personas/therapist.md"
   }
 ]
