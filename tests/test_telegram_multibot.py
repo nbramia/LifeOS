@@ -220,6 +220,38 @@ class TestHandleUpdate:
             await listener._handle_update(update)
         mock_chat.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_specialized_bot_prepends_reply_quote_context(self):
+        listener = self._listener("fitness", "999", persona="P")
+        update = {"message": {
+            "text": "no, that was 145",
+            "chat": {"id": 999},
+            "message_id": 7,
+            "reply_to_message": {"message_id": 6, "text": "Logged: Bench Press 135×8"},
+        }}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "Updated", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "replying to my earlier message" in sent_text
+        assert "Logged: Bench Press 135×8" in sent_text
+        assert "no, that was 145" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_plain_message_has_no_reply_context(self):
+        listener = self._listener("fitness", "999", persona="P")
+        update = {"message": {"text": "bench 135x8", "chat": {"id": 999}, "message_id": 8}}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "Logged", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        assert mock_chat.call_args.args[0] == "bench 135x8"
+
 
 class TestPrimaryOnlyCommands:
     """Agent/Claude-Code/Codex commands belong to the primary bot only."""

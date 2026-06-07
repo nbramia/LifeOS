@@ -1,0 +1,147 @@
+"""
+Tests for the fitness workout store (issue #320).
+
+Covers session logging with set-count expansion, exercise normalization,
+date defaulting, corrections (update latest / by id), health metrics
+(body weight), training profile, and history/volume queries.
+"""
+import pytest
+
+from api.services.fitness_store import FitnessStore, _today
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def store(tmp_path):
+    return FitnessStore(db_path=str(tmp_path / "fitness.db"))
+
+
+# -- sessions / sets --
+
+class TestSessions:
+    def test_single_set_defaults_to_today(self, store):
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}])
+        assert s.date == _today()
+        assert len(s.sets) == 1
+        assert s.sets[0].exercise == "Bench Press"   # normalized
+        assert s.sets[0].reps == 8 and s.sets[0].weight == 135
+        assert s.sets[0].set_index == 1
+
+    def test_count_expands_to_n_rows(self, store):
+        s = store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185, "count": 3}])
+        assert len(s.sets) == 3
+        assert [x.set_index for x in s.sets] == [1, 2, 3]
+        assert all(x.exercise == "Back Squat" and x.reps == 5 and x.weight == 185 for x in s.sets)
+
+    def test_explicit_date_honored(self, store):
+        s = store.add_session(sets=[{"exercise": "deadlift", "reps": 5, "weight": 315}], date="2026-06-05")
+        assert s.date == "2026-06-05"
+
+    def test_unknown_exercise_title_cased(self, store):
+        s = store.add_session(sets=[{"exercise": "zercher carry", "reps": 10}])
+        assert s.sets[0].exercise == "Zercher Carry"
+
+    def test_multi_exercise_session(self, store):
+        s = store.add_session(sets=[
+            {"exercise": "bench", "reps": 8, "weight": 135},
+            {"exercise": "squats", "reps": 5, "weight": 185, "count": 3},
+            {"exercise": "run", "notes": "4 mi, 32:10"},
+        ])
+        assert len(s.sets) == 5  # 1 + 3 + 1
+        assert s.sets[-1].exercise == "Run"
+
+    def test_cardio_default_unit_and_count(self, store):
+        s = store.add_session(sets=[{"exercise": "run", "notes": "5k"}])
+        assert s.sets[0].weight_unit == "lb"  # default
+        assert s.sets[0].reps is None
+
+    def test_explicit_null_weight_unit_defaults(self, store):
+        # The LLM may send weight_unit: null explicitly — must still default to lb.
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135, "weight_unit": None}])
+        assert s.sets[0].weight_unit == "lb"
+
+    def test_list_sessions_newest_first(self, store):
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
+        store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185}], date="2026-06-08")
+        sessions = store.list_sessions()
+        assert len(sessions) == 2
+        assert sessions[0].date == "2026-06-08"
+
+
+class TestUpdate:
+    def test_get_latest_session(self, store):
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
+        s2 = store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185}], date="2026-06-02")
+        latest = store.get_latest_session()
+        assert latest.id == s2.id
+
+    def test_update_latest_replaces_sets(self, store):
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}])
+        updated = store.update_session(target="latest", sets=[{"exercise": "bench", "reps": 8, "weight": 145}])
+        assert updated.sets[0].weight == 145
+        assert len(updated.sets) == 1
+
+    def test_update_by_id(self, store):
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}])
+        store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185}])  # newer
+        updated = store.update_session(session_id=s.id, notes="felt easy")
+        assert updated.id == s.id and updated.notes == "felt easy"
+
+    def test_update_no_session_returns_none(self, store):
+        assert store.update_session(target="latest", notes="x") is None
+
+
+# -- metrics --
+
+class TestMetrics:
+    def test_log_and_list_body_weight(self, store):
+        store.log_metric("body_weight", 178.4, unit="lb")
+        rows = store.list_metrics("body_weight")
+        assert len(rows) == 1 and rows[0].value == 178.4 and rows[0].unit == "lb"
+
+    def test_latest_metric(self, store):
+        store.log_metric("body_weight", 178.0, unit="lb", start_at="2026-06-01T08:00:00")
+        store.log_metric("body_weight", 177.2, unit="lb", start_at="2026-06-08T08:00:00")
+        latest = store.latest_metric("body_weight")
+        assert latest.value == 177.2
+
+    def test_metrics_isolated_by_type(self, store):
+        store.log_metric("body_weight", 178.0)
+        store.log_metric("resting_hr", 54)
+        assert len(store.list_metrics("body_weight")) == 1
+        assert len(store.list_metrics("resting_hr")) == 1
+
+
+# -- profile --
+
+class TestProfile:
+    def test_set_get_roundtrip(self, store):
+        store.set_profile("goals", "half marathon in fall")
+        store.set_profile("injuries", "left knee")
+        prof = store.get_profile()
+        assert prof["goals"] == "half marathon in fall"
+        assert prof["injuries"] == "left knee"
+
+    def test_set_profile_upserts(self, store):
+        store.set_profile("goals", "strength")
+        store.set_profile("goals", "hypertrophy")
+        assert store.get_profile()["goals"] == "hypertrophy"
+
+
+# -- queries --
+
+class TestQueries:
+    def test_exercise_history_newest_first(self, store):
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 145}], date="2026-06-08")
+        hist = store.exercise_history("bench")
+        assert hist[0]["date"] == "2026-06-08" and hist[0]["weight"] == 145
+
+    def test_volume_summary_tonnage(self, store):
+        store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185, "count": 3}])
+        summary = store.volume_summary(exercise="squats")
+        assert summary["sets"] == 3
+        assert summary["reps"] == 15
+        assert summary["tonnage"] == 185 * 5 * 3
+        assert summary["sessions"] == 1
