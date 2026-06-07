@@ -4,5 +4,11 @@
     "token_env": "TELEGRAM_FITNESS_BOT_TOKEN",
     "chat_id_env": "TELEGRAM_FITNESS_CHAT_ID",
     "persona_file": "config/personas/fitness.md"
+  },
+  {
+    "name": "therapy",
+    "token_env": "TELEGRAM_THERAPY_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_THERAPY_CHAT_ID",
+    "persona_file": "config/personas/therapy.md"
   }
 ]
