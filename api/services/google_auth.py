@@ -22,8 +22,11 @@ SCOPES_PERSONAL = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/drive",
-    # Read+write: the fitness Sheet mirror (#321) writes rows. Bumped from
-    # spreadsheets.readonly — requires re-running the OAuth flow to re-consent.
+    # Read+write to Google Sheets — used by the fitness Sheet mirror (#321) to
+    # write rows. Google has no per-file write scope, so this grants write to
+    # ALL spreadsheets the account can reach (acceptable for a single-user,
+    # self-hosted deployment). Bumped from spreadsheets.readonly; requires
+    # re-running the OAuth flow to re-consent.
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 

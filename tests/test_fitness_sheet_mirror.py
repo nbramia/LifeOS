@@ -35,8 +35,12 @@ class FakeSheets:
 @pytest.fixture(autouse=True)
 def reset_mirror_state():
     mirror._last_hash = None
+    mirror._running = False
+    mirror._dirty = False
     yield
     mirror._last_hash = None
+    mirror._running = False
+    mirror._dirty = False
 
 
 @pytest.fixture
@@ -112,3 +116,59 @@ def test_trigger_is_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(mirror.settings, "fitness_sheet_id", "")
     # Should not raise or start a thread.
     mirror.trigger_mirror()
+
+
+# -- background debounce/serialize guard --
+
+def test_drain_reruns_sync_when_dirtied_midflight(monkeypatch):
+    """A write arriving during a sync must trigger one more sync (no lost update)."""
+    calls = []
+
+    def fake_sync(force=False):
+        calls.append(1)
+        if len(calls) == 1:
+            with mirror._state_lock:
+                mirror._dirty = True  # simulate a log() landing mid-sync
+        return True
+
+    monkeypatch.setattr(mirror, "sync", fake_sync)
+    mirror._dirty = True
+    mirror._running = True
+    mirror._drain()
+    assert len(calls) == 2          # re-ran for the mid-flight write
+    assert mirror._dirty is False   # drained
+    assert mirror._running is False  # cleared on exit
+
+
+def test_drain_stops_when_not_dirty(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mirror, "sync", lambda force=False: calls.append(1))
+    mirror._dirty = True
+    mirror._running = True
+    mirror._drain()
+    assert len(calls) == 1
+    assert mirror._running is False
+
+
+def test_trigger_while_running_does_not_double_spawn(monkeypatch):
+    monkeypatch.setattr(mirror.settings, "fitness_sheet_id", "SHEET")
+    spawned = []
+
+    class FakeThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            spawned.append(1)  # do NOT run _drain — leave _running True
+
+    monkeypatch.setattr(mirror.threading, "Thread", FakeThread)
+    mirror._running = False
+    mirror._dirty = False
+
+    mirror.trigger_mirror()          # not running → spawns one drain
+    assert spawned == [1]
+    assert mirror._running is True
+
+    mirror.trigger_mirror()          # already running → just mark dirty, no new thread
+    assert spawned == [1]
+    assert mirror._dirty is True
