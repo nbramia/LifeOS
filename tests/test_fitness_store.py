@@ -56,6 +56,18 @@ class TestSessions:
         assert s.sets[0].weight_unit == "lb"  # default
         assert s.sets[0].reps is None
 
+    def test_explicit_null_weight_unit_defaults(self, store):
+        # The LLM may send weight_unit: null explicitly — must still default to lb.
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135, "weight_unit": None}])
+        assert s.sets[0].weight_unit == "lb"
+
+    def test_list_sessions_newest_first(self, store):
+        store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
+        store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185}], date="2026-06-08")
+        sessions = store.list_sessions()
+        assert len(sessions) == 2
+        assert sessions[0].date == "2026-06-08"
+
 
 class TestUpdate:
     def test_get_latest_session(self, store):

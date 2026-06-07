@@ -648,9 +648,13 @@ TOOL_DEFINITIONS = [
             "count 3, reps 5, weight 185; 'bench 135x8' = count 1, reps 8, weight "
             "135). Omit `date` to log today; pass YYYY-MM-DD for an explicit day. "
             "After logging, tell the user what was recorded in normalized form.\n"
-            "- 'update': correct a session. Defaults to the most recent session "
-            "(target 'latest'); pass `session_id` to target a specific one. Pass "
-            "`sets` to replace its sets, or date/kind/title/notes to amend.\n"
+            "- 'update': correct a session. Defaults to the most recent session; "
+            "to fix an OLDER one (e.g. the user threaded-replied to an earlier "
+            "'Logged…' line), first 'list' recent sessions, find the matching "
+            "`session_id`, and pass it. Pass `sets` to replace its sets, or "
+            "date/kind/title/notes to amend.\n"
+            "- 'list': recent sessions with their id, date, and summary — use to "
+            "find the session a correction refers to before 'update'.\n"
             "- 'history': recent sets for one `exercise` (trend a lift).\n"
             "- 'summary': aggregate volume (sets/reps/tonnage) over a window, "
             "optionally for one `exercise` or `kind`.\n"
@@ -666,7 +670,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["log", "update", "history", "summary", "log_metric", "metrics", "get_profile", "set_profile"],
+                    "enum": ["log", "update", "list", "history", "summary", "log_metric", "metrics", "get_profile", "set_profile"],
                     "description": "Action to perform.",
                 },
                 "sets": {
@@ -694,7 +698,7 @@ TOOL_DEFINITIONS = [
                 "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for summary/metrics)."},
                 "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for summary/metrics)."},
                 "metric_type": {"type": "string", "description": "Metric name for log_metric/metrics, e.g. 'body_weight'."},
-                "value": {"type": "number", "description": "Metric value for 'log_metric'."},
+                "value": {"type": "string", "description": "Value: numeric for 'log_metric' (e.g. '178.4'), free text for 'set_profile'."},
                 "unit": {"type": "string", "description": "Metric unit for 'log_metric', e.g. 'lb'."},
                 "key": {"type": "string", "description": "Training-profile key for 'set_profile'."},
                 "limit": {"type": "integer", "description": "Max rows for history/metrics (default 20/100)."},
@@ -1454,6 +1458,23 @@ def _workout_update(inp: dict) -> str:
     return f"Updated — {_summarize_session(session)} (session id: {session.id})"
 
 
+def _workout_list(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    store = get_fitness_store()
+    sessions = store.list_sessions(
+        date_start=inp.get("date_start"),
+        date_end=inp.get("date_end"),
+        kind=inp.get("kind"),
+        limit=int(inp.get("limit", 10) or 10),
+    )
+    if not sessions:
+        return "No sessions logged."
+    lines = ["Recent sessions (newest first):"]
+    for s in sessions:
+        lines.append(f"  [{s.id}] {_summarize_session(s)}")
+    return "\n".join(lines)
+
+
 def _workout_history(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     exercise = inp.get("exercise")
@@ -1468,7 +1489,8 @@ def _workout_history(inp: dict) -> str:
     for r in rows:
         w = f" @{_fmt_num(r['weight'])} {r['weight_unit']}" if r["weight"] else ""
         rpe = f" RPE {_fmt_num(r['rpe'])}" if r["rpe"] else ""
-        lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}")
+        sid = f" [{r['session_id']}]" if r.get("session_id") else ""
+        lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}{sid}")
     return "\n".join(lines)
 
 
@@ -1539,6 +1561,7 @@ def _tool_manage_workouts(inp: dict) -> str:
     handlers = {
         "log": _workout_log,
         "update": _workout_update,
+        "list": _workout_list,
         "history": _workout_history,
         "summary": _workout_summary,
         "log_metric": _workout_log_metric,
@@ -1719,6 +1742,7 @@ TOOL_STATUS_MESSAGES = {
     "manage_workouts": "Updating workout log...",
     "manage_workouts.log": "Logging workout...",
     "manage_workouts.update": "Correcting log...",
+    "manage_workouts.list": "Loading recent sessions...",
     "manage_workouts.history": "Loading lift history...",
     "manage_workouts.summary": "Tallying volume...",
     "manage_workouts.log_metric": "Recording metric...",

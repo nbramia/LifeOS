@@ -212,7 +212,7 @@ class FitnessStore:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         uuid.uuid4().hex[:12], session_id, exercise, idx,
-                        s.get("reps"), s.get("weight"), s.get("weight_unit", "lb"),
+                        s.get("reps"), s.get("weight"), s.get("weight_unit") or "lb",
                         s.get("rpe"), s.get("notes", ""),
                     ),
                 )
@@ -310,17 +310,6 @@ class FitnessStore:
             conn.close()
         return self.get_session(session_id)
 
-    def delete_session(self, session_id: str) -> bool:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute("PRAGMA foreign_keys=ON")
-            cur = conn.execute("DELETE FROM workout_sessions WHERE id = ?", (session_id,))
-            conn.execute("DELETE FROM workout_sets WHERE session_id = ?", (session_id,))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-
     def list_sessions(
         self, date_start: Optional[str] = None, date_end: Optional[str] = None,
         kind: Optional[str] = None, limit: int = 50,
@@ -352,7 +341,7 @@ class FitnessStore:
         conn = sqlite3.connect(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT s.date, ws.reps, ws.weight, ws.weight_unit, ws.rpe "
+                "SELECT s.date, ws.reps, ws.weight, ws.weight_unit, ws.rpe, s.id "
                 "FROM workout_sets ws JOIN workout_sessions s ON ws.session_id = s.id "
                 "WHERE ws.exercise = ? ORDER BY s.date DESC, ws.set_index ASC LIMIT ?",
                 (canonical, limit),
@@ -360,7 +349,7 @@ class FitnessStore:
         finally:
             conn.close()
         return [
-            {"date": r[0], "reps": r[1], "weight": r[2], "weight_unit": r[3], "rpe": r[4]}
+            {"date": r[0], "reps": r[1], "weight": r[2], "weight_unit": r[3], "rpe": r[4], "session_id": r[5]}
             for r in rows
         ]
 
@@ -479,9 +468,3 @@ def get_fitness_store() -> FitnessStore:
     if _store_instance is None:
         _store_instance = FitnessStore()
     return _store_instance
-
-
-def reset_fitness_store() -> None:
-    """Reset the singleton (testing only)."""
-    global _store_instance
-    _store_instance = None

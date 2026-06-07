@@ -47,6 +47,37 @@ class TestDispatch:
         out = _tool_manage_workouts({"action": "update", "notes": "x"})
         assert out.startswith("Error")
 
+    def test_list_exposes_session_ids(self, temp_store):
+        _tool_manage_workouts({"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]})
+        out = _tool_manage_workouts({"action": "list"})
+        latest_id = temp_store.get_latest_session().id
+        assert latest_id in out  # id surfaced so the orchestrator can target an older session
+
+    def test_update_older_session_by_id(self, temp_store):
+        # Log an older session, then a newer one; correcting the OLDER by id must
+        # not touch the latest (the threaded-reply-to-older-session criterion).
+        old = temp_store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
+        temp_store.add_session(sets=[{"exercise": "squats", "reps": 5, "weight": 185}], date="2026-06-08")
+        out = _tool_manage_workouts({
+            "action": "update", "session_id": old.id,
+            "sets": [{"exercise": "bench", "reps": 8, "weight": 145}],
+        })
+        assert out.startswith("Updated")
+        assert temp_store.get_session(old.id).sets[0].weight == 145
+        # latest (squats) untouched
+        assert temp_store.get_latest_session().sets[0].exercise == "Back Squat"
+
+    def test_history_exposes_session_id(self, temp_store):
+        _tool_manage_workouts({"action": "log", "sets": [{"exercise": "squats", "reps": 5, "weight": 185}]})
+        out = _tool_manage_workouts({"action": "history", "exercise": "squats"})
+        assert temp_store.get_latest_session().id in out
+
+    def test_log_metric_accepts_string_value(self, temp_store):
+        # Schema types `value` as string; numeric metrics must still parse.
+        out = _tool_manage_workouts({"action": "log_metric", "metric_type": "body_weight", "value": "178.4", "unit": "lb"})
+        assert "178.4" in out
+        assert temp_store.latest_metric("body_weight").value == 178.4
+
     def test_log_metric_body_weight(self, temp_store):
         out = _tool_manage_workouts({"action": "log_metric", "metric_type": "body_weight", "value": 178.4, "unit": "lb"})
         assert "178.4" in out
