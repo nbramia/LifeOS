@@ -637,6 +637,71 @@ TOOL_DEFINITIONS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "manage_workouts",
+        "description": (
+            "Log and query the user's workout log and fitness metrics (the fitness "
+            "bot's backend). Parse free-form training text and record it — do NOT "
+            "ask the user to confirm before logging. Actions:\n"
+            "- 'log': record a session. Pass `sets` (one entry per distinct "
+            "exercise/load); use `count` for repeated identical sets ('3x5 @185' = "
+            "count 3, reps 5, weight 185; 'bench 135x8' = count 1, reps 8, weight "
+            "135). Omit `date` to log today; pass YYYY-MM-DD for an explicit day. "
+            "After logging, tell the user what was recorded in normalized form.\n"
+            "- 'update': correct a session. Defaults to the most recent session "
+            "(target 'latest'); pass `session_id` to target a specific one. Pass "
+            "`sets` to replace its sets, or date/kind/title/notes to amend.\n"
+            "- 'history': recent sets for one `exercise` (trend a lift).\n"
+            "- 'summary': aggregate volume (sets/reps/tonnage) over a window, "
+            "optionally for one `exercise` or `kind`.\n"
+            "- 'log_metric': record a body metric, e.g. morning body weight "
+            "(metric_type 'body_weight', value 178.4, unit 'lb').\n"
+            "- 'metrics': list a metric over time (e.g. body_weight trend).\n"
+            "- 'get_profile' / 'set_profile': read or set the training profile "
+            "(keys: goals, injuries, equipment, experience, schedule, constraints, "
+            "preferences)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["log", "update", "history", "summary", "log_metric", "metrics", "get_profile", "set_profile"],
+                    "description": "Action to perform.",
+                },
+                "sets": {
+                    "type": "array",
+                    "description": "Exercises (for log/update). Each: {exercise, reps, weight, weight_unit, count, rpe, notes}. `count` = number of identical sets (default 1).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "exercise": {"type": "string", "description": "Exercise name (normalized server-side)."},
+                            "reps": {"type": "integer", "description": "Reps per set."},
+                            "weight": {"type": "number", "description": "Load."},
+                            "weight_unit": {"type": "string", "description": "'lb' or 'kg' (default lb)."},
+                            "count": {"type": "integer", "description": "Number of identical sets (default 1)."},
+                            "rpe": {"type": "number", "description": "Rate of perceived exertion (optional)."},
+                            "notes": {"type": "string", "description": "Per-exercise note, e.g. cardio distance/time."},
+                        },
+                    },
+                },
+                "date": {"type": "string", "description": "Session date YYYY-MM-DD (for log/update). Omit on log to use today."},
+                "kind": {"type": "string", "description": "strength | cardio | mobility | sport | other (optional)."},
+                "title": {"type": "string", "description": "Session title, e.g. 'Push day' (optional)."},
+                "notes": {"type": "string", "description": "Session notes (optional)."},
+                "session_id": {"type": "string", "description": "Target session for 'update' (defaults to most recent)."},
+                "exercise": {"type": "string", "description": "Exercise name for 'history' / 'summary'."},
+                "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for summary/metrics)."},
+                "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for summary/metrics)."},
+                "metric_type": {"type": "string", "description": "Metric name for log_metric/metrics, e.g. 'body_weight'."},
+                "value": {"type": "number", "description": "Metric value for 'log_metric'."},
+                "unit": {"type": "string", "description": "Metric unit for 'log_metric', e.g. 'lb'."},
+                "key": {"type": "string", "description": "Training-profile key for 'set_profile'."},
+                "limit": {"type": "integer", "description": "Max rows for history/metrics (default 20/100)."},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 # Cache breakpoint on last tool — everything up to here gets cached
@@ -1324,6 +1389,169 @@ def _tool_search_memories(inp: dict) -> str:
     return "\n".join(lines)
 
 
+# -- Workout helpers (fitness bot backend) --
+
+def _fmt_num(n) -> str:
+    if n is None:
+        return ""
+    if isinstance(n, float) and n.is_integer():
+        return str(int(n))
+    return str(n)
+
+
+def _summarize_session(session) -> str:
+    """Compact one-line summary, grouping consecutive identical sets."""
+    groups: list[list] = []
+    for s in session.sets:
+        key = (s.exercise, s.reps, s.weight, s.weight_unit)
+        if groups and groups[-1][0] == key:
+            groups[-1][1] += 1
+        else:
+            groups.append([key, 1])
+    parts = []
+    for (exercise, reps, weight, unit), count in groups:
+        if reps is None and weight is None:
+            parts.append(exercise)
+            continue
+        rep_part = f"{count}×{reps}" if count > 1 else f"{_fmt_num(reps)}"
+        w = f" @{_fmt_num(weight)} {unit}" if weight else ""
+        parts.append(f"{exercise} {rep_part}{w}".strip())
+    body = "; ".join(parts) if parts else "(no sets)"
+    return f"{session.date}: {body}"
+
+
+def _workout_log(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    store = get_fitness_store()
+    sets = inp.get("sets") or []
+    if not sets:
+        return "Error: 'log' needs at least one entry in 'sets'."
+    session = store.add_session(
+        sets=sets,
+        date=inp.get("date"),
+        kind=inp.get("kind", ""),
+        title=inp.get("title", ""),
+        notes=inp.get("notes", ""),
+        raw_ref=inp.get("raw_ref", ""),
+    )
+    return f"Logged — {_summarize_session(session)} (session id: {session.id})"
+
+
+def _workout_update(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    store = get_fitness_store()
+    session = store.update_session(
+        session_id=inp.get("session_id"),
+        target="latest",
+        date=inp.get("date"),
+        kind=inp.get("kind"),
+        title=inp.get("title"),
+        notes=inp.get("notes"),
+        sets=inp.get("sets"),
+    )
+    if not session:
+        return "Error: no session to update (none logged yet, or session_id not found)."
+    return f"Updated — {_summarize_session(session)} (session id: {session.id})"
+
+
+def _workout_history(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    exercise = inp.get("exercise")
+    if not exercise:
+        return "Error: 'history' needs an 'exercise'."
+    store = get_fitness_store()
+    rows = store.exercise_history(exercise, limit=int(inp.get("limit", 20) or 20))
+    canonical = store.normalize_exercise(exercise)
+    if not rows:
+        return f"No history for {canonical}."
+    lines = [f"{canonical} — recent sets:"]
+    for r in rows:
+        w = f" @{_fmt_num(r['weight'])} {r['weight_unit']}" if r["weight"] else ""
+        rpe = f" RPE {_fmt_num(r['rpe'])}" if r["rpe"] else ""
+        lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}")
+    return "\n".join(lines)
+
+
+def _workout_summary(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    store = get_fitness_store()
+    summary = store.volume_summary(
+        exercise=inp.get("exercise"),
+        kind=inp.get("kind"),
+        date_start=inp.get("date_start"),
+        date_end=inp.get("date_end"),
+    )
+    scope = store.normalize_exercise(inp["exercise"]) if inp.get("exercise") else (inp.get("kind") or "all")
+    return (
+        f"Volume ({scope}): {summary['sessions']} sessions, {summary['sets']} sets, "
+        f"{summary['reps']} reps, tonnage {_fmt_num(summary['tonnage'])}."
+    )
+
+
+def _workout_log_metric(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    metric_type = inp.get("metric_type")
+    value = inp.get("value")
+    if not metric_type or value is None:
+        return "Error: 'log_metric' needs 'metric_type' and 'value'."
+    store = get_fitness_store()
+    m = store.log_metric(metric_type, float(value), unit=inp.get("unit", ""), start_at=inp.get("date"))
+    unit = f" {m.unit}" if m.unit else ""
+    return f"Logged {metric_type.replace('_', ' ')}: {_fmt_num(m.value)}{unit}."
+
+
+def _workout_metrics(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    metric_type = inp.get("metric_type")
+    if not metric_type:
+        return "Error: 'metrics' needs a 'metric_type'."
+    store = get_fitness_store()
+    rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"),
+                              limit=int(inp.get("limit", 100) or 100))
+    if not rows:
+        return f"No {metric_type.replace('_', ' ')} recorded."
+    lines = [f"{metric_type.replace('_', ' ')}:"]
+    for m in rows:
+        unit = f" {m.unit}" if m.unit else ""
+        lines.append(f"  {m.start_at[:10]}: {_fmt_num(m.value)}{unit}")
+    return "\n".join(lines)
+
+
+def _workout_get_profile(_inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    profile = get_fitness_store().get_profile()
+    if not profile:
+        return "Training profile is empty."
+    return "\n".join(f"{k}: {v}" for k, v in profile.items())
+
+
+def _workout_set_profile(inp: dict) -> str:
+    from api.services.fitness_store import get_fitness_store
+    key, value = inp.get("key"), inp.get("value")
+    if not key or value is None:
+        return "Error: 'set_profile' needs 'key' and 'value'."
+    get_fitness_store().set_profile(key, str(value))
+    return f"Training profile updated: {key} = {value}"
+
+
+def _tool_manage_workouts(inp: dict) -> str:
+    action = inp.get("action")
+    handlers = {
+        "log": _workout_log,
+        "update": _workout_update,
+        "history": _workout_history,
+        "summary": _workout_summary,
+        "log_metric": _workout_log_metric,
+        "metrics": _workout_metrics,
+        "get_profile": _workout_get_profile,
+        "set_profile": _workout_set_profile,
+    }
+    handler = handlers.get(action)
+    if not handler:
+        return f"Error: Unknown manage_workouts action '{action}'"
+    return handler(inp)
+
+
 # Handler dispatch table
 def _tool_read_vault_file(inp: dict) -> str:
     from pathlib import Path
@@ -1452,6 +1680,7 @@ _TOOL_HANDLERS = {
     "manage_tasks": _tool_manage_tasks,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
+    "manage_workouts": _tool_manage_workouts,
     "search_finances": _tool_search_finances,
     "create_email_draft": _tool_create_email_draft,
     "send_email_draft": _tool_send_email_draft,
@@ -1487,6 +1716,13 @@ TOOL_STATUS_MESSAGES = {
     "manage_schedules": "Managing schedules...",
     "manage_schedules.create": "Setting schedule...",
     "manage_schedules.list": "Loading schedules...",
+    "manage_workouts": "Updating workout log...",
+    "manage_workouts.log": "Logging workout...",
+    "manage_workouts.update": "Correcting log...",
+    "manage_workouts.history": "Loading lift history...",
+    "manage_workouts.summary": "Tallying volume...",
+    "manage_workouts.log_metric": "Recording metric...",
+    "manage_workouts.metrics": "Loading metrics...",
     "search_finances": "Checking finances...",
     "search_finances.accounts": "Loading account balances...",
     "search_finances.transactions": "Searching transactions...",

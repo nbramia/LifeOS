@@ -722,11 +722,21 @@ class TelegramBotListener:
         # an implicit follow-up — so unrelated questions never get
         # silently swallowed into a finished agent or /claude thread.
 
+        # Threaded-reply context for specialized bots: when the user replies to
+        # one of the bot's own messages (e.g. correcting a "Logged: …" line), pass
+        # the quoted text as context so the orchestrator can correlate the
+        # correction to the right earlier item, not just the latest. Primary-bot
+        # threaded replies are handled above (agent/Claude-Code resumption).
+        effective_text = text
+        if not self._is_primary and reply_to and reply_to.get("text"):
+            quoted = reply_to["text"].strip()
+            effective_text = f'[replying to my earlier message: "{quoted}"]\n{text}'
+
         # Send through chat pipeline (intent classification happens there)
         try:
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
-                result = await chat_via_api(text, conversation_id=conv_id, persona=self._persona)
+                result = await chat_via_api(effective_text, conversation_id=conv_id, persona=self._persona)
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 
