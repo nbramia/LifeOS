@@ -726,6 +726,7 @@ class LifeOSMCPServer:
                     "message_content": {"type": "string", "description": "Static text, natural-language prompt, or agent task description"},
                     "endpoint_config": {"type": "object", "description": "For action=endpoint: {endpoint, method, params}"},
                     "executor": {"type": "string", "description": "For action=agent: 'local', 'cloud', 'cloud-haiku', or 'cloud-sonnet'"},
+                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from ('fitness', 'therapy'). Omit for the primary bot."},
                     "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True}
                 },
                 "required": ["name", "schedule_type", "schedule_value", "action"]
@@ -744,6 +745,7 @@ class LifeOSMCPServer:
                     "action": {"type": "string", "description": "'notify', 'prompt', 'endpoint', or 'agent'"},
                     "message_content": {"type": "string", "description": "Message text, prompt, or task description"},
                     "executor": {"type": "string", "description": "For action=agent: local | cloud | cloud-haiku | cloud-sonnet"},
+                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from ('fitness', 'therapy'). Omit for the primary bot."},
                     "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
                     "enabled": {"type": "boolean", "description": "Whether the schedule is active"}
                 },

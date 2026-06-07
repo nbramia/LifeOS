@@ -65,6 +65,43 @@ class TestTokenForBot:
         assert "not found in registry" in caplog.text
 
 
+class TestResolveBot:
+    """_resolve_bot returns (token, chat_id) so routing carries both."""
+
+    def _bots(self):
+        from config.settings import TelegramBotConfig
+        return [TelegramBotConfig(name="fitness", token="FIT-TOK", chat_id="FIT-CHAT")]
+
+    @patch("api.services.telegram.settings")
+    def test_named_bot_returns_token_and_chat(self, ms):
+        ms.telegram_bot_token = "PRIMARY"
+        ms.telegram_chat_id = "PRIMARY-CHAT"
+        ms.telegram_bots = self._bots()
+        from api.services.telegram import _resolve_bot
+        assert _resolve_bot("fitness") == ("FIT-TOK", "FIT-CHAT")
+
+    @patch("api.services.telegram.settings")
+    def test_primary_returns_primary_pair(self, ms):
+        ms.telegram_bot_token = "PRIMARY"
+        ms.telegram_chat_id = "PRIMARY-CHAT"
+        ms.telegram_bots = self._bots()
+        from api.services.telegram import _resolve_bot
+        assert _resolve_bot("primary") == ("PRIMARY", "PRIMARY-CHAT")
+
+    @patch("api.services.telegram.settings")
+    def test_none_returns_pair_of_none(self, ms):
+        ms.telegram_bots = self._bots()
+        from api.services.telegram import _resolve_bot
+        assert _resolve_bot(None) == (None, None)
+
+    @patch("api.services.telegram.settings")
+    def test_unknown_returns_pair_of_none(self, ms):
+        ms.telegram_bot_token = "PRIMARY"
+        ms.telegram_bots = self._bots()
+        from api.services.telegram import _resolve_bot
+        assert _resolve_bot("nope") == (None, None)
+
+
 # ---------------------------------------------------------------------------
 # send_message uses resolved token
 # ---------------------------------------------------------------------------
@@ -92,6 +129,52 @@ class TestSendMessageBotParam:
         url_used = mock_post.call_args[0][0]
         assert "FIT-TOK" in url_used
         assert "PRIMARY" not in url_used
+
+    @patch("api.services.telegram.httpx.post")
+    @patch("api.services.telegram.settings")
+    def test_send_message_named_bot_uses_its_chat_id(self, mock_settings, mock_post):
+        # A bot can only post to its own chat — routing the token must also
+        # route the chat_id, otherwise Telegram rejects the send.
+        from api.services.telegram import send_message
+        from config.settings import TelegramBotConfig
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "PRIMARY-CHAT"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = [
+            TelegramBotConfig(name="fitness", token="FIT-TOK", chat_id="FIT-CHAT")
+        ]
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post.return_value = mock_resp
+
+        send_message("Workout logged", bot="fitness")
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["chat_id"] == "FIT-CHAT"
+
+    @patch("api.services.telegram.httpx.post")
+    @patch("api.services.telegram.settings")
+    def test_explicit_chat_id_overrides_bot_chat_id(self, mock_settings, mock_post):
+        from api.services.telegram import send_message
+        from config.settings import TelegramBotConfig
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "PRIMARY-CHAT"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = [
+            TelegramBotConfig(name="fitness", token="FIT-TOK", chat_id="FIT-CHAT")
+        ]
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post.return_value = mock_resp
+
+        send_message("To a specific chat", chat_id="OVERRIDE", bot="fitness")
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["chat_id"] == "OVERRIDE"
 
     @patch("api.services.telegram.httpx.post")
     @patch("api.services.telegram.settings")
@@ -267,3 +350,46 @@ class TestScheduleEntryBotField:
         }
         entry = ScheduleEntry.from_dict(data)
         assert entry.bot == ""
+
+
+class TestSchedulerApiBotField:
+    """The scheduler API surfaces the bot field for create/update/response."""
+
+    def test_create_request_accepts_bot(self):
+        from api.routes.scheduler import CreateScheduleRequest
+        req = CreateScheduleRequest(
+            name="Morning log", schedule_type="cron", schedule_value="0 8 * * *",
+            action="notify", bot="fitness",
+        )
+        assert req.bot == "fitness"
+
+    def test_create_request_bot_defaults_empty(self):
+        from api.routes.scheduler import CreateScheduleRequest
+        req = CreateScheduleRequest(
+            name="x", schedule_type="cron", schedule_value="0 8 * * *", action="notify",
+        )
+        assert req.bot == ""
+
+    def test_update_request_accepts_bot(self):
+        from api.routes.scheduler import UpdateScheduleRequest
+        req = UpdateScheduleRequest(bot="therapy")
+        assert req.bot == "therapy"
+
+    def test_response_includes_bot(self):
+        from api.routes.scheduler import ScheduleResponse
+        from api.services.scheduler_store import ScheduleEntry
+        entry = ScheduleEntry(
+            id="abc", name="Workout", schedule_type="cron",
+            schedule_value="0 8 * * *", bot="fitness",
+        )
+        resp = ScheduleResponse.from_entry(entry)
+        assert resp.bot == "fitness"
+
+
+class TestMcpScheduleSchemaBotField:
+    def test_schedule_create_and_update_have_bot(self):
+        from mcp_server import LifeOSMCPServer
+        server = LifeOSMCPServer.__new__(LifeOSMCPServer)
+        schemas = server._fallback_schemas()
+        assert "bot" in schemas["lifeos_schedule_create"]["properties"]
+        assert "bot" in schemas["lifeos_schedule_update"]["properties"]

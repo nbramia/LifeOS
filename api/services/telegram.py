@@ -41,23 +41,30 @@ _active_bot_token: ContextVar[Optional[str]] = ContextVar("active_bot_token", de
 # Bot token resolution
 # ---------------------------------------------------------------------------
 
-def _token_for_bot(bot: Optional[str]) -> Optional[str]:
-    """Resolve a bot name to its token.
+def _resolve_bot(bot: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a bot name to its ``(token, chat_id)``.
 
     Looks up ``bot`` in the primary bot and the specialized-bot registry.
-    Returns the matching token, or ``None`` if unresolved (callers then fall
-    back to the primary). Unknown or empty names are silently ignored so a
-    misconfigured caller doesn't break the send path.
+    Returns the matching pair, or ``(None, None)`` if unresolved — callers then
+    fall back to the primary token and chat. Resolving both together matters:
+    a bot can only post to its own chat, so routing the token without the
+    chat_id would send a specialized bot's message to the primary chat. Unknown
+    or empty names are ignored so a misconfigured caller doesn't break the send.
     """
     if not bot:
-        return None
+        return None, None
     if bot == "primary":
-        return settings.telegram_bot_token or None
+        return (settings.telegram_bot_token or None), (settings.telegram_chat_id or None)
     for cfg in settings.telegram_bots:
         if cfg.name == bot:
-            return cfg.token or None
+            return (cfg.token or None), (cfg.chat_id or None)
     logger.warning(f"Telegram bot '{bot}' not found in registry, falling back to primary")
-    return None
+    return None, None
+
+
+def _token_for_bot(bot: Optional[str]) -> Optional[str]:
+    """Resolve a bot name to its token (see :func:`_resolve_bot`)."""
+    return _resolve_bot(bot)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +168,8 @@ def send_message_capture_ids(text: str, chat_id: str = None, bot: str = None) ->
     """
     if not settings.telegram_enabled:
         return []
-    token = _token_for_bot(bot)
-    chat_id = chat_id or settings.telegram_chat_id
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
     ids: list[int] = []
     for part in _split_message(text):
@@ -204,8 +211,8 @@ def send_message(text: str, chat_id: str = None, bot: str = None) -> bool:
         logger.debug("Telegram not configured, skipping send")
         return False
 
-    token = _token_for_bot(bot)
-    chat_id = chat_id or settings.telegram_chat_id
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
 
     success = True
@@ -249,8 +256,8 @@ async def send_message_async(text: str, chat_id: str = None, bot: str = None) ->
     if not settings.telegram_enabled:
         return False
 
-    token = _token_for_bot(bot)
-    chat_id = chat_id or settings.telegram_chat_id
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
     text = _clean_markdown_for_telegram(text)
 
     success = True
