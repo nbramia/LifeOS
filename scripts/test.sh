@@ -265,8 +265,11 @@ run_health_check() {
 # Print the changed files (one per line) for the current branch: everything
 # since the merge-base with origin/main, plus uncommitted and untracked work.
 # Overridable via LIFEOS_TEST_CHANGED_FILES (newline-separated) for testing.
+# Use ${VAR+x} (set, even if empty) — NOT ${VAR:-} (non-empty) — so an explicit
+# empty override ("no changes") is honored instead of falling back to the git
+# diff. Without this the 'empty' case picks up the working tree's real changes.
 compute_changed_files() {
-    if [ -n "${LIFEOS_TEST_CHANGED_FILES:-}" ]; then
+    if [ -n "${LIFEOS_TEST_CHANGED_FILES+x}" ]; then
         printf '%s\n' "$LIFEOS_TEST_CHANGED_FILES" | grep -v '^$' || true
         return
     fi
