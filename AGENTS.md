@@ -65,6 +65,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How does the agent worker work internally? | [specs/technical/agent-worker.md](docs/specs/technical/agent-worker.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
+| How do I import Apple Health/Fitness data? | [guides/apple-health.md](docs/guides/apple-health.md) |
 | What does `/agents` show? | [specs/product/agent-viz.md](docs/specs/product/agent-viz.md) |
 | How does the `/agents` page work internally? | [specs/technical/agent-viz.md](docs/specs/technical/agent-viz.md) |
 | What does the CRM do (overview)? | [specs/product/crm-ui.md](docs/specs/product/crm-ui.md) |
