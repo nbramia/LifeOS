@@ -218,16 +218,6 @@ class GoogleAuthService:
             return False
 
 
-def resolve_account(account: str) -> GoogleAccount:  # noqa: F811 (pre-existing duplicate; see PR #327 note)
-    """Resolve a string account name ('personal'/'work') to a GoogleAccount enum."""
-    return GoogleAccount.PERSONAL if account == "personal" else GoogleAccount.WORK
-
-
-def get_configured_accounts() -> list[GoogleAccount]:  # noqa: F811 (pre-existing duplicate; see PR #327 note)
-    """Return the list of configured Google account types."""
-    return [GoogleAccount.WORK, GoogleAccount.PERSONAL]
-
-
 # Singleton instances for each account
 _auth_services: dict[GoogleAccount, GoogleAuthService] = {}
 
