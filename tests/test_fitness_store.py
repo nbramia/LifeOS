@@ -113,6 +113,29 @@ class TestMetrics:
         assert len(store.list_metrics("resting_hr")) == 1
 
 
+class TestDailyMetricTotals:
+    def test_sums_intraday_samples_per_day(self, store):
+        # Several midday buckets on one day (midday is tz-stable) collapse to one total.
+        for h, v in ((10, 10), (12, 20), (14, 30)):
+            store.log_metric("steps", v, unit="count", start_at=f"2026-06-07T{h}:00:00+00:00")
+        store.log_metric("steps", 5, unit="count", start_at="2026-06-08T12:00:00+00:00")
+        days = store.daily_metric_totals("steps")
+        assert days[0] == {"date": "2026-06-08", "value": 5, "unit": "count", "samples": 1}
+        assert days[1] == {"date": "2026-06-07", "value": 60, "unit": "count", "samples": 3}
+
+    def test_newest_first_and_day_limit(self, store):
+        for d in range(1, 6):
+            store.log_metric("steps", 100, start_at=f"2026-06-0{d}T12:00:00+00:00")
+        days = store.daily_metric_totals("steps", limit=2)
+        assert [r["date"] for r in days] == ["2026-06-05", "2026-06-04"]
+
+    def test_local_day_range_filter(self, store):
+        for d in (1, 2, 3):
+            store.log_metric("steps", 100, start_at=f"2026-06-0{d}T12:00:00+00:00")
+        days = store.daily_metric_totals("steps", start="2026-06-02", end="2026-06-02")
+        assert len(days) == 1 and days[0]["date"] == "2026-06-02"
+
+
 # -- profile --
 
 class TestProfile:

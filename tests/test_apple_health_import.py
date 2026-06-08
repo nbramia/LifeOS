@@ -144,6 +144,42 @@ def test_metric_without_start_is_skipped_not_duplicated(health_env):
     assert len(store.list_metrics("body_weight")) == 0  # never written, never duplicated
 
 
+def test_duplicate_rows_within_one_payload_are_deduped(health_env):
+    # The batch importer dedups in-memory, so duplicate uuids / (type, start)
+    # keys inside a single payload collapse to one row each.
+    store, export = health_env
+    _write(export, {
+        "workouts": [
+            {"uuid": "W1", "type": "Running", "start": "2026-06-07T08:00:00Z", "duration_s": 600},
+            {"uuid": "W1", "type": "Running", "start": "2026-06-07T08:00:00Z", "duration_s": 600},
+        ],
+        "metrics": [
+            {"type": "body_weight", "value": 178.0, "start": "2026-06-07T07:00:00Z"},
+            {"type": "body_weight", "value": 178.0, "start": "2026-06-07T07:00:00Z"},
+        ],
+    })
+    result = import_health()
+    assert result["workouts_created"] == 1 and result["workouts_skipped"] == 1
+    assert result["metrics_created"] == 1 and result["metrics_skipped"] == 1
+    assert len(store.list_sessions()) == 1
+    assert len(store.list_metrics("body_weight")) == 1
+
+
+def test_large_payload_ingests(health_env):
+    # Regression for the timeout: a backfill of many rows must import in a single
+    # transaction, not per-row connect+commit.
+    store, export = health_env
+    metrics = [
+        {"type": "heart_rate", "value": 60 + (i % 40), "unit": "bpm",
+         "start": f"2026-01-{1 + i // 1440:02d}T{(i // 60) % 24:02d}:{i % 60:02d}:00Z"}
+        for i in range(5000)
+    ]
+    _write(export, {"metrics": metrics})
+    result = import_health()
+    assert result["metrics_created"] == 5000
+    assert len(store.list_metrics("heart_rate", limit=10000)) == 5000
+
+
 def test_workout_date_is_local_not_utc(health_env, monkeypatch):
     # An evening-ET workout that crosses midnight UTC must bucket on the local
     # calendar day, matching manual logging.

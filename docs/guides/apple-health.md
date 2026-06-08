@@ -101,6 +101,9 @@ Notes:
 - Suggested `metrics.type` values the fitness bot recognizes as recovery
   signals: `body_weight`, `resting_hr`, `hrv`, `sleep_hours`. Any other type is
   imported and queryable too.
+- Cumulative quantities (`steps`, `active_energy`) arrive as many intraday
+  samples; the fitness bot's `metrics` query returns them as **daily totals**
+  (summed per local calendar day), not raw buckets.
 
 ---
 
