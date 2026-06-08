@@ -3,6 +3,7 @@
 **Status:** Complete
 **Last Updated:** 2026-06-08
 **Decision:** Accepted
+**Amended by:** ADR-015
 
 ## Context
 
@@ -81,6 +82,7 @@ primary path.
 ### Design Context
 - [ADR-010: Apple Data Agent](010-apple-data-agent.md) — The Mac-side pipeline this parallels; explains the FDA grant the rejected Swift-CLI alternative would have used
 - [ADR-013: Self-data fitness store](013-fitness-store.md) — Where imported data lands
+- [ADR-015: HealthBridge app](015-healthbridge-app.md) — Amends this: the app is now the recommended collector, the Shortcut a fallback
 
 ### Operational
 - [guides/apple-health.md](../guides/apple-health.md) — iOS Shortcut build steps + `health.json` schema

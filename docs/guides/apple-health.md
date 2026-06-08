@@ -1,4 +1,4 @@
-# Apple Health Import (iOS Shortcut → LifeOS)
+# Apple Health Import → LifeOS
 
 > **Audience:** Operators setting up Apple Health/Fitness ingestion
 > **Status:** Complete
@@ -8,26 +8,53 @@ LifeOS imports Apple Health/Fitness data (workouts, body weight, resting heart
 rate, HRV, sleep, energy) into the fitness store so the fitness bot can
 cross-reference training with recovery.
 
-**Why a Shortcut and not a Mac job:** macOS has no Health app and a Mac does not
-hold the iPhone/Watch HealthKit store, so the data can only be read **on iOS**.
-An iOS Shortcut reads HealthKit and writes a `health.json` into a synced folder;
-the LifeOS server imports it nightly. See [ADR-014](../adr/014-apple-health-collection.md).
-
+**Why on iOS:** macOS has no Health app and a Mac does not hold the iPhone/Watch
+HealthKit store, so the data can only be read **on iOS** ([ADR-014](../adr/014-apple-health-collection.md)).
 The data lands in the **self-data fitness store** (`data/fitness.db`), not the
-person-centric CRM model — see [ADR-013](../adr/013-fitness-store.md).
+person-centric CRM model ([ADR-013](../adr/013-fitness-store.md)).
+
+## Collectors
+
+Two ways to get the data off the phone, both emitting the same `health.json`
+schema (below):
+
+| Collector | Delivery | When |
+|-----------|----------|------|
+| **HealthBridge app (recommended)** | **POST** to `/api/fitness/health/ingest` over Tailscale | Best — incremental anchored sync + background delivery ([ADR-015](../adr/015-healthbridge-app.md)). |
+| iOS Shortcut (fallback) | **file** into the synced path, imported nightly | No Xcode needed; manual to build, less robust. |
+| Health-app XML export | file, one-shot | History backfill only. |
+
+### HealthBridge app (recommended)
+
+Build and deploy the app per **[`apple/HealthBridge/README.md`](../../apple/HealthBridge/README.md)**
+(Xcode + a free Apple ID). In the app, set the ingest URL and token and tap
+**Sync now**; background delivery handles the rest.
+
+Server setup for POST mode — set a dedicated bearer token in `.env`:
+```
+LIFEOS_HEALTH_INGEST_TOKEN=<openssl rand -hex 32>
+```
+Empty disables the endpoint (it returns 503). The app POSTs to
+`https://<your-machine>.<tailnet>.ts.net/api/fitness/health/ingest`; rows land in
+`fitness.db` immediately, queryable via the fitness bot.
 
 ---
 
-## 1. Where the file goes
+## Fallback: iOS Shortcut (file mode)
+
+If you'd rather not build the app, an iOS Shortcut can write `health.json` into a
+synced folder that the nightly importer reads.
+
+### 1. Where the file goes
 
 The importer reads `LIFEOS_HEALTH_EXPORT_PATH` (default
 `data/apple-imports/health.json`). The simplest automated path is the Syncthing
 share that's already mirrored to every machine:
 
 1. Pick a synced location, e.g. `~/Code/Sync/health/health.json`.
-2. Set it in `.env` on the server:
+2. Set it in `.env` on the server (use your own home path):
    ```
-   LIFEOS_HEALTH_EXPORT_PATH=/home/nathanramia/Code/Sync/health/health.json
+   LIFEOS_HEALTH_EXPORT_PATH=/home/<your-username>/Code/Sync/health/health.json
    ```
    (No "mover" step needed — the Shortcut writes into the synced folder on the
    phone via iCloud Drive/Working Copy, or you point the path at wherever your
@@ -122,5 +149,7 @@ metrics and Apple workouts live in `data/fitness.db` alongside your manual log.
 
 - [ADR-013 — Self-data fitness store](../adr/013-fitness-store.md)
 - [ADR-014 — Apple Health collection & import](../adr/014-apple-health-collection.md)
+- [ADR-015 — HealthBridge app (recommended collector)](../adr/015-healthbridge-app.md)
+- [apple/HealthBridge/README.md](../../apple/HealthBridge/README.md) — Build/sign/run the app
 - [ADR-010 — Apple Data Agent](../adr/010-apple-data-agent.md)
 - [guides/scheduler.md](scheduler.md) — proactive check-ins (e.g. morning weight)
