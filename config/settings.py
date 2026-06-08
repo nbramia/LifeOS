@@ -626,6 +626,13 @@ class Settings(BaseSettings):
         description="Path to the Apple Health export JSON written by the iOS Shortcut "
                     "(e.g. a synced ~/Code/Sync/health/health.json). Imported nightly."
     )
+    health_ingest_token: str = Field(
+        default="",
+        alias="LIFEOS_HEALTH_INGEST_TOKEN",
+        description="Bearer token for POST /api/fitness/health/ingest (the HealthBridge "
+                    "app's POST delivery mode). Empty disables the endpoint (503). "
+                    "Generate with `openssl rand -hex 32`."
+    )
 
     # Monarch Money
     monarch_email: str = Field(

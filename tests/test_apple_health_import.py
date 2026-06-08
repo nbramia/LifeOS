@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from scripts.apple_data_import import import_health, _to_utc_iso, _health_kind, _workout_summary
+from scripts.apple_data_import import import_health
+from api.services.health_import import _to_utc_iso, _health_kind, _workout_summary
 from api.services.fitness_store import FitnessStore
 
 pytestmark = pytest.mark.unit
