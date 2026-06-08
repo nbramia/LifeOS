@@ -2,14 +2,15 @@
 # LifeOS Test Runner
 # ==================
 #
-# Usage: ./scripts/test.sh [unit|integration|browser|smoke|all|health]
+# Usage: ./scripts/test.sh [unit|integration|browser|smoke|all|auto|health]
 #
 # Test levels:
-#   unit        - Fast tests, no external dependencies (~30s)
+#   unit        - Fast tests, no external dependencies (~2min, parallelized)
 #   integration - Tests requiring server to be running
 #   browser     - Playwright browser tests (requires server)
 #   smoke       - Unit + critical browser test (used by deploy.sh)
 #   all         - Run all tests in sequence
+#   auto        - Pick scope from the git diff (see decide_plan below)
 #   health      - Quick server health check
 #
 # Note: Integration, browser, and smoke tests require the server to be running.
@@ -40,6 +41,12 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
+# Parallelize unit tests across all cores via pytest-xdist. --dist loadscope
+# keeps every test in a module on the same worker, which avoids cross-module
+# ordering surprises from shared singletons. Browser/integration runs stay
+# serial (single shared server + Playwright), so they don't use this.
+PYTEST_PARALLEL=(-n auto --dist loadscope)
+
 # Activate virtual environment (located outside Documents for faster startup)
 activate_venv() {
     if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
@@ -68,7 +75,8 @@ run_unit_tests() {
         --ignore=tests/archive \
         -m "not browser and not requires_server and not integration and not slow" \
         --tb=short \
-        -q
+        -q \
+        "${PYTEST_PARALLEL[@]}"
 }
 
 # Run integration tests (requires server)
@@ -109,22 +117,13 @@ run_browser_tests() {
         --browser chromium
 }
 
-# Run smoke tests (unit + critical browser test for deployment verification)
-run_smoke_tests() {
-    local start_time=$(date +%s)
-
-    log_step "Running smoke tests (unit + critical browser test)..."
-    echo ""
-
-    # Unit tests first (fast feedback)
-    run_unit_tests
-    echo ""
-
-    # Critical browser test - verifies the full user flow works
+# Run the single critical browser test that verifies the full user flow.
+# Serial (single shared server + Playwright). Shared by smoke and auto.
+run_critical_browser_test() {
     log_step "Running critical browser smoke test..."
 
     if ! check_server; then
-        log_warn "Server not running. Starting server for smoke test..."
+        log_warn "Server not running. Starting server for browser test..."
         start_server_background
         sleep 3
     fi
@@ -139,11 +138,47 @@ run_smoke_tests() {
     python -m pytest tests/test_e2e_flow.py::TestRealUserFlow::test_user_sends_query_gets_response -v \
         --tb=short \
         --browser chromium
+}
+
+# Run smoke tests (unit + critical browser test for deployment verification)
+run_smoke_tests() {
+    local start_time=$(date +%s)
+
+    log_step "Running smoke tests (unit + critical browser test)..."
+    echo ""
+
+    # Unit tests first (fast feedback)
+    run_unit_tests
+    echo ""
+
+    run_critical_browser_test
 
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
     log_info "Smoke tests passed in ${duration}s"
+}
+
+# Run slow tests (ChromaDB, embeddings, heavy processing). Parallelized.
+run_slow_tests() {
+    log_step "Running slow tests..."
+    python -m pytest tests/ -v \
+        --ignore=tests/test_ui_browser.py \
+        --ignore=tests/archive \
+        -m "slow and not browser and not requires_server and not integration" \
+        --tb=short \
+        -q \
+        "${PYTEST_PARALLEL[@]}"
+}
+
+# Run a specific list of changed test files (parallelized).
+run_changed_test_files() {
+    log_step "Running changed test files: $*"
+    python -m pytest "$@" -v \
+        -m "not browser and not requires_server and not integration" \
+        --tb=short \
+        -q \
+        "${PYTEST_PARALLEL[@]}"
 }
 
 # Start server in background for tests using server.sh
@@ -217,7 +252,121 @@ run_health_check() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Auto mode: pick test scope from the git diff.
+#
+# Lets /implement (and anyone) run only the tests a change can affect.
+# compute_changed_files() gathers the diff; decide_plan() is a pure mapping
+# from a file list to a scope plan (kept pure so it's unit-testable via
+# LIFEOS_TEST_PLAN_ONLY); run_auto() dispatches into the existing runners.
+# ---------------------------------------------------------------------------
+
+# Print the changed files (one per line) for the current branch: everything
+# since the merge-base with origin/main, plus uncommitted and untracked work.
+# Overridable via LIFEOS_TEST_CHANGED_FILES (newline-separated) for testing.
+compute_changed_files() {
+    if [ -n "${LIFEOS_TEST_CHANGED_FILES:-}" ]; then
+        printf '%s\n' "$LIFEOS_TEST_CHANGED_FILES" | grep -v '^$' || true
+        return
+    fi
+    local base
+    base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+    {
+        [ -n "$base" ] && { git diff --name-only "$base" HEAD 2>/dev/null || true; }
+        git diff --name-only HEAD 2>/dev/null || true                  # unstaged tracked
+        git diff --name-only --cached 2>/dev/null || true              # staged
+        git ls-files --others --exclude-standard 2>/dev/null || true   # untracked
+    } | sort -u | grep -v '^$' || true
+}
+
+# Pure mapping: changed-file list (newline-separated, in $1) -> scope plan.
+# Plans: "skip" | "files <f1> <f2> ..." | "unit" [browser] [slow].
+# Adding files can only broaden the plan, never narrow it, so unknown or
+# stray files fall back to the safe full-unit run.
+decide_plan() {
+    local files="$1"
+
+    # No detected changes -> safest default is the full unit suite.
+    [ -z "$files" ] && { echo "unit"; return; }
+
+    # docs-only: no file falls outside the docs patterns (matches pre-push).
+    if ! printf '%s\n' "$files" | grep -qvE '\.(md|txt|rst)$|^docs/'; then
+        echo "skip"; return
+    fi
+
+    # tests-only: every changed file lives under tests/.
+    if ! printf '%s\n' "$files" | grep -qvE '^tests/'; then
+        # A conftest/fixture/helper change affects every test -> full suite.
+        if printf '%s\n' "$files" | grep -qvE '^tests/test_[^/]*\.py$'; then
+            echo "unit"
+        else
+            local list
+            list=$(printf '%s\n' "$files" | grep -E '^tests/test_[^/]*\.py$' | tr '\n' ' ' | sed 's/ *$//')
+            echo "files $list"
+        fi
+        return
+    fi
+
+    # Code change: always run unit; additively widen for the touched areas so
+    # a change spanning categories is fully covered.
+    local plan="unit"
+    if printf '%s\n' "$files" | grep -qE '\.html$|^static/.*\.js$|^api/routes/|/templates/'; then
+        plan="$plan browser"
+    fi
+    if printf '%s\n' "$files" | grep -qE '^scripts/run_all_syncs\.py$|^api/services/[^/]*sync[^/]*|indexer|embeddings|vectorstore|bm25_index'; then
+        plan="$plan slow"
+    fi
+    echo "$plan"
+}
+
+# Compute the plan, then run it (or just print it under LIFEOS_TEST_PLAN_ONLY).
+run_auto() {
+    local files plan
+    files=$(compute_changed_files)
+    plan=$(decide_plan "$files")
+
+    if [ -n "${LIFEOS_TEST_PLAN_ONLY:-}" ]; then
+        echo "auto-plan: $plan"
+        return 0
+    fi
+
+    log_info "Auto-selected test scope: $plan"
+    case "$plan" in
+        skip)
+            log_info "Docs-only change — skipping tests."
+            ;;
+        files\ *)
+            local existing=()
+            local f
+            for f in ${plan#files }; do
+                [ -f "$f" ] && existing+=("$f")
+            done
+            if [ ${#existing[@]} -eq 0 ]; then
+                log_warn "Changed test files no longer exist — running full unit suite."
+                run_unit_tests
+            else
+                run_changed_test_files "${existing[@]}"
+            fi
+            ;;
+        *)
+            run_unit_tests
+            case "$plan" in
+                *browser*) echo ""; run_critical_browser_test ;;
+            esac
+            case "$plan" in
+                *slow*) echo ""; run_slow_tests ;;
+            esac
+            ;;
+    esac
+}
+
 # Main
+# Plan-only auto runs are pure (no pytest), so they don't need the venv.
+if [ "${1:-}" = "auto" ] && [ -n "${LIFEOS_TEST_PLAN_ONLY:-}" ]; then
+    run_auto
+    exit 0
+fi
+
 activate_venv
 
 case "${1:-unit}" in
@@ -236,13 +385,16 @@ case "${1:-unit}" in
     all)
         run_all_tests
         ;;
+    auto)
+        run_auto
+        ;;
     health)
         run_health_check
         ;;
     *)
         echo "LifeOS Test Runner"
         echo ""
-        echo "Usage: $0 [unit|integration|browser|smoke|all|health]"
+        echo "Usage: $0 [unit|integration|browser|smoke|all|auto|health]"
         echo ""
         echo "Test levels:"
         echo "  unit         Fast tests, no external dependencies (default)"
@@ -250,6 +402,7 @@ case "${1:-unit}" in
         echo "  browser      Playwright browser tests"
         echo "  smoke        Unit tests + critical browser test (for deployment)"
         echo "  all          Run all tests in sequence"
+        echo "  auto         Pick scope from the git diff (unit/smoke/slow/skip)"
         echo "  health       Quick server health check"
         exit 1
         ;;
