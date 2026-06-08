@@ -97,3 +97,35 @@ class TestIngestEndpoint:
         )
         assert resp.status_code == 200
         assert resp.json()["workouts_created"] == 0
+
+    def test_auth_runs_before_body_validation(self, env):
+        # Unauthenticated + malformed body must hit the auth gate (503/401), not
+        # leak field-level validation (422).
+        client, _, monkeypatch = env
+        monkeypatch.setattr(fitness_route.settings, "health_ingest_token", "")
+        resp = client.post("/api/fitness/health/ingest", json={"workouts": "not-a-list"})
+        assert resp.status_code == 503  # disabled gate fires before parsing
+
+        monkeypatch.setattr(fitness_route.settings, "health_ingest_token", "secret-token")
+        resp = client.post("/api/fitness/health/ingest", json={"workouts": "not-a-list"})
+        assert resp.status_code == 401  # missing bearer fires before parsing
+
+    def test_malformed_body_with_auth_is_422(self, env):
+        client, _, monkeypatch = env
+        monkeypatch.setattr(fitness_route.settings, "health_ingest_token", "secret-token")
+        resp = client.post(
+            "/api/fitness/health/ingest", json={"workouts": "not-a-list"},
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert resp.status_code == 422
+
+    def test_oversized_payload_rejected(self, env):
+        client, _, monkeypatch = env
+        monkeypatch.setattr(fitness_route.settings, "health_ingest_token", "secret-token")
+        monkeypatch.setattr(fitness_route, "_MAX_INGEST_ITEMS", 3)
+        resp = client.post(
+            "/api/fitness/health/ingest",
+            json={"metrics": [{"type": "body_weight", "value": 1, "start": f"2026-06-0{i}T00:00:00Z"} for i in range(1, 6)]},
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert resp.status_code == 413

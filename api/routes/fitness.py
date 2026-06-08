@@ -9,13 +9,17 @@ import hmac
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/fitness", tags=["fitness"])
+
+# Upper bound on items per ingest. Generous enough for a multi-year one-shot
+# backfill; rejects absurd payloads (the endpoint takes on-demand POSTs).
+_MAX_INGEST_ITEMS = 100_000
 
 
 class HealthIngestRequest(BaseModel):
@@ -43,13 +47,30 @@ def _check_ingest_auth(request: Request) -> None:
 
 
 @router.post("/health/ingest")
-async def health_ingest(payload: HealthIngestRequest, request: Request):
+async def health_ingest(request: Request):
     """Ingest an Apple Health payload into the fitness store.
 
     Idempotent — workouts dedupe on the HKWorkout uuid, metrics on (type, start).
-    Returns created/skipped counts.
+    Returns created/skipped counts. Authenticates BEFORE parsing the body so an
+    unauthenticated caller can't probe validation behavior.
     """
     _check_ingest_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    try:
+        payload = HealthIngestRequest.model_validate(body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+
+    total = len(payload.workouts) + len(payload.metrics)
+    if total > _MAX_INGEST_ITEMS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"payload too large: {total} items (max {_MAX_INGEST_ITEMS})",
+        )
+
     from api.services.health_import import ingest_health
     result = ingest_health(payload.model_dump())
     logger.info(f"Health ingest: {result}")
