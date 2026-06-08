@@ -45,7 +45,7 @@ struct ContentView: View {
             .navigationTitle("HealthBridge")
             .task {
                 await engine.requestAuthorization()
-                engine.startBackgroundDelivery(serverURL: serverURL, token: token)
+                engine.startBackgroundDelivery()
             }
         }
     }

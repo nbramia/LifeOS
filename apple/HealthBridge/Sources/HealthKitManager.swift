@@ -52,18 +52,30 @@ final class HealthKitManager {
 
     // MARK: Collection
 
-    func collect() async -> ExportPayload {
+    /// Collected payload plus the anchors to persist *only after* a successful
+    /// upload (so a failed POST re-reads those samples next time — the server is
+    /// idempotent, so re-sends are harmless).
+    typealias Collected = (payload: ExportPayload, pendingAnchors: [(String, HKQueryAnchor)])
+
+    func collect() async -> Collected {
         async let workouts = collectWorkouts()
         async let quantityMetrics = collectQuantityMetrics()
         async let sleep = collectSleep()
-        let metrics = await quantityMetrics + sleep
-        return ExportPayload(generatedAt: iso.string(from: Date()),
-                             workouts: await workouts,
-                             metrics: metrics)
+        let (w, wA) = await workouts
+        let (q, qA) = await quantityMetrics
+        let (s, sA) = await sleep
+        let payload = ExportPayload(generatedAt: iso.string(from: Date()),
+                                    workouts: w, metrics: q + s)
+        return (payload, wA + qA + sA)
     }
 
-    private func collectWorkouts() async -> [WorkoutSample] {
-        let samples = await runAnchored(type: HKWorkoutType.workoutType(), anchorKey: "workouts")
+    /// Persist anchors after a confirmed upload.
+    func commitAnchors(_ pending: [(String, HKQueryAnchor)]) {
+        for (key, anchor) in pending { AnchorStore.save(key, anchor) }
+    }
+
+    private func collectWorkouts() async -> ([WorkoutSample], [(String, HKQueryAnchor)]) {
+        let (samples, pending) = await runAnchored(type: HKWorkoutType.workoutType(), anchorKey: "workouts")
         var out: [WorkoutSample] = []
         for case let w as HKWorkout in samples {
             let dist = w.statistics(for: HKQuantityType(.distanceWalkingRunning))?
@@ -83,13 +95,15 @@ final class HealthKitManager {
                 avgHr: avgHr
             ))
         }
-        return out
+        return (out, pending.map { [$0] } ?? [])
     }
 
-    private func collectQuantityMetrics() async -> [MetricSample] {
+    private func collectQuantityMetrics() async -> ([MetricSample], [(String, HKQueryAnchor)]) {
         var out: [MetricSample] = []
+        var anchors: [(String, HKQueryAnchor)] = []
         for spec in metricSpecs {
-            let samples = await runAnchored(type: HKQuantityType(spec.id), anchorKey: spec.type)
+            let (samples, pending) = await runAnchored(type: HKQuantityType(spec.id), anchorKey: spec.type)
+            if let pending { anchors.append(pending) }
             for case let q as HKQuantitySample in samples {
                 out.append(MetricSample(
                     type: spec.type,
@@ -100,45 +114,50 @@ final class HealthKitManager {
                 ))
             }
         }
-        return out
+        return (out, anchors)
     }
 
-    /// Aggregate asleep category samples into one `sleep_hours` metric per local night.
-    private func collectSleep() async -> [MetricSample] {
-        let samples = await runAnchored(type: HKCategoryType(.sleepAnalysis), anchorKey: "sleep")
+    /// Aggregate asleep category samples into one `sleep_hours` metric per night.
+    /// The metric `start` is the night's UTC date at midnight — a STABLE key — so
+    /// re-aggregating a night across multiple syncs dedupes to one row instead of
+    /// emitting a new row per differing first-sample time. (A night still being
+    /// filled in across syncs can undercount until the importer supports upsert.)
+    private func collectSleep() async -> ([MetricSample], [(String, HKQueryAnchor)]) {
+        let (samples, pending) = await runAnchored(type: HKCategoryType(.sleepAnalysis), anchorKey: "sleep")
         let asleep: Set<Int> = [
             HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
             HKCategoryValueSleepAnalysis.asleepCore.rawValue,
             HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
             HKCategoryValueSleepAnalysis.asleepREM.rawValue,
         ]
-        var perNight: [String: (seconds: Double, start: Date, end: Date)] = [:]
-        let cal = Calendar.current
+        var perNight: [String: (seconds: Double, end: Date)] = [:]
         for case let s as HKCategorySample in samples where asleep.contains(s.value) {
-            let dayKey = ISO8601DateFormatter.dateOnly.string(from: s.startDate)
+            let dayKey = ISO8601DateFormatter.dateOnly.string(from: s.startDate)  // UTC date
             let dur = s.endDate.timeIntervalSince(s.startDate)
             if var night = perNight[dayKey] {
                 night.seconds += dur
-                night.start = min(night.start, s.startDate)
                 night.end = max(night.end, s.endDate)
                 perNight[dayKey] = night
             } else {
-                perNight[dayKey] = (dur, s.startDate, s.endDate)
+                perNight[dayKey] = (dur, s.endDate)
             }
         }
-        _ = cal
-        return perNight.values.map { night in
+        let metrics = perNight.map { dayKey, night in
             MetricSample(type: "sleep_hours",
                          value: (night.seconds / 3600).rounded(toPlaces: 2),
                          unit: "h",
-                         start: iso.string(from: night.start),
+                         start: "\(dayKey)T00:00:00Z",  // stable per-night key
                          end: iso.string(from: night.end))
         }
+        return (metrics, pending.map { [$0] } ?? [])
     }
 
     // MARK: Anchored query helper
 
-    private func runAnchored(type: HKSampleType, anchorKey: String) async -> [HKSample] {
+    /// Returns the new samples and the (key, newAnchor) to persist — but does NOT
+    /// persist it. The caller commits anchors only after a successful upload so a
+    /// failed delivery re-reads the same samples next time.
+    private func runAnchored(type: HKSampleType, anchorKey: String) async -> ([HKSample], (String, HKQueryAnchor)?) {
         await withCheckedContinuation { continuation in
             let query = HKAnchoredObjectQuery(
                 type: type,
@@ -147,8 +166,8 @@ final class HealthKitManager {
                 limit: HKObjectQueryNoLimit
             ) { _, samples, _, newAnchor, error in
                 if let error { print("HealthBridge anchored query (\(anchorKey)) error: \(error)") }
-                AnchorStore.save(anchorKey, newAnchor)
-                continuation.resume(returning: samples ?? [])
+                let pending = newAnchor.map { (anchorKey, $0) }
+                continuation.resume(returning: (samples ?? [], pending))
             }
             store.execute(query)
         }

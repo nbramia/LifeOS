@@ -32,7 +32,7 @@ final class SyncEngine: ObservableObject {
         }
         isSyncing = true
         status = "Collecting…"
-        let payload = await hk.collect()
+        let (payload, pendingAnchors) = await hk.collect()
         let count = payload.workouts.count + payload.metrics.count
         if count == 0 {
             status = "Nothing new to sync"
@@ -43,21 +43,22 @@ final class SyncEngine: ObservableObject {
         status = "Uploading \(count) items…"
         do {
             let body = try await Uploader.post(payload, to: serverURL, token: token)
+            // Commit anchors ONLY after a confirmed upload, so a failed POST
+            // re-reads these samples next time (the server is idempotent).
+            hk.commitAnchors(pendingAnchors)
             status = "Synced \(count) items. \(body)"
             lastSync = Date()
         } catch {
-            // Anchors already advanced; a transient failure means those samples
-            // would be missed. Reset only on explicit user action — for now,
-            // surface the error so the user can retry (HealthKit re-reads from
-            // the saved anchor on the next run).
-            status = "Upload failed: \(error.localizedDescription)"
+            status = "Upload failed (will retry these samples): \(error.localizedDescription)"
         }
         isSyncing = false
     }
 
     /// Enable background delivery + observer queries so iOS wakes the app to sync.
-    /// Requires the HealthKit background-delivery entitlement.
-    func startBackgroundDelivery(serverURL: String, token: String) {
+    /// Requires the HealthKit background-delivery entitlement. Credentials are read
+    /// from UserDefaults at fire time so editing them in the UI takes effect without
+    /// an app restart.
+    func startBackgroundDelivery() {
         guard !observersStarted else { return }
         observersStarted = true
         for type in hk.backgroundTypes() {
@@ -68,7 +69,9 @@ final class SyncEngine: ObservableObject {
             let observer = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, error in
                 if let error { print("observer(\(type)) error: \(error)") }
                 Task { @MainActor in
-                    await self?.syncNow(serverURL: serverURL, token: token)
+                    let url = UserDefaults.standard.string(forKey: "serverURL") ?? ""
+                    let token = UserDefaults.standard.string(forKey: "token") ?? ""
+                    await self?.syncNow(serverURL: url, token: token)
                     completion()
                 }
             }
