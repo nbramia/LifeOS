@@ -171,7 +171,8 @@ run_slow_tests() {
         "${PYTEST_PARALLEL[@]}"
 }
 
-# Run a specific list of changed test files (parallelized).
+# Run a specific list of changed test files (parallelized). `slow` is NOT
+# excluded here on purpose: if you changed a test file, run all of its cases.
 run_changed_test_files() {
     log_step "Running changed test files: $*"
     python -m pytest "$@" -v \
@@ -290,7 +291,11 @@ decide_plan() {
     [ -z "$files" ] && { echo "unit"; return; }
 
     # docs-only: no file falls outside the docs patterns (matches pre-push).
-    if ! printf '%s\n' "$files" | grep -qvE '\.(md|txt|rst)$|^docs/'; then
+    # Dependency manifests (requirements*.txt / constraints*.txt) are
+    # code-affecting, so they're excluded from the docs class — a dep bump
+    # must still run tests rather than skipping.
+    if ! printf '%s\n' "$files" | grep -qE '(^|/)(requirements|constraints)[^/]*\.txt$' \
+       && ! printf '%s\n' "$files" | grep -qvE '\.(md|txt|rst)$|^docs/'; then
         echo "skip"; return
     fi
 
@@ -402,7 +407,7 @@ case "${1:-unit}" in
         echo "  browser      Playwright browser tests"
         echo "  smoke        Unit tests + critical browser test (for deployment)"
         echo "  all          Run all tests in sequence"
-        echo "  auto         Pick scope from the git diff (unit/smoke/slow/skip)"
+        echo "  auto         Pick scope from the git diff (unit/browser/slow/skip)"
         echo "  health       Quick server health check"
         exit 1
         ;;

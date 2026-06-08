@@ -74,6 +74,11 @@ _CASES = [
     ("api/services/vectorstore.py", "unit slow", "sync_vectorstore"),
     # mixed categories -> additive (covers everything)
     ("api/routes/chat.py\napi/services/embeddings.py", "unit browser slow", "mixed_front_sync"),
+    # dependency manifests are code-affecting, not docs -> must run tests
+    ("requirements.txt", "unit", "requirements"),
+    ("requirements-dev.txt", "unit", "requirements_dev"),
+    ("constraints.txt", "unit", "constraints"),
+    ("requirements.txt\nREADME.md", "unit", "requirements_plus_docs"),
     # docs mixed with code -> not docs-only, classify by the code
     ("docs/x.md\napi/services/llm_client.py", "unit", "mixed_docs_code"),
     # no changes detected -> safe default
