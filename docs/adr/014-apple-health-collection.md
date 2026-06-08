@@ -22,38 +22,69 @@ store. The viable readers are all on iOS.
 
 ## Decision
 
-Collect Apple Health data with an **iOS Shortcut** running on the iPhone:
+Collect Apple Health data with an **iOS Shortcut** on the iPhone. The Shortcut
+reads HealthKit and writes a `health.json` (schema in
+[guides/apple-health.md](../guides/apple-health.md)) into a synced folder (the
+Syncthing `~/Code/Sync/` share, already mirrored to the server); a daily iOS
+Automation runs it. The **server-side import is collection-agnostic**:
+`import_health()` in `scripts/apple_data_import.py` reads the JSON from
+`LIFEOS_HEALTH_EXPORT_PATH` and upserts into `data/fitness.db`, running as a
+source in the existing nightly `apple_import` step. Idempotency: workouts dedupe
+on the HKWorkout `uuid`, metrics on `(type, start)`; timestamps normalize to UTC.
 
-- The Shortcut reads HealthKit (workouts + selected quantity samples) and writes
-  a `health.json` (schema in [guides/apple-health.md](../guides/apple-health.md))
-  into a **synced folder** (the Syncthing `~/Code/Sync/` share, already mirrored
-  to the server). A daily iOS Automation runs it.
-- The **server-side import is collection-agnostic**: `import_health()` in
-  `scripts/apple_data_import.py` reads the JSON from
-  `LIFEOS_HEALTH_EXPORT_PATH` and upserts into `data/fitness.db`. It runs as one
-  of the sources in the existing nightly `apple_import` step.
-- **Idempotency:** workouts dedupe on the HKWorkout `uuid`, metrics on
-  `(type, start)`. Timestamps are normalized to UTC on import.
-- A manual **Health-app XML export** remains a fallback for one-time history
-  backfill (same import target).
+## Rationale
 
-The originally-considered **Swift HealthKit CLI on the Mac Mini is rejected** —
-the Mini doesn't have the data.
+Collection must run where the data actually lives — iOS. Decoupling collection
+(the Shortcut) from import (the server) means the producer can change without
+touching the importer, and the importer can be unit-tested against a fixture.
+Routing through the existing Sync share avoids any new transport. Idempotent,
+windowed imports make a missed automation run self-healing.
+
+## Alternatives Considered
+
+### Swift HealthKit CLI on the Mac Mini
+
+Mirror the existing Apple Data Agent — a compiled Swift binary reading
+`HKHealthStore` under the Mini's FDA grant.
+
+**Rejected because:** macOS does not hold the iPhone/Watch HealthKit store, so
+the CLI would read an empty store. This was the original plan and is the reason
+the issue was spiked before building.
+
+### Manual Health-app XML export only
+
+The iPhone Health app can export a full XML archive.
+
+**Rejected because:** it is manual and not automatable for ongoing sync. Kept as
+a **fallback for one-time history backfill** (same import target), not the
+primary path.
 
 ## Consequences
 
-- **Pro:** Works with Apple's actual data residency; no fragile attempt to read
-  iPhone data from a Mac. No new macOS/Swift build dependency.
-- **Pro:** The import is decoupled from collection — if Apple ever offers a
-  better export, only the producer changes; the importer is unchanged.
-- **Con:** The Shortcut is built and maintained on the phone (can't be authored
-  from the server), and HealthKit "Find Samples" actions are slow over long
-  ranges — mitigated by a small daily window plus idempotent overlap.
-- **Con:** Collection depends on the iOS Automation actually firing; a missed
-  day is self-healing on the next run (idempotent, windowed).
+### Positive
+
+- Works with Apple's actual data residency; no fragile attempt to read iPhone
+  data from a Mac, and no new macOS/Swift build dependency.
+- Import is decoupled from collection — a better future export only changes the
+  producer; the importer is unchanged and independently testable.
+
+### Negative
+
+- The Shortcut is built and maintained on the phone (can't be authored from the
+  server), and HealthKit "Find Samples" actions are slow over long ranges —
+  mitigated by a small daily window plus idempotent overlap.
+- Collection depends on the iOS Automation firing; a missed day self-heals on
+  the next windowed run.
 
 ## Related Documents
 
-- [ADR-010 — Apple Data Agent](010-apple-data-agent.md)
-- [ADR-013 — Self-data fitness store](013-fitness-store.md)
-- [guides/apple-health.md](../guides/apple-health.md)
+### Design Context
+- [ADR-010: Apple Data Agent](010-apple-data-agent.md) — The Mac-side pipeline this parallels; explains the FDA grant the rejected Swift-CLI alternative would have used
+- [ADR-013: Self-data fitness store](013-fitness-store.md) — Where imported data lands
+
+### Operational
+- [guides/apple-health.md](../guides/apple-health.md) — iOS Shortcut build steps + `health.json` schema
+
+### Code References
+- [`scripts/apple_data_import.py`](../../scripts/apple_data_import.py) — `import_health()`
+- [`tests/test_apple_health_import.py`](../../tests/test_apple_health_import.py) — Import coverage

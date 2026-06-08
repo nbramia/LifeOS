@@ -37,11 +37,13 @@ def test_to_utc_iso_normalizes_offset_and_z():
     assert _to_utc_iso("2026-06-07T08:00:00-04:00").startswith("2026-06-07T12:00:00+00:00")
     assert _to_utc_iso("2026-06-07T12:00:00Z").startswith("2026-06-07T12:00:00+00:00")
     assert _to_utc_iso("") == ""
+    assert _to_utc_iso("not-a-date") == ""   # unparseable → "" (no false dedup key)
 
 
 def test_health_kind_maps_apple_types():
     assert _health_kind("HKWorkoutActivityTypeRunning") == "cardio"
     assert _health_kind("functionalStrengthTraining") == "strength"
+    assert _health_kind("Strength Training") == "strength"   # friendly label
     assert _health_kind("Yoga") == "mobility"
     assert _health_kind("Pickleball") == "cardio"  # default
     assert _health_kind(None) == "cardio"
@@ -127,3 +129,29 @@ def test_malformed_json_errors_gracefully(health_env):
     export.write_text("{not json")
     result = import_health()
     assert result["status"] == "error"
+
+
+def test_metric_without_start_is_skipped_not_duplicated(health_env):
+    # Regression: a metric with no parseable start has no stable dedup key, so it
+    # must be skipped — not written (and re-written on every import).
+    store, export = health_env
+    _write(export, {"metrics": [{"type": "body_weight", "value": 178.0}]})  # no start
+    first = import_health()
+    second = import_health()
+    assert first["metrics_created"] == 0 and first["metrics_skipped"] == 1
+    assert second["metrics_created"] == 0
+    assert len(store.list_metrics("body_weight")) == 0  # never written, never duplicated
+
+
+def test_workout_date_is_local_not_utc(health_env, monkeypatch):
+    # An evening-ET workout that crosses midnight UTC must bucket on the local
+    # calendar day, matching manual logging.
+    import config.settings as cfg
+    monkeypatch.setattr(cfg.settings, "timezone", "America/New_York")
+    store, export = health_env
+    _write(export, {"workouts": [
+        {"uuid": "W-eve", "type": "Running", "start": "2026-06-08T01:00:00Z", "duration_s": 600},
+        # 01:00 UTC Jun 8 == 21:00 ET Jun 7
+    ]})
+    import_health()
+    assert store.list_sessions()[0].date == "2026-06-07"

@@ -114,6 +114,7 @@ Skip the export step entirely; have Linux read the Mac's `~/Library/` over a net
 
 ### Design Context
 - [ADR-007: Linux Migration](007-linux-migration.md) — Established the multi-machine pattern this ADR formalizes; the Mac's role change to "Apple Data Agent" was part of that decision but not given its own record
+- [ADR-014: Apple Health collection & import](014-apple-health-collection.md) — Parallels this pipeline for Health data; explains why the Mac-side reader doesn't extend to HealthKit (iOS-only data)
 
 ### Specifications
 - [Data & Sync](../specs/technical/data-and-sync.md) — Seven-phase nightly sync pipeline; phase 5 imports the Mac's export

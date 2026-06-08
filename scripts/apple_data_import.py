@@ -724,12 +724,17 @@ _HEALTH_KIND_MAP = {
     "swimming": "cardio", "rowing": "cardio", "elliptical": "cardio",
     "hiking": "cardio", "highintensityintervaltraining": "cardio",
     "functionalstrengthtraining": "strength", "traditionalstrengthtraining": "strength",
+    "strengthtraining": "strength", "weighttraining": "strength", "weightlifting": "strength",
     "yoga": "mobility", "coretraining": "mobility", "flexibility": "mobility",
 }
 
 
 def _to_utc_iso(ts: str | None) -> str:
-    """Normalize an ISO8601 timestamp (with offset or trailing Z) to UTC ISO."""
+    """Normalize an ISO8601 timestamp (offset or trailing Z) to UTC ISO.
+
+    Returns "" for missing or unparseable input so callers can treat it as "no
+    usable timestamp" — important for metric dedup, which needs a stable key.
+    """
     if not ts:
         return ""
     try:
@@ -738,7 +743,21 @@ def _to_utc_iso(ts: str | None) -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).isoformat()
     except (ValueError, TypeError):
-        return ts
+        return ""
+
+
+def _local_date(utc_iso: str) -> str | None:
+    """Local calendar date (YYYY-MM-DD) for a UTC ISO timestamp, in the configured
+    timezone — so an evening workout buckets on the right day and matches manual
+    logging's notion of 'today'. None if not parseable."""
+    if not utc_iso:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        from config.settings import settings
+        return datetime.fromisoformat(utc_iso).astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 def _health_kind(workout_type: str | None) -> str:
@@ -802,10 +821,9 @@ def import_health(dry_run: bool = False) -> dict:
             w_created += 1
             continue
         start = _to_utc_iso(w.get("start"))
-        date = start[:10] if start else None
         store.add_session(
             sets=[],
-            date=date,
+            date=_local_date(start),   # local calendar day; None → store uses today
             kind=_health_kind(w.get("type")),
             source="apple_health",
             title=w.get("type", "") or "Workout",
@@ -820,6 +838,11 @@ def import_health(dry_run: bool = False) -> dict:
         if not mtype or value is None:
             continue
         start = _to_utc_iso(m.get("start"))
+        if not start:
+            # Without a stable timestamp the metric can't be deduped (log_metric
+            # would substitute now()), so it would duplicate on every re-import.
+            m_skipped += 1
+            continue
         if store.has_metric(mtype, start):
             m_skipped += 1
             continue
