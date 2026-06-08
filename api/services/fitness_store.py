@@ -246,6 +246,33 @@ class FitnessStore:
             for r in rows
         ]
 
+    def has_workout_ref(self, raw_ref: str) -> bool:
+        """Whether a session with this provenance ref (e.g. an Apple workout UUID)
+        already exists — used for idempotent imports."""
+        if not raw_ref:
+            return False
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM workout_sessions WHERE raw_ref = ? LIMIT 1", (raw_ref,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return row is not None
+
+    def has_metric(self, metric_type: str, start_at: str) -> bool:
+        """Whether a metric sample at this (type, start_at) already exists — used
+        for idempotent imports."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM health_metrics WHERE metric_type = ? AND start_at = ? LIMIT 1",
+                (metric_type, start_at),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row is not None
+
     def get_latest_session(self) -> Optional[WorkoutSession]:
         conn = sqlite3.connect(self.db_path)
         try:

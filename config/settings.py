@@ -620,6 +620,12 @@ class Settings(BaseSettings):
         alias="LIFEOS_FITNESS_SHEET_ID",
         description="Google Sheet ID to mirror the workout log into (optional; mirror is off if unset)"
     )
+    health_export_path: str = Field(
+        default="data/apple-imports/health.json",
+        alias="LIFEOS_HEALTH_EXPORT_PATH",
+        description="Path to the Apple Health export JSON written by the iOS Shortcut "
+                    "(e.g. a synced ~/Code/Sync/health/health.json). Imported nightly."
+    )
 
     # Monarch Money
     monarch_email: str = Field(
