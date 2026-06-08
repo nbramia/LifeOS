@@ -718,79 +718,13 @@ def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict
 # that emits health.json into a synced path (see docs/guides/apple-health.md).
 # ---------------------------------------------------------------------------
 
-# Apple HKWorkoutActivityType (or a friendly label) → our session kind.
-_HEALTH_KIND_MAP = {
-    "running": "cardio", "walking": "cardio", "cycling": "cardio",
-    "swimming": "cardio", "rowing": "cardio", "elliptical": "cardio",
-    "hiking": "cardio", "highintensityintervaltraining": "cardio",
-    "functionalstrengthtraining": "strength", "traditionalstrengthtraining": "strength",
-    "strengthtraining": "strength", "weighttraining": "strength", "weightlifting": "strength",
-    "yoga": "mobility", "coretraining": "mobility", "flexibility": "mobility",
-}
-
-
-def _to_utc_iso(ts: str | None) -> str:
-    """Normalize an ISO8601 timestamp (offset or trailing Z) to UTC ISO.
-
-    Returns "" for missing or unparseable input so callers can treat it as "no
-    usable timestamp" — important for metric dedup, which needs a stable key.
-    """
-    if not ts:
-        return ""
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
-    except (ValueError, TypeError):
-        return ""
-
-
-def _local_date(utc_iso: str) -> str | None:
-    """Local calendar date (YYYY-MM-DD) for a UTC ISO timestamp, in the configured
-    timezone — so an evening workout buckets on the right day and matches manual
-    logging's notion of 'today'. None if not parseable."""
-    if not utc_iso:
-        return None
-    try:
-        from zoneinfo import ZoneInfo
-        from config.settings import settings
-        return datetime.fromisoformat(utc_iso).astimezone(ZoneInfo(settings.timezone)).date().isoformat()
-    except (ValueError, TypeError):
-        return None
-
-
-def _health_kind(workout_type: str | None) -> str:
-    if not workout_type:
-        return "cardio"
-    key = re.sub(r"[^a-z]", "", workout_type.lower()).replace("hkworkoutactivitytype", "")
-    return _HEALTH_KIND_MAP.get(key, "cardio")
-
-
-def _workout_summary(w: dict) -> str:
-    """One-line human summary for an Apple workout, e.g. '10.0 km · 55 min · 145 bpm'."""
-    parts = []
-    dist = w.get("distance_m")
-    if dist:
-        parts.append(f"{dist / 1000:.1f} km")
-    dur = w.get("duration_s")
-    if dur:
-        parts.append(f"{int(dur // 60)} min")
-    energy = w.get("energy_kcal")
-    if energy:
-        parts.append(f"{int(energy)} kcal")
-    hr = w.get("avg_hr")
-    if hr:
-        parts.append(f"{int(hr)} bpm")
-    return " · ".join(parts)
-
-
 def import_health(dry_run: bool = False) -> dict:
-    """Import Apple Health export (health.json) into the fitness store.
+    """Import the Apple Health export (health.json) into the fitness store.
 
-    Workouts → workout_sessions(source=apple_health); metrics → health_metrics.
-    Idempotent: workouts dedupe on the Apple UUID, metrics on (type, start_at).
-    Absent file → skipped (a fresh clone / no-iPhone setup is unaffected).
+    Reads the file at LIFEOS_HEALTH_EXPORT_PATH and delegates to the shared
+    ingest core (api.services.health_import.ingest_health) — the same core the
+    POST /api/fitness/health/ingest endpoint uses (#333). Absent file → skipped
+    (a fresh clone / no-iPhone setup is unaffected).
     """
     from config.settings import settings
     path = Path(settings.health_export_path)
@@ -805,69 +739,8 @@ def import_health(dry_run: bool = False) -> dict:
     except (json.JSONDecodeError, OSError) as e:
         return {"status": "error", "error": f"could not read {path}: {e}"}
 
-    from api.services.fitness_store import get_fitness_store
-    store = get_fitness_store()
-
-    w_created = w_skipped = m_created = m_skipped = 0
-
-    for w in data.get("workouts", []):
-        ref = (w.get("uuid") or "").strip()
-        if not ref:
-            continue
-        if store.has_workout_ref(ref):
-            w_skipped += 1
-            continue
-        if dry_run:
-            w_created += 1
-            continue
-        start = _to_utc_iso(w.get("start"))
-        store.add_session(
-            sets=[],
-            date=_local_date(start),   # local calendar day; None → store uses today
-            kind=_health_kind(w.get("type")),
-            source="apple_health",
-            title=w.get("type", "") or "Workout",
-            notes=_workout_summary(w),
-            raw_ref=ref,
-        )
-        w_created += 1
-
-    for m in data.get("metrics", []):
-        mtype = (m.get("type") or "").strip()
-        value = m.get("value")
-        if not mtype or value is None:
-            continue
-        start = _to_utc_iso(m.get("start"))
-        if not start:
-            # Without a stable timestamp the metric can't be deduped (log_metric
-            # would substitute now()), so it would duplicate on every re-import.
-            m_skipped += 1
-            continue
-        if store.has_metric(mtype, start):
-            m_skipped += 1
-            continue
-        if dry_run:
-            m_created += 1
-            continue
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        store.log_metric(
-            mtype, value, unit=m.get("unit", ""),
-            start_at=start, end_at=_to_utc_iso(m.get("end")), source="apple_health",
-        )
-        m_created += 1
-
-    logger.info(
-        f"Apple Health: workouts +{w_created} (skip {w_skipped}), "
-        f"metrics +{m_created} (skip {m_skipped})"
-    )
-    return {
-        "status": "ok",
-        "workouts_created": w_created, "workouts_skipped": w_skipped,
-        "metrics_created": m_created, "metrics_skipped": m_skipped,
-    }
+    from api.services.health_import import ingest_health
+    return ingest_health(data, dry_run=dry_run)
 
 
 def main():
