@@ -94,28 +94,36 @@ def ingest_health(data: dict, dry_run: bool = False) -> dict:
 
     w_created = w_skipped = m_created = m_skipped = 0
 
+    # Preload existing keys once, then dedup in-memory and insert in a single
+    # transaction per table. A multi-year backfill can be 100k+ rows; the old
+    # per-row connect+commit approach took minutes and timed out the request.
+    existing_refs = store.existing_workout_refs()
+    seen_refs: set[str] = set()
+    session_rows: list[dict] = []
     for w in data.get("workouts") or []:
         ref = (w.get("uuid") or "").strip()
         if not ref:
             continue
-        if store.has_workout_ref(ref):
+        if ref in existing_refs or ref in seen_refs:
             w_skipped += 1
             continue
+        seen_refs.add(ref)
+        w_created += 1
         if dry_run:
-            w_created += 1
             continue
         start = _to_utc_iso(w.get("start"))
-        store.add_session(
-            sets=[],
-            date=_local_date(start),   # local calendar day; None → store uses today
-            kind=_health_kind(w.get("type")),
-            source="apple_health",
-            title=w.get("type", "") or "Workout",
-            notes=_workout_summary(w),
-            raw_ref=ref,
-        )
-        w_created += 1
+        session_rows.append({
+            "date": _local_date(start),   # local calendar day; None → store uses today
+            "kind": _health_kind(w.get("type")),
+            "source": "apple_health",
+            "title": w.get("type", "") or "Workout",
+            "notes": _workout_summary(w),
+            "raw_ref": ref,
+        })
 
+    existing_metric_keys = store.existing_metric_keys()
+    seen_keys: set[tuple[str, str]] = set()
+    metric_rows: list[dict] = []
     for m in data.get("metrics") or []:
         mtype = (m.get("type") or "").strip()
         value = m.get("value")
@@ -123,25 +131,32 @@ def ingest_health(data: dict, dry_run: bool = False) -> dict:
             continue
         start = _to_utc_iso(m.get("start"))
         if not start:
-            # Without a stable timestamp the metric can't be deduped (log_metric
-            # would substitute now()), so it would duplicate on every re-import.
+            # Without a stable timestamp the metric can't be deduped (it would
+            # duplicate on every re-import), so skip it.
             m_skipped += 1
             continue
-        if store.has_metric(mtype, start):
+        key = (mtype, start)
+        if key in existing_metric_keys or key in seen_keys:
             m_skipped += 1
             continue
         if dry_run:
+            seen_keys.add(key)
             m_created += 1
             continue
         try:
             value = float(value)
         except (TypeError, ValueError):
             continue
-        store.log_metric(
-            mtype, value, unit=m.get("unit", ""),
-            start_at=start, end_at=_to_utc_iso(m.get("end")), source="apple_health",
-        )
+        seen_keys.add(key)
         m_created += 1
+        metric_rows.append({
+            "metric_type": mtype, "value": value, "unit": m.get("unit", ""),
+            "start_at": start, "end_at": _to_utc_iso(m.get("end")), "source": "apple_health",
+        })
+
+    if not dry_run:
+        store.bulk_insert_sessions(session_rows)
+        store.bulk_insert_metrics(metric_rows)
 
     logger.info(
         f"Apple Health: workouts +{w_created} (skip {w_skipped}), "

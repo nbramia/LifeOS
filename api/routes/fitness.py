@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fitness", tags=["fitness"])
 
 # Upper bound on items per ingest. Generous enough for a multi-year one-shot
-# backfill; rejects absurd payloads (the endpoint takes on-demand POSTs).
-_MAX_INGEST_ITEMS = 100_000
+# backfill of high-frequency samples (heart rate, steps); rejects absurd
+# payloads (the endpoint takes on-demand POSTs).
+_MAX_INGEST_ITEMS = 1_000_000
 
 
 class HealthIngestRequest(BaseModel):

@@ -88,6 +88,16 @@ class TestDispatch:
         out = _tool_manage_workouts({"action": "metrics", "metric_type": "body_weight"})
         assert "body weight" in out.lower()
 
+    def test_metrics_sums_cumulative_to_daily_total(self, temp_store):
+        # steps arrives as intraday buckets; the tool reports one daily total.
+        for h, v in ((10, 100), (12, 250), (14, 75)):
+            temp_store.log_metric("steps", v, unit="count", start_at=f"2026-06-07T{h}:00:00+00:00")
+        out = _tool_manage_workouts({"action": "metrics", "metric_type": "steps"})
+        assert "steps (daily total)" in out
+        assert "2026-06-07: 425 count" in out
+        # one summed line, not three raw buckets
+        assert out.count("2026-06-07:") == 1
+
     def test_history(self, temp_store):
         _tool_manage_workouts({"action": "log", "sets": [{"exercise": "squats", "reps": 5, "weight": 185}]})
         out = _tool_manage_workouts({"action": "history", "exercise": "squats"})

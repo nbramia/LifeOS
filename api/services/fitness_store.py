@@ -44,6 +44,17 @@ def _now_iso() -> str:
     return datetime.now(ZoneInfo(settings.timezone)).isoformat()
 
 
+def _local_day(utc_iso: str) -> Optional[str]:
+    """Local calendar day (YYYY-MM-DD) for a stored UTC ISO timestamp, in the
+    configured timezone — so daily rollups match the session day-bucketing."""
+    if not utc_iso:
+        return None
+    try:
+        return datetime.fromisoformat(utc_iso).astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass
 class WorkoutSet:
     exercise: str
@@ -432,6 +443,76 @@ class FitnessStore:
         return HealthMetric(id=metric_id, metric_type=metric_type, value=value, unit=unit,
                             start_at=start_at, end_at=end_at or "", source=source)
 
+    # -- bulk import (single-transaction; for large Apple Health backfills) --
+
+    def existing_workout_refs(self) -> set[str]:
+        """All non-empty provenance refs — one query for batch idempotent import."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT raw_ref FROM workout_sessions WHERE raw_ref != ''"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {r[0] for r in rows}
+
+    def existing_metric_keys(self) -> set[tuple[str, str]]:
+        """All (metric_type, start_at) pairs — one query for batch idempotent import."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT metric_type, start_at FROM health_metrics"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {(r[0], r[1]) for r in rows}
+
+    def bulk_insert_sessions(self, sessions: list[dict]) -> None:
+        """Insert workout sessions (no sets) in a single transaction. Each dict
+        needs date, kind, source, title, notes, raw_ref; id/timestamps generated.
+        Caller is responsible for dedup (see existing_workout_refs)."""
+        if not sessions:
+            return
+        now = _now_iso()
+        rows = [
+            (uuid.uuid4().hex[:12], s.get("date") or _today(), s.get("kind", ""),
+             s.get("source", "manual"), s.get("title", ""), s.get("notes", ""),
+             s.get("raw_ref", ""), now, now)
+            for s in sessions
+        ]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany(
+                "INSERT INTO workout_sessions (id, date, kind, source, title, notes, raw_ref, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def bulk_insert_metrics(self, metrics: list[dict]) -> None:
+        """Insert health metrics in a single transaction. Each dict needs
+        metric_type, value, unit, start_at, end_at, source; id generated.
+        Caller is responsible for dedup (see existing_metric_keys)."""
+        if not metrics:
+            return
+        rows = [
+            (uuid.uuid4().hex[:12], m["metric_type"], m["value"], m.get("unit", ""),
+             m["start_at"], m.get("end_at"), m.get("source", "manual"))
+            for m in metrics
+        ]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executemany(
+                "INSERT INTO health_metrics (id, metric_type, value, unit, start_at, end_at, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def list_metrics(
         self, metric_type: str, start: Optional[str] = None, end: Optional[str] = None, limit: int = 100,
     ) -> list[HealthMetric]:
@@ -460,6 +541,38 @@ class FitnessStore:
     def latest_metric(self, metric_type: str) -> Optional[HealthMetric]:
         rows = self.list_metrics(metric_type, limit=1)
         return rows[0] if rows else None
+
+    def daily_metric_totals(
+        self, metric_type: str, start: Optional[str] = None, end: Optional[str] = None, limit: int = 100,
+    ) -> list[dict]:
+        """Daily rollup for a cumulative metric (e.g. steps, active_energy): the
+        sum of all samples within each local calendar day. Apple Health stores
+        these as many intraday buckets; this collapses them to one total per day.
+
+        start/end bound the local-day range (YYYY-MM-DD, inclusive). Returns a
+        newest-first list of {date, value, unit, samples}, capped at `limit` days.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT value, unit, start_at FROM health_metrics WHERE metric_type = ?",
+                (metric_type,),
+            ).fetchall()
+        finally:
+            conn.close()
+        buckets: dict[str, dict] = {}
+        for value, unit, start_at in rows:
+            day = _local_day(start_at)
+            if day is None or (start and day < start) or (end and day > end):
+                continue
+            b = buckets.get(day)
+            if b is None:
+                buckets[day] = {"date": day, "value": value, "unit": unit or "", "samples": 1}
+            else:
+                b["value"] += value
+                b["samples"] += 1
+        ordered = sorted(buckets.values(), key=lambda d: d["date"], reverse=True)
+        return ordered[:limit]
 
     # -- training profile --
 

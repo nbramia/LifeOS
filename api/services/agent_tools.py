@@ -660,7 +660,9 @@ TOOL_DEFINITIONS = [
             "optionally for one `exercise` or `kind`.\n"
             "- 'log_metric': record a body metric, e.g. morning body weight "
             "(metric_type 'body_weight', value 178.4, unit 'lb').\n"
-            "- 'metrics': list a metric over time (e.g. body_weight trend).\n"
+            "- 'metrics': list a metric over time (e.g. body_weight trend). "
+            "Cumulative metrics ('steps', 'active_energy') are returned as daily "
+            "totals rather than raw intraday samples.\n"
             "- 'get_profile' / 'set_profile': read or set the training profile "
             "(keys: goals, injuries, equipment, experience, schedule, constraints, "
             "preferences).\n"
@@ -1532,11 +1534,27 @@ def _workout_metrics(inp: dict) -> str:
     if not metric_type:
         return "Error: 'metrics' needs a 'metric_type'."
     store = get_fitness_store()
-    rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"),
-                              limit=int(inp.get("limit", 100) or 100))
+    label = metric_type.replace("_", " ")
+    limit = int(inp.get("limit", 100) or 100)
+
+    # Cumulative metrics (steps, active energy) arrive from Apple Health as many
+    # intraday buckets — sum them to one daily total so the trend is readable.
+    if metric_type in _CUMULATIVE_METRICS:
+        days = store.daily_metric_totals(
+            metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit,
+        )
+        if not days:
+            return f"No {label} recorded."
+        lines = [f"{label} (daily total):"]
+        for d in days:
+            unit = f" {d['unit']}" if d["unit"] else ""
+            lines.append(f"  {d['date']}: {_fmt_num(d['value'])}{unit}")
+        return "\n".join(lines)
+
+    rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit)
     if not rows:
-        return f"No {metric_type.replace('_', ' ')} recorded."
-    lines = [f"{metric_type.replace('_', ' ')}:"]
+        return f"No {label} recorded."
+    lines = [f"{label}:"]
     for m in rows:
         unit = f" {m.unit}" if m.unit else ""
         lines.append(f"  {m.start_at[:10]}: {_fmt_num(m.value)}{unit}")
@@ -1562,6 +1580,10 @@ def _workout_set_profile(inp: dict) -> str:
 
 # Recovery metrics worth citing for a readiness read (manual + Apple Health #323).
 _RECOVERY_METRICS = ("body_weight", "resting_hr", "hrv", "sleep_hours")
+
+# Cumulative metrics: Apple Health emits many intraday buckets per day, so the
+# meaningful view is a daily SUM, not the raw per-sample list (see #333).
+_CUMULATIVE_METRICS = frozenset({"steps", "active_energy"})
 
 
 def _workout_readiness(inp: dict) -> str:
