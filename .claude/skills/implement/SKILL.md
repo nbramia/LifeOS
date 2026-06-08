@@ -57,7 +57,7 @@ Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the targe
 1. **Create a branch** if not already on a feature branch: `<type>/<short-description>` per AGENTS.md § Development Workflow.
 2. **Write tests first** for identified test cases. They should fail until implementation is complete.
 3. **Write production code** to make tests pass. Follow existing patterns. Surgical changes only.
-4. **Run the full test suite** on the server: `./scripts/test.sh`. All tests must pass before proceeding.
+4. **Run the test suite** on the server: `./scripts/test.sh auto` — picks scope (unit/smoke/slow/skip) from the git diff and runs it in parallel. All tests must pass before proceeding.
 5. **Self-review your diff.** Read every changed file. Check for: unused imports, style mismatches, missing error handling, changes that do not trace to the task.
 
 ### Phase 3: Create PR
