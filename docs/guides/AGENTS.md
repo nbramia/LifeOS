@@ -11,6 +11,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `launchd-setup.md` — macOS launchd service configuration
 - `scheduler.md` — Scheduler (triggers + actions): cron/one-off, notify/prompt/endpoint/agent
 - `scripts.md` — Available scripts and their usage
+- `apple-health.md` — Apple Health/Fitness ingestion (HealthBridge app + iOS Shortcut fallback)
 - `troubleshooting.md` — Common issues and solutions
 - `claude-code-orchestration.md` — Claude Code multi-agent orchestration patterns
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)

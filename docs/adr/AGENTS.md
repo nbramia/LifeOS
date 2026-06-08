@@ -16,6 +16,7 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `012-embedding-pipeline.md` — GPU embedding pipeline with CPU fallback
 - `013-fitness-store.md` — Self-data fitness store, separate from the person-centric CRM model
 - `014-apple-health-collection.md` — Apple Health via an iOS Shortcut (a Mac has no HealthKit store)
+- `015-healthbridge-app.md` — HealthBridge iOS app as the recommended collector (amends 014)
 
 ## Key Principles
 
