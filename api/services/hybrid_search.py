@@ -238,6 +238,42 @@ def calculate_recency_boost(date_str: Optional[str], max_boost: float = 0.5) -> 
         return 0.0
 
 
+def _result_date(result: dict) -> Optional[str]:
+    """Extract a document's date from a search result, normalized to YYYY-MM-DD.
+
+    ``vectorstore.search`` spreads metadata to the top level, so the date lives
+    at ``result["modified_date"]``; the BM25-only path (and any legacy callers)
+    may nest it under ``metadata``. Check both.
+    """
+    raw = result.get("modified_date") or result.get("metadata", {}).get("modified_date")
+    if not raw:
+        return None
+    # Tolerate full ISO timestamps as well as bare dates.
+    return raw[:10] if len(raw) >= 10 else raw
+
+
+def in_date_range(
+    result: dict, date_from: Optional[str], date_to: Optional[str]
+) -> bool:
+    """Whether a result falls within [date_from, date_to] (inclusive).
+
+    Dates are compared as ``YYYY-MM-DD`` strings, which sort lexicographically.
+    Undated results pass through (we never silently drop a doc just because its
+    date couldn't be extracted) — this matches the long-standing post-filter
+    behavior in the /api/search route.
+    """
+    if not date_from and not date_to:
+        return True
+    d = _result_date(result)
+    if not d:
+        return True
+    if date_from and d < date_from:
+        return False
+    if date_to and d > date_to:
+        return False
+    return True
+
+
 def deduplicate_overlapping_chunks(results: list[dict]) -> list[dict]:
     """
     Remove overlapping chunks from same file, keeping highest scored.
@@ -351,7 +387,9 @@ class HybridSearch:
         top_k: int = 20,
         apply_recency_boost: bool = True,
         use_reranker: bool | None = None,
-        rerank_candidates: int = 50
+        rerank_candidates: int = 50,
+        date_from: str | None = None,
+        date_to: str | None = None,
     ) -> list[dict]:
         """
         Perform hybrid search combining vector and BM25 with optional cross-encoder re-ranking.
@@ -373,6 +411,8 @@ class HybridSearch:
             apply_recency_boost: Apply recency boosting (default True)
             use_reranker: Apply cross-encoder re-ranking (default True)
             rerank_candidates: Number of candidates to fetch for re-ranking (default 50)
+            date_from: Optional inclusive lower bound (YYYY-MM-DD) on doc date
+            date_to: Optional inclusive upper bound (YYYY-MM-DD) on doc date
 
         Returns:
             List of dicts with id, content, file_path, file_name, hybrid_score
@@ -426,6 +466,10 @@ class HybridSearch:
             if bm25_index is None:
                 from api.services.service_health import record_degradation
                 record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 index unavailable")
+            if date_from or date_to:
+                vector_results = [
+                    r for r in vector_results if in_date_range(r, date_from, date_to)
+                ]
             return vector_results[:top_k]
 
         # Apply RRF fusion + boosting
@@ -460,6 +504,9 @@ class HybridSearch:
                         "file_path": file_path,
                         "file_name": bm25_result.get("file_name", ""),
                         "people": bm25_result.get("people", []),
+                        # Surfaced from the BM25 sidecar date table so BM25-only
+                        # hits are recency-aware and date-filterable too.
+                        "modified_date": bm25_result.get("modified_date", ""),
                         "metadata": {
                             "file_name": bm25_result.get("file_name", ""),
                             "file_path": file_path,
@@ -470,9 +517,16 @@ class HybridSearch:
                     # Unknown result, create minimal
                     result = {"id": doc_id, "content": "", "metadata": {}}
 
-                # Apply recency boost
+                # Drop results outside the requested date window.
+                if not in_date_range(result, date_from, date_to):
+                    continue
+
+                # Apply recency boost. The doc date is stored as ``modified_date``
+                # (top-level for vector hits, surfaced from the sidecar table for
+                # BM25 hits) — NOT ``metadata.date``, which never existed and
+                # silently disabled this boost.
                 if apply_recency_boost:
-                    date_str = result.get("metadata", {}).get("date")
+                    date_str = _result_date(result)
                     recency_boost = calculate_recency_boost(date_str)
                     final_score = rrf_score * (1 + recency_boost)
                 else:

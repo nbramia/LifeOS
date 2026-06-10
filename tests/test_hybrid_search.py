@@ -3,13 +3,13 @@ Tests for Hybrid Retrieval (P5.2).
 
 Tests the BM25Index service and RRF fusion logic.
 """
+import os
+import tempfile
+
 import pytest
 
 # Most tests in this file are fast unit tests (SQLite FTS5 + pure logic)
 pytestmark = pytest.mark.unit
-import tempfile
-import os
-from collections import defaultdict
 
 
 class TestBM25Index:
@@ -26,7 +26,7 @@ class TestBM25Index:
         """Index should create FTS5 table on init."""
         from api.services.bm25_index import BM25Index
 
-        index = BM25Index(db_path=temp_db)
+        BM25Index(db_path=temp_db)  # creates the FTS5 table as a side effect
 
         # Check FTS5 table exists
         import sqlite3
@@ -264,7 +264,14 @@ class TestHybridSearch:
         assert "chunk1" in doc_ids or "chunk3" in doc_ids
 
     def test_hybrid_search_with_recency(self, temp_db):
-        """Hybrid search should apply recency boost."""
+        """Recency boost must actually change ranking order.
+
+        Regression test for the silent-no-op bug: the boost read
+        ``metadata['date']`` but vectorstore.search spreads the date to the
+        top-level ``modified_date`` key, so the boost was always 0. This test
+        uses the REAL production result shape and asserts unconditionally — the
+        older, semantically-favored doc must be overtaken by the newer one.
+        """
         from api.services.hybrid_search import HybridSearch
         from api.services.bm25_index import BM25Index
         from unittest.mock import MagicMock
@@ -274,29 +281,111 @@ class TestHybridSearch:
         bm25.add_document("old_chunk", "Budget content old", "Old.md")
         bm25.add_document("new_chunk", "Budget content new", "New.md")
 
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+
         mock_vector_store = MagicMock()
-        # Both have same semantic similarity
+        # Both equally similar; the OLD one is listed first (better semantic
+        # rank) so only a working recency boost can flip the order. Date is at
+        # the top level, exactly as vectorstore.search returns it.
         mock_vector_store.search.return_value = [
-            {
-                "id": "old_chunk",
-                "content": "Budget content old",
-                "metadata": {"date": (datetime.now() - timedelta(days=365)).isoformat()}
-            },
-            {
-                "id": "new_chunk",
-                "content": "Budget content new",
-                "metadata": {"date": datetime.now().isoformat()}
-            },
+            {"id": "old_chunk", "content": "Budget content old", "modified_date": old_date},
+            {"id": "new_chunk", "content": "Budget content new", "modified_date": new_date},
         ]
 
-        # Pass mock directly to constructor
         hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
-        results = hybrid.search("budget", top_k=5)
+        results = hybrid.search("budget", top_k=5, use_reranker=False)
 
-        # Newer doc should rank higher after recency boost
-        if len(results) >= 2:
-            # First result should be the newer one
-            assert results[0].get("id") == "new_chunk"
+        assert len(results) >= 2
+        assert results[0].get("id") == "new_chunk"
+
+    def test_recency_boost_disabled_keeps_semantic_order(self, temp_db):
+        """With recency boost off, the semantically-favored (older) doc stays on
+        top — proves the ordering in the prior test comes from the boost."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("old_chunk", "Budget content old", "Old.md")
+        bm25.add_document("new_chunk", "Budget content new", "New.md")
+
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "old_chunk", "content": "Budget content old", "modified_date": old_date},
+            {"id": "new_chunk", "content": "Budget content new", "modified_date": new_date},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search(
+            "budget", top_k=5, use_reranker=False, apply_recency_boost=False
+        )
+        assert results[0].get("id") == "old_chunk"
+
+    def test_hybrid_search_date_range_filter(self, temp_db):
+        """date_from/date_to must drop out-of-window docs (fused path)."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("jan", "Budget January", "Jan.md", modified_date="2026-01-15")
+        bm25.add_document("jun", "Budget June", "Jun.md", modified_date="2026-06-05")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "jan", "content": "Budget January", "modified_date": "2026-01-15"},
+            {"id": "jun", "content": "Budget June", "modified_date": "2026-06-05"},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search(
+            "budget", top_k=5, use_reranker=False,
+            date_from="2026-06-01", date_to="2026-06-30",
+        )
+        ids = [r.get("id") for r in results]
+        assert "jun" in ids
+        assert "jan" not in ids
+
+    def test_date_range_filter_vector_only_path(self, temp_db):
+        """Date filtering also applies on the BM25-empty (vector-only) path."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        empty_bm25 = BM25Index(db_path=temp_db)  # no docs → vector-only return
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "jan", "content": "old", "modified_date": "2026-01-15"},
+            {"id": "jun", "content": "new", "modified_date": "2026-06-05"},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=empty_bm25)
+        results = hybrid.search(
+            "budget", top_k=5, date_from="2026-06-01", date_to="2026-06-30"
+        )
+        ids = [r.get("id") for r in results]
+        assert ids == ["jun"]
+
+    def test_undated_docs_survive_date_filter(self, temp_db):
+        """A doc with no extractable date is never silently dropped by a filter."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        empty_bm25 = BM25Index(db_path=temp_db)
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "undated", "content": "no date here"},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=empty_bm25)
+        results = hybrid.search(
+            "budget", top_k=5, date_from="2026-06-01", date_to="2026-06-30"
+        )
+        assert [r.get("id") for r in results] == ["undated"]
 
     def test_fallback_to_vector_only(self, temp_db):
         """Should fallback to vector search if BM25 returns no results."""
@@ -494,7 +583,7 @@ class TestQueryAwareReranking:
             {"id": "jane_ktn", "content": "Jane's KTN: TT11YZS7J", "metadata": {}},
         ]
 
-        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
 
         # find_protected_indices should identify Jane.md for factual query
         results = [

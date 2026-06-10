@@ -81,3 +81,57 @@ class TestDeleteByPath:
 
     def test_returns_zero_when_nothing_to_delete(self, bm25):
         assert bm25.delete_by_path("/nonexistent.md") == 0
+
+
+class TestDocDates:
+    """The sidecar date table backs recency ranking + date filtering for the
+    keyword half of hybrid search."""
+
+    def test_search_returns_modified_date(self, bm25):
+        bm25.add_document(
+            "doc1", "quarterly budget review", "Budget.md",
+            modified_date="2026-06-05",
+        )
+        results = bm25.search("budget")
+        assert len(results) == 1
+        assert results[0]["modified_date"] == "2026-06-05"
+
+    def test_search_returns_empty_string_when_undated(self, bm25):
+        bm25.add_document("doc1", "quarterly budget review", "Budget.md")
+        results = bm25.search("budget")
+        assert results[0]["modified_date"] == ""
+
+    def test_date_updates_on_readd(self, bm25):
+        bm25.add_document("doc1", "budget", "B.md", modified_date="2026-01-01")
+        bm25.add_document("doc1", "budget", "B.md", modified_date="2026-06-01")
+        assert bm25.search("budget")[0]["modified_date"] == "2026-06-01"
+
+    def test_readd_without_date_clears_stale_date(self, bm25):
+        bm25.add_document("doc1", "budget", "B.md", modified_date="2026-01-01")
+        bm25.add_document("doc1", "budget", "B.md")  # no date this time
+        assert bm25.search("budget")[0]["modified_date"] == ""
+
+    def test_delete_by_path_clears_dates(self, bm25):
+        bm25.add_document(
+            "/notes/q.md_0", "budget", "q.md", modified_date="2026-06-01"
+        )
+        bm25.delete_by_path("/notes/q.md")
+        # Re-add undated; the old date must not linger via the sidecar table.
+        bm25.add_document("/notes/q.md_0", "budget", "q.md")
+        assert bm25.search("budget")[0]["modified_date"] == ""
+
+    def test_bulk_add_persists_dates(self, bm25):
+        bm25.bulk_add([
+            {"doc_id": "d1", "content": "budget alpha", "file_name": "a.md",
+             "modified_date": "2026-03-03"},
+            {"doc_id": "d2", "content": "budget beta", "file_name": "b.md"},
+        ])
+        by_id = {r["doc_id"]: r for r in bm25.search("budget")}
+        assert by_id["d1"]["modified_date"] == "2026-03-03"
+        assert by_id["d2"]["modified_date"] == ""
+
+    def test_clear_removes_dates(self, bm25):
+        bm25.add_document("d1", "budget", "a.md", modified_date="2026-03-03")
+        bm25.clear()
+        bm25.add_document("d1", "budget", "a.md")
+        assert bm25.search("budget")[0]["modified_date"] == ""

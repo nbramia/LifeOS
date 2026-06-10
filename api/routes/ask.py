@@ -6,12 +6,12 @@ POST /api/ask - Ask questions and get synthesized answers from the vault.
 import time
 import logging
 from typing import Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field, field_validator
 
 from api.services.hybrid_search import HybridSearch
 from api.services.synthesizer import get_synthesizer, construct_prompt
-from config.settings import settings
+from api.utils.date_parser import resolve_effective_dates
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["ask"])
@@ -32,6 +32,12 @@ class AskRequest(BaseModel):
     """Ask request schema."""
     question: str = Field(..., min_length=1, description="Question to answer")
     include_sources: bool = Field(default=True, description="Include source citations")
+    date_from: Optional[str] = Field(
+        default=None,
+        description="Inclusive lower bound (YYYY-MM-DD). When omitted, a relative-time "
+                    "phrase in the question (e.g. 'last week') is auto-resolved.")
+    date_to: Optional[str] = Field(
+        default=None, description="Inclusive upper bound (YYYY-MM-DD).")
 
     @field_validator('question')
     @classmethod
@@ -93,11 +99,17 @@ async def ask(request: AskRequest) -> AskResponse:
     # Step 1: Retrieve relevant context using hybrid search (vector + BM25)
     retrieval_start = time.time()
 
+    date_from, date_to = resolve_effective_dates(
+        request.question, request.date_from, request.date_to
+    )
+
     try:
         hybrid_search = get_hybrid_search()
         chunks = hybrid_search.search(
             query=request.question,
-            top_k=10  # Get top 10 chunks for context
+            top_k=10,  # Get top 10 chunks for context
+            date_from=date_from,
+            date_to=date_to,
         )
     except Exception as e:
         logger.warning(f"Hybrid search error: {e}")

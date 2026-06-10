@@ -517,7 +517,9 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "question": {"type": "string", "description": "The question to ask"},
-                    "include_sources": {"type": "boolean", "description": "Include source citations", "default": True}
+                    "include_sources": {"type": "boolean", "description": "Include source citations", "default": True},
+                    "date_from": {"type": "string", "description": "Only use notes on/after this date (YYYY-MM-DD). Resolve relative phrases like 'last week' against today's date before passing."},
+                    "date_to": {"type": "string", "description": "Only use notes on/before this date (YYYY-MM-DD)."}
                 },
                 "required": ["question"]
             },
@@ -525,7 +527,9 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "top_k": {"type": "integer", "description": "Number of results (1-100)", "default": 10}
+                    "top_k": {"type": "integer", "description": "Number of results (1-100)", "default": 10},
+                    "date_from": {"type": "string", "description": "Only return notes on/after this date (YYYY-MM-DD). Resolve relative phrases like 'last week' against today's date before passing."},
+                    "date_to": {"type": "string", "description": "Only return notes on/before this date (YYYY-MM-DD)."}
                 },
                 "required": ["query"]
             },

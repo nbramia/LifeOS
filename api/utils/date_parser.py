@@ -1,7 +1,7 @@
 """Date parsing utilities for vault notes."""
 import re
-from datetime import date
-from typing import Optional
+from datetime import date, datetime, timedelta
+from typing import Optional, Union
 
 MONTH_NAMES = {
     'january': 1, 'jan': 1, 'february': 2, 'feb': 2,
@@ -88,6 +88,117 @@ def parse_note_date(text: str) -> Optional[str]:
             return result
 
     return None
+
+
+# Vague "recency" terms map to a generous trailing window. Wide enough not to
+# drop a genuinely-relevant note that is a few weeks old, narrow enough to
+# exclude last year's results (the actual complaint being fixed).
+_RECENT_WINDOW_DAYS = 90
+
+
+def resolve_relative_time(
+    text: str, now: Union[date, datetime]
+) -> Optional[tuple[str, str]]:
+    """Resolve a relative-time phrase in ``text`` to a concrete date range.
+
+    Pure function of ``now`` — never reads the system clock — so callers stay
+    deterministic and testable. ``now`` is the caller's notion of "today"
+    (computed fresh per request, in the user's timezone), so no notion of the
+    current date is hardcoded anywhere.
+
+    Returns ``(date_from, date_to)`` as inclusive ``YYYY-MM-DD`` strings, or
+    ``None`` when no recognized phrase is present. Recognized phrases (checked
+    most-specific first):
+
+    - "today", "yesterday"
+    - "this week" / "last week" (Mon–Sun ISO weeks)
+    - "this month" / "last month"
+    - "this year" / "last year"
+    - "past/last/previous N days/weeks/months"
+    - "recent" / "recently" / "lately" → trailing 90-day window
+
+    The order matters: bounded phrases ("last week") win over the vague
+    "recent" so the more precise range is used when both could match.
+    """
+    if not text:
+        return None
+
+    today = now.date() if isinstance(now, datetime) else now
+    t = text.lower()
+
+    def fmt(d: date) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    # "today" / "yesterday"
+    if re.search(r"\btoday\b", t):
+        return fmt(today), fmt(today)
+    if re.search(r"\byesterday\b", t):
+        y = today - timedelta(days=1)
+        return fmt(y), fmt(y)
+
+    # "past/last/previous N days|weeks|months" (numeric window)
+    m = re.search(r"\b(?:past|last|previous)\s+(\d{1,4})\s+(day|week|month)s?\b", t)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        days = {"day": 1, "week": 7, "month": 30}[unit] * n
+        return fmt(today - timedelta(days=days)), fmt(today)
+
+    # "this/last week" (ISO weeks: Monday start)
+    monday = today - timedelta(days=today.weekday())
+    if re.search(r"\bthis week\b", t):
+        return fmt(monday), fmt(today)
+    if re.search(r"\blast week\b", t):
+        last_monday = monday - timedelta(days=7)
+        return fmt(last_monday), fmt(last_monday + timedelta(days=6))
+
+    # "this/last month"
+    first_of_month = today.replace(day=1)
+    if re.search(r"\bthis month\b", t):
+        return fmt(first_of_month), fmt(today)
+    if re.search(r"\blast month\b", t):
+        last_month_end = first_of_month - timedelta(days=1)
+        return fmt(last_month_end.replace(day=1)), fmt(last_month_end)
+
+    # "this/last year"
+    if re.search(r"\bthis year\b", t):
+        return fmt(today.replace(month=1, day=1)), fmt(today)
+    if re.search(r"\blast year\b", t):
+        ly = today.year - 1
+        return f"{ly:04d}-01-01", f"{ly:04d}-12-31"
+
+    # Vague recency — generous trailing window
+    if re.search(r"\b(recent(ly)?|lately)\b", t):
+        return fmt(today - timedelta(days=_RECENT_WINDOW_DAYS)), fmt(today)
+
+    return None
+
+
+def resolve_effective_dates(
+    query: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Decide the effective date window for a search request.
+
+    Explicit ``date_from``/``date_to`` always win. When neither is given, try to
+    infer a window from a relative-time phrase in ``query`` evaluated against the
+    current date (in the operator's configured timezone). Returns
+    ``(date_from, date_to)``, either of which may be ``None``.
+
+    The "now" used for inference is computed fresh here, so callers never carry a
+    hardcoded notion of today.
+    """
+    if date_from or date_to:
+        return date_from, date_to
+
+    from zoneinfo import ZoneInfo
+    from config.settings import settings
+
+    now = datetime.now(ZoneInfo(settings.timezone))
+    resolved = resolve_relative_time(query, now)
+    if resolved:
+        return resolved
+    return None, None
 
 
 def _validate_and_format(year: int, month: int, day: int, today: date) -> Optional[str]:
