@@ -97,7 +97,7 @@ _RECENT_WINDOW_DAYS = 90
 
 
 def resolve_relative_time(
-    text: str, now: Union[date, datetime]
+    text: str, now: Union[date, datetime], include_vague: bool = True
 ) -> Optional[tuple[str, str]]:
     """Resolve a relative-time phrase in ``text`` to a concrete date range.
 
@@ -110,12 +110,19 @@ def resolve_relative_time(
     ``None`` when no recognized phrase is present. Recognized phrases (checked
     most-specific first):
 
-    - "today", "yesterday"
-    - "this week" / "last week" (Mon–Sun ISO weeks)
-    - "this month" / "last month"
-    - "this year" / "last year"
-    - "past/last/previous N days/weeks/months"
-    - "recent" / "recently" / "lately" → trailing 90-day window
+    - "today", "yesterday"                                       (bounded)
+    - "this week" / "last week" (Mon–Sun ISO weeks)              (bounded)
+    - "this month" / "last month"                                (bounded)
+    - "this year" / "last year"                                  (bounded)
+    - "past/last/previous N days/weeks/months"                   (bounded)
+    - "recent" / "recently" / "lately" → trailing 90-day window  (vague)
+
+    Bounded phrases denote a specific interval and are safe to apply as a hard
+    filter. The vague terms only express a *preference* for recency, which the
+    recency boost already serves — so ``include_vague=False`` returns ``None``
+    for them, letting callers (e.g. the search routes) avoid hard-filtering a
+    query like "the most recent invoice" down to an empty window when the
+    newest match happens to be older than 90 days.
 
     The order matters: bounded phrases ("last week") win over the vague
     "recent" so the more precise range is used when both could match.
@@ -166,8 +173,8 @@ def resolve_relative_time(
         ly = today.year - 1
         return f"{ly:04d}-01-01", f"{ly:04d}-12-31"
 
-    # Vague recency — generous trailing window
-    if re.search(r"\b(recent(ly)?|lately)\b", t):
+    # Vague recency — generous trailing window (preference, not a hard bound)
+    if include_vague and re.search(r"\b(recent(ly)?|lately)\b", t):
         return fmt(today - timedelta(days=_RECENT_WINDOW_DAYS)), fmt(today)
 
     return None
@@ -187,6 +194,11 @@ def resolve_effective_dates(
 
     The "now" used for inference is computed fresh here, so callers never carry a
     hardcoded notion of today.
+
+    Only *bounded* phrases ("last week", "yesterday", "past 30 days") are
+    auto-applied as a hard filter (``include_vague=False``). Vague recency
+    ("recent", "lately") is intentionally left to the recency boost so an
+    auto-filter never empties an otherwise-good result set.
     """
     if date_from or date_to:
         return date_from, date_to
@@ -195,7 +207,7 @@ def resolve_effective_dates(
     from config.settings import settings
 
     now = datetime.now(ZoneInfo(settings.timezone))
-    resolved = resolve_relative_time(query, now)
+    resolved = resolve_relative_time(query, now, include_vague=False)
     if resolved:
         return resolved
     return None, None

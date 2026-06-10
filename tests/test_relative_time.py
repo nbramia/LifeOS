@@ -64,3 +64,30 @@ def test_accepts_datetime_as_now():
 def test_is_pure_does_not_read_clock():
     """Same inputs → same output regardless of wall-clock time."""
     assert resolve_relative_time("today", date(2020, 1, 1)) == ("2020-01-01", "2020-01-01")
+
+
+@pytest.mark.parametrize("phrase", ["recent updates", "anything lately", "recently"])
+def test_include_vague_false_drops_vague_terms(phrase):
+    """With vague terms excluded, 'recent'/'lately' resolve to None so the route
+    never hard-filters on them (the recency boost handles ordering instead)."""
+    assert resolve_relative_time(phrase, NOW, include_vague=False) is None
+
+
+def test_include_vague_false_keeps_bounded_terms():
+    """Bounded phrases are still resolved when vague terms are excluded."""
+    assert resolve_relative_time("notes from last week", NOW, include_vague=False) == (
+        "2026-06-01",
+        "2026-06-07",
+    )
+
+
+def test_resolve_effective_dates_ignores_vague_recent():
+    """The route-facing wrapper must not auto-apply a hard filter for vague
+    'recent' (regression for over-aggressive auto-filtering)."""
+    from api.utils.date_parser import resolve_effective_dates
+    assert resolve_effective_dates("my most recent invoice") == (None, None)
+
+
+def test_resolve_effective_dates_explicit_params_win():
+    from api.utils.date_parser import resolve_effective_dates
+    assert resolve_effective_dates("last week", "2026-01-01", None) == ("2026-01-01", None)

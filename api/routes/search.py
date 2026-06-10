@@ -118,9 +118,14 @@ async def search(request: SearchRequest) -> SearchResponse:
         # For now, we'll filter in post-processing if needed
 
     # Resolve the effective date window: explicit params win; otherwise try to
-    # infer one from a relative-time phrase in the query ("last week", "recent")
+    # infer one from a bounded relative-time phrase in the query ("last week")
     # against the current date. Keeps recency working even when the caller
     # didn't pass explicit bounds.
+    #
+    # NOTE: independent of the legacy ``request.filters.date_from/to`` post-filter
+    # below. Two separate knobs — the top-level params push the window down into
+    # hybrid_search (pre-ranking); ``filters`` filters already-ranked results
+    # here. Both let undated docs pass through, so they compose without conflict.
     date_from, date_to = resolve_effective_dates(
         request.query, request.date_from, request.date_to
     )
