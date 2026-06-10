@@ -447,7 +447,8 @@ class IndexerService:
                 doc_id=doc_id,
                 content=chunk.get("content", ""),
                 file_name=path.name,
-                people=all_people if all_people else None
+                people=all_people if all_people else None,
+                modified_date=metadata["modified_date"]
             )
 
         # Generate document summary for discovery queries (P9.4)
@@ -473,7 +474,8 @@ class IndexerService:
                             doc_id=summary_id,
                             content=summary_content,
                             file_name=path.name,
-                            people=all_people if all_people else None
+                            people=all_people if all_people else None,
+                            modified_date=metadata["modified_date"]
                         )
 
                         logger.debug(f"Generated summary for {file_path} (tier: {tier.value})")
@@ -540,7 +542,7 @@ class IndexerService:
                 content = path.read_text(encoding="utf-8")
                 # Extract body (skip frontmatter)
                 from api.services.chunker import extract_frontmatter
-                _, body = extract_frontmatter(content)
+                frontmatter, body = extract_frontmatter(content)
 
                 summary = retry_summary(body, file_name)
                 if summary:
@@ -551,7 +553,8 @@ class IndexerService:
                     self.bm25_index.add_document(
                         doc_id=summary_id,
                         content=summary_content,
-                        file_name=file_name
+                        file_name=file_name,
+                        modified_date=self._extract_note_date(path, frontmatter, body)
                     )
                     success_count += 1
 

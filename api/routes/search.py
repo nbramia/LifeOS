@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from api.services.vectorstore import VectorStore
 from api.services.hybrid_search import HybridSearch
-from config.settings import settings
+from api.utils.date_parser import resolve_effective_dates
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["search"])
@@ -51,6 +51,12 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query text")
     filters: Optional[SearchFilters] = None
     top_k: int = Field(default=20, ge=1, le=100)
+    date_from: Optional[str] = Field(
+        default=None,
+        description="Inclusive lower bound (YYYY-MM-DD). When omitted, a relative-time "
+                    "phrase in the query (e.g. 'last week') is auto-resolved.")
+    date_to: Optional[str] = Field(
+        default=None, description="Inclusive upper bound (YYYY-MM-DD).")
 
     @field_validator('query')
     @classmethod
@@ -111,12 +117,27 @@ async def search(request: SearchRequest) -> SearchResponse:
         # ChromaDB doesn't support range queries directly on strings
         # For now, we'll filter in post-processing if needed
 
+    # Resolve the effective date window: explicit params win; otherwise try to
+    # infer one from a bounded relative-time phrase in the query ("last week")
+    # against the current date. Keeps recency working even when the caller
+    # didn't pass explicit bounds.
+    #
+    # NOTE: independent of the legacy ``request.filters.date_from/to`` post-filter
+    # below. Two separate knobs — the top-level params push the window down into
+    # hybrid_search (pre-ranking); ``filters`` filters already-ranked results
+    # here. Both let undated docs pass through, so they compose without conflict.
+    date_from, date_to = resolve_effective_dates(
+        request.query, request.date_from, request.date_to
+    )
+
     # Search using hybrid search (vector + BM25 keyword)
     try:
         hybrid_search = get_hybrid_search()
         raw_results = hybrid_search.search(
             query=request.query,
-            top_k=request.top_k
+            top_k=request.top_k,
+            date_from=date_from,
+            date_to=date_to,
         )
     except Exception as e:
         logger.error(f"Hybrid search error: {e}")

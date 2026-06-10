@@ -66,6 +66,17 @@ class BM25Index:
                     tokenize='porter unicode61'
                 )
             """)
+            # Sidecar date table. FTS5 virtual tables can't gain a column
+            # without a destructive rebuild, so doc dates live in a plain table
+            # keyed by doc_id. Created idempotently; populated incrementally as
+            # documents are (re)indexed, so it self-heals on the nightly sync
+            # without forcing a full reindex.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS doc_dates (
+                    doc_id TEXT PRIMARY KEY,
+                    modified_date TEXT
+                )
+            """)
             conn.commit()
         finally:
             conn.close()
@@ -75,7 +86,8 @@ class BM25Index:
         doc_id: str,
         content: str,
         file_name: str,
-        people: Optional[list[str]] = None
+        people: Optional[list[str]] = None,
+        modified_date: Optional[str] = None
     ):
         """
         Add or update a document in the index.
@@ -85,6 +97,8 @@ class BM25Index:
             content: Document text content
             file_name: Source file name
             people: List of people mentioned
+            modified_date: Document date (YYYY-MM-DD), used for recency ranking
+                and date-range filtering
         """
         people_str = " ".join(people) if people else ""
 
@@ -100,6 +114,13 @@ class BM25Index:
                 "INSERT INTO chunks_fts (doc_id, content, file_name, people) VALUES (?, ?, ?, ?)",
                 (doc_id, content, file_name, people_str)
             )
+            if modified_date:
+                conn.execute(
+                    "INSERT OR REPLACE INTO doc_dates (doc_id, modified_date) VALUES (?, ?)",
+                    (doc_id, modified_date)
+                )
+            else:
+                conn.execute("DELETE FROM doc_dates WHERE doc_id = ?", (doc_id,))
             conn.commit()
         finally:
             conn.close()
@@ -117,6 +138,7 @@ class BM25Index:
                 "DELETE FROM chunks_fts WHERE doc_id = ?",
                 (doc_id,)
             )
+            conn.execute("DELETE FROM doc_dates WHERE doc_id = ?", (doc_id,))
             conn.commit()
         finally:
             conn.close()
@@ -142,20 +164,21 @@ class BM25Index:
             # FTS5 doesn't support ESCAPE on LIKE, so escape special chars
             # by enumerating the two known suffix patterns explicitly. The
             # summary uses '::summary' and chunks use '_<int>'.
-            cursor = conn.execute(
-                """
-                DELETE FROM chunks_fts
-                WHERE doc_id = ?
+            id_match = """
+                doc_id = ?
                    OR doc_id = ?
                    OR doc_id GLOB ?
-                """,
-                (
-                    file_path,                       # legacy: path with no suffix
-                    f"{file_path}::summary",         # summary chunk
-                    f"{file_path}_*",                # numbered chunks
-                ),
+            """
+            id_params = (
+                file_path,                       # legacy: path with no suffix
+                f"{file_path}::summary",         # summary chunk
+                f"{file_path}_*",                # numbered chunks
+            )
+            cursor = conn.execute(
+                f"DELETE FROM chunks_fts WHERE {id_match}", id_params
             )
             deleted = cursor.rowcount
+            conn.execute(f"DELETE FROM doc_dates WHERE {id_match}", id_params)
             conn.commit()
             return deleted
         finally:
@@ -227,8 +250,11 @@ class BM25Index:
             # Return all columns for full result data
             cursor = conn.execute(
                 """
-                SELECT doc_id, content, file_name, people, bm25(chunks_fts) as score
+                SELECT chunks_fts.doc_id, chunks_fts.content,
+                       chunks_fts.file_name, chunks_fts.people,
+                       bm25(chunks_fts) as score, doc_dates.modified_date
                 FROM chunks_fts
+                LEFT JOIN doc_dates ON doc_dates.doc_id = chunks_fts.doc_id
                 WHERE chunks_fts MATCH ?
                 ORDER BY score
                 LIMIT ?
@@ -243,7 +269,8 @@ class BM25Index:
                     "content": row[1],
                     "file_name": row[2],
                     "people": row[3].split(",") if row[3] else [],
-                    "bm25_score": row[4]  # Note: BM25 scores are negative, lower is better
+                    "bm25_score": row[4],  # Note: BM25 scores are negative, lower is better
+                    "modified_date": row[5] or ""
                 })
 
             return results
@@ -274,6 +301,14 @@ class BM25Index:
                     "INSERT INTO chunks_fts (doc_id, content, file_name, people) VALUES (?, ?, ?, ?)",
                     (doc["doc_id"], doc["content"], doc["file_name"], people_str)
                 )
+                modified_date = doc.get("modified_date")
+                if modified_date:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO doc_dates (doc_id, modified_date) VALUES (?, ?)",
+                        (doc["doc_id"], modified_date)
+                    )
+                else:
+                    conn.execute("DELETE FROM doc_dates WHERE doc_id = ?", (doc["doc_id"],))
             conn.commit()
         finally:
             conn.close()
@@ -283,6 +318,7 @@ class BM25Index:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute("DELETE FROM chunks_fts")
+            conn.execute("DELETE FROM doc_dates")
             conn.commit()
         finally:
             conn.close()

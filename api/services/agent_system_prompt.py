@@ -197,7 +197,16 @@ def build_system_prompt(persona: str | None = None) -> list[dict]:
     blocks.append(
         {
             "type": "text",
-            "text": f"Current date/time: {current_dt}\nTimezone: {settings.timezone}",
+            "text": (
+                f"Current date/time: {current_dt}\nTimezone: {settings.timezone}\n"
+                "When the user asks for something time-relative ('recent', 'lately', "
+                "'last week', 'this month', 'past few days'), resolve it against the "
+                "current date above into a concrete YYYY-MM-DD range and pass it as "
+                "date_from/date_to to lifeos_search or lifeos_ask (and the equivalent "
+                "after/before on email, message, and calendar tools). Prefer the most "
+                "recent matches, and treat results more than a few months old as stale "
+                "for a 'recent' query unless nothing newer exists."
+            ),
         }
     )
 
