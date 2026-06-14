@@ -366,21 +366,26 @@ TOOL_DEFINITIONS = [
     {
         "name": "manage_schedules",
         "description": (
-            "Manage schedules: create or list. A schedule binds a trigger "
-            "(once/cron) to an action (notify/prompt/endpoint/agent). Use "
-            "action='agent' to run autonomous work on a schedule."
+            "Manage schedules: create, list, update, or delete. A schedule binds "
+            "a trigger (once/cron) to an action (notify/prompt/endpoint/agent). Use "
+            "action='agent' to run autonomous work on a schedule. For update/delete, "
+            "pass schedule_id from a prior list; update changes only the fields you supply."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list"],
+                    "enum": ["create", "list", "update", "delete"],
                     "description": "Operation to perform.",
+                },
+                "schedule_id": {
+                    "type": "string",
+                    "description": "ID of the schedule to update or delete (from action='list').",
                 },
                 "name": {
                     "type": "string",
-                    "description": "Short schedule name/title (for create).",
+                    "description": "Short schedule name/title (for create; optional for update).",
                 },
                 "schedule_type": {
                     "type": "string",
@@ -404,6 +409,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": ["local", "cloud", "cloud-haiku", "cloud-sonnet"],
                     "description": "For schedule_action='agent': which executor the spawned #agent task targets.",
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Enable (true) or pause (false) the schedule (for update).",
                 },
             },
             "required": ["action"],
@@ -1262,12 +1271,52 @@ def _schedule_list(inp: dict) -> str:
     return "\n".join(lines)
 
 
+def _schedule_update(inp: dict) -> str:
+    from api.services.scheduler_store import get_scheduler_store
+    schedule_id = inp.get("schedule_id")
+    if not schedule_id:
+        return "Error: schedule_id is required for update (use action='list' to find it)."
+    # Only forward fields the caller actually supplied (partial update). The
+    # schedule's own action is passed as `schedule_action`, not `action`.
+    fields = {
+        key: inp[key]
+        for key in ("name", "schedule_type", "schedule_value", "message_content", "executor", "enabled")
+        if inp.get(key) is not None
+    }
+    if inp.get("schedule_action") is not None:
+        fields["action"] = inp["schedule_action"]
+    store = get_scheduler_store()
+    entry = store.update(schedule_id, **fields)
+    if entry is None:
+        return f"Error: No schedule found with id '{schedule_id}'."
+    label = f"{entry.action} (#{entry.executor})" if entry.action == "agent" and entry.executor else entry.action
+    return (f"Schedule updated: \"{entry.name}\" (id: {entry.id}, action: {label}, "
+            f"next: {entry.next_trigger_at})")
+
+
+def _schedule_delete(inp: dict) -> str:
+    from api.services.scheduler_store import get_scheduler_store
+    schedule_id = inp.get("schedule_id")
+    if not schedule_id:
+        return "Error: schedule_id is required for delete (use action='list' to find it)."
+    store = get_scheduler_store()
+    entry = store.get(schedule_id)
+    name = entry.name if entry else ""
+    if store.delete(schedule_id):
+        return f"Schedule deleted: \"{name}\" (id: {schedule_id})"
+    return f"Error: No schedule found with id '{schedule_id}'."
+
+
 def _tool_manage_schedules(inp: dict):
     action = inp["action"]
     if action == "create":
         return _schedule_create(inp)
     elif action == "list":
         return _schedule_list(inp)
+    elif action == "update":
+        return _schedule_update(inp)
+    elif action == "delete":
+        return _schedule_delete(inp)
     return f"Error: Unknown manage_schedules action '{action}'"
 
 
@@ -1823,6 +1872,8 @@ TOOL_STATUS_MESSAGES = {
     "manage_schedules": "Managing schedules...",
     "manage_schedules.create": "Setting schedule...",
     "manage_schedules.list": "Loading schedules...",
+    "manage_schedules.update": "Updating schedule...",
+    "manage_schedules.delete": "Removing schedule...",
     "manage_workouts": "Updating workout log...",
     "manage_workouts.log": "Logging workout...",
     "manage_workouts.update": "Correcting log...",
