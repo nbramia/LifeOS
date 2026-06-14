@@ -18,7 +18,10 @@ The markdown line carries the user-editable *definition* (enabled checkbox,
 name, trigger, timezone, action, message type, executor tag). The
 human-editable instruction text (``message_content``) is written beneath the
 line as an indented ``> `` blockquote body, so it can be read and edited in
-Obsidian and round-trips back through reindexing. The structured
+Obsidian and round-trips back through reindexing. Indented blockquote lines
+directly following a schedule line are reserved for this body — a standalone
+note placed there will be absorbed into the schedule's ``message_content`` on
+reindex. The structured
 ``endpoint_config`` and computed ``next_trigger_at`` (plus run history) live in
 a rebuildable index cache (``data/scheduler_index.json``) and are merged back
 by ID when markdown is reindexed. The cache is never the source of truth — it
