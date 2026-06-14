@@ -171,6 +171,95 @@ class TestManageSchedulesAgentTool:
         assert "\"N\"" in out
         assert "notify" in out
 
+    def test_update_schedule_tool(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Old name", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="prompt",
+                               message_content="old prompt")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update",
+                "schedule_id": created.id,
+                "name": "New name",
+                "message_content": "new prompt",
+                "enabled": False,
+            })
+        assert "Schedule updated" in out
+        refreshed = store.get(created.id)
+        assert refreshed.name == "New name"
+        assert refreshed.message_content == "new prompt"
+        assert refreshed.enabled is False
+
+    def test_update_only_changes_supplied_fields(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Keep", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="prompt",
+                               message_content="keep me")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": created.id,
+                "schedule_value": "0 10 * * *",
+            })
+        refreshed = store.get(created.id)
+        assert refreshed.schedule_value == "0 10 * * *"
+        assert refreshed.name == "Keep"
+        assert refreshed.message_content == "keep me"
+
+    def test_update_missing_id_errors(self, tmp_path):
+        from api.services import agent_tools
+        out = agent_tools._tool_manage_schedules({"action": "update", "name": "X"})
+        assert "Error" in out and "schedule_id" in out
+
+    def test_update_unknown_id_errors(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "update", "schedule_id": "nope", "name": "X"})
+        assert "Error" in out and "nope" in out
+
+    def test_delete_schedule_tool(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(name="Doomed", schedule_type="cron",
+                               schedule_value="0 9 * * *", action="notify",
+                               message_content="bye")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "delete", "schedule_id": created.id})
+        assert "Schedule deleted" in out and "Doomed" in out
+        assert store.get(created.id) is None
+
+    def test_delete_missing_id_errors(self, tmp_path):
+        from api.services import agent_tools
+        out = agent_tools._tool_manage_schedules({"action": "delete"})
+        assert "Error" in out and "schedule_id" in out
+
+    def test_delete_unknown_id_errors(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "delete", "schedule_id": "ghost"})
+        assert "Error" in out and "ghost" in out
+
     def test_manage_reminders_alias_still_works(self, tmp_path):
         from api.services.scheduler_store import SchedulerStore
         from api.services import agent_tools

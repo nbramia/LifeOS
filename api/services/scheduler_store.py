@@ -15,12 +15,17 @@ checkbox lines with stable ``<!-- id:xxxx -->`` IDs and Dataview-style
 and edited in Obsidian and a watcher reindexes on change.
 
 The markdown line carries the user-editable *definition* (enabled checkbox,
-name, trigger, timezone, action, message type, executor tag). The heavier
-payload (``message_content``, ``endpoint_config``) and computed
-``next_trigger_at`` live in a rebuildable index cache
-(``data/scheduler_index.json``) and are merged back by ID when markdown is
-reindexed. The cache is never the source of truth — it can be deleted and
-rebuilt from the vault.
+name, trigger, timezone, action, message type, executor tag). The
+human-editable instruction text (``message_content``) is written beneath the
+line as an indented ``> `` blockquote body, so it can be read and edited in
+Obsidian and round-trips back through reindexing. Indented blockquote lines
+directly following a schedule line are reserved for this body — a standalone
+note placed there will be absorbed into the schedule's ``message_content`` on
+reindex. The structured
+``endpoint_config`` and computed ``next_trigger_at`` (plus run history) live in
+a rebuildable index cache (``data/scheduler_index.json``) and are merged back
+by ID when markdown is reindexed. The cache is never the source of truth — it
+can be deleted and rebuilt from the vault.
 """
 import asyncio
 import json
@@ -194,6 +199,9 @@ _INLINE_FIELD_RE = re.compile(r'\[(\w+)::\s*([^\]]*)\]')
 _TAG_RE = re.compile(r'#([\w-]+)')
 _ID_RE = re.compile(r'<!--\s*id:(\w+)\s*-->')
 _CHECKBOX_RE = re.compile(r'^- \[(.)\]\s+(.*)$')
+# Instruction-text body: an indented blockquote line beneath a schedule line.
+_BODY_LINE_RE = re.compile(r'^\s+>\s?(.*)$')
+_BODY_INDENT = "    "
 
 
 def _format_entry_line(entry: ScheduleEntry) -> str:
@@ -266,6 +274,52 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         last_triggered_at=fields.get("last") or None,
         timezone=fields.get("tz", ""),
     )
+
+
+def _format_entry_block(entry: ScheduleEntry) -> list[str]:
+    """ScheduleEntry → its markdown checkbox line plus an indented ``> ``
+    blockquote body carrying the human-editable ``message_content`` (one line
+    per content line). Empty content emits no body lines.
+    """
+    lines = [_format_entry_line(entry)]
+    if entry.message_content:
+        for content_line in entry.message_content.split("\n"):
+            lines.append(f"{_BODY_INDENT}> {content_line}" if content_line else f"{_BODY_INDENT}>")
+    return lines
+
+
+def _iter_entry_blocks(lines: list[str]):
+    """Yield ``(start, end, entry)`` for each schedule block in ``lines``.
+
+    ``end`` is exclusive and includes any indented blockquote body lines that
+    immediately follow the checkbox line; the body is attached to the entry's
+    ``message_content``.
+    """
+    i, n = 0, len(lines)
+    while i < n:
+        entry = _parse_entry_line(lines[i])
+        if entry is None:
+            i += 1
+            continue
+        start, j, body = i, i + 1, []
+        while j < n:
+            m = _BODY_LINE_RE.match(lines[j])
+            if not m:
+                break
+            body.append(m.group(1))
+            j += 1
+        if body:
+            entry.message_content = "\n".join(body)
+        yield start, j, entry
+        i = j
+
+
+def _find_block_span(lines: list[str], entry_id: str) -> Optional[tuple[int, int]]:
+    """Return the ``(start, end)`` line span of the block for ``entry_id``."""
+    for start, end, entry in _iter_entry_blocks(lines):
+        if entry.id == entry_id:
+            return start, end
+    return None
 
 
 class SchedulerStore:
@@ -352,8 +406,8 @@ class SchedulerStore:
                 "---\ntype: scheduler\n---\n# Scheduler Inbox\n\n", encoding="utf-8"
             )
 
-    def _insert_line_at_top(self, line: str):
-        """Insert a schedule line above the first existing schedule line."""
+    def _insert_block_at_top(self, block: list[str]):
+        """Insert a schedule block above the first existing schedule line."""
         self._ensure_inbox()
         lines = self._read_inbox_lines()
         first_idx = next(
@@ -361,28 +415,29 @@ class SchedulerStore:
             None,
         )
         if first_idx is None:
-            lines.append(line)
+            lines.extend(block)
         else:
-            lines = lines[:first_idx] + [line] + lines[first_idx:]
+            lines = lines[:first_idx] + block + lines[first_idx:]
         self._write_inbox_lines(lines)
 
-    def _rewrite_line(self, entry: ScheduleEntry):
-        """Replace the markdown line for ``entry`` (by ID); append if absent."""
-        new_line = _format_entry_line(entry)
+    def _rewrite_block(self, entry: ScheduleEntry):
+        """Replace the markdown block for ``entry`` (by ID); insert if absent."""
+        block = _format_entry_block(entry)
         lines = self._read_inbox_lines()
-        for i, ln in enumerate(lines):
-            m = _ID_RE.search(ln)
-            if m and m.group(1) == entry.id:
-                lines[i] = new_line
-                self._write_inbox_lines(lines)
-                return
-        self._insert_line_at_top(new_line)
+        span = _find_block_span(lines, entry.id)
+        if span is None:
+            self._insert_block_at_top(block)
+            return
+        start, end = span
+        self._write_inbox_lines(lines[:start] + block + lines[end:])
 
-    def _remove_line(self, entry_id: str):
+    def _remove_block(self, entry_id: str):
         lines = self._read_inbox_lines()
-        kept = [ln for ln in lines if not (_ID_RE.search(ln) and _ID_RE.search(ln).group(1) == entry_id)]
-        if len(kept) != len(lines):
-            self._write_inbox_lines(kept)
+        span = _find_block_span(lines, entry_id)
+        if span is None:
+            return
+        start, end = span
+        self._write_inbox_lines(lines[:start] + lines[end:])
 
     # ------------------------------------------------------------------
     # CRUD
@@ -400,7 +455,7 @@ class SchedulerStore:
                 **kwargs,
             )
             entry.next_trigger_at = compute_next_trigger(entry)
-            self._insert_line_at_top(_format_entry_line(entry))
+            self._insert_block_at_top(_format_entry_block(entry))
             self._entries[entry.id] = entry
             self._save()
             logger.info(f"Created schedule: {entry.id} - {entry.name}")
@@ -426,7 +481,7 @@ class SchedulerStore:
                     setattr(entry, key, value)
             if any(k in kwargs for k in ("schedule_type", "schedule_value", "enabled", "timezone")):
                 entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
-            self._rewrite_line(entry)
+            self._rewrite_block(entry)
             self._save()
             return entry
 
@@ -434,7 +489,7 @@ class SchedulerStore:
         with self._lock:
             if entry_id in self._entries:
                 del self._entries[entry_id]
-                self._remove_line(entry_id)
+                self._remove_block(entry_id)
                 self._save()
                 return True
             return False
@@ -451,7 +506,7 @@ class SchedulerStore:
                 entry.next_trigger_at = None
             else:
                 entry.next_trigger_at = compute_next_trigger(entry)
-            self._rewrite_line(entry)
+            self._rewrite_block(entry)
             self._save()
 
     def record_run(self, entry_id: str, status: str, result: str = ""):
@@ -530,10 +585,7 @@ class SchedulerStore:
             except Exception as e:
                 logger.warning(f"Could not read {file_path}: {e}")
                 return
-            for line in lines:
-                entry = _parse_entry_line(line)
-                if not entry:
-                    continue
+            for _start, _end, entry in _iter_entry_blocks(lines):
                 self._merge_prior(entry, prior.get(entry.id))
                 entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
                 self._entries[entry.id] = entry
@@ -543,10 +595,7 @@ class SchedulerStore:
         """Full re-parse of Inbox.md into the cache."""
         prior = {eid: e for eid, e in self._entries.items()}
         self._entries.clear()
-        for line in self._read_inbox_lines():
-            entry = _parse_entry_line(line)
-            if not entry:
-                continue
+        for _start, _end, entry in _iter_entry_blocks(self._read_inbox_lines()):
             self._merge_prior(entry, prior.get(entry.id))
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
             self._entries[entry.id] = entry
@@ -555,7 +604,13 @@ class SchedulerStore:
 
     @staticmethod
     def _merge_prior(entry: ScheduleEntry, prior: Optional[ScheduleEntry]):
-        """Carry payload fields (not represented in markdown) forward by ID."""
+        """Carry cached fields forward by ID when markdown doesn't supply them.
+
+        ``message_content`` now lives in the markdown body, so markdown wins when
+        a body is present; the cache fallback only fills entries written before
+        bodies existed (lazy migration). ``endpoint_config`` and run history have
+        no markdown representation and are always carried from the cache.
+        """
         if not prior:
             return
         if not entry.message_content:

@@ -135,11 +135,11 @@ class TestMarkdownSourceOfTruth:
         assert store.get(entry.id).enabled is False
 
     def test_reindex_preserves_message_content(self, store):
-        """message_content lives in the cache and is merged back by ID."""
+        """An edit to a definition field leaves the instruction body intact."""
         entry = store.create(name="Briefing", schedule_type="cron",
                              schedule_value="0 9 * * *", message_type="prompt",
                              message_content="What's on my calendar?")
-        # A pure markdown edit (no content field) must not wipe the payload.
+        # Editing only the cron field (body untouched) must not wipe the content.
         content = store.inbox_path.read_text(encoding="utf-8")
         patched = content.replace("[cron:: 0 9 * * *]", "[cron:: 30 9 * * *]")
         store.inbox_path.write_text(patched, encoding="utf-8")
@@ -148,6 +148,48 @@ class TestMarkdownSourceOfTruth:
         refreshed = store.get(entry.id)
         assert refreshed.schedule_value == "30 9 * * *"
         assert refreshed.message_content == "What's on my calendar?"
+
+    def test_create_writes_message_content_to_markdown(self, store):
+        """The instruction text is human-readable in Inbox.md, not just the cache."""
+        store.create(name="Briefing", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="prompt", message_content="What's on my calendar?")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "> What's on my calendar?" in content
+
+    def test_external_edit_message_content_round_trips(self, store):
+        """Hand-editing the instruction body in markdown updates the cache on reindex."""
+        entry = store.create(name="Briefing", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="prompt",
+                             message_content="old instruction")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace("> old instruction", "> new instruction")
+        assert patched != content  # sanity: the body line was present to edit
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).message_content == "new instruction"
+
+    def test_multiline_message_content_round_trips(self, store, tmp_path):
+        """Multi-line instructions survive a full rebuild from markdown."""
+        multiline = "Line one.\n\nLine three after a blank."
+        store.create(name="Multi", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="prompt", message_content=multiline)
+        # A fresh store rebuilds purely from the vault markdown.
+        store2 = SchedulerStore(
+            vault_path=tmp_path / "vault",
+            index_path=tmp_path / "scheduler_index_multi.json",
+        )
+        names = {e.name: e for e in store2.list_all()}
+        assert names["Multi"].message_content == multiline
+
+    def test_delete_removes_body_lines(self, store):
+        """Deleting a schedule removes its body block, not just the checkbox line."""
+        entry = store.create(name="Doomed", schedule_type="cron", schedule_value="0 9 * * *",
+                             message_type="prompt", message_content="erase me")
+        store.delete(entry.id)
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "erase me" not in content
+        assert entry.id not in content
 
     def test_rebuild_index_from_markdown(self, store, tmp_path):
         store.create(name="Persist", schedule_type="cron", schedule_value="0 9 * * *",

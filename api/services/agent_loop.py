@@ -29,7 +29,7 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 # Consolidated tools that use sub-action status messages
-_CONSOLIDATED_TOOLS = {"manage_tasks", "manage_reminders", "person_info"}
+_CONSOLIDATED_TOOLS = {"manage_tasks", "manage_reminders", "manage_schedules", "person_info"}
 
 # Patterns that indicate the model is giving up without trying tools
 _GIVE_UP_PATTERNS = re.compile(
