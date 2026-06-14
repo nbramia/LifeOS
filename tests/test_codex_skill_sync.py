@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from api.services.agent_worker.codex_skill_sync import (
+    NATIVE_CODEX_SKILLS,
     PORTABLE_SKILLS,
+    install_native_codex_skills,
     install_skills,
     transform_skill,
 )
@@ -144,6 +146,32 @@ def test_install_skips_missing_sources(tmp_path: Path):
     assert installed == ["standup"]
 
 
+def test_install_native_codex_skills_copies_skill_directory(tmp_path: Path):
+    native_dir = tmp_path / "native_skills"
+    codex_dir = tmp_path / "codex_skills"
+    skill_dir = native_dir / "implement"
+    agents_dir = skill_dir / "agents"
+    agents_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: implement\ndescription: Native Codex lifecycle.\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    (agents_dir / "openai.yaml").write_text(
+        'interface:\n  display_name: "Implement"\n',
+        encoding="utf-8",
+    )
+
+    installed = install_native_codex_skills(native_dir, codex_dir)
+
+    assert installed == ["implement"]
+    assert (codex_dir / "implement" / "SKILL.md").read_text(encoding="utf-8").endswith("Body.\n")
+    assert (codex_dir / "implement" / "agents" / "openai.yaml").is_file()
+
+
 def test_orchestration_skills_excluded_from_allowlist():
     for excluded in ("implement", "review-pr", "address-review", "tune", "mine-for-ideas"):
         assert excluded not in PORTABLE_SKILLS
+
+
+def test_native_codex_skills_include_implement_only():
+    assert NATIVE_CODEX_SKILLS == ("implement",)
