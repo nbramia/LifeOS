@@ -3,7 +3,7 @@ Tests for iMessage integration.
 """
 import pytest
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from api.services.imessage import (
@@ -12,7 +12,6 @@ from api.services.imessage import (
     apple_timestamp_to_datetime,
     datetime_to_apple_timestamp,
     extract_text_from_attributed_body,
-    get_imessage_store,
 )
 
 
@@ -194,6 +193,68 @@ class TestIMessageStore:
         # Verify cleared
         assert temp_store.get_statistics()["total_messages"] == 0
         assert temp_store._get_last_synced_rowid() == 0
+
+
+class TestQueryMessagesDateFilters:
+    """Regression tests for date-bound handling in query_messages.
+
+    Guards the orchestrator's get_message_history path, which passes date
+    bounds as 'YYYY-MM-DD' strings (previously crashed on str.isoformat) and
+    issues single-day queries for 'yesterday'/'on <date>' (previously returned
+    nothing because a date-only end collapsed to midnight). Timestamps are at
+    11:00/13:00 UTC so the target day resolves correctly for any realistic
+    local timezone.
+    """
+
+    @pytest.fixture
+    def store_with_dated_msgs(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = IMessageStore(f.name)
+            batch = [
+                (1, "day before", "2024-06-14T12:00:00+00:00", 1, "+15550000001", "+15550000001", "iMessage"),
+                (2, "target morning", "2024-06-15T11:00:00+00:00", 0, "+15550000001", "+15550000001", "iMessage"),
+                (3, "target afternoon", "2024-06-15T13:00:00+00:00", 1, "+15550000001", "+15550000001", "iMessage"),
+                (4, "day after", "2024-06-16T12:00:00+00:00", 0, "+15550000001", "+15550000001", "iMessage"),
+            ]
+            store._insert_batch(batch)
+            store.update_entity_mappings({"+15550000001": "entity-date"})
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def test_string_bounds_do_not_crash(self, store_with_dated_msgs):
+        # Regression: string bounds previously raised AttributeError on .isoformat()
+        msgs = store_with_dated_msgs.query_messages(
+            entity_id="entity-date", start_date="2024-06-01", end_date="2024-06-30"
+        )
+        assert len(msgs) == 4
+
+    def test_single_day_string_is_inclusive(self, store_with_dated_msgs):
+        # 'on 2024-06-15' / 'yesterday': start == end, date-only -> whole local day
+        msgs = store_with_dated_msgs.query_messages(
+            entity_id="entity-date", start_date="2024-06-15", end_date="2024-06-15"
+        )
+        assert {m.text for m in msgs} == {"target morning", "target afternoon"}
+
+    def test_date_only_start_excludes_earlier(self, store_with_dated_msgs):
+        msgs = store_with_dated_msgs.query_messages(
+            entity_id="entity-date", start_date="2024-06-15"
+        )
+        assert {m.text for m in msgs} == {"target morning", "target afternoon", "day after"}
+
+    def test_datetime_bounds_still_work(self, store_with_dated_msgs):
+        msgs = store_with_dated_msgs.query_messages(
+            entity_id="entity-date",
+            start_date=datetime(2024, 6, 15, tzinfo=timezone.utc),
+            end_date=datetime(2024, 6, 15, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        assert {m.text for m in msgs} == {"target morning", "target afternoon"}
+
+    def test_unparseable_bound_is_ignored_not_emptying(self, store_with_dated_msgs):
+        # A malformed date must not crash and must not silently drop every row.
+        msgs = store_with_dated_msgs.query_messages(
+            entity_id="entity-date", start_date="not-a-date"
+        )
+        assert len(msgs) == 4
 
 
 class TestIMessageRecord:

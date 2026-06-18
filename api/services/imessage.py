@@ -15,10 +15,55 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from api.services.phone_utils import normalize_phone
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+LOCAL_TZ = ZoneInfo(settings.timezone)
+
+
+def _normalize_date_bound(value, *, end: bool) -> Optional[str]:
+    """Coerce a date bound into a UTC ISO-8601 string for timestamp comparison.
+
+    Accepts a ``datetime``, a ``YYYY-MM-DD`` string, or a full ISO datetime
+    string. The chat orchestrator passes bounds as strings, so this is what
+    keeps a date-filtered ``query_messages`` from crashing on ``str.isoformat``.
+
+    Date-only values are expanded to the start (``00:00:00``) or end
+    (``23:59:59.999999``) of that day in the configured local timezone, so a
+    single-day query (``start_date == end_date``, e.g. "yesterday" or "on
+    June 30") covers the whole local day instead of collapsing to midnight.
+    Stored timestamps are UTC, so the result is converted to UTC for correct
+    lexicographic comparison. Unparseable values are ignored (returns ``None``)
+    so a malformed date can never crash or silently empty the query.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        is_date_only = len(s) == 10 and s[4] == "-" and s[7] == "-"
+        try:
+            if is_date_only:
+                dt = datetime.strptime(s, "%Y-%m-%d")
+                if end:
+                    dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+            else:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("Ignoring unparseable date bound: %r", value)
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(timezone.utc).isoformat()
 
 # Apple's epoch starts at 2001-01-01 00:00:00 UTC
 # Dates are stored in nanoseconds
@@ -343,8 +388,8 @@ class IMessageStore:
         except sqlite3.OperationalError as e:
             if "unable to open database" in str(e).lower():
                 raise PermissionError(
-                    f"Cannot access iMessage database. "
-                    f"Grant Full Disk Access to Terminal/IDE in System Preferences."
+                    "Cannot access iMessage database. "
+                    "Grant Full Disk Access to Terminal/IDE in System Preferences."
                 ) from e
             raise
 
@@ -592,8 +637,8 @@ class IMessageStore:
         entity_id: Optional[str] = None,
         phone: Optional[str] = None,
         search_term: Optional[str] = None,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        start_date: Optional[str | datetime] = None,
+        end_date: Optional[str | datetime] = None,
         direction: Optional[str] = None,  # "sent", "received", or None for both
         limit: int = 100,
     ) -> list[IMessageRecord]:
@@ -635,13 +680,15 @@ class IMessageStore:
             sql += " AND text LIKE ?"
             params.append(f"%{search_term}%")
 
-        if start_date:
+        start_bound = _normalize_date_bound(start_date, end=False)
+        if start_bound:
             sql += " AND timestamp >= ?"
-            params.append(start_date.isoformat())
+            params.append(start_bound)
 
-        if end_date:
+        end_bound = _normalize_date_bound(end_date, end=True)
+        if end_bound:
             sql += " AND timestamp <= ?"
-            params.append(end_date.isoformat())
+            params.append(end_bound)
 
         if direction == "sent":
             sql += " AND is_from_me = 1"
@@ -780,8 +827,6 @@ class IMessageStore:
         Returns:
             List of dicts with contact info and message counts
         """
-        cutoff = datetime.now(timezone.utc).isoformat()
-
         with sqlite3.connect(self.storage_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
@@ -964,7 +1009,7 @@ def sync_and_join_imessages() -> dict:
     }
 
 
-def resolve_entity_id(entity_id: str) -> Optional[str]:
+def resolve_entity_id(entity_id: str) -> Optional[str]:  # noqa: F811 - pre-existing duplicate of the definition above; this entity_resolver-based one wins. Flagged as follow-up.
     """If entity_id isn't a UUID, try resolving it as a person name."""
     try:
         uuid_mod.UUID(entity_id)
@@ -983,8 +1028,8 @@ def resolve_entity_id(entity_id: str) -> Optional[str]:
 def query_person_messages(
     entity_id: str,
     search_term: Optional[str] = None,
-    start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
+    start_date: Optional[str | datetime] = None,
+    end_date: Optional[str | datetime] = None,
     limit: int = 100,
 ) -> dict:
     """

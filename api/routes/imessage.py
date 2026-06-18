@@ -113,27 +113,6 @@ async def search_messages(
     try:
         store = get_imessage_store()
 
-        # Parse dates if provided
-        start_date = None
-        end_date = None
-        if after:
-            try:
-                start_date = datetime.fromisoformat(after.replace('Z', '+00:00'))
-                if start_date.tzinfo is None:
-                    start_date = start_date.replace(tzinfo=timezone.utc)
-            except ValueError:
-                # Try date-only format
-                start_date = datetime.strptime(after, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
-        if before:
-            try:
-                end_date = datetime.fromisoformat(before.replace('Z', '+00:00'))
-                if end_date.tzinfo is None:
-                    end_date = end_date.replace(tzinfo=timezone.utc)
-            except ValueError:
-                # Try date-only format
-                end_date = datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
         # Validate direction
         if direction and direction not in ("sent", "received"):
             raise HTTPException(
@@ -151,12 +130,14 @@ async def search_messages(
                     detail=f"Could not resolve person '{entity_id}'. Use lifeos_people_search first to find the correct entity ID."
                 )
 
+        # Date bounds are normalized inside query_messages (date-only values are
+        # expanded to whole local days), so pass the raw strings through.
         messages = store.query_messages(
             entity_id=resolved_entity_id,
             phone=phone,
             search_term=q,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=after,
+            end_date=before,
             direction=direction,
             limit=max_results,
         )
