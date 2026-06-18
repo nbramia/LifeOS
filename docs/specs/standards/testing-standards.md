@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-06-18
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -154,6 +154,15 @@ Option (a) is the default. Options (b) and (c) require explicit justification in
 - Rewrite a test you don't fully understand.
 - Weaken assertions (e.g., changing `assertEqual` to `assertIn`) without justification.
 
+## HTTP client contract tests
+
+When changing chat or conversation APIs, run the tests in [Client Surfaces](../technical/client-surfaces.md#before-changing-chat-or-conversation-apis) and update them if shapes change.
+
+| Test file | Endpoints |
+|-----------|-----------|
+| `tests/test_chat_api.py` | ask/stream, handoff |
+| `tests/test_conversations_api.py` | conversation list/detail |
+
 ## Benchmark Tests
 
 `test_perf_benchmark.py` runs queries against a **live server**, collects perf traces, and validates answer quality. It is not part of the unit test suite.
@@ -178,5 +187,6 @@ There is no enforced coverage threshold. The project relies on targeted tests fo
 ## Related Documents
 
 - [specs/technical/architecture.md](../technical/architecture.md) -- system architecture and code structure
+- [Client Surfaces](../technical/client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [AGENTS.md](../../../AGENTS.md) -- development workflow and agent instructions
 - [Python Conventions](python-conventions.md) -- coding style and module patterns

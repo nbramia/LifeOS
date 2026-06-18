@@ -5,6 +5,7 @@ This directory contains technical specifications — how the system is built fro
 - `agent-viz.md` — Implementation of the `/agents` page (SSE feed, JSONL ingest, D3 graph, status inference)
 - `agent-worker.md` — Agent worker internals (session lifecycle, executor split, MCP transport, budget enforcement)
 - `architecture.md` — Top-level code structure, module boundaries, request flow
+- `client-surfaces.md` — HTTP consumers, whisper-relay integration, breaking-change policy
 - `claude-code-orchestration.md` — Implementation of the Claude Code orchestration surface (skill discovery, MCP server wiring)
 - `data-and-sync.md` — Seven-phase nightly sync pipeline; per-phase responsibilities and failure modes
 - `frontend.md` — Vanilla HTML/JS architecture (no build step), shared components, page conventions

@@ -225,5 +225,6 @@ See [Frontend Architecture](../technical/frontend.md) for:
 ## Related Documents
 
 - [API Reference](api-reference.md) -- API endpoint contracts
+- [Client Surfaces](../technical/client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [Frontend](../technical/frontend.md) -- UI implementation details
 - [MCP Tools](mcp-tools.md) -- MCP tool specifications

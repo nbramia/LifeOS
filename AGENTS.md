@@ -2,12 +2,12 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-03-04
+> **Last Updated:** 2026-06-18
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
 1. **A context layer** — indexes personal data (notes, emails, messages, photos, calendar, contacts, financial data) into a unified semantically-searchable corpus with cross-source entity resolution.
-2. **An agentic layer** — an agent worker plus chat/Telegram/MCP surfaces that autonomously complete multi-step tasks against that context (drafting, scheduling, researching, prepping) and report progress as they work.
+2. **An agentic layer** — an agent worker plus chat/Telegram/MCP/**voice (whisper-relay)** surfaces that autonomously complete multi-step tasks against that context (drafting, scheduling, researching, prepping) and report progress as they work.
 
 Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMessage, phone calls, and contacts.
 
@@ -21,6 +21,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 - **Sync phases**: Seven-phase nightly pipeline — Collection → Entity Processing → Relationship Building → Indexing → Content Sync → Entity Cleanup → Consistency Verification.
 - **Agentic chat**: Orchestrator LLM autonomously calls 15+ tools (search, calendar, email, tasks, etc.) across multiple rounds to answer queries.
 - **Agent worker**: Autonomous executor for `#agent`-tagged tasks (or work delegated from chat/Telegram). Runs long, multi-step sessions with the full MCP tool catalog, reports progress through the originating channel, and can route to local Gemma or cloud Claude via Managed Agents. See [specs/product/agent-worker.md](docs/specs/product/agent-worker.md).
+- **HTTP client surfaces**: Web chat, Telegram, and whisper-relay share a stable HTTP contract — see [specs/technical/client-surfaces.md](docs/specs/technical/client-surfaces.md) before changing chat or conversation APIs.
 
 ## Tech Stack
 
@@ -57,6 +58,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 |----------|----------|
 | How is data modeled? | [specs/product/data-model.md](docs/specs/product/data-model.md) |
 | What API endpoints exist? | [specs/product/api-reference.md](docs/specs/product/api-reference.md) |
+| What must not break for external chat clients? | [specs/technical/client-surfaces.md](docs/specs/technical/client-surfaces.md) |
 | How does the sync pipeline work? | [specs/technical/data-and-sync.md](docs/specs/technical/data-and-sync.md) |
 | What does the code structure look like? | [specs/technical/architecture.md](docs/specs/technical/architecture.md) |
 | How does hybrid search work internally? | [specs/technical/search-indexing.md](docs/specs/technical/search-indexing.md) |
@@ -187,6 +189,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | **Ask first** | Public API changes (new or modified endpoints) |
 | **Ask first** | Changes to sync pipeline phases or cron jobs |
 | **Ask first** | Changes to MCP tool definitions |
+| **Ask first** | Breaking changes to HTTP client contract — see [client-surfaces.md](docs/specs/technical/client-surfaces.md) |
 | **Never** | Commit secrets, credentials, or API keys |
 | **Never** | Force push to main |
 | **Never** | Skip pre-commit hooks (`--no-verify`) |
@@ -427,6 +430,7 @@ Services are tracked on-use, not by polling. Degradation events (fallback usage)
 3. **Committing without testing** → Use `./scripts/deploy.sh`
 4. **Starting server on localhost only** → Must use 0.0.0.0 for Tailscale
 5. **Overfitting to specific test cases** → Consider effects on the full system
+6. **Breaking external chat clients** → See [client-surfaces.md](docs/specs/technical/client-surfaces.md) before editing chat/conversation routes or web SSE handling
 
 ---
 

@@ -301,6 +301,7 @@ Tests are in `tests/` with naming convention `test_*.py`.
 ## Related Documents
 
 - [Data & Sync](data-and-sync.md) -- Data sources and sync pipeline
+- [Client Surfaces](client-surfaces.md) -- HTTP consumers and breaking-change policy
 - [Frontend](frontend.md) -- UI components and patterns
 - [API Reference](../product/api-reference.md) -- API endpoint contracts
 - [ADR-001: Python/FastAPI](../../adr/001-python-fastapi.md) -- Why Python/FastAPI was chosen
