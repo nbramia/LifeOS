@@ -60,3 +60,4 @@ curl http://localhost:8000/health/full | jq   # Health check
 9. **Over-documenting routine changes** → Not every change needs a docs update. Write what helps the next reader understand current state.
 10. **Deleting or modifying a failing test to unblock a commit** → See AGENTS.md § "Tests Are Sacred" for the full decision framework.
 11. **Committing without running the test suite** → Run `./scripts/test.sh` before every commit. No exceptions.
+12. **Breaking external chat clients** → See [client-surfaces.md](docs/specs/technical/client-surfaces.md) before editing chat/conversation routes or web SSE handling.

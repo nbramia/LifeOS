@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-06-18
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -39,6 +39,8 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two
 
 **Authentication:** None (Tailscale-only access)
 
+**External HTTP clients:** See [Client Surfaces](../technical/client-surfaces.md) for consumers (web, Telegram, whisper-relay) and breaking-change policy.
+
 **OpenAPI Spec:** `GET /openapi.json`
 
 ---
@@ -65,10 +67,15 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `routing` | `sources`, `reasoning`, `latency_ms` | Which pipeline path was selected |
 | `status` | `message` | Tool execution status (e.g. "Searching notes...") |
 | `content` | `content` | Streamed response text chunk |
+| `self_correction` | — | Model retrying; consumers should clear buffered text |
+| `conversation_id` | `conversation_id` | Assigned or confirmed thread id (required for multi-turn clients) |
 | `sources` | `sources` | Data sources used (vault, calendar, gmail, etc.) |
-| `claude_intent` | `task` | Query requires Claude Code (terminal/filesystem) |
+| `claude_intent` | `task`, `engine` (`claude_code` \| `codex`) | CLI engine handoff; HTTP clients POST `/api/chat/handoff` |
+| `error` | `message` | Fatal error for this turn |
 | `usage` | `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` | Token usage and cost |
-| `done` | — | Stream complete |
+| `done` | — | Stream complete (optional; HTTP stream close also finalizes) |
+
+**Wire format:** lines `data: {json}\n`. Clients may ignore `routing`, `sources`, `usage`, and `done` if they handle stream close.
 
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
@@ -100,6 +107,34 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `search_memories` | Search previously saved memories |
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
+
+### POST /api/chat/handoff
+
+Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on the SSE stream. HTTP clients call this endpoint; Telegram spawns in-process instead.
+
+**Request:**
+```json
+{
+  "engine": "claude_code",
+  "task": "refactor the parser",
+  "conversation_id": "optional-uuid"
+}
+```
+
+- `engine` — `"claude_code"` or `"codex"` only
+- `task` — non-empty task description forwarded to the worker
+- `conversation_id` — optional; when set, an assistant acknowledgment is appended to the thread
+
+**Response (200):**
+```json
+{
+  "ok": true,
+  "engine": "claude_code",
+  "session_id": "sess_abc123",
+  "working_dir": "/path/to/repo",
+  "message": "Handed off to Claude Code — running in the background..."
+}
+```
 
 ### POST /api/search
 
@@ -383,7 +418,22 @@ Search memories by keyword.
 
 ### GET /api/conversations
 
-List all conversations.
+List all conversations (most recent first, up to 50).
+
+**Response:**
+```json
+{
+  "conversations": [
+    {
+      "id": "conv-uuid",
+      "title": "Budget planning",
+      "created_at": "2026-06-01T12:00:00",
+      "updated_at": "2026-06-01T12:05:00",
+      "message_count": 4
+    }
+  ]
+}
+```
 
 ### POST /api/conversations
 
@@ -392,6 +442,28 @@ Create new conversation.
 ### GET /api/conversations/{id}
 
 Get conversation with messages.
+
+**Response:**
+```json
+{
+  "id": "conv-uuid",
+  "title": "Budget planning",
+  "created_at": "2026-06-01T12:00:00",
+  "updated_at": "2026-06-01T12:05:00",
+  "messages": [
+    {
+      "id": "msg-uuid",
+      "role": "user",
+      "content": "What did we discuss last week?",
+      "created_at": "2026-06-01T12:00:00",
+      "sources": null,
+      "routing": null
+    }
+  ]
+}
+```
+
+`role` is `user` or `assistant`.
 
 ### DELETE /api/conversations/{id}
 
@@ -707,5 +779,6 @@ Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost
 - [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline
 - [Chat UI](chat-ui.md) — Chat interface product spec
+- [Client Surfaces](../technical/client-surfaces.md) — HTTP consumers and breaking-change policy
 - [CRM UI](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [Configuration](../../guides/configuration.md) — Env vars referenced by several endpoints (LIFEOS_USER_NAME, LIFEOS_WORK_DOMAIN, etc.)
