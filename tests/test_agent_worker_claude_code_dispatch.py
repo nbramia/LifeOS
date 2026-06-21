@@ -94,6 +94,81 @@ def _recording_worker(tmp_path: Path, claude_code_executor):
     return worker, calls
 
 
+def _capturing_worker(tmp_path: Path, claude_code_executor):
+    """Worker whose Telegram senders record every message, so a test can assert
+    the exact operator-facing message count (#349)."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    sent: list[str] = []
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: sent.append(text) or True,
+        telegram_send_with_id=lambda text: sent.append(text) or [1],
+        http_client=client,
+        claude_code_executor=claude_code_executor,
+        cli_pool=_SynchronousPool(),
+    )
+    return worker, store, transcripts, sent
+
+
+def test_spawned_child_completion_does_not_telegram_operator(tmp_path: Path):
+    """A spawned claude_code child (has a parent) must NOT send its completion
+    text to the operator — the parent relays it in one message (#349)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Match 1: A vs B at noon.")
+    )
+    worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    store.enqueue_message(child.session_id, "agent", "list today's matches")
+
+    worker._dispatch_claude_code_session(child, [{"content": "list today's matches"}])
+
+    assert sent == []  # nothing reached the operator
+
+
+def test_operator_claude_session_still_telegrams_on_completion(tmp_path: Path):
+    """Contrast: an operator /claude session (no parent) still surfaces its
+    final text to the operator."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="All done.")
+    )
+    worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="op-1", routing="claude_code", origin="operator")
+    store.enqueue_message(session.session_id, "operator", "do a thing")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
+
+    assert any("All done." in s for s in sent)
+
+
+def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
+    """The parent pulls a claude_code child's final_text from the
+    claude_code_completed transcript event — the child's only path out now that
+    it stays silent to the operator (#349)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="")
+    )
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    transcripts.append(child.session_id, "claude_code_completed", {
+        "final_chars": 23, "final_text": "Match 1: A vs B at noon.",
+    })
+
+    assert "Match 1: A vs B at noon." in worker._child_final_text(child)
+
+
 def test_vault_claude_task_marked_complete_on_finish(tmp_path: Path):
     """A vault-routed ``#agent #claude`` task (origin != 'operator', no parent)
     must be reconciled in the vault when the Claude Code session completes:

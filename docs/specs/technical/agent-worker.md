@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-06-03
+> **Last Updated:** 2026-06-21
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -256,7 +256,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 
 | Tool | Purpose |
 |---|---|
-| `lifeos_agent_spawn` | Create a new agent session (local or claude). Returns `session_id`. |
+| `lifeos_agent_spawn` | Create a new agent session (local or claude). Returns `session_id`. Optional `tier` (`haiku`/`sonnet`/`opus`) picks the Claude Code child's CLI model — see [Delegation tier + single-message (#349)](#delegation-tier--single-message-349). |
 | `lifeos_agent_send` | Post a message to a child session's queue. |
 | `lifeos_agent_check` | Poll a child's current state. |
 | `lifeos_agent_yield_until` | Pause the caller until specific children reach terminal state — preferred over polling (no idle billing). |
@@ -280,6 +280,13 @@ Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget 
 ### Off-tick CLI dispatch (#299)
 
 Spawned `claude_code` / `codex` children are long-running subprocesses. `_dispatch_spawned_sessions` runs them on a bounded `ThreadPoolExecutor` (`_cli_pool`, sized `2 × agent_max_concurrent_managed`) via `_submit_cli_dispatch`, rather than inline — so one delegated child can't park the poll loop and starve new `#agent` claims or sibling dispatch. An `_cli_inflight` set (lock-guarded) prevents a re-scan from re-submitting a child in the window before its executor flips the row `CLAIMED→RUNNING`; for CLI routes the guard is checked *before* draining pending messages so a skipped re-scan can't discard them. Per-routing concurrency stays bounded at `lifeos_agent_spawn` time (`count_active_by_routing`), independent of dispatch timing. The `local` route stays inline (in-process, GPU-bound, cap 1). `stop()` calls `shutdown(wait=False, cancel_futures=True)`; children still running are reconciled by `resume_pending()` on restart. Tests inject a `_SynchronousPool` for deterministic dispatch.
+
+### Delegation tier + single-message (#349)
+
+When an agent delegates to a `claude_code` child, two behaviors keep the cost down and the operator's inbox clean:
+
+- **Tier.** `lifeos_agent_spawn`'s optional `tier` (`haiku` / `sonnet` / `opus`, default `opus`) is persisted on the child's `sessions.claude_code_model` column (additive migration; NULL → CLI default) and threaded into `_build_command` as `--model`, so the worker can run a simple lookup on Haiku instead of Opus. Ignored for non-`claude_code` engines.
+- **One operator message.** A spawned child (`parent_session_id` set) stays silent to the operator: `ClaudeCodeExecutor` suppresses live `[NOTIFY]`/heartbeat streaming and instead folds the notify bodies into `final_text` (`_effective_final_text`), and `_dispatch_claude_code_session` skips the terminal Telegram send for children. The child's `final_text` is persisted in its `claude_code_completed` transcript event, where the parent reads it via `_child_final_text` — so the parent's single completion message carries the child's findings. That message is flagged by `_escalation_note` with the engine + tier, e.g. `⤴️ Escalated to Claude Code (haiku)`. Operator `/claude` sessions (no parent) stream and send as before.
 
 ---
 

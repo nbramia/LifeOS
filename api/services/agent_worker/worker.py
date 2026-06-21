@@ -1259,8 +1259,12 @@ class Worker:
             # capture so a threaded reply can resume the session via
             # _resume_as_followup. [NOTIFY] bodies that already streamed
             # during execution are stripped from final_text by the executor.
+            # Spawned children (have a parent) stay silent to the operator —
+            # the parent relays their findings in its own single completion
+            # message (#349); the child's final_text reaches the parent via
+            # _child_final_text instead.
             body = outcome.final_text.strip() if outcome.final_text else ""
-            if body:
+            if body and not session.parent_session_id:
                 try:
                     sent_ids = self._telegram_send_with_id(body) or []
                 except Exception as exc:
@@ -1986,14 +1990,14 @@ class Worker:
             cached = None
         if cached:
             return cached
-        # Fallback: scan the transcript for a `completed` or `managed_completed`
-        # event with non-empty `final_text`.
+        # Fallback: scan the transcript for a `completed`, `managed_completed`,
+        # or `claude_code_completed` event with non-empty `final_text`.
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
         last_text = ""
         for d in _iter_transcript(path):
             kind = d.get("kind", "")
             payload = d.get("payload", {}) or {}
-            if kind in ("completed", "managed_completed"):
+            if kind in ("completed", "managed_completed", "claude_code_completed"):
                 ft = payload.get("final_text") or ""
                 if ft:
                     last_text = ft

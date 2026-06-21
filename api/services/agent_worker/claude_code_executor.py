@@ -456,6 +456,10 @@ class ClaudeCodeExecutor:
                 "cost_usd": state.cost_usd,
                 "notifications_sent": state.notifications_sent,
                 "final_chars": len(final_text),
+                # Persist the text itself so a parent that spawned this session
+                # can read it via _child_final_text — for children the bodies
+                # never streamed to Telegram, so this is their only path out (#349).
+                "final_text": final_text,
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,

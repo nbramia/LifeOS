@@ -256,8 +256,15 @@ def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
     assert "Match 1: A vs B." in outcome.final_text
     assert "Match 2: C vs D." in outcome.final_text
     # Audit trail still records the bodies as transcript events.
-    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    events = _read_transcript(transcripts, session.session_id)
+    kinds = [e["kind"] for e in events]
     assert kinds.count("claude_code_notify") == 2
+    # The completion event persists the folded text so the parent can read it
+    # via _child_final_text (the child never streamed it to Telegram).
+    completed = [e for e in events if e["kind"] == "claude_code_completed"]
+    assert completed
+    persisted = completed[0]["payload"]["final_text"]
+    assert "Match 1: A vs B." in persisted and "Match 2: C vs D." in persisted
 
 
 def test_build_command_uses_session_model_tier(tmp_path: Path):
