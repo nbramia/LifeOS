@@ -8,7 +8,7 @@
 // contract in docs/specs/technical/client-surfaces.md.
 
 import { config, elements, endpoints } from './session.js';
-import { newChat } from './conversations.js';
+import { newChat, loadConversations } from './conversations.js';
 
 const PERSONA_STORAGE_KEY = 'lifeos:chat:persona_id';
 const DEFAULT_PERSONA_ID = 'primary';
@@ -50,10 +50,15 @@ export async function loadPersonas() {
   // If the stored persona is no longer offered, fall back to primary.
   if (personas.length > 0 && !personas.some(p => p.id === config.personaId)) {
     config.personaId = DEFAULT_PERSONA_ID;
-    storePersonaId(config.personaId);
   }
+  storePersonaId(config.personaId);
 
   renderPersonaOptions();
+  // Load the sidebar once the persona is resolved so it is correctly scoped.
+  // initChat no longer calls loadConversations itself — this is the single
+  // initial load, which keeps the picker and the sidebar consistent even when
+  // the stored persona had to be reset.
+  loadConversations();
 }
 
 function renderPersonaOptions() {
@@ -72,6 +77,13 @@ function renderPersonaOptions() {
     picker.appendChild(opt);
   }
   picker.value = config.personaId;
+  // If the stored id isn't among the offered options (e.g. discovery failed and
+  // a non-primary persona was previously chosen), fall back to the first option
+  // and keep config in sync so the picker is never blank.
+  if (picker.selectedIndex < 0 && picker.options.length > 0) {
+    picker.selectedIndex = 0;
+    config.personaId = picker.value;
+  }
 }
 
 export function onPersonaChange() {
@@ -87,12 +99,14 @@ export function onPersonaChange() {
 
 // True iff the selected persona advertises the `handoff` capability. Gates the
 // claude_intent handoff on capabilities rather than a hardcoded `primary`
-// check. When the list hasn't loaded yet (or discovery failed) we preserve the
-// default handoff behavior so a transient /api/personas outage doesn't silently
-// disable handoff for the primary persona.
+// check. Until the list loads (or if discovery failed) we fail open ONLY for
+// the default persona — preserving its pre-#359 handoff behavior — and fail
+// closed for any explicitly-selected persona whose capabilities we can't yet
+// confirm (a returning non-handoff persona restored from sessionStorage must
+// not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
-  if (!personas || personas.length === 0) return true;
+  if (!personas || personas.length === 0) return personaId === DEFAULT_PERSONA_ID;
   const p = personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));
 }

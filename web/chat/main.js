@@ -15,7 +15,7 @@ import { addMessage, copyMessage, toggleSources, setStatus } from './thread.js';
 import { setupAttachmentHandlers, openFilePicker, removeAttachment } from './attachments.js';
 import {
   setupSwipeGestures, toggleSidebar, closeSidebar, newChat,
-  filterConversations, loadConversation, deleteConversation, loadConversations,
+  filterConversations, loadConversation, deleteConversation,
 } from './conversations.js';
 import { sendMessage, askQuestion } from './ask-stream.js';
 import { loadPersonas, onPersonaChange } from './persona.js';
@@ -46,11 +46,11 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
-  // loadPersonas() sets config.personaId synchronously (from sessionStorage)
-  // before its fetch, so the persona-scoped loadConversations() below is correct
-  // on first paint.
+  // loadPersonas() resolves the persona (from sessionStorage, validated against
+  // /api/personas) and then loads the persona-scoped conversation sidebar — it
+  // owns the single initial loadConversations() so the picker and sidebar stay
+  // consistent even when a stored persona has to be reset.
   loadPersonas();
-  loadConversations();
   setStatus('', 'Ready');
   inputField.focus();
 }

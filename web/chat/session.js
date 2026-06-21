@@ -3,8 +3,8 @@
 // Extracted from the index.html SPA's single inline <script>. These objects are
 // the one source of truth for chat state; the feature modules import them
 // directly, and the classic shell script reaches the same objects through the
-// `window.lifeChat` bridge installed in main.js. No persistence yet —
-// sessionStorage (backend × persona × conversation) is a follow-on (#361).
+// `window.lifeChat` bridge installed in main.js. Persona selection persists in
+// sessionStorage (#359); backend × conversation persistence is a follow-on (#361).
 
 // In-memory chat state. `attachments` and `allConversations` are reassigned in
 // place (e.g. `state.attachments = state.attachments.filter(...)`), so they live
