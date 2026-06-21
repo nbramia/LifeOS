@@ -23,8 +23,9 @@ Engineering view of the agent worker — the stand-alone process that consumes `
 11. [Restart resumability](#restart-resumability)
 12. [Telegram clarification flow](#telegram-clarification-flow)
 13. [Transcripts](#transcripts)
-14. [Configuration surface](#configuration-surface)
-15. [Related Documents](#related-documents)
+14. [Agent Output notes](#agent-output-notes)
+15. [Configuration surface](#configuration-surface)
+16. [Related Documents](#related-documents)
 
 ---
 
@@ -66,7 +67,7 @@ All code lives in `api/services/agent_worker/`:
 
 | File | Responsibility |
 |---|---|
-| `worker.py` | Main poll loop, claim/dispatch, startup resume, signal handling, Telegram delivery, completion summaries |
+| `worker.py` | Main poll loop, claim/dispatch, startup resume, signal handling, Telegram delivery, completion summaries, Agent Output notes |
 | `preflight.py` | Haiku-based classifier (budget parsing, routing, ambiguity, sanity) |
 | `local_executor.py` | Agent loop against a local LLM (llama-server / Gemma 4 by default) |
 | `managed_executor.py` | Lifecycle wrapper around a Managed Agents session — `start()` → `poll()` → `_finalize_remote()` |
@@ -112,6 +113,7 @@ poll → spend tracker check (`can_start_task(default_budget)`)
              ask    → Telegram clarification, park at #agent-blocked
          on terminal outcome:
              COMPLETED → mark task done in vault + swap to #agent-completed
+                         + write Agent Output note (one-off, or prepend for recurring)
              FAILED / BUDGET_EXCEEDED → swap to matching tag
              BLOCKED → Telegram clarification + leave for human
              YIELDED → leave for sleeps loop to wake at wake_at
@@ -351,6 +353,19 @@ Every session has an append-only JSONL transcript at `data/agent_transcripts/<se
 ```
 
 Transcripts are append-only and survive worker restarts. They're the audit trail of choice — Telegram summaries point at them when a task lands at `#agent-failed` or produces an unexpectedly empty completion.
+
+---
+
+## Agent Output notes
+
+On every successful completion (root sessions only — not spawned children or operator root-spawns), `_completion_summary` calls `_write_agent_output` to persist the agent's final text as a Markdown note under `settings.agent_output_dir` (`LIFEOS_AGENT_OUTPUT_DIR`, default `LifeOS/Tasks/Agent Output`). This is unconditional now — it supersedes the old "spill to vault only when the reply exceeds 2000 chars" behavior — so short answers also get a durable note. Failed / blocked / budget-exceeded outcomes write nothing; an empty final text writes nothing.
+
+Two layouts:
+
+- **One-off task** → a new note `<YYYY-MM-DD>-<slug>-<sid>.md` (the trailing 6-char session id prevents same-day/same-slug clobbering), with `task` / `session_id` / `routing` / `created` / `source: agent-worker` frontmatter.
+- **Recurring (cron) schedule** → one shared note per schedule. The scheduler stamps the handed-off `#agent` task with a `sched-<id>` tag (see [scheduler.md](scheduler.md)); `_schedule_id_from_task` reads it on completion, resolves the schedule's name via `GET /api/scheduler/{id}` for a readable filename `<schedule-slug>-<id>.md` (falling back to `recurring-<id>.md`), and `_recurring_content` prepends this fire above prior runs under a `## YYYY-MM-DD HH:MM` heading — newest first, frontmatter `created` preserved and `updated` bumped.
+
+The Telegram summary links the note; over-length replies show a preview + link instead of the full body. When the vault path is unset or the write fails the worker keeps the inline summary so the operator never loses content.
 
 ---
 

@@ -455,6 +455,10 @@ class TelegramBotListener:
         # get their own offset file so concurrent pollers don't clobber each other.
         self._bot = bot or settings.telegram_primary_bot
         self._is_primary = self._bot.name == "primary"
+        # Bots that own Claude Code session reply threads: the primary, plus any
+        # orchestration bot (e.g. doctor). These run the agent/Claude-Code reply
+        # hooks — scoped to their own bot — instead of being pure chat (#348).
+        self._owns_agent_sessions = self._is_primary or self._bot.orchestrates
         self._token = self._bot.token
         self._chat_id = self._bot.chat_id
         self._persona = self._bot.persona
@@ -583,7 +587,7 @@ class TelegramBotListener:
         try:
             from api.services.agent_worker.session_store import SessionStore
             store = SessionStore()
-            return store.deposit_answer(reply_to_message_id, text)
+            return store.deposit_answer(reply_to_message_id, text, bot=self._bot.name)
         except Exception as exc:
             logger.warning(f"agent-worker deposit_answer failed: {exc}")
             return False
@@ -657,6 +661,51 @@ class TelegramBotListener:
             chat_id=chat_id,
         )
 
+    async def _handle_orchestration_message(self, text: str, chat_id: str):
+        """Spawn a Claude Code session for an orchestration bot (e.g. doctor).
+
+        The bot's persona is the orchestration contract; the user's message is
+        the problem report. The session is tagged with this bot's name so the
+        worker routes every [NOTIFY]/[CLARIFY]/completion notice back to this
+        bot, and a threaded reply (handled by the resume hook) continues it.
+        Working dir is the canonical LifeOS checkout, not whatever worktree the
+        operator happens to be in.
+        """
+        import os
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import SessionStore
+
+        working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
+        prompt = (
+            f"{self._persona}\n\n"
+            f"---\n\n"
+            f"The user just sent this report via the {self._bot.name} bot:\n\n{text}"
+        )
+        await send_message_async(
+            "🩺 On it — taking a look now. I'll follow up here as I go.",
+            chat_id=chat_id,
+        )
+        try:
+            result = await asyncio.to_thread(
+                spawn_claude_code_session,
+                SessionStore(),
+                prompt,
+                working_dir=working_dir,
+                plan_mode=False,
+                chat_id=chat_id,
+                bot=self._bot.name,
+            )
+        except Exception as exc:
+            logger.warning(f"orchestration spawn failed: {exc}")
+            await send_message_async(
+                f"Couldn't start the session: {str(exc)[:200]}", chat_id=chat_id,
+            )
+            return
+        if not result.get("ok"):
+            await send_message_async(
+                f"Couldn't start the session: {result.get('error')}", chat_id=chat_id,
+            )
+
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
         # Route every outbound send during this update through this bot's token.
@@ -689,12 +738,13 @@ class TelegramBotListener:
         # Agent-worker clarification hook (Issue F). If this message is a
         # reply-thread to a previously-sent clarification question, deposit
         # the answer and short-circuit — don't route to the chat pipeline.
-        # Only the primary bot owns these agent/Claude-Code reply threads:
-        # Telegram message_ids are unique per chat (per bot), so a specialized
-        # bot must not match a reply against the shared follow-up table or it
-        # could collide with the primary's ids. Specialized bots are pure chat.
+        # Only bots that own agent/Claude-Code reply threads run this — the
+        # primary and any orchestration bot (doctor). The lookup is scoped to
+        # this bot (#348): Telegram message_ids are unique per chat (per bot),
+        # so without scoping a specialized bot could collide with the primary's
+        # ids in the shared follow-up table. Pure-chat specialized bots skip it.
         reply_to = message.get("reply_to_message")
-        if self._is_primary and reply_to and reply_to.get("message_id"):
+        if self._owns_agent_sessions and reply_to and reply_to.get("message_id"):
             reply_to_id = int(reply_to["message_id"])
             # A reply to a /claude completion resumes that Claude Code session
             # (#237) — checked before the agent-worker deposit since both use
@@ -721,6 +771,14 @@ class TelegramBotListener:
         # plain non-threaded message is always a fresh chat query, never
         # an implicit follow-up — so unrelated questions never get
         # silently swallowed into a finished agent or /claude thread.
+
+        # Orchestration bots (e.g. doctor) drive a Claude Code session instead
+        # of the chat pipeline. A threaded reply to one of its messages is
+        # already handled above (resume hook); a fresh message starts a new
+        # repair session whose clarify/implement gates round-trip on this bot.
+        if self._bot.orchestrates:
+            await self._handle_orchestration_message(text, chat_id)
+            return
 
         # Threaded-reply context for specialized bots: when the user replies to
         # one of the bot's own messages (e.g. correcting a "Logged: …" line), pass
@@ -902,7 +960,7 @@ class TelegramBotListener:
         try:
             from api.services.agent_worker.session_store import SessionStore
             store = SessionStore()
-            q = store.get_open_question_by_message_id(reply_to_message_id)
+            q = store.get_open_question_by_message_id(reply_to_message_id, bot=self._bot.name)
         except Exception as exc:
             logger.warning(f"cli reply lookup failed: {exc}")
             return False
@@ -914,7 +972,7 @@ class TelegramBotListener:
         session = store.get_by_session_id(session_id)
         if not session or session.routing not in ("claude_code", "codex"):
             return False
-        store.deposit_answer(reply_to_message_id, text)
+        store.deposit_answer(reply_to_message_id, text, bot=self._bot.name)
         label = "Codex" if session.routing == "codex" else "Claude Code"
         await send_message_async(f"Resuming {label} session...", chat_id=chat_id)
         return True

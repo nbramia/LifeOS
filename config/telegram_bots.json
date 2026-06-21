@@ -10,5 +10,12 @@
     "token_env": "TELEGRAM_THERAPIST_BOT_TOKEN",
     "chat_id_env": "TELEGRAM_THERAPIST_CHAT_ID",
     "persona_file": "config/personas/therapist.md"
+  },
+  {
+    "name": "doctor",
+    "token_env": "TELEGRAM_DOCTOR_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_DOCTOR_CHAT_ID",
+    "persona_file": "config/personas/doctor.md",
+    "orchestrates": true
   }
 ]

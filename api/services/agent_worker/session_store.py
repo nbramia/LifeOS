@@ -88,6 +88,12 @@ class Session:
     # the worker can escalate simple delegated work to a cheaper model. NULL
     # falls back to the CLI default ("opus").
     claude_code_model: str | None = None
+    # Telegram bot identity that owns this session's operator-facing messages.
+    # NULL = primary bot (the default for every legacy / non-doctor session).
+    # An orchestration bot (e.g. "doctor") tags its spawned sessions so the
+    # worker routes [NOTIFY]/[CLARIFY]/completion notices back to that bot, not
+    # the primary. See api/services/telegram.py and config/telegram_bots.json.
+    bot: str | None = None
 
 
 _SCHEMA = """
@@ -114,7 +120,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     preset_class              TEXT,
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
     claude_code_session_id    TEXT,  -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
-    claude_code_model         TEXT   -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
+    claude_code_model         TEXT,  -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
+    bot                       TEXT   -- Telegram bot that owns this session's notices; NULL = primary (#348)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -166,7 +173,11 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     -- on any chunk, so `deposit_answer` matches membership in this list (not
     -- just the first chunk in `sent_message_id`). NULL for legacy rows, which
     -- still match via `sent_message_id`.
-    sent_message_ids  TEXT
+    sent_message_ids  TEXT,
+    -- Telegram bot that sent this question. NULL = primary. Reply matching is
+    -- scoped by bot so a doctor-bot reply can't collide with a primary-bot
+    -- question that happens to share a numeric message id (#348).
+    bot               TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pq_message_id ON pending_questions(sent_message_id);
 CREATE INDEX IF NOT EXISTS idx_pq_open ON pending_questions(answered_at, processed, timed_out);
@@ -281,6 +292,10 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE pending_questions ADD COLUMN sent_message_ids TEXT"
                 )
+            # Idempotent migration for `pending_questions.bot` (#348) — scopes
+            # reply matching to the sending bot. Legacy rows stay NULL = primary.
+            if "bot" not in pq_cols:
+                conn.execute("ALTER TABLE pending_questions ADD COLUMN bot TEXT")
             # Idempotent migration for the prompt-cache token buckets on
             # `sessions`. Old rows stay at zero — we don't backfill historical
             # sessions, the raw event payloads in transcripts still have the
@@ -309,6 +324,8 @@ class SessionStore:
             # Idempotent migration for the Claude Code CLI session UUID.
             # Set for routing="claude_code" (Claude Code) and "codex" sessions;
             # NULL for everything else.
+            if "bot" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN bot TEXT")
             if "claude_code_session_id" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_session_id TEXT")
                 # Migrate data from the legacy column if it existed (pre-rename
@@ -378,6 +395,7 @@ class SessionStore:
         spawn_depth: int = 0,
         origin: str | None = None,
         claude_code_model: str | None = None,
+        bot: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
         already has a row — the caller should treat that as a lost-race signal.
@@ -399,15 +417,15 @@ class SessionStore:
                     task_id, session_id, status, routing, budget_json,
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
-                    root_session_id, spawn_depth, origin, claude_code_model
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_session_id, spawn_depth, origin, claude_code_model, bot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
                     json.dumps(budget) if budget else None,
                     now, now,
                     expected_output, parent_session_id,
-                    root_sid, spawn_depth, origin, claude_code_model,
+                    root_sid, spawn_depth, origin, claude_code_model, bot,
                 ),
             )
         return Session(
@@ -424,6 +442,7 @@ class SessionStore:
             spawn_depth=spawn_depth,
             origin=origin,
             claude_code_model=claude_code_model,
+            bot=bot,
         )
 
     def get(self, task_id: str) -> Session | None:
@@ -966,12 +985,15 @@ class SessionStore:
         sent_message_id: int,
         kind: str = "clarification",
         sent_message_ids: list[int] | None = None,
+        bot: str | None = None,
     ) -> int:
         """Record a pending question / follow-up keyed by Telegram message id.
 
         `sent_message_id` is the first (matchable) chunk id; `sent_message_ids`
         is the full chunk list for a split notification (defaults to just the
         first chunk). `deposit_answer` matches a reply to any chunk in the list.
+        `bot` is the Telegram bot that sent the message (NULL = primary); reply
+        matching is scoped by it so bots can't collide on numeric ids (#348).
         """
         ids = sent_message_ids or [int(sent_message_id)]
         with self._connect() as conn:
@@ -979,12 +1001,12 @@ class SessionStore:
                 """
                 INSERT INTO pending_questions (
                     session_id, task_id, question, sent_message_id, sent_at,
-                    kind, sent_message_ids
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    kind, sent_message_ids, bot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id, task_id, question, int(sent_message_id), _now(),
-                    kind, json.dumps([int(i) for i in ids]),
+                    kind, json.dumps([int(i) for i in ids]), bot,
                 ),
             )
         return cur.lastrowid
@@ -1016,23 +1038,38 @@ class SessionStore:
             sent_message_ids=sent_message_ids,
         )
 
-    def deposit_answer(self, sent_message_id: int, answer: str) -> bool:
+    @staticmethod
+    def _bot_scope_clause(bot: str | None) -> tuple[str, list]:
+        """SQL fragment + params that scope a pending_questions lookup to `bot`.
+
+        ``bot=None`` → no scoping (legacy behavior). ``bot="primary"`` matches
+        both explicit 'primary' rows and legacy NULL-bot rows; any other name
+        matches only its own rows (#348).
+        """
+        if bot is None:
+            return "", []
+        return " AND (bot = ? OR (bot IS NULL AND ? = 'primary'))", [bot, bot]
+
+    def deposit_answer(self, sent_message_id: int, answer: str, bot: str | None = None) -> bool:
         """Record an answer for an open question, keyed by Telegram message_id.
 
         Matches a reply landing on any chunk of a split notification: the id is
         checked against both the primary `sent_message_id` and membership in the
-        `sent_message_ids` JSON list. Returns True if a matching open question
-        was found and updated; False otherwise (so the listener can fall through
-        to the chat pipeline).
+        `sent_message_ids` JSON list. When `bot` is given, the match is scoped to
+        that bot (see :meth:`_bot_scope_clause`). Returns True if a matching open
+        question was found and updated; False otherwise (so the listener can fall
+        through to the chat pipeline).
         """
+        bot_clause, bot_params = self._bot_scope_clause(bot)
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT id FROM pending_questions "
                 "WHERE answered_at IS NULL AND timed_out = 0 "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
-                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?))) "
-                "ORDER BY id ASC LIMIT 1",
-                (int(sent_message_id), int(sent_message_id)),
+                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
+                + bot_clause +
+                " ORDER BY id ASC LIMIT 1",
+                (int(sent_message_id), int(sent_message_id), *bot_params),
             ).fetchone()
             if not row:
                 return False
@@ -1103,22 +1140,27 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def get_open_question_by_message_id(self, sent_message_id: int) -> dict | None:
+    def get_open_question_by_message_id(
+        self, sent_message_id: int, bot: str | None = None
+    ) -> dict | None:
         """Return the open (unanswered, not-timed-out) question a reply to
         `sent_message_id` matches — on any chunk — or None.
 
         Read-only sibling of `deposit_answer`: lets a caller inspect the matched
         row's `kind` before recording an answer (e.g. so the Telegram listener
-        can recognize a ``routing='code'`` follow-up).
+        can recognize a ``routing='code'`` follow-up). When `bot` is given, the
+        match is scoped to that bot (see :meth:`_bot_scope_clause`).
         """
+        bot_clause, bot_params = self._bot_scope_clause(bot)
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NULL AND timed_out = 0 "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
-                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?))) "
-                "ORDER BY id ASC LIMIT 1",
-                (int(sent_message_id), int(sent_message_id)),
+                "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
+                + bot_clause +
+                " ORDER BY id ASC LIMIT 1",
+                (int(sent_message_id), int(sent_message_id), *bot_params),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1209,4 +1251,5 @@ class SessionStore:
             claude_code_model=(
                 row["claude_code_model"] if "claude_code_model" in row.keys() else None
             ),
+            bot=(row["bot"] if "bot" in row.keys() else None),
         )

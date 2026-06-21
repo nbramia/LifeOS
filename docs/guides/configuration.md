@@ -93,7 +93,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks until next local midnight. Set to `0` to pause new claims entirely. |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | int | `72` | How long to wait for a Telegram clarification before abandoning the task. |
 | `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
-| `LIFEOS_AGENT_OUTPUT_DIR` | path | varies | Directory for worker-written task outputs. |
+| `LIFEOS_AGENT_OUTPUT_DIR` | path | `LifeOS/Tasks/Agent Output` | Vault-relative folder where the worker writes an Agent Output note on every successful task completion (one note per one-off task; one shared, prepended note per recurring cron schedule). |
 | `LIFEOS_AGENT_PREFLIGHT_MODEL` | str | `claude-haiku-4-5` | Model used for preflight (budget parsing, routing, ambiguity, sanity). |
 | `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-4-6` | Informational — actual model lives in the Anthropic Console preset. |
 | `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS` | str | — | Override for test runs. |
@@ -253,6 +253,14 @@ When both are set, Telegram becomes a conversational client (full chat pipeline)
 
 Natural-language messages run through the chat pipeline (search, synthesis, tools).
 
+**Specialized bots** (optional) are separate `@BotFather` bots registered in [`config/telegram_bots.json`](../../config/telegram_bots.json), each with a persona in `config/personas/`. Leave a bot's token unset to not run it. `*_CHAT_ID` is optional and defaults to `TELEGRAM_CHAT_ID`.
+
+| Variable | Bot | Kind |
+|---|---|---|
+| `TELEGRAM_FITNESS_BOT_TOKEN` / `TELEGRAM_FITNESS_CHAT_ID` | `fitness` | Pure chat — clinical training/nutrition logging surface. |
+| `TELEGRAM_THERAPIST_BOT_TOKEN` / `TELEGRAM_THERAPIST_CHAT_ID` | `therapist` | Pure chat — advice-oriented surface grounded in therapy notes. |
+| `TELEGRAM_DOCTOR_BOT_TOKEN` / `TELEGRAM_DOCTOR_CHAT_ID` | `doctor` | **Orchestration** — self-repair surface that files an issue and ships a fix. See [doctor-bot.md](doctor-bot.md). |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |
@@ -325,6 +333,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [First Run](first-run.md) — Post-install verification.
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
+- [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.
