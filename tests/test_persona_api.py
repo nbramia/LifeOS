@@ -90,6 +90,23 @@ class TestListHttpPersonas:
         doctor = settings.list_http_personas()[1]
         assert doctor.label == "Dr. LifeOS"
 
+    def test_orchestrating_bot_advertises_capabilities(self, tmp_path, monkeypatch):
+        # An orchestrating bot (e.g. the doctor self-repair bot) drives Claude
+        # Code sessions, so it advertises handoff/agent like the primary; a
+        # pure-chat bot does not.
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_DOC", "orchestrates": True},
+            {"name": "fitness", "token_env": "TG_FIT"},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_DOC", "tok")
+        monkeypatch.setenv("TG_FIT", "tok")
+        from config.settings import settings
+
+        by_id = {p.id: p for p in settings.list_http_personas()}
+        assert by_id["doctor"].capabilities == ["handoff", "agent"]
+        assert by_id["fitness"].capabilities == []
+
 
 # ---------------------------------------------------------------------------
 # settings.resolve_persona

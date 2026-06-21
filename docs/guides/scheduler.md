@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-06-21
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
@@ -68,6 +68,13 @@ and the executor tag (`#local` / `#cloud` / `#cloud-haiku` / `#cloud-sonnet`).
 The existing [agent worker](../specs/product/agent-worker.md) discovers the
 task and routes it via preflight. Progress is reported through the worker's own
 channel, not the scheduler.
+
+For **cron** (recurring) schedules the hand-off also stamps a `#sched-<id>` tag
+on the task. The worker reads it on completion and appends every fire's output
+to **one shared Agent Output note per schedule** (`LifeOS/Tasks/Agent Output/<schedule-slug>-<id>.md`),
+newest run on top under a dated heading — rather than a new note per fire. A
+one-time (`once`) agent schedule gets no such tag and produces its own one-off
+note like any other `#agent` task.
 
 ```markdown
 - [ ] Weekly Review [cron:: 0 9 * * 6] [action:: agent] #cloud <!-- id:d4e5f6 -->

@@ -27,19 +27,23 @@ class TelegramBotConfig:
     safe. ``persona`` is a system-prompt preamble injected for this bot's chats
     (empty for the primary bot). ``label`` is an optional human-friendly display
     name surfaced to HTTP clients; when blank, callers fall back to the
-    capitalized ``name``.
+    capitalized ``name``. ``orchestrates`` marks a bot that drives Claude Code
+    sessions (e.g. the doctor self-repair bot) instead of being pure chat — such
+    a bot owns its own agent-session reply threads rather than redirecting coding
+    tasks to the primary bot.
     """
     name: str
     token: str
     chat_id: str
     persona: str = ""
     label: str = ""
+    orchestrates: bool = False
 
 
-# Capabilities advertised to HTTP clients for the primary persona only.
-# Specialized bots are pure chat (no /agent, no engine handoff), matching the
-# Telegram primary-only command surface.
-PRIMARY_PERSONA_CAPABILITIES = ("handoff", "agent")
+# Capabilities advertised to HTTP clients. The primary persona and any
+# orchestrating bot (e.g. the doctor self-repair bot) drive Claude Code
+# sessions, so they advertise handoff/agent; pure-chat specialized bots do not.
+ORCHESTRATOR_PERSONA_CAPABILITIES = ("handoff", "agent")
 
 
 @dataclass(frozen=True)
@@ -766,7 +770,8 @@ class Settings(BaseSettings):
             label = (entry.get("label") or "").strip()
             seen.add(name)
             bots.append(TelegramBotConfig(
-                name=name, token=token, chat_id=chat_id, persona=persona, label=label
+                name=name, token=token, chat_id=chat_id, persona=persona, label=label,
+                orchestrates=bool(entry.get("orchestrates", False)),
             ))
         return bots
 
@@ -775,21 +780,24 @@ class Settings(BaseSettings):
 
         Returns the primary persona plus every configured specialized bot from
         the registry whose token env is set (``telegram_bots`` already drops the
-        unset ones). No secrets are exposed. Only the primary advertises
-        ``handoff``/``agent`` capabilities; specialized bots are pure chat.
-        Adding a registry entry + its token env var surfaces a new persona on
-        the next restart with no code change.
+        unset ones). No secrets are exposed. The primary persona and any
+        orchestrating bot (``orchestrates: true``, e.g. the doctor self-repair
+        bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
+        bots advertise none. Adding a registry entry + its token env var surfaces
+        a new persona on the next restart with no code change.
         """
         personas = [PersonaInfo(
             id="primary",
             label="LifeOS",
-            capabilities=list(PRIMARY_PERSONA_CAPABILITIES),
+            capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
         )]
         for bot in self.telegram_bots:
             personas.append(PersonaInfo(
                 id=bot.name,
                 label=bot.label or bot.name.capitalize(),
-                capabilities=[],
+                capabilities=(
+                    list(ORCHESTRATOR_PERSONA_CAPABILITIES) if bot.orchestrates else []
+                ),
             ))
         return personas
 

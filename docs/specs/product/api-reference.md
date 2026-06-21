@@ -129,7 +129,7 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 
 - `id` — pass as `persona_id` on [`POST /api/ask/stream`](#post-apiaskstream) and as the `persona_id` query param on [`GET /api/conversations`](#get-apiconversations).
 - `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
-- `capabilities` — only `primary` advertises `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns). Specialized personas are pure chat (`[]`).
+- `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`.
 
 ### POST /api/chat/handoff
 
