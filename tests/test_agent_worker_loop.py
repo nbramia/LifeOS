@@ -37,6 +37,15 @@ from api.services.agent_worker.worker import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _redirect_agent_output(tmp_path, monkeypatch):
+    """Every completed task now writes a note to the vault's Agent Output
+    folder. Redirect the vault to a throwaway tmp dir so these worker tests
+    write there instead of the repo's ./vault default."""
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Fake API
 # ---------------------------------------------------------------------------
@@ -1145,7 +1154,9 @@ def test_completion_label_says_local_for_local_routing(tmp_path: Path):
 
 @pytest.mark.unit
 def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
-    """A short final_text is delivered inline — no spillover to vault."""
+    """A short final_text is delivered inline (not replaced by a preview), and
+    every completion now also lands a note in the vault — so the message carries
+    the full body plus a 'Saved to vault' pointer + obsidian:// link."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent", "local"]},
     ])
@@ -1160,9 +1171,12 @@ def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
     w.tick()
     sent = w._sent_telegram  # type: ignore[attr-defined]
     assert sent
+    # Full body inline — short answers are not truncated to a preview.
     assert short_text.strip() in sent[0]
     assert "Full answer saved to vault" not in sent[0]
-    assert "obsidian://" not in sent[0]
+    # Always-write: short completions still get a saved-note pointer.
+    assert "Saved to vault:" in sent[0]
+    assert "obsidian://" in sent[0]
 
 
 @pytest.mark.unit

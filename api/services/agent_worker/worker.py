@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -61,6 +62,30 @@ logger = logging.getLogger(__name__)
 # (init-failed MCPs). Above this we spill the body to a vault note and
 # put just a 1-line preview + obsidian:// link in the Telegram message.
 _INLINE_SUMMARY_MAX_CHARS = 2000
+
+# A recurring (cron) schedule stamps its handed-off #agent task with a
+# `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
+# it on completion to append every fire's output to one shared note per
+# schedule instead of a new note per fire.
+_SCHED_TAG_RE = re.compile(r"^sched-(\w+)$")
+
+
+def _slugify(text: str) -> str:
+    """Lowercase, hyphenated, filesystem-safe slug capped at 60 chars.
+    Returns '' for empty/symbol-only input."""
+    return re.sub(r"[^A-Za-z0-9]+", "-", text or "").strip("-").lower()[:60]
+
+
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Split a leading `---\\n...\\n---` YAML frontmatter block from the body.
+    Returns (frontmatter_with_delimiters, body). When there's no frontmatter,
+    returns ('', text) so the whole document is treated as body."""
+    if not text.startswith("---"):
+        return "", text
+    m = re.match(r"^---\n.*?\n---\n?", text, re.DOTALL)
+    if not m:
+        return "", text
+    return text[: m.end()], text[m.end():]
 
 
 def _worker_label(routing: str | None) -> str:
@@ -1709,21 +1734,32 @@ class Worker:
                     f"(agent idled without a final text reply — check transcript at "
                     f"`data/agent_transcripts/{session.session_id}.jsonl` for tool-use detail)"
                 )
-        elif len(final_text) <= _INLINE_SUMMARY_MAX_CHARS:
-            result_blurb = final_text
         else:
-            # Spill the full body to a vault note and link to it instead of
-            # truncating mid-answer. The agent's system prompts now ask the
-            # agent itself to create artifacts for long outputs, but the
-            # operator-facing UX shouldn't depend on the agent following
-            # that guidance: any over-length response gets spilled here.
-            spillover = self._spill_to_vault(session, task, final_text)
-            if spillover is None:
-                # Vault not configured or write failed — preserve the old
-                # behavior so the operator still gets *something* readable.
+            # Every completed task now lands a durable note in the vault's
+            # Agent Output folder — one-off tasks get a new note, recurring
+            # (cron-scheduled) tasks append to one shared note per schedule.
+            # The agent's system prompts also ask it to create artifacts for
+            # long outputs, but the operator-facing record shouldn't depend on
+            # the agent following that guidance: the worker always writes.
+            written = self._write_agent_output(session, task, final_text)
+            if len(final_text) <= _INLINE_SUMMARY_MAX_CHARS:
+                # Short answer: show it inline. Append a pointer to the saved
+                # note when the write succeeded (vault may be unconfigured).
+                result_blurb = final_text
+                if written is not None:
+                    rel_path, obsidian_url = written
+                    result_blurb += (
+                        f"\n\nSaved to vault: `{rel_path}`\n"
+                        f"[Open in Obsidian]({obsidian_url})"
+                    )
+            elif written is None:
+                # Over-length but vault not configured / write failed —
+                # preserve the old behavior so the operator still gets
+                # *something* readable instead of an empty message.
                 result_blurb = final_text[:_INLINE_SUMMARY_MAX_CHARS] + "…"
             else:
-                rel_path, obsidian_url = spillover
+                # Over-length: link to the note instead of truncating mid-answer.
+                rel_path, obsidian_url = written
                 preview = final_text.split("\n\n", 1)[0].strip()
                 if len(preview) > 400:
                     preview = preview[:400].rsplit(" ", 1)[0] + "…"
@@ -2027,22 +2063,48 @@ class Worker:
         })
         return True
 
-    def _spill_to_vault(
+    def _schedule_id_from_task(self, task: dict[str, Any]) -> str | None:
+        """Return the recurring schedule's id when the task carries a
+        `sched-<id>` tag (stamped by scheduler_store._hand_off_to_agent for
+        cron schedules), else None. Presence of the tag is the sole signal
+        that a completion belongs to a recurring schedule."""
+        for tag in task.get("tags") or []:
+            m = _SCHED_TAG_RE.match(str(tag).lstrip("#"))
+            if m:
+                return m.group(1)
+        return None
+
+    def _resolve_schedule_name(self, schedule_id: str) -> str | None:
+        """Look up a schedule's human name via the API so the recurring note
+        can be titled readably. Returns None on 404 / any error — the caller
+        falls back to a stable id-based filename so grouping still works."""
+        try:
+            resp = self._http.get(f"{self.api_base}/api/scheduler/{schedule_id}")
+            if resp.status_code != 200:
+                return None
+            name = (resp.json() or {}).get("name") or ""
+            return name.strip() or None
+        except Exception as exc:
+            logger.warning("resolve_schedule_name %s failed: %s", schedule_id, exc)
+            return None
+
+    def _write_agent_output(
         self, session: Session, task: dict[str, Any], final_text: str,
     ) -> tuple[str, str] | None:
-        """Write the agent's full response to a vault Markdown file and
-        return (vault-relative path, obsidian:// URL). Returns None when
-        the vault path is unset or the write fails — caller falls back to
-        a truncated inline summary so the operator never loses content
-        entirely.
+        """Write the agent's final answer to a Markdown note in the vault's
+        Agent Output folder and return (vault-relative path, obsidian:// URL).
+        Returns None when the vault path is unset or the write fails — the
+        caller keeps the inline summary so the operator never loses content.
 
-        File layout: `<vault>/<LIFEOS_AGENT_OUTPUT_DIR>/<YYYY-MM-DD>-<slug>.md`.
-        The output dir is operator-configurable via `LIFEOS_AGENT_OUTPUT_DIR`
-        (default `LifeOS/Tasks/Agent Output`) so spillover and the local
-        executor's direct vault writes land in the same place.
+        Two layouts, both under `<vault>/<LIFEOS_AGENT_OUTPUT_DIR>`
+        (operator-configurable via `LIFEOS_AGENT_OUTPUT_DIR`, default
+        `LifeOS/Tasks/Agent Output`):
+        - One-off task → a new note `<YYYY-MM-DD>-<slug>-<sid>.md`.
+        - Recurring (cron) task → one shared note per schedule
+          (`<schedule-slug>.md`); each fire is prepended under a dated heading,
+          newest on top, with frontmatter kept at the file head.
         """
         from datetime import datetime
-        import re
 
         vault_root = settings.vault_path
         if not vault_root:
@@ -2053,34 +2115,88 @@ class Worker:
             return None
 
         title = (task.get("description") or session.task_id).strip()
-        slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:60] or session.task_id
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        filename = f"{today}-{slug}.md"
+        now = datetime.now().astimezone()
+        today = now.strftime("%Y-%m-%d")
         folder = settings.agent_output_dir
+        schedule_id = self._schedule_id_from_task(task)
 
         try:
             target_dir = vault_root / folder
             target_dir.mkdir(parents=True, exist_ok=True)
-            file_path = target_dir / filename
-            # Frontmatter gives Obsidian / Dataview something to query on
-            # without changing how the body renders.
-            frontmatter = (
-                "---\n"
-                f"task: {title}\n"
-                f"session_id: {session.session_id}\n"
-                f"routing: {session.routing or 'unknown'}\n"
-                f"created: {today}\n"
-                "source: agent-worker\n"
-                "---\n\n"
-            )
-            file_path.write_text(frontmatter + final_text, encoding="utf-8")
+            if schedule_id:
+                # One shared note per schedule, titled by the schedule's human
+                # name when resolvable, else a stable id-keyed fallback so every
+                # fire still maps to the same file.
+                sched_name = self._resolve_schedule_name(schedule_id)
+                slug = _slugify(sched_name) if sched_name else ""
+                filename = f"{slug}.md" if slug else f"recurring-{schedule_id}.md"
+                file_path = target_dir / filename
+                content = self._recurring_content(
+                    file_path, schedule_id, sched_name or title, now, final_text,
+                )
+            else:
+                # Suffix with a short session id so two same-day tasks with
+                # the same slug don't clobber each other now that every
+                # completion writes a note.
+                slug = _slugify(title) or session.task_id
+                sid = session.session_id[-6:]
+                filename = f"{today}-{slug}-{sid}.md"
+                file_path = target_dir / filename
+                frontmatter = (
+                    "---\n"
+                    f"task: {title}\n"
+                    f"session_id: {session.session_id}\n"
+                    f"routing: {session.routing or 'unknown'}\n"
+                    f"created: {today}\n"
+                    "source: agent-worker\n"
+                    "---\n\n"
+                )
+                content = frontmatter + final_text
+            file_path.write_text(content, encoding="utf-8")
         except Exception as exc:
-            logger.warning("vault spillover write failed for %s: %s", session.task_id, exc)
+            logger.warning("agent output write failed for %s: %s", session.task_id, exc)
             return None
 
         rel_path = f"{folder}/{filename}"
         obsidian_url = build_obsidian_link(str(file_path), str(vault_root))
         return (rel_path, obsidian_url)
+
+    def _recurring_content(
+        self, file_path, schedule_id: str, label: str, now, final_text: str,
+    ) -> str:
+        """Build the new contents for a recurring schedule's shared note by
+        prepending this fire above any existing runs, newest first. Frontmatter
+        stays at the file head: `created` is preserved from the first run,
+        `updated` is bumped to today."""
+        today = now.strftime("%Y-%m-%d")
+        stamp = now.strftime("%Y-%m-%d %H:%M")
+        run_block = f"## {stamp}\n\n{final_text}\n\n---\n"
+
+        created = today
+        existing_body = ""
+        if file_path.exists():
+            try:
+                existing = file_path.read_text(encoding="utf-8")
+            except Exception:
+                existing = ""
+            fm, existing_body = _split_frontmatter(existing)
+            existing_body = existing_body.lstrip("\n")
+            # Keep the original creation date across fires.
+            m = re.search(r"^created:\s*(.+)$", fm, re.M)
+            if m:
+                created = m.group(1).strip()
+
+        frontmatter = (
+            "---\n"
+            f"schedule: {label}\n"
+            f"schedule_id: {schedule_id}\n"
+            f"created: {created}\n"
+            f"updated: {today}\n"
+            "source: agent-worker-recurring\n"
+            "---\n\n"
+        )
+        body = run_block + ("\n" + existing_body if existing_body else "")
+        return frontmatter + body
 
     def _mark_failed(self, session: Session, task: dict[str, Any], reason: str) -> None:
         title = task.get("description", session.task_id)

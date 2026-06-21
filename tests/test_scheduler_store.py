@@ -522,7 +522,9 @@ class TestActionDispatch:
         fake_tm.create.assert_called_once()
         kwargs = fake_tm.create.call_args.kwargs
         assert kwargs["description"] == "Draft my weekly review"
-        assert kwargs["tags"] == ["agent", "cloud"]
+        # Cron (recurring) schedules carry a sched-<id> tag so the worker
+        # appends each fire's output to one shared note per schedule.
+        assert kwargs["tags"] == ["agent", "cloud", f"sched-{entry.id}"]
         # No Telegram for an agent hand-off; the worker reports through its channel.
         mock_send.assert_not_called()
         refreshed = scheduler.store.get(entry.id)
@@ -537,6 +539,21 @@ class TestActionDispatch:
         )
         fake_tm = MagicMock()
         fake_tm.create.return_value = MagicMock(id="t1")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["agent", "local", f"sched-{entry.id}"]
+
+    @pytest.mark.asyncio
+    async def test_once_agent_action_has_no_sched_tag(self, scheduler):
+        """One-time schedules are stand-alone; they get no sched-<id> tag, so
+        the worker treats each as a one-off task with its own output note."""
+        entry = scheduler.store.create(
+            name="One shot", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="local", message_content="do it once",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="t9")
         with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
             await scheduler._fire_entry(entry)
         assert fake_tm.create.call_args.kwargs["tags"] == ["agent", "local"]
