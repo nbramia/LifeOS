@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-06-22
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -12,7 +12,7 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 
 | Surface | Transport | Chat/conversation endpoints |
 |---------|-----------|----------------------------|
-| Web chat | Browser → FastAPI | ask/stream, handoff, conversation CRUD — `web/index.html` |
+| Web chat | Browser → FastAPI | personas, ask/stream, handoff, conversation CRUD — `web/index.html` + `web/chat/` |
 | Telegram | In-process `chat_via_api` | Same SSE as ask/stream; handoffs spawn in-process — `api/services/telegram.py` |
 | **whisper-relay** | Separate app → HTTP | ask/stream, handoff, `GET /api/conversations`, `GET /api/conversations/{id}` — see below |
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
@@ -32,6 +32,8 @@ Connects to LifeOS at `LIFEOS_BASE_URL` (default `http://127.0.0.1:8000`), 300s 
 - `GET /api/personas` lists selectable personas (`primary` + configured specialized bots). The client renders these as a picker; ids are stable, labels are display-only. The `primary` persona and orchestrating bots (e.g. the doctor self-repair bot) carry `handoff`/`agent` capabilities — gate any handoff UI on a persona's `capabilities`, not on a hardcoded `primary` check.
 - Send the chosen `persona_id` on `POST /api/ask/stream`. The server applies the matching persona preamble and tags a newly created conversation with that persona. Unknown ids and `persona`+`persona_id` together are **400** — surface as a turn-level failure, not a crash.
 - Scope the thread sidebar with `GET /api/conversations?persona_id=<id>`. Omitting the param shows the `primary` persona's threads (default web behavior). Conversation detail (`GET /api/conversations/{id}`) is not persona-scoped — fetch by id directly.
+
+Web chat implements this contract in `web/chat/persona.js`: a header `<select>` populated from `/api/personas`, the selection persisted across refresh in `sessionStorage` (`lifeos:chat:persona_id`), capability-gated `claude_intent` handoff, and a persona-scoped sidebar. Switching persona starts a fresh, persona-scoped conversation.
 
 **Consumer-specific behavior** (LifeOS API unchanged; how whisper-relay interprets it):
 

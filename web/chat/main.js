@@ -18,6 +18,7 @@ import {
   filterConversations, loadConversation, deleteConversation, loadConversations,
 } from './conversations.js';
 import { sendMessage, askQuestion } from './ask-stream.js';
+import { loadPersonas, onPersonaChange } from './persona.js';
 
 // Boot the chat surface. The shell passes in the explicit DOM element map (so
 // the modules never getElementById), the API endpoints, and integration hooks
@@ -45,6 +46,10 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
+  // loadPersonas() sets config.personaId synchronously (from sessionStorage)
+  // before its fetch, so the persona-scoped loadConversations() below is correct
+  // on first paint.
+  loadPersonas();
   loadConversations();
   setStatus('', 'Ready');
   inputField.focus();
@@ -63,4 +68,6 @@ Object.assign(window, {
   openFilePicker, removeAttachment,
   // ask-stream.js
   sendMessage, askQuestion,
+  // persona.js
+  onPersonaChange,
 });

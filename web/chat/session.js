@@ -22,12 +22,14 @@ export const state = {
   allConversations: [], // all conversations, for client-side filtering
 };
 
-// Optional per-query selectors reserved for the persona (#359) and
-// backend/Voice-Text (#361) follow-ons. Declared now so those PRs don't have to
-// reshape the askStream/session interface; unused in this behavior-neutral PR.
+// Per-query selectors. `personaId` is the selected persona (#359); `backend`
+// is reserved for the #361 Voice|Text follow-on. `personas` caches the list
+// from /api/personas so handoff gating can read the selected persona's
+// capabilities.
 export const config = {
   personaId: null,
   backend: null,
+  personas: [],
 };
 
 // DOM element handles, populated by initChat() (main.js). Modules read
