@@ -83,6 +83,11 @@ class Session:
     # NB: codex sessions reuse this column too (CodexExecutor stores the
     # codex thread id here); routing disambiguates.
     claude_code_session_id: str | None = None
+    # Claude tier the Claude Code CLI runs for routing="claude_code" sessions
+    # ("haiku" / "sonnet" / "opus"). Set by lifeos_agent_spawn's `tier` arg so
+    # the worker can escalate simple delegated work to a cheaper model. NULL
+    # falls back to the CLI default ("opus").
+    claude_code_model: str | None = None
     # Telegram bot identity that owns this session's operator-facing messages.
     # NULL = primary bot (the default for every legacy / non-doctor session).
     # An orchestration bot (e.g. "doctor") tags its spawned sessions so the
@@ -115,6 +120,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     preset_class              TEXT,
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
     claude_code_session_id    TEXT,  -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
+    claude_code_model         TEXT,  -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
     bot                       TEXT   -- Telegram bot that owns this session's notices; NULL = primary (#348)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
@@ -329,6 +335,10 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
+            # Idempotent migration for the per-session Claude Code tier (#349).
+            # Old rows stay NULL → the CLI default ("opus").
+            if "claude_code_model" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_model TEXT")
             # Migrate legacy routing tag: 'code' was the pre-rename name for
             # what is now 'claude_code'. Idempotent — only flips rows that
             # still carry the old value.
@@ -384,6 +394,7 @@ class SessionStore:
         root_session_id: str | None = None,
         spawn_depth: int = 0,
         origin: str | None = None,
+        claude_code_model: str | None = None,
         bot: str | None = None,
     ) -> Session:
         """Insert a new session row. Raises sqlite3.IntegrityError if `task_id`
@@ -406,15 +417,15 @@ class SessionStore:
                     task_id, session_id, status, routing, budget_json,
                     started_at, last_activity_at,
                     expected_output, parent_session_id,
-                    root_session_id, spawn_depth, origin, bot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_session_id, spawn_depth, origin, claude_code_model, bot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, sid, status, routing,
                     json.dumps(budget) if budget else None,
                     now, now,
                     expected_output, parent_session_id,
-                    root_sid, spawn_depth, origin, bot,
+                    root_sid, spawn_depth, origin, claude_code_model, bot,
                 ),
             )
         return Session(
@@ -430,6 +441,7 @@ class SessionStore:
             root_session_id=root_sid,
             spawn_depth=spawn_depth,
             origin=origin,
+            claude_code_model=claude_code_model,
             bot=bot,
         )
 
@@ -1235,6 +1247,9 @@ class SessionStore:
             origin=(row["origin"] if "origin" in row.keys() else None),
             claude_code_session_id=(
                 row["claude_code_session_id"] if "claude_code_session_id" in row.keys() else None
+            ),
+            claude_code_model=(
+                row["claude_code_model"] if "claude_code_model" in row.keys() else None
             ),
             bot=(row["bot"] if "bot" in row.keys() else None),
         )

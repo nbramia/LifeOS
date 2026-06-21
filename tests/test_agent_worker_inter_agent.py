@@ -120,6 +120,51 @@ def test_spawn_cli_child_for_capability_fallback(ctx, store, parent, model):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("tier", ["haiku", "sonnet", "opus"])
+def test_spawn_claude_code_tier_persisted(ctx, store, tier):
+    """A claude_code child's `tier` arg lands on the session as
+    claude_code_model so the executor runs the CLI with that --model (#349)."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "look up today's matches", "model": "claude_code", "tier": tier,
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.claude_code_model == tier
+
+
+@pytest.mark.unit
+def test_spawn_claude_code_default_tier_is_none(ctx, store):
+    """No tier → claude_code_model NULL → the executor falls back to opus."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "hard reasoning task", "model": "claude_code",
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.claude_code_model is None
+
+
+@pytest.mark.unit
+def test_spawn_rejects_invalid_tier(ctx):
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "x", "model": "claude_code", "tier": "ultra",
+    })
+    assert not result["ok"]
+    assert result["error"] == "invalid_arg"
+
+
+@pytest.mark.unit
+def test_spawn_tier_ignored_for_non_claude_code(ctx, store):
+    """tier is a claude_code-only knob — a valid tier on a local child is
+    silently dropped rather than erroring, so callers can pass it uniformly."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "x", "model": "local", "tier": "haiku",
+    })
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.claude_code_model is None
+
+
+@pytest.mark.unit
 def test_spawn_cli_child_skips_dollar_ceiling(store, transcript):
     """CLI routes are subscription-billed, so a CLI child spawns even when the
     parent has no remaining per-token dollar budget."""

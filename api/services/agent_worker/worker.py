@@ -104,6 +104,16 @@ def _worker_label(routing: str | None) -> str:
     return "Agent worker"
 
 
+# Friendly names for the engine a child session ran on, used in the escalation
+# flag (#349) so the operator sees where delegated work actually executed.
+_ENGINE_LABELS = {
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+    "claude": "cloud Claude",
+    "local": "local Gemma",
+}
+
+
 def _format_token_buckets(
     tokens_in: int,
     cache_creation: int,
@@ -1297,8 +1307,12 @@ class Worker:
             # capture so a threaded reply can resume the session via
             # _resume_as_followup. [NOTIFY] bodies that already streamed
             # during execution are stripped from final_text by the executor.
+            # Spawned children (have a parent) stay silent to the operator —
+            # the parent relays their findings in its own single completion
+            # message (#349); the child's final_text reaches the parent via
+            # _child_final_text instead.
             body = outcome.final_text.strip() if outcome.final_text else ""
-            if body:
+            if body and not session.parent_session_id:
                 try:
                     sent_ids = _send_with_id(body) or []
                 except Exception as exc:
@@ -1729,6 +1743,26 @@ class Worker:
 
         logger.warning("unhandled outcome status %r for %s", outcome.status, session.task_id)
 
+    def _escalation_note(self, session: Session) -> str:
+        """One-line flag naming the engine(s) a session delegated work to (#349).
+
+        Empty when the session spawned no children. When it did, the operator
+        gets a single completion message (the children stayed silent), so this
+        tells them the work was escalated and where it ran — e.g.
+        "⤴️ Escalated to Claude Code (haiku)".
+        """
+        children = self.session_store.list_sessions(parent_session_id=session.session_id)
+        if not children:
+            return ""
+        labels: list[str] = []
+        for child in children:
+            engine = _ENGINE_LABELS.get(child.routing, child.routing or "agent")
+            if child.routing == "claude_code":
+                engine = f"{engine} ({child.claude_code_model or 'opus'})"
+            if engine not in labels:
+                labels.append(engine)
+        return "⤴️ Escalated to " + ", ".join(labels)
+
     def _completion_summary(self, session: Session, task: dict[str, Any], outcome) -> str:
         refreshed = self.session_store.get(session.task_id) or session
         # Use active seconds (excludes sleeps) so the figure reflects real
@@ -1819,10 +1853,13 @@ class Worker:
         if init_failed:
             footer = f"\n\nNote: {len(init_failed)} MCP server(s) unavailable this session: {', '.join(init_failed)}"
 
+        escalation = self._escalation_note(session)
+        escalation_line = f"\n{escalation}" if escalation else ""
+
         return (
             f"✅ {label}: completed '{title}' "
             f"({expected}) — {tokens_summary}, ${refreshed.total_dollars:.2f}, "
-            f"{active_s}s active.\n\n{result_blurb}{footer}"
+            f"{active_s}s active.{escalation_line}\n\n{result_blurb}{footer}"
         )
 
     def _recover_result_from_transcript(self, session_id: str) -> str:
@@ -2027,14 +2064,14 @@ class Worker:
             cached = None
         if cached:
             return cached
-        # Fallback: scan the transcript for a `completed` or `managed_completed`
-        # event with non-empty `final_text`.
+        # Fallback: scan the transcript for a `completed`, `managed_completed`,
+        # or `claude_code_completed` event with non-empty `final_text`.
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
         last_text = ""
         for d in _iter_transcript(path):
             kind = d.get("kind", "")
             payload = d.get("payload", {}) or {}
-            if kind in ("completed", "managed_completed"):
+            if kind in ("completed", "managed_completed", "claude_code_completed"):
                 ft = payload.get("final_text") or ""
                 if ft:
                     last_text = ft
