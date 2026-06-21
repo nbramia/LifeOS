@@ -9,6 +9,7 @@
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script type="module" src="/static/chat/main.js"></script>
     <style>
         :root {
             --bg-primary: #1a1a2e;
@@ -2894,55 +2895,44 @@
     </div>
 
     <script>
-        // DOM elements
+        // DOM elements still referenced by this shell script. The chat modules
+        // (web/chat/) receive their own element map via initChat() below.
         const messagesEl = document.getElementById('messages');
         const inputField = document.getElementById('inputField');
-        const sendBtn = document.getElementById('sendBtn');
-        const statusDot = document.getElementById('statusDot');
-        const statusText = document.getElementById('statusText');
         const scrollBottomBtn = document.getElementById('scrollBottom');
-        const sidebar = document.getElementById('sidebar');
-        const overlay = document.getElementById('overlay');
-        const conversationsList = document.getElementById('conversationsList');
         const chatTitle = document.getElementById('chatTitle');
-        const sessionCostEl = document.getElementById('sessionCost');
-        const inputArea = document.getElementById('inputArea');
-        const attachmentsPreview = document.getElementById('attachmentsPreview');
-        const fileInput = document.getElementById('fileInput');
 
-        // State
-        let isLoading = false;
-        let currentConversationId = null;
-        // When set, the main chat view is showing an agent thread (#236 thread
-        // view): the composer continues that thread instead of normal chat.
-        // Shape: {sessionId, resumable, label, status, convCount}.
-        let currentAgentThread = null;
-        let sessionCost = 0;
-        let attachments = []; // Array of {file, dataUrl, filename, mediaType, sizeBytes}
-        let allConversations = []; // Store all conversations for filtering
-
-        // Attachment configuration
-        const ALLOWED_TYPES = {
-            'image/png': 5 * 1024 * 1024,
-            'image/jpeg': 5 * 1024 * 1024,
-            'image/jpg': 5 * 1024 * 1024,
-            'image/gif': 5 * 1024 * 1024,
-            'image/webp': 5 * 1024 * 1024,
-            'application/pdf': 10 * 1024 * 1024,
-            'text/plain': 1 * 1024 * 1024,
-            'text/markdown': 1 * 1024 * 1024,
-            'text/csv': 1 * 1024 * 1024,
-            'application/json': 1 * 1024 * 1024,
-        };
-        const MAX_ATTACHMENTS = 5;
-        const MAX_TOTAL_SIZE = 20 * 1024 * 1024;
+        // Shared chat state lives in web/chat/session.js; this shell reaches it
+        // through the window.lifeChat bridge (assigned in DOMContentLoaded).
+        let chatState;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
-            loadConversations();
-            inputField.focus();
+            chatState = window.lifeChat.state;
+            // Boot the extracted chat modules, passing the DOM elements, API
+            // endpoints, and the agent-thread reply hook (#236) this shell owns.
+            window.lifeChat.initChat({
+                elements: {
+                    messagesEl, inputField, chatTitle,
+                    sendBtn: document.getElementById('sendBtn'),
+                    statusDot: document.getElementById('statusDot'),
+                    statusText: document.getElementById('statusText'),
+                    conversationsList: document.getElementById('conversationsList'),
+                    sessionCostEl: document.getElementById('sessionCost'),
+                    sidebar: document.getElementById('sidebar'),
+                    overlay: document.getElementById('overlay'),
+                    inputArea: document.getElementById('inputArea'),
+                    attachmentsPreview: document.getElementById('attachmentsPreview'),
+                    fileInput: document.getElementById('fileInput'),
+                },
+                endpoints: {
+                    conversations: '/api/conversations',
+                    ask: '/api/ask/stream',
+                    handoff: '/api/chat/handoff',
+                },
+                hooks: { onAgentThreadReply: sendThreadReply },
+            });
             setupScrollListener();
-            setupAttachmentHandlers();
             loadAgentThreads();
             // Light polling for live-ish status; the /api/agents/stream SSE
             // already drives the dedicated /agents page.
@@ -2987,7 +2977,7 @@
                 const labelAttr = label.replace(/"/g, '&quot;');
                 const status = (t.status || '').toString();
                 const sid = t.session_id;
-                const isActive = currentAgentThread && currentAgentThread.sessionId === sid;
+                const isActive = chatState.currentAgentThread && chatState.currentAgentThread.sessionId === sid;
                 const div = document.createElement('div');
                 div.className = 'agent-thread clickable' + (isActive ? ' active' : '');
                 div.title = 'Open this thread';
@@ -3014,8 +3004,8 @@
 
             const thread = data.thread || {};
             const conversation = data.conversation || [];
-            currentConversationId = null;  // leave any normal-chat conversation
-            currentAgentThread = {
+            chatState.currentConversationId = null;  // leave any normal-chat conversation
+            chatState.currentAgentThread = {
                 sessionId,
                 resumable: !!thread.resumable,
                 label: (thread.label || sessionId).toString(),
@@ -3024,7 +3014,7 @@
                 modelLabel: (thread.model_label || '').toString(),
                 convCount: conversation.length,
             };
-            chatTitle.textContent = '🧵 ' + currentAgentThread.label;
+            chatTitle.textContent = '🧵 ' + chatState.currentAgentThread.label;
             renderThreadConversation(conversation);
             updateThreadComposer();
             loadAgentThreads();   // refresh the panel's active highlight
@@ -3046,7 +3036,7 @@
         function renderThreadConversation(conversation, preserveFrom = null) {
             messagesEl.innerHTML = '';
             threadRender = null;
-            const t = currentAgentThread || {};
+            const t = chatState.currentAgentThread || {};
             const banner = document.createElement('div');
             banner.className = 'agent-thread-banner';
             const cont = t.resumable
@@ -3149,10 +3139,10 @@
         }
 
         function updateThreadComposer() {
-            if (!currentAgentThread) { inputField.placeholder = 'Ask a question...'; return; }
-            inputField.placeholder = currentAgentThread.resumable
+            if (!chatState.currentAgentThread) { inputField.placeholder = 'Ask a question...'; return; }
+            inputField.placeholder = chatState.currentAgentThread.resumable
                 ? 'Reply to continue this agent thread…'
-                : 'Thread is ' + currentAgentThread.status + ' — press + for a new chat';
+                : 'Thread is ' + chatState.currentAgentThread.status + ' — press + for a new chat';
         }
 
         function exitAgentThread() {
@@ -3160,7 +3150,7 @@
         }
 
         async function sendThreadReply(text) {
-            const t = currentAgentThread;
+            const t = chatState.currentAgentThread;
             if (!t) return;
             if (!t.resumable) {
                 alert('This thread is ' + t.status + ' and can’t be replied to yet. Press + for a new chat.');
@@ -3193,7 +3183,7 @@
             let tries = 0;
             const iv = setInterval(async () => {
                 tries++;
-                if (!currentAgentThread || currentAgentThread.sessionId !== sessionId || tries > 60) {
+                if (!chatState.currentAgentThread || chatState.currentAgentThread.sessionId !== sessionId || tries > 60) {
                     clearInterval(iv);
                     return;
                 }
@@ -3205,10 +3195,10 @@
                     const thread = data.thread || {};
                     // New turns have landed (worker appended the reply + the
                     // agent's response) — re-render and stop once it's finished.
-                    if (conv.length > currentAgentThread.convCount) {
-                        currentAgentThread.convCount = conv.length;
-                        currentAgentThread.resumable = !!thread.resumable;
-                        currentAgentThread.status = (thread.status || '').toString();
+                    if (conv.length > chatState.currentAgentThread.convCount) {
+                        chatState.currentAgentThread.convCount = conv.length;
+                        chatState.currentAgentThread.resumable = !!thread.resumable;
+                        chatState.currentAgentThread.status = (thread.status || '').toString();
                         // Keep any history the user expanded via "load earlier".
                         const keepFrom = threadRender ? threadRender.earliestShown : null;
                         renderThreadConversation(conv, keepFrom);
@@ -3242,61 +3232,6 @@
             } catch (e) { alert('Spawn failed: ' + e); }
         }
 
-        // Sidebar toggle
-        function toggleSidebar() {
-            sidebar.classList.toggle('open');
-            overlay.classList.toggle('visible');
-        }
-
-        function closeSidebar() {
-            sidebar.classList.remove('open');
-            overlay.classList.remove('visible');
-        }
-
-        function openSidebar() {
-            sidebar.classList.add('open');
-            overlay.classList.add('visible');
-        }
-
-        // Swipe gesture to open/close sidebar on mobile
-        (function setupSwipeGestures() {
-            let touchStartX = 0;
-            let touchStartY = 0;
-            let isSwiping = false;
-            const edgeThreshold = 30;  // px from left edge to trigger
-            const swipeThreshold = 50; // px movement to complete swipe
-
-            document.addEventListener('touchstart', (e) => {
-                touchStartX = e.touches[0].clientX;
-                touchStartY = e.touches[0].clientY;
-                // Only track swipes starting from left edge (when sidebar closed)
-                // or from sidebar area (when open)
-                isSwiping = touchStartX < edgeThreshold || sidebar.classList.contains('open');
-            }, { passive: true });
-
-            document.addEventListener('touchend', (e) => {
-                if (!isSwiping) return;
-
-                const touchEndX = e.changedTouches[0].clientX;
-                const touchEndY = e.changedTouches[0].clientY;
-                const deltaX = touchEndX - touchStartX;
-                const deltaY = Math.abs(touchEndY - touchStartY);
-
-                // Ignore if vertical movement is greater (scrolling)
-                if (deltaY > Math.abs(deltaX)) return;
-
-                if (!sidebar.classList.contains('open') && touchStartX < edgeThreshold && deltaX > swipeThreshold) {
-                    // Swipe right from left edge - open sidebar
-                    openSidebar();
-                } else if (sidebar.classList.contains('open') && deltaX < -swipeThreshold) {
-                    // Swipe left when sidebar open - close it
-                    closeSidebar();
-                }
-
-                isSwiping = false;
-            }, { passive: true });
-        })();
-
         // Scroll handling
         function setupScrollListener() {
             messagesEl.addEventListener('scroll', () => {
@@ -3310,759 +3245,6 @@
                 top: messagesEl.scrollHeight,
                 behavior: 'smooth'
             });
-        }
-
-        // Attachment handling
-        function setupAttachmentHandlers() {
-            // Drag and drop
-            inputArea.addEventListener('dragenter', handleDragEnter);
-            inputArea.addEventListener('dragover', handleDragOver);
-            inputArea.addEventListener('dragleave', handleDragLeave);
-            inputArea.addEventListener('drop', handleDrop);
-
-            // File input change
-            fileInput.addEventListener('change', handleFileSelect);
-
-            // Paste handler
-            document.addEventListener('paste', handlePaste);
-        }
-
-        function handleDragEnter(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            inputArea.classList.add('drag-over');
-        }
-
-        function handleDragOver(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            inputArea.classList.add('drag-over');
-        }
-
-        function handleDragLeave(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            // Only remove if leaving the input area entirely
-            if (!inputArea.contains(e.relatedTarget)) {
-                inputArea.classList.remove('drag-over');
-            }
-        }
-
-        function handleDrop(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            inputArea.classList.remove('drag-over');
-
-            const files = e.dataTransfer.files;
-            if (files.length > 0) {
-                addFiles(Array.from(files));
-            }
-        }
-
-        function handleFileSelect(e) {
-            const files = e.target.files;
-            if (files.length > 0) {
-                addFiles(Array.from(files));
-            }
-            // Reset input so same file can be selected again
-            fileInput.value = '';
-        }
-
-        function handlePaste(e) {
-            // Only handle paste if input field or input area is focused
-            if (document.activeElement !== inputField && !inputArea.contains(document.activeElement)) {
-                return;
-            }
-
-            const items = e.clipboardData?.items;
-            if (!items) return;
-
-            const files = [];
-            for (const item of items) {
-                if (item.kind === 'file') {
-                    const file = item.getAsFile();
-                    if (file) {
-                        files.push(file);
-                    }
-                }
-            }
-
-            if (files.length > 0) {
-                e.preventDefault(); // Prevent default paste behavior for files
-                addFiles(files);
-            }
-            // If no files, allow normal text paste
-        }
-
-        function openFilePicker() {
-            fileInput.click();
-        }
-
-        async function addFiles(files) {
-            for (const file of files) {
-                await addFile(file);
-            }
-        }
-
-        async function addFile(file) {
-            // Validate file type
-            if (!ALLOWED_TYPES[file.type]) {
-                showAttachmentError(`Unsupported file type: ${file.type || 'unknown'}`);
-                return;
-            }
-
-            // Validate file size
-            const maxSize = ALLOWED_TYPES[file.type];
-            if (file.size > maxSize) {
-                const maxMB = (maxSize / (1024 * 1024)).toFixed(0);
-                showAttachmentError(`File too large. Max ${maxMB}MB for ${file.type}`);
-                return;
-            }
-
-            // Check attachment count
-            if (attachments.length >= MAX_ATTACHMENTS) {
-                showAttachmentError(`Maximum ${MAX_ATTACHMENTS} attachments allowed`);
-                return;
-            }
-
-            // Check total size
-            const currentTotal = attachments.reduce((sum, a) => sum + a.sizeBytes, 0);
-            if (currentTotal + file.size > MAX_TOTAL_SIZE) {
-                showAttachmentError('Total attachment size exceeds 20MB limit');
-                return;
-            }
-
-            // Read file as data URL
-            try {
-                const dataUrl = await readFileAsDataUrl(file);
-                const attachment = {
-                    id: Date.now() + Math.random(),
-                    file: file,
-                    dataUrl: dataUrl,
-                    filename: file.name,
-                    mediaType: file.type,
-                    sizeBytes: file.size
-                };
-                attachments.push(attachment);
-                renderAttachments();
-            } catch (err) {
-                console.error('Error reading file:', err);
-                showAttachmentError('Failed to read file');
-            }
-        }
-
-        function readFileAsDataUrl(file) {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-            });
-        }
-
-        function removeAttachment(id) {
-            attachments = attachments.filter(a => a.id !== id);
-            renderAttachments();
-        }
-
-        function renderAttachments() {
-            if (attachments.length === 0) {
-                attachmentsPreview.classList.remove('visible');
-                attachmentsPreview.innerHTML = '';
-                return;
-            }
-
-            attachmentsPreview.classList.add('visible');
-            attachmentsPreview.innerHTML = attachments.map(att => {
-                const isImage = att.mediaType.startsWith('image/');
-                const icon = getFileIcon(att.mediaType);
-                const sizeStr = formatFileSize(att.sizeBytes);
-
-                return `
-                    <div class="attachment-item">
-                        <div class="attachment-thumb">
-                            ${isImage ? `<img src="${att.dataUrl}" alt="${escapeHtml(att.filename)}">` : icon}
-                        </div>
-                        <div class="attachment-info">
-                            <div class="attachment-name" title="${escapeHtml(att.filename)}">${escapeHtml(att.filename)}</div>
-                            <div class="attachment-size">${sizeStr}</div>
-                        </div>
-                        <button class="attachment-remove" onclick="removeAttachment(${att.id})" title="Remove">×</button>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        function getFileIcon(mediaType) {
-            if (mediaType === 'application/pdf') return '📄';
-            if (mediaType.startsWith('text/')) return '📝';
-            if (mediaType === 'application/json') return '📋';
-            return '📎';
-        }
-
-        function formatFileSize(bytes) {
-            if (bytes < 1024) return bytes + ' B';
-            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-        }
-
-        function showAttachmentError(message) {
-            const toast = document.createElement('div');
-            toast.className = 'attachment-error';
-            toast.textContent = message;
-            document.body.appendChild(toast);
-            setTimeout(() => toast.remove(), 3000);
-        }
-
-        function clearAttachments() {
-            attachments = [];
-            renderAttachments();
-        }
-
-        function getAttachmentsForApi() {
-            return attachments.map(att => {
-                // Extract base64 data from data URL (remove "data:image/png;base64," prefix)
-                const base64Data = att.dataUrl.split(',')[1];
-                return {
-                    filename: att.filename,
-                    media_type: att.mediaType,
-                    data: base64Data
-                };
-            });
-        }
-
-        // Auto-resize textarea
-        inputField.addEventListener('input', function() {
-            this.style.height = 'auto';
-            this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-        });
-
-        // Enter to send (Shift+Enter for newline)
-        inputField.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendMessage();
-            }
-        });
-
-        // Status updates
-        function setStatus(status, text) {
-            statusDot.className = 'status-dot ' + status;
-            statusText.textContent = text;
-        }
-
-        // Conversations
-        async function loadConversations() {
-            try {
-                const response = await fetch('/api/conversations');
-                if (response.ok) {
-                    const data = await response.json();
-                    allConversations = data.conversations || [];
-                    filterConversations(); // Apply current search filter
-                }
-            } catch (e) {
-                console.log('Could not load conversations');
-            }
-        }
-
-        // Cache for conversation messages (for search)
-        const conversationMessagesCache = {};
-        let searchDebounceTimer = null;
-
-        function filterConversations() {
-            const searchInput = document.getElementById('conversationSearch');
-            const searchTerm = (searchInput?.value || '').toLowerCase().trim();
-
-            if (!searchTerm) {
-                renderConversations(allConversations);
-                return;
-            }
-
-            // Debounce the search to avoid too many API calls
-            clearTimeout(searchDebounceTimer);
-            searchDebounceTimer = setTimeout(() => filterConversationsAsync(searchTerm), 200);
-        }
-
-        async function filterConversationsAsync(searchTerm) {
-            // First, filter by title (immediate results)
-            const titleMatches = allConversations.filter(conv => {
-                const title = (conv.title || 'New conversation').toLowerCase();
-                return title.includes(searchTerm);
-            });
-
-            // Show title matches immediately
-            renderConversations(titleMatches, true);
-
-            // Then search in message content for remaining conversations
-            const nonTitleMatches = allConversations.filter(conv => {
-                const title = (conv.title || 'New conversation').toLowerCase();
-                return !title.includes(searchTerm);
-            });
-
-            // Fetch and search message content
-            const messageMatches = [];
-            for (const conv of nonTitleMatches) {
-                try {
-                    // Use cache if available
-                    if (!conversationMessagesCache[conv.id]) {
-                        const response = await fetch(`/api/conversations/${conv.id}`);
-                        if (response.ok) {
-                            const data = await response.json();
-                            conversationMessagesCache[conv.id] = data.messages || [];
-                        }
-                    }
-
-                    const messages = conversationMessagesCache[conv.id] || [];
-                    const hasMatch = messages.some(msg =>
-                        (msg.content || '').toLowerCase().includes(searchTerm)
-                    );
-                    if (hasMatch) {
-                        messageMatches.push(conv);
-                    }
-                } catch (e) {
-                    // Skip conversations we can't fetch
-                }
-            }
-
-            // Combine results: title matches first, then message matches
-            const allMatches = [...titleMatches, ...messageMatches];
-            renderConversations(allMatches);
-        }
-
-        function renderConversations(conversations, isPartial = false) {
-            if (conversations.length === 0 && !isPartial) {
-                const searchInput = document.getElementById('conversationSearch');
-                const isSearching = searchInput?.value?.trim();
-                const emptyText = isSearching ? 'No matching conversations' : 'No conversations yet';
-                conversationsList.innerHTML = `<div class="empty-conversations">${emptyText}</div>`;
-                return;
-            }
-
-            conversationsList.innerHTML = conversations.map(conv => `
-                <div class="conversation-item ${conv.id === currentConversationId ? 'active' : ''}"
-                     onclick="loadConversation('${conv.id}')">
-                    <div class="conversation-icon">💬</div>
-                    <div class="conversation-info">
-                        <div class="conversation-title" title="${escapeHtml(conv.title || 'New conversation')}">${escapeHtml(conv.title || 'New conversation')}</div>
-                        <div class="conversation-date">${formatDate(conv.updated_at)}</div>
-                    </div>
-                    <button class="conversation-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')" title="Delete">✕</button>
-                </div>
-            `).join('');
-        }
-
-        async function loadConversation(id) {
-            currentConversationId = id;
-            closeSidebar();
-
-            try {
-                const response = await fetch(`/api/conversations/${id}`);
-                if (response.ok) {
-                    const data = await response.json();
-                    chatTitle.textContent = data.title || 'Conversation';
-
-                    // Clear and render messages
-                    messagesEl.innerHTML = '';
-                    if (data.messages && data.messages.length > 0) {
-                        data.messages.forEach(msg => {
-                            // Sources are stored directly on the message, not in metadata
-                            addMessage(msg.content, msg.role, msg.sources || []);
-                        });
-                    }
-
-                    loadConversations(); // Refresh list to show active
-                }
-            } catch (e) {
-                console.error('Error loading conversation:', e);
-            }
-        }
-
-        async function deleteConversation(id) {
-            if (!confirm('Delete this conversation?')) return;
-
-            try {
-                await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
-                if (id === currentConversationId) {
-                    newChat();
-                }
-                loadConversations();
-            } catch (e) {
-                console.error('Error deleting conversation:', e);
-            }
-        }
-
-        function newChat() {
-            currentConversationId = null;
-            currentAgentThread = null;   // leave agent-thread mode (#236)
-            inputField.placeholder = 'Ask a question...';
-            chatTitle.textContent = 'New conversation';
-            messagesEl.innerHTML = `
-                <div class="welcome">
-                    <div class="welcome-icon">🧠</div>
-                    <h2>Welcome to LifeOS</h2>
-                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
-                    <div class="suggestions">
-                        <button class="suggestion" onclick="askQuestion('What\\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
-                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
-                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
-                    </div>
-                </div>
-            `;
-            loadConversations();
-            closeSidebar();
-            inputField.focus();
-        }
-
-        function askQuestion(question) {
-            inputField.value = question;
-            sendMessage();
-        }
-
-        function addMessage(content, type, sources = [], messageId = null, target = null) {
-            // Remove welcome message if exists
-            const welcome = messagesEl.querySelector('.welcome');
-            if (welcome) welcome.remove();
-
-            const msg = document.createElement('div');
-            msg.className = 'message ' + type;
-            if (messageId) msg.id = messageId;
-
-            let html = `
-                <div class="message-actions">
-                    <button class="action-btn" onclick="copyMessage(this)" title="Copy">📋</button>
-                </div>
-                <div class="message-content">${formatContent(content)}</div>
-            `;
-
-            if (type === 'assistant' && content) {
-                html += `<div class="message-meta">`;
-
-                if (sources.length > 0) {
-                    // Add collapsed class if more than 3 sources
-                    const collapsedClass = sources.length > 3 ? ' collapsed' : '';
-                    html += `<div class="sources${collapsedClass}">`;
-                    sources.forEach(src => {
-                        const fileName = src.file_name || src;
-                        const sourceType = src.source_type || 'vault';
-
-                        if (sourceType === 'calendar' && src.url) {
-                            // Calendar sources use Google Calendar URL
-                            html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
-                        } else {
-                            // Vault sources use Obsidian URL
-                            const obsidianPath = src.obsidian_path || fileName;
-                            const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-                            html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
-                        }
-                    });
-                    // Add toggle button if more than 3 sources
-                    if (sources.length > 3) {
-                        const hiddenCount = sources.length - 3;
-                        html += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
-                    }
-                    html += `</div>`;
-                }
-
-                html += `
-                    <div class="meta-actions">
-                        <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
-                    </div>
-                </div>`;
-            }
-
-            msg.innerHTML = html;
-            // When rendering into a detached target (e.g. bulk thread render),
-            // append there and skip the per-message scroll; the caller scrolls
-            // once after the batch lands.
-            (target || messagesEl).appendChild(msg);
-            if (!target) scrollToBottom();
-
-            return msg;
-        }
-
-        function updateMessage(messageId, content) {
-            const msg = document.getElementById(messageId);
-            if (msg) {
-                const contentEl = msg.querySelector('.message-content');
-                if (contentEl) {
-                    contentEl.innerHTML = formatContent(content);
-                }
-            }
-        }
-
-        function formatContent(content) {
-            return content
-                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*(.*?)\*/g, '<em>$1</em>')
-                .replace(/`(.*?)`/g, '<code>$1</code>')
-                .replace(/\n/g, '<br>');
-        }
-
-        function copyMessage(btn) {
-            const msg = btn.closest('.message');
-            const content = msg.querySelector('.message-content').textContent;
-            navigator.clipboard.writeText(content).then(() => {
-                btn.classList.add('copied');
-                btn.textContent = '✓';
-                setTimeout(() => {
-                    btn.classList.remove('copied');
-                    btn.textContent = '📋';
-                }, 2000);
-            });
-        }
-
-        function toggleSources(btn) {
-            const sourcesDiv = btn.closest('.sources');
-            const isCollapsed = sourcesDiv.classList.contains('collapsed');
-            const sourceLinks = sourcesDiv.querySelectorAll('.source-link');
-            const totalCount = sourceLinks.length;
-            const hiddenCount = totalCount - 3;
-
-            if (isCollapsed) {
-                // Expand
-                sourcesDiv.classList.remove('collapsed');
-                btn.textContent = 'Show less';
-            } else {
-                // Collapse
-                sourcesDiv.classList.add('collapsed');
-                btn.textContent = `Show ${hiddenCount} more...`;
-            }
-        }
-
-        async function sendMessage() {
-            const question = inputField.value.trim();
-            if (!question || isLoading) return;
-
-            // In agent-thread mode the composer continues that thread instead
-            // of starting a normal chat query (#236).
-            if (currentAgentThread) {
-                await sendThreadReply(question);
-                return;
-            }
-
-            isLoading = true;
-            setStatus('loading', 'Thinking...');
-            sendBtn.disabled = true;
-
-            // Capture attachments before clearing
-            const messageAttachments = [...attachments];
-            const attachmentCount = messageAttachments.length;
-
-            // Add user message with attachment indicator
-            let userMsgContent = question;
-            if (attachmentCount > 0) {
-                userMsgContent += `\n<span class="attachment-indicator">📎 ${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}</span>`;
-            }
-            addMessage(userMsgContent, 'user');
-            inputField.value = '';
-            inputField.style.height = 'auto';
-
-            // Clear attachments after capturing them
-            clearAttachments();
-
-            // Update title if new conversation
-            if (!currentConversationId) {
-                chatTitle.textContent = question.slice(0, 40) + (question.length > 40 ? '...' : '');
-            }
-
-            // Add placeholder for assistant response
-            const msgId = 'msg-' + Date.now();
-            const msg = addMessage('', 'assistant', [], msgId);
-
-            // Add typing indicator
-            const typingHtml = '<div class="typing"><span></span><span></span><span></span></div>';
-            msg.querySelector('.message-content').innerHTML = typingHtml;
-
-            try {
-                const body = { question };
-                if (currentConversationId) {
-                    body.conversation_id = currentConversationId;
-                }
-
-                // Include attachments if any
-                if (messageAttachments.length > 0) {
-                    body.attachments = messageAttachments.map(att => ({
-                        filename: att.filename,
-                        media_type: att.mediaType,
-                        data: att.dataUrl.split(',')[1]  // Extract base64 data
-                    }));
-                }
-
-                const response = await fetch('/api/ask/stream', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
-                });
-
-                if (!response.ok) {
-                    throw new Error('Request failed');
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let fullContent = '';
-                let sources = [];
-                let routingSources = [];  // Track which sources were used
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    const chunk = decoder.decode(value);
-                    const lines = chunk.split('\n');
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-
-                                if (data.type === 'routing') {
-                                    // Capture which sources are being used
-                                    routingSources = data.sources || [];
-                                    console.log('Routing to:', routingSources);
-                                } else if (data.type === 'self_correction') {
-                                    fullContent = '';
-                                    updateMessage(msgId, '');
-                                } else if (data.type === 'content') {
-                                    fullContent += data.content;
-                                    updateMessage(msgId, fullContent);
-                                } else if (data.type === 'sources') {
-                                    sources = data.sources;
-                                } else if (data.type === 'conversation_id') {
-                                    currentConversationId = data.conversation_id;
-                                } else if (data.type === 'usage') {
-                                    sessionCost += data.cost_usd || 0;
-                                    sessionCostEl.textContent = '$' + sessionCost.toFixed(3);
-                                } else if (data.type === 'claude_intent') {
-                                    // Engine handoff (#305b/c): the orchestrator
-                                    // delegated to a CLI worker. Spawn it via the
-                                    // handoff endpoint and reflect it in the thread.
-                                    const engine = data.engine || 'claude_code';
-                                    const label = engine === 'codex' ? 'Codex' : 'Claude Code';
-                                    fullContent = '🤝 Handing off to ' + label + '…';
-                                    updateMessage(msgId, fullContent);
-                                    fetch('/api/chat/handoff', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                            engine: engine,
-                                            task: data.task || '',
-                                            conversation_id: currentConversationId,
-                                        }),
-                                    }).then(r => r.json()).then(d => {
-                                        fullContent = (d && d.message)
-                                            ? d.message
-                                            : '⚠️ Handoff to ' + label + ' failed.';
-                                        updateMessage(msgId, fullContent);
-                                    }).catch(() => {
-                                        fullContent = '⚠️ Handoff to ' + label + ' failed.';
-                                        updateMessage(msgId, fullContent);
-                                    });
-                                } else if (data.type === 'done') {
-                                    // Add sources and meta to message
-                                    const msgEl = document.getElementById(msgId);
-                                    if (msgEl) {
-                                        let metaHtml = '<div class="message-meta">';
-
-                                        // Show routing sources used
-                                        if (routingSources.length > 0) {
-                                            metaHtml += '<div class="routing-sources">';
-                                            const sourceIcons = {
-                                                vault: '📚',
-                                                calendar: '📅',
-                                                gmail: '✉️',
-                                                drive: '📁',
-                                                attachment: '📎',
-                                                people: '👤',
-                                                actions: '✅'
-                                            };
-                                            routingSources.forEach(src => {
-                                                const icon = sourceIcons[src] || '📄';
-                                                metaHtml += `<span class="routing-source ${src}">${icon} ${src}</span>`;
-                                            });
-                                            metaHtml += '</div>';
-                                        }
-
-                                        if (sources.length > 0) {
-                                            // Add collapsed class if more than 3 sources
-                                            const collapsedClass = sources.length > 3 ? ' collapsed' : '';
-                                            metaHtml += `<div class="sources${collapsedClass}">`;
-                                            sources.forEach(src => {
-                                                const fileName = src.file_name || src;
-                                                const sourceType = src.source_type || 'vault';
-
-                                                if (sourceType === 'calendar' && src.url) {
-                                                    // Calendar sources use Google Calendar URL
-                                                    metaHtml += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
-                                                } else {
-                                                    // Vault sources use Obsidian URL
-                                                    const obsidianPath = src.obsidian_path || fileName;
-                                                    const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-                                                    metaHtml += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
-                                                }
-                                            });
-                                            // Add toggle button if more than 3 sources
-                                            if (sources.length > 3) {
-                                                const hiddenCount = sources.length - 3;
-                                                metaHtml += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
-                                            }
-                                            metaHtml += '</div>';
-                                        }
-
-                                        metaHtml += `
-                                            <div class="meta-actions">
-                                                <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
-                                            </div>
-                                        </div>`;
-
-                                        // Remove any existing meta
-                                        const existingMeta = msgEl.querySelector('.message-meta');
-                                        if (existingMeta) existingMeta.remove();
-
-                                        msgEl.insertAdjacentHTML('beforeend', metaHtml);
-                                    }
-
-                                    loadConversations();
-                                } else if (data.type === 'error') {
-                                    // Handle error from server
-                                    const errorMsg = data.message || 'An error occurred';
-                                    let userMessage = 'Sorry, something went wrong.';
-
-                                    // Provide helpful messages for common errors
-                                    if (errorMsg.toLowerCase().includes('api') ||
-                                        errorMsg.toLowerCase().includes('auth') ||
-                                        errorMsg.toLowerCase().includes('key') ||
-                                        errorMsg.toLowerCase().includes('token')) {
-                                        userMessage = 'API configuration error. Please check that your API key is set correctly.';
-                                    } else if (errorMsg.toLowerCase().includes('timeout')) {
-                                        userMessage = 'The request timed out. Please try again.';
-                                    } else if (errorMsg.toLowerCase().includes('rate')) {
-                                        userMessage = 'Rate limit exceeded. Please wait a moment and try again.';
-                                    }
-
-                                    console.error('Stream error:', errorMsg);
-                                    updateMessage(msgId, userMessage);
-                                    setStatus('error', 'Error');
-                                    return; // Stop processing
-                                }
-                            } catch (e) {
-                                // Skip malformed JSON
-                            }
-                        }
-                    }
-                }
-
-                setStatus('', 'Ready');
-
-            } catch (error) {
-                console.error('Error:', error);
-                updateMessage(msgId, 'Sorry, something went wrong. Please try again.');
-                setStatus('error', 'Error');
-            }
-
-            isLoading = false;
-            sendBtn.disabled = false;
-            inputField.focus();
         }
 
         // Save to Vault modal state
@@ -4142,8 +3324,8 @@
             };
 
             // Use conversation_id if available and full conversation mode
-            if (fullConversation && currentConversationId) {
-                body.conversation_id = currentConversationId;
+            if (fullConversation && chatState.currentConversationId) {
+                body.conversation_id = chatState.currentConversationId;
             } else {
                 // Fallback to single Q&A
                 body.question = saveVaultContext.question;
@@ -4329,7 +3511,7 @@
         async function openUsageModal() {
             document.getElementById('usageModal').classList.add('visible');
             // Show current session cost in modal
-            document.getElementById('usageSession').textContent = '$' + sessionCost.toFixed(3);
+            document.getElementById('usageSession').textContent = '$' + chatState.sessionCost.toFixed(3);
             await loadUsageStats();
         }
 
@@ -4473,70 +3655,6 @@
             return div.innerHTML;
         }
 
-        function formatDate(dateStr) {
-            if (!dateStr) return '';
-            const date = new Date(dateStr);
-            const now = new Date();
-            const diff = now - date;
-
-            // Under 1 minute: "Just now"
-            if (diff < 60000) return 'Just now';
-
-            // Under 1 hour: "5m ago", "23m ago"
-            if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
-
-            // Check if date is today (same calendar day in local timezone)
-            const isToday = date.toDateString() === now.toDateString();
-
-            // Under 24 hours AND today: "2h ago", "11h ago"
-            if (diff < 86400000 && isToday) {
-                return Math.floor(diff / 3600000) + 'h ago';
-            }
-
-            // Check if date is yesterday
-            const yesterday = new Date(now);
-            yesterday.setDate(yesterday.getDate() - 1);
-            const isYesterday = date.toDateString() === yesterday.toDateString();
-
-            // Format time as "3:15 PM"
-            const timeStr = date.toLocaleTimeString('en-US', {
-                hour: 'numeric',
-                minute: '2-digit',
-                hour12: true
-            });
-
-            // Yesterday: "Yesterday 3:15 PM"
-            if (isYesterday) {
-                return 'Yesterday ' + timeStr;
-            }
-
-            // Format month and day as "Jan 8"
-            const monthDay = date.toLocaleDateString('en-US', {
-                month: 'short',
-                day: 'numeric'
-            });
-
-            // Check if same year
-            const isSameYear = date.getFullYear() === now.getFullYear();
-
-            // This year: "Jan 8" (short) or could include time for recent dates
-            if (isSameYear) {
-                // For dates within the last week, include time
-                if (diff < 604800000) {
-                    return monthDay + ', ' + timeStr;
-                }
-                // Older this-year dates: just "Jan 8"
-                return monthDay;
-            }
-
-            // Older (different year): "Jan 8, 2025"
-            return date.toLocaleDateString('en-US', {
-                month: 'short',
-                day: 'numeric',
-                year: 'numeric'
-            });
-        }
-
         // Page routing
         function navigateToPage(page) {
             // Hide all pages
@@ -4569,8 +3687,8 @@
         // Handle hash changes
         window.addEventListener('hashchange', handleRouting);
 
-        // Initialize
-        setStatus('', 'Ready');
+        // Initialize. (The "Ready" status is set by initChat(); the initial
+        // markup already renders it, so there is no flash.)
         handleRouting(); // Handle initial route
 
         // ============================================
