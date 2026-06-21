@@ -1,7 +1,7 @@
 # Documentation Strategy
 
 **Status:** Complete
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-06-19
 
 > **Backlog lives in GitHub issues.** Future work, deferred features, bugs, and enhancements are tracked as GitHub issues — never as `backlog.md` files in this directory. Plan files are reserved for time-bounded execution notes (migration plans, gap analyses, point-in-time issue-drafting context).
 
@@ -359,6 +359,7 @@ Aim for ≤30 lines. Subdirectory AGENTS.md files are wayfinding, not extended c
 2. Update `Last Updated` in the frontmatter.
 3. Check if cross-references need updates.
 4. Verify bidirectional links still resolve.
+5. **Architecture topology** — when client surfaces or cross-repo integration changes (web chat, Telegram, whisper-relay, MCP), update root `README.md` diagrams and [specs/technical/client-surfaces.md](specs/technical/client-surfaces.md) in the same PR. API contracts live in specs — link, don't duplicate shapes in AGENTS.md.
 
 **When documents get long (over the Max in [Length Guidelines](#length-guidelines)):**
 1. Identify distinct concerns within the document.
