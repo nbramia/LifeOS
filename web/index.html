@@ -43,7 +43,8 @@
         }
 
         html, body {
-            height: 100%;
+            height: 100vh;   /* fallback for browsers without dvh */
+            height: 100dvh;  /* track the mobile browser's dynamic chrome (address bar / keyboard) so the composer stays reachable */
             overflow: hidden;
         }
 
@@ -979,6 +980,13 @@
             margin: 0 auto;
         }
 
+        /* Wrapper around the run-as-agent controls (routing select + spawn).
+           Transparent on desktop so they sit inline in the composer row; on
+           mobile it becomes its own row above the input (#361). */
+        .composer-tools {
+            display: contents;
+        }
+
         .input-wrapper {
             flex: 1;
             position: relative;
@@ -1329,6 +1337,35 @@
                 padding: 0 0.75rem;
             }
 
+            /* Compact topbar (#361): icon-only nav + remember, snug action row
+               so the persona picker, title, and actions fit a phone width. */
+            .header-nav .nav-label,
+            .remember-btn .btn-label {
+                display: none;
+            }
+
+            .nav-link {
+                padding: 0.375rem 0.5rem;
+            }
+
+            .header-left {
+                gap: 0.5rem;
+                min-width: 0;
+            }
+
+            .header-right {
+                gap: 0.5rem;
+                min-width: 0;
+            }
+
+            .persona-picker {
+                max-width: 108px;
+            }
+
+            .remember-btn {
+                padding: 0.375rem 0.5rem;
+            }
+
             .messages {
                 padding: 0.75rem;
             }
@@ -1351,6 +1388,24 @@
 
             .input-container {
                 gap: 0.5rem;
+                flex-wrap: wrap;
+            }
+
+            /* Declutter the composer (#361): hide attach, and lift the
+               run-as-agent tools (routing + spawn) onto their own row above the
+               input so the bottom row is just the textarea + send. */
+            .attach-btn {
+                display: none;
+            }
+
+            .composer-tools {
+                display: flex;
+                order: -1;
+                flex-basis: 100%;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 0.5rem;
+                margin-bottom: 0.25rem;
             }
 
             .input-field {
@@ -2575,16 +2630,16 @@
             <div class="header-left">
                 <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰</button>
                 <nav class="header-nav">
-                    <a href="/chat" class="nav-link active">💬 Chat</a>
-                    <a href="/crm" class="nav-link">👥 CRM</a>
-                    <a href="/agents" class="nav-link">🛠️ Agents</a>
+                    <a href="/chat" class="nav-link active" title="Chat">💬 <span class="nav-label">Chat</span></a>
+                    <a href="/crm" class="nav-link" title="CRM">👥 <span class="nav-label">CRM</span></a>
+                    <a href="/agents" class="nav-link" title="Agents">🛠️ <span class="nav-label">Agents</span></a>
                 </nav>
             </div>
             <div class="header-right">
                 <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
                 <span class="chat-title" id="chatTitle">New conversation</span>
                 <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
-                    <span>💭</span> Remember
+                    <span>💭</span> <span class="btn-label">Remember</span>
                 </button>
                 <div class="cost-display" id="costDisplay" onclick="openUsageModal()" title="Click to view usage stats">
                     <span class="label">Session:</span> <span class="amount" id="sessionCost">$0.00</span>
@@ -2629,12 +2684,14 @@
                 <input type="file" id="fileInput" class="file-input" multiple
                        accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
                 <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files">📎</button>
-                <select id="agentRouting" class="agent-routing-select" title="Agent model (run-as-agent)">
-                    <option value="auto">🤖 auto</option>
-                    <option value="local">local</option>
-                    <option value="claude">cloud</option>
-                </select>
-                <button class="agent-spawn-btn" id="agentSpawnBtn" onclick="spawnAgentFromComposer()" title="Run the composer text as an agent">⚙</button>
+                <div class="composer-tools">
+                    <select id="agentRouting" class="agent-routing-select" title="Agent model (run-as-agent)">
+                        <option value="auto">🤖 auto</option>
+                        <option value="local">local</option>
+                        <option value="claude">cloud</option>
+                    </select>
+                    <button class="agent-spawn-btn" id="agentSpawnBtn" onclick="spawnAgentFromComposer()" title="Run the composer text as an agent">⚙</button>
+                </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
             </div>
         </footer>
