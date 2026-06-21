@@ -7,6 +7,7 @@ import { state, config, elements, endpoints, hooks } from './session.js';
 import { addMessage, updateMessage, setStatus } from './thread.js';
 import { clearAttachments } from './attachments.js';
 import { loadConversations } from './conversations.js';
+import { personaSupportsHandoff } from './persona.js';
 
 // Low-level SSE transport. Builds the request body, opens the stream, and calls
 // `on(data)` for each parsed `data:` event. If `on` returns `true`, processing
@@ -141,30 +142,33 @@ export async function sendMessage() {
           state.sessionCost += data.cost_usd || 0;
           elements.sessionCostEl.textContent = '$' + state.sessionCost.toFixed(3);
         } else if (data.type === 'claude_intent') {
-          // Engine handoff (#305b/c): the orchestrator
-          // delegated to a CLI worker. Spawn it via the
-          // handoff endpoint and reflect it in the thread.
-          const engine = data.engine || 'claude_code';
-          const label = engine === 'codex' ? 'Codex' : 'Claude Code';
-          fullContent = '🤝 Handing off to ' + label + '…';
-          updateMessage(msgId, fullContent);
-          fetch(endpoints.handoff, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              engine: engine,
-              task: data.task || '',
-              conversation_id: state.currentConversationId,
-            }),
-          }).then(r => r.json()).then(d => {
-            fullContent = (d && d.message)
-              ? d.message
-              : '⚠️ Handoff to ' + label + ' failed.';
+          // Engine handoff (#305b/c): the orchestrator delegated to a CLI
+          // worker. Gate it on the selected persona's advertised capabilities
+          // (#359) — only personas with the `handoff` capability may trigger
+          // it; for others, ignore the intent (no handoff UI).
+          if (personaSupportsHandoff()) {
+            const engine = data.engine || 'claude_code';
+            const label = engine === 'codex' ? 'Codex' : 'Claude Code';
+            fullContent = '🤝 Handing off to ' + label + '…';
             updateMessage(msgId, fullContent);
-          }).catch(() => {
-            fullContent = '⚠️ Handoff to ' + label + ' failed.';
-            updateMessage(msgId, fullContent);
-          });
+            fetch(endpoints.handoff, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                engine: engine,
+                task: data.task || '',
+                conversation_id: state.currentConversationId,
+              }),
+            }).then(r => r.json()).then(d => {
+              fullContent = (d && d.message)
+                ? d.message
+                : '⚠️ Handoff to ' + label + ' failed.';
+              updateMessage(msgId, fullContent);
+            }).catch(() => {
+              fullContent = '⚠️ Handoff to ' + label + ' failed.';
+              updateMessage(msgId, fullContent);
+            });
+          }
         } else if (data.type === 'done') {
           // Add sources and meta to message
           const msgEl = document.getElementById(msgId);

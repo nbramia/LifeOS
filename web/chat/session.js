@@ -3,8 +3,8 @@
 // Extracted from the index.html SPA's single inline <script>. These objects are
 // the one source of truth for chat state; the feature modules import them
 // directly, and the classic shell script reaches the same objects through the
-// `window.lifeChat` bridge installed in main.js. No persistence yet —
-// sessionStorage (backend × persona × conversation) is a follow-on (#361).
+// `window.lifeChat` bridge installed in main.js. Persona selection persists in
+// sessionStorage (#359); backend × conversation persistence is a follow-on (#361).
 
 // In-memory chat state. `attachments` and `allConversations` are reassigned in
 // place (e.g. `state.attachments = state.attachments.filter(...)`), so they live
@@ -22,12 +22,14 @@ export const state = {
   allConversations: [], // all conversations, for client-side filtering
 };
 
-// Optional per-query selectors reserved for the persona (#359) and
-// backend/Voice-Text (#361) follow-ons. Declared now so those PRs don't have to
-// reshape the askStream/session interface; unused in this behavior-neutral PR.
+// Per-query selectors. `personaId` is the selected persona (#359); `backend`
+// is reserved for the #361 Voice|Text follow-on. `personas` caches the list
+// from /api/personas so handoff gating can read the selected persona's
+// capabilities.
 export const config = {
   personaId: null,
   backend: null,
+  personas: [],
 };
 
 // DOM element handles, populated by initChat() (main.js). Modules read

@@ -592,6 +592,25 @@
             color: white;
         }
 
+        /* Persona picker (#359) */
+        .persona-picker {
+            padding: 0.375rem 0.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            max-width: 160px;
+        }
+
+        .persona-picker:hover,
+        .persona-picker:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
         /* Modal */
         .modal-overlay {
             display: none;
@@ -2562,6 +2581,7 @@
                 </nav>
             </div>
             <div class="header-right">
+                <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
                 <span class="chat-title" id="chatTitle">New conversation</span>
                 <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
                     <span>💭</span> Remember
@@ -2924,11 +2944,13 @@
                     inputArea: document.getElementById('inputArea'),
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
+                    personaPicker: document.getElementById('personaPicker'),
                 },
                 endpoints: {
                     conversations: '/api/conversations',
                     ask: '/api/ask/stream',
                     handoff: '/api/chat/handoff',
+                    personas: '/api/personas',
                 },
                 hooks: { onAgentThreadReply: sendThreadReply },
             });
