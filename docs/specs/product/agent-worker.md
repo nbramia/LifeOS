@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-06-03
+> **Last Updated:** 2026-06-21
 
 LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -39,7 +39,7 @@ Within a poll cycle (default 60s), the worker:
 2. Atomically swaps the tag to `#agent-running` (so two workers can't claim the same task)
 3. Routes the task — to your local Gemma model or to Claude on Managed Agents — depending on tags, title cues, or capability inference
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
-5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, and sends you a one-paragraph Telegram summary with the actual result
+5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
 
 Cost for that task: usually under $0.10 on Claude Sonnet 4.6, free on local Gemma. The full transcript (every tool call, every model turn) lands in `data/agent_transcripts/<session_id>.jsonl` for later review.
 

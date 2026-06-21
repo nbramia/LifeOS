@@ -93,7 +93,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks until next local midnight. Set to `0` to pause new claims entirely. |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | int | `72` | How long to wait for a Telegram clarification before abandoning the task. |
 | `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
-| `LIFEOS_AGENT_OUTPUT_DIR` | path | varies | Directory for worker-written task outputs. |
+| `LIFEOS_AGENT_OUTPUT_DIR` | path | `LifeOS/Tasks/Agent Output` | Vault-relative folder where the worker writes an Agent Output note on every successful task completion (one note per one-off task; one shared, prepended note per recurring cron schedule). |
 | `LIFEOS_AGENT_PREFLIGHT_MODEL` | str | `claude-haiku-4-5` | Model used for preflight (budget parsing, routing, ambiguity, sanity). |
 | `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-4-6` | Informational — actual model lives in the Anthropic Console preset. |
 | `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS` | str | — | Override for test runs. |
