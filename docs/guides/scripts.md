@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-06-21
 > **Audience:** Operators
 
 Reference for all LifeOS scripts with usage examples.
@@ -103,7 +103,7 @@ Orchestrate all data sync operations.
 3. Relationship Building (discover connections)
 4. Vector Store Indexing (reindex vault)
 5. Content Sync (Google Docs/Sheets to vault)
-6. Entity Cleanup (auto-hide non-humans, queue duplicates)
+6. Entity Cleanup (auto-hide obvious non-human entities)
 7. Consistency Verification (orphan checks, stats reconciliation)
 
 ---
@@ -168,7 +168,7 @@ Example:
 
 | Script | Purpose |
 |--------|---------|
-| `sync_entity_cleanup.py` | Clean up orphaned/stale entities |
+| `sync_entity_cleanup.py` | Auto-hide obvious non-human entities (noreply@, newsletters) |
 
 ---
 
