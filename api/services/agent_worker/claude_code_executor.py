@@ -151,6 +151,13 @@ class _RunState:
     pending_clarification: str = ""   # Last [CLARIFY] body
     plan_text: str = ""               # Accumulated [NOTIFY] when plan_mode
     plan_mode: bool = False
+    # True when this session was spawned by another agent (has a parent). Child
+    # sessions report back to their parent, not the operator: their [NOTIFY]
+    # bodies and heartbeats are NOT streamed to Telegram (#349). Instead the
+    # bodies accumulate in `notify_bodies` and get folded into final_text so the
+    # parent — which only reads final_text — still receives the substance.
+    is_child: bool = False
+    notify_bodies: list[str] = field(default_factory=list)
     awaiting_approval: bool = False   # plan-mode result event reached
     awaiting_clarification: bool = False
     cost_usd: float = 0.0
@@ -281,7 +288,13 @@ class ClaudeCodeExecutor:
     # Internal lifecycle
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str, resume_session_id: Optional[str], session_id: str = "") -> list[str]:
+    def _build_command(
+        self,
+        prompt: str,
+        resume_session_id: Optional[str],
+        session_id: str = "",
+        model: str = "opus",
+    ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
             if platform.system() == "Linux"
@@ -292,7 +305,7 @@ class ClaudeCodeExecutor:
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--model", "opus",
+            "--model", model,
             "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
             "--chrome",
@@ -316,6 +329,24 @@ class ClaudeCodeExecutor:
         already inside a session and refuse to run."""
         return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
 
+    @staticmethod
+    def _effective_final_text(state: _RunState) -> str:
+        """Text handed back to the worker as the session's result.
+
+        For child sessions (#349) the [NOTIFY] bodies never streamed to the
+        operator, so fold them into final_text — the parent only reads
+        final_text and would otherwise lose everything the child reported.
+        Operator sessions return final_text unchanged (their notifies already
+        streamed live, and are deliberately stripped to avoid repetition).
+        """
+        if not state.is_child or not state.notify_bodies:
+            return state.final_text
+        parts = list(state.notify_bodies)
+        prose = (state.final_text or "").strip()
+        if prose and prose not in parts:
+            parts.append(prose)
+        return "\n\n".join(parts).strip()
+
     def _run(
         self,
         *,
@@ -326,7 +357,10 @@ class ClaudeCodeExecutor:
         plan_mode: bool,
     ) -> ExecutorOutcome:
         sid = session.session_id
-        cmd = self._build_command(prompt, resume_session_id, session_id=sid)
+        cmd = self._build_command(
+            prompt, resume_session_id, session_id=sid,
+            model=session.claude_code_model or "opus",
+        )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
             "resume": bool(resume_session_id),
@@ -355,7 +389,7 @@ class ClaudeCodeExecutor:
         # observer sees the correct status.
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
 
-        state = _RunState(plan_mode=plan_mode)
+        state = _RunState(plan_mode=plan_mode, is_child=bool(session.parent_session_id))
         timed_out = threading.Event()
         stop_heartbeat = threading.Event()
 
@@ -416,15 +450,16 @@ class ClaudeCodeExecutor:
             )
 
         if proc.returncode == 0 or state.terminal:
+            final_text = self._effective_final_text(state)
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(sid, "claude_code_completed", {
                 "cost_usd": state.cost_usd,
                 "notifications_sent": state.notifications_sent,
-                "final_chars": len(state.final_text),
+                "final_chars": len(final_text),
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,
-                final_text=state.final_text,
+                final_text=final_text,
             )
 
         # Subprocess exited non-zero without a terminal event — surface the
@@ -529,10 +564,14 @@ class ClaudeCodeExecutor:
                         continue
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
-                    try:
-                        self._notify(body)
-                    except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("notification callback raised: %s", exc)
+                    state.notify_bodies.append(body)
+                    # Child sessions don't stream to the operator — their bodies
+                    # are folded into final_text for the parent instead (#349).
+                    if not state.is_child:
+                        try:
+                            self._notify(body)
+                        except Exception as exc:  # pragma: no cover — defensive
+                            logger.warning("notification callback raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_notify", {
                         "body": body, "body_chars": len(body),
                     })
@@ -607,6 +646,11 @@ class ClaudeCodeExecutor:
                 return
             now = time.time()
             if now - state.last_notify_at < self._heartbeat_interval:
+                continue
+            # Child sessions stay silent to the operator — the parent reports
+            # progress on their behalf (#349).
+            if state.is_child:
+                state.last_notify_at = now
                 continue
             elapsed = int(now - state.started_at)
             minutes = elapsed // 60

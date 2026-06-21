@@ -75,6 +75,16 @@ def _worker_label(routing: str | None) -> str:
     return "Agent worker"
 
 
+# Friendly names for the engine a child session ran on, used in the escalation
+# flag (#349) so the operator sees where delegated work actually executed.
+_ENGINE_LABELS = {
+    "claude_code": "Claude Code",
+    "codex": "Codex",
+    "claude": "cloud Claude",
+    "local": "local Gemma",
+}
+
+
 def _format_token_buckets(
     tokens_in: int,
     cache_creation: int,
@@ -1666,6 +1676,26 @@ class Worker:
 
         logger.warning("unhandled outcome status %r for %s", outcome.status, session.task_id)
 
+    def _escalation_note(self, session: Session) -> str:
+        """One-line flag naming the engine(s) a session delegated work to (#349).
+
+        Empty when the session spawned no children. When it did, the operator
+        gets a single completion message (the children stayed silent), so this
+        tells them the work was escalated and where it ran — e.g.
+        "⤴️ Escalated to Claude Code (haiku)".
+        """
+        children = self.session_store.list_sessions(parent_session_id=session.session_id)
+        if not children:
+            return ""
+        labels: list[str] = []
+        for child in children:
+            engine = _ENGINE_LABELS.get(child.routing, child.routing or "agent")
+            if child.routing == "claude_code":
+                engine = f"{engine} ({child.claude_code_model or 'opus'})"
+            if engine not in labels:
+                labels.append(engine)
+        return "⤴️ Escalated to " + ", ".join(labels)
+
     def _completion_summary(self, session: Session, task: dict[str, Any], outcome) -> str:
         refreshed = self.session_store.get(session.task_id) or session
         # Use active seconds (excludes sleeps) so the figure reflects real
@@ -1745,10 +1775,13 @@ class Worker:
         if init_failed:
             footer = f"\n\nNote: {len(init_failed)} MCP server(s) unavailable this session: {', '.join(init_failed)}"
 
+        escalation = self._escalation_note(session)
+        escalation_line = f"\n{escalation}" if escalation else ""
+
         return (
             f"✅ {label}: completed '{title}' "
             f"({expected}) — {tokens_summary}, ${refreshed.total_dollars:.2f}, "
-            f"{active_s}s active.\n\n{result_blurb}{footer}"
+            f"{active_s}s active.{escalation_line}\n\n{result_blurb}{footer}"
         )
 
     def _recover_result_from_transcript(self, session_id: str) -> str:

@@ -139,10 +139,11 @@ def _with_caller(props: dict, required: list[str]) -> dict:
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lifeos_agent_spawn",
-        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here).",
+        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here). For `claude_code` children, pick `tier` by task difficulty: `haiku` for simple lookups / quick web research, `sonnet` for moderate work, `opus` (default) for hard reasoning.",
         "input_schema": _with_caller({
             "prompt": {"type": "string", "description": "Task description for the child agent"},
             "model": {"type": "string", "enum": ["claude", "local", "claude_code", "codex"], "description": "Which executor to run the child on. claude=Managed Agents (cloud API), local=Gemma, claude_code=Claude Code CLI (has a working --chrome browser), codex=Codex CLI (code/general tasks; no browser in headless mode)."},
+            "tier": {"type": "string", "enum": ["haiku", "sonnet", "opus"], "description": "For model=claude_code only: which Claude tier the child CLI runs. Use 'haiku' for simple lookups/quick research, 'sonnet' for moderate tasks, 'opus' (default) for hard reasoning. Ignored for other engines."},
             "max_dollars": {"type": "number", "description": "Optional per-child dollar budget"},
             "max_tokens": {"type": "integer", "description": "Optional per-child token budget"},
             "wall_seconds": {"type": "integer", "description": "Optional per-child wall-clock budget"},
@@ -225,6 +226,15 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
             "model must be one of 'claude', 'local', 'claude_code', 'codex'",
             code="invalid_arg",
         )
+    # Optional Claude tier for claude_code children (#349). Ignored for other
+    # engines so the caller can pass it uniformly without an error.
+    tier = (args.get("tier") or "").strip().lower() or None
+    if tier and tier not in ("haiku", "sonnet", "opus"):
+        return _err(
+            "tier must be one of 'haiku', 'sonnet', 'opus'",
+            code="invalid_arg",
+        )
+    claude_code_model = tier if model == "claude_code" else None
 
     caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
     if caller is None:
@@ -307,6 +317,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         parent_session_id=caller.session_id,
         root_session_id=root,
         spawn_depth=new_depth,
+        claude_code_model=claude_code_model,
     )
     # The prompt becomes the child's task description (used by the executor's
     # _seed_conversation) so the system prompt + inter-agent guidance run as
@@ -318,6 +329,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         "root_session_id": root,
         "spawn_depth": new_depth,
         "model": model,
+        "tier": claude_code_model,
         "prompt_chars": len(prompt),
     })
     ctx.transcript_store.append(caller.session_id, "spawned_child", {

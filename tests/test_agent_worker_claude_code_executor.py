@@ -130,6 +130,19 @@ def _seed_session(store: SessionStore, *, task_id: str = "task-1"):
     )
 
 
+def _seed_child_session(
+    store: SessionStore, *, task_id: str = "child-1", claude_code_model: str | None = None,
+):
+    """A claude_code session spawned by another agent — has a parent, so it
+    reports back to that parent rather than streaming to the operator (#349)."""
+    return store.create(
+        task_id=task_id,
+        routing="claude_code",
+        parent_session_id="sess_parent",
+        claude_code_model=claude_code_model,
+    )
+
+
 def _read_transcript(transcripts: TranscriptStore, session_id: str) -> list[dict]:
     return transcripts.read(session_id)
 
@@ -210,6 +223,77 @@ def test_assistant_narrative_outside_notify_is_kept_as_final_text(tmp_path: Path
     assert "Found a typo." in outcome.final_text
     assert "NOTIFY" not in outcome.final_text
     assert notifications == ["Fixed it."]
+
+
+def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
+    """A spawned child (#349) must NOT stream [NOTIFY] to the operator. Instead
+    the bodies are folded into final_text so the parent — which only reads
+    final_text — still receives the substance the child reported."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Match 1: A vs B."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Match 2: C vs D."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.05, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_child_session(store)
+
+    outcome = executor.execute(session, {"description": "list today's matches"})
+
+    assert outcome.status == STATUS_COMPLETED
+    # Nothing streamed to the operator's Telegram.
+    assert notifications == []
+    # Both bodies are present in the text the parent receives.
+    assert "Match 1: A vs B." in outcome.final_text
+    assert "Match 2: C vs D." in outcome.final_text
+    # Audit trail still records the bodies as transcript events.
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert kinds.count("claude_code_notify") == 2
+
+
+def test_build_command_uses_session_model_tier(tmp_path: Path):
+    """A child seeded with claude_code_model='haiku' runs the CLI with
+    --model haiku; the default (None) falls back to opus (#349)."""
+    captured: dict = {}
+
+    def _spawn_capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc([
+            {"type": "system", "subtype": "init", "session_id": "cli-1"},
+            {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "ok"},
+        ])
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
+    session = _seed_child_session(store, claude_code_model="haiku")
+    executor.execute(session, {"description": "simple lookup"})
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "haiku"
+
+
+def test_build_command_defaults_to_opus(tmp_path: Path):
+    captured: dict = {}
+
+    def _spawn_capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc([
+            {"type": "system", "subtype": "init", "session_id": "cli-1"},
+            {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "ok"},
+        ])
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
+    session = _seed_session(store)  # operator session, no tier set
+    executor.execute(session, {"description": "anything"})
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "opus"
 
 
 def test_tool_use_records_transcript_event(tmp_path: Path):

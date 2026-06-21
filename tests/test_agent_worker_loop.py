@@ -496,6 +496,46 @@ def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_completion_summary_flags_escalation_to_child_engine(tmp_path: Path):
+    """When a session delegated work to a claude_code child, the single
+    completion message names the engine + tier so the operator knows the task
+    was escalated and where it ran (#349)."""
+    api = FakeApi(tasks=[])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="Here are today's matches: A vs B at noon.",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    parent = w.session_store.create(task_id="t1", routing="local", expected_output="text")
+    w.session_store.create(
+        task_id="spawn_child", routing="claude_code",
+        parent_session_id=parent.session_id, claude_code_model="haiku",
+    )
+    msg = w._completion_summary(parent, {"id": "t1", "description": "world cup"},
+                                executor.outcome)
+    assert "⤴️ Escalated to Claude Code (haiku)" in msg
+    # The single message still carries the actual result.
+    assert "Here are today's matches" in msg
+
+
+@pytest.mark.unit
+def test_completion_summary_no_escalation_line_without_children(tmp_path: Path):
+    """A session that ran solo (spawned no children) gets no escalation flag."""
+    api = FakeApi(tasks=[])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="Done.",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    sess = w.session_store.create(task_id="t1", routing="local", expected_output="text")
+    msg = w._completion_summary(sess, {"id": "t1", "description": "simple task"},
+                                executor.outcome)
+    assert "Escalated" not in msg
+
+
+@pytest.mark.unit
 def test_completion_summary_includes_init_failed_mcps_footer(tmp_path: Path):
     """When the managed executor reports MCPs that failed to initialize,
     the completion summary appends a "Note: N MCP server(s) unavailable"
