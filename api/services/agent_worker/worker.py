@@ -1327,8 +1327,11 @@ class Worker:
             transcript_store=self.transcript_store,
             notification_callback=notify,
         )
-        self._claude_code_executors[key] = executor
-        return executor
+        # CLI dispatch runs on a thread pool, so two same-bot sessions can reach
+        # here concurrently. The executor is cheap and stateless (per-session
+        # state lives in SessionStore), so the race is benign — setdefault just
+        # makes both callers return the same cached instance (#354 review).
+        return self._claude_code_executors.setdefault(key, executor)
 
     def _dispatch_codex_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='codex'`` session through ``CodexExecutor``.

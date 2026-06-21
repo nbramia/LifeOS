@@ -458,7 +458,7 @@ class TelegramBotListener:
         # Bots that own Claude Code session reply threads: the primary, plus any
         # orchestration bot (e.g. doctor). These run the agent/Claude-Code reply
         # hooks — scoped to their own bot — instead of being pure chat (#348).
-        self._owns_agent_sessions = self._is_primary or getattr(self._bot, "orchestrates", False)
+        self._owns_agent_sessions = self._is_primary or self._bot.orchestrates
         self._token = self._bot.token
         self._chat_id = self._bot.chat_id
         self._persona = self._bot.persona
