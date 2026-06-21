@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-06-18
+**Last Updated:** 2026-06-21
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -56,9 +56,13 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 {
   "question": "What did we discuss in the product meeting?",
   "conversation_id": "optional-uuid",
-  "include_sources": true
+  "include_sources": true,
+  "persona_id": "fitness"
 }
 ```
+
+- `persona_id` (optional) — selects a chat persona by id (see [`GET /api/personas`](#get-apipersonas)). The server applies the same system-prompt preamble the matching Telegram bot uses. Unknown ids return **400**. Omit it for the default (`primary`) persona. A new conversation created in this call is tagged with the persona so it can be filtered later (see [`GET /api/conversations`](#get-apiconversations)).
+- `persona` (optional, internal) — raw preamble text used by the in-process Telegram client. Mutually exclusive with `persona_id` (sending both returns **400**); HTTP clients should use `persona_id`.
 
 **Response:** Server-Sent Events stream with event types:
 
@@ -107,6 +111,25 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `search_memories` | Search previously saved memories |
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
+
+### GET /api/personas
+
+List chat personas available to HTTP clients (web chat, voice/whisper-relay). Returns the `primary` persona plus each configured specialized Telegram bot whose token env is set. No secrets are exposed. Adding a registry entry (`config/telegram_bots.json`) plus its token env var surfaces a new persona after restart — no code change.
+
+**Response:**
+```json
+{
+  "personas": [
+    { "id": "primary", "label": "LifeOS", "capabilities": ["handoff", "agent"] },
+    { "id": "fitness", "label": "Fitness", "capabilities": [] },
+    { "id": "therapist", "label": "Therapist", "capabilities": [] }
+  ]
+}
+```
+
+- `id` — pass as `persona_id` on [`POST /api/ask/stream`](#post-apiaskstream) and as the `persona_id` query param on [`GET /api/conversations`](#get-apiconversations).
+- `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
+- `capabilities` — only `primary` advertises `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns). Specialized personas are pure chat (`[]`).
 
 ### POST /api/chat/handoff
 
@@ -418,7 +441,10 @@ Search memories by keyword.
 
 ### GET /api/conversations
 
-List all conversations (most recent first, up to 50).
+List conversations for a persona (most recent first, up to 50).
+
+**Query params:**
+- `persona_id` (optional, default `"primary"`) — scope to a persona's threads (e.g. `?persona_id=fitness`). Omitting it returns the `primary` persona's threads, preserving web-chat behavior. Persona ids come from [`GET /api/personas`](#get-apipersonas).
 
 **Response:**
 ```json
@@ -429,11 +455,14 @@ List all conversations (most recent first, up to 50).
       "title": "Budget planning",
       "created_at": "2026-06-01T12:00:00",
       "updated_at": "2026-06-01T12:05:00",
-      "message_count": 4
+      "message_count": 4,
+      "persona_id": "primary"
     }
   ]
 }
 ```
+
+Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`.
 
 ### POST /api/conversations
 
@@ -441,7 +470,7 @@ Create new conversation.
 
 ### GET /api/conversations/{id}
 
-Get conversation with messages.
+Get conversation with messages. Access by id is **not** persona-scoped — any valid id resolves regardless of its persona.
 
 **Response:**
 ```json

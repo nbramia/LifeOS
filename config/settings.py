@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,12 +25,29 @@ class TelegramBotConfig:
 
     ``name`` doubles as the per-bot state-file suffix, so it must be filesystem
     safe. ``persona`` is a system-prompt preamble injected for this bot's chats
-    (empty for the primary bot).
+    (empty for the primary bot). ``label`` is an optional human-friendly display
+    name surfaced to HTTP clients; when blank, callers fall back to the
+    capitalized ``name``.
     """
     name: str
     token: str
     chat_id: str
     persona: str = ""
+    label: str = ""
+
+
+# Capabilities advertised to HTTP clients for the primary persona only.
+# Specialized bots are pure chat (no /agent, no engine handoff), matching the
+# Telegram primary-only command surface.
+PRIMARY_PERSONA_CAPABILITIES = ("handoff", "agent")
+
+
+@dataclass(frozen=True)
+class PersonaInfo:
+    """An HTTP-visible chat persona (no secrets) for the discovery endpoint."""
+    id: str
+    label: str
+    capabilities: list = field(default_factory=list)
 
 
 class Settings(BaseSettings):
@@ -746,9 +763,50 @@ class Settings(BaseSettings):
                     persona = Path(persona_file).read_text().strip()
                 except OSError as e:
                     logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
+            label = (entry.get("label") or "").strip()
             seen.add(name)
-            bots.append(TelegramBotConfig(name=name, token=token, chat_id=chat_id, persona=persona))
+            bots.append(TelegramBotConfig(
+                name=name, token=token, chat_id=chat_id, persona=persona, label=label
+            ))
         return bots
+
+    def list_http_personas(self) -> list["PersonaInfo"]:
+        """Chat personas visible to HTTP clients (web, voice/whisper-relay).
+
+        Returns the primary persona plus every configured specialized bot from
+        the registry whose token env is set (``telegram_bots`` already drops the
+        unset ones). No secrets are exposed. Only the primary advertises
+        ``handoff``/``agent`` capabilities; specialized bots are pure chat.
+        Adding a registry entry + its token env var surfaces a new persona on
+        the next restart with no code change.
+        """
+        personas = [PersonaInfo(
+            id="primary",
+            label="LifeOS",
+            capabilities=list(PRIMARY_PERSONA_CAPABILITIES),
+        )]
+        for bot in self.telegram_bots:
+            personas.append(PersonaInfo(
+                id=bot.name,
+                label=bot.label or bot.name.capitalize(),
+                capabilities=[],
+            ))
+        return personas
+
+    def resolve_persona(self, persona_id: str) -> "str | None":
+        """Resolve a persona id to its system-prompt preamble for HTTP clients.
+
+        Same registry source as Telegram, so ``persona_id="fitness"`` yields the
+        exact preamble the fitness Telegram bot uses. ``"primary"`` resolves to
+        an empty preamble (the default, no persona). Returns ``None`` for an
+        unknown id so the caller can reject it with HTTP 400.
+        """
+        if persona_id == "primary":
+            return ""
+        for bot in self.telegram_bots:
+            if bot.name == persona_id:
+                return bot.persona
+        return None
 
     @property
     def photos_db_path(self) -> str:

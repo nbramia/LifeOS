@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-06-18
+> **Last Updated:** 2026-06-21
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -25,7 +25,13 @@ Voice transport in the same GitHub org as LifeOS: [github.com/nbramia/whisper-re
 
 Connects to LifeOS at `LIFEOS_BASE_URL` (default `http://127.0.0.1:8000`), 300s timeout on ask/stream, no auth headers — same trust model as web chat on localhost/Tailscale.
 
-**Endpoints used** (request/response shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`, `GET /api/conversations`, `GET /api/conversations/{id}`.
+**Endpoints used** (request/response shapes: [api-reference.md](../product/api-reference.md)): `GET /api/personas`, `POST /api/ask/stream`, `POST /api/chat/handoff`, `GET /api/conversations`, `GET /api/conversations/{id}`.
+
+**Persona contract** (shared by web and voice; lets a thin client expose LifeOS's multi-bot personas without reading LifeOS config):
+
+- `GET /api/personas` lists selectable personas (`primary` + configured specialized bots). The client renders these as a picker; ids are stable, labels are display-only. Only `primary` carries `handoff`/`agent` capabilities — gate any handoff UI on that.
+- Send the chosen `persona_id` on `POST /api/ask/stream`. The server applies the matching persona preamble and tags a newly created conversation with that persona. Unknown ids and `persona`+`persona_id` together are **400** — surface as a turn-level failure, not a crash.
+- Scope the thread sidebar with `GET /api/conversations?persona_id=<id>`. Omitting the param shows the `primary` persona's threads (default web behavior). Conversation detail (`GET /api/conversations/{id}`) is not persona-scoped — fetch by id directly.
 
 **Consumer-specific behavior** (LifeOS API unchanged; how whisper-relay interprets it):
 
