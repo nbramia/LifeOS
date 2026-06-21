@@ -62,8 +62,13 @@ def spawn_claude_code_session(
     working_dir: str | None = None,
     plan_mode: bool = False,
     chat_id: str | None = None,
+    bot: str | None = None,
 ) -> dict:
     """Create a parentless ``routing='claude_code'`` session.
+
+    ``bot`` tags the session with the Telegram bot that owns its operator-facing
+    notices (NULL = primary). An orchestration bot like the doctor passes its
+    name so the worker routes [NOTIFY]/[CLARIFY]/completion back to that bot.
 
     Returns ``{"ok": True, "session_id", "task_id"}`` on success, or
     ``{"ok": False, "error"}`` when ``prompt`` is empty.
@@ -86,6 +91,7 @@ def spawn_claude_code_session(
         "working_dir": working_dir,
         "plan_mode": bool(plan_mode),
         "chat_id": chat_id,
+        "bot": bot,
     }
     # See operator_spawn for the rationale on enqueueing the prompt before
     # the session row exists.
@@ -99,6 +105,7 @@ def spawn_claude_code_session(
         expected_output="text",
         parent_session_id=None,
         origin="operator",
+        bot=bot,
     )
 
     logger.info(
@@ -121,12 +128,13 @@ def parse_claude_code_spawn_payload(content: str) -> dict:
     try:
         data = json.loads(content)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return {"prompt": content or "", "working_dir": None, "plan_mode": False, "chat_id": None}
+        return {"prompt": content or "", "working_dir": None, "plan_mode": False, "chat_id": None, "bot": None}
     if not isinstance(data, dict) or "prompt" not in data:
-        return {"prompt": content or "", "working_dir": None, "plan_mode": False, "chat_id": None}
+        return {"prompt": content or "", "working_dir": None, "plan_mode": False, "chat_id": None, "bot": None}
     return {
         "prompt": str(data.get("prompt") or ""),
         "working_dir": data.get("working_dir"),
         "plan_mode": bool(data.get("plan_mode")),
         "chat_id": data.get("chat_id"),
+        "bot": data.get("bot"),
     }

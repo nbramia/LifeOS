@@ -212,4 +212,5 @@ If Claude is working in the wrong directory, make your task description more exp
 - [Claude Code Orchestration — Technical](../specs/technical/claude-code-orchestration.md) -- Implementation: subprocess, stream parsing, system prompt, cancellation
 - [Configuration](configuration.md) -- `LIFEOS_CLAUDE_*` env vars
 - [MCP Tools](../specs/product/mcp-tools.md) -- MCP tools available to Claude Code sessions
+- [Doctor Bot](doctor-bot.md) -- The self-repair bot, which drives a Claude Code session per the same orchestration machinery
 - [Scripts Reference](scripts.md) -- All LifeOS scripts with usage examples

@@ -253,6 +253,14 @@ When both are set, Telegram becomes a conversational client (full chat pipeline)
 
 Natural-language messages run through the chat pipeline (search, synthesis, tools).
 
+**Specialized bots** (optional) are separate `@BotFather` bots registered in [`config/telegram_bots.json`](../../config/telegram_bots.json), each with a persona in `config/personas/`. Leave a bot's token unset to not run it. `*_CHAT_ID` is optional and defaults to `TELEGRAM_CHAT_ID`.
+
+| Variable | Bot | Kind |
+|---|---|---|
+| `TELEGRAM_FITNESS_BOT_TOKEN` / `TELEGRAM_FITNESS_CHAT_ID` | `fitness` | Pure chat — clinical training/nutrition logging surface. |
+| `TELEGRAM_THERAPIST_BOT_TOKEN` / `TELEGRAM_THERAPIST_CHAT_ID` | `therapist` | Pure chat — advice-oriented surface grounded in therapy notes. |
+| `TELEGRAM_DOCTOR_BOT_TOKEN` / `TELEGRAM_DOCTOR_CHAT_ID` | `doctor` | **Orchestration** — self-repair surface that files an issue and ships a fix. See [doctor-bot.md](doctor-bot.md). |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |
@@ -325,6 +333,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [First Run](first-run.md) — Post-install verification.
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
+- [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.

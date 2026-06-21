@@ -221,9 +221,9 @@ class Worker:
         # production wiring is explicit in `main()`. The previous default
         # — auto-importing the real Telegram module — leaked a test stub
         # message to a real operator chat once; never again.
-        def _noop_telegram(text, chat_id=None):
+        def _noop_telegram(text, chat_id=None, bot=None):
             return False
-        def _noop_with_id(text):
+        def _noop_with_id(text, chat_id=None, bot=None):
             return []
         self._telegram_send = telegram_send if telegram_send is not None else _noop_telegram
         self._telegram_send_with_id = (
@@ -235,6 +235,11 @@ class Worker:
         self._local_executor = local_executor  # lazily instantiated on first use
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
         self._claude_code_executor = claude_code_executor  # lazily instantiated on first /claude task
+        # Per-bot ClaudeCodeExecutor cache (#348). An orchestration bot (doctor)
+        # needs its [NOTIFY]/[CLARIFY] notices routed to its own Telegram bot, so
+        # each bot gets an executor whose notification_callback is bound to that
+        # bot. Bypassed entirely when a test injects `_claude_code_executor`.
+        self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
         # Spawned CLI children (claude_code/codex) are long-running subprocesses.
         # Running them off the tick keeps the poll loop free to claim new tasks
@@ -1202,8 +1207,20 @@ class Worker:
         )
         from api.services.agent_worker.claude_code_spawn import parse_claude_code_spawn_payload
 
-        claude_code = self._get_claude_code_executor()
+        # The owning bot (NULL = primary) routes every operator-facing notice for
+        # this session — the streaming [NOTIFY]/[CLARIFY] (via the executor's
+        # callback) and the worker-sent block/completion/failure messages below.
+        bot = session.bot
+        claude_code = self._get_claude_code_executor(bot)
         sid = session.session_id
+
+        # Only thread `bot` when set so the primary path's send signature is
+        # byte-identical to before this change (#348). bot=None → primary.
+        def _send(text):
+            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
+
+        def _send_with_id(text):
+            return self._telegram_send_with_id(text, bot=bot) if bot else self._telegram_send_with_id(text)
 
         # Build the task dict + resume message from drained pending messages.
         # Fresh spawns carry the JSON payload produced by spawn_claude_code_session;
@@ -1251,7 +1268,7 @@ class Worker:
             else:
                 prompt = "Awaiting your reply to continue."
             try:
-                sent_ids = self._telegram_send_with_id(prompt) or []
+                sent_ids = _send_with_id(prompt) or []
             except Exception as exc:
                 logger.warning("code blocked reply prompt send failed: %s", exc)
                 sent_ids = []
@@ -1259,7 +1276,8 @@ class Worker:
                 # kind='followup' so _resume_as_followup picks the reply up
                 # alongside agent threads (unified routing model, #248). The
                 # session.routing == 'code' tells _resume_as_followup which
-                # executor branch to take.
+                # executor branch to take. `bot` scopes the reply match so a
+                # doctor reply can't collide with a primary question (#348).
                 self.session_store.create_pending_question(
                     session_id=sid,
                     task_id=session.task_id,
@@ -1267,6 +1285,7 @@ class Worker:
                     sent_message_id=sent_ids[0],
                     sent_message_ids=sent_ids,
                     kind="followup",
+                    bot=bot,
                 )
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
                     "reason": outcome.reason, "message_ids": sent_ids,
@@ -1281,7 +1300,7 @@ class Worker:
             body = outcome.final_text.strip() if outcome.final_text else ""
             if body:
                 try:
-                    sent_ids = self._telegram_send_with_id(body) or []
+                    sent_ids = _send_with_id(body) or []
                 except Exception as exc:
                     logger.warning("code completion send failed: %s", exc)
                     sent_ids = []
@@ -1293,6 +1312,7 @@ class Worker:
                         sent_message_id=sent_ids[0],
                         sent_message_ids=sent_ids,
                         kind="followup",
+                        bot=bot,
                     )
             self.transcript_store.append(sid, "code_handled_completion", {
                 "final_chars": len(body),
@@ -1306,27 +1326,41 @@ class Worker:
         # operator-spawned /claude sessions have no vault row and are no-ops.
         label = "Code session"
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
+            _send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
-            self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+            _send(f"⚠️ {label} failed: {outcome.reason}.")
         self._reconcile_vault_terminal(session, outcome.status)
 
-    def _get_claude_code_executor(self):
+    def _get_claude_code_executor(self, bot: str | None = None):
         """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
 
-        Tests inject one via the constructor; production builds default
-        a ClaudeCodeExecutor wired to the worker's Telegram sender so [NOTIFY]
-        bodies stream live during the subprocess run.
+        Tests inject one via the constructor (returned for every bot). Production
+        builds one executor per owning bot, each wired to a notification callback
+        bound to that bot so [NOTIFY]/[CLARIFY] bodies stream live to the right
+        Telegram surface — the doctor bot's notices go to the doctor bot, not the
+        primary (#348). ``bot=None`` is the primary.
         """
         if self._claude_code_executor is not None:
             return self._claude_code_executor
+        key = bot or "primary"
+        cached = self._claude_code_executors.get(key)
+        if cached is not None:
+            return cached
         from api.services.agent_worker.claude_code_executor import ClaudeCodeExecutor
-        self._claude_code_executor = ClaudeCodeExecutor(
+        # Primary keeps the original callback (byte-identical to pre-#348). An
+        # orchestration bot gets a callback bound to its bot so streaming
+        # [NOTIFY]/[CLARIFY] bodies land on its Telegram surface.
+        notify = (lambda text: self._telegram_send(text, bot=bot)) if bot else self._telegram_send
+        executor = ClaudeCodeExecutor(
             session_store=self.session_store,
             transcript_store=self.transcript_store,
-            notification_callback=self._telegram_send,
+            notification_callback=notify,
         )
-        return self._claude_code_executor
+        # CLI dispatch runs on a thread pool, so two same-bot sessions can reach
+        # here concurrently. The executor is cheap and stateless (per-session
+        # state lives in SessionStore), so the race is benign — setdefault just
+        # makes both callers return the same cached instance (#354 review).
+        return self._claude_code_executors.setdefault(key, executor)
 
     def _dispatch_codex_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='codex'`` session through ``CodexExecutor``.

@@ -25,12 +25,16 @@ class TelegramBotConfig:
 
     ``name`` doubles as the per-bot state-file suffix, so it must be filesystem
     safe. ``persona`` is a system-prompt preamble injected for this bot's chats
-    (empty for the primary bot).
+    (empty for the primary bot). ``orchestrates`` marks a bot that drives Claude
+    Code sessions (e.g. the doctor self-repair bot) instead of being pure chat —
+    such a bot owns its own agent-session reply threads rather than redirecting
+    coding tasks to the primary bot.
     """
     name: str
     token: str
     chat_id: str
     persona: str = ""
+    orchestrates: bool = False
 
 
 class Settings(BaseSettings):
@@ -747,7 +751,10 @@ class Settings(BaseSettings):
                 except OSError as e:
                     logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
             seen.add(name)
-            bots.append(TelegramBotConfig(name=name, token=token, chat_id=chat_id, persona=persona))
+            bots.append(TelegramBotConfig(
+                name=name, token=token, chat_id=chat_id, persona=persona,
+                orchestrates=bool(entry.get("orchestrates", False)),
+            ))
         return bots
 
     @property
