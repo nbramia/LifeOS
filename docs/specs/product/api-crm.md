@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-06-21
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -22,11 +22,10 @@ Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-r
 10. [Family](#family)
 11. [Birthdays](#birthdays)
 12. [Sync Health](#sync-health)
-13. [Cleanup](#cleanup)
-14. [Relationship Insights](#relationship-insights)
-15. [Tone Analysis](#tone-analysis)
-16. [Slack Integration](#slack-integration)
-17. [Contacts Sync](#contacts-sync)
+13. [Relationship Insights](#relationship-insights)
+14. [Tone Analysis](#tone-analysis)
+15. [Slack Integration](#slack-integration)
+16. [Contacts Sync](#contacts-sync)
 
 ---
 
@@ -503,42 +502,6 @@ Get recent sync errors for debugging.
 **Query parameters:**
 - `source` (string): Filter by source
 - `limit` (int): Max results (default: 50)
-
----
-
-## Cleanup
-
-### GET /api/crm/cleanup/queue
-
-Entity cleanup review queue. Returns entities needing human review (duplicates, non-human, over-merged).
-
-**Query parameters:**
-- `review_type` (string): Filter by type (duplicate, non_human, over_merged)
-- `limit` (int): Max results (default: 5000)
-- `offset` (int): Pagination offset
-
-### GET /api/crm/cleanup/stats
-
-Statistics about the cleanup review queue. Returns counts by status and type.
-
-### POST /api/crm/cleanup/{item_id}/skip
-
-Skip a cleanup item (mark as different people / not a duplicate).
-
-### POST /api/crm/cleanup/{item_id}/keep
-
-Keep a non-human candidate as a real person (false positive).
-
-### POST /api/crm/cleanup/{item_id}/hide
-
-Hide a non-human entity and add to blocklist.
-
-### POST /api/crm/cleanup/{item_id}/merge
-
-Merge entities from the cleanup queue.
-
-**Query parameters:**
-- `primary_id` (string): ID of person to keep (required for non_human items)
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-06-21
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -104,8 +104,8 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 03:14          └─ Monarch Money (monthly, runs on 1st only)
 
                === PHASE 6: Post-Sync Cleanup ===
-               Clean up entity data quality issues
-03:15          └─ Entity cleanup (auto-hide non-humans, queue duplicates)
+               Auto-hide obvious non-human entities
+03:15          └─ Entity cleanup (auto-hide non-human entities)
 
 ~03:16         Unified sync complete
 07:00          Post-sync health check (API server)
@@ -126,7 +126,7 @@ The 6-phase structure ensures correct data flow:
 3. **Relationship Building** computes metrics using linked entities
 4. **Vector Store Indexing** indexes content with fresh CRM data available for entity resolution
 5. **Content Sync** pulls external content (indexed on next run)
-6. **Post-Sync Cleanup** cleans up entity data quality issues after all other syncs
+6. **Post-Sync Cleanup** auto-hides obvious non-human entities after all other syncs
 
 **Note:** Apple data (contacts, phone calls, iMessage, photos) is exported from the Mac Mini via the Apple Data Agent (`scripts/apple_data_agent.sh`) at 2:50 AM, before the main pipeline. The export runs on the Mac Mini (which has FDA access) and syncs to the Linux server via rsync.
 
@@ -232,7 +232,7 @@ WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
-| `sync_entity_cleanup.py` | Auto-hide non-humans, queue duplicates for review | `data/crm.db` |
+| `sync_entity_cleanup.py` | Auto-hide obvious non-human entities (noreply@, newsletters) | `data/crm.db` |
 
 ### Unified Sync Runner
 
@@ -379,7 +379,7 @@ The unified sync runner (`run_all_syncs.py`) executes in this order:
 18. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
 
 **Phase 6: Post-Sync Cleanup**
-19. `entity_cleanup` - Auto-hide non-humans, queue duplicates for review
+19. `entity_cleanup` - Auto-hide obvious non-human entities
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

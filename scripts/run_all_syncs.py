@@ -620,7 +620,7 @@ SYNC_ORDER = [
 
     # === Phase 6: Post-Sync Cleanup ===
     # Clean up entity data quality issues after all other syncs
-    "entity_cleanup",           # Auto-hide non-humans, queue duplicates for review
+    "entity_cleanup",           # Auto-hide obvious non-human entities (noreply@, newsletters)
 
     # === Phase 7: Consistency Verification ===
     # Verify cross-store data consistency after all syncs complete

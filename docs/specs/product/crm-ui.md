@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-06-21
 
 LifeOS's Personal CRM is built on top of the [two-tier data model](data-model.md) ([ADR-003](../../adr/003-two-tier-data-model.md)) and provides network management and relationship context across every observed touchpoint with the people in your life. The UI lives at `/crm`; the API lives at `/api/crm/*`.
 
@@ -25,7 +25,7 @@ The CRM is split across four focused specs by feature area — this file is the 
 
 | Spec | Covers |
 |------|--------|
-| [crm-people.md](crm-people.md) | Person list view, detail view, edit flows; the two-tier entity model; contact-source aggregation; split and merge operations; link overrides; cleanup queue; relationship-strength scoring; Dunbar circles; the multi-stage person-facts extraction pipeline. |
+| [crm-people.md](crm-people.md) | Person list view, detail view, edit flows; the two-tier entity model; contact-source aggregation; split and merge operations; link overrides; relationship-strength scoring; Dunbar circles; the multi-stage person-facts extraction pipeline. |
 | [crm-interactions.md](crm-interactions.md) | The interaction timeline and the data-source integrations behind it (Gmail, Calendar, iMessage, Apple Contacts, Slack, WhatsApp, Signal). |
 | [crm-graph.md](crm-graph.md) | The D3 force-directed relationship graph; multi-source `Relationship` model; per-source counts; source-filter UI; edge-weight calculation. |
 | [crm-analytics.md](crm-analytics.md) | Aggregated views: Family Dashboard (`/crm#family`), Me Dashboard (`/me` — the landing page), Birthdays Page (`/birthdays`), Relationship Dashboard (`/relationship`). |
