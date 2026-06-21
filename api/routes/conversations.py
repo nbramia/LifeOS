@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.services.conversation_store import (
-    get_store, generate_title, format_conversation_history
+    get_store, generate_title
 )
 from api.services.hybrid_search import HybridSearch
 from api.services.synthesizer import construct_prompt, get_synthesizer
@@ -36,6 +36,7 @@ class ConversationResponse(BaseModel):
     created_at: str
     updated_at: str
     message_count: int
+    persona_id: str = "primary"
 
 
 class MessageResponse(BaseModel):
@@ -68,14 +69,16 @@ class AskRequest(BaseModel):
 
 
 @router.get("", response_model=ConversationListResponse)
-async def list_conversations():
+async def list_conversations(persona_id: str = "primary"):
     """
-    List all conversations sorted by most recent.
+    List conversations for a persona, sorted by most recent.
 
-    Returns up to 50 conversations with metadata.
+    Returns up to 50 conversations with metadata. ``persona_id`` defaults to
+    ``"primary"`` so web chat (which omits it) keeps seeing its own threads;
+    pass e.g. ``?persona_id=fitness`` to scope to a specialized persona.
     """
     store = get_store()
-    conversations = store.list_conversations()
+    conversations = store.list_conversations(persona_id=persona_id)
 
     return ConversationListResponse(
         conversations=[
@@ -84,7 +87,8 @@ async def list_conversations():
                 title=c.title,
                 created_at=c.created_at.isoformat(),
                 updated_at=c.updated_at.isoformat(),
-                message_count=c.message_count
+                message_count=c.message_count,
+                persona_id=c.persona_id,
             )
             for c in conversations
         ]

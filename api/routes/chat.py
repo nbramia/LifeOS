@@ -791,6 +791,35 @@ def find_task_by_topic(
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+
+class PersonaInfoResponse(BaseModel):
+    """A single HTTP-visible chat persona (no secrets)."""
+    id: str
+    label: str
+    capabilities: list[str] = []
+
+
+class PersonasResponse(BaseModel):
+    """Response for the persona discovery endpoint."""
+    personas: list[PersonaInfoResponse]
+
+
+@router.get("/personas", response_model=PersonasResponse)
+async def list_personas():
+    """List chat personas available to HTTP clients (web, voice/whisper-relay).
+
+    Returns the primary persona plus each configured specialized bot. Adding a
+    registry entry + its token env var surfaces a new persona after restart with
+    no code change. Only the primary advertises handoff/agent capabilities.
+    """
+    return PersonasResponse(
+        personas=[
+            PersonaInfoResponse(id=p.id, label=p.label, capabilities=p.capabilities)
+            for p in settings.list_http_personas()
+        ]
+    )
+
+
 # Attachment configuration
 ALLOWED_MEDIA_TYPES = {
     # Images - 5MB each
@@ -849,6 +878,11 @@ class AskStreamRequest(BaseModel):
     conversation_id: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
     persona: Optional[str] = None
+    # HTTP clients (web, voice) select a persona by id; the server resolves it to
+    # the same preamble the matching Telegram bot uses. The raw `persona` field
+    # above is the internal Telegram path (full preamble text); the two are
+    # mutually exclusive (sending both is a 400 in the route handler).
+    persona_id: Optional[str] = None
 
     @field_validator("persona")
     @classmethod
@@ -981,6 +1015,27 @@ async def ask_stream(request: AskStreamRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    # Resolve persona BEFORE the SSE stream opens so an invalid selection is a
+    # clean 400 rather than a mid-stream error. `persona` (raw preamble text) is
+    # the internal Telegram path; `persona_id` is the HTTP-client path resolved
+    # against the same registry. They are mutually exclusive.
+    persona_preamble = request.persona or ""
+    new_conversation_persona_id = "primary"
+    if request.persona_id is not None:
+        if request.persona is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either persona_id or persona, not both",
+            )
+        resolved = settings.resolve_persona(request.persona_id)
+        if resolved is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown persona_id: {request.persona_id!r}",
+            )
+        persona_preamble = resolved
+        new_conversation_persona_id = request.persona_id
+
     async def generate():
         try:
             # Get or create conversation
@@ -988,8 +1043,9 @@ async def ask_stream(request: AskStreamRequest):
             conversation_id = request.conversation_id
 
             if not conversation_id:
-                # Create new conversation
-                conv = store.create_conversation()
+                # Create new conversation, tagged with the selected persona so
+                # persona-scoped listing (e.g. the voice sidebar) can filter it.
+                conv = store.create_conversation(persona_id=new_conversation_persona_id)
                 conversation_id = conv.id
                 # Generate title from question
                 title = generate_title(request.question)
@@ -1224,7 +1280,7 @@ async def ask_stream(request: AskStreamRequest):
                 model_tier=orchestrator_model,
                 max_tool_rounds=5,
                 model=orchestrator_model if escalated else "",
-                persona=request.persona or "",
+                persona=persona_preamble,
             ):
                 if event["type"] == "text":
                     yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"

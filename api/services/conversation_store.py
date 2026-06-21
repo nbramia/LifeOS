@@ -7,7 +7,7 @@ import sqlite3
 import json
 import uuid
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,6 +32,7 @@ class Conversation:
     created_at: datetime
     updated_at: datetime
     message_count: int = 0
+    persona_id: str = "primary"
 
 
 @dataclass
@@ -72,10 +73,22 @@ class ConversationStore:
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
+                    persona_id TEXT NOT NULL DEFAULT 'primary',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Additive migration for pre-existing databases (#351): tag each
+            # conversation with the persona that owns it. Existing rows backfill
+            # to 'primary' so web/Telegram history is unaffected.
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(conversations)")
+            }
+            if "persona_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE conversations "
+                    "ADD COLUMN persona_id TEXT NOT NULL DEFAULT 'primary'"
+                )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
@@ -97,12 +110,17 @@ class ConversationStore:
         finally:
             conn.close()
 
-    def create_conversation(self, title: Optional[str] = None) -> Conversation:
+    def create_conversation(
+        self,
+        title: Optional[str] = None,
+        persona_id: str = "primary",
+    ) -> Conversation:
         """
         Create a new conversation.
 
         Args:
             title: Optional title (default "New Conversation")
+            persona_id: Persona that owns the thread (default "primary")
 
         Returns:
             Created conversation
@@ -114,8 +132,9 @@ class ConversationStore:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
-                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (conv_id, title, now, now)
+                "INSERT INTO conversations (id, title, persona_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (conv_id, title, persona_id, now, now)
             )
             conn.commit()
         finally:
@@ -126,7 +145,8 @@ class ConversationStore:
             title=title,
             created_at=now,
             updated_at=now,
-            message_count=0
+            message_count=0,
+            persona_id=persona_id,
         )
 
     def get_conversation(self, conv_id: str) -> Optional[Conversation]:
@@ -144,7 +164,7 @@ class ConversationStore:
             cursor = conn.execute(
                 """
                 SELECT c.id, c.title, c.created_at, c.updated_at,
-                       COUNT(m.id) as message_count
+                       COUNT(m.id) as message_count, c.persona_id
                 FROM conversations c
                 LEFT JOIN messages m ON m.conversation_id = c.id
                 WHERE c.id = ?
@@ -162,34 +182,49 @@ class ConversationStore:
                 title=row[1],
                 created_at=datetime.fromisoformat(row[2]) if isinstance(row[2], str) else row[2],
                 updated_at=datetime.fromisoformat(row[3]) if isinstance(row[3], str) else row[3],
-                message_count=row[4]
+                message_count=row[4],
+                persona_id=row[5] or "primary",
             )
         finally:
             conn.close()
 
-    def list_conversations(self, limit: int = 50) -> list[Conversation]:
+    def list_conversations(
+        self,
+        limit: int = 50,
+        persona_id: Optional[str] = None,
+    ) -> list[Conversation]:
         """
-        List all conversations sorted by updated_at desc.
+        List conversations sorted by updated_at desc.
 
         Args:
             limit: Maximum number of conversations to return
+            persona_id: When set, return only threads owned by that persona.
+                When None, return all personas' threads.
 
         Returns:
             List of conversations
         """
+        where = ""
+        params: list = []
+        if persona_id is not None:
+            where = "WHERE c.persona_id = ?"
+            params.append(persona_id)
+        params.append(limit)
+
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT c.id, c.title, c.created_at, c.updated_at,
-                       COUNT(m.id) as message_count
+                       COUNT(m.id) as message_count, c.persona_id
                 FROM conversations c
                 LEFT JOIN messages m ON m.conversation_id = c.id
+                {where}
                 GROUP BY c.id
                 ORDER BY c.updated_at DESC
                 LIMIT ?
                 """,
-                (limit,)
+                params
             )
 
             conversations = []
@@ -199,7 +234,8 @@ class ConversationStore:
                     title=row[1],
                     created_at=datetime.fromisoformat(row[2]) if isinstance(row[2], str) else row[2],
                     updated_at=datetime.fromisoformat(row[3]) if isinstance(row[3], str) else row[3],
-                    message_count=row[4]
+                    message_count=row[4],
+                    persona_id=row[5] or "primary",
                 ))
 
             return conversations

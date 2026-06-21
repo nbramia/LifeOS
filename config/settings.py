@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,16 +25,33 @@ class TelegramBotConfig:
 
     ``name`` doubles as the per-bot state-file suffix, so it must be filesystem
     safe. ``persona`` is a system-prompt preamble injected for this bot's chats
-    (empty for the primary bot). ``orchestrates`` marks a bot that drives Claude
-    Code sessions (e.g. the doctor self-repair bot) instead of being pure chat —
-    such a bot owns its own agent-session reply threads rather than redirecting
-    coding tasks to the primary bot.
+    (empty for the primary bot). ``label`` is an optional human-friendly display
+    name surfaced to HTTP clients; when blank, callers fall back to the
+    capitalized ``name``. ``orchestrates`` marks a bot that drives Claude Code
+    sessions (e.g. the doctor self-repair bot) instead of being pure chat — such
+    a bot owns its own agent-session reply threads rather than redirecting coding
+    tasks to the primary bot.
     """
     name: str
     token: str
     chat_id: str
     persona: str = ""
+    label: str = ""
     orchestrates: bool = False
+
+
+# Capabilities advertised to HTTP clients. The primary persona and any
+# orchestrating bot (e.g. the doctor self-repair bot) drive Claude Code
+# sessions, so they advertise handoff/agent; pure-chat specialized bots do not.
+ORCHESTRATOR_PERSONA_CAPABILITIES = ("handoff", "agent")
+
+
+@dataclass(frozen=True)
+class PersonaInfo:
+    """An HTTP-visible chat persona (no secrets) for the discovery endpoint."""
+    id: str
+    label: str
+    capabilities: list = field(default_factory=list)
 
 
 class Settings(BaseSettings):
@@ -750,12 +767,54 @@ class Settings(BaseSettings):
                     persona = Path(persona_file).read_text().strip()
                 except OSError as e:
                     logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
+            label = (entry.get("label") or "").strip()
             seen.add(name)
             bots.append(TelegramBotConfig(
-                name=name, token=token, chat_id=chat_id, persona=persona,
+                name=name, token=token, chat_id=chat_id, persona=persona, label=label,
                 orchestrates=bool(entry.get("orchestrates", False)),
             ))
         return bots
+
+    def list_http_personas(self) -> list["PersonaInfo"]:
+        """Chat personas visible to HTTP clients (web, voice/whisper-relay).
+
+        Returns the primary persona plus every configured specialized bot from
+        the registry whose token env is set (``telegram_bots`` already drops the
+        unset ones). No secrets are exposed. The primary persona and any
+        orchestrating bot (``orchestrates: true``, e.g. the doctor self-repair
+        bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
+        bots advertise none. Adding a registry entry + its token env var surfaces
+        a new persona on the next restart with no code change.
+        """
+        personas = [PersonaInfo(
+            id="primary",
+            label="LifeOS",
+            capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
+        )]
+        for bot in self.telegram_bots:
+            personas.append(PersonaInfo(
+                id=bot.name,
+                label=bot.label or bot.name.capitalize(),
+                capabilities=(
+                    list(ORCHESTRATOR_PERSONA_CAPABILITIES) if bot.orchestrates else []
+                ),
+            ))
+        return personas
+
+    def resolve_persona(self, persona_id: str) -> "str | None":
+        """Resolve a persona id to its system-prompt preamble for HTTP clients.
+
+        Same registry source as Telegram, so ``persona_id="fitness"`` yields the
+        exact preamble the fitness Telegram bot uses. ``"primary"`` resolves to
+        an empty preamble (the default, no persona). Returns ``None`` for an
+        unknown id so the caller can reject it with HTTP 400.
+        """
+        if persona_id == "primary":
+            return ""
+        for bot in self.telegram_bots:
+            if bot.name == persona_id:
+                return bot.persona
+        return None
 
     @property
     def photos_db_path(self) -> str:
