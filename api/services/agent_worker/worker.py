@@ -24,9 +24,13 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+
+if TYPE_CHECKING:
+    from datetime import datetime
+    from pathlib import Path
 
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
@@ -2129,7 +2133,9 @@ class Worker:
                 # fire still maps to the same file.
                 sched_name = self._resolve_schedule_name(schedule_id)
                 slug = _slugify(sched_name) if sched_name else ""
-                filename = f"{slug}.md" if slug else f"recurring-{schedule_id}.md"
+                # Append the schedule id so two distinct schedules that share a
+                # human name don't interleave into the same note.
+                filename = f"{slug}-{schedule_id}.md" if slug else f"recurring-{schedule_id}.md"
                 file_path = target_dir / filename
                 content = self._recurring_content(
                     file_path, schedule_id, sched_name or title, now, final_text,
@@ -2162,7 +2168,8 @@ class Worker:
         return (rel_path, obsidian_url)
 
     def _recurring_content(
-        self, file_path, schedule_id: str, label: str, now, final_text: str,
+        self, file_path: Path, schedule_id: str, label: str,
+        now: datetime, final_text: str,
     ) -> str:
         """Build the new contents for a recurring schedule's shared note by
         prepending this fire above any existing runs, newest first. Frontmatter

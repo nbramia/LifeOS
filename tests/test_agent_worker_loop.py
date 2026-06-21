@@ -1180,6 +1180,26 @@ def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_failed_task_writes_no_agent_output(tmp_path: Path):
+    """Only successful completions write a note. A FAILED outcome notifies via
+    Telegram but leaves the Agent Output folder untouched (criterion #6)."""
+    from config.settings import settings as _settings
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent and "failed" in sent[0].lower()
+    out_dir = _settings.vault_path / _settings.agent_output_dir
+    assert not out_dir.exists() or not list(out_dir.glob("*.md"))
+
+
+@pytest.mark.unit
 def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     """When final_text is >2000 chars, the worker writes the full body
     to the vault and replaces the inline blob with a short preview +

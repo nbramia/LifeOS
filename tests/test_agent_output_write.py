@@ -111,7 +111,9 @@ def test_recurring_first_run_creates_named_file(worker_and_vault, monkeypatch):
     res = w._write_agent_output(_session(), task, "First run body.")
 
     assert res is not None
-    f = _out_dir(vault) / "weekly-review.md"
+    # Filename is <schedule-slug>-<id>.md so distinct schedules sharing a name
+    # never collide.
+    f = _out_dir(vault) / "weekly-review-ab12cd34.md"
     assert f.exists()
     text = f.read_text(encoding="utf-8")
     assert "schedule_id: ab12cd34" in text
@@ -135,9 +137,11 @@ def test_recurring_second_run_prepends_newest_on_top(worker_and_vault, monkeypat
     assert "OLDER run body." in text
     assert "NEWER run body." in text
     assert text.index("NEWER run body.") < text.index("OLDER run body.")
-    # Exactly one frontmatter block and two dated run headings.
+    # Exactly one frontmatter block and two dated run headings, each closed by
+    # its own `---` rule (criterion #4: prior runs sit below the rule).
     assert text.count("source: agent-worker-recurring") == 1
     assert len(re.findall(r"^## ", text, re.M)) == 2
+    assert len(re.findall(r"^---$", _split_frontmatter(text)[1], re.M)) == 2
 
 
 def test_recurring_preserves_created_date_bumps_updated(worker_and_vault, monkeypatch):
@@ -147,7 +151,7 @@ def test_recurring_preserves_created_date_bumps_updated(worker_and_vault, monkey
     out = _out_dir(vault)
     out.mkdir(parents=True, exist_ok=True)
     # Seed an existing note from an earlier run with an old created date.
-    (out / "weekly-review.md").write_text(
+    (out / "weekly-review-ab12cd34.md").write_text(
         "---\n"
         "schedule: Weekly Review\n"
         "schedule_id: ab12cd34\n"
@@ -162,7 +166,7 @@ def test_recurring_preserves_created_date_bumps_updated(worker_and_vault, monkey
 
     w._write_agent_output(_session(), task, "fresh run")
 
-    text = (out / "weekly-review.md").read_text(encoding="utf-8")
+    text = (out / "weekly-review-ab12cd34.md").read_text(encoding="utf-8")
     fm, _body = _split_frontmatter(text)
     assert "created: 2020-01-01" in fm
     assert "updated: 2020-01-01" not in fm  # bumped to today
