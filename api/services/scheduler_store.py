@@ -990,11 +990,19 @@ class SchedulerScheduler:
         The schedule's executor tag (``local`` / ``cloud`` / ``cloud-haiku`` /
         ``cloud-sonnet``) is passed straight through as a task tag — the agent
         worker's preflight routes on it, so no new execution path is needed.
+
+        For ``cron`` (recurring) schedules we also stamp a ``sched-<id>`` tag.
+        The worker reads it on completion to recognise the task as a recurring
+        fire and append its output to one shared note per schedule, rather than
+        a new note per fire. One-time (``once``) schedules get no such tag — each
+        is a stand-alone task that produces its own note.
         """
         from api.services.task_manager import get_task_manager
         tags = ["agent"]
         if entry.executor:
             tags.append(entry.executor.lstrip("#"))
+        if entry.schedule_type == "cron":
+            tags.append(f"sched-{entry.id}")
         task = get_task_manager().create(
             description=entry.message_content or entry.name,
             tags=tags,
