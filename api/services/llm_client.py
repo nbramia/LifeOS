@@ -23,10 +23,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMUsage:
-    """Token usage from an LLM response."""
+    """Token usage from an LLM response.
+
+    The cache fields are populated only on the Anthropic backend (prompt
+    caching); they stay 0 for the local/OpenAI backend, which has no caching.
+    """
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 @dataclass
@@ -430,13 +436,15 @@ class AnthropicLLMClient:
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
 
-    def _extract_system(self, system: str | list | None) -> str | None:
-        if system is None:
-            return None
-        if isinstance(system, list):
-            return "\n\n".join(
-                block["text"] for block in system if block.get("type") == "text"
-            )
+    def _prepare_system(self, system: str | list | None) -> str | list | None:
+        """Return the ``system`` value for the Anthropic SDK unchanged.
+
+        A list of content blocks is forwarded as-is so the ``cache_control``
+        markers set in build_system_prompt survive to the API and prompt
+        caching stays active across turns. A plain string is returned as-is.
+        (LocalLLMClient flattens a block list to a string instead — the
+        OpenAI-compatible backend has no prompt caching.)
+        """
         return system
 
     def create(
@@ -454,9 +462,9 @@ class AnthropicLLMClient:
             "messages": messages,
             "max_tokens": max_tokens,
         }
-        sys_text = self._extract_system(system)
-        if sys_text:
-            kwargs["system"] = sys_text
+        system_param = self._prepare_system(system)
+        if system_param:
+            kwargs["system"] = system_param
         if tools:
             kwargs["tools"] = tools
         if temperature is not None:
@@ -480,9 +488,9 @@ class AnthropicLLMClient:
             "messages": messages,
             "max_tokens": max_tokens,
         }
-        sys_text = self._extract_system(system)
-        if sys_text:
-            kwargs["system"] = sys_text
+        system_param = self._prepare_system(system)
+        if system_param:
+            kwargs["system"] = system_param
         if tools:
             kwargs["tools"] = tools
         if temperature is not None:
@@ -509,9 +517,9 @@ class AnthropicLLMClient:
             "messages": messages,
             "max_tokens": max_tokens,
         }
-        sys_text = self._extract_system(system)
-        if sys_text:
-            kwargs["system"] = sys_text
+        system_param = self._prepare_system(system)
+        if system_param:
+            kwargs["system"] = system_param
         if tools:
             kwargs["tools"] = tools
         if temperature is not None:
@@ -545,6 +553,8 @@ class AnthropicLLMClient:
                     input_tokens=msg.usage.input_tokens,
                     output_tokens=msg.usage.output_tokens,
                     total_tokens=msg.usage.input_tokens + msg.usage.output_tokens,
+                    cache_creation_input_tokens=getattr(msg.usage, "cache_creation_input_tokens", 0) or 0,
+                    cache_read_input_tokens=getattr(msg.usage, "cache_read_input_tokens", 0) or 0,
                 ),
                 "finish_reason": msg.stop_reason or "end_turn",
             }
@@ -573,6 +583,8 @@ class AnthropicLLMClient:
                 input_tokens=resp.usage.input_tokens,
                 output_tokens=resp.usage.output_tokens,
                 total_tokens=resp.usage.input_tokens + resp.usage.output_tokens,
+                cache_creation_input_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+                cache_read_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
             ),
             model=resp.model,
             finish_reason=resp.stop_reason or "",

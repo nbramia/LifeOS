@@ -476,3 +476,161 @@ class TestDataClasses:
         assert resp.model == ""
         assert resp.finish_reason == ""
         assert resp.tool_calls is None
+
+    def test_llm_usage_cache_fields_default_zero(self):
+        """Cache-token fields default to 0 (only populated on the Anthropic backend)."""
+        from api.services.llm_client import LLMUsage
+        usage = LLMUsage()
+        assert usage.cache_creation_input_tokens == 0
+        assert usage.cache_read_input_tokens == 0
+
+
+# ---- Anthropic prompt caching (#383 Phase 1) ----
+
+
+def _fake_anthropic_usage(*, input_tokens=100, output_tokens=10,
+                          cache_creation=0, cache_read=0):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
+    )
+
+
+class _FakeAnthropicStream:
+    """Minimal async context manager mimicking anthropic's streaming response."""
+
+    def __init__(self, final_message, deltas=None):
+        self._final = final_message
+        self._deltas = deltas or []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for d in self._deltas:
+            yield d
+
+    async def get_final_message(self):
+        return self._final
+
+
+# A block list shaped exactly like build_system_prompt() output: a cached
+# static block followed by an uncached dynamic block.
+_SYSTEM_BLOCKS = [
+    {"type": "text", "text": "STATIC PROMPT", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "Current date/time: ..."},
+]
+_CACHED_TOOLS = [
+    {"name": "search", "description": "d", "input_schema": {"type": "object", "properties": {}},
+     "cache_control": {"type": "ephemeral"}},
+]
+
+
+def _anthropic_client():
+    from api.services.llm_client import AnthropicLLMClient
+    try:
+        return AnthropicLLMClient(api_key="sk-ant-test")
+    except ImportError:
+        pytest.skip("anthropic package not installed")
+
+
+class TestAnthropicCaching:
+    """The Anthropic backend must forward the system block list (and tool
+    cache_control markers) to the SDK unflattened so prompt caching works,
+    and must surface cache-token usage so caching is measurable."""
+
+    def test_create_forwards_system_blocks_unflattened(self):
+        """create() passes the block list through verbatim — NOT a joined string —
+        so the cache_control marker reaches the API."""
+        from types import SimpleNamespace
+        client = _anthropic_client()
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="hi")],
+                usage=_fake_anthropic_usage(cache_read=2600),
+                model="claude-haiku-4-5",
+                stop_reason="end_turn",
+            )
+
+        client._sync_client = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+        resp = client.create([{"role": "user", "content": "hi"}], system=_SYSTEM_BLOCKS)
+
+        # System forwarded as a list, with cache_control intact (the bug was it
+        # got flattened to a "\n\n".join(...) string, dropping cache_control).
+        assert captured["system"] == _SYSTEM_BLOCKS
+        assert captured["system"][0]["cache_control"] == {"type": "ephemeral"}
+        # Cache-read tokens surfaced from the response usage.
+        assert resp.usage.cache_read_input_tokens == 2600
+
+    def test_create_still_accepts_plain_string_system(self):
+        """A plain-string system prompt is forwarded as-is (backward compat)."""
+        from types import SimpleNamespace
+        client = _anthropic_client()
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="ok")],
+                usage=_fake_anthropic_usage(),
+                model="claude-haiku-4-5",
+                stop_reason="end_turn",
+            )
+
+        client._sync_client = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+        client.create([{"role": "user", "content": "hi"}], system="You are helpful.")
+        assert captured["system"] == "You are helpful."
+
+    @pytest.mark.asyncio
+    async def test_astream_forwards_cache_control_and_captures_cache_tokens(self):
+        """The streaming path (used by the chat orchestrator) forwards the system
+        blocks and tool cache_control, and reports cache-read tokens on 'done'."""
+        from types import SimpleNamespace
+        client = _anthropic_client()
+        captured = {}
+
+        final = SimpleNamespace(
+            content=[],
+            usage=_fake_anthropic_usage(input_tokens=120, output_tokens=8, cache_read=2600),
+            stop_reason="end_turn",
+        )
+        delta = SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(text="hello"),
+        )
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            return _FakeAnthropicStream(final, deltas=[delta])
+
+        client._async_client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+
+        events = [
+            e async for e in client.astream(
+                [{"role": "user", "content": "hi"}],
+                system=_SYSTEM_BLOCKS,
+                tools=_CACHED_TOOLS,
+            )
+        ]
+
+        # System + tools forwarded with cache_control intact.
+        assert captured["system"] == _SYSTEM_BLOCKS
+        assert captured["system"][0]["cache_control"] == {"type": "ephemeral"}
+        assert captured["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "hello"
+        done = next(e for e in events if e["type"] == "done")
+        assert done["usage"].cache_read_input_tokens == 2600
