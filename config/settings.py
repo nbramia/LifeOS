@@ -7,6 +7,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import frontmatter
 from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
@@ -38,6 +40,42 @@ class TelegramBotConfig:
     persona: str = ""
     label: str = ""
     orchestrates: bool = False
+    # Parsed from the persona file's optional YAML frontmatter (see _parse_persona).
+    # `voice` rules apply only on voice turns; `model` is an optional per-persona
+    # model preference. Both default to unset and are consumed by the orchestrator,
+    # not here.
+    voice: tuple[str, ...] = ()
+    model: str = ""
+
+
+def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], str]":
+    """Split a persona file into ``(body, voice, model)``.
+
+    Personas may carry a leading YAML frontmatter block (``id`` / ``model`` /
+    ``voice``); only the **body** becomes the system-prompt preamble, so the
+    frontmatter never leaks into the prompt. Files without frontmatter pass
+    through unchanged. The body is returned verbatim (no ``str.format``) so a
+    persona may contain literal ``{...}`` examples. ``voice``/``model`` are parsed
+    for the orchestrator to consume later; they are inert here.
+    """
+    try:
+        post = frontmatter.loads(text)
+    except Exception as e:  # noqa: BLE001 — a malformed persona file must not take down
+        # the whole bot registry (telegram_bots is an uncached property feeding
+        # resolve_persona / list_http_personas). Degrade to the raw file as the preamble.
+        logger.warning(f"persona file {name!r}: frontmatter parse failed ({e}); using the raw file as the preamble")
+        return text.strip(), (), ""
+    meta = post.metadata or {}
+    raw_voice = meta.get("voice") or []
+    if raw_voice and not isinstance(raw_voice, list):
+        logger.warning(f"persona file {name!r}: `voice` must be a YAML list; ignoring {type(raw_voice).__name__}")
+        raw_voice = []
+    voice = tuple(str(v).strip() for v in raw_voice)
+    model = str(meta.get("model") or "").strip()
+    fid = meta.get("id")
+    if fid and name and str(fid) != name:
+        logger.warning(f"persona file id={fid!r} does not match bot name {name!r}")
+    return post.content.strip(), voice, model
 
 
 # Capabilities advertised to HTTP clients. The primary persona and any
@@ -791,11 +829,11 @@ class Settings(BaseSettings):
                 )
                 continue
             chat_id = (env.get(entry.get("chat_id_env", "")) or "").strip() or self.telegram_chat_id
-            persona = ""
+            persona, voice, model = "", (), ""
             persona_file = entry.get("persona_file")
             if persona_file:
                 try:
-                    persona = Path(persona_file).read_text().strip()
+                    persona, voice, model = _parse_persona(Path(persona_file).read_text(), name)
                 except OSError as e:
                     logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
             label = (entry.get("label") or "").strip()
@@ -803,6 +841,7 @@ class Settings(BaseSettings):
             bots.append(TelegramBotConfig(
                 name=name, token=token, chat_id=chat_id, persona=persona, label=label,
                 orchestrates=bool(entry.get("orchestrates", False)),
+                voice=voice, model=model,
             ))
         return bots
 

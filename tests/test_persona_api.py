@@ -138,6 +138,83 @@ class TestResolvePersona:
 
 
 # ---------------------------------------------------------------------------
+# Persona frontmatter loader (#390 Phase 1)
+# ---------------------------------------------------------------------------
+
+class TestPersonaFrontmatter:
+    def test_parse_strips_frontmatter_keeps_body_and_braces(self):
+        from config.settings import _parse_persona
+        text = (
+            "---\n"
+            "id: fitness\n"
+            "model: opus\n"
+            "voice:\n"
+            "  - lead with the number\n"
+            "  - no markdown\n"
+            "---\n\n"
+            'You are the fitness bot. Log `bench 135x8` as {exercise: "bench"}.\n'
+        )
+        body, voice, model = _parse_persona(text, "fitness")
+        assert body.startswith("You are the fitness bot.")
+        assert "---" not in body and "id: fitness" not in body  # frontmatter stripped
+        assert '{exercise: "bench"}' in body  # literal braces survive (no str.format)
+        assert voice == ("lead with the number", "no markdown")
+        assert model == "opus"
+
+    def test_parse_no_frontmatter_passthrough(self):
+        from config.settings import _parse_persona
+        body, voice, model = _parse_persona("Just a body with a {literal} brace.", "x")
+        assert body == "Just a body with a {literal} brace."
+        assert voice == ()
+        assert model == ""
+
+    def test_resolve_persona_returns_body_only(self, tmp_path, monkeypatch):
+        pf = tmp_path / "therapist.md"
+        pf.write_text("---\nid: therapist\nvoice:\n  - calm\n---\n\nADVICE BODY.")
+        reg = _registry(tmp_path, [
+            {"name": "therapist", "token_env": "TG_TH", "persona_file": str(pf)},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_TH", "tok")
+        from config.settings import settings
+        assert settings.resolve_persona("therapist") == "ADVICE BODY."  # no YAML leak
+        bot = settings.telegram_bots[0]
+        assert bot.voice == ("calm",)
+        assert bot.model == ""
+
+    def test_real_persona_files_parse_clean(self):
+        from pathlib import Path
+        from config.settings import _parse_persona
+        files = [f for f in Path("config/personas").glob("*.md") if f.name != "README.md"]
+        assert files, "no persona files found"
+        for f in files:
+            body, _voice, _model = _parse_persona(f.read_text(), f.stem)
+            assert body, f"{f.name}: empty body"
+            assert not body.lstrip().startswith(("---", "id:")), f"{f.name}: frontmatter leaked into body"
+
+    def test_malformed_frontmatter_falls_back_to_raw_body(self):
+        # Invalid YAML must not raise (would 500 every persona request) — degrade gracefully.
+        from config.settings import _parse_persona
+        body, voice, model = _parse_persona("---\nid: x\nvoice: [unterminated\n---\n\nBODY", "x")
+        assert "BODY" in body
+        assert voice == ()
+        assert model == ""
+
+    def test_non_list_voice_is_ignored(self):
+        from config.settings import _parse_persona
+        body, voice, model = _parse_persona("---\nid: x\nvoice: just a scalar\n---\n\nB", "x")
+        assert voice == ()
+        assert body == "B"
+
+    def test_id_mismatch_warns(self, caplog):
+        import logging
+        from config.settings import _parse_persona
+        with caplog.at_level(logging.WARNING):
+            _parse_persona("---\nid: wrong\n---\n\nB", "right")
+        assert any("does not match" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # GET /api/personas
 # ---------------------------------------------------------------------------
 
