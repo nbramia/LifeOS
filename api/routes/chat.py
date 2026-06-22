@@ -22,8 +22,6 @@ from api.services.gmail import GmailService
 from api.services.usage_store import get_usage_store
 from api.services.chat_helpers import (
     expand_followup_query,
-    format_messages_for_synthesis as _format_messages_for_synthesis,
-    format_raw_qa_section as _format_raw_qa_section,
     classify_action_intent,
 )
 from api.services.time_parser import (
@@ -931,32 +929,6 @@ class AskStreamRequest(BaseModel):
         return v
 
 
-class SaveToVaultRequest(BaseModel):
-    """Request for save to vault endpoint.
-
-    Supports two modes:
-    1. Full conversation mode: provide conversation_id
-    2. Single Q&A mode: provide question and answer (backward compatible)
-    """
-    # Content - supports full conversation
-    conversation_id: Optional[str] = None
-    question: Optional[str] = None  # Fallback for single Q&A
-    answer: Optional[str] = None
-
-    # User customization
-    title: Optional[str] = None
-    folder: Optional[str] = None
-    tags: Optional[list[str]] = None
-
-    # Content toggles
-    include_sources: bool = True
-    include_raw_qa: bool = False
-    full_conversation: bool = True
-
-    # Custom guidance
-    guidance: Optional[str] = None
-
-
 async def _handle_agent_slash(stripped: str, conversation_id, store):
     """Stream the SSE response for a `/agent [local|claude] <task>` chat command.
 
@@ -1415,155 +1387,6 @@ async def ask_stream(request: AskStreamRequest):
             "Connection": "keep-alive",
         }
     )
-
-
-@router.post("/save-to-vault")
-async def save_to_vault(request: SaveToVaultRequest):
-    """
-    Save conversation to vault as a note.
-
-    Supports two modes:
-    1. Full conversation mode: provide conversation_id to save entire thread
-    2. Single Q&A mode: provide question and answer (backward compatible)
-
-    Additional options:
-    - title: Override auto-generated title
-    - folder: Override auto-detected folder
-    - tags: Include specific tags in frontmatter
-    - guidance: Custom instructions for synthesis
-    - include_sources: Include source references in prompt
-    - include_raw_qa: Append raw conversation to note
-    """
-    # Determine content source: conversation or single Q&A
-    conversation_text = None
-    raw_messages = []
-
-    if request.full_conversation and request.conversation_id:
-        # Full conversation mode
-        store = get_store()
-        messages = store.get_messages(request.conversation_id)
-        if not messages:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        conversation_text = _format_messages_for_synthesis(messages, request.include_sources)
-        raw_messages = messages
-    elif request.question and request.answer and request.question.strip() and request.answer.strip():
-        # Single Q&A mode (backward compatible)
-        conversation_text = f"Question: {request.question}\n\nAnswer: {request.answer}"
-        # Create fake message objects for raw Q&A if needed
-        from api.services.conversation_store import Message
-        raw_messages = [
-            Message(id="", conversation_id="", role="user", content=request.question,
-                    created_at=datetime.now(), sources=None, routing=None),
-            Message(id="", conversation_id="", role="assistant", content=request.answer,
-                    created_at=datetime.now(), sources=None, routing=None),
-        ]
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Either conversation_id or both question and answer are required"
-        )
-
-    try:
-        synthesizer = get_synthesizer()
-
-        # Build synthesis prompt
-        prompt_parts = [
-            "Based on this conversation, create a well-structured note for my Obsidian vault.",
-            "",
-            "Conversation:",
-            conversation_text,
-            "",
-        ]
-
-        # Add custom guidance if provided
-        if request.guidance:
-            prompt_parts.extend([
-                "Additional guidance:",
-                request.guidance,
-                "",
-            ])
-
-        # Add tags hint if provided
-        if request.tags:
-            prompt_parts.extend([
-                f"Include these tags in the frontmatter: {', '.join(request.tags)}",
-                "",
-            ])
-
-        prompt_parts.extend([
-            "Create a note with:",
-            "1. A clear, concise title (not 'Q&A' or 'Conversation')",
-            "2. YAML frontmatter with: created date, source: lifeos, relevant tags",
-            "3. A TL;DR section at the top",
-            "4. Well-organized content (not just the raw Q&A)",
-            "5. Any relevant insights or key takeaways",
-            "",
-            "Output ONLY the markdown content for the note, starting with the frontmatter.",
-        ])
-
-        save_prompt = "\n".join(prompt_parts)
-
-        # Get synthesized note content
-        note_content = await synthesizer.get_response(save_prompt)
-
-        # Append raw Q&A if requested
-        if request.include_raw_qa and raw_messages:
-            note_content += _format_raw_qa_section(raw_messages)
-
-        # Determine title: user override or extract from content
-        if request.title:
-            title = request.title
-        else:
-            # Extract title from frontmatter or first heading
-            lines = note_content.split('\n')
-            title = "LifeOS Note"
-            for line in lines:
-                if line.startswith('# '):
-                    title = line[2:].strip()
-                    break
-                if line.startswith('title:'):
-                    title = line.split(':', 1)[1].strip().strip('"\'')
-                    break
-
-        # Clean filename
-        safe_title = "".join(c for c in title if c.isalnum() or c in ' -_').strip()
-        safe_title = safe_title[:50]  # Limit length
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-        filename = f"{safe_title} ({timestamp}).md"
-
-        # Determine folder: user override or auto-detect
-        if request.folder:
-            folder = request.folder
-        else:
-            folder = "LifeOS/Research"  # Default
-            lower_content = note_content.lower()
-            if any(word in lower_content for word in ['meeting', 'calendar', 'schedule']):
-                folder = "LifeOS/Meetings"
-            elif any(word in lower_content for word in ['todo', 'action', 'task']):
-                folder = "LifeOS/Actions"
-            elif any(word in lower_content for word in ['person', 'about', 'briefing']):
-                folder = "LifeOS/People"
-
-        # Write to vault
-        vault_path = settings.vault_path
-        note_path = vault_path / folder / filename
-
-        note_path.parent.mkdir(parents=True, exist_ok=True)
-        note_path.write_text(note_content)
-
-        # Return obsidian link
-        from urllib.parse import quote
-        vault_name = quote(vault_path.name)
-        obsidian_url = f"obsidian://open?vault={vault_name}&file={folder}/{filename}"
-
-        return {
-            "status": "saved",
-            "path": str(note_path),
-            "obsidian_url": obsidian_url,
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save: {e}")
 
 
 class HandoffRequest(BaseModel):

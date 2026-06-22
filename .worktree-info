@@ -1,0 +1,5 @@
+NAME=feat/chat-persona-picker
+BRANCH=feat/chat-persona-picker
+API_PORT=8100
+CHROMA_PORT=8200
+CREATED_AT=2026-06-22T02:52:25Z

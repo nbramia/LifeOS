@@ -38,17 +38,6 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 - Mobile-responsive layout
 - Status indicator (ready/loading/error)
 
-### P2.2: Save to Vault
-
-**Status:** Complete
-
-**Features:**
-- "Save to vault" button on assistant responses
-- Claude synthesizes save-worthy content (not raw chat)
-- Determines folder based on topic
-- Writes formatted markdown with YAML frontmatter
-- Confirms save with link to new note
-
 ### P2.3: Stakeholder Briefings
 
 **Status:** Complete

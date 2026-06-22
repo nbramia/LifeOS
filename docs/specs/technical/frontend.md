@@ -51,7 +51,7 @@ LifeOS uses vanilla HTML/JavaScript with no build step. Both UIs are single-page
 │  ...            │  ┌────────────────────────────────────┐   │
 │                 │  │ Assistant: Here are your events... │   │
 │                 │  │ [Sources: event1.md, event2.md]    │   │
-│                 │  │ [Save to Vault] [Remember]         │   │
+│                 │  │ [Remember]                         │   │
 │                 │  └────────────────────────────────────┘   │
 │                 │                                           │
 ├─────────────────┴───────────────────────────────────────────┤
