@@ -429,7 +429,7 @@ async def run_agent_loop(
         Dicts with "type" key: "text", "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
-    system_prompt = build_system_prompt(persona=persona)
+    system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds)
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
     # sending any draft created during this same turn — sends require the user
