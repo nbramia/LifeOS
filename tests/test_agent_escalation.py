@@ -14,6 +14,7 @@ import pytest
 
 from api.services.agent_loop import (
     parse_engine_directive,
+    resolve_model_alias,
     resolve_orchestrator_model,
     should_escalate,
     _select_client,
@@ -467,3 +468,36 @@ def test_select_client_ignores_model_on_local_backend(monkeypatch):
     monkeypatch.setattr("api.services.agent_loop.get_local_llm", lambda: sentinel)
     # Even with a model requested, the local backend uses the singleton.
     assert _select_client("claude-opus-4-8") is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Model picker: resolve_model_alias + per-turn local ("Gemma")
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,expected", [
+    ("haiku", "claude-haiku-4-5"),
+    ("sonnet", "claude-sonnet-4-6"),
+    ("opus", "claude-opus-4-8"),
+    ("Opus", "claude-opus-4-8"),            # case-insensitive
+    ("claude-opus-4-8", "claude-opus-4-8"),  # a full id passes through
+    ("", ""),
+])
+def test_resolve_model_alias(name, expected):
+    assert resolve_model_alias(name) == expected
+
+
+def test_force_local_builds_local_client_on_anthropic_backend(monkeypatch):
+    # The "Gemma" picker option runs a turn on the local llama-server even though
+    # the global backend is Anthropic.
+    monkeypatch.setattr("api.services.agent_loop.settings.llm_backend", "anthropic", raising=False)
+    client = _select_client("", force_local=True)
+    from api.services.llm_client import LocalLLMClient
+    assert isinstance(client, LocalLLMClient)
+
+
+def test_force_local_reuses_singleton_on_local_backend(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr("api.services.agent_loop.settings.llm_backend", "local", raising=False)
+    monkeypatch.setattr("api.services.agent_loop.get_local_llm", lambda: sentinel)
+    # Already local — reuse the singleton rather than build another client.
+    assert _select_client("", force_local=True) is sentinel

@@ -15,7 +15,7 @@ import { setStoredConversationId } from './backend.js';
 // stops immediately (used for the server-`error` path). `personaId`/`backend`
 // are reserved for follow-ons and omitted from the body when unset, so today's
 // request is byte-identical.
-export async function askStream({ question, conversationId, attachments, personaId, backend, on }) {
+export async function askStream({ question, conversationId, attachments, personaId, backend, model, on }) {
   const body = { question };
   if (conversationId) {
     body.conversation_id = conversationId;
@@ -35,6 +35,9 @@ export async function askStream({ question, conversationId, attachments, persona
   // /api/ask/stream exactly as before.
   const isAgent = backend === 'agent';
   if (!isAgent && personaId != null) body.persona_id = personaId;
+  // Per-turn model picker (lifeos backend only). 'auto' is the default — omit
+  // it so the request stays byte-identical for users who never touch the picker.
+  if (!isAgent && model && model !== 'auto') body.model_override = model;
 
   const response = await fetch(isAgent ? endpoints.agentAsk : endpoints.ask, {
     method: 'POST',
@@ -127,6 +130,7 @@ export async function sendMessage() {
       attachments: messageAttachments,
       personaId: config.personaId,
       backend: config.backend,
+      model: config.model,
       on: (data) => {
         if (data.type === 'routing') {
           // Capture which sources are being used
