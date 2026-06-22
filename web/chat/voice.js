@@ -16,6 +16,7 @@
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, setStatus } from './thread.js';
 import { loadConversations } from './conversations.js';
+import { setStoredConversationId } from './backend.js';
 
 const VOICE_MODE_KEY = 'lifeos:chat:voice_mode';
 const DOCK_SETTINGS_KEY = 'lifeos:chat:dock_settings';
@@ -442,6 +443,7 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
 
     if (data.conversation_id) {
       state.currentConversationId = data.conversation_id;
+      setStoredConversationId(data.conversation_id);  // per-backend persistence
       loadConversations();
     }
     clearThinking();
