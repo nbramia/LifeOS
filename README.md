@@ -243,7 +243,7 @@ flowchart LR
 
     subgraph P6["6: Cleanup"]
         direction TB
-        Clean["Entity cleanup\n& dedup"]
+        Clean["Entity cleanup\n(auto-hide)"]
     end
 
     subgraph P7["7: Verify"]
@@ -259,7 +259,7 @@ flowchart LR
 2. Entity Processing must complete before Relationship Building has linked entities
 3. Relationship Building must complete before Vector Indexing has fresh CRM data
 4. Content Sync runs last (indexed on next cycle)
-5. Entity Cleanup auto-hides non-humans and queues duplicates for review
+5. Entity Cleanup auto-hides obvious non-human entities (noreply@, newsletters)
 6. Consistency Verification checks orphaned records, stale merged IDs, and stats mismatches
 
 </details>

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-06-21
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -24,8 +24,7 @@ See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover in
 10. [Link Overrides](#link-overrides)
 11. [Split Modal UI](#split-modal-ui)
 12. [Merge Toolbar](#merge-toolbar)
-13. [Cleanup Modal](#cleanup-modal)
-14. [Person Facts Pipeline](#person-facts-pipeline)
+13. [Person Facts Pipeline](#person-facts-pipeline)
 
 ---
 
@@ -405,18 +404,6 @@ Multi-select people from the list view and perform bulk merge or hide operations
 - Checkbox on each person card for multi-selection.
 - A floating toolbar appears when 1+ people are selected, showing the count and action buttons.
 - **Actions:** Merge selected (combines into one PersonEntity), Hide selected (soft-deletes), Clear selection.
-
----
-
-## Cleanup Modal
-
-A review queue for data-quality issues. Three tabs:
-
-- **Duplicates** — People that may be the same person (fuzzy name match, shared identifiers). Actions: merge or dismiss.
-- **Non-Human** — Entities detected as non-person (mailing lists, bots, system addresses). Actions: hide or dismiss.
-- **Over-Merged** — People with suspiciously many identifiers that may be incorrectly merged. Actions: split or dismiss.
-
-Each tab shows a count badge. Items sourced from `api/services/review_queue.py` via `GET /api/crm/cleanup/pending`.
 
 ---
 
