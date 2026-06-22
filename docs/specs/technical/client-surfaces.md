@@ -62,6 +62,8 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 Web chat implements voice mode in `web/chat/voice.js` — a faithful port of whisper-relay's `static/app.js` turn lifecycle (Voice|Text toggle, hold-to-talk, render the transcript + response from the `done` data, sequential audio queue, cancel via `AbortController`), adapted to LifeOS state and same-origin endpoints. The mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
+**Agent text backend.** Both modes carry a `backend` (`lifeos` | `agent`). The `agent` backend is the OpenClaw voice-adapter, which speaks the same `/api/ask/stream` SSE contract at `LIFEOS_AGENT_BACKEND_URL` and may require a bearer token. LifeOS proxies it at `POST /api/agent/ask/stream` (`api/routes/agent_proxy.py`), **adding the bearer server-side** so it never reaches the browser; `GET /api/agent/status` reports whether it's configured (drives the UI toggle). The agent backend has no personas and no handoff. Conversation ids are stored per backend in `sessionStorage` (`lifeos:chat:conv:agent`, and `lifeos:chat:conv:lifeos:<persona>` for lifeos) so switching and refreshing continues the right thread. `web/chat/backend.js` owns the toggle + per-backend conversation persistence.
+
 ---
 
 ## Before changing chat or conversation APIs
