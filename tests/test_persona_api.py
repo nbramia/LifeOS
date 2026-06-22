@@ -160,6 +160,18 @@ class TestPersonasEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/chat/config
+# ---------------------------------------------------------------------------
+
+class TestChatConfigEndpoint:
+    def test_default_voice_reflects_setting(self, client, monkeypatch):
+        monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", False, raising=False)
+        assert client.get("/api/chat/config").json() == {"default_voice": False}
+        monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
+        assert client.get("/api/chat/config").json() == {"default_voice": True}
+
+
+# ---------------------------------------------------------------------------
 # persona_id resolution on POST /api/ask/stream
 # ---------------------------------------------------------------------------
 

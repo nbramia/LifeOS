@@ -525,53 +525,6 @@
             color: var(--text-secondary);
         }
 
-        .meta-actions {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .save-btn {
-            padding: 0.375rem 0.75rem;
-            background: transparent;
-            border: 1px solid var(--accent);
-            border-radius: 6px;
-            color: var(--accent);
-            font-size: 0.75rem;
-            cursor: pointer;
-            transition: all 0.2s;
-            min-height: 32px;
-        }
-
-        .save-btn:hover {
-            background: var(--accent);
-            color: white;
-        }
-
-        .save-btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .save-btn.saved {
-            background: var(--success);
-            border-color: var(--success);
-            color: white;
-        }
-
-        .save-btn.hidden {
-            display: none;
-        }
-
-        .saved-link {
-            background: rgba(76, 175, 80, 0.15) !important;
-            border: 1px solid var(--success) !important;
-            color: var(--success) !important;
-        }
-
-        .saved-link:hover {
-            background: rgba(76, 175, 80, 0.25) !important;
-        }
-
         /* Remember button */
         .remember-btn {
             padding: 0.375rem 0.75rem;
@@ -805,96 +758,6 @@
             background: rgba(244, 67, 54, 0.1);
             border: 1px solid var(--error);
             color: var(--error);
-        }
-
-        /* Save to Vault modal styles */
-        .save-vault-modal {
-            max-width: 500px;
-        }
-
-        .save-vault-modal .form-group {
-            margin-bottom: 1rem;
-        }
-
-        .save-vault-modal .form-group label {
-            display: block;
-            font-size: 0.875rem;
-            font-weight: 500;
-            color: var(--text-primary);
-            margin-bottom: 0.375rem;
-        }
-
-        .save-vault-modal .form-group input[type="text"],
-        .save-vault-modal .form-group select,
-        .save-vault-modal .form-group textarea {
-            width: 100%;
-            padding: 0.625rem 0.75rem;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            font-size: 0.875rem;
-            font-family: inherit;
-        }
-
-        .save-vault-modal .form-group input[type="text"]:focus,
-        .save-vault-modal .form-group select:focus,
-        .save-vault-modal .form-group textarea:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 2px rgba(111, 158, 211, 0.2);
-        }
-
-        .save-vault-modal .form-group input::placeholder,
-        .save-vault-modal .form-group textarea::placeholder {
-            color: var(--text-muted);
-        }
-
-        .save-vault-modal .form-group select {
-            cursor: pointer;
-            appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238a8a8a' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
-            background-repeat: no-repeat;
-            background-position: right 0.75rem center;
-            padding-right: 2rem;
-        }
-
-        .save-vault-modal .toggle-group {
-            padding: 0.5rem 0;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .save-vault-modal .toggle-group:last-of-type {
-            border-bottom: none;
-            margin-bottom: 1rem;
-        }
-
-        .save-vault-modal .toggle-label {
-            display: flex;
-            align-items: flex-start;
-            gap: 0.75rem;
-            cursor: pointer;
-        }
-
-        .save-vault-modal .toggle-label input[type="checkbox"] {
-            margin-top: 0.125rem;
-            width: 1rem;
-            height: 1rem;
-            accent-color: var(--accent);
-            cursor: pointer;
-        }
-
-        .save-vault-modal .toggle-text {
-            font-weight: 500;
-            color: var(--text-primary);
-            font-size: 0.875rem;
-        }
-
-        .save-vault-modal .toggle-hint {
-            display: block;
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            margin-top: 0.125rem;
         }
 
         /* Usage modal specific styles */
@@ -3042,84 +2905,6 @@
         </div>
     </div>
 
-    <!-- Save to Vault Modal -->
-    <div class="modal-overlay" id="saveVaultModal">
-        <div class="modal save-vault-modal">
-            <div class="modal-header">
-                <h3>Save to Vault</h3>
-                <button class="modal-close" onclick="closeSaveVaultModal()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <p>Customize how this conversation is saved to your Obsidian vault.</p>
-
-                <!-- Title -->
-                <div class="form-group">
-                    <label for="vaultTitle">Title</label>
-                    <input type="text" id="vaultTitle" placeholder="Auto-generated from content">
-                </div>
-
-                <!-- Folder -->
-                <div class="form-group">
-                    <label for="vaultFolder">Folder</label>
-                    <select id="vaultFolder">
-                        <option value="">Auto-detect</option>
-                        <option value="LifeOS/Research">LifeOS/Research</option>
-                        <option value="LifeOS/Meetings">LifeOS/Meetings</option>
-                        <option value="LifeOS/Actions">LifeOS/Actions</option>
-                        <option value="LifeOS/People">LifeOS/People</option>
-                    </select>
-                </div>
-
-                <!-- Tags -->
-                <div class="form-group">
-                    <label for="vaultTags">Tags</label>
-                    <input type="text" id="vaultTags" placeholder="Comma-separated (e.g., python, tutorial)">
-                </div>
-
-                <!-- Toggles -->
-                <div class="form-group toggle-group">
-                    <label class="toggle-label">
-                        <input type="checkbox" id="vaultFullConversation" checked>
-                        <span class="toggle-text">Full conversation</span>
-                        <span class="toggle-hint">Save entire thread vs. just last exchange</span>
-                    </label>
-                </div>
-
-                <div class="form-group toggle-group">
-                    <label class="toggle-label">
-                        <input type="checkbox" id="vaultIncludeSources" checked>
-                        <span class="toggle-text">Include sources</span>
-                        <span class="toggle-hint">Include retrieved sources/references</span>
-                    </label>
-                </div>
-
-                <div class="form-group toggle-group">
-                    <label class="toggle-label">
-                        <input type="checkbox" id="vaultIncludeRawQA">
-                        <span class="toggle-text">Include raw Q&A</span>
-                        <span class="toggle-hint">Append original conversation verbatim</span>
-                    </label>
-                </div>
-
-                <!-- Custom Guidance -->
-                <div class="form-group">
-                    <label for="vaultGuidance">Custom guidance</label>
-                    <textarea
-                        id="vaultGuidance"
-                        placeholder="e.g., Focus on the technical implementation details..."
-                        rows="3"
-                    ></textarea>
-                </div>
-
-                <div id="vaultStatus"></div>
-            </div>
-            <div class="modal-footer">
-                <button class="modal-btn modal-btn-cancel" onclick="closeSaveVaultModal()">Cancel</button>
-                <button class="modal-btn modal-btn-save" id="saveVaultBtn" onclick="submitSaveVault()">Save to Vault</button>
-            </div>
-        </div>
-    </div>
-
     <!-- Review Queue Modal -->
     <div class="modal-overlay" id="reviewQueueModal">
         <div class="modal review-modal">
@@ -3225,6 +3010,7 @@
                     voice: '/api/voice',
                     agentAsk: '/api/agent/ask/stream',
                     agentStatus: '/api/agent/status',
+                    chatConfig: '/api/chat/config',
                 },
                 hooks: { onAgentThreadReply: sendThreadReply },
             });
@@ -3521,139 +3307,6 @@
             });
         }
 
-        // Save to Vault modal state
-        let saveVaultContext = {
-            button: null,
-            question: '',
-            answer: ''
-        };
-
-        function openSaveVaultModal(btn) {
-            const msg = btn.closest('.message');
-            const content = msg.querySelector('.message-content').textContent;
-
-            // Find corresponding user message
-            let userContent = '';
-            let prev = msg.previousElementSibling;
-            while (prev) {
-                if (prev.classList.contains('user')) {
-                    userContent = prev.querySelector('.message-content').textContent;
-                    break;
-                }
-                prev = prev.previousElementSibling;
-            }
-
-            // Store context for submission
-            saveVaultContext = {
-                button: btn,
-                question: userContent,
-                answer: content
-            };
-
-            // Reset form to defaults
-            document.getElementById('vaultTitle').value = '';
-            document.getElementById('vaultFolder').value = '';
-            document.getElementById('vaultTags').value = '';
-            document.getElementById('vaultFullConversation').checked = true;
-            document.getElementById('vaultIncludeSources').checked = true;
-            document.getElementById('vaultIncludeRawQA').checked = false;
-            document.getElementById('vaultGuidance').value = '';
-            document.getElementById('vaultStatus').innerHTML = '';
-            document.getElementById('saveVaultBtn').disabled = false;
-            document.getElementById('saveVaultBtn').textContent = 'Save to Vault';
-
-            // Show modal
-            document.getElementById('saveVaultModal').classList.add('visible');
-            document.getElementById('vaultTitle').focus();
-        }
-
-        function closeSaveVaultModal() {
-            document.getElementById('saveVaultModal').classList.remove('visible');
-            saveVaultContext = { button: null, question: '', answer: '' };
-        }
-
-        async function submitSaveVault() {
-            const statusEl = document.getElementById('vaultStatus');
-            const saveBtn = document.getElementById('saveVaultBtn');
-
-            saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
-            statusEl.innerHTML = '';
-
-            // Gather form values
-            const title = document.getElementById('vaultTitle').value.trim() || null;
-            const folder = document.getElementById('vaultFolder').value || null;
-            const tagsInput = document.getElementById('vaultTags').value.trim();
-            const tags = tagsInput ? tagsInput.split(',').map(t => t.trim()).filter(t => t) : null;
-            const fullConversation = document.getElementById('vaultFullConversation').checked;
-            const includeSources = document.getElementById('vaultIncludeSources').checked;
-            const includeRawQA = document.getElementById('vaultIncludeRawQA').checked;
-            const guidance = document.getElementById('vaultGuidance').value.trim() || null;
-
-            // Build request body
-            const body = {
-                include_sources: includeSources,
-                include_raw_qa: includeRawQA,
-                full_conversation: fullConversation
-            };
-
-            // Use conversation_id if available and full conversation mode
-            if (fullConversation && chatState.currentConversationId) {
-                body.conversation_id = chatState.currentConversationId;
-            } else {
-                // Fallback to single Q&A
-                body.question = saveVaultContext.question;
-                body.answer = saveVaultContext.answer;
-            }
-
-            if (title) body.title = title;
-            if (folder) body.folder = folder;
-            if (tags) body.tags = tags;
-            if (guidance) body.guidance = guidance;
-
-            try {
-                const response = await fetch('/api/save-to-vault', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
-                });
-
-                if (response.ok) {
-                    const data = await response.json();
-
-                    // Show success in modal
-                    statusEl.innerHTML = `<div class="modal-status success">Saved successfully!</div>`;
-
-                    // Update the original button to show saved state
-                    if (saveVaultContext.button) {
-                        const metaActions = saveVaultContext.button.closest('.meta-actions');
-                        if (metaActions && data.obsidian_url) {
-                            const fileName = data.path.split('/').pop();
-                            metaActions.innerHTML = `
-                                <a href="${data.obsidian_url}" class="source-link saved-link" title="Open in Obsidian">
-                                    ✓ Saved: ${fileName}
-                                </a>
-                            `;
-                        }
-                    }
-
-                    // Close modal after brief delay
-                    setTimeout(() => {
-                        closeSaveVaultModal();
-                    }, 1000);
-                } else {
-                    const errorData = await response.json().catch(() => ({}));
-                    const errorMsg = errorData.detail || 'Failed to save note';
-                    throw new Error(errorMsg);
-                }
-            } catch (error) {
-                console.error('Save error:', error);
-                statusEl.innerHTML = `<div class="modal-status error">Error: ${error.message}</div>`;
-                saveBtn.disabled = false;
-                saveBtn.textContent = 'Save to Vault';
-            }
-        }
-
         // Remember modal functions
         function openRememberModal() {
             document.getElementById('rememberModal').classList.add('visible');
@@ -3723,14 +3376,12 @@
             // Check if any modal is open
             const rememberModalOpen = document.getElementById('rememberModal').classList.contains('visible');
             const usageModalOpen = document.getElementById('usageModal').classList.contains('visible');
-            const saveVaultModalOpen = document.getElementById('saveVaultModal').classList.contains('visible');
-            const anyModalOpen = rememberModalOpen || usageModalOpen || saveVaultModalOpen;
+            const anyModalOpen = rememberModalOpen || usageModalOpen;
 
             // Escape - close any open modal
             if (e.key === 'Escape') {
                 if (rememberModalOpen) closeRememberModal();
                 if (usageModalOpen) closeUsageModal();
-                if (saveVaultModalOpen) closeSaveVaultModal();
                 return;
             }
 
@@ -3741,15 +3392,6 @@
                 return;
             }
 
-            // Enter - submit save vault when Save Vault modal is open (only if not in textarea)
-            if (e.key === 'Enter' && !e.shiftKey && saveVaultModalOpen) {
-                const activeElement = document.activeElement;
-                if (activeElement.tagName !== 'TEXTAREA') {
-                    e.preventDefault();
-                    submitSaveVault();
-                    return;
-                }
-            }
 
             // Don't handle other shortcuts if a modal is open
             if (anyModalOpen) return;
