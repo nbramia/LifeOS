@@ -182,7 +182,7 @@ export async function sendMessage() {
           // Add sources and meta to message
           const msgEl = document.getElementById(msgId);
           if (msgEl) {
-            let metaHtml = '<div class="message-meta">';
+            let metaHtml = '';
 
             // Show routing sources used
             if (routingSources.length > 0) {
@@ -229,17 +229,15 @@ export async function sendMessage() {
               metaHtml += '</div>';
             }
 
-            metaHtml += `
-                                            <div class="meta-actions">
-                                                <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
-                                            </div>
-                                        </div>`;
-
             // Remove any existing meta
             const existingMeta = msgEl.querySelector('.message-meta');
             if (existingMeta) existingMeta.remove();
 
-            msgEl.insertAdjacentHTML('beforeend', metaHtml);
+            // Only render the meta block when there's something to show
+            // (routing sources or vault sources); no save-to-vault button.
+            if (metaHtml) {
+              msgEl.insertAdjacentHTML('beforeend', `<div class="message-meta">${metaHtml}</div>`);
+            }
           }
 
           loadConversations();

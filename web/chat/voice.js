@@ -132,12 +132,26 @@ function isVoiceMode() {
   return config.voiceMode === true;
 }
 
-function readVoiceMode() {
+// Resolve the initial input mode. Precedence: an explicit URL param
+// (/chat?mode=voice | /chat?mode=text), which also sticks; then the stored
+// preference; otherwise VOICE is the default.
+function resolveInitialVoiceMode() {
   try {
-    return window.sessionStorage.getItem(VOICE_MODE_KEY) === '1';
+    const mode = new URLSearchParams(window.location.search).get('mode');
+    if (mode === 'voice') { storeVoiceMode(true); return true; }
+    if (mode === 'text') { storeVoiceMode(false); return false; }
   } catch (e) {
-    return false;
+    /* no URLSearchParams / blocked — fall through */
   }
+  let stored = null;
+  try {
+    stored = window.sessionStorage.getItem(VOICE_MODE_KEY);
+  } catch (e) {
+    /* sessionStorage unavailable */
+  }
+  if (stored === '1') return true;
+  if (stored === '0') return false;
+  return true;  // default: voice
 }
 
 function storeVoiceMode(on) {
@@ -187,7 +201,7 @@ function formatMicError(err) {
 }
 
 export function initVoice() {
-  config.voiceMode = readVoiceMode();
+  config.voiceMode = resolveInitialVoiceMode();
   applyVoiceMode();
 
   loadDockSettings();
