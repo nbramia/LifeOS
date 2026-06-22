@@ -25,7 +25,7 @@ class _FakeClient:
         self._cache_creation = cache_creation
 
     async def astream(self, messages, *, system=None, max_tokens=4096,
-                      tools=None, temperature=None):
+                      tools=None, temperature=None, timeout=None):
         # Signature mirrors the real AnthropicLLMClient.astream exactly (no
         # **kwargs) so drift between run_agent_loop's calls and the client
         # surfaces as a test failure instead of being silently swallowed.
@@ -81,3 +81,51 @@ async def test_cache_tokens_surface_in_agent_result():
     assert result.total_cache_read_tokens == 2600
     assert result.total_cache_creation_tokens == 512
     assert result.full_text == "The answer is 42."
+
+
+class _ExhaustThenSynthesize:
+    """Returns a tool call on every tool round (so the loop exhausts its rounds
+    and falls through to the synthesis round), then a text answer on the
+    synthesis round. astream's signature mirrors the real client exactly,
+    including the ``timeout`` kwarg the synthesis round passes."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def astream(self, messages, *, system=None, max_tokens=4096,
+                      tools=None, temperature=None, timeout=None):
+        from api.services.llm_client import LLMUsage
+        self.calls.append({"has_tools": tools is not None, "timeout": timeout})
+        if tools:
+            yield {"type": "tool_calls", "calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "search_vault", "arguments": "{}"}}]}
+            yield {"type": "done", "usage": LLMUsage(), "finish_reason": "tool_use"}
+        else:
+            yield {"type": "text", "content": "Synthesized answer."}
+            yield {"type": "done", "usage": LLMUsage(), "finish_reason": "end_turn"}
+
+
+@pytest.mark.asyncio
+async def test_synthesis_round_passes_timeout_and_completes():
+    """When tool rounds are exhausted, the synthesis round calls
+    astream(..., timeout=180) with no tools, and the loop produces the
+    synthesized answer.
+
+    Regression for #385: that call used to raise TypeError on the Anthropic
+    backend (astream had no timeout param), so the user got an error instead of
+    a synthesized answer whenever the loop exhausted its rounds.
+    """
+    from unittest.mock import AsyncMock
+    from api.services import agent_loop
+
+    fake = _ExhaustThenSynthesize()
+    with patch.object(agent_loop, "_select_client", return_value=fake), \
+         patch.object(agent_loop, "execute_tool_parallel",
+                      AsyncMock(return_value="vault result")):
+        events = [e async for e in agent_loop.run_agent_loop("find X", max_tool_rounds=1)]
+
+    result = next(e["result"] for e in events if e["type"] == "result")
+    assert result.full_text == "Synthesized answer."
+    # The final call was the synthesis round: no tools, timeout forwarded.
+    assert fake.calls[-1] == {"has_tools": False, "timeout": 180}

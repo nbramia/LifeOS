@@ -507,10 +507,13 @@ class AnthropicLLMClient:
         max_tokens: int = 4096,
         tools: list[dict] | None = None,
         temperature: float | None = None,
+        timeout: float | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Async streaming via Anthropic API.
 
-        Yields the same event format as LocalLLMClient.astream().
+        Yields the same event format as LocalLLMClient.astream(). ``timeout``
+        (seconds) sets a per-request timeout — the agent loop's synthesis round
+        passes one, and LocalLLMClient.astream accepts the same kwarg.
         """
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -524,6 +527,8 @@ class AnthropicLLMClient:
             kwargs["tools"] = tools
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if timeout is not None:
+            kwargs["timeout"] = timeout
 
         async with self._async_client.messages.stream(**kwargs) as stream:
             async for event in stream:
