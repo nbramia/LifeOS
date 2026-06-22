@@ -100,7 +100,7 @@ def _conv_id(sse_text: str):
 
 def deterministic_checks():
     """Inventory, telegram equivalence, and the text routing matrix — all
-    in-process with run_agent_loop mocked (no LLM calls, no spawns)."""
+    in-process with run_agent_loop and the worker spawn mocked (no LLM calls, no real workers)."""
     from unittest.mock import patch
     import api.services.agent_loop as agent_loop_mod
     from config.settings import settings
@@ -148,7 +148,7 @@ def deterministic_checks():
     mism = []
     for pid in persona_ids:
         resolved = settings.resolve_persona(pid)
-        expected = "" if pid == "primary" else bots.get(pid)
+        expected = settings.telegram_primary_bot.persona if pid == "primary" else bots.get(pid)
         if resolved is None or (pid != "primary" and pid not in bots) or resolved != expected:
             mism.append(pid)
     if mism:
@@ -158,9 +158,16 @@ def deterministic_checks():
         record("equivalence/persona-preamble-source", "PASS",
                "resolve_persona(id) == matching Telegram bot.persona for every persona")
 
+    # Orchestrating personas (doctor) take the Phase 5 spawn path on the
+    # persona_id surface — they never reach run_agent_loop — so the inline
+    # equivalence/matrix checks below skip them; check F covers their spawn.
+    orchestrating = {pid for pid in persona_ids if settings.persona_orchestrates(pid)}
+
     # --- D. Empirical: /chat persona_id path == Telegram persona path -------
     eq_fail = []
     for pid in persona_ids:
+        if pid in orchestrating:
+            continue
         pre = settings.resolve_persona(pid)
         _captured.clear()
         with patch.object(agent_loop_mod, "run_agent_loop", _fake_loop):
@@ -178,7 +185,7 @@ def deterministic_checks():
         record("equivalence/chat-vs-telegram-orchestrator-input", "FAIL", "; ".join(eq_fail))
     else:
         record("equivalence/chat-vs-telegram-orchestrator-input", "PASS",
-               "run_agent_loop receives identical persona via /chat persona_id and Telegram persona, all personas")
+               "run_agent_loop receives identical persona via /chat persona_id and Telegram persona (inline personas)")
 
     # --- E. TEXT routing matrix: persona x model dispatch -------------------
     def expected_model(mo):
@@ -192,6 +199,8 @@ def deterministic_checks():
 
     npass = ntotal = 0
     for pid in persona_ids:
+        if pid in orchestrating:
+            continue
         pre = settings.resolve_persona(pid)
         for mo in MODELS:
             ntotal += 1
@@ -216,9 +225,38 @@ def deterministic_checks():
             if not ok:
                 record(f"text-matrix/{pid}/{mo}", "FAIL", json.dumps(_captured[-1] if _captured else {}, default=str)[:160])
     if npass == ntotal:
-        record("text-matrix/all-cells", "PASS", f"{npass}/{ntotal} (persona x model) cells dispatch correctly")
+        record("text-matrix/all-cells", "PASS", f"{npass}/{ntotal} (persona x model) inline cells dispatch correctly")
     else:
         record("text-matrix/all-cells", "FAIL", f"{npass}/{ntotal} cells passed — see per-cell failures above")
+
+    # --- F. Orchestrating personas spawn a Claude Code session, not inline ---
+    # Mock the spawn so this stays deterministic (no real worker is launched).
+    from api.services.agent_worker import claude_code_spawn as _ccs
+    from api.services.agent_worker import session_store as _ss
+    if orchestrating:
+        spawn_calls: list[dict] = []
+
+        def _fake_spawn(store, prompt, **kw):
+            spawn_calls.append({"prompt": prompt, **kw})
+            return {"ok": True, "session_id": "sess_routingcheck"}
+
+        f_fail = []
+        for pid in sorted(orchestrating):
+            _captured.clear()
+            spawn_calls.clear()
+            with patch.object(agent_loop_mod, "run_agent_loop", _fake_loop), \
+                 patch.object(_ccs, "spawn_claude_code_session", _fake_spawn), \
+                 patch.object(_ss, "SessionStore", lambda *a, **k: object()):
+                r = _post(client, {"question": PROBE, "persona_id": pid})
+            created_convs.append(_conv_id(r.text))
+            spawned = len(spawn_calls) == 1 and spawn_calls[0].get("bot") == pid
+            if not spawned or _captured:
+                f_fail.append(f"{pid}(spawned={spawned},inlined={bool(_captured)})")
+        if f_fail:
+            record("orchestrating/spawn-not-inline", "FAIL", "; ".join(f_fail))
+        else:
+            record("orchestrating/spawn-not-inline", "PASS",
+                   f"{sorted(orchestrating)} spawn a bot-tagged Claude Code session instead of the inline loop")
 
     return persona_ids
 
