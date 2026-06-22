@@ -5,7 +5,9 @@ These guard the two halves of the fix that live in run_agent_loop:
 1. Tool definitions are forwarded with their ``cache_control`` marker intact
    (we stopped stripping it on the Anthropic path).
 2. Cache-token usage reported by the client flows into AgentResult so caching
-   is observable — a 2nd turn reporting cache_read > 0 is how we prove it works.
+   is observable. (These are unit tests of the wiring; that Anthropic actually
+   caches across turns is exercised by the client-level tests in
+   test_llm_client.py against the real SDK shapes.)
 """
 import pytest
 from unittest.mock import patch
@@ -23,7 +25,10 @@ class _FakeClient:
         self._cache_creation = cache_creation
 
     async def astream(self, messages, *, system=None, max_tokens=4096,
-                      tools=None, temperature=None, timeout=None, **kwargs):
+                      tools=None, temperature=None):
+        # Signature mirrors the real AnthropicLLMClient.astream exactly (no
+        # **kwargs) so drift between run_agent_loop's calls and the client
+        # surfaces as a test failure instead of being silently swallowed.
         from api.services.llm_client import LLMUsage
         self._captured["tools"] = tools
         self._captured["system"] = system
@@ -66,11 +71,13 @@ async def test_system_prompt_forwarded_as_cached_block_list():
 
 
 @pytest.mark.asyncio
-async def test_cache_read_tokens_surface_in_agent_result():
-    """A turn whose response reports cache_read tokens (a warm cache, i.e. the
-    2nd turn) surfaces them on AgentResult."""
+async def test_cache_tokens_surface_in_agent_result():
+    """Cache-token usage reported by the client is accumulated onto AgentResult —
+    the plumbing that makes caching observable. (A warm turn reporting
+    cache_read > 0 is how callers see the cache working.)"""
     captured = {}
-    events = await _run(_FakeClient(captured, cache_read=2600))
+    events = await _run(_FakeClient(captured, cache_read=2600, cache_creation=512))
     result = next(e["result"] for e in events if e["type"] == "result")
     assert result.total_cache_read_tokens == 2600
+    assert result.total_cache_creation_tokens == 512
     assert result.full_text == "The answer is 42."
