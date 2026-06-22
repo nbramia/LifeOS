@@ -902,6 +902,19 @@ class Settings(BaseSettings):
                 return bot.persona
         return None
 
+    def persona_voice(self, persona_id: str) -> "tuple[str, ...]":
+        """Spoken-turn rules for a persona id; empty tuple if none or unknown.
+
+        Appended to the system prompt on voice turns (the `modality` flag on
+        /api/ask/stream). Same registry source as resolve_persona.
+        """
+        if persona_id == "primary":
+            return _load_primary_persona()[1]
+        for bot in self.telegram_bots:
+            if bot.name == persona_id:
+                return bot.voice
+        return ()
+
     @property
     def photos_db_path(self) -> str:
         """Get path to Photos.sqlite database."""

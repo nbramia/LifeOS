@@ -402,6 +402,7 @@ async def run_agent_loop(
     max_tool_rounds: int = 5,
     model: str = "",
     persona: str = "",
+    voice_rules: tuple = (),
     force_local: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -421,6 +422,8 @@ async def run_agent_loop(
             Ignored on the local backend.
         persona: Optional per-bot system-prompt preamble (e.g. the fitness bot).
             Empty for the default chat surface.
+        voice_rules: The selected persona's spoken-response rules, appended to the
+            system prompt only on voice turns (empty for text turns).
         force_local: Run this turn on the local (llama-server / Gemma) backend
             even when the global backend is Anthropic — the chat model picker's
             "Gemma (local)" option. Builds a per-turn LocalLLMClient.
@@ -429,7 +432,7 @@ async def run_agent_loop(
         Dicts with "type" key: "text", "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
-    system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds)
+    system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds, voice_rules=voice_rules)
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
     # sending any draft created during this same turn — sends require the user

@@ -160,7 +160,8 @@ def _existing_tags_block() -> str | None:
     )
 
 
-def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5) -> list[dict]:
+def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5,
+                        voice_rules: "tuple[str, ...] | None" = None) -> list[dict]:
     """Build the system prompt for the agentic loop.
 
     Returns a list of content blocks for the Anthropic ``system`` parameter.
@@ -188,6 +189,13 @@ def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5) ->
 
     if persona and persona.strip():
         blocks.append({"type": "text", "text": persona.strip()})
+
+    if voice_rules:
+        spoken = "\n".join(f"- {r}" for r in voice_rules)
+        blocks.append({"type": "text", "text": (
+            "## Spoken response\n\nThis turn will be read aloud — format your reply "
+            "for speech, not the screen:\n" + spoken
+        )})
 
     blocks.append(
         {
