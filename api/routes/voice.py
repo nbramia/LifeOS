@@ -22,29 +22,16 @@ from fastapi.responses import StreamingResponse
 
 from config.settings import settings
 
+from api.routes._proxy import TIMEOUT, filter_headers as _filter_headers
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
-# Hop-by-hop headers are connection-specific and must not be forwarded by a proxy
-# (RFC 7230 §6.1). Content-Length is dropped too; httpx/Starlette recompute it.
-_HOP_BY_HOP = {
-    "host", "content-length", "connection", "keep-alive", "transfer-encoding",
-    "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer",
-}
-
-# Voice turns run STT → LLM → TTS and can take a while; match whisper-relay's
-# generous read budget so long turns aren't cut off.
-_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=300.0, pool=5.0)
-
-
-def _filter_headers(headers) -> dict:
-    return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
-
 
 def _client() -> httpx.AsyncClient:
     """The httpx client used to reach the gateway (a seam for tests)."""
-    return httpx.AsyncClient(timeout=_TIMEOUT)
+    return httpx.AsyncClient(timeout=TIMEOUT)
 
 
 @router.api_route("/{path:path}", methods=["GET", "POST"])

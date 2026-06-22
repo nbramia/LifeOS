@@ -20,6 +20,7 @@ import {
 import { sendMessage, askQuestion } from './ask-stream.js';
 import { loadPersonas, onPersonaChange } from './persona.js';
 import { initVoice, toggleVoiceMode, submitTurn } from './voice.js';
+import { initBackend } from './backend.js';
 
 // Boot the chat surface. The shell passes in the explicit DOM element map (so
 // the modules never getElementById), the API endpoints, and integration hooks
@@ -47,12 +48,14 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
-  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
-  // loadPersonas() resolves the persona (from sessionStorage, validated against
-  // /api/personas) and then loads the persona-scoped conversation sidebar — it
-  // owns the single initial loadConversations() so the picker and sidebar stay
-  // consistent even when a stored persona has to be reset.
+  // loadPersonas() resolves config.personaId synchronously (from sessionStorage,
+  // validated against /api/personas) and then loads the persona-scoped
+  // conversation sidebar. It runs BEFORE initBackend() so the per-backend
+  // conversation key (which is persona-scoped for lifeos) reads the right
+  // persona on a refresh.
   loadPersonas();
+  initBackend();  // LifeOS|Agent toggle + restore per-backend conversation (#361)
+  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
   setStatus('', 'Ready');
   inputField.focus();
 }

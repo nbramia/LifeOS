@@ -106,6 +106,7 @@ export function onPersonaChange() {
 // not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
+  if (config.backend === 'agent') return false;  // the agent backend has no handoff
   if (!personas || personas.length === 0) return personaId === DEFAULT_PERSONA_ID;
   const p = personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));

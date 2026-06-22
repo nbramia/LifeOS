@@ -159,6 +159,15 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 }
 ```
 
+### Voice & Agent backends
+
+`/chat` reaches two transport surfaces through LifeOS reverse proxies so the browser stays same-origin (#361). The shapes are owned upstream; LifeOS only forwards.
+
+- `POST /api/voice/turn/stream` — multipart voice turn (`audio` or `transcript`, plus `backend`, `persona_id`, `conversation_id`) → SSE turn events (`started` / `transcript` / `status_audio` / `response` / `main_audio` / `done` / `error` / `cancelled`); the `done` data is authoritative. Proxied to `LIFEOS_VOICE_GATEWAY_URL` (whisper-relay). Also `POST /api/voice/turn/{turn_id}/cancel` and `GET /api/voice/audio/{turn_id}/{clip_id}`.
+- `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI toggle).
+
+See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
+
 ### POST /api/search
 
 Vector similarity search across indexed content.

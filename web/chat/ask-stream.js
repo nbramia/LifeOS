@@ -8,6 +8,7 @@ import { addMessage, updateMessage, setStatus } from './thread.js';
 import { clearAttachments } from './attachments.js';
 import { loadConversations } from './conversations.js';
 import { personaSupportsHandoff } from './persona.js';
+import { setStoredConversationId } from './backend.js';
 
 // Low-level SSE transport. Builds the request body, opens the stream, and calls
 // `on(data)` for each parsed `data:` event. If `on` returns `true`, processing
@@ -29,10 +30,13 @@ export async function askStream({ question, conversationId, attachments, persona
     }));
   }
 
-  if (personaId != null) body.persona_id = personaId;
-  if (backend != null) body.backend = backend;
+  // The agent backend has no personas and is reached via its own proxied
+  // endpoint (bearer added server-side); lifeos sends persona_id to
+  // /api/ask/stream exactly as before.
+  const isAgent = backend === 'agent';
+  if (!isAgent && personaId != null) body.persona_id = personaId;
 
-  const response = await fetch(endpoints.ask, {
+  const response = await fetch(isAgent ? endpoints.agentAsk : endpoints.ask, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
@@ -138,6 +142,7 @@ export async function sendMessage() {
           sources = data.sources;
         } else if (data.type === 'conversation_id') {
           state.currentConversationId = data.conversation_id;
+          setStoredConversationId(data.conversation_id);  // per-backend persistence
         } else if (data.type === 'usage') {
           state.sessionCost += data.cost_usd || 0;
           elements.sessionCostEl.textContent = '$' + state.sessionCost.toFixed(3);

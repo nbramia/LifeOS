@@ -290,6 +290,7 @@ flowchart LR
         Gmail["Google\nGmail"]
         LLM["LLM Backend\n(Claude API or local llama-server)"]
         Voice["whisper-relay\nVoice Gateway :9788\n(reverse-proxied)"]
+        Agent["Agent text backend\n(reverse-proxied, optional)"]
     end
 
     style Local fill:#ffcccc

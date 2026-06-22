@@ -612,6 +612,41 @@
             border-color: var(--accent);
         }
 
+        /* LifeOS|Agent text-backend toggle (#361); shown only when the agent
+           backend is configured server-side (body.agent-available). */
+        .backend-toggle {
+            display: none;
+            align-items: center;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        body.agent-available .backend-toggle {
+            display: inline-flex;
+        }
+
+        .backend-option {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+            padding: 0.3rem 0.55rem;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .backend-option.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        /* Agent mode has no personas — hide the picker. */
+        body.agent-mode .persona-picker {
+            display: none;
+        }
+
         /* Modal */
         .modal-overlay {
             display: none;
@@ -2750,6 +2785,10 @@
                 </nav>
             </div>
             <div class="header-right">
+                <div class="backend-toggle" role="group" aria-label="Text backend">
+                    <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
+                    <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
+                </div>
                 <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
                 <span class="chat-title" id="chatTitle">New conversation</span>
                 <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
@@ -3135,6 +3174,8 @@
                     voiceMute: document.getElementById('voiceMute'),
                     voiceFast: document.getElementById('voiceFast'),
                     voiceAuto: document.getElementById('voiceAuto'),
+                    backendLifeos: document.getElementById('backendLifeos'),
+                    backendAgent: document.getElementById('backendAgent'),
                 },
                 endpoints: {
                     conversations: '/api/conversations',
@@ -3142,6 +3183,8 @@
                     handoff: '/api/chat/handoff',
                     personas: '/api/personas',
                     voice: '/api/voice',
+                    agentAsk: '/api/agent/ask/stream',
+                    agentStatus: '/api/agent/status',
                 },
                 hooks: { onAgentThreadReply: sendThreadReply },
             });
