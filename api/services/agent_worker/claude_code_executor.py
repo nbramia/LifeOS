@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -115,12 +116,7 @@ NOTIFICATIONS — use [NOTIFY] for:
 - Plans before large changes
 
 DELEGATION:
-- Your LifeOS agent session id is {session_id}.
-- You already have a browser (--chrome), filesystem, and shell. If you want to
-  run background work in parallel, delegate it with the `lifeos_agent_spawn`
-  MCP tool (pass caller_session_id={session_id}, model="local" or "claude").
-  Monitor the child with `lifeos_agent_check` and read its result with
-  `lifeos_agent_transcript_read`.
+You already have a browser (--chrome), filesystem, and shell. {delegation}
 """
 
 
@@ -314,7 +310,11 @@ class ClaudeCodeExecutor:
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
-                session_id=session_id,
+                delegation=delegation_preamble(
+                    session_id,
+                    trigger="To run background work in parallel,",
+                    model='"local" or "claude"',
+                ),
             ),
         ]
         if resume_session_id:

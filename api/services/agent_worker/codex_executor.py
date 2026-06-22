@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
+from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
@@ -90,14 +91,13 @@ def _resolve_codex_binary() -> str:
 def _delegation_header(session_id: str) -> str:
     """Per-session preamble line telling Codex its LifeOS session id and how to
     hand off work it can't do (e.g. browser automation) to another engine."""
-    return (
-        f"=== YOUR SESSION ===\n"
-        f"Your LifeOS agent session id is {session_id}. If a task needs a "
-        f"capability you lack — e.g. browser/GUI automation you can't perform "
-        f"headlessly — delegate it with the `lifeos_agent_spawn` MCP tool "
-        f"(caller_session_id={session_id}, model=\"claude_code\" for the "
-        f"browser-enabled Claude Code CLI). Monitor with `lifeos_agent_check` "
-        f"and read the result with `lifeos_agent_transcript_read`."
+    return "=== YOUR SESSION ===\n" + delegation_preamble(
+        session_id,
+        trigger=(
+            "If a task needs a capability you lack — e.g. browser/GUI "
+            "automation you can't perform headlessly —"
+        ),
+        model='"claude_code" for the browser-enabled Claude Code CLI',
     )
 
 

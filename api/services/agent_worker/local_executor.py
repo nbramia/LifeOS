@@ -23,6 +23,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from api.services.agent_worker.delegation import INTER_AGENT_BLOCK
 from api.services.agent_worker.pricing import cost_for
 from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
@@ -155,7 +156,8 @@ class ExecutorOutcome:
 # as a module-level constant so prompt caches can hit on it; the dynamic
 # per-session bits (expected output, soft budget) are appended at call time
 # and live in a small trailing section so cache invalidation is minimized.
-_SYSTEM_PROMPT_STATIC = """\
+_SYSTEM_PROMPT_STATIC = (
+    """\
 <role>
 You are an autonomous task executor running inside LifeOS, the operator's
 personal-assistant system. You receive a single task from the operator's
@@ -224,20 +226,15 @@ user. Just note the assumptions made in your final summary. If you
 cannot complete the task safely, say so plainly in your final response.
 </ambiguity>
 
-<inter_agent>
-Other agent sessions are visible via `lifeos_agent_transcript_read` and
-`lifeos_agent_sessions_list`. Spawn child agents with `lifeos_agent_spawn`,
-message them with `lifeos_agent_send`, check status with
-`lifeos_agent_check`. When you have nothing to do until specific children
-finish, call `lifeos_agent_yield_until(children=[...])` — this ends your
-session cleanly (no idle billing) and resumes you when the children are
-done. Prefer `yield_until` over polling.
-</inter_agent>
+"""
+    + INTER_AGENT_BLOCK
+    + """
 
 <sleep>
 When you need to wait for external state to change with no child sessions
 to await, call the `sleep` tool rather than busy-looping.
 </sleep>"""
+)
 
 
 def _system_prompt(session_id: str, expected_output: str, budget, parent_session_id: str | None = None) -> str:
