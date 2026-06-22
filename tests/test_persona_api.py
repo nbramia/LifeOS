@@ -310,6 +310,68 @@ class TestVoiceAwareness:
 
 
 # ---------------------------------------------------------------------------
+# Personal-context resolution (#390 Phase 4)
+# ---------------------------------------------------------------------------
+
+class TestPersonalContext:
+    def test_personal_context_therapist_from_config(self, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setattr(settings, "partner_name", "Sam")
+        monkeypatch.setattr(settings, "therapist_patterns", "Dr. A|Dr. B")
+        block = settings.personal_context("therapist")
+        assert "Partner: Sam" in block and "Dr. A, Dr. B" in block
+        assert settings.personal_context("primary") == ""   # scoped to therapist
+        assert settings.personal_context("fitness") == ""
+
+    def test_personal_context_empty_when_config_unset(self, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setattr(settings, "partner_name", "Partner")  # the default → skipped
+        monkeypatch.setattr(settings, "therapist_patterns", "")
+        assert settings.personal_context("therapist") == ""
+
+    def test_build_system_prompt_appends_personal_context(self):
+        from api.services.agent_system_prompt import build_system_prompt
+        blocks = build_system_prompt(persona="P", personal_context="## Your people\n\n- Partner: X")
+        assert any("Your people" in b["text"] and "Partner: X" in b["text"] for b in blocks)
+
+    def test_therapist_threading_both_paths(self, client, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        import api.services.agent_loop as agent_loop_mod
+        from config.settings import settings
+        pf = tmp_path / "therapist.md"
+        pf.write_text("THERAPY PERSONA")
+        reg = _registry(tmp_path, [{"name": "therapist", "token_env": "TG_TH", "persona_file": str(pf)}])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_TH", "tok")
+        monkeypatch.setattr(settings, "partner_name", "Sam")
+        monkeypatch.setattr(settings, "therapist_patterns", "Dr. A")
+        captured: dict = {}
+
+        async def fake_loop(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="ok")}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", fake_classify)
+
+        # persona_id path (web/voice)
+        client.post("/api/ask/stream", json={"question": "hi", "persona_id": "therapist"})
+        assert "Sam" in (captured.get("personal_context") or "")
+        # raw-persona path (Telegram) → reverse-lookup → same block
+        client.post("/api/ask/stream", json={"question": "hi", "persona": "THERAPY PERSONA"})
+        assert "Sam" in (captured.get("personal_context") or "")
+        # a different persona gets none
+        client.post("/api/ask/stream", json={"question": "hi", "persona_id": "primary"})
+        assert captured.get("personal_context") == ""
+
+
+# ---------------------------------------------------------------------------
 # GET /api/personas
 # ---------------------------------------------------------------------------
 

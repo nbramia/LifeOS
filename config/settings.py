@@ -915,6 +915,33 @@ class Settings(BaseSettings):
                 return bot.voice
         return ()
 
+    def personal_context(self, persona_id: str) -> str:
+        """A resolved people block for a persona, from existing config.
+
+        Scoped to the therapist (the surface built around the user's relationships
+        and therapy). Names come from LIFEOS_PARTNER_NAME / LIFEOS_THERAPIST_PATTERNS
+        — never hardcoded in a persona file, and resolved only at runtime so the
+        committed repo stays clean. Empty for other personas and for a fresh clone
+        with no config set.
+        """
+        if persona_id != "therapist":
+            return ""
+        lines = []
+        partner = (self.partner_name or "").strip()
+        if partner and partner.lower() != "partner":
+            lines.append(f"- Partner: {partner}")
+        therapists = [t.strip() for t in re.split(r"[|,]", self.therapist_patterns or "") if t.strip()]
+        if therapists:
+            lines.append(f"- Therapists (individual + couples): {', '.join(therapists)}")
+        if not lines:
+            return ""
+        return (
+            "## Your people (resolved from config)\n\n"
+            + "\n".join(lines)
+            + "\n\nThese are the actual people behind this surface — search their "
+            "sessions and messages directly rather than asking who they are."
+        )
+
     @property
     def photos_db_path(self) -> str:
         """Get path to Photos.sqlite database."""
