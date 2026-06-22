@@ -71,7 +71,7 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     if raw_voice and not isinstance(raw_voice, list):
         logger.warning(f"persona file {name!r}: `voice` must be a YAML list; ignoring {type(raw_voice).__name__}")
         raw_voice = []
-    voice = tuple(str(v).strip() for v in raw_voice)
+    voice = tuple(s for v in raw_voice if (s := str(v).strip()))  # drop blank rules
     model = str(meta.get("model") or "").strip()
     fid = meta.get("id")
     if fid and name and str(fid) != name:

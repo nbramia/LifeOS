@@ -279,6 +279,35 @@ class TestVoiceAwareness:
         client.post("/api/ask/stream", json={"question": "hi", "persona_id": "primary"})
         assert captured.get("voice_rules") == ()
 
+    def test_voice_block_is_uncached(self):
+        from api.services.agent_system_prompt import build_system_prompt
+        blocks = build_system_prompt(persona="P", voice_rules=("brief",))
+        spoken = next(b for b in blocks if "Spoken response" in b["text"])
+        assert "cache_control" not in spoken  # uncached, like the persona block
+
+    def test_raw_persona_path_gets_no_voice_rules(self, client, monkeypatch):
+        # The raw `persona` path (no id) + modality=voice gets no voice rules,
+        # rather than misapplying primary's (guard on persona_id).
+        from types import SimpleNamespace
+        import api.services.agent_loop as agent_loop_mod
+        captured: dict = {}
+
+        async def fake_loop(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="ok")}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", fake_classify)
+        r = client.post("/api/ask/stream", json={"question": "hi", "persona": "RAW", "modality": "voice"})
+        assert r.status_code == 200
+        assert captured.get("voice_rules") == ()
+
 
 # ---------------------------------------------------------------------------
 # GET /api/personas

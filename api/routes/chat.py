@@ -455,9 +455,11 @@ async def ask_stream(request: AskStreamRequest):
 
     # Voice turns get the selected persona's spoken-response rules appended to the
     # system prompt; text turns get none. (Set by the voice gateway via `modality`.)
+    # Guard on persona_id: voice rules are keyed by id, so the raw-`persona` path
+    # (Telegram preamble text, no id) gets none rather than misapplying primary's.
     voice_rules = (
-        settings.persona_voice(new_conversation_persona_id)
-        if (request.modality or "").strip().lower() == "voice"
+        settings.persona_voice(request.persona_id)
+        if (request.modality or "").strip().lower() == "voice" and request.persona_id
         else ()
     )
 
