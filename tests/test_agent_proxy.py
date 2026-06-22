@@ -7,7 +7,7 @@ ASGITransport (no sockets), so they're fast and deterministic.
 import httpx
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from api.routes import agent_proxy as ap
 
@@ -66,6 +66,40 @@ async def test_ask_stream_injects_bearer_and_streams(proxy_client):
     assert "agent says hi" in resp.text
     assert _received["authorization"] == "Bearer secret-token"
     assert b'"question"' in _received["body"]
+
+
+async def test_empty_token_forwards_no_auth(proxy_client, monkeypatch):
+    # No token configured + no client auth → nothing on the wire upstream.
+    monkeypatch.setattr(ap.settings, "agent_backend_token", "")
+    resp = await proxy_client.post(
+        "/api/agent/ask/stream", json={"question": "hi"},
+        headers={"Authorization": "Bearer client-sneaky"},
+    )
+    assert resp.status_code == 200
+    # the client's Authorization is stripped (not forwarded), and no server token
+    assert _received["authorization"] is None
+
+
+_stub_500 = FastAPI()
+
+
+@_stub_500.post("/api/ask/stream")
+async def _stub_err():
+    return Response(status_code=500, content=b"upstream boom")
+
+
+async def test_non_200_upstream_is_passed_through(monkeypatch):
+    monkeypatch.setattr(
+        ap, "_client",
+        lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=_stub_500), base_url="http://a"),
+    )
+    monkeypatch.setattr(ap.settings, "agent_backend_url", "http://a")
+    monkeypatch.setattr(ap.settings, "agent_backend_token", "")
+    app = FastAPI()
+    app.include_router(ap.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post("/api/agent/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 500
 
 
 async def test_503_when_not_configured(monkeypatch):

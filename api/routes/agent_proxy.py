@@ -16,20 +16,16 @@ from fastapi.responses import StreamingResponse
 
 from config.settings import settings
 
+from api.routes._proxy import TIMEOUT, filter_headers
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
-_HOP_BY_HOP = {
-    "host", "content-length", "connection", "keep-alive", "transfer-encoding",
-    "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer",
-}
-_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=300.0, pool=5.0)
-
 
 def _client() -> httpx.AsyncClient:
     """httpx client for the agent backend (a seam for tests)."""
-    return httpx.AsyncClient(timeout=_TIMEOUT)
+    return httpx.AsyncClient(timeout=TIMEOUT)
 
 
 @router.get("/status")
@@ -45,10 +41,9 @@ async def agent_ask_stream(request: Request):
         raise HTTPException(status_code=503, detail="agent backend not configured")
 
     url = f"{settings.agent_backend_url.rstrip('/')}/api/ask/stream"
-    headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP
-    }
-    # Add the bearer token server-side — never exposed to the browser.
+    # filter_headers() strips any inbound Authorization (and hop-by-hop); the
+    # bearer is added server-side below, so a client can never inject it.
+    headers = filter_headers(request.headers)
     if settings.agent_backend_token:
         headers["authorization"] = f"Bearer {settings.agent_backend_token}"
 
@@ -71,12 +66,9 @@ async def agent_ask_stream(request: Request):
             await upstream.aclose()
             await client.aclose()
 
-    resp_headers = {
-        k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP
-    }
     return StreamingResponse(
         relay(),
         status_code=upstream.status_code,
-        headers=resp_headers,
+        headers=filter_headers(upstream.headers),
         media_type=upstream.headers.get("content-type"),
     )
