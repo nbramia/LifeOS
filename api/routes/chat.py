@@ -893,8 +893,11 @@ class AskStreamRequest(BaseModel):
     # Per-turn chat model picker. "auto"/None = the configured orchestrator
     # (Haiku) with escalation; "sonnet"/"opus" (or a full model id) pins this
     # turn to that cloud model; "gemma"/"local" runs this turn on the local
-    # llama-server. Honored only on the Anthropic backend (the local backend is
-    # already local); unknown values fall back to auto.
+    # llama-server; "claude_code" hands the turn off to a background Claude Code
+    # worker session instead of answering inline (see the handoff short-circuit
+    # in stream_response). The model picks are honored only on the Anthropic
+    # backend (the local backend is already local); the "claude_code" handoff
+    # works on any backend. Unknown values fall back to auto.
     model_override: Optional[str] = None
 
     @field_validator("persona")
@@ -1081,6 +1084,22 @@ async def ask_stream(request: AskStreamRequest):
             if _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent "):
                 async for _ev in _handle_agent_slash(_stripped, conversation_id, store):
                     yield _ev
+                return
+
+            # Model picker → "Claude Code": the toolbar model dropdown can pin a
+            # turn to the Claude Code engine. Unlike the cloud/local model picks
+            # (resolved further down), this isn't an LLM turn at all — it routes
+            # the whole message to a background Claude Code worker session, the
+            # same handoff the orchestrator emits for an inferred "use claude
+            # code" directive (#305b). An explicit per-turn choice, so it precedes
+            # numeric selection, classification, and the agentic loop, and works
+            # regardless of the chat LLM backend (the handoff spawns a CLI worker,
+            # not an LLM turn). The frontend treats an explicit pick as its own
+            # handoff opt-in, bypassing the persona capability gate (#359).
+            if (request.model_override or "").strip().lower() == "claude_code":
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Model picker → Claude Code', 'latency_ms': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
             # Get conversation history for context in follow-up questions

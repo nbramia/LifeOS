@@ -783,6 +783,15 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
   if (getBackendMode() === 'lifeos' && config.personaId) {
     form.append('persona_id', config.personaId);
   }
+  // Per-turn model pick — forwarded as `model_override`, mirroring how text
+  // turns send it on /api/ask/stream (web/chat/ask-stream.js). Omitted for
+  // 'auto' so the default turn stays byte-identical; only the lifeos backend
+  // honors model picks. whisper-relay relays the field to /api/ask/stream
+  // (whisper-relay#24) — until that ships the gateway drops it, degrading
+  // gracefully to the default orchestrator.
+  if (getBackendMode() === 'lifeos' && config.model && config.model !== 'auto') {
+    form.append('model_override', config.model);
+  }
 
   try {
     const res = await fetch(`${endpoints.voice}/turn/stream`, {

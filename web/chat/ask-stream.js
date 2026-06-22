@@ -154,8 +154,11 @@ export async function sendMessage() {
           // Engine handoff (#305b/c): the orchestrator delegated to a CLI
           // worker. Gate it on the selected persona's advertised capabilities
           // (#359) — only personas with the `handoff` capability may trigger
-          // it; for others, ignore the intent (no handoff UI).
-          if (personaSupportsHandoff()) {
+          // it; for others, ignore the intent (no handoff UI). An explicit
+          // `claude_code` model pick is itself the handoff opt-in, so it
+          // bypasses the persona gate; inferred intents still require a
+          // handoff-capable persona.
+          if (personaSupportsHandoff() || config.model === 'claude_code') {
             const engine = data.engine || 'claude_code';
             const label = engine === 'codex' ? 'Codex' : 'Claude Code';
             fullContent = '🤝 Handing off to ' + label + '…';
