@@ -3,20 +3,26 @@
 LifeOS owns the unified `/chat` client; voice *transport* lives in the separate
 whisper-relay app (STT → backend → TTS). We reverse-proxy ``/api/voice/*`` to
 ``LIFEOS_VOICE_GATEWAY_URL`` so the browser stays same-origin: one HTTPS/Tailscale
-front, one mic permission, no CORS. See ADR-006 and
+front, one mic permission, no CORS. See ADR-016 and
 ``docs/specs/technical/client-surfaces.md``.
 
 LifeOS adds **no** voice logic here — it only forwards the request/response,
 streaming both directions so SSE turn events and audio clips pass through
-unbuffered. The gateway is trusted (localhost); LifeOS is the access-control
-front, consistent with the rest of the API's localhost/Tailscale trust model.
+unbuffered. The gateway is trusted (localhost) and its URL is server config (not
+user-controllable, so no SSRF); LifeOS is the access-control front, consistent
+with the rest of the API's localhost/Tailscale trust model.
 """
 
+import logging
+from urllib.parse import unquote
+
 import httpx
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
@@ -44,17 +50,14 @@ def _client() -> httpx.AsyncClient:
 @router.api_route("/{path:path}", methods=["GET", "POST"])
 async def voice_proxy(path: str, request: Request):
     """Forward any ``/api/voice/<path>`` request to the voice gateway, streaming."""
-    # Defense-in-depth: never let a crafted path escape the /api/voice/ prefix on
-    # the upstream (the gateway exposes only voice/health routes anyway).
-    if ".." in path:
-        return JSONResponse(status_code=400, content={"error": "invalid path"})
+    # Basic guard against an obviously crafted path. The gateway routes by its
+    # declared routes (no filesystem traversal is reachable) and its host is
+    # fixed config, so this is just hygiene, not a security boundary.
+    if ".." in path or ".." in unquote(path):
+        raise HTTPException(status_code=400, detail="invalid path")
 
     base = settings.voice_gateway_url.rstrip("/")
     url = f"{base}/api/voice/{path}"
-
-    # Audio uploads are bounded by the gateway (<=25 MB), so reading the body is
-    # safe; this also lets httpx set a correct Content-Length for the multipart.
-    body = await request.body()
 
     client = _client()
     try:
@@ -63,15 +66,16 @@ async def voice_proxy(path: str, request: Request):
             url,
             params=request.query_params,
             headers=_filter_headers(request.headers),
-            content=body,
+            # Stream the request body upstream rather than buffering it, so a
+            # large audio upload can't OOM LifeOS (the gateway enforces its own
+            # size cap once it receives the stream).
+            content=request.stream() if request.method == "POST" else None,
         )
         upstream = await client.send(upstream_req, stream=True)
-    except httpx.RequestError as exc:
+    except (httpx.RequestError, httpx.InvalidURL) as exc:
         await client.aclose()
-        return JSONResponse(
-            status_code=502,
-            content={"error": "voice gateway unreachable", "detail": str(exc)},
-        )
+        logger.warning("voice gateway request failed (%s %s): %s", request.method, path, exc)
+        raise HTTPException(status_code=502, detail=f"voice gateway unreachable: {exc}")
 
     async def relay():
         try:

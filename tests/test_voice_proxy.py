@@ -7,7 +7,7 @@ ASGITransport (no real server/sockets), so they're fast and deterministic.
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from starlette.requests import Request as StarletteRequest
 
@@ -110,7 +110,22 @@ async def test_gateway_unreachable_returns_502(monkeypatch):
     ) as client:
         resp = await client.post("/api/voice/turn/stream", content=b"x")
     assert resp.status_code == 502
-    assert resp.json()["error"] == "voice gateway unreachable"
+    assert "voice gateway unreachable" in resp.json()["detail"]
+
+
+def test_filter_headers_drops_hop_by_hop():
+    # The proxy must not forward the *client's* connection-control headers; httpx
+    # sets its own for the upstream hop (a round-trip can't assert their absence).
+    headers = httpx.Headers({
+        "Host": "proxy", "Connection": "keep-alive", "Content-Length": "10",
+        "Content-Type": "multipart/form-data", "X-Keep": "yes",
+    })
+    out = {k.lower(): v for k, v in voice_module._filter_headers(headers).items()}
+    assert "host" not in out
+    assert "connection" not in out
+    assert "content-length" not in out
+    assert out.get("content-type") == "multipart/form-data"
+    assert out.get("x-keep") == "yes"
 
 
 async def test_rejects_parent_traversal_path():
@@ -127,5 +142,6 @@ async def test_rejects_parent_traversal_path():
         return {"type": "http.request", "body": b"", "more_body": False}
 
     req = StarletteRequest(scope, receive)
-    resp = await voice_module.voice_proxy("../secret", req)
-    assert resp.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        await voice_module.voice_proxy("../secret", req)
+    assert exc.value.status_code == 400

@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     )
 
     # Voice gateway (whisper-relay). LifeOS reverse-proxies /api/voice/* here so
-    # the browser stays same-origin for mic/HTTPS (#361). See ADR-006.
+    # the browser stays same-origin for mic/HTTPS (#361). See ADR-016.
     voice_gateway_url: str = Field(
         default="http://127.0.0.1:9788",
         alias="LIFEOS_VOICE_GATEWAY_URL",
