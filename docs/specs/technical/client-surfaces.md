@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-06-22
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -15,6 +15,7 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 | Web chat | Browser → FastAPI | personas, ask/stream, handoff, conversation CRUD — `web/index.html` + `web/chat/` |
 | Telegram | In-process `chat_via_api` | Same SSE as ask/stream; handoffs spawn in-process — `api/services/telegram.py` |
 | **whisper-relay** | Separate app → HTTP | ask/stream, handoff, `GET /api/conversations`, `GET /api/conversations/{id}` — see below |
+| **Voice (web)** | Browser → FastAPI reverse-proxy → whisper-relay | LifeOS proxies `/api/voice/*` to the gateway; turn SSE + audio — `web/chat/voice.js`, `api/routes/voice.py` |
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
 
 ---
@@ -44,6 +45,22 @@ Web chat implements this contract in `web/chat/persona.js`: a header `<select>` 
 - Cancel = close the SSE connection (LifeOS has no cancel endpoint).
 
 Upstream mirror of this integration: `whisper-relay/docs/adr/002-upstream-integration-boundaries.md`.
+
+---
+
+## Voice transport (reverse proxy)
+
+With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* stays in whisper-relay; LifeOS **reverse-proxies** `/api/voice/*` to `LIFEOS_VOICE_GATEWAY_URL` (default `http://127.0.0.1:9788`) so the browser stays same-origin for the mic (HTTPS) and audio. LifeOS adds no voice logic — it forwards and streams both directions (`api/routes/voice.py`). See [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
+
+**Voice turn contract** (the gateway's API, reached through the proxy):
+
+- `POST /api/voice/turn/stream` — multipart `audio` (or `transcript`) + `backend` (`lifeos`|`agent`) + `persona_id` (lifeos backend) + `conversation_id`. Responds with an SSE stream: `started` (turn_id, for cancel), `transcript`, `status_audio`/`main_audio` (clip URLs, played as they arrive), `response`, and a terminal `done` whose `data` is **authoritative**: `{transcript, response_text, status_audio_urls, audio_url, conversation_id, handoff, timings_ms}`. `error`/`cancelled` terminate the turn.
+- `POST /api/voice/turn/{turn_id}/cancel` — cancel an in-flight turn.
+- `GET /api/voice/audio/{turn_id}/{clip_id}` — WAV clips (status + main).
+
+**Topology:** browser → LifeOS `/chat` → (proxy) → gateway → for the `lifeos` backend, the gateway calls back into LifeOS `/api/ask/stream` (the consumer-into-LifeOS direction above). Conversation/persona listing is owned by LifeOS, not the gateway.
+
+Web chat implements voice mode in `web/chat/voice.js` — a faithful port of whisper-relay's `static/app.js` turn lifecycle (Voice|Text toggle, hold-to-talk, render the transcript + response from the `done` data, sequential audio queue, cancel via `AbortController`), adapted to LifeOS state and same-origin endpoints. The mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
 ---
 

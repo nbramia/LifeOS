@@ -289,6 +289,7 @@ flowchart LR
         GCal["Google\nCalendar"]
         Gmail["Google\nGmail"]
         LLM["LLM Backend\n(Claude API or local llama-server)"]
+        Voice["whisper-relay\nVoice Gateway :9788\n(reverse-proxied)"]
     end
 
     style Local fill:#ffcccc
