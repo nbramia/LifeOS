@@ -2,9 +2,13 @@
 //
 // Lets a chat turn run on a chosen model: 'auto' (the default Haiku orchestrator
 // with escalation), 'sonnet' / 'opus' (pin this turn to that cloud model), or
-// 'gemma' (run this turn on the local llama-server). The choice persists in
-// sessionStorage and rides along on /api/ask/stream as `model_override`; the
-// server honors it on the Anthropic backend and falls back to auto otherwise.
+// 'gemma' (run this turn on the local llama-server). 'claude_code' is special:
+// it isn't an inline model but a handoff — the turn is routed to a background
+// Claude Code worker session (the same handoff the orchestrator emits for an
+// inferred "use claude code" directive). The choice persists in sessionStorage
+// and rides along on /api/ask/stream as `model_override`; the server honors the
+// model picks on the Anthropic backend (the 'claude_code' handoff works on any
+// backend) and falls back to auto otherwise.
 // See docs/specs/technical/client-surfaces.md.
 
 import { config, elements } from './session.js';

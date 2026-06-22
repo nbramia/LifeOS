@@ -913,10 +913,11 @@
             justify-content: center;
         }
 
-        /* The model picker is text-mode only (voice turns use the backend). */
-        body.voice-mode #modelPicker {
-            display: none;
-        }
+        /* The model picker rides along on voice turns too — voice.js sends the
+           pick as `model_override` on /api/voice/turn/stream, which whisper-relay
+           relays to /api/ask/stream (whisper-relay#24) — so it stays visible in
+           voice mode. It is still hidden on the Agent backend via
+           `body.agent-mode .persona-picker` (that backend ignores model picks). */
 
         .mode-toggle:hover {
             opacity: 1;
@@ -2707,6 +2708,7 @@
                 <option value="sonnet">Sonnet</option>
                 <option value="opus">Opus</option>
                 <option value="gemma">Gemma (local)</option>
+                <option value="claude_code">💻 Claude Code</option>
             </select>
             <div class="backend-toggle" role="group" aria-label="Text backend">
                 <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>

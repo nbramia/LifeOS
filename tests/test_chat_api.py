@@ -85,6 +85,26 @@ class TestAskStreamEndpoint:
                 content = response.text
                 assert "data:" in content
 
+    def test_stream_claude_code_model_hands_off(self, client):
+        """Selecting the 'claude_code' model routes the turn to the engine
+        handoff (a claude_intent event) rather than running the agentic loop."""
+        with patch('api.routes.chat.classify_action_intent', new_callable=AsyncMock) as mock_classify:
+            response = client.post(
+                "/api/ask/stream",
+                json={"question": "refactor the parser", "model_override": "claude_code"},
+            )
+            body = response.text
+
+        assert response.status_code == 200
+        # Emits the engine-handoff intent with the full question as the task...
+        assert '"type": "claude_intent"' in body
+        assert '"engine": "claude_code"' in body
+        assert "refactor the parser" in body
+        # ...and short-circuits before classification and the agentic loop, so no
+        # inline answer is synthesized.
+        assert '"type": "content"' not in body
+        mock_classify.assert_not_called()
+
 
 class TestSaveToVaultEndpoint:
     """Test the /api/save-to-vault endpoint."""
