@@ -40,47 +40,32 @@ export function addMessage(content, type, sources = [], messageId = null, target
   msg.className = 'message ' + type;
   if (messageId) msg.id = messageId;
 
-  let html = `
-                <div class="message-actions">
-                    <button class="action-btn" onclick="copyMessage(this)" title="Copy">📋</button>
-                </div>
-                <div class="message-content">${formatContent(content)}</div>
-            `;
+  let html = `<div class="message-content">${formatContent(content)}</div>`;
 
-  if (type === 'assistant' && content) {
-    html += `<div class="message-meta">`;
+  if (type === 'assistant' && content && sources.length > 0) {
+    // Add collapsed class if more than 3 sources
+    const collapsedClass = sources.length > 3 ? ' collapsed' : '';
+    html += `<div class="message-meta"><div class="sources${collapsedClass}">`;
+    sources.forEach(src => {
+      const fileName = src.file_name || src;
+      const sourceType = src.source_type || 'vault';
 
-    if (sources.length > 0) {
-      // Add collapsed class if more than 3 sources
-      const collapsedClass = sources.length > 3 ? ' collapsed' : '';
-      html += `<div class="sources${collapsedClass}">`;
-      sources.forEach(src => {
-        const fileName = src.file_name || src;
-        const sourceType = src.source_type || 'vault';
-
-        if (sourceType === 'calendar' && src.url) {
-          // Calendar sources use Google Calendar URL
-          html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
-        } else {
-          // Vault sources use Obsidian URL
-          const obsidianPath = src.obsidian_path || fileName;
-          const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-          html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
-        }
-      });
-      // Add toggle button if more than 3 sources
-      if (sources.length > 3) {
-        const hiddenCount = sources.length - 3;
-        html += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
+      if (sourceType === 'calendar' && src.url) {
+        // Calendar sources use Google Calendar URL
+        html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
+      } else {
+        // Vault sources use Obsidian URL
+        const obsidianPath = src.obsidian_path || fileName;
+        const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
+        html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
       }
-      html += `</div>`;
+    });
+    // Add toggle button if more than 3 sources
+    if (sources.length > 3) {
+      const hiddenCount = sources.length - 3;
+      html += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
     }
-
-    html += `
-                    <div class="meta-actions">
-                        <button class="save-btn" onclick="openSaveVaultModal(this)">Save to vault</button>
-                    </div>
-                </div>`;
+    html += `</div></div>`;
   }
 
   msg.innerHTML = html;
@@ -109,19 +94,6 @@ export function formatContent(content) {
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
     .replace(/`(.*?)`/g, '<code>$1</code>')
     .replace(/\n/g, '<br>');
-}
-
-export function copyMessage(btn) {
-  const msg = btn.closest('.message');
-  const content = msg.querySelector('.message-content').textContent;
-  navigator.clipboard.writeText(content).then(() => {
-    btn.classList.add('copied');
-    btn.textContent = '✓';
-    setTimeout(() => {
-      btn.classList.remove('copied');
-      btn.textContent = '📋';
-    }, 2000);
-  });
 }
 
 export function toggleSources(btn) {

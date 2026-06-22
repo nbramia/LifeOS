@@ -11,7 +11,7 @@
 // handler runs — so the bridge exists by the time any shell code touches it.
 
 import { state, config, elements, endpoints, hooks } from './session.js';
-import { addMessage, copyMessage, toggleSources, setStatus } from './thread.js';
+import { addMessage, toggleSources, setStatus } from './thread.js';
 import { setupAttachmentHandlers, openFilePicker, removeAttachment } from './attachments.js';
 import {
   setupSwipeGestures, toggleSidebar, closeSidebar, newChat,
@@ -67,7 +67,7 @@ window.lifeChat = { state, config, initChat };
 
 Object.assign(window, {
   // thread.js
-  addMessage, copyMessage, toggleSources,
+  addMessage, toggleSources,
   // conversations.js
   toggleSidebar, closeSidebar, newChat, filterConversations,
   loadConversation, deleteConversation,
