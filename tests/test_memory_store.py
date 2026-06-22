@@ -57,8 +57,11 @@ def temp_json_file():
     fd, path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     yield path
-    if os.path.exists(path):
-        os.unlink(path)
+    # Clean up both the memories file and its sidecar embedding cache.
+    sidecar = Path(path).with_name(Path(path).stem + "_embeddings.json")
+    for p in (Path(path), sidecar):
+        if p.exists():
+            p.unlink()
 
 
 @pytest.fixture
@@ -655,8 +658,13 @@ class TestMemoryStoreHybridSearch:
         results = store.search_memories("alpha signal")
         ids = [m.id for m in results]
 
-        assert ids[0] == both.id
         assert set(ids) == {both.id, kw_only.id, sem_only.id}
+        # The dual-signal match must outrank BOTH single-signal matches — a
+        # naive "sort by best single score" would tie `both` with `sem_only`
+        # (both cosine 1.0); only rank fusion makes `both` strictly first.
+        assert ids[0] == both.id
+        assert ids.index(both.id) < ids.index(kw_only.id)
+        assert ids.index(both.id) < ids.index(sem_only.id)
 
     def test_precision_floor_blocks_unrelated(self, store, monkeypatch):
         """A vague query with no keyword overlap and sub-floor cosine returns
@@ -680,6 +688,28 @@ class TestMemoryStoreHybridSearch:
 
         assert results == []
         assert MEMORY_SEMANTIC_FLOOR > 0.30  # guards the boundary this test assumes
+
+    def test_semantic_match_just_above_floor_is_returned(self, store, monkeypatch):
+        """A semantic-only match just above the floor IS recalled — locks the
+        inclusion side of the boundary (paired with the 0.30-excluded test above,
+        this brackets the floor to (0.30, 0.40))."""
+        import math
+        memory = store.create_memory("quarterly revenue figures")
+        # cosine 0.40 with the query (unit vectors), comfortably above the floor.
+        above = [0.40, math.sqrt(1 - 0.40 ** 2), 0.0]
+        fake = _FakeEmbeddingService(
+            vectors={
+                "quarterly revenue figures": above,
+                "zzzzz wxyzz": [1.0, 0.0, 0.0],  # query along axis 0, no keyword overlap
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+
+        results = store.search_memories("zzzzz wxyzz")
+
+        assert [m.id for m in results] == [memory.id]
+        assert MEMORY_SEMANTIC_FLOOR < 0.40  # guards the boundary this test assumes
 
     def test_embedding_failure_falls_back_to_keyword(self, store, monkeypatch):
         """If the embedding service raises, search degrades to keyword-only."""

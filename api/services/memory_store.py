@@ -11,6 +11,7 @@ Storage: Human-readable JSON file at ~/.lifeos/memories.json
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -380,11 +381,14 @@ class MemoryStore:
             return empty
 
     def _save_embedding_cache(self) -> None:
-        """Persist the sidecar embedding cache (compact — it is not meant to be
-        read by humans, unlike memories.json)."""
+        """Persist the sidecar embedding cache atomically (compact — it is not
+        meant to be read by humans, unlike memories.json). The temp-file +
+        os.replace keeps a crash mid-write from leaving truncated JSON behind."""
         try:
-            with open(self.embeddings_path, "w") as f:
+            tmp = self.embeddings_path.with_name(self.embeddings_path.name + ".tmp")
+            with open(tmp, "w") as f:
                 json.dump(self._embedding_cache, f)
+            os.replace(tmp, self.embeddings_path)
         except OSError as e:
             logger.warning(f"Error saving memory embeddings cache: {e}")
 
@@ -416,6 +420,14 @@ class MemoryStore:
             ]
             if pending:
                 fresh = service.embed_texts([m.content for m in pending])
+                if len(fresh) != len(pending):
+                    # Defensive: a well-behaved service returns one vector per
+                    # input. If it doesn't, score what we got rather than letting
+                    # a truncated zip silently disable semantic recall entirely.
+                    logger.warning(
+                        f"Embedding service returned {len(fresh)} vectors for "
+                        f"{len(pending)} memories; scoring only what was returned."
+                    )
                 for memory, vector in zip(pending, fresh):
                     vectors[memory.id] = {"hash": self._content_hash(memory.content), "vector": vector}
 
@@ -435,7 +447,10 @@ class MemoryStore:
 
             scores: dict[str, float] = {}
             for memory in memories:
-                vec = np.asarray(pruned[memory.id]["vector"], dtype=float)
+                entry = pruned.get(memory.id)
+                if entry is None:
+                    continue  # never embedded (e.g. partial service return) — skip, don't fail
+                vec = np.asarray(entry["vector"], dtype=float)
                 norm = np.linalg.norm(vec)
                 if norm == 0:
                     continue
