@@ -18,10 +18,18 @@ import { addMessage, setStatus } from './thread.js';
 import { loadConversations } from './conversations.js';
 
 const VOICE_MODE_KEY = 'lifeos:chat:voice_mode';
+const DOCK_SETTINGS_KEY = 'lifeos:chat:dock_settings';
+
+// Ported thresholds from whisper-relay static/app.js.
+const FAST_PLAYBACK_RATE = 2;
+const MIN_RECORD_MS = 300;
+const SILENCE_PEAK_THRESHOLD = 0.012;
+const SILENCE_RMS_THRESHOLD = 0.006;
 
 let mediaRecorder = null;
 let recordedChunks = [];
 let recording = false;
+let recordStartedAt = 0;
 
 let activeTurnId = null;
 let activeTurnAbort = null;
@@ -30,10 +38,45 @@ let playbackChain = Promise.resolve();
 let isPlaying = false;
 let thinkingEl = null;
 
-// --- PR-C seams (stubbed for PR-B) ---
-function shouldPlayAudio() { return true; }          // Mute → PR-C
-function applyPlaybackRate(_audio) { /* 2x → PR-C */ }
-function getBackendMode() { return config.backend || 'lifeos'; }  // LifeOS|Agent toggle → PR-C
+// Dock toggles (Mute / Auto-continue / 2x fast speech), persisted in
+// localStorage. Ported from whisper-relay's dockSettings.
+let dockSettings = { mute: false, auto: false, fast: false };
+
+function loadDockSettings() {
+  try {
+    const raw = window.localStorage.getItem(DOCK_SETTINGS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      dockSettings = { mute: !!p.mute, auto: !!p.auto, fast: !!p.fast };
+    }
+  } catch (e) {
+    /* storage blocked — keep defaults */
+  }
+  return dockSettings;
+}
+
+function persistDockSettings() {
+  try {
+    window.localStorage.setItem(DOCK_SETTINGS_KEY, JSON.stringify(dockSettings));
+  } catch (e) {
+    /* storage blocked */
+  }
+}
+
+function shouldPlayAudio() { return !dockSettings.mute; }
+function getAutoContinue() { return dockSettings.auto; }
+function getPlaybackRate() { return dockSettings.fast ? FAST_PLAYBACK_RATE : 1; }
+
+function applyPlaybackRate(audio) {
+  audio.playbackRate = getPlaybackRate();
+  audio.preservesPitch = true;
+}
+
+function syncActivePlaybackRates() {
+  for (const a of activeAudios) applyPlaybackRate(a);
+}
+
+function getBackendMode() { return config.backend || 'lifeos'; }  // LifeOS|Agent toggle → PR-D
 
 function isVoiceMode() {
   return config.voiceMode === true;
@@ -55,9 +98,25 @@ function storeVoiceMode(on) {
   }
 }
 
+function wireDockToggle(checkbox, key, onChange) {
+  if (!checkbox) return;
+  checkbox.checked = dockSettings[key];
+  checkbox.addEventListener('change', () => {
+    dockSettings[key] = checkbox.checked;
+    persistDockSettings();
+    if (onChange) onChange();
+  });
+}
+
 export function initVoice() {
   config.voiceMode = readVoiceMode();
   applyVoiceMode();
+
+  // Dock toggles (Mute / 2x fast / Auto-continue), persisted in localStorage.
+  loadDockSettings();
+  wireDockToggle(elements.voiceMute, 'mute', () => { if (dockSettings.mute) stopAllAudio(); });
+  wireDockToggle(elements.voiceFast, 'fast', syncActivePlaybackRates);
+  wireDockToggle(elements.voiceAuto, 'auto');
 
   const talk = elements.voiceTalkBtn;
   if (talk) {
@@ -95,11 +154,17 @@ async function startRecording() {
     recordedChunks = [];
     mediaRecorder = new MediaRecorder(stream);
     mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onstop = () => {
+    mediaRecorder.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
       const mime = mediaRecorder.mimeType || 'audio/webm';
       const blob = new Blob(recordedChunks, { type: mime });
-      if (blob.size > 0) submitTurn({ blob, mime });
+      if (blob.size === 0) return;
+      // Skip-silent: if nothing was said, drop the turn (re-listen if Auto on).
+      if (await isSilentBlob(blob)) {
+        if (getAutoContinue()) maybeAutoContinue();
+        return;
+      }
+      submitTurn({ blob, mime });
     };
     mediaRecorder.start();
   } catch (e) {
@@ -109,13 +174,19 @@ async function startRecording() {
     return;
   }
   recording = true;
+  recordStartedAt = Date.now();
   setTalkActive(true);
 }
 
-function stopRecording() {
+async function stopRecording() {
   if (!recording) return;
   recording = false;
   setTalkActive(false);
+  // Don't cut a too-short clip (whisper-relay MIN_RECORD_MS).
+  const elapsed = Date.now() - recordStartedAt;
+  if (elapsed < MIN_RECORD_MS) {
+    await new Promise(r => setTimeout(r, MIN_RECORD_MS - elapsed));
+  }
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
   }
@@ -173,6 +244,91 @@ function isBenignPlaybackError(err) {
     || msg.includes('not allowed by the user agent') || msg.includes('aborted');
 }
 
+// --- skip-silent: detect an empty/quiet recording before sending ---
+function pcmLevels(samples) {
+  if (!samples || !samples.length) return { peak: 0, rms: 0 };
+  let sumSq = 0, peak = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const abs = Math.abs(samples[i]);
+    if (abs > peak) peak = abs;
+    sumSq += samples[i] * samples[i];
+  }
+  return { peak, rms: Math.sqrt(sumSq / samples.length) };
+}
+
+function isSilentLevels(peak, rms) {
+  return peak < SILENCE_PEAK_THRESHOLD && rms < SILENCE_RMS_THRESHOLD;
+}
+
+async function isSilentBlob(blob) {
+  if (!blob || blob.size === 0) return true;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return false;
+  const ctx = new Ctx();
+  try {
+    const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const { peak, rms } = pcmLevels(buffer.getChannelData(0));
+    return isSilentLevels(peak, rms);
+  } catch (e) {
+    return false;
+  } finally {
+    ctx.close().catch(() => {});
+  }
+}
+
+// --- replay: tap a response to replay its audio clips ---
+function parseAudioUrls(el) {
+  try { return JSON.parse(el.dataset.audioUrls || '[]'); } catch (e) { return []; }
+}
+
+function attachReplay(el, audioUrls) {
+  if (!el || !audioUrls || !audioUrls.length) return;
+  el.classList.add('replayable');
+  el.dataset.audioUrls = JSON.stringify(audioUrls);
+  el.setAttribute('role', 'button');
+  el.setAttribute('tabindex', '0');
+  el.title = 'Tap to replay';
+  el.addEventListener('click', () => replayMessage(el));
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); replayMessage(el); }
+  });
+}
+
+async function replayMessage(el) {
+  if (!shouldPlayAudio()) return;
+  await playUrls(parseAudioUrls(el));
+}
+
+async function playUrls(urls) {
+  if (!shouldPlayAudio() || !urls.length) return;
+  stopAllAudio();
+  isPlaying = true;
+  try {
+    for (const url of urls) {
+      await new Promise((resolve) => {
+        const audio = new Audio(url);
+        applyPlaybackRate(audio);
+        activeAudios.push(audio);
+        audio.onended = resolve;
+        audio.onerror = resolve;  // a failed clip shouldn't stall replay
+        audio.play().catch(resolve);
+      });
+    }
+  } finally {
+    isPlaying = false;
+  }
+}
+
+// --- auto-continue: re-enter recording after a turn when enabled ---
+async function maybeAutoContinue() {
+  if (!getAutoContinue()) return;
+  try {
+    await startRecording();
+  } catch (e) {
+    /* mic re-acquire may need a tap on some platforms — stay idle */
+  }
+}
+
 // --- thinking placeholder in the thread ---
 function showThinking() {
   clearThinking();
@@ -221,7 +377,14 @@ async function consumeTurnStream(response) {
     if (event.type === 'error') {
       throw new Error(event.message || 'Turn failed');
     }
-    if (event.type === 'status_audio' || event.type === 'main_audio') {
+    if (event.type === 'status_audio') {
+      if (event.message) setStatus('loading', event.message);  // spoken status text
+      if (shouldPlayAudio() && event.url) {
+        isPlaying = true;
+        enqueueClip(event.url);
+      }
+    }
+    if (event.type === 'main_audio') {
       if (shouldPlayAudio() && event.url) {
         isPlaying = true;
         enqueueClip(event.url);
@@ -283,12 +446,17 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
     }
     clearThinking();
     if (data.transcript) addMessage(data.transcript, 'user');
-    if (data.response_text) addMessage(data.response_text, 'assistant');
+    const playbackUrls = [...(data.status_audio_urls || []), data.audio_url].filter(Boolean);
+    if (data.response_text) {
+      const el = addMessage(data.response_text, 'assistant');
+      attachReplay(el, playbackUrls);  // tap to replay
+    }
 
     await playbackChain;
     isPlaying = false;
     showCancel(false);
     setStatus('', 'Ready');
+    await maybeAutoContinue();  // re-record if Auto-continue is on
   } catch (err) {
     if (err?.name === 'AbortError') return;  // cancelled — the cancel handler resets UI
     clearThinking();
