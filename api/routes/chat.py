@@ -522,6 +522,48 @@ async def ask_stream(request: AskStreamRequest):
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
+            # Orchestrating personas (e.g. doctor) run as a Claude Code session,
+            # not the inline orchestrator (which has no shell/git/filesystem and
+            # would make the persona's "I am a Claude Code session" framing false).
+            # Mirror the Telegram orchestration path: spawn with the persona as the
+            # prompt + the user's message, in the canonical LifeOS checkout. Gated on
+            # persona_id (the web/voice surfaces); Telegram's own orchestration path
+            # handles its bots, so this never double-spawns.
+            if request.persona_id and settings.persona_orchestrates(request.persona_id):
+                import os
+                from api.services.agent_worker.claude_code_spawn import (
+                    spawn_claude_code_session,
+                    should_use_plan_mode,
+                )
+                from api.services.agent_worker.session_store import SessionStore
+                working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
+                spawn_prompt = (
+                    f"{persona_preamble}\n\n---\n\nThe user just sent this via the "
+                    f"{request.persona_id} surface:\n\n{request.question}"
+                )
+                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': f'Orchestrating persona ({request.persona_id}) → Claude Code session', 'latency_ms': 0})}\n\n"
+                _spawn = await asyncio.to_thread(
+                    spawn_claude_code_session, SessionStore(), spawn_prompt,
+                    working_dir=working_dir,
+                    plan_mode=should_use_plan_mode(request.question),
+                    chat_id=getattr(settings, "telegram_chat_id", "") or None,
+                )
+                if _spawn.get("ok"):
+                    _sid = _spawn.get("session_id", "")
+                    ack = (
+                        f"🩺 On it — running as a Claude Code session in the background "
+                        f"(session `{_sid[:12]}`). I'll follow up via Telegram and on the /agents page."
+                    )
+                else:
+                    ack = f"⚠️ Couldn't start the session: {_spawn.get('error', 'spawn failed')}"
+                yield f"data: {json.dumps({'type': 'content', 'content': ack})}\n\n"
+                store.add_message(conversation_id, "assistant", ack, routing={
+                    "reasoning": f"orchestrating persona {request.persona_id} → claude_code",
+                    "sources": ["claude_code"],
+                })
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
             # Get conversation history for context in follow-up questions
             conversation_history = store.get_messages(conversation_id, limit=10)
             # Exclude current message to avoid duplication

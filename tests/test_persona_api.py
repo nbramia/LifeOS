@@ -372,6 +372,60 @@ class TestPersonalContext:
 
 
 # ---------------------------------------------------------------------------
+# Web-spawn for orchestrating personas (#390 Phase 5)
+# ---------------------------------------------------------------------------
+
+class TestOrchestratingPersonaSpawn:
+    def _doctor_registry(self, tmp_path, monkeypatch):
+        pf = tmp_path / "doctor.md"
+        pf.write_text("DOCTOR PIPELINE")
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_D", "persona_file": str(pf), "orchestrates": True},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_D", "tok")
+
+    def test_persona_orchestrates(self, tmp_path, monkeypatch):
+        self._doctor_registry(tmp_path, monkeypatch)
+        from config.settings import settings
+        assert settings.persona_orchestrates("doctor") is True
+        assert settings.persona_orchestrates("primary") is False
+        assert settings.persona_orchestrates("ghost") is False
+
+    def test_doctor_persona_spawns_claude_code_not_inline(self, client, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        import api.services.agent_loop as agent_loop_mod
+        import api.services.agent_worker.claude_code_spawn as ccs
+        self._doctor_registry(tmp_path, monkeypatch)
+        spawned: dict = {}
+
+        def fake_spawn(store, prompt, **kw):
+            spawned["prompt"] = prompt
+            spawned["kw"] = kw
+            return {"ok": True, "session_id": "sess_test12345abc"}
+
+        loop_calls = {"n": 0}
+
+        async def fake_loop(**kwargs):
+            loop_calls["n"] += 1
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="x")}
+
+        monkeypatch.setattr(ccs, "spawn_claude_code_session", fake_spawn)
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.services.agent_worker.session_store.SessionStore", lambda *a, **k: object())
+
+        r = client.post("/api/ask/stream", json={"question": "lifeos is broken", "persona_id": "doctor"})
+        assert r.status_code == 200
+        body = r.text
+        assert "Claude Code session" in body and "sess_test12" in body  # ack streamed back
+        assert "DOCTOR PIPELINE" in spawned["prompt"]      # the persona pipeline is the prompt
+        assert "lifeos is broken" in spawned["prompt"]     # plus the user's message
+        assert loop_calls["n"] == 0                         # did NOT fall through to the inline orchestrator
+
+
+# ---------------------------------------------------------------------------
 # GET /api/personas
 # ---------------------------------------------------------------------------
 
