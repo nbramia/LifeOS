@@ -987,6 +987,81 @@
             display: contents;
         }
 
+        /* Voice mode (#361): the mode toggle + hold-to-talk dock. */
+        .mode-toggle {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 1.15rem;
+            opacity: 0.75;
+            padding: 0 0.25rem;
+        }
+
+        .mode-toggle:hover {
+            opacity: 1;
+        }
+
+        .voice-dock {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .voice-talk-btn {
+            flex: 1;
+            max-width: 320px;
+            min-height: 48px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.15s;
+            user-select: none;
+        }
+
+        .voice-talk-btn:hover {
+            border-color: var(--accent);
+        }
+
+        .voice-talk-btn.recording {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .voice-cancel-btn {
+            display: none;
+            width: 48px;
+            height: 48px;
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 1rem;
+        }
+
+        .voice-cancel-btn.visible {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Mode swap: voice mode hides the text composer, shows the dock. */
+        body.voice-mode .input-container,
+        body.voice-mode .attachments-preview {
+            display: none;
+        }
+
+        body.voice-mode .voice-dock {
+            display: flex;
+        }
+
         .input-wrapper {
             flex: 1;
             position: relative;
@@ -2691,8 +2766,15 @@
                         <option value="claude">cloud</option>
                     </select>
                     <button class="agent-spawn-btn" id="agentSpawnBtn" onclick="spawnAgentFromComposer()" title="Run the composer text as an agent">⚙</button>
+                    <button class="mode-toggle" id="voiceModeBtn" onclick="toggleVoiceMode()" title="Voice input">🎙️</button>
                 </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+            </div>
+            <!-- Voice dock (#361): hold-to-talk; shown in voice mode -->
+            <div class="voice-dock" id="voiceDock">
+                <button class="mode-toggle" onclick="toggleVoiceMode()" title="Text input">⌨️</button>
+                <button class="voice-talk-btn" id="voiceTalkBtn" title="Hold to talk">🎙️ Hold to talk</button>
+                <button class="voice-cancel-btn" id="voiceCancelBtn" title="Cancel turn">✕</button>
             </div>
         </footer>
         </div>
@@ -3002,12 +3084,15 @@
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
                     personaPicker: document.getElementById('personaPicker'),
+                    voiceTalkBtn: document.getElementById('voiceTalkBtn'),
+                    voiceCancelBtn: document.getElementById('voiceCancelBtn'),
                 },
                 endpoints: {
                     conversations: '/api/conversations',
                     ask: '/api/ask/stream',
                     handoff: '/api/chat/handoff',
                     personas: '/api/personas',
+                    voice: '/api/voice',
                 },
                 hooks: { onAgentThreadReply: sendThreadReply },
             });
