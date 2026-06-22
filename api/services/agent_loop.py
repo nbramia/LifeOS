@@ -403,6 +403,7 @@ async def run_agent_loop(
     model: str = "",
     persona: str = "",
     voice_rules: tuple = (),
+    personal_context: str = "",
     force_local: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -432,7 +433,8 @@ async def run_agent_loop(
         Dicts with "type" key: "text", "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
-    system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds, voice_rules=voice_rules)
+    system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
+                                        voice_rules=voice_rules, personal_context=personal_context)
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
     # sending any draft created during this same turn — sends require the user

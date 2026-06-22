@@ -463,6 +463,15 @@ async def ask_stream(request: AskStreamRequest):
         else ()
     )
 
+    # Personal-context block: the therapist persona pre-resolves the user's people
+    # from config so it can target sessions/messages without a lookup round. Works
+    # on the persona_id path and the raw-`persona` (Telegram) path via a reverse
+    # lookup of the preamble back to a bot name.
+    _effective_pid = request.persona_id
+    if _effective_pid is None and request.persona:
+        _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
+    personal_context = settings.personal_context(_effective_pid or "")
+
     async def generate():
         try:
             # Get or create conversation
@@ -741,6 +750,7 @@ async def ask_stream(request: AskStreamRequest):
                 model=orchestrator_model if escalated else "",
                 persona=persona_preamble,
                 voice_rules=voice_rules,
+                personal_context=personal_context,
                 force_local=force_local,
             ):
                 if event["type"] == "text":
