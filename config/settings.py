@@ -58,10 +58,19 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     persona may contain literal ``{...}`` examples. ``voice``/``model`` are parsed
     for the orchestrator to consume later; they are inert here.
     """
-    post = frontmatter.loads(text)
+    try:
+        post = frontmatter.loads(text)
+    except Exception as e:  # noqa: BLE001 — a malformed persona file must not take down
+        # the whole bot registry (telegram_bots is an uncached property feeding
+        # resolve_persona / list_http_personas). Degrade to the raw file as the preamble.
+        logger.warning(f"persona file {name!r}: frontmatter parse failed ({e}); using the raw file as the preamble")
+        return text.strip(), (), ""
     meta = post.metadata or {}
     raw_voice = meta.get("voice") or []
-    voice = tuple(str(v).strip() for v in raw_voice) if isinstance(raw_voice, list) else ()
+    if raw_voice and not isinstance(raw_voice, list):
+        logger.warning(f"persona file {name!r}: `voice` must be a YAML list; ignoring {type(raw_voice).__name__}")
+        raw_voice = []
+    voice = tuple(str(v).strip() for v in raw_voice)
     model = str(meta.get("model") or "").strip()
     fid = meta.get("id")
     if fid and name and str(fid) != name:

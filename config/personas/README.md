@@ -14,7 +14,7 @@ The loader (`settings._parse_persona`, used by `settings.telegram_bots`) strips 
 
 The frontmatter holds **only what code acts on** — never real names, vault paths, or other personal values (the project's open-source rule; `/persona-check` enforces it). The schema leaves room to add hard tool allow-lists later (a `tools:` field) without restructuring.
 
-Files with no frontmatter still load fine (the whole file is the body), so frontmatter is purely additive.
+A file with no leading `---` block loads whole — frontmatter is purely additive. A file that *starts* with a `---…---` block is always parsed as frontmatter (standard YAML-frontmatter semantics), so don't open a persona body with a raw `---` horizontal rule. A malformed frontmatter block doesn't crash loading — the loader logs a warning and falls back to using the raw file as the preamble.
 
 ## Prose skeleton
 

@@ -192,6 +192,27 @@ class TestPersonaFrontmatter:
             assert body, f"{f.name}: empty body"
             assert not body.lstrip().startswith(("---", "id:")), f"{f.name}: frontmatter leaked into body"
 
+    def test_malformed_frontmatter_falls_back_to_raw_body(self):
+        # Invalid YAML must not raise (would 500 every persona request) — degrade gracefully.
+        from config.settings import _parse_persona
+        body, voice, model = _parse_persona("---\nid: x\nvoice: [unterminated\n---\n\nBODY", "x")
+        assert "BODY" in body
+        assert voice == ()
+        assert model == ""
+
+    def test_non_list_voice_is_ignored(self):
+        from config.settings import _parse_persona
+        body, voice, model = _parse_persona("---\nid: x\nvoice: just a scalar\n---\n\nB", "x")
+        assert voice == ()
+        assert body == "B"
+
+    def test_id_mismatch_warns(self, caplog):
+        import logging
+        from config.settings import _parse_persona
+        with caplog.at_level(logging.WARNING):
+            _parse_persona("---\nid: wrong\n---\n\nB", "right")
+        assert any("does not match" in r.message for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # GET /api/personas
