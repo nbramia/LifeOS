@@ -86,6 +86,20 @@ class Settings(BaseSettings):
         description="whisper-relay voice gateway base URL"
     )
 
+    # Agent text backend (OpenClaw voice-adapter). LifeOS proxies the "Agent"
+    # text backend to /api/ask/stream here, adding the bearer token server-side
+    # so it's never exposed to the browser (#361). Empty url = Agent disabled.
+    agent_backend_url: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_BACKEND_URL",
+        description="Agent text backend base URL (empty disables the Agent toggle)"
+    )
+    agent_backend_token: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_BACKEND_TOKEN",
+        description="Optional bearer token for the Agent text backend"
+    )
+
     # Code directory (parent directory containing LifeOS and other projects)
     code_dir: str = Field(default="~/Code", alias="LIFEOS_CODE_DIR")
 
