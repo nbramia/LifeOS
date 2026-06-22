@@ -65,6 +65,19 @@ def test_static_block_still_cached(tm):
         assert "cache_control" not in block
 
 
+def test_max_tool_rounds_templated_not_hardcoded(tm):
+    """The tool-round budget is rendered from the arg into an uncached dynamic
+    block — never a hard-coded literal in the cached static prompt — so the
+    prompt and the loop's actual budget can't drift."""
+    prompt = build_system_prompt(max_tool_rounds=7)
+    text = "\n".join(_text_blocks(prompt))
+    assert "7 tool rounds" in text
+    # The count must not live in the cached static block (it must stay
+    # byte-stable across turns regardless of the per-turn budget).
+    assert "7 tool rounds" not in prompt[0]["text"]
+    assert "5 tool rounds" not in prompt[0]["text"]
+
+
 def test_task_manager_failure_is_silent(monkeypatch):
     def boom():
         raise RuntimeError("task manager unavailable")
