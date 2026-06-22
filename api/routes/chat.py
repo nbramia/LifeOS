@@ -211,7 +211,6 @@ Example: {{"schedule_type": "once", "schedule_value": "2026-02-08T19:00:00-05:00
     return None
 
 
-
 router = APIRouter(prefix="/api", tags=["chat"])
 
 
