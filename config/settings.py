@@ -942,6 +942,15 @@ class Settings(BaseSettings):
             "sessions and messages directly rather than asking who they are."
         )
 
+    def persona_orchestrates(self, persona_id: str) -> bool:
+        """True if the persona drives a Claude Code session instead of inline chat.
+
+        Orchestrating bots (e.g. doctor) spawn a worker rather than answering
+        inline. The primary persona is NOT an orchestrator (it uses the inline
+        loop + claude_intent handoff for code tasks).
+        """
+        return any(b.name == persona_id and b.orchestrates for b in self.telegram_bots)
+
     @property
     def photos_db_path(self) -> str:
         """Get path to Photos.sqlite database."""
