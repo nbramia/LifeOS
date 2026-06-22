@@ -219,9 +219,10 @@ function applyVoiceMode() {
 }
 
 function setTalkActive(on) {
+  // The talk button is a circular shutter; recording state is shown via CSS on
+  // the .recording class (we don't overwrite the shutter-core span).
   if (elements.voiceTalkBtn) {
     elements.voiceTalkBtn.classList.toggle('recording', on);
-    elements.voiceTalkBtn.textContent = on ? '🎙️ Recording…' : '🎙️ Tap to talk';
   }
 }
 

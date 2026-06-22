@@ -67,7 +67,7 @@ function renderPersonaOptions() {
   // Keep the control usable even if discovery failed.
   const personas = (config.personas && config.personas.length)
     ? config.personas
-    : [{ id: DEFAULT_PERSONA_ID, label: 'LifeOS' }];
+    : [{ id: DEFAULT_PERSONA_ID, label: 'Primary' }];
 
   picker.innerHTML = '';
   for (const p of personas) {

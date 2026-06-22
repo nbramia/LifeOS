@@ -1002,8 +1002,6 @@
         .input-area {
             padding: 1rem;
             padding-bottom: calc(1rem + var(--safe-bottom));
-            background: var(--bg-secondary);
-            border-top: 1px solid var(--border);
             flex-shrink: 0;
         }
 
@@ -1022,14 +1020,38 @@
             display: contents;
         }
 
-        /* Voice mode (#361): the mode toggle + hold-to-talk dock. */
+        /* Top-of-chat selector toolbar (#361 UI) */
+        .chat-toolbar {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            padding: 0.4rem 1rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+            flex-shrink: 0;
+        }
+
+        /* The mode toggle sits to the left of the box (same spot in both modes,
+           so tapping the same place flips Voice <-> Text). */
         .mode-toggle {
+            width: 40px;
+            height: 40px;
             background: none;
             border: none;
             cursor: pointer;
-            font-size: 1.15rem;
+            font-size: 1.3rem;
             opacity: 0.75;
-            padding: 0 0.25rem;
+            padding: 0;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* The run-as-agent routing dropdown is text-mode only. */
+        body.voice-mode .agent-routing-select {
+            display: none;
         }
 
         .mode-toggle:hover {
@@ -1084,28 +1106,52 @@
             border-color: var(--accent);
         }
 
-        .voice-talk-btn {
-            flex: 1;
-            max-width: 320px;
-            min-height: 48px;
+        /* Circular camera-shutter talk button (#361 UI) */
+        .voice-talk-btn.shutter {
+            width: 76px;
+            height: 76px;
+            min-height: 76px;
+            max-width: none;
+            flex: 0 0 auto;
+            padding: 0;
+            border-radius: 50%;
             background: var(--bg-tertiary);
-            border: 1px solid var(--border);
-            border-radius: 24px;
-            color: var(--text-primary);
-            font-size: 1rem;
+            border: 3px solid var(--border);
             cursor: pointer;
             transition: all 0.15s;
             user-select: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
 
-        .voice-talk-btn:hover {
+        .voice-talk-btn.shutter:hover {
             border-color: var(--accent);
         }
 
-        .voice-talk-btn.recording {
+        .shutter-core {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
             background: var(--accent);
-            border-color: var(--accent);
-            color: white;
+            transition: all 0.15s ease;
+        }
+
+        .voice-talk-btn.shutter.recording {
+            border-color: var(--error);
+        }
+
+        .voice-talk-btn.shutter.recording .shutter-core {
+            width: 30px;
+            height: 30px;
+            border-radius: 8px;
+            background: var(--error);
+            animation: shutter-pulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes shutter-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.55; }
         }
 
         .voice-cancel-btn {
@@ -1194,15 +1240,17 @@
             transform: none;
         }
 
-        /* Attach button */
+        /* Attach button — iMessage-style round "+" to the left of the box */
         .attach-btn {
-            width: 48px;
-            height: 48px;
+            width: 40px;
+            height: 40px;
             background: var(--bg-tertiary);
             border: 1px solid var(--border);
-            border-radius: 12px;
+            border-radius: 50%;
             color: var(--text-secondary);
-            font-size: 1.25rem;
+            font-size: 1.6rem;
+            line-height: 1;
+            padding: 0;
             cursor: pointer;
             display: flex;
             align-items: center;
@@ -1537,24 +1585,6 @@
 
             .input-container {
                 gap: 0.5rem;
-                flex-wrap: wrap;
-            }
-
-            /* Declutter the composer (#361): hide attach, and lift the
-               run-as-agent tools (routing + spawn) onto their own row above the
-               input so the bottom row is just the textarea + send. */
-            .attach-btn {
-                display: none;
-            }
-
-            .composer-tools {
-                display: flex;
-                order: -1;
-                flex-basis: 100%;
-                justify-content: flex-end;
-                align-items: center;
-                gap: 0.5rem;
-                margin-bottom: 0.25rem;
             }
 
             .input-field {
@@ -2785,12 +2815,7 @@
                 </nav>
             </div>
             <div class="header-right">
-                <div class="backend-toggle" role="group" aria-label="Text backend">
-                    <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
-                    <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
-                </div>
-                <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
-                <span class="chat-title" id="chatTitle">New conversation</span>
+                <span class="chat-title" id="chatTitle" hidden></span>
                 <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
                     <span>💭</span> <span class="btn-label">Remember</span>
                 </button>
@@ -2803,6 +2828,21 @@
                 </div>
             </div>
         </header>
+
+        <!-- Top-of-chat selector toolbar (#361 UI): persona + routing + backend -->
+        <div class="chat-toolbar">
+            <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
+            <select id="modelPicker" class="agent-routing-select" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
+                <option value="auto">🤖 Auto</option>
+                <option value="sonnet">Sonnet</option>
+                <option value="opus">Opus</option>
+                <option value="gemma">Gemma (local)</option>
+            </select>
+            <div class="backend-toggle" role="group" aria-label="Text backend">
+                <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
+                <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
+            </div>
+        </div>
 
         <div class="messages-container">
             <main class="messages" id="messages">
@@ -2825,6 +2865,10 @@
             <div class="attachments-preview" id="attachmentsPreview"></div>
 
             <div class="input-container">
+                <input type="file" id="fileInput" class="file-input" multiple
+                       accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
+                <button class="mode-toggle" id="voiceModeBtn" onclick="toggleVoiceMode()" title="Voice input" aria-label="Switch to voice">🎙️</button>
+                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files" aria-label="Attach files">+</button>
                 <div class="input-wrapper">
                     <textarea
                         class="input-field"
@@ -2834,25 +2878,13 @@
                         autofocus
                     ></textarea>
                 </div>
-                <input type="file" id="fileInput" class="file-input" multiple
-                       accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
-                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files">📎</button>
-                <div class="composer-tools">
-                    <select id="agentRouting" class="agent-routing-select" title="Agent model (run-as-agent)">
-                        <option value="auto">🤖 auto</option>
-                        <option value="local">local</option>
-                        <option value="claude">cloud</option>
-                    </select>
-                    <button class="agent-spawn-btn" id="agentSpawnBtn" onclick="spawnAgentFromComposer()" title="Run the composer text as an agent">⚙</button>
-                    <button class="mode-toggle" id="voiceModeBtn" onclick="toggleVoiceMode()" title="Voice input">🎙️</button>
-                </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
             </div>
             <!-- Voice dock (#361): tap-to-talk + dock toggles; shown in voice mode -->
             <div class="voice-dock" id="voiceDock">
                 <div class="voice-dock-row">
-                    <button class="mode-toggle" onclick="toggleVoiceMode()" title="Text input">⌨️</button>
-                    <button class="voice-talk-btn" id="voiceTalkBtn" title="Tap to talk">🎙️ Tap to talk</button>
+                    <button class="mode-toggle" onclick="toggleVoiceMode()" title="Text input" aria-label="Switch to text">⌨️</button>
+                    <button class="voice-talk-btn shutter" id="voiceTalkBtn" title="Tap to talk" aria-label="Tap to talk"><span class="shutter-core"></span></button>
                     <button class="voice-cancel-btn" id="voiceCancelBtn" title="Cancel turn">✕</button>
                 </div>
                 <div class="voice-dock-toggles">
@@ -3169,6 +3201,7 @@
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
                     personaPicker: document.getElementById('personaPicker'),
+                    modelPicker: document.getElementById('modelPicker'),
                     voiceTalkBtn: document.getElementById('voiceTalkBtn'),
                     voiceCancelBtn: document.getElementById('voiceCancelBtn'),
                     voiceMute: document.getElementById('voiceMute'),
@@ -3464,28 +3497,6 @@
                     }
                 } catch (e) { /* transient — keep polling */ }
             }, 3000);
-        }
-
-        async function spawnAgentFromComposer() {
-            const prompt = (inputField.value || '').trim();
-            if (!prompt) { inputField.focus(); return; }
-            const sel = document.getElementById('agentRouting');
-            const routing = (sel && sel.value) || 'auto';
-            try {
-                const resp = await fetch('/api/agents/spawn', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt, routing }),
-                });
-                const data = await resp.json().catch(() => ({}));
-                if (resp.ok) {
-                    inputField.value = '';
-                    inputField.style.height = 'auto';
-                    setTimeout(loadAgentThreads, 500);
-                } else {
-                    alert('Spawn failed: ' + (data.detail || resp.status));
-                }
-            } catch (e) { alert('Spawn failed: ' + e); }
         }
 
         // Scroll handling

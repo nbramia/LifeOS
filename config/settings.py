@@ -810,7 +810,7 @@ class Settings(BaseSettings):
         """
         personas = [PersonaInfo(
             id="primary",
-            label="LifeOS",
+            label="Primary",
             capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
         )]
         for bot in self.telegram_bots:

@@ -50,7 +50,7 @@ class TestListHttpPersonas:
         assert [p.id for p in personas] == ["primary", "fitness"]
 
         primary = personas[0]
-        assert primary.label == "LifeOS"
+        assert primary.label == "Primary"
         assert primary.capabilities == ["handoff", "agent"]
 
         fitness = personas[1]
