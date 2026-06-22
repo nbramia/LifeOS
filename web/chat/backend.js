@@ -45,6 +45,7 @@ function applyBackendUi() {
 }
 
 function setBackendMode(mode) {
+  if (state.isLoading) return;  // don't switch backends mid-turn (would store the id under the wrong key)
   const next = mode === 'agent' ? 'agent' : 'lifeos';
   if (next === getBackendMode()) return;
   // config.backend drives ask/stream routing + voice turns; null = lifeos

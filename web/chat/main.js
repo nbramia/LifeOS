@@ -48,13 +48,14 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
+  // loadPersonas() resolves config.personaId synchronously (from sessionStorage,
+  // validated against /api/personas) and then loads the persona-scoped
+  // conversation sidebar. It runs BEFORE initBackend() so the per-backend
+  // conversation key (which is persona-scoped for lifeos) reads the right
+  // persona on a refresh.
+  loadPersonas();
   initBackend();  // LifeOS|Agent toggle + restore per-backend conversation (#361)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
-  // loadPersonas() resolves the persona (from sessionStorage, validated against
-  // /api/personas) and then loads the persona-scoped conversation sidebar — it
-  // owns the single initial loadConversations() so the picker and sidebar stay
-  // consistent even when a stored persona has to be reset.
-  loadPersonas();
   setStatus('', 'Ready');
   inputField.focus();
 }
