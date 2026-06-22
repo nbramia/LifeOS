@@ -34,6 +34,23 @@ def test_inter_agent_block_references_full_protocol():
         assert tool in block
 
 
+def test_inter_agent_block_text_is_pinned():
+    """Pin the exact block text. local_executor embeds this verbatim in its
+    cached _SYSTEM_PROMPT_STATIC, so an accidental edit here would silently
+    change (and invalidate the cache of) that prompt."""
+    assert delegation.INTER_AGENT_BLOCK == (
+        "<inter_agent>\n"
+        "Other agent sessions are visible via `lifeos_agent_transcript_read` and\n"
+        "`lifeos_agent_sessions_list`. Spawn child agents with `lifeos_agent_spawn`,\n"
+        "message them with `lifeos_agent_send`, check status with\n"
+        "`lifeos_agent_check`. When you have nothing to do until specific children\n"
+        "finish, call `lifeos_agent_yield_until(children=[...])` — this ends your\n"
+        "session cleanly (no idle billing) and resumes you when the children are\n"
+        "done. Prefer `yield_until` over polling.\n"
+        "</inter_agent>"
+    )
+
+
 def test_all_three_executors_draw_from_the_shared_source():
     # codex builds its header from the shared preamble
     from api.services.agent_worker.codex_executor import _delegation_header
