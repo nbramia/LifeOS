@@ -423,6 +423,33 @@ class TestOrchestratingPersonaSpawn:
         assert "DOCTOR PIPELINE" in spawned["prompt"]      # the persona pipeline is the prompt
         assert "lifeos is broken" in spawned["prompt"]     # plus the user's message
         assert loop_calls["n"] == 0                         # did NOT fall through to the inline orchestrator
+        assert spawned["kw"].get("bot") == "doctor"        # notifications route via the doctor bot, not primary
+        assert spawned["kw"].get("plan_mode") is False     # web has no CLI plan-mode resume path
+
+    def test_doctor_voice_also_spawns(self, client, tmp_path, monkeypatch):
+        import api.services.agent_worker.claude_code_spawn as ccs
+        self._doctor_registry(tmp_path, monkeypatch)
+        spawned: dict = {}
+
+        def fake_spawn(store, prompt, **kw):
+            spawned["called"] = True
+            return {"ok": True, "session_id": "sess_voice123"}
+
+        monkeypatch.setattr(ccs, "spawn_claude_code_session", fake_spawn)
+        monkeypatch.setattr("api.services.agent_worker.session_store.SessionStore", lambda *a, **k: object())
+        r = client.post("/api/ask/stream", json={"question": "fix it", "persona_id": "doctor", "modality": "voice"})
+        assert r.status_code == 200
+        assert spawned.get("called")  # voice doctor spawns too (gate keys on persona_id)
+
+    def test_doctor_spawn_failure_acks_gracefully(self, client, tmp_path, monkeypatch):
+        import api.services.agent_worker.claude_code_spawn as ccs
+        self._doctor_registry(tmp_path, monkeypatch)
+        monkeypatch.setattr(ccs, "spawn_claude_code_session", lambda *a, **k: {"ok": False, "error": "boom"})
+        monkeypatch.setattr("api.services.agent_worker.session_store.SessionStore", lambda *a, **k: object())
+        r = client.post("/api/ask/stream", json={"question": "x", "persona_id": "doctor"})
+        assert r.status_code == 200
+        body = r.text
+        assert "Couldn't start" in body and '"type": "done"' in body  # graceful ack + terminal done
 
 
 # ---------------------------------------------------------------------------

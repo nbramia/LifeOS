@@ -531,10 +531,7 @@ async def ask_stream(request: AskStreamRequest):
             # handles its bots, so this never double-spawns.
             if request.persona_id and settings.persona_orchestrates(request.persona_id):
                 import os
-                from api.services.agent_worker.claude_code_spawn import (
-                    spawn_claude_code_session,
-                    should_use_plan_mode,
-                )
+                from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
                 from api.services.agent_worker.session_store import SessionStore
                 working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
                 spawn_prompt = (
@@ -542,12 +539,17 @@ async def ask_stream(request: AskStreamRequest):
                     f"{request.persona_id} surface:\n\n{request.question}"
                 )
                 yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': f'Orchestrating persona ({request.persona_id}) → Claude Code session', 'latency_ms': 0})}\n\n"
-                _spawn = await asyncio.to_thread(
-                    spawn_claude_code_session, SessionStore(), spawn_prompt,
-                    working_dir=working_dir,
-                    plan_mode=should_use_plan_mode(request.question),
-                    chat_id=getattr(settings, "telegram_chat_id", "") or None,
-                )
+                try:
+                    _spawn = await asyncio.to_thread(
+                        spawn_claude_code_session, SessionStore(), spawn_prompt,
+                        working_dir=working_dir,
+                        plan_mode=False,  # the doctor pipeline plans itself; web has no CLI plan-mode resume path
+                        chat_id=getattr(settings, "telegram_chat_id", "") or None,
+                        bot=request.persona_id,  # route [NOTIFY]/[CLARIFY]/completion via this bot (parity with Telegram)
+                    )
+                except Exception:  # noqa: BLE001 — never end the SSE without a `done`
+                    logger.warning("orchestrating-persona spawn failed", exc_info=True)
+                    _spawn = {"ok": False, "error": "could not start the session"}
                 if _spawn.get("ok"):
                     _sid = _spawn.get("session_id", "")
                     ack = (
