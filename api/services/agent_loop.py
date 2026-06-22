@@ -352,10 +352,29 @@ def resolve_orchestrator_model(
     return base_model, False
 
 
-def _select_client(model: str = ""):
-    """Pick the LLM client for a turn. With a per-turn `model` on the Anthropic
-    backend (escalation, #303), build a dedicated client for that model;
-    otherwise use the shared singleton. The local backend ignores `model`."""
+def resolve_model_alias(name: str) -> str:
+    """Map a short tier word ("haiku"/"sonnet"/"opus") to its Anthropic model id;
+    pass any other string through unchanged. Shared by user-directed escalation
+    and the chat model picker so the alias table stays single-source."""
+    return _MODEL_ALIASES.get((name or "").strip().lower(), name)
+
+
+def _select_client(model: str = "", force_local: bool = False):
+    """Pick the LLM client for a turn.
+
+    - `force_local`: build a per-turn local (llama-server / Gemma) client even
+      when the global backend is Anthropic — the chat model picker's "Gemma"
+      option. Context is preserved the same way as any per-turn switch: the full
+      conversation_history is replayed into the new client, and llm_client does
+      the Anthropic↔OpenAI format translation.
+    - a per-turn `model` on the Anthropic backend (escalation, #303) builds a
+      dedicated client for that model; otherwise the shared singleton is used.
+    """
+    if force_local:
+        if getattr(settings, "llm_backend", "anthropic").lower() != "anthropic":
+            return get_local_llm()  # already local — reuse the singleton
+        from api.services.llm_client import LocalLLMClient
+        return LocalLLMClient()
     if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
         from api.services.llm_client import AnthropicLLMClient
         return AnthropicLLMClient(model=model)
@@ -383,6 +402,7 @@ async def run_agent_loop(
     max_tool_rounds: int = 5,
     model: str = "",
     persona: str = "",
+    force_local: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -401,11 +421,14 @@ async def run_agent_loop(
             Ignored on the local backend.
         persona: Optional per-bot system-prompt preamble (e.g. the fitness bot).
             Empty for the default chat surface.
+        force_local: Run this turn on the local (llama-server / Gemma) backend
+            even when the global backend is Anthropic — the chat model picker's
+            "Gemma (local)" option. Builds a per-turn LocalLLMClient.
 
     Yields:
         Dicts with "type" key: "text", "status", or "result".
     """
-    client = _select_client(model)
+    client = _select_client(model, force_local=force_local)
     system_prompt = build_system_prompt(persona=persona)
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse

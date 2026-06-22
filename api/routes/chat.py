@@ -883,6 +883,12 @@ class AskStreamRequest(BaseModel):
     # above is the internal Telegram path (full preamble text); the two are
     # mutually exclusive (sending both is a 400 in the route handler).
     persona_id: Optional[str] = None
+    # Per-turn chat model picker. "auto"/None = the configured orchestrator
+    # (Haiku) with escalation; "sonnet"/"opus" (or a full model id) pins this
+    # turn to that cloud model; "gemma"/"local" runs this turn on the local
+    # llama-server. Honored only on the Anthropic backend (the local backend is
+    # already local); unknown values fall back to auto.
+    model_override: Optional[str] = None
 
     @field_validator("persona")
     @classmethod
@@ -1222,7 +1228,23 @@ async def ask_stream(request: AskStreamRequest):
             # prior turn refused and this message pushes back (#303). Anthropic
             # backend only — the local backend can't honor a per-turn model.
             escalated = False
-            if getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
+            force_local = False
+            # Per-turn model picker: an explicit pick wins over auto-escalation.
+            # "gemma"/"local" → run this turn on the local backend; a tier word
+            # or model id → pin this turn to that cloud model. "auto"/unset falls
+            # through to the normal Haiku + escalation path.
+            _override = (request.model_override or "").strip().lower()
+            _backend_is_anthropic = getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
+            if _override in ("gemma", "local"):
+                force_local = True
+                orchestrator_model = "local"
+            elif _override and _override != "auto" and _backend_is_anthropic:
+                from api.services.agent_loop import resolve_model_alias
+                picked = resolve_model_alias(_override)
+                if picked != orchestrator_model:
+                    orchestrator_model = picked
+                    escalated = True  # build a dedicated per-turn client for the pick
+            elif _backend_is_anthropic:
                 escalation_model = getattr(settings, "agent_escalation_model", "") or ""
                 orchestrator_model, escalated = resolve_orchestrator_model(
                     conversation_history, request.question, orchestrator_model, escalation_model
@@ -1281,6 +1303,7 @@ async def ask_stream(request: AskStreamRequest):
                 max_tool_rounds=5,
                 model=orchestrator_model if escalated else "",
                 persona=persona_preamble,
+                force_local=force_local,
             ):
                 if event["type"] == "text":
                     yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"

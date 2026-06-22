@@ -32,6 +32,10 @@ export const config = {
   personas: [],
   // Voice|Text input mode (#361); restored from sessionStorage by initVoice().
   voiceMode: false,
+  // Per-turn chat model picker: 'auto' (Haiku + escalation), 'sonnet', 'opus',
+  // or 'gemma' (local). Sent as model_override on ask/stream. Restored by
+  // initModel().
+  model: 'auto',
 };
 
 // DOM element handles, populated by initChat() (main.js). Modules read
