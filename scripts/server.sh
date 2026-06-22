@@ -262,9 +262,13 @@ show_status() {
 
     # Tailscale URL if available
     if command -v tailscale &> /dev/null; then
-        local ts_ip=$(tailscale ip -4 2>/dev/null || true)
+        local ts_ip
+        ts_ip=$(tailscale ip -4 2>/dev/null || true)
         if [ -n "$ts_ip" ]; then
             echo "  Tailscale: http://$ts_ip:$PORT"
+        fi
+        if [ -n "${TAILNET_HTTPS_URL:-}" ]; then
+            echo "  Voice/chat: ${TAILNET_HTTPS_URL}/chat  (HTTPS — required for mic)"
         fi
     fi
     echo ""
