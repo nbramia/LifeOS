@@ -14,19 +14,19 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 |---------|-----------|----------------------------|
 | Web chat | Browser → FastAPI | personas, ask/stream, handoff, conversation CRUD — `web/index.html` + `web/chat/` |
 | Telegram | In-process `chat_via_api` | Same SSE as ask/stream; handoffs spawn in-process — `api/services/telegram.py` |
-| **whisper-relay** | Separate app → HTTP | ask/stream, handoff, `GET /api/conversations`, `GET /api/conversations/{id}` — see below |
-| **Voice (web)** | Browser → FastAPI reverse-proxy → whisper-relay | LifeOS proxies `/api/voice/*` to the gateway; turn SSE + audio — `web/chat/voice.js`, `api/routes/voice.py` |
+| **whisper-relay** | Separate app → HTTP (voice transport API) | Server-side only: `POST /api/ask/stream`, handoff — via `src/voice_gateway/adapters/lifeos.py`; no browser UI after #21 |
+| **Voice (web)** | Browser → LifeOS reverse-proxy → whisper-relay | LifeOS `/chat` + `web/chat/voice.js`; proxies `/api/voice/*` — `api/routes/voice.py` |
 | MCP / Managed Agents | stdio or HTTP MCP | Tool catalog only — `mcp_server.py` |
 
 ---
 
-## whisper-relay
+## whisper-relay (voice transport API)
 
-Voice transport in the same GitHub org as LifeOS: [github.com/nbramia/whisper-relay](https://github.com/nbramia/whisper-relay). Local checkout: `~/Code/whisper-relay` (review the consumer implementation in `src/voice_gateway/adapters/lifeos.py` when changing chat or conversation APIs).
+Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https://github.com/nbramia/whisper-relay). Local checkout: `~/Code/whisper-relay`. After #21 it is **API-only** — no `static/` UI, no `/api/voice/personas` or `/api/voice/conversations*` proxies. Review `src/voice_gateway/adapters/lifeos.py` when changing chat or conversation APIs.
 
-Connects to LifeOS at `LIFEOS_BASE_URL` (default `http://127.0.0.1:8000`), 300s timeout on ask/stream, no auth headers — same trust model as web chat on localhost/Tailscale.
+The gateway connects to LifeOS at `LIFEOS_BASE_URL` for orchestration (ask/stream, handoff). Persona listing and conversation CRUD are **LifeOS-owned** — consumed by `/chat` directly, not through whisper-relay.
 
-**Endpoints used** (request/response shapes: [api-reference.md](../product/api-reference.md)): `GET /api/personas`, `POST /api/ask/stream`, `POST /api/chat/handoff`, `GET /api/conversations`, `GET /api/conversations/{id}`.
+**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers).
 
 **Persona contract** (shared by web and voice; lets a thin client expose LifeOS's multi-bot personas without reading LifeOS config):
 
@@ -36,15 +36,14 @@ Connects to LifeOS at `LIFEOS_BASE_URL` (default `http://127.0.0.1:8000`), 300s 
 
 Web chat implements this contract in `web/chat/persona.js`: a top-of-chat toolbar `<select>` populated from `/api/personas`, the selection persisted across refresh in `sessionStorage` (`lifeos:chat:persona_id`), capability-gated `claude_intent` handoff, and a persona-scoped sidebar. Switching persona starts a fresh, persona-scoped conversation.
 
-**Model picker.** The same toolbar carries a per-turn model picker (`web/chat/model.js`): `Auto` (Haiku + escalation) / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. The choice persists in `sessionStorage` (`lifeos:chat:model`) and rides along on `/api/ask/stream` as `model_override` (omitted for `auto`, so the default request is unchanged). For the inline model picks the server pins the turn to that model — cloud picks reuse the per-turn escalation client; `gemma` builds a per-turn `LocalLLMClient`. Context is preserved the same way every turn is: the full `conversation_history` is replayed into the chosen client. `Claude Code` is not an inline model: selecting it short-circuits the turn into the same engine handoff the orchestrator emits for an inferred "use claude code" directive (a `claude_intent` SSE event → `/api/chat/handoff` → `spawn_claude_code_session`), so the message runs in a background Claude Code worker rather than answering inline, on any backend. The frontend treats an explicit `claude_code` pick as its own handoff opt-in, bypassing the persona capability gate that filters inferred handoffs. The **voice** surface carries the same selection: `web/chat/voice.js` forwards it as `model_override` on `/api/voice/turn/stream`, which whisper-relay relays to `/api/ask/stream` (tracked in whisper-relay#24), so the picker is shown in voice mode as well as text — hidden only on the Agent backend, which ignores model picks. Until whisper-relay forwards the field the voice gateway drops it, degrading gracefully to the default orchestrator.
+**Model picker.** The same toolbar carries a per-turn model picker (`web/chat/model.js`): `Auto` (Haiku + escalation) / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. The choice persists in `sessionStorage` (`lifeos:chat:model`) and rides along on `/api/ask/stream` as `model_override` (omitted for `auto`, so the default request is unchanged). For the inline model picks the server pins the turn to that model — cloud picks reuse the per-turn escalation client; `gemma` builds a per-turn `LocalLLMClient`. Context is preserved the same way every turn is: the full `conversation_history` is replayed into the chosen client. `Claude Code` is not an inline model: selecting it short-circuits the turn into the same engine handoff the orchestrator emits for an inferred "use claude code" directive (a `claude_intent` SSE event → `/api/chat/handoff` → `spawn_claude_code_session`), so the message runs in a background Claude Code worker rather than answering inline, on any backend. The frontend treats an explicit `claude_code` pick as its own handoff opt-in, bypassing the persona capability gate that filters inferred handoffs. The **voice** surface carries the same model selection: `web/chat/voice.js` forwards `model_override` on `/api/voice/turn/stream`; whisper-relay relays it to `/api/ask/stream` (#24). The picker is shown in voice mode as well as text — hidden only on the Agent backend.
 
-**Consumer-specific behavior** (LifeOS API unchanged; how whisper-relay interprets it):
+**Gateway behavior** (LifeOS API unchanged):
 
 - Speaks `status` events immediately during long tool rounds.
-- On `claude_intent`, POSTs handoff after the SSE stream ends; **replaces** accumulated `content` with the handoff confirmation (does not append).
-- Reads handoff `message`, then `ack`, then a generic phrase using `session_id`; non-200 handoff still completes the turn with a spoken failure message.
-- Proxies conversation list/detail to its mobile UI (`/api/voice/conversations*`). No `channel` or modality field — voice text is identical to typed chat at the API layer.
-- Cancel = close the SSE connection (LifeOS has no cancel endpoint).
+- On `claude_intent`, POSTs handoff after the SSE stream ends; **replaces** accumulated `content` with the handoff confirmation.
+- Explicit `model_override` of `claude_code`/`codex` enables handoff parsing even on personas without the `handoff` capability (whisper-relay ADR-004 / #24).
+- Cancel = `POST /api/voice/turn/{turn_id}/cancel` (proxied).
 
 Upstream mirror of this integration: `whisper-relay/docs/adr/002-upstream-integration-boundaries.md`.
 
@@ -62,7 +61,7 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 **Topology:** browser → LifeOS `/chat` → (proxy) → gateway → for the `lifeos` backend, the gateway calls back into LifeOS `/api/ask/stream` (the consumer-into-LifeOS direction above). Conversation/persona listing is owned by LifeOS, not the gateway.
 
-Web chat implements voice mode in `web/chat/voice.js` — a port of whisper-relay's `static/app.js` turn lifecycle (Voice|Text toggle, **tap-to-talk**, render the transcript + response from the `done` data, sequential audio queue, cancel via `AbortController`), adapted to LifeOS state and same-origin endpoints. The mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
+Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifecycle (Voice|Text toggle, SSE `done` data, sequential audio, cancel via `AbortController`), same-origin via the reverse proxy. Mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
 **Agent text backend.** Both modes carry a `backend` (`lifeos` | `agent`). The `agent` backend is the OpenClaw voice-adapter, which speaks the same `/api/ask/stream` SSE contract at `LIFEOS_AGENT_BACKEND_URL` and may require a bearer token. LifeOS proxies it at `POST /api/agent/ask/stream` (`api/routes/agent_proxy.py`), **adding the bearer server-side** so it never reaches the browser; `GET /api/agent/status` reports whether it's configured (drives the UI toggle). The agent backend has no personas and no handoff. Conversation ids are stored per backend in `sessionStorage` (`lifeos:chat:conv:agent`, and `lifeos:chat:conv:lifeos:<persona>` for lifeos) so switching and refreshing continues the right thread. `web/chat/backend.js` owns the toggle + per-backend conversation persistence.
 
