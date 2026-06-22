@@ -30,6 +30,8 @@ export const config = {
   personaId: null,
   backend: null,
   personas: [],
+  // Voice|Text input mode (#361); restored from sessionStorage by initVoice().
+  voiceMode: false,
 };
 
 // DOM element handles, populated by initChat() (main.js). Modules read

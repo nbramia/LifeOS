@@ -19,6 +19,7 @@ import {
 } from './conversations.js';
 import { sendMessage, askQuestion } from './ask-stream.js';
 import { loadPersonas, onPersonaChange } from './persona.js';
+import { initVoice, toggleVoiceMode, submitTurn } from './voice.js';
 
 // Boot the chat surface. The shell passes in the explicit DOM element map (so
 // the modules never getElementById), the API endpoints, and integration hooks
@@ -46,6 +47,7 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
+  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
   // loadPersonas() resolves the persona (from sessionStorage, validated against
   // /api/personas) and then loads the persona-scoped conversation sidebar — it
   // owns the single initial loadConversations() so the picker and sidebar stay
@@ -70,4 +72,9 @@ Object.assign(window, {
   sendMessage, askQuestion,
   // persona.js
   onPersonaChange,
+  // voice.js
+  toggleVoiceMode,
 });
+
+// Voice helpers for the headless test harness (mic/audio can't run headless).
+window.lifeChatVoice = { submitTurn };
