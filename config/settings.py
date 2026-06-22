@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Registry of specialized Telegram bots (beyond the primary). Committed, no
 # secrets — each entry references the env var holding its token.
 _TELEGRAM_BOTS_FILE = Path("config/telegram_bots.json")
+_PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
 _BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
@@ -76,6 +77,18 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     if fid and name and str(fid) != name:
         logger.warning(f"persona file id={fid!r} does not match bot name {name!r}")
     return post.content.strip(), voice, model
+
+
+def _load_primary_persona() -> "tuple[str, tuple[str, ...], str]":
+    """Load the primary persona from ``config/personas/primary.md`` if present.
+
+    Primary has no registry entry, so its preamble (and ``voice``/``model``) come
+    from this file directly. An absent file → no preamble, the historical default.
+    """
+    try:
+        return _parse_persona(_PRIMARY_PERSONA_FILE.read_text(), "primary")
+    except OSError:
+        return "", (), ""
 
 
 # Capabilities advertised to HTTP clients. The primary persona and any
@@ -776,11 +789,14 @@ class Settings(BaseSettings):
         Named "primary" so its update-offset file stays the legacy
         ``data/telegram_state.json`` and existing behavior is unchanged.
         """
+        persona, voice, model = _load_primary_persona()
         return TelegramBotConfig(
             name="primary",
             token=self.telegram_bot_token,
             chat_id=self.telegram_chat_id,
-            persona="",
+            persona=persona,
+            voice=voice,
+            model=model,
         )
 
     @property
@@ -880,7 +896,7 @@ class Settings(BaseSettings):
         unknown id so the caller can reject it with HTTP 400.
         """
         if persona_id == "primary":
-            return ""
+            return _load_primary_persona()[0]
         for bot in self.telegram_bots:
             if bot.name == persona_id:
                 return bot.persona

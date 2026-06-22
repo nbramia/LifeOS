@@ -113,9 +113,22 @@ class TestListHttpPersonas:
 # ---------------------------------------------------------------------------
 
 class TestResolvePersona:
-    def test_primary_resolves_to_empty(self):
+    def test_primary_resolves_to_primary_md(self):
+        # #390 P2: primary's personality now lives in config/personas/primary.md.
         from config.settings import settings
-        assert settings.resolve_persona("primary") == ""
+        pre = settings.resolve_persona("primary")
+        assert pre and "general-purpose" in pre  # body loaded (no longer empty)
+        assert not pre.lstrip().startswith("---")  # frontmatter stripped
+        # The primary Telegram bot draws from the same file (single source).
+        assert settings.telegram_primary_bot.persona == pre
+
+    def test_primary_personality_moved_out_of_static_prompt(self):
+        # The proactivity/tone now lives in primary.md, not the shared static prompt.
+        import api.services.agent_system_prompt as asp
+        from config.settings import _load_primary_persona
+        body = _load_primary_persona()[0]
+        assert "obvious next action" in body
+        assert "obvious next action" not in asp._STATIC_PROMPT
 
     def test_unknown_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "none.json")
