@@ -1,17 +1,8 @@
-// Voice mode for /chat (#361, PR-B).
+// Voice mode for /chat (#361).
 //
-// A Voice|Text toggle swaps the text composer for a hold-to-talk dock. The turn
-// lifecycle is a faithful port of whisper-relay's proven static/app.js (record →
-// multipart POST to the LifeOS-proxied /api/voice/turn/stream → consume SSE →
-// render the transcript + response from the final `done` data → play audio clips
-// in order via a promise chain → cancel via AbortController). Conversation /
-// persona / backend selection is LifeOS-owned (config); the gateway is pure
-// transport.
-//
-// PR-B ships the core dock (talk + cancel + mode toggle). The full dock parity
-// (Mute / 2x / Auto-continue / Replay / Skip-silent) and the LifeOS|Agent
-// backend toggle land in PR-C — the seams (shouldPlayAudio / applyPlaybackRate /
-// getBackendMode) are stubbed here so PR-C only extends them.
+// Tap-to-talk (tap start, tap stop) — same interaction model as
+// whisper-relay/static/app.js (onTalkClick), not hold-to-talk. Turn lifecycle:
+// record → multipart POST /api/voice/turn/stream → SSE → done data → playback.
 
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, setStatus } from './thread.js';
@@ -20,17 +11,43 @@ import { setStoredConversationId } from './backend.js';
 
 const VOICE_MODE_KEY = 'lifeos:chat:voice_mode';
 const DOCK_SETTINGS_KEY = 'lifeos:chat:dock_settings';
+const MIME_CANDIDATES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+  'audio/mp4;codecs=mp4a.40.2',
+  'audio/mp4',
+  'audio/ogg;codecs=opus',
+];
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==';
 
-// Ported thresholds from whisper-relay static/app.js.
 const FAST_PLAYBACK_RATE = 2;
 const MIN_RECORD_MS = 300;
 const SILENCE_PEAK_THRESHOLD = 0.012;
 const SILENCE_RMS_THRESHOLD = 0.006;
 
+const platform = (() => {
+  const ua = navigator.userAgent;
+  const isIOS =
+    /iPhone|iPod|iPad/i.test(ua) ||
+    (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+  return { isIOS };
+})();
+const useWebAudioRecorder = platform.isIOS;
+
 let mediaRecorder = null;
-let recordedChunks = [];
-let recording = false;
+let selectedMime = '';
+let chunks = [];
+let pcmChunks = [];
+let micStream = null;
+let audioCtx = null;
+let audioSource = null;
+let audioProcessor = null;
+let isRecording = false;
+let isStarting = false;
+let micAcquireFailed = false;
 let recordStartedAt = 0;
+let voiceBusy = false;
 
 let activeTurnId = null;
 let activeTurnAbort = null;
@@ -38,10 +55,20 @@ let activeAudios = [];
 let playbackChain = Promise.resolve();
 let isPlaying = false;
 let thinkingEl = null;
+let ttsAudio = null;
 
-// Dock toggles (Mute / Auto-continue / 2x fast speech), persisted in
-// localStorage. Ported from whisper-relay's dockSettings.
 let dockSettings = { mute: false, auto: false, fast: false };
+
+class EmptyRecordingError extends Error {
+  constructor() {
+    super('Empty recording');
+    this.name = 'EmptyRecordingError';
+  }
+}
+
+function isEmptyRecordingError(err) {
+  return err?.name === 'EmptyRecordingError';
+}
 
 function loadDockSettings() {
   try {
@@ -51,7 +78,7 @@ function loadDockSettings() {
       dockSettings = { mute: !!p.mute, auto: !!p.auto, fast: !!p.fast };
     }
   } catch (e) {
-    /* storage blocked — keep defaults */
+    /* storage blocked */
   }
   return dockSettings;
 }
@@ -77,7 +104,29 @@ function syncActivePlaybackRates() {
   for (const a of activeAudios) applyPlaybackRate(a);
 }
 
-function getBackendMode() { return config.backend || 'lifeos'; }  // LifeOS|Agent toggle → PR-D
+function useSharedTtsAudio() {
+  return platform.isIOS || /Android/i.test(navigator.userAgent);
+}
+
+function getTtsAudioElement() {
+  if (!ttsAudio) {
+    ttsAudio = new Audio();
+    ttsAudio.setAttribute('playsinline', '');
+    ttsAudio.preload = 'auto';
+  }
+  return ttsAudio;
+}
+
+function unlockTtsAudio() {
+  if (!useSharedTtsAudio()) return;
+  const audio = getTtsAudioElement();
+  audio.volume = 1;
+  audio.src = SILENT_WAV;
+  audio.playbackRate = 1;
+  audio.play().catch(() => {});
+}
+
+function getBackendMode() { return config.backend || 'lifeos'; }
 
 function isVoiceMode() {
   return config.voiceMode === true;
@@ -95,7 +144,7 @@ function storeVoiceMode(on) {
   try {
     window.sessionStorage.setItem(VOICE_MODE_KEY, on ? '1' : '0');
   } catch (e) {
-    // sessionStorage unavailable — selection just won't persist
+    /* sessionStorage unavailable */
   }
 }
 
@@ -109,11 +158,38 @@ function wireDockToggle(checkbox, key, onChange) {
   });
 }
 
+function pickMimeType() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  for (const mime of MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported(mime)) return mime;
+  }
+  return '';
+}
+
+function canRecordAudio() {
+  return (
+    window.isSecureContext &&
+    !!navigator.mediaDevices?.getUserMedia &&
+    typeof MediaRecorder !== 'undefined' &&
+    (useWebAudioRecorder || pickMimeType() !== '')
+  );
+}
+
+function formatMicError(err) {
+  const name = err?.name || '';
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Microphone permission denied. Allow mic access for this site, then reload.';
+  }
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    return 'No microphone was found on this device.';
+  }
+  return err?.message || String(err);
+}
+
 export function initVoice() {
   config.voiceMode = readVoiceMode();
   applyVoiceMode();
 
-  // Dock toggles (Mute / 2x fast / Auto-continue), persisted in localStorage.
   loadDockSettings();
   wireDockToggle(elements.voiceMute, 'mute', () => { if (dockSettings.mute) stopAllAudio(); });
   wireDockToggle(elements.voiceFast, 'fast', syncActivePlaybackRates);
@@ -121,13 +197,14 @@ export function initVoice() {
 
   const talk = elements.voiceTalkBtn;
   if (talk) {
-    talk.addEventListener('mousedown', startRecording);
-    talk.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); }, { passive: false });
-    ['mouseup', 'mouseleave'].forEach(ev => talk.addEventListener(ev, stopRecording));
-    ['touchend', 'touchcancel'].forEach(ev => talk.addEventListener(ev, (e) => { e.preventDefault(); stopRecording(); }, { passive: false }));
+    talk.addEventListener('click', onTalkClick, false);
+    talk.addEventListener('contextmenu', (e) => e.preventDefault());
   }
   if (elements.voiceCancelBtn) {
-    elements.voiceCancelBtn.addEventListener('click', cancelActiveTurn);
+    elements.voiceCancelBtn.addEventListener('click', () => {
+      if (voiceBusy || isPlaying) cancelActiveTurn();
+      else stopAllAudio();
+    });
   }
 }
 
@@ -141,60 +218,273 @@ function applyVoiceMode() {
   document.body.classList.toggle('voice-mode', isVoiceMode());
 }
 
-// --- recording (hold-to-talk) ---
-async function startRecording() {
-  if (recording || state.isLoading) return;
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) {
-    setStatus('error', 'Mic blocked');
+function setTalkActive(on) {
+  if (elements.voiceTalkBtn) {
+    elements.voiceTalkBtn.classList.toggle('recording', on);
+    elements.voiceTalkBtn.textContent = on ? '🎙️ Recording…' : '🎙️ Tap to talk';
+  }
+}
+
+function onTalkClick(event) {
+  event.preventDefault();
+  unlockTtsAudio();
+  if (!canRecordAudio()) {
+    setStatus('error', 'Mic unavailable (HTTPS required)');
     return;
   }
+  if (voiceBusy || state.isLoading) return;
+  if (isStarting) return;
+
+  if (isPlaying) {
+    stopAllAudio();
+    return;
+  }
+
+  if (isRecording) {
+    stopRecordingAndSend().catch((err) => {
+      setStatus('error', 'Error');
+      addMessage('⚠️ ' + (err?.message || 'Recording failed'), 'assistant');
+      setTalkActive(false);
+    });
+    return;
+  }
+
+  beginRecordingFromTap();
+}
+
+async function acquireMicStream() {
+  const backoffMs = [0, 200, 400, 800];
+  let lastErr;
+  for (const delay of backoffMs) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      lastErr = err;
+      if (err?.name !== 'NotAllowedError') throw err;
+    }
+  }
+  throw lastErr;
+}
+
+function requestMicInGesture() {
+  if (!window.isSecureContext) {
+    return Promise.reject(new Error('Microphone requires HTTPS.'));
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return Promise.reject(new Error('Microphone not available.'));
+  }
+  if (micStream?.getAudioTracks().some((t) => t.readyState === 'live')) {
+    return Promise.resolve(micStream);
+  }
+  return acquireMicStream().then((stream) => {
+    micStream = stream;
+    return stream;
+  });
+}
+
+function setupMediaRecorder(stream) {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    try { mediaRecorder.stop(); } catch (_) { /* ignore */ }
+  }
+  selectedMime = pickMimeType();
   try {
-    recordedChunks = [];
+    mediaRecorder = selectedMime
+      ? new MediaRecorder(stream, { mimeType: selectedMime })
+      : new MediaRecorder(stream);
+  } catch (_) {
     mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      const mime = mediaRecorder.mimeType || 'audio/webm';
-      const blob = new Blob(recordedChunks, { type: mime });
-      if (blob.size === 0) return;
-      // Skip-silent: if nothing was said, drop the turn (re-listen if Auto on).
-      if (await isSilentBlob(blob)) {
-        if (getAutoContinue()) maybeAutoContinue();
-        return;
-      }
-      submitTurn({ blob, mime });
-    };
-    mediaRecorder.start();
-  } catch (e) {
-    // MediaRecorder unsupported / failed — don't leak the live mic.
-    stream.getTracks().forEach(t => t.stop());
-    setStatus('error', 'Mic error');
-    return;
+    selectedMime = '';
   }
-  recording = true;
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
+}
+
+function beginRecording(stream) {
+  chunks = [];
+  setupMediaRecorder(stream);
+  mediaRecorder.start(250);
   recordStartedAt = Date.now();
+  isRecording = true;
+  setStatus('', 'Recording…');
   setTalkActive(true);
 }
 
-async function stopRecording() {
-  if (!recording) return;
-  recording = false;
-  setTalkActive(false);
-  // Don't cut a too-short clip (whisper-relay MIN_RECORD_MS).
-  const elapsed = Date.now() - recordStartedAt;
-  if (elapsed < MIN_RECORD_MS) {
-    await new Promise(r => setTimeout(r, MIN_RECORD_MS - elapsed));
-  }
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
+function ensureAudioContext() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  if (!audioCtx || audioCtx.state === 'closed') audioCtx = new Ctx();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function beginWebAudioRecording(stream) {
+  ensureAudioContext();
+  if (!audioCtx) throw new Error('Recording is not supported in this browser.');
+  pcmChunks = [];
+  audioSource = audioCtx.createMediaStreamSource(stream);
+  audioProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+  audioProcessor.onaudioprocess = (e) => {
+    pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  audioSource.connect(audioProcessor);
+  audioProcessor.connect(audioCtx.destination);
+  recordStartedAt = Date.now();
+  isRecording = true;
+  setStatus('', 'Recording…');
+  setTalkActive(true);
+}
+
+function releaseCapture() {
+  try {
+    if (audioProcessor) {
+      audioProcessor.onaudioprocess = null;
+      audioProcessor.disconnect();
+    }
+    if (audioSource) audioSource.disconnect();
+  } catch (_) { /* ignore */ }
+  audioProcessor = null;
+  audioSource = null;
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
   }
 }
 
-function setTalkActive(on) {
-  if (elements.voiceTalkBtn) elements.voiceTalkBtn.classList.toggle('recording', on);
+function encodeWav(samples, sampleRate) {
+  const view = new DataView(new ArrayBuffer(44 + samples.length * 2));
+  const writeStr = (off, s) => {
+    for (let i = 0; i < s.length; i += 1) view.setUint8(off + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    off += 2;
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
+
+function stopMediaRecorder() {
+  return new Promise((resolve, reject) => {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+      reject(new Error('Recorder not active'));
+      return;
+    }
+    const mime = mediaRecorder.mimeType || selectedMime || 'audio/webm';
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mime });
+      chunks = [];
+      if (blob.size === 0) {
+        reject(new EmptyRecordingError());
+        return;
+      }
+      resolve({ blob, mime });
+    };
+    if (mediaRecorder.state === 'recording') {
+      if (typeof mediaRecorder.requestData === 'function') {
+        mediaRecorder.requestData();
+      }
+      mediaRecorder.stop();
+    }
+  });
+}
+
+function stopWebAudioRecording() {
+  return new Promise((resolve, reject) => {
+    const sampleRate = audioCtx ? audioCtx.sampleRate : 44100;
+    let total = 0;
+    for (const c of pcmChunks) total += c.length;
+    const flat = new Float32Array(total);
+    let off = 0;
+    for (const c of pcmChunks) {
+      flat.set(c, off);
+      off += c.length;
+    }
+    pcmChunks = [];
+    releaseCapture();
+    if (flat.length === 0) {
+      reject(new EmptyRecordingError());
+      return;
+    }
+    const { peak, rms } = pcmLevels(flat);
+    if (isSilentLevels(peak, rms)) {
+      reject(new EmptyRecordingError());
+      return;
+    }
+    resolve({ blob: encodeWav(flat, sampleRate), mime: 'audio/wav' });
+  });
+}
+
+function stopRecorder() {
+  return useWebAudioRecorder ? stopWebAudioRecording() : stopMediaRecorder();
+}
+
+async function handleSkippedEmptyRecording() {
+  setTalkActive(false);
+  setStatus('', 'Ready');
+  if (getAutoContinue()) await maybeAutoContinue();
+}
+
+async function beginRecordingFromTap() {
+  isStarting = true;
+  try {
+    if (useWebAudioRecorder) ensureAudioContext();
+    const stream = await requestMicInGesture();
+    if (useWebAudioRecorder) beginWebAudioRecording(stream);
+    else beginRecording(stream);
+    micAcquireFailed = false;
+  } catch (err) {
+    if (err?.name === 'NotAllowedError' && !micAcquireFailed) {
+      micAcquireFailed = true;
+      setStatus('error', 'Tap to talk again — mic was not ready.');
+    } else {
+      setStatus('error', 'Mic error');
+      addMessage('⚠️ ' + formatMicError(err), 'assistant');
+    }
+  } finally {
+    isStarting = false;
+  }
+}
+
+async function stopRecordingAndSend() {
+  if (isStarting || !isRecording) return;
+
+  const elapsed = Date.now() - recordStartedAt;
+  if (elapsed < MIN_RECORD_MS) {
+    await new Promise((r) => setTimeout(r, MIN_RECORD_MS - elapsed));
+  }
+
+  isRecording = false;
+  setTalkActive(false);
+
+  try {
+    const { blob, mime } = await stopRecorder();
+    if (await isSilentBlob(blob)) {
+      await handleSkippedEmptyRecording();
+      return;
+    }
+    await submitTurn({ blob, mime });
+  } catch (err) {
+    if (isEmptyRecordingError(err)) {
+      await handleSkippedEmptyRecording();
+      return;
+    }
+    throw err;
+  }
 }
 
 function blobFilename(mime) {
@@ -205,8 +495,43 @@ function blobFilename(mime) {
   return 'recording.webm';
 }
 
-// --- audio playback (sequential promise chain — survives a failed clip) ---
+function playUrlOnElement(audio, url) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+    const cleanup = () => {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.oncanplaythrough = null;
+    };
+    const start = () => {
+      applyPlaybackRate(audio);
+      audio.onended = () => { cleanup(); finish(resolve); };
+      audio.onerror = () => { cleanup(); finish(reject, new Error('playback failed')); };
+      audio.play().catch((err) => { cleanup(); finish(reject, err); });
+    };
+    cleanup();
+    audio.pause();
+    audio.src = url;
+    audio.load();
+    if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+      start();
+    } else {
+      audio.oncanplaythrough = () => start();
+    }
+  });
+}
+
 function playSingleUrl(url) {
+  if (useSharedTtsAudio()) {
+    const audio = getTtsAudioElement();
+    if (!activeAudios.includes(audio)) activeAudios.push(audio);
+    return playUrlOnElement(audio, url);
+  }
   return new Promise((resolve, reject) => {
     const audio = new Audio(url);
     applyPlaybackRate(audio);
@@ -297,6 +622,7 @@ function attachReplay(el, audioUrls) {
 
 async function replayMessage(el) {
   if (!shouldPlayAudio()) return;
+  unlockTtsAudio();
   await playUrls(parseAudioUrls(el));
 }
 
@@ -306,27 +632,19 @@ async function playUrls(urls) {
   isPlaying = true;
   try {
     for (const url of urls) {
-      await new Promise((resolve) => {
-        const audio = new Audio(url);
-        applyPlaybackRate(audio);
-        activeAudios.push(audio);
-        audio.onended = resolve;
-        audio.onerror = resolve;  // a failed clip shouldn't stall replay
-        audio.play().catch(resolve);
-      });
+      await playSingleUrl(url);
     }
   } finally {
     isPlaying = false;
   }
 }
 
-// --- auto-continue: re-enter recording after a turn when enabled ---
 async function maybeAutoContinue() {
   if (!getAutoContinue()) return;
   try {
-    await startRecording();
+    await beginRecordingFromTap();
   } catch (e) {
-    /* mic re-acquire may need a tap on some platforms — stay idle */
+    /* mic re-acquire may need a tap on some platforms */
   }
 }
 
@@ -411,6 +729,8 @@ async function consumeTurnStream(response) {
 // Exported so the headless test harness can drive a turn without a real mic
 // (getUserMedia/MediaRecorder don't run headless).
 export async function submitTurn({ blob, mime, transcript } = {}) {
+  voiceBusy = true;
+  state.isLoading = true;
   setStatus('loading', getBackendMode() === 'agent' ? 'Agent thinking…' : 'Thinking…');
   showThinking();
   activeTurnId = null;
@@ -468,6 +788,8 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
   } finally {
     activeTurnId = null;
     activeTurnAbort = null;
+    voiceBusy = false;
+    state.isLoading = false;
   }
 }
 
@@ -485,6 +807,8 @@ function cancelActiveTurn() {
   clearThinking();
   activeTurnId = null;
   activeTurnAbort = null;
+  voiceBusy = false;
+  state.isLoading = false;
   showCancel(false);
   setStatus('', 'Ready');
 }
