@@ -474,18 +474,15 @@ async def run_agent_loop(
     def _track_usage(usage: LLMUsage):
         result.total_input_tokens += usage.input_tokens
         result.total_output_tokens += usage.output_tokens
+        result.total_cache_read_tokens += usage.cache_read_input_tokens
+        result.total_cache_creation_tokens += usage.cache_creation_input_tokens
         # Local model has no cost
         result.total_cost_usd = 0.0
 
-    # Strip cache_control from tool definitions (Anthropic-specific)
-    tools = []
-    for t in TOOL_DEFINITIONS:
-        tool_copy = dict(t)
-        tool_copy.pop("cache_control", None)
-        schema = dict(tool_copy.get("input_schema", {}))
-        schema.pop("cache_control", None)
-        tool_copy["input_schema"] = schema
-        tools.append(tool_copy)
+    # Pass tool definitions through with their cache_control marker intact so
+    # Anthropic caches the large, stable tool schema across turns and rounds.
+    # The local backend strips cache_control itself in _anthropic_tools_to_openai.
+    tools = TOOL_DEFINITIONS
 
     for round_num in range(1, max_tool_rounds + 1):
         print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
