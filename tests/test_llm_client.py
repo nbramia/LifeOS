@@ -634,3 +634,25 @@ class TestAnthropicCaching:
         assert text == "hello"
         done = next(e for e in events if e["type"] == "done")
         assert done["usage"].cache_read_input_tokens == 2600
+
+    @pytest.mark.asyncio
+    async def test_astream_forwards_timeout_to_sdk(self):
+        """astream accepts a per-request timeout and forwards it to the SDK.
+
+        Regression for #385: the agent loop's synthesis round calls
+        astream(..., timeout=180), which used to raise TypeError on the
+        Anthropic backend because the method had no timeout parameter.
+        """
+        from types import SimpleNamespace
+        client = _anthropic_client()
+        captured = {}
+        final = SimpleNamespace(
+            content=[], usage=_fake_anthropic_usage(), stop_reason="end_turn")
+
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+            return _FakeAnthropicStream(final)
+
+        client._async_client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+        _ = [e async for e in client.astream([{"role": "user", "content": "hi"}], timeout=180)]
+        assert captured["timeout"] == 180
