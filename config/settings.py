@@ -100,6 +100,15 @@ class Settings(BaseSettings):
         description="Optional bearer token for the Agent text backend"
     )
 
+    # Default /chat input mode. Off (text) by default so a fresh clone without a
+    # voice gateway isn't dropped onto a non-functional dock; set true to make
+    # voice the default. A ?mode= URL param or a stored preference still wins.
+    chat_default_voice: bool = Field(
+        default=False,
+        alias="LIFEOS_CHAT_DEFAULT_VOICE",
+        description="Make voice the default /chat input mode"
+    )
+
     # Code directory (parent directory containing LifeOS and other projects)
     code_dir: str = Field(default="~/Code", alias="LIFEOS_CODE_DIR")
 

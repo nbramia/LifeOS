@@ -132,10 +132,11 @@ function isVoiceMode() {
   return config.voiceMode === true;
 }
 
-// Resolve the initial input mode. Precedence: an explicit URL param
-// (/chat?mode=voice | /chat?mode=text), which also sticks; then the stored
-// preference; otherwise VOICE is the default.
-function resolveInitialVoiceMode() {
+// An explicit input-mode choice: a URL param (/chat?mode=voice | ?mode=text),
+// which also sticks, then the stored preference. Returns true (voice), false
+// (text), or null when there's no explicit choice — in which case the caller
+// falls back to the server's configured default (LIFEOS_CHAT_DEFAULT_VOICE).
+function resolveExplicitVoiceMode() {
   try {
     const mode = new URLSearchParams(window.location.search).get('mode');
     if (mode === 'voice') { storeVoiceMode(true); return true; }
@@ -151,7 +152,19 @@ function resolveInitialVoiceMode() {
   }
   if (stored === '1') return true;
   if (stored === '0') return false;
-  return true;  // default: voice
+  return null;
+}
+
+// The server-configured default mode (LIFEOS_CHAT_DEFAULT_VOICE). Off by default
+// so a fresh clone without a voice gateway stays on text.
+async function fetchDefaultVoiceMode() {
+  try {
+    const resp = await fetch(endpoints.chatConfig);
+    if (resp.ok) return !!(await resp.json()).default_voice;
+  } catch (e) {
+    /* config unavailable — keep text */
+  }
+  return false;
 }
 
 function storeVoiceMode(on) {
@@ -201,8 +214,19 @@ function formatMicError(err) {
 }
 
 export function initVoice() {
-  config.voiceMode = resolveInitialVoiceMode();
+  const explicit = resolveExplicitVoiceMode();
+  config.voiceMode = explicit === true;  // text until the server default resolves
   applyVoiceMode();
+  if (explicit === null) {
+    // No URL param / stored preference — honor the server default. Async, but
+    // local + sub-frame, so any text→voice flip is imperceptible.
+    fetchDefaultVoiceMode().then((isVoice) => {
+      if (isVoice && resolveExplicitVoiceMode() === null && !config.voiceMode) {
+        config.voiceMode = true;
+        applyVoiceMode();
+      }
+    });
+  }
 
   loadDockSettings();
   wireDockToggle(elements.voiceMute, 'mute', () => { if (dockSettings.mute) stopAllAudio(); });

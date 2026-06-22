@@ -820,6 +820,13 @@ async def list_personas():
     )
 
 
+@router.get("/chat/config")
+async def chat_config():
+    """Client-facing /chat defaults. `default_voice` drives the web client's
+    default input mode when there's no ?mode= param or stored preference."""
+    return {"default_voice": bool(settings.chat_default_voice)}
+
+
 # Attachment configuration
 ALLOWED_MEDIA_TYPES = {
     # Images - 5MB each
