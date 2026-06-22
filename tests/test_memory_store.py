@@ -7,9 +7,8 @@ import json
 import os
 import tempfile
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
 
 from api.services.memory_store import (
     Memory,
@@ -18,9 +17,34 @@ from api.services.memory_store import (
     extract_keywords,
     format_memories_for_prompt,
     get_memory_store,
-    CATEGORY_PATTERNS,
-    STOPWORDS,
+    MEMORY_SEMANTIC_FLOOR,
 )
+
+
+class _FakeEmbeddingService:
+    """Deterministic stand-in for the embedding service used in hybrid tests.
+
+    Returns a fixed vector per exact text (falling back to ``default`` for
+    unknown text) and records every text it is asked to embed, so tests can
+    assert what was (re)embedded.
+    """
+
+    def __init__(self, vectors, default, model_name="fake-embed-model"):
+        self._vectors = vectors          # text -> vector
+        self._default = default          # vector for unknown text
+        self.model_name = model_name
+        self.embedded_texts = []         # every text passed to embed_text/embed_texts
+
+    def _lookup(self, text):
+        return list(self._vectors.get(text, self._default))
+
+    def embed_text(self, text):
+        self.embedded_texts.append(text)
+        return self._lookup(text)
+
+    def embed_texts(self, texts):
+        self.embedded_texts.extend(texts)
+        return [self._lookup(t) for t in texts]
 
 
 # =============================================================================
@@ -298,7 +322,7 @@ class TestMemoryStoreInit:
         """Test initialization creates parent directory if needed."""
         with tempfile.TemporaryDirectory() as tmpdir:
             nested_path = Path(tmpdir) / "subdir" / "memories.json"
-            store = MemoryStore(file_path=str(nested_path))
+            MemoryStore(file_path=str(nested_path))
 
             assert nested_path.parent.exists()
 
@@ -337,7 +361,7 @@ class TestMemoryStoreCreate:
 
     def test_create_memory_persists(self, store, temp_json_file):
         """Test that created memory is saved to file."""
-        memory = store.create_memory("Persistent memory")
+        store.create_memory("Persistent memory")
 
         # Read the file directly
         with open(temp_json_file, 'r') as f:
@@ -513,7 +537,20 @@ class TestMemoryStoreDelete:
 
 @pytest.mark.unit
 class TestMemoryStoreSearch:
-    """Tests for search_memories method."""
+    """Tests for the keyword-only behavior of search_memories.
+
+    These predate hybrid recall and assert the keyword path in isolation, so
+    the embedding service is forced unavailable (search then falls back to
+    keyword-only) — keeping them fast and independent of any installed model.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_keyword_only(self, monkeypatch):
+        def _unavailable(*args, **kwargs):
+            raise RuntimeError("embedding service disabled for keyword-only tests")
+        monkeypatch.setattr(
+            "api.services.embeddings.get_embedding_service", _unavailable
+        )
 
     def test_search_by_keyword(self, populated_store):
         """Test searching by keyword."""
@@ -550,6 +587,181 @@ class TestMemoryStoreSearch:
 
         assert len(results) <= 5
         assert len(results) > 0
+
+
+@pytest.mark.unit
+class TestMemoryStoreHybridSearch:
+    """Tests for hybrid (semantic + keyword) recall in search_memories.
+
+    A fake embedding service supplies deterministic vectors so the semantic
+    path, RRF fusion, and precision floor can be asserted without a real model.
+    """
+
+    def _use(self, monkeypatch, fake):
+        monkeypatch.setattr(
+            "api.services.embeddings.get_embedding_service", lambda *a, **k: fake
+        )
+
+    def test_semantic_match_without_keyword_overlap(self, store, monkeypatch):
+        """A paraphrase with zero shared tokens is recalled via embeddings."""
+        memory = store.create_memory("I prefer terse replies")
+        fake = _FakeEmbeddingService(
+            vectors={
+                "I prefer terse replies": [1.0, 0.0, 0.0],
+                "keep it short": [0.96, 0.05, 0.0],
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+
+        # No keyword overlap between query and memory — only semantics can match.
+        results = store.search_memories("keep it short")
+
+        assert [m.id for m in results] == [memory.id]
+
+    def test_alias_match_via_keyword_no_regression(self, store, monkeypatch):
+        """Alias/spelling memories still match on keyword even when the query is
+        semantically distant (cosine below the floor)."""
+        memory = store.create_memory("Sarah may also be spelled Sara")
+        fake = _FakeEmbeddingService(
+            vectors={
+                "Sarah may also be spelled Sara": [1.0, 0.0, 0.0],
+                "Sara": [0.0, 1.0, 0.0],  # orthogonal -> cosine 0, below floor
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+
+        results = store.search_memories("Sara")
+
+        assert memory.id in [m.id for m in results]
+
+    def test_rrf_ranks_dual_matches_first(self, store, monkeypatch):
+        """A memory matched by BOTH signals outranks single-signal matches."""
+        both = store.create_memory("alpha report")      # keyword 'alpha' + near query
+        kw_only = store.create_memory("alpha notes")     # keyword 'alpha', far vector
+        sem_only = store.create_memory("zzzzz wxyzz")    # no shared keyword, near query
+        fake = _FakeEmbeddingService(
+            vectors={
+                "alpha report": [1.0, 0.0, 0.0],
+                "alpha notes": [0.0, 1.0, 0.0],
+                "zzzzz wxyzz": [1.0, 0.0, 0.0],
+                "alpha signal": [1.0, 0.0, 0.0],
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+
+        results = store.search_memories("alpha signal")
+        ids = [m.id for m in results]
+
+        assert ids[0] == both.id
+        assert set(ids) == {both.id, kw_only.id, sem_only.id}
+
+    def test_precision_floor_blocks_unrelated(self, store, monkeypatch):
+        """A vague query with no keyword overlap and sub-floor cosine returns
+        nothing — memories are injected every turn, so junk must be excluded."""
+        import math
+        store.create_memory("banana bread recipe")
+        store.create_memory("quarterly revenue figures")
+        # cosine ~0.30 (just below the 0.35 floor) for the second memory.
+        near = [0.30, math.sqrt(1 - 0.30 ** 2), 0.0]
+        fake = _FakeEmbeddingService(
+            vectors={
+                "banana bread recipe": [0.0, 0.0, 1.0],
+                "quarterly revenue figures": near,
+                "qwerty asdf": [1.0, 0.0, 0.0],
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+
+        results = store.search_memories("qwerty asdf")
+
+        assert results == []
+        assert MEMORY_SEMANTIC_FLOOR > 0.30  # guards the boundary this test assumes
+
+    def test_embedding_failure_falls_back_to_keyword(self, store, monkeypatch):
+        """If the embedding service raises, search degrades to keyword-only."""
+        memory = store.create_memory("John drinks black coffee")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("model unavailable")
+        monkeypatch.setattr("api.services.embeddings.get_embedding_service", _boom)
+
+        results = store.search_memories("John")
+
+        assert memory.id in [m.id for m in results]
+
+    def test_memories_json_has_no_vectors_and_sidecar_used(self, store, monkeypatch):
+        """Vectors live in the sidecar cache, never in the human-readable file."""
+        memory = store.create_memory("I prefer terse replies")
+        fake = _FakeEmbeddingService(
+            vectors={
+                "I prefer terse replies": [1.0, 0.0, 0.0],
+                "keep it short": [0.96, 0.05, 0.0],
+            },
+            default=[0.0, 0.0, 1.0],
+        )
+        self._use(monkeypatch, fake)
+        store.search_memories("keep it short")
+
+        raw = Path(store.file_path).read_text()
+        assert "vector" not in raw
+        memories_data = json.loads(raw)
+        for mem in memories_data["memories"]:
+            assert "vector" not in mem and "embedding" not in mem
+
+        assert store.embeddings_path.exists()
+        cache = json.loads(store.embeddings_path.read_text())
+        assert cache["model"] == "fake-embed-model"
+        entry = cache["vectors"][memory.id]
+        assert entry["vector"] == [1.0, 0.0, 0.0]
+        assert len(entry["hash"]) == 64  # sha256 hex digest
+
+    def test_cache_recomputes_only_on_content_change(self, store, monkeypatch):
+        """A memory is re-embedded when its content changes, not on every search."""
+        memory = store.create_memory("original wording here")
+        fake = _FakeEmbeddingService(vectors={}, default=[1.0, 0.0, 0.0])
+        self._use(monkeypatch, fake)
+
+        store.search_memories("first query")
+        # Warm cache: a second search must NOT re-embed the unchanged memory.
+        fake.embedded_texts.clear()
+        store.search_memories("second query")
+        assert "original wording here" not in fake.embedded_texts
+
+        # Editing the content invalidates the cached vector.
+        store.update_memory(memory.id, "completely new wording now")
+        fake.embedded_texts.clear()
+        store.search_memories("third query")
+        assert "completely new wording now" in fake.embedded_texts
+
+        import hashlib
+        cache = json.loads(store.embeddings_path.read_text())
+        expected = hashlib.sha256("completely new wording now".encode("utf-8")).hexdigest()
+        assert cache["vectors"][memory.id]["hash"] == expected
+
+    def test_cache_invalidated_on_model_change(self, store, temp_json_file, monkeypatch):
+        """Swapping the embedding model rebuilds the cache from scratch."""
+        memory = store.create_memory("durable memory content")
+
+        fake_a = _FakeEmbeddingService(vectors={}, default=[1.0, 0.0, 0.0], model_name="model-A")
+        self._use(monkeypatch, fake_a)
+        store.search_memories("query one")
+        cache = json.loads(store.embeddings_path.read_text())
+        assert cache["model"] == "model-A"
+
+        # New store instance (same files) with a different model.
+        store2 = MemoryStore(file_path=temp_json_file)
+        fake_b = _FakeEmbeddingService(vectors={}, default=[0.0, 1.0, 0.0], model_name="model-B")
+        self._use(monkeypatch, fake_b)
+        store2.search_memories("query two")
+
+        assert "durable memory content" in fake_b.embedded_texts
+        cache = json.loads(store2.embeddings_path.read_text())
+        assert cache["model"] == "model-B"
+        assert cache["vectors"][memory.id]["vector"] == [0.0, 1.0, 0.0]
 
 
 # =============================================================================
@@ -637,6 +849,14 @@ class TestGetMemoryStore:
 @pytest.mark.unit
 class TestMemoryWorkflow:
     """Integration tests for memory workflows."""
+
+    @pytest.fixture(autouse=True)
+    def _force_keyword_only(self, monkeypatch):
+        def _unavailable(*args, **kwargs):
+            raise RuntimeError("embedding service disabled for keyword-only tests")
+        monkeypatch.setattr(
+            "api.services.embeddings.get_embedding_service", _unavailable
+        )
 
     def test_complete_memory_lifecycle(self, store):
         """Test complete memory lifecycle."""

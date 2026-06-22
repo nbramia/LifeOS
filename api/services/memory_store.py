@@ -8,11 +8,12 @@ Storage: Human-readable JSON file at ~/.lifeos/memories.json
 - Can be pre-populated with personal context
 - Auto-loaded on startup
 """
+import hashlib
 import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Default storage path - JSON file for human readability
 DEFAULT_MEMORIES_PATH = Path.home() / ".lifeos" / "memories.json"
+
+# Minimum cosine similarity for a memory to count as a semantic match. Because
+# relevant memories are injected into the chat prompt every turn, this floor
+# keeps vague/unrelated queries from pulling in low-relevance memories. Tunable.
+MEMORY_SEMANTIC_FLOOR = 0.35
 
 # Memory categories and their trigger patterns
 CATEGORY_PATTERNS = {
@@ -81,8 +87,6 @@ def categorize_memory(content: str) -> str:
     Returns:
         Category string (people, preferences, facts, decisions, reminders, context)
     """
-    content_lower = content.lower()
-
     # Check each category's patterns
     for category, patterns in CATEGORY_PATTERNS.items():
         for pattern in patterns:
@@ -168,6 +172,14 @@ class MemoryStore:
 
         # Ensure directory exists
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Sidecar cache of memory embeddings, kept next to the memories file.
+        # Pure cache (regenerable from memories.json) — kept separate so the
+        # human-readable memories file never carries raw float vectors.
+        self.embeddings_path = self.file_path.with_name(
+            self.file_path.stem + "_embeddings.json"
+        )
+        self._embedding_cache: dict = self._load_embedding_cache()
 
         # Load or initialize memories
         self._memories: dict[str, Memory] = {}
@@ -346,45 +358,156 @@ class MemoryStore:
 
         return True
 
+    @staticmethod
+    def _content_hash(content: str) -> str:
+        """Stable hash of a memory's content, used to invalidate cached vectors."""
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _load_embedding_cache(self) -> dict:
+        """Load the sidecar embedding cache (defensive — a missing or corrupt
+        cache just starts empty and is rebuilt on the next search)."""
+        empty = {"model": None, "vectors": {}}
+        if not self.embeddings_path.exists():
+            return empty
+        try:
+            with open(self.embeddings_path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("vectors"), dict):
+                return empty
+            return {"model": data.get("model"), "vectors": data["vectors"]}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Error loading memory embeddings cache: {e}. Rebuilding.")
+            return empty
+
+    def _save_embedding_cache(self) -> None:
+        """Persist the sidecar embedding cache (compact — it is not meant to be
+        read by humans, unlike memories.json)."""
+        try:
+            with open(self.embeddings_path, "w") as f:
+                json.dump(self._embedding_cache, f)
+        except OSError as e:
+            logger.warning(f"Error saving memory embeddings cache: {e}")
+
+    def _semantic_scores(self, query: str, memories: list[Memory]) -> Optional[dict[str, float]]:
+        """Cosine similarity between the query and each memory.
+
+        Embeddings are cached per memory (keyed by content hash) in the sidecar
+        file and only recomputed when a memory's content or the embedding model
+        changes. Returns a {memory_id: cosine} map, or None if the embedding
+        service is unavailable (the caller then falls back to keyword-only).
+        """
+        try:
+            import numpy as np
+            from api.services.embeddings import get_embedding_service
+
+            service = get_embedding_service()
+            model_name = service.model_name
+
+            cache = self._embedding_cache
+            # A model swap invalidates every cached vector at once.
+            if cache.get("model") != model_name:
+                cache = {"model": model_name, "vectors": {}}
+            vectors = dict(cache["vectors"])
+
+            # (Re)embed memories whose content changed or were never embedded.
+            pending = [
+                m for m in memories
+                if vectors.get(m.id, {}).get("hash") != self._content_hash(m.content)
+            ]
+            if pending:
+                fresh = service.embed_texts([m.content for m in pending])
+                for memory, vector in zip(pending, fresh):
+                    vectors[memory.id] = {"hash": self._content_hash(memory.content), "vector": vector}
+
+            # Drop vectors for memories that no longer exist (e.g. deleted).
+            active_ids = {m.id for m in memories}
+            pruned = {mid: v for mid, v in vectors.items() if mid in active_ids}
+
+            dirty = bool(pending) or len(pruned) != len(cache["vectors"])
+            self._embedding_cache = {"model": model_name, "vectors": pruned}
+            if dirty:
+                self._save_embedding_cache()
+
+            query_vec = np.asarray(service.embed_text(query), dtype=float)
+            query_norm = np.linalg.norm(query_vec)
+            if query_norm == 0:
+                return {}
+
+            scores: dict[str, float] = {}
+            for memory in memories:
+                vec = np.asarray(pruned[memory.id]["vector"], dtype=float)
+                norm = np.linalg.norm(vec)
+                if norm == 0:
+                    continue
+                scores[memory.id] = float(np.dot(query_vec, vec) / (query_norm * norm))
+            return scores
+        except Exception as e:
+            logger.warning(f"Semantic memory recall unavailable, using keyword-only: {e}")
+            return None
+
     def search_memories(self, query: str, limit: int = 10, min_relevance: float = 0.15) -> list[Memory]:
         """
-        Search memories by keyword matching with relevance filtering.
+        Search memories with hybrid recall: semantic (embedding cosine) fused
+        with keyword overlap via Reciprocal Rank Fusion.
+
+        Keyword matching alone misses paraphrases ("keep it short" vs. a "prefers
+        terse replies" memory); semantic alone is weak on the alias/spelling
+        memories this store is built for. Fusing both keeps each one's strength.
+        Falls back to keyword-only when the embedding service is unavailable.
 
         Args:
             query: Search query
             limit: Maximum results to return
-            min_relevance: Minimum relevance score (overlap / search_terms count).
+            min_relevance: Minimum keyword relevance (overlap / search_terms count).
                            Default 0.15 requires ~15% keyword overlap.
 
         Returns:
             List of matching Memory objects
         """
-        # Extract keywords from query
+        if not query.strip():
+            return []
+
+        memories = self.list_memories(limit=1000)
+        if not memories:
+            return []
+
+        by_id = {m.id: m for m in memories}
+
+        # Keyword overlap scoring (the original signal).
         query_keywords = set(extract_keywords(query))
         query_words = set(query.lower().split())
         search_terms = query_keywords | query_words
         term_count = max(len(search_terms), 1)
 
-        # Get all active memories and score them
-        memories = self.list_memories(limit=1000)
-        scored = []
-
+        keyword_scores: dict[str, int] = {}
         for memory in memories:
-            # Score based on keyword overlap
             memory_keywords = set(kw.lower() for kw in memory.keywords)
             content_words = set(memory.content.lower().split())
             all_terms = memory_keywords | content_words
 
             overlap = len(search_terms & all_terms)
-            if overlap > 0:
-                relevance = overlap / term_count
-                if relevance >= min_relevance:
-                    scored.append((memory, overlap))
+            if overlap > 0 and overlap / term_count >= min_relevance:
+                keyword_scores[memory.id] = overlap
 
-        # Sort by score descending
-        scored.sort(key=lambda x: -x[1])
+        keyword_ranked = [mid for mid, _ in sorted(keyword_scores.items(), key=lambda x: -x[1])]
 
-        return [m for m, score in scored[:limit]]
+        semantic_scores = self._semantic_scores(query, memories)
+
+        # Embedding service unavailable — preserve the original keyword behavior.
+        if semantic_scores is None:
+            return [by_id[mid] for mid in keyword_ranked[:limit]]
+
+        semantic_ranked = [
+            mid for mid, score in sorted(semantic_scores.items(), key=lambda x: -x[1])
+            if score >= MEMORY_SEMANTIC_FLOOR
+        ]
+
+        if not semantic_ranked and not keyword_ranked:
+            return []
+
+        from api.services.hybrid_search import reciprocal_rank_fusion
+        fused = reciprocal_rank_fusion(semantic_ranked, keyword_ranked)
+        return [by_id[mid] for mid, _ in fused[:limit] if mid in by_id]
 
     def get_relevant_memories(self, query: str, limit: int = 5) -> list[Memory]:
         """
