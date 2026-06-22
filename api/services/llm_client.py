@@ -528,6 +528,8 @@ class AnthropicLLMClient:
         if temperature is not None:
             kwargs["temperature"] = temperature
         if timeout is not None:
+            # The SDK accepts float | httpx.Timeout; a bare float sets a uniform
+            # per-request timeout. (LocalLLMClient wraps it with connect=10s.)
             kwargs["timeout"] = timeout
 
         async with self._async_client.messages.stream(**kwargs) as stream:

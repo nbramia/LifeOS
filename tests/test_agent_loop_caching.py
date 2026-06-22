@@ -83,49 +83,75 @@ async def test_cache_tokens_surface_in_agent_result():
     assert result.full_text == "The answer is 42."
 
 
-class _ExhaustThenSynthesize:
-    """Returns a tool call on every tool round (so the loop exhausts its rounds
-    and falls through to the synthesis round), then a text answer on the
-    synthesis round. astream's signature mirrors the real client exactly,
-    including the ``timeout`` kwarg the synthesis round passes."""
+class _MockAnthropicStream:
+    """Minimal async context manager mimicking anthropic's streaming response,
+    so the REAL AnthropicLLMClient.astream can be exercised against it."""
 
-    def __init__(self):
-        self.calls = []
+    def __init__(self, final_message, deltas=None):
+        self._final = final_message
+        self._deltas = deltas or []
 
-    async def astream(self, messages, *, system=None, max_tokens=4096,
-                      tools=None, temperature=None, timeout=None):
-        from api.services.llm_client import LLMUsage
-        self.calls.append({"has_tools": tools is not None, "timeout": timeout})
-        if tools:
-            yield {"type": "tool_calls", "calls": [
-                {"id": "c1", "type": "function",
-                 "function": {"name": "search_vault", "arguments": "{}"}}]}
-            yield {"type": "done", "usage": LLMUsage(), "finish_reason": "tool_use"}
-        else:
-            yield {"type": "text", "content": "Synthesized answer."}
-            yield {"type": "done", "usage": LLMUsage(), "finish_reason": "end_turn"}
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for d in self._deltas:
+            yield d
+
+    async def get_final_message(self):
+        return self._final
 
 
 @pytest.mark.asyncio
-async def test_synthesis_round_passes_timeout_and_completes():
-    """When tool rounds are exhausted, the synthesis round calls
-    astream(..., timeout=180) with no tools, and the loop produces the
-    synthesized answer.
-
-    Regression for #385: that call used to raise TypeError on the Anthropic
-    backend (astream had no timeout param), so the user got an error instead of
-    a synthesized answer whenever the loop exhausted its rounds.
+async def test_synthesis_round_drives_real_client_with_timeout():
+    """End-to-end regression for #385. run_agent_loop exhausts its tool rounds
+    and the synthesis round drives the REAL AnthropicLLMClient.astream with
+    timeout=180 (only the SDK is mocked). If astream loses its timeout param the
+    synthesis call raises TypeError, the loop yields "(Error during synthesis…)"
+    instead of the answer, and this test fails — so it genuinely guards the bug,
+    not just the call shape.
     """
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from api.services import agent_loop
+    from api.services.llm_client import AnthropicLLMClient
 
-    fake = _ExhaustThenSynthesize()
-    with patch.object(agent_loop, "_select_client", return_value=fake), \
+    def _usage():
+        return SimpleNamespace(input_tokens=10, output_tokens=5,
+                               cache_creation_input_tokens=0, cache_read_input_tokens=0)
+
+    seen_timeouts = []
+
+    def fake_stream(**kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        if kwargs.get("tools"):
+            # tool round: final message carries a tool_use block so the loop
+            # spends its one round and falls through to synthesis.
+            final = SimpleNamespace(
+                content=[SimpleNamespace(type="tool_use", id="c1",
+                                         name="search_vault", input={})],
+                usage=_usage(), stop_reason="tool_use")
+            return _MockAnthropicStream(final)
+        # synthesis round: a text answer, no tool_use.
+        final = SimpleNamespace(content=[], usage=_usage(), stop_reason="end_turn")
+        delta = SimpleNamespace(type="content_block_delta",
+                                delta=SimpleNamespace(text="Synthesized answer."))
+        return _MockAnthropicStream(final, deltas=[delta])
+
+    client = AnthropicLLMClient(api_key="sk-ant-test")
+    client._async_client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+
+    with patch.object(agent_loop, "_select_client", return_value=client), \
          patch.object(agent_loop, "execute_tool_parallel",
                       AsyncMock(return_value="vault result")):
         events = [e async for e in agent_loop.run_agent_loop("find X", max_tool_rounds=1)]
 
     result = next(e["result"] for e in events if e["type"] == "result")
     assert result.full_text == "Synthesized answer."
-    # The final call was the synthesis round: no tools, timeout forwarded.
-    assert fake.calls[-1] == {"has_tools": False, "timeout": 180}
+    assert 180 in seen_timeouts  # the synthesis round forwarded the timeout
