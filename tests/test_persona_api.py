@@ -228,6 +228,88 @@ class TestPersonaFrontmatter:
 
 
 # ---------------------------------------------------------------------------
+# Voice-awareness (#390 Phase 3)
+# ---------------------------------------------------------------------------
+
+class TestVoiceAwareness:
+    def test_build_system_prompt_appends_spoken_block(self):
+        from api.services.agent_system_prompt import build_system_prompt
+        blocks = build_system_prompt(persona="P", voice_rules=("no markdown", "be brief"))
+        joined = "\n".join(b["text"] for b in blocks)
+        assert "Spoken response" in joined and "no markdown" in joined and "be brief" in joined
+
+    def test_build_system_prompt_no_spoken_block_for_text(self):
+        from api.services.agent_system_prompt import build_system_prompt
+        blocks = build_system_prompt(persona="P")
+        assert not any("Spoken response" in b["text"] for b in blocks)
+
+    def test_persona_voice_returns_rules(self, tmp_path, monkeypatch):
+        pf = tmp_path / "fitness.md"
+        pf.write_text("---\nid: fitness\nvoice:\n  - terse\n  - no emoji\n---\n\nB")
+        reg = _registry(tmp_path, [{"name": "fitness", "token_env": "TG_F", "persona_file": str(pf)}])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_F", "tok")
+        from config.settings import settings
+        assert settings.persona_voice("fitness") == ("terse", "no emoji")
+        assert settings.persona_voice("ghost") == ()
+
+    def test_voice_modality_threads_voice_rules(self, client, monkeypatch):
+        # A modality="voice" turn appends the persona's voice rules; text does not.
+        from types import SimpleNamespace
+        import api.services.agent_loop as agent_loop_mod
+        captured: dict = {}
+
+        async def fake_loop(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="ok")}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", fake_classify)
+
+        r = client.post("/api/ask/stream", json={"question": "hi", "persona_id": "primary", "modality": "voice"})
+        assert r.status_code == 200
+        assert captured.get("voice_rules")  # non-empty — primary.md carries voice rules
+
+        client.post("/api/ask/stream", json={"question": "hi", "persona_id": "primary"})
+        assert captured.get("voice_rules") == ()
+
+    def test_voice_block_is_uncached(self):
+        from api.services.agent_system_prompt import build_system_prompt
+        blocks = build_system_prompt(persona="P", voice_rules=("brief",))
+        spoken = next(b for b in blocks if "Spoken response" in b["text"])
+        assert "cache_control" not in spoken  # uncached, like the persona block
+
+    def test_raw_persona_path_gets_no_voice_rules(self, client, monkeypatch):
+        # The raw `persona` path (no id) + modality=voice gets no voice rules,
+        # rather than misapplying primary's (guard on persona_id).
+        from types import SimpleNamespace
+        import api.services.agent_loop as agent_loop_mod
+        captured: dict = {}
+
+        async def fake_loop(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="ok")}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", fake_classify)
+        r = client.post("/api/ask/stream", json={"question": "hi", "persona": "RAW", "modality": "voice"})
+        assert r.status_code == 200
+        assert captured.get("voice_rules") == ()
+
+
+# ---------------------------------------------------------------------------
 # GET /api/personas
 # ---------------------------------------------------------------------------
 

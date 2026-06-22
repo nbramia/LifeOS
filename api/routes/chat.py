@@ -321,6 +321,11 @@ class AskStreamRequest(BaseModel):
     # backend (the local backend is already local); the "claude_code" handoff
     # works on any backend. Unknown values fall back to auto.
     model_override: Optional[str] = None
+    # Response modality. "voice" tells the orchestrator this turn will be read
+    # aloud, so the selected persona's `voice` rules are appended to the system
+    # prompt; None/"text" is a normal typed turn. Set by the voice gateway
+    # (whisper-relay) on spoken turns; omitted for text.
+    modality: Optional[str] = None
 
     @field_validator("persona")
     @classmethod
@@ -447,6 +452,16 @@ async def ask_stream(request: AskStreamRequest):
             )
         persona_preamble = resolved
         new_conversation_persona_id = request.persona_id
+
+    # Voice turns get the selected persona's spoken-response rules appended to the
+    # system prompt; text turns get none. (Set by the voice gateway via `modality`.)
+    # Guard on persona_id: voice rules are keyed by id, so the raw-`persona` path
+    # (Telegram preamble text, no id) gets none rather than misapplying primary's.
+    voice_rules = (
+        settings.persona_voice(request.persona_id)
+        if (request.modality or "").strip().lower() == "voice" and request.persona_id
+        else ()
+    )
 
     async def generate():
         try:
@@ -725,6 +740,7 @@ async def ask_stream(request: AskStreamRequest):
                 max_tool_rounds=5,
                 model=orchestrator_model if escalated else "",
                 persona=persona_preamble,
+                voice_rules=voice_rules,
                 force_local=force_local,
             ):
                 if event["type"] == "text":

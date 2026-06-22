@@ -71,7 +71,7 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     if raw_voice and not isinstance(raw_voice, list):
         logger.warning(f"persona file {name!r}: `voice` must be a YAML list; ignoring {type(raw_voice).__name__}")
         raw_voice = []
-    voice = tuple(str(v).strip() for v in raw_voice)
+    voice = tuple(s for v in raw_voice if (s := str(v).strip()))  # drop blank rules
     model = str(meta.get("model") or "").strip()
     fid = meta.get("id")
     if fid and name and str(fid) != name:
@@ -901,6 +901,19 @@ class Settings(BaseSettings):
             if bot.name == persona_id:
                 return bot.persona
         return None
+
+    def persona_voice(self, persona_id: str) -> "tuple[str, ...]":
+        """Spoken-turn rules for a persona id; empty tuple if none or unknown.
+
+        Appended to the system prompt on voice turns (the `modality` flag on
+        /api/ask/stream). Same registry source as resolve_persona.
+        """
+        if persona_id == "primary":
+            return _load_primary_persona()[1]
+        for bot in self.telegram_bots:
+            if bot.name == persona_id:
+                return bot.voice
+        return ()
 
     @property
     def photos_db_path(self) -> str:
