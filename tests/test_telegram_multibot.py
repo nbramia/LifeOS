@@ -125,9 +125,14 @@ class TestTokenRouting:
 class TestListenerWiring:
     def test_primary_uses_legacy_state_file(self, tmp_path):
         from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+
+        primary = TelegramBotConfig(
+            name="primary", token="T", chat_id="C", persona=""
+        )
         state = tmp_path / "telegram_state.json"
         with patch.object(TelegramBotListener, "_STATE_FILE", state):
-            listener = TelegramBotListener()  # None -> primary
+            listener = TelegramBotListener(primary)
             assert listener._is_primary
             assert listener._state_file == state
 
