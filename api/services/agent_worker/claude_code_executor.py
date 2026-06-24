@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
@@ -41,6 +41,72 @@ HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 _NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
 _CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
+# Fenced code blocks: a fence marker (``` or ~~~) at the START of a line
+# through its matching closing fence on its own line. Tags inside these are
+# illustrative — the agent quoting the protocol or showing example output — so
+# they must NOT be treated as real notifications nor stripped from the
+# narrative (#402). Anchoring to line starts (proper Markdown semantics) means
+# an *inline* triple-backtick span inside a tag body is not mistaken for a
+# fence and so doesn't truncate the body. Tag bodies are short operator-facing
+# prose by contract, so a multi-line fenced block embedded *inside* a tag body
+# is out of scope (it would split at the fence — acceptable for short tags).
+# Only *balanced* fences match; an unclosed fence falls back to plain scanning,
+# so a real tag after a stray fence marker still surfaces (the safe direction).
+_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
+# Orphaned/malformed control-tag markers left after well-formed extraction
+# (e.g. an unclosed "[NOTIFY" with no closing bracket). Scrubbed from the
+# operator-facing narrative so raw control tokens never leak (#402). The
+# closing bracket is optional to catch unclosed tags; the (?![A-Za-z]) boundary
+# stops it from eating the prefix of unrelated words like "[NOTIFYING ...]".
+_ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY)(?![A-Za-z])\]?")
+
+
+class _TagScan(NamedTuple):
+    """Result of a fence-aware scan of assistant text for control tags.
+
+    ``clarify`` / ``notify`` are the non-empty tag bodies in document order,
+    drawn only from outside fenced code blocks. ``narrative`` is the text with
+    all control tags + orphaned markers removed from non-fenced regions and
+    fenced code blocks preserved verbatim — i.e. the agent's prose as the
+    operator should see it.
+    """
+    clarify: list[str]
+    notify: list[str]
+    narrative: str
+
+
+def _scan_segment(seg: str, clarify: list[str], notify: list[str], parts: list[str]) -> None:
+    """Extract tag bodies from one non-fenced segment and append its cleaned
+    narrative to ``parts``."""
+    for match in _CLARIFY_RE.finditer(seg):
+        body = match.group(1).strip()
+        if body:
+            clarify.append(body)
+    for match in _NOTIFY_RE.finditer(seg):
+        body = match.group(1).strip()
+        if body:
+            notify.append(body)
+    cleaned = _NOTIFY_RE.sub("", seg)
+    cleaned = _CLARIFY_RE.sub("", cleaned)
+    cleaned = _ORPHAN_TAG_RE.sub("", cleaned)
+    parts.append(cleaned)
+
+
+def _scan_protocol_tags(text: str) -> _TagScan:
+    """Fence-aware extraction of ``[NOTIFY]``/``[CLARIFY]`` tags from assistant
+    text. Tags inside fenced code blocks are left untouched (neither extracted
+    nor stripped); outside fences, well-formed bodies are extracted and the
+    tags plus any orphaned/malformed markers are stripped from the narrative."""
+    clarify: list[str] = []
+    notify: list[str] = []
+    parts: list[str] = []
+    pos = 0
+    for fence in _FENCE_RE.finditer(text):
+        _scan_segment(text[pos:fence.start()], clarify, notify, parts)
+        parts.append(text[fence.start():fence.end()])  # fenced block, verbatim
+        pos = fence.end()
+    _scan_segment(text[pos:], clarify, notify, parts)
+    return _TagScan(clarify, notify, "".join(parts))
 
 
 # Common install locations for the Claude CLI when launchd-style minimal PATHs
@@ -539,33 +605,29 @@ class ClaudeCodeExecutor:
             btype = block.get("type")
             if btype == "text":
                 text = block.get("text", "") or ""
-                if text.strip():
-                    # Strip the [NOTIFY]/[CLARIFY] tag-and-body so `final_text`
-                    # holds just the agent's narrative prose. Tags themselves
-                    # already stream out via the notification callback below;
-                    # leaving them in would make the worker's terminal summary
-                    # repeat each tagged body verbatim.
-                    stripped = _NOTIFY_RE.sub("", text)
-                    stripped = _CLARIFY_RE.sub("", stripped).strip()
-                    if stripped:
-                        state.final_text = stripped
-                for match in _CLARIFY_RE.finditer(text):
-                    body = match.group(1).strip()
-                    if body:
-                        state.pending_clarification = body
-                        state.notifications_sent += 1
-                        state.last_notify_at = time.time()
-                        try:
-                            self._notify(body)
-                        except Exception as exc:  # pragma: no cover — defensive
-                            logger.warning("notification callback raised: %s", exc)
-                        self.transcript_store.append(sid, "claude_code_clarify", {
-                            "body": body, "body_chars": len(body),
-                        })
-                for match in _NOTIFY_RE.finditer(text):
-                    body = match.group(1).strip()
-                    if not body:
-                        continue
+                if not text.strip():
+                    continue
+                # Fence-aware scan: extract [NOTIFY]/[CLARIFY] bodies from
+                # outside code fences, and keep `final_text` as the agent's
+                # narrative with tags (and any orphaned markers) stripped. Tags
+                # inside ``` fences are illustrative and left untouched (#402).
+                # Streaming the tags out here would otherwise make the worker's
+                # terminal summary repeat each tagged body verbatim.
+                scan = _scan_protocol_tags(text)
+                if scan.narrative.strip():
+                    state.final_text = scan.narrative.strip()
+                for body in scan.clarify:
+                    state.pending_clarification = body
+                    state.notifications_sent += 1
+                    state.last_notify_at = time.time()
+                    try:
+                        self._notify(body)
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.warning("notification callback raised: %s", exc)
+                    self.transcript_store.append(sid, "claude_code_clarify", {
+                        "body": body, "body_chars": len(body),
+                    })
+                for body in scan.notify:
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
                     state.notify_bodies.append(body)
@@ -616,12 +678,11 @@ class ClaudeCodeExecutor:
 
         result_text = (event.get("result") or "").strip()
         if result_text:
-            # Strip any [NOTIFY]/[CLARIFY] tags that already streamed via
-            # assistant events so we don't double-surface them in final_text.
-            stripped = _NOTIFY_RE.sub("", result_text)
-            stripped = _CLARIFY_RE.sub("", stripped).strip()
-            if stripped:
-                state.final_text = stripped
+            # Strip any [NOTIFY]/[CLARIFY] tags (fence-aware) that already
+            # streamed via assistant events so we don't double-surface them.
+            narrative = _scan_protocol_tags(result_text).narrative.strip()
+            if narrative:
+                state.final_text = narrative
         state.terminal = True
 
     # ------------------------------------------------------------------

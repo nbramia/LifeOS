@@ -490,3 +490,120 @@ def test_system_prompt_carries_session_id_for_delegation(tmp_path: Path):
     appended = cmd[cmd.index("--append-system-prompt") + 1]
     assert session.session_id in appended
     assert "lifeos_agent_spawn" in appended
+
+
+# ---------------------------------------------------------------------------
+# Protocol tag hardening (#402): fence-aware scan + malformed-tag tolerance
+# ---------------------------------------------------------------------------
+
+
+def test_scan_splits_adjacent_and_interleaved_tags():
+    """Adjacent/interleaved well-formed tags split into discrete bodies and are
+    stripped from the narrative (the lazy regex + lookahead, no regression)."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("before [NOTIFY] alpha [CLARIFY] beta [NOTIFY] gamma")
+    assert scan.notify == ["alpha", "gamma"]
+    assert scan.clarify == ["beta"]
+    assert scan.narrative.strip() == "before"
+
+
+def test_scan_ignores_tags_inside_code_fence():
+    """A tag inside a fenced code block is illustrative — not extracted, and
+    preserved verbatim in the narrative."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    text = "ship it [NOTIFY] real\n```python\n[NOTIFY] example only\n```\nthe end"
+    scan = _scan_protocol_tags(text)
+    assert scan.notify == ["real"]  # the fenced one is NOT extracted
+    assert "[NOTIFY] example only" in scan.narrative  # preserved inside the fence
+    assert "example only" not in " ".join(scan.notify)
+
+
+def test_scan_scrubs_malformed_unclosed_tag():
+    """An unclosed/malformed tag marker does not leak into the narrative, while
+    a well-formed tag in the same text is still extracted."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("note [NOTIFY oops no bracket, then [NOTIFY] real one")
+    assert scan.notify == ["real one"]
+    assert "[NOTIFY" not in scan.narrative
+
+
+def test_scan_ignores_empty_body_tags():
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("[NOTIFY]   [CLARIFY]   ")
+    assert scan.notify == []
+    assert scan.clarify == []
+    assert scan.narrative.strip() == ""
+
+
+def test_notify_inside_code_fence_not_streamed(tmp_path: Path):
+    """End-to-end: a [NOTIFY] inside a fenced block must NOT fire the operator
+    notification callback; only the real one outside the fence does (#402)."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text",
+                "text": "```\n[NOTIFY] inside fence\n```\n[NOTIFY] outside fence"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "do a thing"})
+    assert outcome.status == STATUS_COMPLETED
+    assert notifications == ["outside fence"]
+
+
+def test_scan_inline_backticks_in_tag_body_not_treated_as_fence():
+    """An inline triple-backtick span inside a tag body is NOT a fence (fences
+    are line-anchored), so the body is extracted intact — not truncated."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("[CLARIFY] should I use ```black``` or autopep8?")
+    assert scan.clarify == ["should I use ```black``` or autopep8?"]
+    assert scan.notify == []
+
+
+def test_scan_ignores_tags_inside_tilde_fence():
+    """The ~~~ fence variant is handled the same as ```."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("do it [NOTIFY] go\n~~~\n[NOTIFY] sample\n~~~\ndone")
+    assert scan.notify == ["go"]  # fenced one not extracted
+    assert "[NOTIFY] sample" in scan.narrative
+
+
+def test_scan_orphan_scrub_does_not_eat_partial_words():
+    """The orphan-marker scrub must not strip the prefix of an unrelated word
+    that merely starts with NOTIFY/CLARIFY (e.g. '[NOTIFYING ...]')."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("the agent is [NOTIFYING you] about it")
+    assert scan.notify == []
+    assert "[NOTIFYING you]" in scan.narrative
+
+
+def test_result_event_fenced_tag_preserved_in_final_text(tmp_path: Path):
+    """The result-event path is fence-aware too: a fenced tag in the result
+    text survives in final_text rather than being stripped."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01,
+         "result": "Summary:\n```\n[NOTIFY] example\n```\nall done"},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "x"})
+    assert outcome.status == STATUS_COMPLETED
+    assert "[NOTIFY] example" in outcome.final_text  # fenced tag preserved
+    assert notifications == []  # result path never streams

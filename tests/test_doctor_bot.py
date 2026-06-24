@@ -349,3 +349,128 @@ class TestDoctorListener:
             await listener._handle_update(update)
         mock_spawn.assert_not_called()
         mock_chat.assert_awaited_once()  # pure chat, as before
+
+
+# ---------------------------------------------------------------------------
+# 6. worker — a BLOCKED session whose reply-prompt can't be delivered escalates
+#    instead of hanging BLOCKED forever (#402)
+# ---------------------------------------------------------------------------
+
+class TestBlockedSessionEscalation:
+    def _worker(self, tmp_path, monkeypatch, executor, send_with_id):
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.spend_tracker import SpendTracker
+        from api.services.agent_worker.transcript_store import TranscriptStore
+        from api.services.agent_worker import worker as worker_mod
+        from api.services.agent_worker.worker import Worker, _SynchronousPool
+
+        # No real sleeps between retries.
+        monkeypatch.setattr(worker_mod, "_BLOCKED_PROMPT_RETRY_DELAY_S", 0)
+
+        transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+        client = httpx.Client(transport=transport, base_url="http://api")
+        escalations: list = []
+
+        def _send(text, chat_id=None, bot=None):
+            escalations.append((text, bot))
+            return True
+
+        w = Worker(
+            api_base="http://api",
+            session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+            transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+            spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+            poll_seconds=0.01,
+            telegram_send=_send,
+            telegram_send_with_id=send_with_id,
+            http_client=client,
+            claude_code_executor=executor,
+            cli_pool=_SynchronousPool(),
+        )
+        w._escalations = escalations  # type: ignore[attr-defined]
+        return w
+
+    def _blocked_stub(self):
+        from dataclasses import dataclass
+        from api.services.agent_worker.claude_code_executor import REASON_AWAITING_CLARIFICATION
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        @dataclass
+        class _Stub:
+            outcome: ExecutorOutcome
+            def execute(self, session, task):
+                return self.outcome
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        return _Stub(ExecutorOutcome(
+            status=STATUS_BLOCKED, reason=REASON_AWAITING_CLARIFICATION, final_text="which file?",
+        ))
+
+    def test_undeliverable_clarification_escalates_and_fails(self, tmp_path, monkeypatch):
+        """A reply-prompt send that always raises is retried the bounded count,
+        then the session is marked FAILED (not left silently BLOCKED) and the
+        owning bot's surface gets a best-effort escalation."""
+        from api.services.agent_worker import worker as worker_mod
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import STATUS_FAILED
+
+        attempts = {"n": 0}
+
+        def _raises(text, chat_id=None, bot=None):
+            attempts["n"] += 1
+            raise RuntimeError("telegram down")
+
+        w = self._worker(tmp_path, monkeypatch, self._blocked_stub(), _raises)
+        result = spawn_claude_code_session(w.session_store, "fix it", chat_id="123", bot="doctor")
+        w._dispatch_spawned_sessions()
+
+        assert attempts["n"] == worker_mod._BLOCKED_PROMPT_SEND_ATTEMPTS
+        sess = w.session_store.get_by_session_id(result["session_id"])
+        # FAILED is the disposition — no resumable BLOCKED zombie left behind.
+        assert sess.status == STATUS_FAILED
+        assert w._escalations and w._escalations[-1][1] == "doctor"
+
+    def test_empty_send_result_also_escalates(self, tmp_path, monkeypatch):
+        """A send that returns no message ids (without raising) is also a
+        delivery failure — no reply anchor — so it escalates too."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import STATUS_FAILED
+
+        def _empty(text, chat_id=None, bot=None):
+            return []
+
+        w = self._worker(tmp_path, monkeypatch, self._blocked_stub(), _empty)
+        result = spawn_claude_code_session(w.session_store, "fix it", chat_id="123", bot="doctor")
+        w._dispatch_spawned_sessions()
+
+        sess = w.session_store.get_by_session_id(result["session_id"])
+        assert sess.status == STATUS_FAILED
+        assert w._escalations and w._escalations[-1][1] == "doctor"
+
+    def test_retry_succeeds_on_second_attempt_registers_anchor(self, tmp_path, monkeypatch):
+        """A transient send failure that recovers on retry registers the reply
+        anchor and does NOT escalate or fail the session. (The stub executor
+        doesn't set BLOCKED the way the real one does, so we assert on the
+        observable worker effects: the anchor exists and nothing escalated.)"""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+
+        calls = {"n": 0}
+
+        def _flaky(text, chat_id=None, bot=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient blip")
+            return [7000]
+
+        w = self._worker(tmp_path, monkeypatch, self._blocked_stub(), _flaky)
+        result = spawn_claude_code_session(w.session_store, "fix it", chat_id="123", bot="doctor")
+        w._dispatch_spawned_sessions()
+
+        assert calls["n"] == 2  # failed once, then succeeded
+        # The reply anchor was registered (so the operator can resume)...
+        assert w.session_store.get_open_question_by_message_id(7000, bot="doctor") is not None
+        # ...and the success path did NOT escalate or mark the session failed.
+        assert w._escalations == []
+        assert w.session_store.get_by_session_id(result["session_id"]).status != "failed"

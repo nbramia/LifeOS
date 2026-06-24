@@ -67,6 +67,13 @@ logger = logging.getLogger(__name__)
 # put just a 1-line preview + obsidian:// link in the Telegram message.
 _INLINE_SUMMARY_MAX_CHARS = 2000
 
+# When a BLOCKED session's reply-prompt (the resume anchor the operator replies
+# to) can't be delivered, retry a bounded number of times before escalating —
+# rather than leaving the session BLOCKED forever with no way to resume it
+# (#402). The delay is a module constant so tests can zero it out.
+_BLOCKED_PROMPT_SEND_ATTEMPTS = 3
+_BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
+
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
 # it on completion to append every fire's output to one shared note per
@@ -1277,11 +1284,20 @@ class Worker:
                 prompt = "Awaiting your reply — answer the question above to continue."
             else:
                 prompt = "Awaiting your reply to continue."
-            try:
-                sent_ids = _send_with_id(prompt) or []
-            except Exception as exc:
-                logger.warning("code blocked reply prompt send failed: %s", exc)
-                sent_ids = []
+            sent_ids: list = []
+            for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
+                try:
+                    sent_ids = _send_with_id(prompt) or []
+                except Exception as exc:
+                    logger.warning(
+                        "code blocked reply prompt send failed (attempt %d/%d): %s",
+                        attempt + 1, _BLOCKED_PROMPT_SEND_ATTEMPTS, exc,
+                    )
+                    sent_ids = []
+                if sent_ids:
+                    break
+                if attempt + 1 < _BLOCKED_PROMPT_SEND_ATTEMPTS and _BLOCKED_PROMPT_RETRY_DELAY_S:
+                    time.sleep(_BLOCKED_PROMPT_RETRY_DELAY_S)
             if sent_ids:
                 # kind='followup' so _resume_as_followup picks the reply up
                 # alongside agent threads (unified routing model, #248). The
@@ -1300,6 +1316,25 @@ class Worker:
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
                     "reason": outcome.reason, "message_ids": sent_ids,
                 })
+                return
+            # Delivery failed after all retries. Without a sent message id there
+            # is no anchor for the operator to reply to, so the session would sit
+            # BLOCKED forever, unresumable and silent. Escalate instead: record
+            # the undelivered question, mark the session FAILED so recovery and
+            # the /agents view reflect reality, and best-effort notify the owning
+            # surface that a question is stuck (#402).
+            self.transcript_store.append(sid, "code_block_prompt_undelivered", {
+                "reason": outcome.reason, "attempts": _BLOCKED_PROMPT_SEND_ATTEMPTS,
+            })
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            try:
+                _send(
+                    "⚠️ A session needs your input, but the question couldn't be "
+                    "delivered. It was marked failed — re-trigger it to retry."
+                )
+            except Exception as exc:  # best-effort; the same surface may be down
+                logger.warning("blocked-session escalation send failed: %s", exc)
+            self._reconcile_vault_terminal(session, STATUS_FAILED)
             return
 
         if outcome.status == STATUS_COMPLETED:
