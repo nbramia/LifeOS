@@ -349,3 +349,84 @@ class TestDoctorListener:
             await listener._handle_update(update)
         mock_spawn.assert_not_called()
         mock_chat.assert_awaited_once()  # pure chat, as before
+
+
+# ---------------------------------------------------------------------------
+# 6. worker — a BLOCKED session whose reply-prompt can't be delivered escalates
+#    instead of hanging BLOCKED forever (#402)
+# ---------------------------------------------------------------------------
+
+class TestBlockedSessionEscalation:
+    def _worker(self, tmp_path, monkeypatch, executor):
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.spend_tracker import SpendTracker
+        from api.services.agent_worker.transcript_store import TranscriptStore
+        from api.services.agent_worker import worker as worker_mod
+        from api.services.agent_worker.worker import Worker, _SynchronousPool
+
+        # No real sleeps between retries.
+        monkeypatch.setattr(worker_mod, "_BLOCKED_PROMPT_RETRY_DELAY_S", 0)
+
+        transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+        client = httpx.Client(transport=transport, base_url="http://api")
+        escalations: list = []
+        attempts = {"n": 0}
+
+        def _send(text, chat_id=None, bot=None):
+            escalations.append((text, bot))
+            return True
+
+        def _send_with_id(text, chat_id=None, bot=None):
+            attempts["n"] += 1
+            raise RuntimeError("telegram down")
+
+        w = Worker(
+            api_base="http://api",
+            session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+            transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+            spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+            poll_seconds=0.01,
+            telegram_send=_send,
+            telegram_send_with_id=_send_with_id,
+            http_client=client,
+            claude_code_executor=executor,
+            cli_pool=_SynchronousPool(),
+        )
+        w._escalations = escalations  # type: ignore[attr-defined]
+        w._send_attempts = attempts  # type: ignore[attr-defined]
+        return w
+
+    def test_undeliverable_clarification_escalates_and_fails(self, tmp_path, monkeypatch):
+        from dataclasses import dataclass
+        from api.services.agent_worker import worker as worker_mod
+        from api.services.agent_worker.claude_code_executor import REASON_AWAITING_CLARIFICATION
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import STATUS_BLOCKED, STATUS_FAILED
+
+        @dataclass
+        class _Stub:
+            outcome: ExecutorOutcome
+            def execute(self, session, task):
+                return self.outcome
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        stub = _Stub(ExecutorOutcome(
+            status=STATUS_BLOCKED, reason=REASON_AWAITING_CLARIFICATION, final_text="which file?",
+        ))
+        w = self._worker(tmp_path, monkeypatch, stub)
+        result = spawn_claude_code_session(
+            w.session_store, "fix it", chat_id="123", bot="doctor",
+        )
+        w._dispatch_spawned_sessions()
+
+        # The prompt send was retried the bounded number of times...
+        assert w._send_attempts["n"] == worker_mod._BLOCKED_PROMPT_SEND_ATTEMPTS
+        # ...then the session was marked FAILED rather than left silently BLOCKED.
+        sess = w.session_store.get_by_session_id(result["session_id"])
+        assert sess.status == STATUS_FAILED
+        # No reply anchor was registered (there was no deliverable message id).
+        assert w.session_store.get_open_question_by_message_id(5000, bot="doctor") is None
+        # The owning (doctor) surface got a best-effort escalation notice.
+        assert w._escalations and w._escalations[-1][1] == "doctor"
