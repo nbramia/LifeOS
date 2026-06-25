@@ -2,15 +2,17 @@
 # LifeOS Server Management Script
 # Designed for reliable server management from Claude or command line
 #
-# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight]
+# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|restart-worker-detached]
 #
 # Commands:
-#   start     - Kill any existing processes, start server, wait for health check
-#   stop      - Stop the server
-#   restart   - Stop and start the server
-#   status    - Check if server is running and healthy
-#   wait      - Wait for server to be healthy (use after manual start)
-#   preflight - Check prerequisites before first start
+#   start                    - Kill any existing processes, start server, wait for health check
+#   stop                     - Stop the server
+#   restart                  - Stop and start the server
+#   status                   - Check if server is running and healthy
+#   wait                     - Wait for server to be healthy (use after manual start)
+#   preflight                - Check prerequisites before first start
+#   classify-change          - Print whether a diff needs a worker or api-only restart (#401)
+#   restart-worker-detached  - Detached restart of lifeos-agent-worker for the doctor (#401)
 #
 # Expected startup time: 30-60 seconds (loading sentence-transformers model)
 
@@ -27,6 +29,14 @@ STARTUP_TIMEOUT=180  # seconds to wait for server to start (model loading can ta
 HEALTH_URL="http://127.0.0.1:$PORT/health"
 CHROMADB_URL="http://localhost:8001/api/v2/heartbeat"
 LOG_FILE="$PROJECT_DIR/logs/server.log"
+# The agent worker is its own systemd unit (separate from lifeos-api). The
+# doctor self-repair persona drives a headless session *inside* this unit, so
+# bouncing it kills the doctor's own session — see restart-worker-detached.
+WORKER_UNIT="lifeos-agent-worker"
+VENV_PYTHON="$HOME/.venvs/lifeos/bin/python"
+# Files whose change requires the agent worker (not just lifeos-api) to
+# restart for the change to take effect — see classify-change.
+WORKER_CODE_PATH="api/services/agent_worker/"
 
 # Ensure logs directory exists
 mkdir -p "$PROJECT_DIR/logs"
@@ -285,6 +295,100 @@ sctl() {
     sudo systemctl "$@"
 }
 
+# classify-change <git-range> — print which restart a diff needs.
+#
+# The doctor ships changes through PRs; at end-of-goal it must restart so the
+# change takes effect. API-only changes are cheap (`lifeos-api` restart leaves
+# the worker — and the doctor's own session — alive). Changes under
+# api/services/agent_worker/ require bouncing the worker itself, which kills the
+# doctor mid-run, so they go through restart-worker-detached instead.
+#
+# Prints "worker" if any changed file is under WORKER_CODE_PATH, else "api".
+# Default range is the last commit (HEAD~1..HEAD); pass an explicit range
+# (e.g. "main..HEAD") to classify a whole branch.
+#
+# This is a path-prefix HEURISTIC, not a guarantee: a change that alters worker
+# behavior from outside api/services/agent_worker/ (e.g. config/settings.py,
+# which the worker imports) classifies as "api" and would leave the worker on
+# stale code. Acceptable because the doctor ships localized PRs; widen
+# WORKER_CODE_PATH or add paths if that assumption stops holding.
+classify_change() {
+    local range="${1:-HEAD~1..HEAD}"
+    local changed
+    changed=$(git -C "$PROJECT_DIR" diff --name-only "$range" 2>/dev/null)
+    if echo "$changed" | grep -q "^${WORKER_CODE_PATH}"; then
+        echo "worker"
+    else
+        echo "api"
+    fi
+}
+
+# restart-worker-detached [--session ID] [--notify TEXT] [--bot NAME]
+#
+# Restart lifeos-agent-worker such that any pending final notice is delivered
+# BEFORE the worker gets SIGTERM (#401). The doctor runs a headless session
+# *inside* the worker, so an inline `systemctl restart` would kill the restart
+# command along with the session. Steps:
+#   1. Send the final notice first (if --notify given) so the operator gets the
+#      "Shipped" message even if the streamed [NOTIFY] raced the SIGTERM.
+#   2. Write the self-restart marker (names --session) so resume_pending()
+#      finalizes that session quietly instead of firing the rollback notice.
+#   3. Restart the worker in a DETACHED process (systemd-run; nohup+setsid
+#      fallback) that outlives the dying session and actually performs the bounce.
+restart_worker_detached() {
+    local session_id="" notify_text="" bot=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session) session_id="$2"; shift 2 ;;
+            --notify)  notify_text="$2"; shift 2 ;;
+            --bot)     bot="$2"; shift 2 ;;
+            *) log_warn "restart-worker-detached: ignoring unknown arg '$1'"; shift ;;
+        esac
+    done
+
+    # 1. Flush the final notice BEFORE anything can kill the session.
+    if [ -n "$notify_text" ]; then
+        log_info "Sending final notice before worker restart..."
+        "$VENV_PYTHON" - "$notify_text" "$bot" <<'PYEOF' || log_warn "final notice send failed (continuing to restart)"
+import sys
+text = sys.argv[1]
+bot = sys.argv[2] or None
+from api.services.telegram import send_message
+send_message(text, bot=bot)
+PYEOF
+    fi
+
+    # 2. Mark the deliberate self-restart so resume_pending() stays quiet.
+    if [ -n "$session_id" ]; then
+        log_info "Marking session $session_id as a deliberate self-restart..."
+        "$VENV_PYTHON" -m api.services.agent_worker.worker \
+            --mark-self-restart --session "$session_id" \
+            || log_warn "could not write self-restart marker (continuing to restart)"
+    fi
+
+    # 3. Restart the worker in a detached process that outlives this session.
+    log_info "Triggering detached restart of $WORKER_UNIT..."
+    if command -v systemd-run &>/dev/null; then
+        # Transient unit in its own cgroup — fully decoupled from the caller, so
+        # the SIGTERM the worker is about to receive can't kill the restarter.
+        sudo systemd-run --unit="lifeos-worker-restart-$$" --collect \
+            systemctl restart "$WORKER_UNIT" \
+            || log_error "systemd-run restart failed"
+    else
+        # Fallback for non-systemd hosts (no systemd-run). setsid+nohup detach
+        # into a new session that survives the worker's process-group teardown
+        # and SIGHUP — but, unlike the systemd-run path, this does NOT move the
+        # restarter into its own cgroup, so a cgroup-level kill of the worker
+        # could still reach it. This branch only runs where `systemctl restart`
+        # itself wouldn't apply anyway, so it's a best-effort degraded path, not
+        # an equivalent guarantee.
+        setsid nohup sudo systemctl restart "$WORKER_UNIT" \
+            >> "$PROJECT_DIR/logs/worker-restart.log" 2>&1 &
+        disown 2>/dev/null || true
+    fi
+    log_info "Detached worker restart triggered."
+}
+
 # Main
 case "${1:-status}" in
     start)
@@ -327,19 +431,30 @@ case "${1:-status}" in
     preflight)
         exec "$SCRIPT_DIR/preflight.sh"
         ;;
+    classify-change)
+        classify_change "${2:-}"
+        ;;
+    restart-worker-detached)
+        shift
+        restart_worker_detached "$@"
+        ;;
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|restart-worker-detached [opts]}"
         echo ""
         echo "Commands:"
-        echo "  start      - Start server (kills existing, waits for healthy)"
-        echo "  stop       - Stop the server"
-        echo "  restart    - Restart the server"
-        echo "  foreground - Run in foreground (for systemd)"
-        echo "  status     - Show server status"
-        echo "  wait       - Wait for server to become healthy"
-        echo "  preflight  - Check prerequisites before first start"
+        echo "  start                    - Start server (kills existing, waits for healthy)"
+        echo "  stop                     - Stop the server"
+        echo "  restart                  - Restart the server"
+        echo "  foreground               - Run in foreground (for systemd)"
+        echo "  status                   - Show server status"
+        echo "  wait                     - Wait for server to become healthy"
+        echo "  preflight                - Check prerequisites before first start"
+        echo "  classify-change [range]  - Print 'worker' or 'api': which restart a diff needs"
+        echo "                             (default range HEAD~1..HEAD; e.g. 'main..HEAD')"
+        echo "  restart-worker-detached  - Detached restart of $WORKER_UNIT for the doctor"
+        echo "                             [--session ID] [--notify TEXT] [--bot NAME]"
         echo ""
         echo "Expected startup time: 30-60 seconds (ML model loading)"
         exit 1

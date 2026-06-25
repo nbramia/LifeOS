@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import signal
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +96,84 @@ _GOAL_REFINE_SIGNALS = (
     "add ", "remove", "stricter", "actually", "with change", "no,", "don't",
     "rather", "tweak", "adjust",
 )
+
+
+# Filename of the self-restart marker the detached worker-restart primitive
+# (`scripts/server.sh restart-worker-detached`) drops next to the session DB
+# before bouncing `lifeos-agent-worker` (#401). `resume_pending()` consults it
+# on startup: a session named here was killed by a *deliberate* end-of-goal
+# restart, not a crash, so it's finalized quietly (COMPLETED, no rollback /
+# "could not be safely resumed" notice). The marker is JSON
+# (`{"session_ids": [...], "task_ids": [...]}`); either key is honored so the
+# primitive can name the doctor's run by whichever id it has on hand.
+_SELF_RESTART_MARKER_NAME = "self_restart.json"
+
+
+def _self_restart_marker_path(db_path: Path) -> Path:
+    """Path to the self-restart marker, co-located with the session DB so the
+    primitive (a separate process) and the worker agree on its location."""
+    from pathlib import Path as _Path  # module-level Path import is TYPE_CHECKING-only
+    return _Path(db_path).parent / _SELF_RESTART_MARKER_NAME
+
+
+def _read_self_restart_marker(db_path: Path) -> tuple[set[str], set[str]]:
+    """Read the self-restart marker → (session_ids, task_ids). Missing or
+    malformed marker yields empty sets — a corrupt marker must never make a
+    real crash look deliberate, so we fail closed (treat nothing as planned)."""
+    path = _self_restart_marker_path(db_path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return set(), set()
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("self-restart marker at %s is unparseable; ignoring", path)
+        return set(), set()
+    sids = {str(s) for s in (data.get("session_ids") or []) if s}
+    tids = {str(t) for t in (data.get("task_ids") or []) if t}
+    return sids, tids
+
+
+def _clear_self_restart_marker(db_path: Path) -> None:
+    """Remove the self-restart marker. Consumed once per restart, so it's
+    deleted after `resume_pending()` honors it — a leftover would otherwise
+    quiet a later, unrelated session."""
+    try:
+        _self_restart_marker_path(db_path).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def write_self_restart_marker(
+    session_ids: list[str] | None = None,
+    task_ids: list[str] | None = None,
+    db_path: Path | str | None = None,
+) -> Path:
+    """Write the self-restart marker before a deliberate end-of-goal worker
+    restart (#401). Called by `scripts/server.sh restart-worker-detached` (via
+    `python -m api.services.agent_worker.worker --mark-self-restart …`) so the
+    bash primitive and the worker share one marker format. Returns the path
+    written. `db_path` defaults to the SessionStore default so the caller
+    doesn't need to know where the DB lives.
+
+    The production primitive names the doctor's run by `session_id` (a single-use
+    UUID that never recurs), not `task_id`. That matters: a stale marker (one not
+    consumed for any reason) naming a session_id can match nothing on a later
+    startup, whereas task_ids are vault-stable and could quiet a future real
+    crash of a session reusing that id. The `task_ids` path exists for the
+    CLI/tests; prefer `session_ids` for anything that writes a real marker."""
+    from pathlib import Path as _Path
+    from api.services.agent_worker.session_store import DEFAULT_DB_PATH
+    resolved = _Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    path = _self_restart_marker_path(resolved)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_ids": [s for s in (session_ids or []) if s],
+        "task_ids": [t for t in (task_ids or []) if t],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def _is_affirmative(text: str) -> bool:
@@ -379,9 +458,23 @@ class Worker:
           roll the tag back to #agent so the operator can retry. We can't
           safely re-enter a partially-driven LLM conversation without risking
           duplicate side effects (file writes, API calls, etc.).
+
+        Exception — deliberate self-restart (#401): a session named in the
+        self-restart marker was killed by an end-of-goal `restart-worker-detached`
+        (the doctor restarting the worker after shipping an agent-worker-code
+        change), not by a crash. Its final `[NOTIFY]` was already delivered
+        before SIGTERM, so it's finalized quietly as COMPLETED — no FAILED
+        status, no #agent rollback, no "could not be safely resumed" notice.
         """
         pending = self.session_store.list_non_terminal()
+        # Sessions the detached-restart primitive deliberately killed. Read once
+        # and cleared after the loop so a single marker is honored exactly once.
+        self_restart_sids, self_restart_tids = _read_self_restart_marker(
+            self.session_store.db_path
+        )
         if not pending:
+            if self_restart_sids or self_restart_tids:
+                _clear_self_restart_marker(self.session_store.db_path)
             return 0
         recovered = 0
         for session in pending:
@@ -391,6 +484,30 @@ class Worker:
                 continue
             # Blocked sessions are waiting on the user; leave alone.
             if session.status == STATUS_BLOCKED:
+                continue
+            # Deliberate self-restart: finalize quietly, skip the alarming
+            # rollback. The doctor already shipped + notified before the bounce.
+            if sid in self_restart_sids or session.task_id in self_restart_tids:
+                self.transcript_store.append(
+                    sid, "resume_self_restart",
+                    {"prior_status": session.status},
+                )
+                self.session_store.update_status(session.task_id, STATUS_COMPLETED)
+                # Mirror the canonical COMPLETED path (see _handle_outcome /
+                # _finalize_terminal): advance the vault checkbox to done ([x])
+                # AND swap the tag — gated on has_vault_task. Operator-spawned
+                # roots and spawned children carry a synthetic task_id with no
+                # vault row, so both vault ops are skipped for them (#401 review).
+                # The session-row update_status above stays unconditional.
+                has_vault_task = session.origin != "operator" and not session.parent_session_id
+                if has_vault_task:
+                    self._complete_task(session.task_id)
+                    self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
+                logger.info(
+                    "session %s finalized after a deliberate self-restart "
+                    "(no rollback notice)", sid,
+                )
+                recovered += 1
                 continue
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
             self.session_store.update_status(session.task_id, STATUS_FAILED)
@@ -414,6 +531,9 @@ class Worker:
                 f"`data/agent_transcripts/{sid}.jsonl`"
             )
             recovered += 1
+        # Consume the marker so it can't quiet a later, unrelated session.
+        if self_restart_sids or self_restart_tids:
+            _clear_self_restart_marker(self.session_store.db_path)
         if recovered:
             logger.info("rolled back %d non-resumable session(s) on startup", recovered)
         return recovered
@@ -2583,7 +2703,28 @@ class Worker:
             )
 
 
+def _mark_self_restart_cli(argv: list[str]) -> int:
+    """`--mark-self-restart [--session ID]... [--task ID]...` — write the
+    self-restart marker, then exit. Invoked by the detached-restart primitive
+    (`scripts/server.sh restart-worker-detached`) before it bounces the worker,
+    so `resume_pending()` finalizes the named session quietly instead of firing
+    the rollback notice (#401). Kept tiny and import-light so the bash primitive
+    can call it without spinning up the full worker."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="agent_worker --mark-self-restart")
+    parser.add_argument("--mark-self-restart", action="store_true")
+    parser.add_argument("--session", action="append", default=[], dest="sessions")
+    parser.add_argument("--task", action="append", default=[], dest="tasks")
+    args = parser.parse_args(argv)
+    path = write_self_restart_marker(session_ids=args.sessions, task_ids=args.tasks)
+    print(str(path))
+    return 0
+
+
 def main() -> None:
+    # Marker-writing subcommand short-circuits before any worker wiring.
+    if "--mark-self-restart" in sys.argv[1:]:
+        raise SystemExit(_mark_self_restart_cli(sys.argv[1:]))
     logging.basicConfig(
         level=os.environ.get("LIFEOS_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
