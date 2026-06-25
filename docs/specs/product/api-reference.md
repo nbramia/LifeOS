@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-06-21
+**Last Updated:** 2026-06-25
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -498,11 +498,30 @@ Get conversation with messages. Access by id is **not** persona-scoped — any v
       "sources": null,
       "routing": null
     }
-  ]
+  ],
+  "pending_question": null
 }
 ```
 
 `role` is `user` or `assistant`.
+
+`pending_question` is present only while a spawned **orchestrating-persona** session (e.g. `doctor`) started from this conversation is awaiting an answer — `{ "session_id": "...", "question": "...", "kind": "..." }` — and is `null`/absent otherwise. `kind` is `goal_approval` (a `[GOAL]` awaiting approval) or `followup` (a `[CLARIFY]`). The client renders an answer affordance when it's present and posts to `/answer` below.
+
+### POST /api/conversations/{id}/answer
+
+Answer a pending `[CLARIFY]`/`[GOAL]` from a spawned orchestrating-persona session (e.g. `doctor`) started from web/voice — without Telegram. Deposits the answer onto the session's existing open question (preserving its `kind`); the worker's normal tick then resumes the session via the **same** single resume path a Telegram reply uses (no second resume mechanism). Only meaningful while `GET /api/conversations/{id}` reports a `pending_question`.
+
+**Request:**
+```json
+{ "answer": "yes" }
+```
+
+**Response:**
+```json
+{ "ok": true, "session_id": "sess-uuid", "status": "claimed" }
+```
+
+**Errors:** `400` empty answer · `404` no such conversation · `409` no spawned session linked, or no open question (never asked, already answered, or timed out).
 
 ### DELETE /api/conversations/{id}
 

@@ -9,7 +9,7 @@ The loader (`settings._parse_persona`, used by `settings.telegram_bots`) strips 
 | Field | Meaning |
 |---|---|
 | `id` | Should equal the bot `name` in `telegram_bots.json` (a mismatch logs a warning). |
-| `model` | Optional per-persona model preference (e.g. `opus`); empty/omitted = orchestrator default + normal escalation. |
+| `model` | **Reserved** — an optional per-persona model preference, parsed and stored on `TelegramBotConfig` but not yet read by any code path (the orchestrator resolves its model from `LIFEOS_ANTHROPIC_MODEL` + per-turn escalation). Setting it is currently a no-op. |
 | `voice` | A list of behaviour rules applied **only on voice (spoken) turns**; ignored for text. |
 
 The frontmatter holds **only what code acts on** — never real names, vault paths, or other personal values (the project's open-source rule; `/persona-check` enforces it). The schema leaves room to add hard tool allow-lists later (a `tools:` field) without restructuring.
@@ -29,10 +29,11 @@ Not every persona needs every section — include what applies. Suggested order:
 7. `## When data is thin` — sparse-data fallback.
 8. `## Out of scope` — redirect behaviour (omit for `primary`, the catch-all).
 
-## Status / roadmap
+## What the loader consumes
 
-This file documents the schema as loaded today (frontmatter parsed + stripped; `voice`/`model` stored on `TelegramBotConfig`). Consuming the parsed fields and the rest of the schema is tracked in #390:
+The frontmatter is parsed and stripped; the body becomes the system-prompt preamble (used verbatim — no `str.format`). Of the parsed fields:
 
-- `voice` rules are parsed now but **applied on voice turns** in a follow-up (needs a text-vs-voice modality flag).
-- `model` preference is parsed now; wiring it into model selection is a follow-up.
-- A `primary.md` (lifting `primary`'s personality out of the static prompt) and a resolved **personal-context block** (partner / therapists / inner circle / folders, from existing config — never hardcoded here) are follow-up phases.
+- `voice` rules are applied on voice (spoken) turns and ignored on text turns.
+- `model` is **reserved** — stored but not read by any code path yet (see the field table above).
+
+Beyond the registry personas, `primary.md` carries the primary persona's personality, and a resolved **personal-context block** (partner / therapists / inner circle / folders, drawn from existing config — never hardcoded here) is composed for personas that need it. The schema's main open extension point is a hard tool allow-list (`tools:`), which is not parsed yet.
