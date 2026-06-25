@@ -946,8 +946,8 @@ async def chat_handoff(request: HandoffRequest):
     session_id = result.get("session_id", "")
     ack = (
         f"🤝 Handed off to **{label}** — running in the background "
-        f"(session `{session_id[:12]}`). The result will arrive via Telegram and "
-        f"appear on the /agents page."
+        f"(session `{session_id[:12]}`). The result will appear right here, "
+        f"and also via Telegram and on the /agents page."
     )
     if request.conversation_id:
         try:
@@ -957,6 +957,16 @@ async def chat_handoff(request: HandoffRequest):
             )
         except Exception:
             logger.warning("failed to record handoff acknowledgment", exc_info=True)
+        # #311: link the conversation to the spawned session so the worker can
+        # mirror the session's progress + terminal result back into this thread
+        # (in addition to Telegram). Best-effort — a link failure only loses the
+        # web round-trip, not the Telegram delivery. Mirrors the orchestrating-
+        # persona path (chat.py set_agent_session_id after a doctor spawn).
+        if session_id:
+            try:
+                get_store().set_agent_session_id(request.conversation_id, session_id)
+            except Exception:
+                logger.warning("failed to link conversation to handoff session", exc_info=True)
 
     return {
         "ok": True,

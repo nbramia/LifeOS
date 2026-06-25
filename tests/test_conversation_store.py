@@ -772,3 +772,38 @@ class TestConversationWorkflow:
 
         messages2_after = store.get_messages(conv2.id)
         assert len(messages2_after) == 2
+
+
+# =============================================================================
+# Agent-session reverse lookup (#311)
+# =============================================================================
+
+class TestAgentSessionReverseLookup:
+    """get_conversation_id_by_agent_session_id — the worker resolves a spawned
+    session back to the web/voice conversation that started it, so it can mirror
+    the result into that thread."""
+
+    def test_returns_linked_conversation_id(self, store):
+        conv = store.create_conversation(title="Web thread")
+        store.set_agent_session_id(conv.id, "sess-abc")
+
+        assert store.get_conversation_id_by_agent_session_id("sess-abc") == conv.id
+
+    def test_returns_none_when_no_conversation_linked(self, store):
+        # A Telegram-origin session is never linked to a conversation, so the
+        # reverse lookup must return None — this is what keeps the mirror a
+        # no-op for Telegram-origin handoffs (AC2).
+        store.create_conversation(title="Unlinked")
+        assert store.get_conversation_id_by_agent_session_id("sess-telegram") is None
+
+    def test_returns_none_for_empty_session_id(self, store):
+        assert store.get_conversation_id_by_agent_session_id("") is None
+
+    def test_resolves_only_the_matching_conversation(self, store):
+        conv1 = store.create_conversation(title="One")
+        conv2 = store.create_conversation(title="Two")
+        store.set_agent_session_id(conv1.id, "sess-1")
+        store.set_agent_session_id(conv2.id, "sess-2")
+
+        assert store.get_conversation_id_by_agent_session_id("sess-1") == conv1.id
+        assert store.get_conversation_id_by_agent_session_id("sess-2") == conv2.id

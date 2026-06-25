@@ -299,6 +299,7 @@ class ClaudeCodeExecutor:
         session_store: SessionStore,
         transcript_store: TranscriptStore,
         notification_callback: Optional[NotificationCallback] = None,
+        conversation_mirror: Optional[Callable[[str, str], None]] = None,
         spawn_fn: Optional[SpawnFn] = None,
         binary_resolver: Optional[Callable[[], str]] = None,
         timeout_seconds: Optional[int] = None,
@@ -307,6 +308,12 @@ class ClaudeCodeExecutor:
         self.session_store = session_store
         self.transcript_store = transcript_store
         self._notify = notification_callback or (lambda _msg: None)
+        # #311: optional (session_id, body) sink that mirrors each streamed
+        # [NOTIFY]/[CLARIFY]/[GOAL] body into the web/voice conversation thread
+        # that spawned the session. Additive — `notification_callback` (the
+        # Telegram relay) is unchanged. None → no mirroring (the default; tests
+        # and non-web sessions are unaffected).
+        self._conversation_mirror = conversation_mirror
         self._spawn_fn = spawn_fn or subprocess.Popen
         self._binary_resolver = binary_resolver or _resolve_claude_binary
         self._timeout = timeout_seconds if timeout_seconds is not None else settings.claude_timeout_seconds
@@ -652,6 +659,8 @@ class ClaudeCodeExecutor:
                         self._notify(body)
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning("notification callback raised: %s", exc)
+                    if self._conversation_mirror:  # #311: stream into the web thread
+                        self._conversation_mirror(session.session_id, body)
                     self.transcript_store.append(sid, "claude_code_clarify", {
                         "body": body, "body_chars": len(body),
                     })
@@ -666,6 +675,8 @@ class ClaudeCodeExecutor:
                             self._notify(body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
+                        if self._conversation_mirror:  # #311: stream into the web thread
+                            self._conversation_mirror(session.session_id, body)
                     self.transcript_store.append(sid, "claude_code_notify", {
                         "body": body, "body_chars": len(body),
                     })
@@ -684,6 +695,8 @@ class ClaudeCodeExecutor:
                             self._notify(body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
+                        if self._conversation_mirror:  # #311: stream into the web thread
+                            self._conversation_mirror(session.session_id, body)
                     self.transcript_store.append(sid, "claude_code_goal", {
                         "body": body, "body_chars": len(body),
                     })

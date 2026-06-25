@@ -447,6 +447,28 @@ class ConversationStore:
         finally:
             conn.close()
 
+    def get_conversation_id_by_agent_session_id(self, session_id: str) -> Optional[str]:
+        """Reverse of set_agent_session_id: the conversation linked to a spawned
+        session, or None (#311).
+
+        The agent worker runs out-of-process and only knows a session_id; this
+        lets it resolve the web/voice conversation thread that spawned the
+        session so its progress + result can be mirrored back there. Returns
+        None for Telegram-origin sessions (never linked to a conversation),
+        which keeps the mirror a no-op for them.
+        """
+        if not session_id:
+            return None
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT id FROM conversations WHERE agent_session_id = ? LIMIT 1",
+                (session_id,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
 
 def generate_title(question: str, max_length: int = 50) -> str:
     """

@@ -34,6 +34,10 @@ CHAT_URL = BASE_URL.rstrip("/") + "/chat"
 CONV_ID = "conv_doctor_1"
 SESSION_ID = "sess_doctor_1"
 
+# The client polls every 4s; wait a touch past one full interval to be sure a
+# second poll fired (so the dedup guard is actually exercised).
+POLL_WAIT_FOR_DEDUP_MS = 4500
+
 
 def _install_conversation_mocks(page: Page, state: dict):
     """Single dispatcher for /api/conversations/* calls, driven by `state`.
@@ -70,13 +74,10 @@ def _install_conversation_mocks(page: Page, state: dict):
                 "title": "Knee pain follow-up",
                 "created_at": "2026-06-25T10:00:00",
                 "updated_at": "2026-06-25T10:01:00",
-                "messages": [
-                    {"id": "m1", "role": "user", "content": "my knee hurts after runs",
-                     "created_at": "2026-06-25T10:00:00", "sources": None, "routing": None},
-                    {"id": "m2", "role": "assistant",
-                     "content": "\U0001fa7a On it — running as a Claude Code session.",
-                     "created_at": "2026-06-25T10:00:05", "sources": None, "routing": None},
-                ],
+                # `state["messages"]` is mutable so a test can simulate a
+                # late-arriving message (the worker mirroring the spawned
+                # session's result, #311) landing in a later poll.
+                "messages": list(state["messages"]),
                 "pending_question": None,
             }
             if state["awaiting"]:
@@ -109,6 +110,13 @@ class TestPendingQuestionUI:
             "question": "Is the goal to draft a PT plan, or just log the symptom?",
             "kind": "goal_approval",
             "answers": [],
+            "messages": [
+                {"id": "m1", "role": "user", "content": "my knee hurts after runs",
+                 "created_at": "2026-06-25T10:00:00", "sources": None, "routing": None},
+                {"id": "m2", "role": "assistant",
+                 "content": "\U0001fa7a On it — running as a Claude Code session.",
+                 "created_at": "2026-06-25T10:00:05", "sources": None, "routing": None},
+            ],
         }
         _install_conversation_mocks(page, self.state)
         page.goto(CHAT_URL)
@@ -170,3 +178,34 @@ class TestPendingQuestionUI:
         self._open_conversation(page)
         page.wait_for_timeout(500)
         expect(page.locator("#pendingQuestionCard")).to_have_count(0)
+
+    def test_late_mirrored_message_renders_once(self, page: Page):
+        """#311: a message that appears in a LATER poll (the worker mirroring the
+        spawned session's result into the thread) is rendered into #messages and
+        is NOT duplicated on subsequent polls.
+
+        Opening with an outstanding question starts the same 4s poll the result
+        rides on. The first poll seeds the seen-set from m1+m2 (already on
+        screen); a later m3 (the mirrored result) is the only id the dedup hasn't
+        seen, so it renders exactly once."""
+        self._open_conversation(page)
+        expect(page.locator("#pendingQuestionCard")).to_be_visible(timeout=8000)
+        # The seeded messages are on screen, but the late result is not yet.
+        expect(page.locator("#messages")).not_to_contain_text("Opened PR #5")
+
+        # The worker mirrors the result: a new assistant message lands in the GET
+        # (and the question resolves, as it would when the session finishes).
+        self.state["messages"].append({
+            "id": "m3", "role": "assistant",
+            "content": "All done — Opened PR #5.",
+            "created_at": "2026-06-25T10:05:00", "sources": None, "routing": None,
+        })
+        self.state["awaiting"] = False
+
+        # The next poll renders it into the thread exactly once.
+        result = page.locator("#messages .message.assistant",
+                              has_text="Opened PR #5")
+        expect(result).to_have_count(1, timeout=8000)
+        # Subsequent polls must NOT duplicate it (dedup by message id).
+        page.wait_for_timeout(POLL_WAIT_FOR_DEDUP_MS)
+        expect(result).to_have_count(1)

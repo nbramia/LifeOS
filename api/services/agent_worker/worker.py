@@ -56,6 +56,7 @@ from api.services.agent_worker.session_store import (
 from api.services.agent_worker.managed_executor import _sanitize_title as _managed_sanitize_title
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.conversation_store import ConversationStore
 from api.services.interaction_store import build_obsidian_link
 from config.settings import settings
 
@@ -320,6 +321,7 @@ class Worker:
         self,
         api_base: str | None = None,
         session_store: SessionStore | None = None,
+        conversation_store: ConversationStore | None = None,
         transcript_store: TranscriptStore | None = None,
         spend_tracker: SpendTracker | None = None,
         poll_seconds: float | None = None,
@@ -335,6 +337,10 @@ class Worker:
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
+        # #311: resolves a spawned session back to the web/voice conversation it
+        # originated from, so the session's progress + result can be mirrored
+        # into that thread (additive — Telegram routing is untouched).
+        self.conversation_store = conversation_store or ConversationStore()
         self.transcript_store = transcript_store or TranscriptStore()
         self.spend_tracker = spend_tracker or SpendTracker(
             daily_cap_dollars=settings.agent_daily_cap_dollars,
@@ -1452,6 +1458,28 @@ class Worker:
             logger.warning("spawn-marker read failed for %s: %s", session_id, exc)
             return 0
 
+    def _mirror_to_conversation(self, session_id: str, text: str) -> None:
+        """#311: mirror a web-spawned session's operator-facing output into its
+        linked conversation thread (additive — Telegram is untouched).
+
+        No-op when the session isn't linked to a conversation (i.e.
+        Telegram-origin), which keeps AC2: Telegram-origin handoffs unaffected.
+        Best-effort: a mirror failure only loses the web round-trip, never the
+        session's Telegram delivery. The reverse lookup is keyed on the
+        per-call session_id, so concurrent sessions can't cross-write threads.
+        """
+        if not session_id or not text or not text.strip():
+            return
+        try:
+            conv_id = self.conversation_store.get_conversation_id_by_agent_session_id(session_id)
+            if conv_id:
+                self.conversation_store.add_message(
+                    conv_id, "assistant", text.strip(),
+                    routing={"agent_session_id": session_id},
+                )
+        except Exception as exc:
+            logger.warning("web-thread mirror failed for %s: %s", session_id, exc)
+
     def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
 
@@ -1655,6 +1683,10 @@ class Worker:
                         kind="followup",
                         bot=bot,
                     )
+                # #311: also land the final result in the web/voice thread that
+                # spawned this session (no-op for Telegram-origin). Gated the same
+                # way as the Telegram send above — non-empty, non-child.
+                self._mirror_to_conversation(sid, body)
             self.transcript_store.append(sid, "code_handled_completion", {
                 "final_chars": len(body),
             })
@@ -1666,10 +1698,17 @@ class Worker:
         # vault-routed #claude task still needs its tag/checkbox reconciled —
         # operator-spawned /claude sessions have no vault row and are no-ops.
         label = "Code session"
+        notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            _send(f"⚠️ {label} hit its budget ({outcome.reason}).")
+            notice = f"⚠️ {label} hit its budget ({outcome.reason})."
         elif outcome.status == STATUS_FAILED:
-            _send(f"⚠️ {label} failed: {outcome.reason}.")
+            notice = f"⚠️ {label} failed: {outcome.reason}."
+        if notice:
+            _send(notice)
+            # #311: mirror the same failure/budget notice into the web/voice
+            # thread (no-op for Telegram-origin); a child session has no thread.
+            if not session.parent_session_id:
+                self._mirror_to_conversation(sid, notice)
         # Persist the terminal status to the session ROW (#400). The executor
         # sets RUNNING on launch but doesn't always flip to a terminal status on
         # failure (e.g. the binary-not-found path returns FAILED while leaving the
@@ -1705,6 +1744,9 @@ class Worker:
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=notify,
+            # #311: mirror each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the
+            # web/voice thread that spawned the session (no-op when unlinked).
+            conversation_mirror=self._mirror_to_conversation,
         )
         # CLI dispatch runs on a thread pool, so two same-bot sessions can reach
         # here concurrently. The executor is cheap and stateless (per-session
@@ -1804,6 +1846,12 @@ class Worker:
                         sent_message_ids=sent_ids,
                         kind="followup",
                     )
+                # #311: mirror the final result into the web/voice thread that
+                # spawned this codex session (no-op for Telegram-origin). Codex
+                # has no rich [NOTIFY] stream, so this terminal mirror is the
+                # whole web round-trip for it. Children have no parent here
+                # (codex isn't spawned as a child), so no extra gate is needed.
+                self._mirror_to_conversation(sid, body)
             self.transcript_store.append(sid, "codex_handled_completion", {
                 "final_chars": len(body),
             })
@@ -1811,10 +1859,16 @@ class Worker:
             return
 
         label = "Codex session"
+        notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
+            notice = f"⚠️ {label} hit its budget ({outcome.reason})."
         elif outcome.status == STATUS_FAILED:
-            self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+            notice = f"⚠️ {label} failed: {outcome.reason}."
+        if notice:
+            self._telegram_send(notice)
+            # #311: mirror the same failure/budget notice into the web/voice
+            # thread (no-op for Telegram-origin).
+            self._mirror_to_conversation(sid, notice)
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
         # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).

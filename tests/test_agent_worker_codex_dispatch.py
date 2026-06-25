@@ -189,3 +189,72 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
     assert stub.calls == [("cx-fail", "do a thing")]
     assert worker.session_store.get("cx-fail").status == STATUS_FAILED
     assert any("failed" in s.lower() for s in plain_sends)
+
+
+# ---------------------------------------------------------------------------
+# Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
+# terminal completion/failure mirror is the whole web round-trip for it.
+# ---------------------------------------------------------------------------
+
+from api.services.conversation_store import ConversationStore
+
+
+def _mirroring_codex_worker(tmp_path: Path, codex_executor):
+    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        conversation_store=conv_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: True,
+        telegram_send_with_id=lambda text: [777],
+        http_client=client,
+        codex_executor=codex_executor,
+    )
+    return worker, conv_store
+
+
+def test_codex_completion_mirrors_into_linked_conversation(tmp_path: Path):
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Done: 3 events.")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-web", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_codex_session(session, [{"content": "events?"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "Done: 3 events." in m.content for m in msgs)
+
+
+def test_codex_completion_does_not_mirror_when_unlinked(tmp_path: Path):
+    """AC2: a Telegram-origin codex session is unlinked → no conversation write."""
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Done.")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-tg", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Some other thread")  # not linked
+
+    worker._dispatch_codex_session(session, [{"content": "events?"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_codex_failure_mirrors_notice_into_linked_conversation(tmp_path: Path):
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-web-fail", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_codex_session(session, [{"content": "do it"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "failed" in m.content.lower() for m in msgs)

@@ -25,6 +25,15 @@ const CARD_ID = 'pendingQuestionCard';
 let pollTimer = null;
 let pollingConversationId = null;
 
+// #311: ids of conversation messages already on screen, so a late-arriving
+// message (the spawned session's streamed [NOTIFY] or terminal result) is
+// rendered exactly once. Seeded on the FIRST poll from the messages already in
+// the thread (those were rendered by askStream / loadConversation, not by us),
+// then every subsequent poll appends only messages whose id is new. Reset on
+// stop so a re-opened/other conversation starts clean.
+let seenMessageIds = new Set();
+let seededSeenSet = false;
+
 function answerEndpoint(conversationId) {
   return `${endpoints.conversations}/${encodeURIComponent(conversationId)}/answer`;
 }
@@ -42,6 +51,11 @@ export function startPendingQuestionPolling(conversationId) {
   if (pollTimer && pollingConversationId === conversationId) return;
   stopPendingQuestionPolling();
   pollingConversationId = conversationId;
+  // #311: the first poll seeds the seen-message set from whatever is already in
+  // the thread (so we don't re-render existing messages); subsequent polls
+  // render only newly-arrived ones.
+  seenMessageIds = new Set();
+  seededSeenSet = false;
   // Poll once immediately so a re-opened thread shows the affordance without
   // waiting a full interval, then on a cadence.
   pollOnce();
@@ -54,6 +68,9 @@ export function stopPendingQuestionPolling() {
     pollTimer = null;
   }
   pollingConversationId = null;
+  // #311: drop the dedup state so the next polled conversation seeds fresh.
+  seenMessageIds = new Set();
+  seededSeenSet = false;
 }
 
 async function pollOnce() {
@@ -78,6 +95,13 @@ async function pollOnce() {
   // A late response can arrive after the user navigated away; ignore it.
   if (state.currentConversationId !== conversationId) return;
 
+  // #311: render messages that arrived since the thread was last rendered —
+  // the spawned session's streamed [NOTIFY]/[GOAL] and its terminal result,
+  // written into the conversation by the worker out-of-band. The first poll
+  // only SEEDS the seen-set (those messages are already on screen, rendered by
+  // askStream/loadConversation); later polls append only ids we haven't seen.
+  renderNewMessages(data && data.messages);
+
   const pq = data && data.pending_question;
   if (pq && pq.question) {
     renderAffordance(conversationId, pq);
@@ -86,6 +110,36 @@ async function pollOnce() {
     // yet. Drop any stale card but keep polling so the next [CLARIFY]/[GOAL]
     // (a session can ask more than once) still surfaces.
     clearAffordance();
+  }
+}
+
+// #311: append conversation messages that aren't on screen yet, deduped by id.
+// On the first poll we only record ids (seed) without rendering — those came
+// from the initial thread render. Afterward, any id we haven't recorded is a
+// late arrival from the worker, so we render it and record it. Idempotent: a
+// re-poll of the same messages adds nothing (every id is already seen), so
+// there's no duplication and no extra polling loop — this reuses the 4s poll.
+function renderNewMessages(messages) {
+  if (!Array.isArray(messages)) return;
+
+  if (!seededSeenSet) {
+    for (const m of messages) {
+      if (m && m.id) seenMessageIds.add(m.id);
+    }
+    seededSeenSet = true;
+    return;
+  }
+
+  for (const m of messages) {
+    if (!m || !m.id || seenMessageIds.has(m.id)) continue;
+    seenMessageIds.add(m.id);
+    // Only render assistant output. The worker mirrors its progress/result as
+    // assistant messages; user messages here are the operator's own answer
+    // (POST /answer records it server-side), which submitAnswer already echoed
+    // into the thread with addMessage(answer, 'user') and has no client-side id
+    // to dedup against — so rendering it would duplicate. Skip user roles.
+    if (m.role !== 'assistant') continue;
+    addMessage(m.content, m.role, m.sources || []);
   }
 }
 

@@ -177,6 +177,14 @@ export async function sendMessage() {
                 ? d.message
                 : '⚠️ Handoff to ' + label + ' failed.';
               updateMessage(msgId, fullContent);
+              // #311: the handoff linked the spawned session to this
+              // conversation server-side, so poll for the session's streamed
+              // progress + terminal result and render them into this thread
+              // (parity with the orchestrating-persona path below). Only on a
+              // successful spawn with a conversation to land results in.
+              if (d && d.ok && state.currentConversationId) {
+                startPendingQuestionPolling(state.currentConversationId);
+              }
             }).catch(() => {
               fullContent = '⚠️ Handoff to ' + label + ' failed.';
               updateMessage(msgId, fullContent);

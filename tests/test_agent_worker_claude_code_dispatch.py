@@ -330,3 +330,136 @@ def test_fresh_spawn_with_no_prior_spawn_event_still_executes(tmp_path: Path):
     worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
 
     assert stub.calls == [("op-2", "do a thing")]
+
+
+# =============================================================================
+# Web-thread result mirroring (#311)
+# =============================================================================
+
+from api.services.conversation_store import ConversationStore
+
+
+def _mirroring_worker(tmp_path: Path, claude_code_executor):
+    """Worker with an isolated ConversationStore so a test can assert the
+    spawned session's output is mirrored into the linked conversation (#311)."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=store,
+        conversation_store=conv_store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: True,
+        telegram_send_with_id=lambda text: [1],
+        http_client=client,
+        claude_code_executor=claude_code_executor,
+        cli_pool=_SynchronousPool(),
+    )
+    return worker, store, conv_store
+
+
+def test_mirror_to_conversation_writes_when_linked(tmp_path: Path):
+    """_mirror_to_conversation writes an assistant message into the conversation
+    linked to a session_id."""
+    worker, _, conv_store = _mirroring_worker(tmp_path, claude_code_executor=None)
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, "sess-xyz")
+
+    worker._mirror_to_conversation("sess-xyz", "  progress update  ")
+
+    msgs = conv_store.get_messages(conv.id)
+    assert [(m.role, m.content) for m in msgs] == [("assistant", "progress update")]
+
+
+def test_mirror_to_conversation_noop_when_unlinked(tmp_path: Path):
+    """AC2: a Telegram-origin session is unlinked, so the mirror is a no-op —
+    no conversation is written and no crash."""
+    worker, _, conv_store = _mirroring_worker(tmp_path, claude_code_executor=None)
+    conv = conv_store.create_conversation(title="Unrelated thread")
+
+    worker._mirror_to_conversation("sess-not-linked", "should not land anywhere")
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_mirror_to_conversation_noop_on_empty_text(tmp_path: Path):
+    worker, _, conv_store = _mirroring_worker(tmp_path, claude_code_executor=None)
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, "sess-xyz")
+
+    worker._mirror_to_conversation("sess-xyz", "   ")
+    worker._mirror_to_conversation("", "text")
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_completion_mirrors_final_text_into_linked_conversation(tmp_path: Path):
+    """A completed web-spawned claude_code session lands its final text in the
+    linked conversation thread (in addition to Telegram)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="All done — opened PR #5.")
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="web-1", routing="claude_code", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "All done — opened PR #5." in m.content for m in msgs)
+
+
+def test_completion_does_not_mirror_when_unlinked(tmp_path: Path):
+    """An operator/Telegram-origin completion writes nothing to any conversation
+    (AC2)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="tg-1", routing="claude_code", origin="operator")
+    conv = conv_store.create_conversation(title="Some other thread")  # not linked
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_failure_mirrors_notice_into_linked_conversation(tmp_path: Path):
+    """A FAILED web-spawned session mirrors its failure notice into the thread."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="web-fail-1", routing="claude_code", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "failed" in m.content.lower() for m in msgs)
+
+
+def test_child_completion_does_not_mirror(tmp_path: Path):
+    """A spawned child session (has a parent) stays silent to the operator and
+    must not mirror into any conversation — even if one is linked."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="child result")
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_claude_code_session(child, [{"content": "list matches"}])
+
+    assert conv_store.get_messages(conv.id) == []
