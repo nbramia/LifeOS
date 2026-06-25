@@ -54,9 +54,20 @@ class TestDoctorRegistry:
         assert bots["fitness"].orchestrates is False
 
     def test_persona_file_encodes_orchestration_contract(self):
-        """The doctor persona must carry the actual workflow, not be a stub."""
+        """The doctor persona must carry the actual goal-first workflow, not a stub.
+
+        Beyond the original pipeline anchors, the goal-first rewrite (#397) wires
+        in the enabler primitives: a [GOAL] gate, the integration-branch flow,
+        pre-flight worktree cleanup, the detached restart primitive, and the
+        configurable /implement base. These needles guard against the contract
+        silently regressing to the old inline-implement shape.
+        """
         text = Path("config/personas/doctor.md").read_text().lower()
-        for needle in ("/draft-issue", "/implement", "worktree", "[clarify]", "[notify]", "restart"):
+        for needle in (
+            "/draft-issue", "/implement", "worktree", "[clarify]", "[notify]", "restart",
+            "[goal]", "integration branch", "cleanup-worktrees.sh",
+            "restart-worker-detached", "--base",
+        ):
             assert needle in text, f"doctor persona missing '{needle}'"
 
 
