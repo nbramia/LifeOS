@@ -80,6 +80,35 @@ _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 # schedule instead of a new note per fire.
 _SCHED_TAG_RE = re.compile(r"^sched-(\w+)$")
 
+# Affirmative replies that lock a proposed [GOAL] (#398). A goal-approval reply
+# that isn't affirmative is treated as a refinement and passed back verbatim.
+_GOAL_AFFIRMATIVE = {
+    "yes", "y", "yep", "yeah", "approve", "approved", "ok", "okay", "k",
+    "go", "go ahead", "do it", "ship it", "lock it", "lock", "start",
+    "sounds good", "sure", "lgtm", "looks good", "yes please",
+}
+# Phrases that signal the operator wants changes, not a lock. These take
+# precedence over the affirmative prefix check so "yes but make it stricter"
+# is treated as a refinement (it must NOT lock the stale condition).
+_GOAL_REFINE_SIGNALS = (
+    "but ", "however", "instead", "except", "change", "make it", " also ",
+    "add ", "remove", "stricter", "actually", "with change", "no,", "don't",
+    "rather", "tweak", "adjust",
+)
+
+
+def _is_affirmative(text: str) -> bool:
+    """True when a goal-approval reply means 'lock it and go' (#398).
+
+    A refinement signal anywhere in the reply wins over the affirmative prefix
+    so "yes but make it stricter" / "approve with changes" don't lock the stale
+    proposed condition — they fall through to the refinement path."""
+    t = text.strip().lower()
+    if any(sig in t for sig in _GOAL_REFINE_SIGNALS):
+        return False
+    t = t.rstrip("!. ")
+    return t in _GOAL_AFFIRMATIVE or t.startswith("yes") or t.startswith("approve")
+
 
 def _slugify(text: str) -> str:
     """Lowercase, hyphenated, filesystem-safe slug capped at 60 chars.
@@ -663,6 +692,10 @@ class Worker:
             answer = q["answer"] or ""
             kind = q.get("kind") or "clarification"
 
+            if kind == "goal_approval":
+                self._resume_goal(q, session, answer)
+                continue
+
             if kind == "followup":
                 self._resume_as_followup(q, session, answer)
                 continue
@@ -769,6 +802,61 @@ class Worker:
                     session, task,
                     "managed clarification resume not yet supported",
                 )
+
+    def _resume_goal(self, q: dict, session: Session, answer: str) -> None:
+        """Operator replied to a proposed [GOAL] (#398). On approval, inject
+        `/goal <condition>` so Claude Code's native goal mode is armed for the
+        resumed session; on a refinement (non-affirmative) reply, pass the raw
+        answer back so the doctor re-proposes. Mirrors the `claude_code` branch
+        of `_resume_as_followup` — enqueue a pending message and flip status to
+        CLAIMED so `_dispatch_claude_code_session` drains it and resumes.
+        """
+        sid = session.session_id
+        task_id = session.task_id
+        condition = self._pending_goal_condition(sid)
+        if _is_affirmative(answer):
+            if condition:
+                resume_msg = f"/goal {condition}"
+                self.transcript_store.append(sid, "claude_code_goal_locked", {
+                    "condition_chars": len(condition),
+                })
+            else:
+                # Approved, but the proposed condition couldn't be recovered from
+                # the transcript (e.g. it was already locked, or never recorded).
+                # Forwarding a bare "yes" would be meaningless to the agent — ask
+                # it to re-propose so the operator can approve a real goal.
+                resume_msg = (
+                    "Approval received, but I couldn't recover the proposed goal "
+                    "to lock. Please re-emit the [GOAL] you proposed."
+                )
+                self.transcript_store.append(sid, "claude_code_goal_lock_failed", {})
+        else:
+            resume_msg = answer  # refinement — doctor re-proposes
+            self.transcript_store.append(sid, "claude_code_goal_refine", {
+                "answer_chars": len(answer),
+            })
+        # Operator root-spawns (#235) have no backing vault task, so skip the
+        # tag/status mutations (they would 404).
+        if session.origin != "operator":
+            self._swap_tag(task_id, BLOCKED_TAG, RUNNING_TAG)
+            self._set_task_status(task_id, "in_progress")
+        self.session_store.enqueue_message(sid, "operator", resume_msg)
+        self.session_store.update_status(task_id, STATUS_CLAIMED)
+        self.session_store.mark_question_processed(q["id"])
+
+    def _pending_goal_condition(self, session_id: str) -> str | None:
+        """The most recent proposed-but-not-yet-locked [GOAL] condition for a
+        session, or None. Scans the transcript: an `awaiting_goal_approval`
+        event sets the pending condition; a later `goal_locked` clears it (so a
+        second proposal after a refinement supersedes the first)."""
+        condition = None
+        for ev in self.transcript_store.read(session_id):
+            k = ev.get("kind")
+            if k == "claude_code_awaiting_goal_approval":
+                condition = (ev.get("payload") or {}).get("condition")
+            elif k == "claude_code_goal_locked":
+                condition = None
+        return condition
 
     def _resume_as_followup(self, q: dict, session: Session, answer: str) -> None:
         """Operator replied to a completion message — reopen the COMPLETED
@@ -1220,6 +1308,7 @@ class Worker:
         """
         from api.services.agent_worker.claude_code_executor import (
             REASON_AWAITING_CLARIFICATION,
+            REASON_AWAITING_GOAL_APPROVAL,
             REASON_AWAITING_PLAN_APPROVAL,
         )
         from api.services.agent_worker.claude_code_spawn import parse_claude_code_spawn_payload
@@ -1282,8 +1371,13 @@ class Worker:
                 prompt = "Plan ready — reply 'approve' to proceed, 'reject' to cancel, or send feedback to refine."
             elif outcome.reason == REASON_AWAITING_CLARIFICATION:
                 prompt = "Awaiting your reply — answer the question above to continue."
+            elif outcome.reason == REASON_AWAITING_GOAL_APPROVAL:
+                prompt = "Reply 'yes' to lock this goal and start, or send changes to refine it."
             else:
                 prompt = "Awaiting your reply to continue."
+            # Goal-approval replies route through `_resume_goal` (which injects
+            # `/goal <condition>` on a yes); everything else is a followup (#398).
+            kind = "goal_approval" if outcome.reason == REASON_AWAITING_GOAL_APPROVAL else "followup"
             sent_ids: list = []
             for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
                 try:
@@ -1310,7 +1404,7 @@ class Worker:
                     question=prompt,
                     sent_message_id=sent_ids[0],
                     sent_message_ids=sent_ids,
-                    kind="followup",
+                    kind=kind,
                     bot=bot,
                 )
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
