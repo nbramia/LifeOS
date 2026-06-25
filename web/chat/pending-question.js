@@ -14,7 +14,7 @@
 // the Telegram round-trip, and existing SSE behavior are untouched.
 
 import { state, endpoints } from './session.js';
-import { escapeHtml } from './thread.js';
+import { escapeHtml, addMessage } from './thread.js';
 
 const POLL_INTERVAL_MS = 4000;
 const CARD_ID = 'pendingQuestionCard';
@@ -172,8 +172,13 @@ async function submitAnswer(conversationId, input, sendBtn, card) {
 
   if (resp.ok) {
     // Answer deposited; the server echoed it into the thread and the worker
-    // resumes the session. Clear the card and keep polling so a follow-up
-    // question (or, via #311, the resumed output) surfaces here.
+    // resumes the session. Echo the answer into the thread (the server records
+    // it as a user message too, but the thread isn't re-rendered until reopen),
+    // then clear the card and keep polling so a follow-up question (or, via
+    // #311, the resumed output) surfaces here. A re-render of the just-answered
+    // question on the next poll (≤4s, before the worker consumes the deposit) is
+    // idempotent — a re-submit returns 409 and clears.
+    addMessage(answer, 'user');
     clearAffordance();
     return;
   }

@@ -138,6 +138,9 @@ class TestPendingQuestionUI:
         expect(page.locator("#pendingQuestionCard")).to_have_count(0, timeout=8000)
         assert self.state["answers"], "answer POST should have fired"
         assert self.state["answers"][0]["answer"] == "yes, draft the PT plan"
+        # ...and the answer is echoed into the thread as a user message so it
+        # doesn't vanish until the conversation is reopened.
+        expect(page.locator("#messages")).to_contain_text("yes, draft the PT plan")
 
     def test_empty_answer_does_not_post(self, page: Page):
         self._open_conversation(page)
