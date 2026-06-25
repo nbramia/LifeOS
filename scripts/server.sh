@@ -2,7 +2,7 @@
 # LifeOS Server Management Script
 # Designed for reliable server management from Claude or command line
 #
-# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|restart-worker-detached]
+# Usage: ./scripts/server.sh [start|stop|restart|status|wait|preflight|classify-change|verify-deployed|restart-worker-detached]
 #
 # Commands:
 #   start                    - Kill any existing processes, start server, wait for health check
@@ -12,6 +12,7 @@
 #   wait                     - Wait for server to be healthy (use after manual start)
 #   preflight                - Check prerequisites before first start
 #   classify-change          - Print whether a diff needs a worker or api-only restart (#401)
+#   verify-deployed          - Exit 0 only if the checkout is a real work tree on the expected SHA (#419)
 #   restart-worker-detached  - Detached restart of lifeos-agent-worker for the doctor (#401)
 #
 # Expected startup time: 30-60 seconds (loading sentence-transformers model)
@@ -323,6 +324,46 @@ classify_change() {
     fi
 }
 
+# verify-deployed [<expected-sha>] — confirm the canonical checkout actually
+# advanced to the merged code and is a real work tree (#419).
+#
+# The doctor's deploy step pulls main then restarts; a silent pull failure — most
+# notably a bare/misconfigured checkout (core.bare=true makes `git pull`/`checkout`
+# error out as a no-op) — otherwise lets it report "Shipped" while the OLD code is
+# still running. This is the guard: prints "deployed: <head>" and exits 0 only when
+# PROJECT_DIR is a real work tree AND its HEAD matches <expected-sha> (or origin/main
+# when no arg is given). On any mismatch it prints "not-deployed: <reason>" to stderr
+# and exits 1, so the doctor reports a deploy failure instead of a false success.
+verify_deployed() {
+    local expected="${1:-}"
+    # A bare repo (core.bare=true) or non-work-tree can't pull/checkout, so a
+    # "successful" deploy there never changed the code on disk.
+    if [ "$(git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+        echo "not-deployed: $PROJECT_DIR is not a work tree (core.bare?) — pull/checkout cannot apply" >&2
+        return 1
+    fi
+    local head
+    if ! head=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null); then
+        echo "not-deployed: cannot read HEAD of $PROJECT_DIR" >&2
+        return 1
+    fi
+    if [ -z "$expected" ]; then
+        if ! expected=$(git -C "$PROJECT_DIR" rev-parse origin/main 2>/dev/null); then
+            echo "not-deployed: cannot resolve origin/main (fetch first)" >&2
+            return 1
+        fi
+    fi
+    # Accept an abbreviated <expected-sha> (prefix match), the way git does.
+    case "$head" in
+        "$expected"*)
+            echo "deployed: HEAD=$head"
+            return 0 ;;
+        *)
+            echo "not-deployed: HEAD=$head != expected=$expected — deploy did NOT take effect" >&2
+            return 1 ;;
+    esac
+}
+
 # restart-worker-detached [--session ID] [--notify TEXT] [--bot NAME]
 #
 # Restart lifeos-agent-worker such that any pending final notice is delivered
@@ -434,6 +475,9 @@ case "${1:-status}" in
     classify-change)
         classify_change "${2:-}"
         ;;
+    verify-deployed)
+        verify_deployed "${2:-}"
+        ;;
     restart-worker-detached)
         shift
         restart_worker_detached "$@"
@@ -441,7 +485,7 @@ case "${1:-status}" in
     *)
         echo "LifeOS Server Management"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|restart-worker-detached [opts]}"
+        echo "Usage: $0 {start|stop|restart|status|wait [timeout]|foreground|preflight|classify-change [range]|verify-deployed [sha]|restart-worker-detached [opts]}"
         echo ""
         echo "Commands:"
         echo "  start                    - Start server (kills existing, waits for healthy)"
@@ -453,6 +497,8 @@ case "${1:-status}" in
         echo "  preflight                - Check prerequisites before first start"
         echo "  classify-change [range]  - Print 'worker' or 'api': which restart a diff needs"
         echo "                             (default range HEAD~1..HEAD; e.g. 'main..HEAD')"
+        echo "  verify-deployed [sha]    - Exit 0 only if the checkout is a real work tree on"
+        echo "                             <sha> (default origin/main); else exit 1 (#419)"
         echo "  restart-worker-detached  - Detached restart of $WORKER_UNIT for the doctor"
         echo "                             [--session ID] [--notify TEXT] [--bot NAME]"
         echo ""

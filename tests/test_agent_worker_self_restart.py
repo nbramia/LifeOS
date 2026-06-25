@@ -367,3 +367,63 @@ def test_server_sh_known_subcommands_still_parse(tmp_path: Path):
     assert usage.returncode == 1
     assert "restart-worker-detached" in usage.stdout
     assert "classify-change" in usage.stdout
+    assert "verify-deployed" in usage.stdout
+
+
+@pytest.mark.unit
+def test_verify_deployed_checks_worktree_and_head(tmp_path: Path):
+    """verify-deployed (#419) exits 0 only when the checkout is a real work tree
+    whose HEAD matches the expected sha (or origin/main); else exits 1. This is
+    the doctor's guard against reporting "Shipped" after a silently-failed pull
+    (e.g. a bare/misconfigured checkout)."""
+    if not SERVER_SH.exists():
+        pytest.skip("server.sh not present")
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "server.sh").write_text(SERVER_SH.read_text(), encoding="utf-8")
+
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True,
+                       capture_output=True, text=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "t@t.t")
+    _git("config", "user.name", "t")
+    (repo / "f.txt").write_text("base\n")
+    _git("add", "-A")
+    _git("commit", "-qm", "base")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+
+    def _verify(*extra):
+        return subprocess.run(
+            ["bash", str(scripts / "server.sh"), "verify-deployed", *extra],
+            cwd=repo, capture_output=True, text=True, timeout=30,
+        )
+
+    # exact full sha → deployed, exit 0
+    r = _verify(head)
+    assert r.returncode == 0, r.stderr
+    assert "deployed" in r.stdout
+
+    # abbreviated sha (prefix match, like git) → deployed, exit 0
+    assert _verify(head[:8]).returncode == 0
+
+    # wrong sha → not-deployed, exit 1
+    r = _verify("0" * 40)
+    assert r.returncode == 1
+    assert "not-deployed" in r.stderr
+
+    # bare repo (core.bare=true) can't pull/checkout → not a work tree → exit 1
+    _git("config", "core.bare", "true")
+    r = _verify(head)
+    assert r.returncode == 1
+    assert "work tree" in r.stderr
+    _git("config", "core.bare", "false")
+
+    # no arg → compares HEAD against origin/main; point origin/main at HEAD → deployed
+    _git("update-ref", "refs/remotes/origin/main", head)
+    r = _verify()
+    assert r.returncode == 0, r.stderr
+    assert "deployed" in r.stdout

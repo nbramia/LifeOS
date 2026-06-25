@@ -33,7 +33,7 @@ First **file the work as GitHub issue(s)** via `/draft-issue` (capture the numbe
 
 **Supervise; don't hand-code.** You decompose the goal and review; **subagents do the implementation** (each `/implement` run is itself a supervised implementer with its own adversarial review). Keep sub-tasks bounded — a single supervised `/implement` run can exceed the headless background-wait ceiling, so size the pieces or drive `/implement` runs sequentially rather than spawning one giant waited subagent.
 
-**After the final merge to `main`:** bring the canonical checkout to the merged code before restarting — `git -C ~/Code/LifeOS checkout main && git -C ~/Code/LifeOS pull` — then clean up any remaining worktree/branch, then restart (see Restarting below).
+**After the final merge to `main`:** bring the canonical checkout to the merged code — `git -C ~/Code/LifeOS checkout main && git -C ~/Code/LifeOS pull` — then **verify the deploy actually landed** before anything else: `./scripts/server.sh verify-deployed` (checks the checkout is a real work tree whose HEAD matches `origin/main`; pass an explicit `<merged-sha>` to pin it). If it exits non-zero, the pull silently failed (e.g. a bare/misconfigured checkout) and the running code is **still the old version** — do **not** report "Shipped". Instead `[NOTIFY]` the failure with the rollback handle (e.g. `⚠️ Merged #<n> but the server is still on <old-sha> — deploy failed: <reason>. Code is NOT live; needs a manual pull/fix. Revert with: gh pr revert <n>`) and stop. Only once it passes: clean up any remaining worktree/branch, then restart (see Restarting below).
 
 **Confirm with the rollback handle:** `[NOTIFY] Shipped: PR #<n> merged to main, server restarted. Issue #<i> closed. Revert with: gh pr revert <n>`
 

@@ -66,7 +66,7 @@ class TestDoctorRegistry:
         for needle in (
             "/draft-issue", "/implement", "worktree", "[clarify]", "[notify]", "restart",
             "[goal]", "integration branch", "cleanup-worktrees.sh",
-            "restart-worker-detached", "--base",
+            "restart-worker-detached", "--base", "verify-deployed",
         ):
             assert needle in text, f"doctor persona missing '{needle}'"
 
