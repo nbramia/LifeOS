@@ -660,7 +660,10 @@ class ClaudeCodeExecutor:
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning("notification callback raised: %s", exc)
                     if self._conversation_mirror:  # #311: stream into the web thread
-                        self._conversation_mirror(session.session_id, body)
+                        try:
+                            self._conversation_mirror(session.session_id, body)
+                        except Exception as exc:  # pragma: no cover — defensive
+                            logger.warning("conversation mirror raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_clarify", {
                         "body": body, "body_chars": len(body),
                     })
@@ -676,7 +679,10 @@ class ClaudeCodeExecutor:
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
                         if self._conversation_mirror:  # #311: stream into the web thread
-                            self._conversation_mirror(session.session_id, body)
+                            try:
+                                self._conversation_mirror(session.session_id, body)
+                            except Exception as exc:  # pragma: no cover — defensive
+                                logger.warning("conversation mirror raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_notify", {
                         "body": body, "body_chars": len(body),
                     })
@@ -696,7 +702,10 @@ class ClaudeCodeExecutor:
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
                         if self._conversation_mirror:  # #311: stream into the web thread
-                            self._conversation_mirror(session.session_id, body)
+                            try:
+                                self._conversation_mirror(session.session_id, body)
+                            except Exception as exc:  # pragma: no cover — defensive
+                                logger.warning("conversation mirror raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_goal", {
                         "body": body, "body_chars": len(body),
                     })

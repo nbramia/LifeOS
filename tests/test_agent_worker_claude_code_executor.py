@@ -344,6 +344,52 @@ def test_child_session_does_not_mirror(tmp_path: Path):
     assert mirror_calls == []
 
 
+def test_raising_conversation_mirror_does_not_abort_run(tmp_path: Path):
+    """#311 (review): a conversation_mirror that raises (e.g. a transient DB
+    lock) must NOT kill the assistant-event loop — the session still completes,
+    later bodies still stream to Telegram, and the terminal result is produced.
+    Mirrors the existing guard around the Telegram notification callback."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] First update."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Second update."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.02, "result": "All done."},
+    ]
+    notifications: list[str] = []
+
+    def _boom(_sid, _body):
+        raise RuntimeError("mirror sink exploded")
+
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path=db_path)
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    executor = ClaudeCodeExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        notification_callback=lambda msg: notifications.append(msg),
+        conversation_mirror=_boom,
+        spawn_fn=_spawn_with(events),
+        binary_resolver=lambda: "/usr/bin/true",
+        timeout_seconds=30,
+        heartbeat_interval=3600,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "do the thing"})
+
+    # The raising mirror was swallowed: the run reached its terminal result...
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.final_text == "All done."
+    # ...and BOTH notifies still streamed to Telegram (the loop never aborted).
+    assert notifications == ["First update.", "Second update."]
+
+
 def test_build_command_uses_session_model_tier(tmp_path: Path):
     """A child seeded with claude_code_model='haiku' runs the CLI with
     --model haiku; the default (None) falls back to opus (#349)."""
