@@ -1506,9 +1506,8 @@ class Worker:
         # `claude` binary (spawn event written, but no subprocess) is NOT
         # misdiagnosed as a side-effecting interruption — that case re-executes
         # safely once Fix A (terminal-status persistence below) stops the loop.
-        # Scope: claude_code only. The codex path (_dispatch_codex_session) has
-        # the same spawn-before-init window unguarded — intentionally out of #400
-        # (doctor == claude_code); tracked as a follow-up.
+        # The codex path (_dispatch_codex_session) carries the same guard via the
+        # shared _cli_subprocess_launch_count helper (#411).
         prior_launches = self._cli_subprocess_launch_count(
             sid, "claude_code_spawn", "claude_code_binary_not_found"
         )
@@ -1740,7 +1739,7 @@ class Worker:
         if not is_resume and self._cli_subprocess_launch_count(
             sid, "codex_spawn", "codex_binary_not_found"
         ) > 0:
-            self.transcript_store.append(sid, "codex_reexecute_prevented", {
+            self.transcript_store.append(sid, "codex_reexecute_averted", {
                 "reason": "subprocess launched without a persisted session id "
                           "(interrupted before init); not re-executing to avoid repeating side effects",
             })

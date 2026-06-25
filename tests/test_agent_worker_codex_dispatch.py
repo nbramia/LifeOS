@@ -151,7 +151,7 @@ def test_codex_crash_before_init_does_not_reexecute(tmp_path: Path):
     assert stub.calls == [] and stub.resume_calls == []  # neither re-ran the prompt
     assert worker.session_store.get("cx-crash").status == STATUS_FAILED
     kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
-    assert "codex_reexecute_prevented" in kinds
+    assert "codex_reexecute_averted" in kinds
     assert any("already started" in s for s in plain_sends)
 
 
@@ -172,7 +172,7 @@ def test_codex_binary_not_found_does_not_trip_guard(tmp_path: Path):
     assert stub.calls == [("cx-bn", "do it")]  # guard skipped → execute ran
     assert worker.session_store.get("cx-bn").status == STATUS_FAILED
     kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
-    assert "codex_reexecute_prevented" not in kinds
+    assert "codex_reexecute_averted" not in kinds
 
 
 def test_codex_failed_finalizes_session_row(tmp_path: Path):
