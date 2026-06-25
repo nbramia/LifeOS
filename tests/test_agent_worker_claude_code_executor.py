@@ -559,3 +559,51 @@ def test_notify_inside_code_fence_not_streamed(tmp_path: Path):
     outcome = executor.execute(session, {"description": "do a thing"})
     assert outcome.status == STATUS_COMPLETED
     assert notifications == ["outside fence"]
+
+
+def test_scan_inline_backticks_in_tag_body_not_treated_as_fence():
+    """An inline triple-backtick span inside a tag body is NOT a fence (fences
+    are line-anchored), so the body is extracted intact — not truncated."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("[CLARIFY] should I use ```black``` or autopep8?")
+    assert scan.clarify == ["should I use ```black``` or autopep8?"]
+    assert scan.notify == []
+
+
+def test_scan_ignores_tags_inside_tilde_fence():
+    """The ~~~ fence variant is handled the same as ```."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("do it [NOTIFY] go\n~~~\n[NOTIFY] sample\n~~~\ndone")
+    assert scan.notify == ["go"]  # fenced one not extracted
+    assert "[NOTIFY] sample" in scan.narrative
+
+
+def test_scan_orphan_scrub_does_not_eat_partial_words():
+    """The orphan-marker scrub must not strip the prefix of an unrelated word
+    that merely starts with NOTIFY/CLARIFY (e.g. '[NOTIFYING ...]')."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("the agent is [NOTIFYING you] about it")
+    assert scan.notify == []
+    assert "[NOTIFYING you]" in scan.narrative
+
+
+def test_result_event_fenced_tag_preserved_in_final_text(tmp_path: Path):
+    """The result-event path is fence-aware too: a fenced tag in the result
+    text survives in final_text rather than being stripped."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01,
+         "result": "Summary:\n```\n[NOTIFY] example\n```\nall done"},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+    outcome = executor.execute(session, {"description": "x"})
+    assert outcome.status == STATUS_COMPLETED
+    assert "[NOTIFY] example" in outcome.final_text  # fenced tag preserved
+    assert notifications == []  # result path never streams

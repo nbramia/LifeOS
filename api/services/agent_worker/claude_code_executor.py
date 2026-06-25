@@ -41,15 +41,24 @@ HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 _NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
 _CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
-# Fenced code blocks (``` or ~~~). Tags inside these are illustrative — the
-# agent quoting the protocol or showing example output — so they must NOT be
-# treated as real notifications nor stripped from the narrative (#402).
-_FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+# Fenced code blocks: a fence marker (``` or ~~~) at the START of a line
+# through its matching closing fence on its own line. Tags inside these are
+# illustrative — the agent quoting the protocol or showing example output — so
+# they must NOT be treated as real notifications nor stripped from the
+# narrative (#402). Anchoring to line starts (proper Markdown semantics) means
+# an *inline* triple-backtick span inside a tag body is not mistaken for a
+# fence and so doesn't truncate the body. Tag bodies are short operator-facing
+# prose by contract, so a multi-line fenced block embedded *inside* a tag body
+# is out of scope (it would split at the fence — acceptable for short tags).
+# Only *balanced* fences match; an unclosed fence falls back to plain scanning,
+# so a real tag after a stray fence marker still surfaces (the safe direction).
+_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
 # Orphaned/malformed control-tag markers left after well-formed extraction
-# (e.g. an unclosed "[NOTIFY" with no closing bracket, or a stray fragment).
-# Scrubbed from the operator-facing narrative so raw control tokens never leak
-# (#402). The closing bracket is optional to catch unclosed tags.
-_ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY)\]?")
+# (e.g. an unclosed "[NOTIFY" with no closing bracket). Scrubbed from the
+# operator-facing narrative so raw control tokens never leak (#402). The
+# closing bracket is optional to catch unclosed tags; the (?![A-Za-z]) boundary
+# stops it from eating the prefix of unrelated words like "[NOTIFYING ...]".
+_ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY)(?![A-Za-z])\]?")
 
 
 class _TagScan(NamedTuple):
