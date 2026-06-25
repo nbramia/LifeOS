@@ -713,3 +713,32 @@ def test_child_goal_not_streamed_to_operator(tmp_path: Path):
     assert outcome.status == STATUS_BLOCKED
     assert outcome.reason == REASON_AWAITING_GOAL_APPROVAL
     assert notifications == []  # child stays silent
+
+
+def test_clarify_takes_precedence_over_goal_in_same_turn(tmp_path: Path):
+    """When one assistant turn emits BOTH [CLARIFY] and [GOAL], clarification
+    wins — the session blocks awaiting the answer and the goal is NOT locked
+    (it must be re-proposed once the clarification resolves)."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text",
+                "text": "[CLARIFY] which suite? [GOAL] all tests pass"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "make it green"})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_CLARIFICATION  # clarification wins
+    assert outcome.final_text == "which suite?"
+    # The goal proposal did NOT produce a goal-approval block this turn.
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "claude_code_awaiting_goal_approval" not in kinds

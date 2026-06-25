@@ -718,6 +718,9 @@ class ClaudeCodeExecutor:
         if state.pending_goal:
             # Agent proposed a goal — block for operator approval (#398). On
             # approval the worker injects `/goal <condition>` at resume.
+            # Clarification is checked first above: a same-turn [CLARIFY]
+            # supersedes [GOAL], so the goal must be re-proposed after the
+            # clarification resolves.
             state.awaiting_goal = True
             state.terminal = True
             return

@@ -538,16 +538,24 @@ class TestGoalApproval:
         from api.services.agent_worker.worker import _is_affirmative
         assert _is_affirmative("yes")
         assert _is_affirmative("Yes!")
-        assert _is_affirmative("yes, go ahead")
         assert _is_affirmative("approve")
         assert _is_affirmative("Approved.")
         assert _is_affirmative("lock it")
+        assert _is_affirmative("go ahead")
+        assert _is_affirmative("sounds good")
+        assert _is_affirmative("sure")
+        assert _is_affirmative("yes please")
 
     def test_is_affirmative_rejects_refinements(self):
         from api.services.agent_worker.worker import _is_affirmative
         assert not _is_affirmative("no, make it stricter")
         assert not _is_affirmative("change it to all tests AND lint pass")
         assert not _is_affirmative("hmm")
+        # "yes but ..." / "approve with changes" must NOT lock the stale goal —
+        # the refinement signal wins over the affirmative prefix (#406 review).
+        assert not _is_affirmative("yes but make it stricter")
+        assert not _is_affirmative("approve with changes: also require lint")
+        assert not _is_affirmative("yes, also require lint")
 
     def test_goal_block_registers_goal_approval_question(self, tmp_path):
         """A goal-approval BLOCKED outcome registers a kind='goal_approval'
@@ -634,3 +642,109 @@ class TestGoalApproval:
         kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
         assert "claude_code_goal_locked" not in kinds
         assert "claude_code_goal_refine" in kinds
+
+    def test_affirmative_without_recoverable_condition_reprompts(self, tmp_path):
+        """An affirmative reply when the proposed condition can't be recovered
+        (e.g. it was already locked) must NOT forward a bare 'yes' — it asks the
+        agent to re-emit the [GOAL], and records a goal_lock_failed event."""
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session = w.session_store.create(
+            task_id="task-goal-nofind",
+            routing="claude_code",
+            origin="operator",
+            bot="doctor",
+            status=STATUS_BLOCKED,
+        )
+        w.session_store.set_claude_code_session_id(session.task_id, "cli-goal-nf")
+        # A proposal that was already locked → _pending_goal_condition returns None.
+        w.transcript_store.append(
+            session.session_id, "claude_code_awaiting_goal_approval",
+            {"condition": "all tests pass", "condition_chars": 14},
+        )
+        w.transcript_store.append(
+            session.session_id, "claude_code_goal_locked", {"condition_chars": 14},
+        )
+        w.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question="Reply 'yes' to lock this goal and start, or send changes to refine it.",
+            sent_message_id=9200,
+            sent_message_ids=[9200],
+            kind="goal_approval",
+            bot="doctor",
+        )
+
+        assert w.session_store.deposit_answer(9200, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        pending = w.session_store.drain_pending_messages(session.session_id)
+        assert len(pending) == 1
+        msg = pending[0]["content"]
+        assert not msg.startswith("/goal")  # no stale/bare command forwarded
+        assert msg != "yes"
+        assert "re-emit" in msg.lower()
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "claude_code_goal_lock_failed" in kinds
+
+    def test_goal_condition_survives_restart_and_reinjects(self, tmp_path):
+        """The #398 acceptance criterion: the proposed condition is durable via
+        the transcript (no DB column). A fresh Worker over the SAME paths
+        (simulating a restart) still injects `/goal <condition>` on approval."""
+        from api.services.agent_worker.session_store import STATUS_BLOCKED, STATUS_CLAIMED
+
+        # First worker: seed the blocked goal + answered approval question.
+        w1 = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session = w1.session_store.create(
+            task_id="task-goal-restart",
+            routing="claude_code",
+            origin="operator",
+            bot="doctor",
+            status=STATUS_BLOCKED,
+        )
+        w1.session_store.set_claude_code_session_id(session.task_id, "cli-goal-rs")
+        w1.transcript_store.append(
+            session.session_id, "claude_code_awaiting_goal_approval",
+            {"condition": "all tests pass", "condition_chars": 14},
+        )
+        w1.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question="Reply 'yes' to lock this goal and start, or send changes to refine it.",
+            sent_message_id=9300,
+            sent_message_ids=[9300],
+            kind="goal_approval",
+            bot="doctor",
+        )
+        assert w1.session_store.deposit_answer(9300, "yes", bot="doctor") is True
+
+        # Simulate a worker restart: a brand-new Worker over the same DB +
+        # transcript dir processes the still-unprocessed answered question.
+        w2 = self._make_worker(tmp_path, self._goal_blocked_stub())
+        w2._process_clarification_answers()
+
+        pending = w2.session_store.drain_pending_messages(session.session_id)
+        assert [m["content"] for m in pending] == ["/goal all tests pass"]
+        assert w2.session_store.get_by_session_id(session.session_id).status == STATUS_CLAIMED
+
+    def test_pending_goal_condition_returns_latest_after_relock_cycle(self, tmp_path):
+        """A later awaiting_goal_approval supersedes an earlier locked one:
+        awaiting{A} → locked → awaiting{B} resolves to B."""
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session = w.session_store.create(
+            task_id="task-goal-cycle",
+            routing="claude_code",
+            origin="operator",
+            bot="doctor",
+            status=STATUS_BLOCKED,
+        )
+        sid = session.session_id
+        w.transcript_store.append(sid, "claude_code_awaiting_goal_approval",
+                                  {"condition": "A", "condition_chars": 1})
+        w.transcript_store.append(sid, "claude_code_goal_locked", {"condition_chars": 1})
+        w.transcript_store.append(sid, "claude_code_awaiting_goal_approval",
+                                  {"condition": "B", "condition_chars": 1})
+        assert w._pending_goal_condition(sid) == "B"

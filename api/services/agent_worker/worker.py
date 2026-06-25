@@ -83,14 +83,30 @@ _SCHED_TAG_RE = re.compile(r"^sched-(\w+)$")
 # Affirmative replies that lock a proposed [GOAL] (#398). A goal-approval reply
 # that isn't affirmative is treated as a refinement and passed back verbatim.
 _GOAL_AFFIRMATIVE = {
-    "yes", "y", "yep", "yeah", "approve", "approved", "ok", "okay", "go",
-    "do it", "ship it", "lock it", "lock", "start",
+    "yes", "y", "yep", "yeah", "approve", "approved", "ok", "okay", "k",
+    "go", "go ahead", "do it", "ship it", "lock it", "lock", "start",
+    "sounds good", "sure", "lgtm", "looks good", "yes please",
 }
+# Phrases that signal the operator wants changes, not a lock. These take
+# precedence over the affirmative prefix check so "yes but make it stricter"
+# is treated as a refinement (it must NOT lock the stale condition).
+_GOAL_REFINE_SIGNALS = (
+    "but ", "however", "instead", "except", "change", "make it", " also ",
+    "add ", "remove", "stricter", "actually", "with change", "no,", "don't",
+    "rather", "tweak", "adjust",
+)
 
 
 def _is_affirmative(text: str) -> bool:
-    """True when a goal-approval reply means 'lock it and go' (#398)."""
-    t = text.strip().lower().rstrip("!. ")
+    """True when a goal-approval reply means 'lock it and go' (#398).
+
+    A refinement signal anywhere in the reply wins over the affirmative prefix
+    so "yes but make it stricter" / "approve with changes" don't lock the stale
+    proposed condition — they fall through to the refinement path."""
+    t = text.strip().lower()
+    if any(sig in t for sig in _GOAL_REFINE_SIGNALS):
+        return False
+    t = t.rstrip("!. ")
     return t in _GOAL_AFFIRMATIVE or t.startswith("yes") or t.startswith("approve")
 
 
@@ -798,11 +814,22 @@ class Worker:
         sid = session.session_id
         task_id = session.task_id
         condition = self._pending_goal_condition(sid)
-        if condition and _is_affirmative(answer):
-            resume_msg = f"/goal {condition}"
-            self.transcript_store.append(sid, "claude_code_goal_locked", {
-                "condition_chars": len(condition),
-            })
+        if _is_affirmative(answer):
+            if condition:
+                resume_msg = f"/goal {condition}"
+                self.transcript_store.append(sid, "claude_code_goal_locked", {
+                    "condition_chars": len(condition),
+                })
+            else:
+                # Approved, but the proposed condition couldn't be recovered from
+                # the transcript (e.g. it was already locked, or never recorded).
+                # Forwarding a bare "yes" would be meaningless to the agent — ask
+                # it to re-propose so the operator can approve a real goal.
+                resume_msg = (
+                    "Approval received, but I couldn't recover the proposed goal "
+                    "to lock. Please re-emit the [GOAL] you proposed."
+                )
+                self.transcript_store.append(sid, "claude_code_goal_lock_failed", {})
         else:
             resume_msg = answer  # refinement — doctor re-proposes
             self.transcript_store.append(sid, "claude_code_goal_refine", {
