@@ -652,9 +652,25 @@ class ClaudeCodeExecutor:
                 if scan.narrative.strip():
                     state.final_text = scan.narrative.strip()
                 for body in scan.clarify:
-                    state.pending_clarification = body
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
+                    if state.is_child:
+                        # #356: a spawned child must not pause on an operator reply.
+                        # The operator owns no thread to a child, and a BLOCKED child
+                        # would strand its yielded parent (which only resumes once
+                        # every child is terminal). So fold the question into the
+                        # child's output — prefixed so the parent recognizes it as a
+                        # request, like [NOTIFY] folding (#349) — and let the turn
+                        # complete. The PARENT, which owns the operator conversation,
+                        # reads it on resume and decides (answer via a re-spawn,
+                        # relay to the operator, or proceed). Crucially DON'T set
+                        # pending_clarification: no BLOCKED outcome, no operator notify.
+                        state.notify_bodies.append(f"[needs clarification] {body}")
+                        self.transcript_store.append(sid, "claude_code_child_clarify_folded", {
+                            "body": body, "body_chars": len(body),
+                        })
+                        continue
+                    state.pending_clarification = body
                     try:
                         self._notify(body)
                     except Exception as exc:  # pragma: no cover — defensive

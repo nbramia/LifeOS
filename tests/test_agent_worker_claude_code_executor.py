@@ -278,6 +278,51 @@ def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
     assert "Match 1: A vs B." in persisted and "Match 2: C vs D." in persisted
 
 
+def test_child_clarify_folds_into_final_text_and_does_not_block(tmp_path: Path):
+    """#356: a spawned child's [CLARIFY] must NOT message the operator and must
+    NOT go BLOCKED (which would strand the yielded parent — it only resumes once
+    every child is terminal). The question is folded into final_text, prefixed
+    [needs clarification], so the parent reads it on resume and decides; the
+    child's turn completes normally."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[CLARIFY] Use API v1 or v2?"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.05, "result": ""},
+    ]
+    notifications: list[str] = []
+    mirror_calls: list[tuple[str, str]] = []
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events),
+        notifications=notifications, mirror_calls=mirror_calls,
+    )
+    session = _seed_child_session(store)
+
+    outcome = executor.execute(session, {"description": "wire the API call"})
+
+    # Completes (not BLOCKED) so the parent isn't stranded.
+    assert outcome.status == STATUS_COMPLETED
+    # Nothing streamed to the operator — neither Telegram nor the web thread.
+    assert notifications == []
+    assert mirror_calls == []
+    # The question is folded into the text the parent reads, marked as a request.
+    assert "[needs clarification] Use API v1 or v2?" in outcome.final_text
+    # Audit trail: the folded-clarify event, and NOT the operator-facing clarify.
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "claude_code_child_clarify_folded" in kinds
+    assert "claude_code_clarify" not in kinds
+    # The completion persists the folded text so the parent reads it via
+    # _child_final_text (the child never streamed it anywhere).
+    completed = [
+        e for e in _read_transcript(transcripts, session.session_id)
+        if e["kind"] == "claude_code_completed"
+    ]
+    assert completed
+    assert "[needs clarification] Use API v1 or v2?" in completed[0]["payload"]["final_text"]
+
+
 def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
     """#311: when a conversation_mirror is wired, the executor calls it with
     (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] — the same
