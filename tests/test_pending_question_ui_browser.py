@@ -224,7 +224,9 @@ class TestPendingQuestionUI:
     def test_poll_stops_when_session_terminal_and_no_question(self, page: Page):
         """#311: once the spawned session reaches a terminal status AND no
         question is pending, the client stops the 4s poll instead of running
-        forever. Asserted via the detail-GET count plateauing."""
+        forever. The stop needs TWO consecutive terminal polls (race guard), so
+        this allows a couple of cycles before asserting the detail-GET count
+        plateaus."""
         self._open_conversation(page)
         # A question is pending, so the poll is running and the card is shown.
         expect(page.locator("#pendingQuestionCard")).to_be_visible(timeout=8000)
@@ -234,11 +236,11 @@ class TestPendingQuestionUI:
         self.state["awaiting"] = False
         self.state["agent_session_active"] = False
 
-        # Wait for the poll that observes the terminal status (which stops the
-        # loop), then record the GET count and confirm it no longer grows.
+        # The card clears on the first terminal poll; the loop stops on the
+        # second. Wait past two full intervals so the stop has definitely fired,
+        # then snapshot the GET count and confirm it no longer grows.
         expect(page.locator("#pendingQuestionCard")).to_have_count(0, timeout=8000)
-        # Let any in-flight poll settle, then snapshot the count.
-        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS)
+        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS * 2)
         settled = self.state.get("detail_get_count", 0)
         # Across two more full intervals the count must not increase — the loop
         # is stopped, not merely idle for one tick.
@@ -246,3 +248,52 @@ class TestPendingQuestionUI:
         assert self.state.get("detail_get_count", 0) == settled, (
             "detail GET fired after the session went terminal — poll did not stop"
         )
+
+    def test_terminal_poll_before_result_is_stored_still_renders_result(self, page: Page):
+        """#311 (race guard): the executor flips the session row terminal BEFORE
+        the dispatch handler writes the result mirror, so a poll can see
+        agent_session_active=false with the result not yet in the GET. A single
+        terminal poll must NOT stop — the next poll, once the mirrored result has
+        landed, must render it and only THEN stop. (For the codex handoff path
+        this mirror is the only web output, so a premature stop = lost result.)"""
+        self._open_conversation(page)
+        expect(page.locator("#pendingQuestionCard")).to_be_visible(timeout=8000)
+
+        # Simulate the race window: the session is reported terminal (status
+        # already flipped) and the question is resolved, but the result mirror
+        # has NOT been written to the conversation yet.
+        self.state["awaiting"] = False
+        self.state["agent_session_active"] = False
+
+        # The card clears on the first terminal poll, but the result isn't here.
+        expect(page.locator("#pendingQuestionCard")).to_have_count(0, timeout=8000)
+        expect(page.locator("#messages")).not_to_contain_text("Opened PR #5")
+        # Record the GET count: if the single terminal poll wrongly stopped the
+        # loop, the count will not advance and the result below never renders.
+        count_after_first_terminal = self.state.get("detail_get_count", 0)
+
+        # The mirror lands (the dispatch handler finally wrote the result).
+        self.state["messages"].append({
+            "id": "m3", "role": "assistant",
+            "content": "All done — Opened PR #5.",
+            "created_at": "2026-06-25T10:05:00", "sources": None, "routing": None,
+        })
+
+        # The poll did NOT stop after one terminal observation, so a subsequent
+        # poll fires, renders the late result exactly once, and only then stops.
+        result = page.locator("#messages .message.assistant", has_text="Opened PR #5")
+        expect(result).to_have_count(1, timeout=8000)
+        assert self.state.get("detail_get_count", 0) > count_after_first_terminal, (
+            "no further poll fired after the first terminal poll — the loop "
+            "stopped before the mirrored result was stored (the race bug)"
+        )
+
+        # And now (two consecutive terminal polls observed) the loop stops and
+        # does not duplicate the result.
+        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS * 2)
+        settled = self.state.get("detail_get_count", 0)
+        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS * 2)
+        assert self.state.get("detail_get_count", 0) == settled, (
+            "poll did not stop after the result was rendered + two terminal polls"
+        )
+        expect(result).to_have_count(1)

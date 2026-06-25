@@ -34,6 +34,18 @@ let pollingConversationId = null;
 let seenMessageIds = new Set();
 let seededSeenSet = false;
 
+// #311: count consecutive polls that report the spawned session terminal AND
+// have no pending question. We require TWO in a row before stopping, to close a
+// race: the executor flips the session row to a terminal status BEFORE the
+// dispatch handler writes the terminal-result mirror into the conversation (the
+// mirror lands ~1s later, after a Telegram send). A single terminal poll could
+// land in that window — session done, result not stored yet — and stop before
+// the result renders. Demanding a second consecutive terminal poll guarantees
+// ≥1 full ~4s cycle after the status flip, by which point the mirror is stored
+// and renderNewMessages (which runs before the stop check) has rendered it. Any
+// active poll or a pending question resets the counter.
+let terminalPollCount = 0;
+
 function answerEndpoint(conversationId) {
   return `${endpoints.conversations}/${encodeURIComponent(conversationId)}/answer`;
 }
@@ -56,6 +68,7 @@ export function startPendingQuestionPolling(conversationId) {
   // render only newly-arrived ones.
   seenMessageIds = new Set();
   seededSeenSet = false;
+  terminalPollCount = 0;
   // Poll once immediately so a re-opened thread shows the affordance without
   // waiting a full interval, then on a cadence.
   pollOnce();
@@ -71,6 +84,7 @@ export function stopPendingQuestionPolling() {
   // #311: drop the dedup state so the next polled conversation seeds fresh.
   seenMessageIds = new Set();
   seededSeenSet = false;
+  terminalPollCount = 0;
 }
 
 async function pollOnce() {
@@ -105,21 +119,33 @@ async function pollOnce() {
   const pq = data && data.pending_question;
   if (pq && pq.question) {
     renderAffordance(conversationId, pq);
+    // A live question means the session isn't done with us — reset the
+    // terminal-stop counter so a later resolution starts the two-poll countdown
+    // fresh.
+    terminalPollCount = 0;
   } else {
     // No (longer a) pending question — the session resolved or hasn't asked
     // yet. Drop any stale card but keep polling so the next [CLARIFY]/[GOAL]
     // (a session can ask more than once) still surfaces.
     clearAffordance();
     // #311: terminate the poll once the spawned session is done AND nothing is
-    // awaiting an answer. Without this the 4s loop runs forever after the
-    // session completes. `agent_session_active === false` is the server's
-    // signal that the linked session reached a terminal status (or there's no
-    // linked session); the `!pq` guard above means we never stop while a
-    // [CLARIFY]/[GOAL] is still pending. We require an explicit `=== false` so
-    // an older server that omits the field (undefined) keeps the prior
-    // run-forever behavior rather than stopping prematurely.
+    // awaiting an answer — but only after TWO consecutive terminal polls, to
+    // avoid stopping inside the status-flip→mirror-write race (see
+    // terminalPollCount above). `agent_session_active === false` is the
+    // server's signal that the linked session reached a terminal status (or
+    // there's no linked session). We require an explicit `=== false` so an
+    // older server that omits the field (undefined) keeps the prior
+    // run-forever behavior rather than stopping prematurely; that same `!==
+    // false` (active OR field-absent) resets the counter. renderNewMessages
+    // above already ran this poll, so a result that landed since the status
+    // flip is rendered on the second terminal poll BEFORE we stop here.
     if (data && data.agent_session_active === false) {
-      stopPendingQuestionPolling();
+      terminalPollCount += 1;
+      if (terminalPollCount >= 2) {
+        stopPendingQuestionPolling();
+      }
+    } else {
+      terminalPollCount = 0;
     }
   }
 }
