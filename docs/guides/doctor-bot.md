@@ -15,6 +15,8 @@ Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orc
 
 ## The flow
 
+This is the operator's-eye summary; the exact contract the session runs lives in [`config/personas/doctor.md`](../../config/personas/doctor.md) — treat that as authoritative if the two ever drift.
+
 1. **You report a problem**, e.g. _"the calendar tool returns last week's events when I ask for this week."_
 2. **Clarify the goal.** The doctor investigates the code and asks the minimum `[CLARIFY]` questions needed to pin down what "done" means. No work starts yet.
 3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** Reply **yes** to lock it (which arms the session's `/goal`), or send changes to refine it.
@@ -60,6 +62,6 @@ The doctor's machinery is generic. To add another orchestration surface, add an 
 
 ### Code References
 - [`config/telegram_bots.json`](../../config/telegram_bots.json) — Bot registry (the `doctor` entry, `orchestrates: true`).
-- [`config/personas/doctor.md`](../../config/personas/doctor.md) — The orchestration contract the session runs.
+- [`config/personas/doctor.md`](../../config/personas/doctor.md) — **The authoritative orchestration contract** the session runs; this guide is its operator-facing summary.
 - [`api/services/telegram.py`](../../api/services/telegram.py) — Listener routing + bot-scoped reply hooks.
 - [`api/services/agent_worker/worker.py`](../../api/services/agent_worker/worker.py) — Bot-bound notification routing for Claude Code sessions.

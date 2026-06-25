@@ -42,9 +42,10 @@ class TelegramBotConfig:
     label: str = ""
     orchestrates: bool = False
     # Parsed from the persona file's optional YAML frontmatter (see _parse_persona).
-    # `voice` rules apply only on voice turns; `model` is an optional per-persona
-    # model preference. Both default to unset and are consumed by the orchestrator,
-    # not here.
+    # `voice` rules are consumed on voice turns (the chat route appends them to the
+    # system prompt). `model` is RESERVED — parsed and stored here but not yet read
+    # by any code path; the orchestrator resolves its model from anthropic_model +
+    # per-turn escalation, so setting a persona `model` is currently a no-op.
     voice: tuple[str, ...] = ()
     model: str = ""
 

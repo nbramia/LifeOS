@@ -133,7 +133,7 @@ For longer or fuzzier objectives, Claude can propose a **success condition** wit
 
 Approval is recognized from short affirmatives (`yes`, `approve`, `go ahead`, `sounds good`, `lgtm`, …). A reply that also asks for changes (`yes, but make it stricter`) is treated as a refinement, not a lock.
 
-**Note:** `[GOAL]` is a first-class protocol tag with its own pending state (`REASON_AWAITING_GOAL_APPROVAL`). The doctor persona is the first to emit it; that persona change is tracked separately (issue #397).
+**Note:** `[GOAL]` is a first-class protocol tag with its own pending state (`REASON_AWAITING_GOAL_APPROVAL`). The doctor persona emits it as the gate of its goal-first pipeline (see [doctor-bot.md](../../guides/doctor-bot.md)).
 
 ---
 
