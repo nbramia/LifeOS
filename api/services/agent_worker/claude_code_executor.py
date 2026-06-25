@@ -39,8 +39,13 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 
-_NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
-_CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY)\]|\Z)", re.DOTALL)
+_NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
+_CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
+# [GOAL] proposes a success condition for the operator to approve; once
+# approved, the worker injects `/goal <condition>` at resume (#398). It mirrors
+# the [NOTIFY]/[CLARIFY] split so an interleaved GOAL doesn't bleed into an
+# adjacent tag's body.
+_GOAL_RE = re.compile(r"\[GOAL\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
 # Fenced code blocks: a fence marker (``` or ~~~) at the START of a line
 # through its matching closing fence on its own line. Tags inside these are
 # illustrative — the agent quoting the protocol or showing example output — so
@@ -58,24 +63,27 @@ _FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.MULTILINE 
 # operator-facing narrative so raw control tokens never leak (#402). The
 # closing bracket is optional to catch unclosed tags; the (?![A-Za-z]) boundary
 # stops it from eating the prefix of unrelated words like "[NOTIFYING ...]".
-_ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY)(?![A-Za-z])\]?")
+_ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY|GOAL)(?![A-Za-z])\]?")
 
 
 class _TagScan(NamedTuple):
     """Result of a fence-aware scan of assistant text for control tags.
 
-    ``clarify`` / ``notify`` are the non-empty tag bodies in document order,
-    drawn only from outside fenced code blocks. ``narrative`` is the text with
-    all control tags + orphaned markers removed from non-fenced regions and
+    ``clarify`` / ``notify`` / ``goal`` are the non-empty tag bodies in document
+    order, drawn only from outside fenced code blocks. ``narrative`` is the text
+    with all control tags + orphaned markers removed from non-fenced regions and
     fenced code blocks preserved verbatim — i.e. the agent's prose as the
     operator should see it.
     """
     clarify: list[str]
     notify: list[str]
+    goal: list[str]
     narrative: str
 
 
-def _scan_segment(seg: str, clarify: list[str], notify: list[str], parts: list[str]) -> None:
+def _scan_segment(
+    seg: str, clarify: list[str], notify: list[str], goal: list[str], parts: list[str]
+) -> None:
     """Extract tag bodies from one non-fenced segment and append its cleaned
     narrative to ``parts``."""
     for match in _CLARIFY_RE.finditer(seg):
@@ -86,27 +94,33 @@ def _scan_segment(seg: str, clarify: list[str], notify: list[str], parts: list[s
         body = match.group(1).strip()
         if body:
             notify.append(body)
+    for match in _GOAL_RE.finditer(seg):
+        body = match.group(1).strip()
+        if body:
+            goal.append(body)
     cleaned = _NOTIFY_RE.sub("", seg)
     cleaned = _CLARIFY_RE.sub("", cleaned)
+    cleaned = _GOAL_RE.sub("", cleaned)
     cleaned = _ORPHAN_TAG_RE.sub("", cleaned)
     parts.append(cleaned)
 
 
 def _scan_protocol_tags(text: str) -> _TagScan:
-    """Fence-aware extraction of ``[NOTIFY]``/``[CLARIFY]`` tags from assistant
-    text. Tags inside fenced code blocks are left untouched (neither extracted
-    nor stripped); outside fences, well-formed bodies are extracted and the
-    tags plus any orphaned/malformed markers are stripped from the narrative."""
+    """Fence-aware extraction of ``[NOTIFY]``/``[CLARIFY]``/``[GOAL]`` tags from
+    assistant text. Tags inside fenced code blocks are left untouched (neither
+    extracted nor stripped); outside fences, well-formed bodies are extracted and
+    the tags plus any orphaned/malformed markers are stripped from the narrative."""
     clarify: list[str] = []
     notify: list[str] = []
+    goal: list[str] = []
     parts: list[str] = []
     pos = 0
     for fence in _FENCE_RE.finditer(text):
-        _scan_segment(text[pos:fence.start()], clarify, notify, parts)
+        _scan_segment(text[pos:fence.start()], clarify, notify, goal, parts)
         parts.append(text[fence.start():fence.end()])  # fenced block, verbatim
         pos = fence.end()
-    _scan_segment(text[pos:], clarify, notify, parts)
-    return _TagScan(clarify, notify, "".join(parts))
+    _scan_segment(text[pos:], clarify, notify, goal, parts)
+    return _TagScan(clarify, notify, goal, "".join(parts))
 
 
 # Common install locations for the Claude CLI when launchd-style minimal PATHs
@@ -199,6 +213,7 @@ The user will review and approve the plan before you proceed.
 # to discriminate without parsing prose.
 REASON_AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
 REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
+REASON_AWAITING_GOAL_APPROVAL = "awaiting_goal_approval"
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
 
@@ -222,6 +237,8 @@ class _RunState:
     notify_bodies: list[str] = field(default_factory=list)
     awaiting_approval: bool = False   # plan-mode result event reached
     awaiting_clarification: bool = False
+    pending_goal: str = ""            # Last [GOAL] body, awaiting approval (#398)
+    awaiting_goal: bool = False
     cost_usd: float = 0.0
     last_activity: str = ""
     notifications_sent: int = 0
@@ -504,6 +521,17 @@ class ClaudeCodeExecutor:
                 final_text=state.pending_clarification,
             )
 
+        if state.awaiting_goal:
+            self.session_store.update_status(session.task_id, STATUS_BLOCKED)
+            self.transcript_store.append(sid, "claude_code_awaiting_goal_approval", {
+                "condition": state.pending_goal, "condition_chars": len(state.pending_goal),
+            })
+            return ExecutorOutcome(
+                status=STATUS_BLOCKED,
+                reason=REASON_AWAITING_GOAL_APPROVAL,
+                final_text=state.pending_goal,
+            )
+
         if state.awaiting_approval:
             self.session_store.update_status(session.task_id, STATUS_BLOCKED)
             self.transcript_store.append(sid, "claude_code_awaiting_plan_approval", {
@@ -643,6 +671,22 @@ class ClaudeCodeExecutor:
                     })
                     if state.plan_mode and not state.awaiting_approval:
                         state.plan_text += body + "\n"
+                for body in scan.goal:
+                    # The agent proposed a success condition (#398). Stream it so
+                    # the operator can SEE what they're approving, then the result
+                    # event flips the session to BLOCKED awaiting their yes/no.
+                    # Child sessions stay silent to the operator like [NOTIFY].
+                    state.pending_goal = body
+                    state.notifications_sent += 1
+                    state.last_notify_at = time.time()
+                    if not state.is_child:
+                        try:
+                            self._notify(body)
+                        except Exception as exc:  # pragma: no cover — defensive
+                            logger.warning("notification callback raised: %s", exc)
+                    self.transcript_store.append(sid, "claude_code_goal", {
+                        "body": body, "body_chars": len(body),
+                    })
             elif btype == "tool_use":
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {}) or {}
@@ -668,6 +712,13 @@ class ClaudeCodeExecutor:
             # Agent asked a question — surface as BLOCKED outcome so the
             # worker can register the question for follow-up reply routing.
             state.awaiting_clarification = True
+            state.terminal = True
+            return
+
+        if state.pending_goal:
+            # Agent proposed a goal — block for operator approval (#398). On
+            # approval the worker injects `/goal <condition>` at resume.
+            state.awaiting_goal = True
             state.terminal = True
             return
 

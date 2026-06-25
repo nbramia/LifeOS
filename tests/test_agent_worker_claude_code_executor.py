@@ -21,6 +21,7 @@ import pytest
 
 from api.services.agent_worker.claude_code_executor import (
     REASON_AWAITING_CLARIFICATION,
+    REASON_AWAITING_GOAL_APPROVAL,
     REASON_AWAITING_PLAN_APPROVAL,
     REASON_BINARY_NOT_FOUND,
     ClaudeCodeExecutor,
@@ -607,3 +608,108 @@ def test_result_event_fenced_tag_preserved_in_final_text(tmp_path: Path):
     assert outcome.status == STATUS_COMPLETED
     assert "[NOTIFY] example" in outcome.final_text  # fenced tag preserved
     assert notifications == []  # result path never streams
+
+
+# ---------------------------------------------------------------------------
+# [GOAL] tag (#398)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_extracts_goal_body_and_strips_from_narrative():
+    """A [GOAL] body is extracted and removed from the operator-facing narrative
+    just like [NOTIFY]/[CLARIFY]."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("here's the plan [GOAL] all tests pass")
+    assert scan.goal == ["all tests pass"]
+    assert scan.notify == []
+    assert scan.clarify == []
+    assert scan.narrative.strip() == "here's the plan"
+
+
+def test_scan_splits_goal_interleaved_with_notify_and_clarify():
+    """GOAL interleaved with NOTIFY/CLARIFY splits into discrete bodies and none
+    bleeds into another tag's body (shared lookahead)."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags(
+        "lead [NOTIFY] alpha [GOAL] beta [CLARIFY] gamma [GOAL] delta"
+    )
+    assert scan.notify == ["alpha"]
+    assert scan.goal == ["beta", "delta"]
+    assert scan.clarify == ["gamma"]
+    assert scan.narrative.strip() == "lead"
+
+
+def test_scan_ignores_goal_inside_code_fence():
+    """A [GOAL] inside a fenced block is illustrative — not extracted, preserved
+    verbatim in the narrative."""
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    text = "do it [GOAL] real\n```\n[GOAL] example only\n```\nend"
+    scan = _scan_protocol_tags(text)
+    assert scan.goal == ["real"]  # fenced one not extracted
+    assert "[GOAL] example only" in scan.narrative
+
+
+def test_scan_ignores_empty_goal_body():
+    from api.services.agent_worker.claude_code_executor import _scan_protocol_tags
+
+    scan = _scan_protocol_tags("[GOAL]   ")
+    assert scan.goal == []
+    assert scan.narrative.strip() == ""
+
+
+def test_goal_returns_blocked_streams_and_records(tmp_path: Path):
+    """End-to-end: an assistant [GOAL] then a result event yields a BLOCKED
+    outcome awaiting approval, the body is streamed to the operator, and the
+    transcript records the proposed condition."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[GOAL] all tests pass"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "make the suite green"})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_GOAL_APPROVAL
+    assert outcome.final_text == "all tests pass"
+    # The operator must SEE the proposed goal to approve it.
+    assert notifications == ["all tests pass"]
+    assert store.get(session.task_id).status == STATUS_BLOCKED
+    events_out = _read_transcript(transcripts, session.session_id)
+    awaiting = [e for e in events_out if e["kind"] == "claude_code_awaiting_goal_approval"]
+    assert awaiting and awaiting[0]["payload"]["condition"] == "all tests pass"
+
+
+def test_child_goal_not_streamed_to_operator(tmp_path: Path):
+    """A spawned child's [GOAL] stays silent to the operator (like [NOTIFY])
+    while still blocking and recording the condition."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[GOAL] benchmark beats baseline"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_child_session(store)
+
+    outcome = executor.execute(session, {"description": "tune the model"})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_GOAL_APPROVAL
+    assert notifications == []  # child stays silent

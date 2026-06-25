@@ -474,3 +474,163 @@ class TestBlockedSessionEscalation:
         # ...and the success path did NOT escalate or mark the session failed.
         assert w._escalations == []
         assert w.session_store.get_by_session_id(result["session_id"]).status != "failed"
+
+
+# ---------------------------------------------------------------------------
+# 6. [GOAL] tag → worker /goal injection on approval (#398)
+# ---------------------------------------------------------------------------
+
+class TestGoalApproval:
+    def _make_worker(self, tmp_path, executor):
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.agent_worker.spend_tracker import SpendTracker
+        from api.services.agent_worker.transcript_store import TranscriptStore
+        from api.services.agent_worker.worker import Worker, _SynchronousPool
+
+        transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+        client = httpx.Client(transport=transport, base_url="http://api")
+        sent_with_ids: list[tuple] = []
+
+        def _send_with_id(text, chat_id=None, bot=None):
+            msg_id = len(sent_with_ids) + 6000
+            sent_with_ids.append((msg_id, text, bot))
+            return [msg_id]
+
+        def _send(text, chat_id=None, bot=None):
+            return True
+
+        w = Worker(
+            api_base="http://api",
+            session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+            transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+            spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+            poll_seconds=0.01,
+            telegram_send=_send,
+            telegram_send_with_id=_send_with_id,
+            http_client=client,
+            claude_code_executor=executor,
+            cli_pool=_SynchronousPool(),
+        )
+        w._sent_with_ids = sent_with_ids  # type: ignore[attr-defined]
+        return w
+
+    def _goal_blocked_stub(self):
+        from dataclasses import dataclass
+        from api.services.agent_worker.claude_code_executor import REASON_AWAITING_GOAL_APPROVAL
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        @dataclass
+        class _Stub:
+            outcome: ExecutorOutcome
+            def execute(self, session, task):
+                return self.outcome
+            def resume(self, session, message, working_dir=None):
+                return self.outcome
+
+        return _Stub(ExecutorOutcome(
+            status=STATUS_BLOCKED,
+            reason=REASON_AWAITING_GOAL_APPROVAL,
+            final_text="all tests pass",
+        ))
+
+    def test_is_affirmative_recognizes_yes_and_approve(self):
+        from api.services.agent_worker.worker import _is_affirmative
+        assert _is_affirmative("yes")
+        assert _is_affirmative("Yes!")
+        assert _is_affirmative("yes, go ahead")
+        assert _is_affirmative("approve")
+        assert _is_affirmative("Approved.")
+        assert _is_affirmative("lock it")
+
+    def test_is_affirmative_rejects_refinements(self):
+        from api.services.agent_worker.worker import _is_affirmative
+        assert not _is_affirmative("no, make it stricter")
+        assert not _is_affirmative("change it to all tests AND lint pass")
+        assert not _is_affirmative("hmm")
+
+    def test_goal_block_registers_goal_approval_question(self, tmp_path):
+        """A goal-approval BLOCKED outcome registers a kind='goal_approval'
+        pending question scoped to the doctor bot, with the goal prompt."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        result = spawn_claude_code_session(
+            w.session_store, "make the suite green", chat_id="123", bot="doctor",
+        )
+        w._dispatch_spawned_sessions()
+
+        assert w._sent_with_ids, "no id-captured message was sent"
+        msg_id, text, bot = w._sent_with_ids[-1]
+        assert bot == "doctor"
+        assert "lock this goal" in text.lower()
+        q = w.session_store.get_open_question_by_message_id(msg_id, bot="doctor")
+        assert q is not None
+        assert q["kind"] == "goal_approval"
+        assert q["session_id"] == result["session_id"]
+
+    def _seed_blocked_goal_session(self, w, *, condition="all tests pass"):
+        """Drop a BLOCKED doctor session with a pending (proposed-not-locked)
+        goal in its transcript, plus an open goal_approval question — the shape
+        left behind after a goal-block round-trips through dispatch."""
+        from api.services.agent_worker.session_store import STATUS_BLOCKED
+
+        session = w.session_store.create(
+            task_id="task-goal-1",
+            routing="claude_code",
+            origin="operator",
+            bot="doctor",
+            status=STATUS_BLOCKED,
+        )
+        w.session_store.set_claude_code_session_id(session.task_id, "cli-goal-1")
+        w.transcript_store.append(
+            session.session_id, "claude_code_awaiting_goal_approval",
+            {"condition": condition, "condition_chars": len(condition)},
+        )
+        qid = w.session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=session.task_id,
+            question="Reply 'yes' to lock this goal and start, or send changes to refine it.",
+            sent_message_id=9100,
+            sent_message_ids=[9100],
+            kind="goal_approval",
+            bot="doctor",
+        )
+        return session, qid
+
+    def test_affirmative_reply_injects_slash_goal(self, tmp_path):
+        """An affirmative reply enqueues `/goal <condition>` as the resume
+        message and records a goal_locked transcript event."""
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session, _ = self._seed_blocked_goal_session(w, condition="all tests pass")
+
+        # Operator replies 'yes' on the goal-approval message.
+        assert w.session_store.deposit_answer(9100, "yes", bot="doctor") is True
+        w._process_clarification_answers()
+
+        # The resume message injected is the native /goal command.
+        pending = w.session_store.drain_pending_messages(session.session_id)
+        assert [m["content"] for m in pending] == ["/goal all tests pass"]
+        # The session is flipped back to CLAIMED for re-dispatch.
+        from api.services.agent_worker.session_store import STATUS_CLAIMED
+        assert w.session_store.get_by_session_id(session.session_id).status == STATUS_CLAIMED
+        # A goal_locked event was recorded (the refine event was not).
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "claude_code_goal_locked" in kinds
+        assert "claude_code_goal_refine" not in kinds
+
+    def test_refinement_reply_passes_raw_answer_without_locking(self, tmp_path):
+        """A non-affirmative reply is a refinement: the raw answer is enqueued
+        (so the doctor re-proposes) and NO goal_locked event is written."""
+        w = self._make_worker(tmp_path, self._goal_blocked_stub())
+        session, _ = self._seed_blocked_goal_session(w, condition="all tests pass")
+
+        answer = "make it all tests AND lint pass"
+        assert w.session_store.deposit_answer(9100, answer, bot="doctor") is True
+        w._process_clarification_answers()
+
+        pending = w.session_store.drain_pending_messages(session.session_id)
+        assert [m["content"] for m in pending] == [answer]
+        kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
+        assert "claude_code_goal_locked" not in kinds
+        assert "claude_code_goal_refine" in kinds
