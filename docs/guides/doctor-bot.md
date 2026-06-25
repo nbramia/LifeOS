@@ -1,22 +1,27 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-06-21
+**Last Updated:** 2026-06-25
 **Audience:** Operator
 
-The **doctor** bot is a dedicated `@BotFather` Telegram bot whose only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it clarifies what you mean, files a GitHub issue, asks whether to implement, and — on your go-ahead — ships the fix end to end and reports back.
+The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
 
-Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orchestrates**: each message drives a real Claude Code session, and that session's progress, questions, and completion all come back on the doctor bot.
+Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orchestrates**: each message drives a real Claude Code session, and that session's progress, questions, and completion all come back to you.
+
+## Surfaces
+
+- **Telegram** (primary): a dedicated `@BotFather` bot. Full round-trip — reply to a `[CLARIFY]`/`[GOAL]` message (swipe-to-reply) to answer; a fresh, non-threaded message starts a **new** repair.
+- **Web / voice**: selecting the `doctor` persona in web chat (or via whisper-relay) spawns the same orchestrating session. You can answer its `[CLARIFY]`/`[GOAL]` from the web conversation too (`POST /api/conversations/{id}/answer`); notices also surface on the doctor's Telegram thread and the `/agents` page.
 
 ## The flow
 
-1. **You report a problem** (a fresh message to the doctor bot), e.g. _"the calendar tool returns last week's events when I ask for this week."_
-2. **Clarify.** The doctor asks questions only if intent is unclear; otherwise it proceeds.
-3. **Issue.** It runs `/draft-issue` and replies with a clickable GitHub issue link.
-4. **Gate.** It asks _"Implement this now?"_ — reply **yes** to ship, **no** to leave it as an issue. This is the single human gate.
-5. **Ship.** On **yes** it creates a worktree off `origin/main`, runs `/implement` (plan → tests → PR → adversarial review → merge), brings the canonical checkout to merged `main`, restarts the server, and confirms: _"Shipped: PR #N merged, server restarted."_
-
-Continue any step by **replying to the doctor's message** (swipe-to-reply in Telegram). A fresh, non-threaded message starts a **new** repair.
+1. **You report a problem**, e.g. _"the calendar tool returns last week's events when I ask for this week."_
+2. **Clarify the goal.** The doctor investigates the code and asks the minimum `[CLARIFY]` questions needed to pin down what "done" means. No work starts yet.
+3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** Reply **yes** to lock it (which arms the session's `/goal`), or send changes to refine it.
+4. **Execute.** On approval it files the issue(s) via `/draft-issue`, then ships — adaptive to size:
+   - **Small goal:** one branch → `/implement` → one PR → `main`.
+   - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
+5. **Confirm.** It brings the canonical checkout to merged `main`, restarts (the right way — see Autonomy and safety), and confirms with the revert handle: _"Shipped: PR #N merged, server restarted. Revert with: gh pr revert N."_
 
 ## Setup
 
@@ -35,10 +40,12 @@ Continue any step by **replying to the doctor's message** (swipe-to-reply in Tel
 
 ## Autonomy and safety
 
-- **One gate.** Full-auto from your "yes" through merge; `/implement`'s built-in adversarial review is the quality bar.
-- **Escalation respected.** If `/implement` can't resolve its review findings after 3 rounds, the doctor leaves the PR open and reports the escalation instead of merging.
-- **Isolation.** Implementation happens in a throwaway worktree off `origin/main`, so the canonical checkout other agents share is never left on a feature branch.
+- **One gate.** Full-auto from your goal approval through merge; `/implement`'s built-in adversarial review is the quality bar.
+- **Always PR-gated, always revertable.** Even the smallest fix goes branch → PR → `main` with tests + docs + review; the doctor never pushes to `main`, and each change lands as a single revertable merge commit whose `gh pr revert` handle it reports.
+- **Escalation respected.** If `/implement` can't resolve its review findings after its rounds, the doctor leaves the PR open and reports the escalation instead of merging.
+- **Isolation.** Implementation happens in throwaway worktrees off `origin/main` (pre-flight-cleaned via `scripts/cleanup-worktrees.sh` so a prior crashed run can't block the `add`), so the canonical checkout other agents share is never left on a feature branch.
 - **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout before restarting, so the running server actually reflects the change.
+- **Safe self-restart.** The doctor runs *inside* `lifeos-agent-worker`. It uses `scripts/classify-change` to tell an API-only change (plain `lifeos-api` restart; its session survives) from an agent-worker change (which would kill it mid-run). For the latter it uses `./scripts/server.sh restart-worker-detached`, which flushes the final notice and marks the restart deliberate **before** bouncing the worker in a detached process — so the "Shipped" notice always lands and the run isn't surfaced as a spurious failure.
 
 ## Adding another orchestration bot
 
