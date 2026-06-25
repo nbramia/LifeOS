@@ -39,9 +39,12 @@ Any text after the leading token controls which phases run. Parse it before boot
 | `quick` or `no-review` | Skip Phase 4 entirely — Phase 1 → 2 → 3 → 5 |
 | `no-plan` | Skip Phase 1 — go straight to Phase 2 |
 | `review-only` | Run Phase 4 only on the target PR (target MUST be a PR number) |
+| `--base <branch>` | Open and merge the PR against `<branch>` instead of `main`, and diff adversarial review against it (see below) |
 | Any other text | Interpret intent. Do more rather than less — the full lifecycle is always safe. |
 
 Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the target is an existing PR and no instructions are given, skip to Phase 4.
+
+**Base branch.** Parse `--base <branch>` from the trailing instructions; if absent, the base is `main`. The base is the branch the PR targets and merges into. Record it as `<base>` and thread it through Phase 2 (branching point + review diff), Phase 3 (`gh pr create --base`), and Phase 5 (`merge-pr`). With no `--base`, every step below is byte-identical to targeting `main`. This exists so stacked sub-PRs can land on a long-lived integration branch (off `main`) before a single PR merges that branch to `main`.
 
 ---
 
@@ -54,7 +57,7 @@ Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the targe
 
 ### Phase 2: Implement
 
-1. **Create a branch** if not already on a feature branch: `<type>/<short-description>` per AGENTS.md § Development Workflow.
+1. **Create a branch** if not already on a feature branch: `<type>/<short-description>` per AGENTS.md § Development Workflow. Branch off `<base>` (default `main`): `git fetch origin <base> && git checkout -b <type>/<desc> origin/<base>`.
 2. **Write tests first** for identified test cases. They should fail until implementation is complete.
 3. **Write production code** to make tests pass. Follow existing patterns. Surgical changes only.
 4. **Run the test suite** on the server: `./scripts/test.sh auto` — picks scope (unit/browser/slow/skip) from the git diff and runs it in parallel. All tests must pass before proceeding.
@@ -64,9 +67,9 @@ Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the targe
 
 1. **Commit** with `<type>: <summary>` format. Separate logical changes into distinct commits.
 2. **Push** the branch.
-3. **Create the PR:**
+3. **Create the PR** against `<base>` (default `main`). Pass `--base <base>` explicitly — when `<base>` is `main` this is identical to the repo default:
    ```
-   gh pr create --title "<type>: <imperative summary>" --body "$(cat <<'EOF'
+   gh pr create --base <base> --title "<type>: <imperative summary>" --body "$(cat <<'EOF'
    ## Summary
    <1-3 sentences: what and why>
 
@@ -249,11 +252,11 @@ Then stop and inform the user directly with the escalation details.
 ### Phase 5: Merge & Finalize
 
 1. **Final test run.** Confirm all tests pass.
-2. **Merge and update issues.** Invoke the merge skill explicitly:
+2. **Merge and update issues.** Invoke the merge skill explicitly, passing the base after the PR number when it is not `main`:
    ```
-   Skill tool → skill: "merge-pr", args: "<pr-number>"
+   Skill tool → skill: "merge-pr", args: "<pr-number> [--base <base>]"
    ```
-   This validates the PR against standards, squash-merges it, deletes the branch, and posts progress updates on all linked GitHub issues.
+   `merge-pr` reads the PR's actual base from GitHub, so the `--base` arg is optional; pass it for clarity when threading a non-`main` base. This validates the PR against standards, squash-merges it into its base, deletes the branch, and posts progress updates on all linked GitHub issues.
 3. Report the result to the user.
 
 ---
