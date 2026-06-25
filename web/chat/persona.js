@@ -111,3 +111,19 @@ export function personaSupportsHandoff() {
   const p = personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));
 }
+
+// True iff the selected persona is an *orchestrating* bot — one that spawns a
+// background Claude Code session on send (e.g. doctor) rather than answering
+// inline. Mirrors the server's `persona_orchestrates`: the `primary` persona is
+// the inline orchestrator (it carries handoff capability but never spawns), so
+// it is excluded; orchestrating bots are the non-primary personas that advertise
+// handoff. Used to decide whether a turn should poll for a `[CLARIFY]`/`[GOAL]`
+// on surfaces (voice) whose stream doesn't expose the `claude_code` routing the
+// text path keys off (#412).
+export function personaOrchestrates() {
+  const { personas, personaId } = config;
+  if (config.backend === 'agent') return false;  // the agent backend has no personas
+  if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
+  const p = personas && personas.find(x => x.id === personaId);
+  return !!(p && p.capabilities && p.capabilities.includes('handoff'));
+}
