@@ -20,6 +20,7 @@ from api.services.agent_worker.session_store import (
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker, _SynchronousPool
+from api.services.conversation_store import ConversationStore
 
 
 pytestmark = pytest.mark.unit
@@ -50,6 +51,10 @@ def _make_worker(tmp_path: Path, claude_code_executor):
     return Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        # Isolate the conversation DB to a tmp file: the default ConversationStore()
+        # resolves to the production data/conversations.db, which a test must never
+        # open or migrate.
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
@@ -88,6 +93,8 @@ def _recording_worker(tmp_path: Path, claude_code_executor):
     worker = Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        # Isolate the conversation DB (default resolves to prod data/conversations.db).
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
@@ -111,6 +118,8 @@ def _capturing_worker(tmp_path: Path, claude_code_executor):
     worker = Worker(
         api_base="http://api",
         session_store=store,
+        # Isolate the conversation DB (default resolves to prod data/conversations.db).
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
         transcript_store=transcripts,
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
@@ -335,8 +344,6 @@ def test_fresh_spawn_with_no_prior_spawn_event_still_executes(tmp_path: Path):
 # =============================================================================
 # Web-thread result mirroring (#311)
 # =============================================================================
-
-from api.services.conversation_store import ConversationStore
 
 
 def _mirroring_worker(tmp_path: Path, claude_code_executor):

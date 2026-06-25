@@ -24,6 +24,7 @@ from api.services.agent_worker.session_store import (
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker
+from api.services.conversation_store import ConversationStore
 
 
 pytestmark = pytest.mark.unit
@@ -55,6 +56,8 @@ def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
     return Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        # Isolate the conversation DB (default resolves to prod data/conversations.db).
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
@@ -195,8 +198,6 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
 # Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
 # terminal completion/failure mirror is the whole web round-trip for it.
 # ---------------------------------------------------------------------------
-
-from api.services.conversation_store import ConversationStore
 
 
 def _mirroring_codex_worker(tmp_path: Path, codex_executor):

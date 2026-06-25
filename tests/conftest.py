@@ -258,6 +258,29 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
             pass
 
 
+@pytest.fixture(autouse=True)
+def _isolate_conversation_store_db(tmp_path, monkeypatch):
+    """Stop tests from opening (and migrating) the production conversations DB.
+
+    ``ConversationStore()`` with no ``db_path`` resolves its path from
+    ``settings.chroma_path`` (``get_conversation_db_path()``) — i.e. the real
+    ``data/conversations.db`` on whatever machine runs the suite. Any helper or
+    fixture that builds a default ``ConversationStore()`` (e.g. the agent-worker
+    dispatch helpers that construct ``Worker()`` without an explicit store) would
+    otherwise open and run migrations against production data. Redirect the
+    default path to a per-test tmp file so no test can ever touch the live DB,
+    mirroring ``_isolate_vault_indexer_stores`` above. Tests that inject their own
+    ``db_path`` are unaffected (the redirect only changes the default).
+    """
+    import api.services.conversation_store as conv_store_mod
+
+    monkeypatch.setattr(
+        conv_store_mod,
+        "get_conversation_db_path",
+        lambda: str(tmp_path / "conversations.db"),
+    )
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """
