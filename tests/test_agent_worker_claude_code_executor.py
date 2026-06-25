@@ -101,17 +101,27 @@ def _spawn_with(events, returncode: int = 0, stderr: str = ""):
     return _spawn_fn
 
 
-def _build_executor(tmp_path: Path, *, spawn_fn, notifications: list[str] | None = None):
+def _build_executor(
+    tmp_path: Path,
+    *,
+    spawn_fn,
+    notifications: list[str] | None = None,
+    mirror_calls: list[tuple[str, str]] | None = None,
+):
     db_path = tmp_path / "sessions.db"
     transcript_dir = tmp_path / "transcripts"
     store = SessionStore(db_path=db_path)
     transcripts = TranscriptStore(transcripts_dir=transcript_dir)
 
     notify = (lambda msg: notifications.append(msg)) if notifications is not None else None
+    # #311: a fake (session_id, body) sink so a test can assert the executor
+    # mirrors each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the web thread.
+    mirror = (lambda sid, body: mirror_calls.append((sid, body))) if mirror_calls is not None else None
     executor = ClaudeCodeExecutor(
         session_store=store,
         transcript_store=transcripts,
         notification_callback=notify,
+        conversation_mirror=mirror,
         spawn_fn=spawn_fn,
         binary_resolver=lambda: "/usr/bin/true",
         timeout_seconds=30,
@@ -266,6 +276,118 @@ def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
     assert completed
     persisted = completed[0]["payload"]["final_text"]
     assert "Match 1: A vs B." in persisted and "Match 2: C vs D." in persisted
+
+
+def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
+    """#311: when a conversation_mirror is wired, the executor calls it with
+    (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] — the same
+    bodies it relays to Telegram — so the web thread mirrors live progress."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Reading the file."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[CLARIFY] Which repo?"}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[GOAL] Tests pass."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.05, "result": ""},
+    ]
+    notifications: list[str] = []
+    mirror_calls: list[tuple[str, str]] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events),
+        notifications=notifications, mirror_calls=mirror_calls,
+    )
+    session = _seed_session(store)
+
+    executor.execute(session, {"description": "do the thing"})
+
+    # Every streamed body is mirrored with the session id, in order, matching
+    # exactly what Telegram received.
+    assert mirror_calls == [
+        (session.session_id, "Reading the file."),
+        (session.session_id, "Which repo?"),
+        (session.session_id, "Tests pass."),
+    ]
+    assert [b for _, b in mirror_calls] == notifications
+
+
+def test_child_session_does_not_mirror(tmp_path: Path):
+    """#311: a child session stays silent to the operator, and its [NOTIFY]
+    bodies are folded into final_text — so they must NOT be mirrored to a web
+    thread either (parity with the no-Telegram gate)."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] child progress"}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": ""},
+    ]
+    notifications: list[str] = []
+    mirror_calls: list[tuple[str, str]] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events),
+        notifications=notifications, mirror_calls=mirror_calls,
+    )
+    session = _seed_child_session(store)
+
+    executor.execute(session, {"description": "list matches"})
+
+    assert notifications == []
+    assert mirror_calls == []
+
+
+def test_raising_conversation_mirror_does_not_abort_run(tmp_path: Path):
+    """#311 (review): a conversation_mirror that raises (e.g. a transient DB
+    lock) must NOT kill the assistant-event loop — the session still completes,
+    later bodies still stream to Telegram, and the terminal result is produced.
+    Mirrors the existing guard around the Telegram notification callback."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] First update."}]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Second update."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.02, "result": "All done."},
+    ]
+    notifications: list[str] = []
+
+    def _boom(_sid, _body):
+        raise RuntimeError("mirror sink exploded")
+
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path=db_path)
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    executor = ClaudeCodeExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        notification_callback=lambda msg: notifications.append(msg),
+        conversation_mirror=_boom,
+        spawn_fn=_spawn_with(events),
+        binary_resolver=lambda: "/usr/bin/true",
+        timeout_seconds=30,
+        heartbeat_interval=3600,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "do the thing"})
+
+    # The raising mirror was swallowed: the run reached its terminal result...
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.final_text == "All done."
+    # ...and BOTH notifies still streamed to Telegram (the loop never aborted).
+    assert notifications == ["First update.", "Second update."]
 
 
 def test_build_command_uses_session_model_tier(tmp_path: Path):

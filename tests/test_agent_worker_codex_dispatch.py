@@ -24,6 +24,7 @@ from api.services.agent_worker.session_store import (
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker
+from api.services.conversation_store import ConversationStore
 
 
 pytestmark = pytest.mark.unit
@@ -55,6 +56,8 @@ def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
     return Worker(
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        # Isolate the conversation DB (default resolves to prod data/conversations.db).
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
@@ -189,3 +192,107 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
     assert stub.calls == [("cx-fail", "do a thing")]
     assert worker.session_store.get("cx-fail").status == STATUS_FAILED
     assert any("failed" in s.lower() for s in plain_sends)
+
+
+# ---------------------------------------------------------------------------
+# Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
+# terminal completion/failure mirror is the whole web round-trip for it.
+# ---------------------------------------------------------------------------
+
+
+def _mirroring_codex_worker(tmp_path: Path, codex_executor):
+    conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        conversation_store=conv_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: True,
+        telegram_send_with_id=lambda text: [777],
+        http_client=client,
+        codex_executor=codex_executor,
+    )
+    return worker, conv_store
+
+
+def test_codex_completion_mirrors_into_linked_conversation(tmp_path: Path):
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Done: 3 events.")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-web", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_codex_session(session, [{"content": "events?"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "Done: 3 events." in m.content for m in msgs)
+
+
+def test_codex_completion_does_not_mirror_when_unlinked(tmp_path: Path):
+    """AC2: a Telegram-origin codex session is unlinked → no conversation write."""
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Done.")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-tg", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Some other thread")  # not linked
+
+    worker._dispatch_codex_session(session, [{"content": "events?"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_codex_failure_mirrors_notice_into_linked_conversation(tmp_path: Path):
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-web-fail", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_codex_session(session, [{"content": "do it"}])
+
+    msgs = conv_store.get_messages(conv.id)
+    assert any(m.role == "assistant" and "failed" in m.content.lower() for m in msgs)
+
+
+def test_codex_child_completion_does_not_mirror(tmp_path: Path):
+    """A codex child (has a parent — codex is in SPAWN_MODELS, so it IS
+    dispatchable as a child) must not mirror its result into a conversation,
+    even one linked to the child. Parity with the claude_code child gate."""
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="child codex result")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    parent = worker.session_store.create(task_id="cx-parent", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child", routing="codex", parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_codex_session(child, [{"content": "do it"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_codex_child_failure_does_not_mirror(tmp_path: Path):
+    """A codex child's failure/budget notice must not mirror into a linked
+    conversation either (parity with the claude_code failure gate)."""
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    parent = worker.session_store.create(task_id="cx-parent-2", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child-2", routing="codex", parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_codex_session(child, [{"content": "do it"}])
+
+    assert conv_store.get_messages(conv.id) == []

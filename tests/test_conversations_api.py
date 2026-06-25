@@ -611,3 +611,55 @@ class TestPendingQuestionSurfacing:
             response = client.get("/api/conversations/conv-123")
         assert response.status_code == 200
         assert response.json()["pending_question"] is None
+        # No linked session → not active, so the client's result poll won't run.
+        assert response.json()["agent_session_active"] is False
+
+
+@pytest.mark.unit
+class TestAgentSessionActive:
+    """GET /api/conversations/{id} reports whether the spawned session is still
+    running (#311) so the client's result-streaming poll can terminate."""
+
+    def _linked_conversation(self):
+        now = datetime.now()
+        return Conversation(
+            id="conv-403", title="Doctor", created_at=now, updated_at=now,
+            message_count=1, persona_id="doctor", agent_session_id="sess_abc",
+        )
+
+    def _get(self, client, mock_store, fake_session_store):
+        mock_store.get_conversation.return_value = self._linked_conversation()
+        mock_store.get_messages.return_value = []
+        with patch("api.routes.conversations.get_store", return_value=mock_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=fake_session_store):
+            return client.get("/api/conversations/conv-403")
+
+    def test_active_when_session_running(self, client, mock_store):
+        """A linked session with a non-terminal status reports active=True."""
+        fake_session_store = MagicMock()
+        fake_session_store.get_open_question_by_session_id.return_value = None
+        fake_session_store.get_by_session_id.return_value = MagicMock(status="running")
+        response = self._get(client, mock_store, fake_session_store)
+        assert response.status_code == 200
+        assert response.json()["agent_session_active"] is True
+
+    def test_inactive_when_session_terminal(self, client, mock_store):
+        """A linked session that reached a terminal status reports active=False
+        so the client stops polling."""
+        fake_session_store = MagicMock()
+        fake_session_store.get_open_question_by_session_id.return_value = None
+        fake_session_store.get_by_session_id.return_value = MagicMock(status="completed")
+        response = self._get(client, mock_store, fake_session_store)
+        assert response.status_code == 200
+        assert response.json()["agent_session_active"] is False
+
+    def test_inactive_when_session_row_missing(self, client, mock_store):
+        """A linked session id with no row (never created / pruned) is treated
+        as not-active — the client must not poll forever for a ghost."""
+        fake_session_store = MagicMock()
+        fake_session_store.get_open_question_by_session_id.return_value = None
+        fake_session_store.get_by_session_id.return_value = None
+        response = self._get(client, mock_store, fake_session_store)
+        assert response.status_code == 200
+        assert response.json()["agent_session_active"] is False

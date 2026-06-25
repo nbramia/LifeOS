@@ -67,6 +67,13 @@ class ConversationDetailResponse(BaseModel):
     # conversation is currently awaiting an answer (#403). The client renders
     # an answer affordance and POSTs to `{id}/answer`. Absent/None otherwise.
     pending_question: Optional[PendingQuestionResponse] = None
+    # Whether a session spawned by this conversation is still running (#311).
+    # True iff the conversation links a session whose status is non-terminal.
+    # False when there's no linked session or it has reached a terminal status
+    # (completed/failed/budget_exceeded). The client's result-streaming poll
+    # uses this to STOP once the session is done and nothing awaits an answer —
+    # otherwise the 4s poll would run forever after the session finishes.
+    agent_session_active: bool = False
 
 
 class ConversationListResponse(BaseModel):
@@ -144,19 +151,34 @@ async def get_conversation(conversation_id: str):
     messages = store.get_messages(conversation_id)
 
     # Surface an open [CLARIFY]/[GOAL] from a session this conversation spawned
-    # (#403) so the client can show an answer affordance. Best-effort: a lookup
-    # failure (or no spawned session) just omits it — never breaks the read.
+    # (#403) so the client can show an answer affordance, and report whether that
+    # session is still running (#311) so the client's result-streaming poll can
+    # stop once it's done. Both are best-effort: a lookup failure (or no spawned
+    # session) just leaves pending_question=None / agent_session_active=False and
+    # never breaks the read.
     pending_question = None
+    agent_session_active = False
     if conv.agent_session_id:
         try:
-            from api.services.agent_worker.session_store import SessionStore
-            q = SessionStore().get_open_question_by_session_id(conv.agent_session_id)
+            from api.services.agent_worker.session_store import (
+                SessionStore,
+                TERMINAL_STATUSES,
+            )
+            session_store = SessionStore()
+            q = session_store.get_open_question_by_session_id(conv.agent_session_id)
             if q:
                 pending_question = PendingQuestionResponse(
                     session_id=conv.agent_session_id,
                     question=q.get("question") or "",
                     kind=q.get("kind") or "clarification",
                 )
+            # Active = the linked session row exists and hasn't reached a
+            # terminal status. A missing session row (never created, or pruned)
+            # counts as not-active, so the client stops polling.
+            session = session_store.get_by_session_id(conv.agent_session_id)
+            agent_session_active = bool(
+                session is not None and session.status not in TERMINAL_STATUSES
+            )
         except Exception:  # noqa: BLE001
             logger.warning("pending-question lookup failed", exc_info=True)
 
@@ -177,6 +199,7 @@ async def get_conversation(conversation_id: str):
             for m in messages
         ],
         pending_question=pending_question,
+        agent_session_active=agent_session_active,
     )
 
 

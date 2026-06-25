@@ -25,6 +25,27 @@ const CARD_ID = 'pendingQuestionCard';
 let pollTimer = null;
 let pollingConversationId = null;
 
+// #311: ids of conversation messages already on screen, so a late-arriving
+// message (the spawned session's streamed [NOTIFY] or terminal result) is
+// rendered exactly once. Seeded on the FIRST poll from the messages already in
+// the thread (those were rendered by askStream / loadConversation, not by us),
+// then every subsequent poll appends only messages whose id is new. Reset on
+// stop so a re-opened/other conversation starts clean.
+let seenMessageIds = new Set();
+let seededSeenSet = false;
+
+// #311: count consecutive polls that report the spawned session terminal AND
+// have no pending question. We require TWO in a row before stopping, to close a
+// race: the executor flips the session row to a terminal status BEFORE the
+// dispatch handler writes the terminal-result mirror into the conversation (the
+// mirror lands ~1s later, after a Telegram send). A single terminal poll could
+// land in that window — session done, result not stored yet — and stop before
+// the result renders. Demanding a second consecutive terminal poll guarantees
+// ≥1 full ~4s cycle after the status flip, by which point the mirror is stored
+// and renderNewMessages (which runs before the stop check) has rendered it. Any
+// active poll or a pending question resets the counter.
+let terminalPollCount = 0;
+
 function answerEndpoint(conversationId) {
   return `${endpoints.conversations}/${encodeURIComponent(conversationId)}/answer`;
 }
@@ -42,6 +63,12 @@ export function startPendingQuestionPolling(conversationId) {
   if (pollTimer && pollingConversationId === conversationId) return;
   stopPendingQuestionPolling();
   pollingConversationId = conversationId;
+  // #311: the first poll seeds the seen-message set from whatever is already in
+  // the thread (so we don't re-render existing messages); subsequent polls
+  // render only newly-arrived ones.
+  seenMessageIds = new Set();
+  seededSeenSet = false;
+  terminalPollCount = 0;
   // Poll once immediately so a re-opened thread shows the affordance without
   // waiting a full interval, then on a cadence.
   pollOnce();
@@ -54,6 +81,10 @@ export function stopPendingQuestionPolling() {
     pollTimer = null;
   }
   pollingConversationId = null;
+  // #311: drop the dedup state so the next polled conversation seeds fresh.
+  seenMessageIds = new Set();
+  seededSeenSet = false;
+  terminalPollCount = 0;
 }
 
 async function pollOnce() {
@@ -78,14 +109,74 @@ async function pollOnce() {
   // A late response can arrive after the user navigated away; ignore it.
   if (state.currentConversationId !== conversationId) return;
 
+  // #311: render messages that arrived since the thread was last rendered —
+  // the spawned session's streamed [NOTIFY]/[GOAL] and its terminal result,
+  // written into the conversation by the worker out-of-band. The first poll
+  // only SEEDS the seen-set (those messages are already on screen, rendered by
+  // askStream/loadConversation); later polls append only ids we haven't seen.
+  renderNewMessages(data && data.messages);
+
   const pq = data && data.pending_question;
   if (pq && pq.question) {
     renderAffordance(conversationId, pq);
+    // A live question means the session isn't done with us — reset the
+    // terminal-stop counter so a later resolution starts the two-poll countdown
+    // fresh.
+    terminalPollCount = 0;
   } else {
     // No (longer a) pending question — the session resolved or hasn't asked
     // yet. Drop any stale card but keep polling so the next [CLARIFY]/[GOAL]
     // (a session can ask more than once) still surfaces.
     clearAffordance();
+    // #311: terminate the poll once the spawned session is done AND nothing is
+    // awaiting an answer — but only after TWO consecutive terminal polls, to
+    // avoid stopping inside the status-flip→mirror-write race (see
+    // terminalPollCount above). `agent_session_active === false` is the
+    // server's signal that the linked session reached a terminal status (or
+    // there's no linked session). We require an explicit `=== false` so an
+    // older server that omits the field (undefined) keeps the prior
+    // run-forever behavior rather than stopping prematurely; that same `!==
+    // false` (active OR field-absent) resets the counter. renderNewMessages
+    // above already ran this poll, so a result that landed since the status
+    // flip is rendered on the second terminal poll BEFORE we stop here.
+    if (data && data.agent_session_active === false) {
+      terminalPollCount += 1;
+      if (terminalPollCount >= 2) {
+        stopPendingQuestionPolling();
+      }
+    } else {
+      terminalPollCount = 0;
+    }
+  }
+}
+
+// #311: append conversation messages that aren't on screen yet, deduped by id.
+// On the first poll we only record ids (seed) without rendering — those came
+// from the initial thread render. Afterward, any id we haven't recorded is a
+// late arrival from the worker, so we render it and record it. Idempotent: a
+// re-poll of the same messages adds nothing (every id is already seen), so
+// there's no duplication and no extra polling loop — this reuses the 4s poll.
+function renderNewMessages(messages) {
+  if (!Array.isArray(messages)) return;
+
+  if (!seededSeenSet) {
+    for (const m of messages) {
+      if (m && m.id) seenMessageIds.add(m.id);
+    }
+    seededSeenSet = true;
+    return;
+  }
+
+  for (const m of messages) {
+    if (!m || !m.id || seenMessageIds.has(m.id)) continue;
+    seenMessageIds.add(m.id);
+    // Only render assistant output. The worker mirrors its progress/result as
+    // assistant messages; user messages here are the operator's own answer
+    // (POST /answer records it server-side), which submitAnswer already echoed
+    // into the thread with addMessage(answer, 'user') and has no client-side id
+    // to dedup against — so rendering it would duplicate. Skip user roles.
+    if (m.role !== 'assistant') continue;
+    addMessage(m.content, m.role, m.sources || []);
   }
 }
 
