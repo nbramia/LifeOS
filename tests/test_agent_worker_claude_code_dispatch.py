@@ -14,6 +14,7 @@ import pytest
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
+    STATUS_FAILED,
     SessionStore,
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
@@ -29,9 +30,14 @@ class _StubClaudeCodeExecutor:
     """Minimal ClaudeCodeExecutor stand-in: records calls + returns a canned outcome."""
     outcome: ExecutorOutcome
     calls: list = field(default_factory=list)
+    resume_calls: list = field(default_factory=list)
 
     def execute(self, session, task):
         self.calls.append((session.task_id, task.get("description")))
+        return self.outcome
+
+    def resume(self, session, message):
+        self.resume_calls.append((session.task_id, message))
         return self.outcome
 
 
@@ -225,3 +231,102 @@ def test_dispatch_calls_claude_code_executor(tmp_path: Path):
     # The seeded pending message is the bare string "print hello"; the
     # JSON-decode falls back to treating the whole content as the prompt.
     assert stub.calls == [("code-1", "print hello")]
+
+
+def test_already_launched_subprocess_does_not_reexecute_prompt(tmp_path: Path):
+    """A re-dispatch of a session that ALREADY launched a subprocess must NOT
+    re-run the original prompt (#400).
+
+    Simulates the spawn-before-init window: a routing='claude_code' session whose
+    subprocess actually launched once (a `claude_code_spawn` transcript event with
+    NO following `claude_code_binary_not_found`) but whose `claude_code_session_id`
+    never persisted. On a non-restart re-dispatch the fresh-spawn fork would
+    naively call execute() with the original prompt again — which for a doctor turn
+    can re-file a GitHub issue or restart /implement. Assert execute()/resume() are
+    NOT called, the session is marked FAILED (not left non-terminal, which would
+    re-pick every tick), the aversion is recorded with the prior launch count, and
+    the operator is notified so they can re-trigger deliberately."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should never run")
+    )
+    worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    # Operator spawn: no backing vault row, so no complete/swap-tag side effects.
+    session = store.create(task_id="op-1", routing="claude_code", origin="operator")
+    # A subprocess launched once (spawn event, no binary-not-found) — but
+    # claude_code_session_id is still NULL because the CLI init never persisted.
+    transcripts.append(session.session_id, "claude_code_spawn", {
+        "resume": False, "plan_mode": False, "working_dir": "/repo",
+    })
+
+    worker._dispatch_claude_code_session(session, [{"content": "file the doctor issue"}])
+
+    # The original prompt was NOT re-run (no execute(), and not coerced to resume()).
+    assert stub.calls == []
+    assert stub.resume_calls == []
+    # Session terminated FAILED rather than left non-terminal (which would be
+    # re-picked every tick → hot loop / permanent strand) or silently no-op'd.
+    assert store.get("op-1").status == STATUS_FAILED
+    # The aversion is auditable (with the prior launch count), and the operator
+    # was told so they can re-trigger deliberately.
+    events = transcripts.read(session.session_id)
+    averted = [e for e in events if e["kind"] == "claude_code_reexecute_averted"]
+    assert len(averted) == 1
+    assert averted[0]["payload"]["prior_launch_count"] == 1
+    assert any("already started" in s for s in sent)
+
+
+def test_binary_not_found_does_not_loop_or_misdiagnose(tmp_path: Path):
+    """A missing `claude` binary must end the session FAILED without re-dispatch
+    looping, and must NOT trip the already-launched guard (#400).
+
+    The executor writes `claude_code_spawn` *before* the spawn call, then on a
+    missing binary writes `claude_code_binary_not_found` and returns FAILED — no
+    subprocess ever launched, so there are no side effects and re-execute would be
+    safe. Two things must hold: (1) the terminal tail persists FAILED to the
+    session row so the next tick does NOT re-pick it (Fix A — root cause of the
+    real-world loop), and (2) when the transcript already carries spawn +
+    binary-not-found from a prior attempt, the guard does NOT misdiagnose it as a
+    side-effecting interruption (no `claude_code_reexecute_averted`)."""
+    from api.services.agent_worker.claude_code_executor import REASON_BINARY_NOT_FOUND
+
+    # 1. A fresh dispatch whose executor returns the binary-not-found FAILED.
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_BINARY_NOT_FOUND)
+    )
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="bnf-1", routing="claude_code", origin="operator")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
+
+    # The terminal tail persisted FAILED to the row — so it won't re-dispatch.
+    assert store.get("bnf-1").status == STATUS_FAILED
+    assert stub.calls == [("bnf-1", "do a thing")]
+
+    # 2. Re-dispatch with a transcript that already shows spawn + binary-not-found
+    #    (the prior attempt's events). The guard must NOT fire: subtracting the
+    #    not-found from the spawn leaves zero real launches.
+    transcripts.append(session.session_id, "claude_code_spawn", {"resume": False})
+    transcripts.append(session.session_id, "claude_code_binary_not_found", {"error": "no claude"})
+    stub.calls.clear()
+
+    worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
+
+    # No misdiagnosis event, and the prompt was allowed to re-execute (safe — no
+    # subprocess ever launched).
+    kinds = [e["kind"] for e in transcripts.read(session.session_id)]
+    assert "claude_code_reexecute_averted" not in kinds
+    assert stub.calls == [("bnf-1", "do a thing")]
+
+
+def test_fresh_spawn_with_no_prior_spawn_event_still_executes(tmp_path: Path):
+    """Guardrail: the crash-before-init check must not break the normal first
+    dispatch. With no prior `claude_code_spawn` event, execute() still runs (#400)."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
+    )
+    worker, store, _, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="op-2", routing="claude_code", origin="operator")
+
+    worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
+
+    assert stub.calls == [("op-2", "do a thing")]
