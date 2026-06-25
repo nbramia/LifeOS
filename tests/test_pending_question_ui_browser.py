@@ -37,6 +37,9 @@ SESSION_ID = "sess_doctor_1"
 # The client polls every 4s; wait a touch past one full interval to be sure a
 # second poll fired (so the dedup guard is actually exercised).
 POLL_WAIT_FOR_DEDUP_MS = 4500
+# A touch past one 4s poll interval — long enough that a still-running loop
+# would have fired at least once more in the window.
+POLL_INTERVAL_MS_PLUS = 4500
 
 
 def _install_conversation_mocks(page: Page, state: dict):
@@ -69,6 +72,9 @@ def _install_conversation_mocks(page: Page, state: dict):
         # GET /{id} detail (a segment after conversations/)
         m = re.search(r"/conversations/([^/]+)$", path)
         if m and m.group(1) != "conversations":
+            # Count detail polls so a test can assert the loop stopped (the count
+            # plateaus once the client stops polling).
+            state["detail_get_count"] = state.get("detail_get_count", 0) + 1
             detail = {
                 "id": CONV_ID,
                 "title": "Knee pain follow-up",
@@ -79,6 +85,11 @@ def _install_conversation_mocks(page: Page, state: dict):
                 # session's result, #311) landing in a later poll.
                 "messages": list(state["messages"]),
                 "pending_question": None,
+                # #311: whether the spawned session is still running. The client
+                # stops polling once this is False AND no question is pending.
+                # Defaults to active so a test that never sets it keeps the
+                # historical "poll runs" behavior.
+                "agent_session_active": state.get("agent_session_active", True),
             }
             if state["awaiting"]:
                 detail["pending_question"] = {
@@ -209,3 +220,29 @@ class TestPendingQuestionUI:
         # Subsequent polls must NOT duplicate it (dedup by message id).
         page.wait_for_timeout(POLL_WAIT_FOR_DEDUP_MS)
         expect(result).to_have_count(1)
+
+    def test_poll_stops_when_session_terminal_and_no_question(self, page: Page):
+        """#311: once the spawned session reaches a terminal status AND no
+        question is pending, the client stops the 4s poll instead of running
+        forever. Asserted via the detail-GET count plateauing."""
+        self._open_conversation(page)
+        # A question is pending, so the poll is running and the card is shown.
+        expect(page.locator("#pendingQuestionCard")).to_be_visible(timeout=8000)
+
+        # The session finishes: the question resolves and the server now reports
+        # the linked session as terminal (not active).
+        self.state["awaiting"] = False
+        self.state["agent_session_active"] = False
+
+        # Wait for the poll that observes the terminal status (which stops the
+        # loop), then record the GET count and confirm it no longer grows.
+        expect(page.locator("#pendingQuestionCard")).to_have_count(0, timeout=8000)
+        # Let any in-flight poll settle, then snapshot the count.
+        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS)
+        settled = self.state.get("detail_get_count", 0)
+        # Across two more full intervals the count must not increase — the loop
+        # is stopped, not merely idle for one tick.
+        page.wait_for_timeout(POLL_INTERVAL_MS_PLUS * 2)
+        assert self.state.get("detail_get_count", 0) == settled, (
+            "detail GET fired after the session went terminal — poll did not stop"
+        )

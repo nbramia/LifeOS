@@ -110,6 +110,17 @@ async function pollOnce() {
     // yet. Drop any stale card but keep polling so the next [CLARIFY]/[GOAL]
     // (a session can ask more than once) still surfaces.
     clearAffordance();
+    // #311: terminate the poll once the spawned session is done AND nothing is
+    // awaiting an answer. Without this the 4s loop runs forever after the
+    // session completes. `agent_session_active === false` is the server's
+    // signal that the linked session reached a terminal status (or there's no
+    // linked session); the `!pq` guard above means we never stop while a
+    // [CLARIFY]/[GOAL] is still pending. We require an explicit `=== false` so
+    // an older server that omits the field (undefined) keeps the prior
+    // run-forever behavior rather than stopping prematurely.
+    if (data && data.agent_session_active === false) {
+      stopPendingQuestionPolling();
+    }
   }
 }
 
