@@ -33,6 +33,12 @@ class Conversation:
     updated_at: datetime
     message_count: int = 0
     persona_id: str = "primary"
+    # Agent-worker session this web/voice conversation spawned, if any (#403).
+    # Set when an orchestrating persona (e.g. doctor) is selected and the turn
+    # spawns a background Claude Code session. Lets the conversation answer that
+    # session's [CLARIFY]/[GOAL] without a Telegram message id. NULL for normal
+    # inline conversations.
+    agent_session_id: Optional[str] = None
 
 
 @dataclass
@@ -88,6 +94,12 @@ class ConversationStore:
                 conn.execute(
                     "ALTER TABLE conversations "
                     "ADD COLUMN persona_id TEXT NOT NULL DEFAULT 'primary'"
+                )
+            # Additive migration for the spawned agent-worker session link
+            # (#403). Existing rows backfill to NULL (no spawned session).
+            if "agent_session_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE conversations ADD COLUMN agent_session_id TEXT"
                 )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -164,7 +176,8 @@ class ConversationStore:
             cursor = conn.execute(
                 """
                 SELECT c.id, c.title, c.created_at, c.updated_at,
-                       COUNT(m.id) as message_count, c.persona_id
+                       COUNT(m.id) as message_count, c.persona_id,
+                       c.agent_session_id
                 FROM conversations c
                 LEFT JOIN messages m ON m.conversation_id = c.id
                 WHERE c.id = ?
@@ -184,6 +197,7 @@ class ConversationStore:
                 updated_at=datetime.fromisoformat(row[3]) if isinstance(row[3], str) else row[3],
                 message_count=row[4],
                 persona_id=row[5] or "primary",
+                agent_session_id=row[6],
             )
         finally:
             conn.close()
@@ -406,6 +420,27 @@ class ConversationStore:
             cursor = conn.execute(
                 "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
                 (title, datetime.now(), conv_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def set_agent_session_id(self, conv_id: str, session_id: Optional[str]) -> bool:
+        """Link a conversation to the agent-worker session it spawned (#403).
+
+        Set after an orchestrating persona spawns a background Claude Code
+        session, so the conversation can later answer that session's
+        [CLARIFY]/[GOAL] via the session-keyed deposit path. Idempotently
+        overwrites any prior link (a fresh spawn supersedes). Returns True if
+        the conversation row was updated.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute(
+                "UPDATE conversations SET agent_session_id = ?, updated_at = ? "
+                "WHERE id = ?",
+                (session_id, datetime.now(), conv_id)
             )
             conn.commit()
             return cursor.rowcount > 0

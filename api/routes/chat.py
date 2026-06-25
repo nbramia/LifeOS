@@ -552,9 +552,20 @@ async def ask_stream(request: AskStreamRequest):
                     _spawn = {"ok": False, "error": "could not start the session"}
                 if _spawn.get("ok"):
                     _sid = _spawn.get("session_id", "")
+                    # Link the conversation to the spawned session so a later
+                    # [CLARIFY]/[GOAL] can be answered from this web/voice thread
+                    # (no Telegram needed) via POST /api/conversations/{id}/answer
+                    # → the session-keyed deposit → the worker's existing resume
+                    # path (#403). Best-effort: a link failure only loses the
+                    # web round-trip, not the session (Telegram parity still works).
+                    try:
+                        store.set_agent_session_id(conversation_id, _sid)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("could not link conversation to spawned session", exc_info=True)
                     ack = (
                         f"🩺 On it — running as a Claude Code session in the background "
-                        f"(session `{_sid[:12]}`). I'll follow up via Telegram and on the /agents page."
+                        f"(session `{_sid[:12]}`). If I need to clarify the goal, I'll ask "
+                        f"right here — reply to answer. I'll also follow up via Telegram and on the /agents page."
                     )
                 else:
                     ack = f"⚠️ Couldn't start the session: {_spawn.get('error', 'spawn failed')}"

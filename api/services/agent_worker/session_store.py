@@ -1080,6 +1080,53 @@ class SessionStore:
             )
         return True
 
+    def get_open_question_by_session_id(self, session_id: str) -> dict | None:
+        """Return the open (unanswered, not-timed-out) question for `session_id`,
+        or None.
+
+        The session-keyed sibling of `get_open_question_by_message_id`: a
+        web/voice surface has no Telegram `sent_message_id` to match a reply
+        against, but it does know which agent session its conversation spawned
+        (#403). Returns the oldest open question so the caller can inspect its
+        `kind` (clarification / goal_approval / followup) before depositing an
+        answer onto it.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE session_id = ? AND answered_at IS NULL AND timed_out = 0 "
+                "ORDER BY id ASC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def deposit_answer_by_session_id(self, session_id: str, answer: str) -> bool:
+        """Record an answer for `session_id`'s open question, keyed by session.
+
+        The session-keyed sibling of `deposit_answer` (#403). A web/voice
+        surface deposits onto the *existing* open `pending_questions` row for the
+        session rather than creating a new one, so the row's `kind` is preserved
+        and the worker's existing tick resumes it through the right path
+        (`_resume_goal` for goal_approval, `_resume_as_followup` / clarification
+        otherwise). Returns True if a matching open question was found and
+        updated; False otherwise (no open question, or already answered).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM pending_questions "
+                "WHERE session_id = ? AND answered_at IS NULL AND timed_out = 0 "
+                "ORDER BY id ASC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE pending_questions "
+                "SET answer = ?, answered_at = ? WHERE id = ?",
+                (answer, _now(), row["id"]),
+            )
+        return True
+
     def delete_session(self, session_id: str) -> None:
         """Hard-delete a session and its queued messages/questions/turns.
 

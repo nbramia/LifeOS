@@ -486,3 +486,128 @@ class TestConversationEdgeCases:
         assert response.status_code == 200
         data = response.json()
         assert len(data["messages"]) == 100
+
+
+# =============================================================================
+# POST /api/conversations/{id}/answer Tests (#403 web/voice parity)
+# =============================================================================
+
+@pytest.mark.unit
+class TestAnswerInConversation:
+    """Tests for POST /api/conversations/{id}/answer — answering a spawned
+    orchestrating-persona session's [CLARIFY]/[GOAL] from web/voice."""
+
+    def _linked_conversation(self):
+        now = datetime.now()
+        return Conversation(
+            id="conv-403", title="Doctor session", created_at=now, updated_at=now,
+            message_count=1, persona_id="doctor", agent_session_id="sess_abc",
+        )
+
+    def test_answer_deposits_via_session_keyed_path(self, client, mock_store):
+        """Happy path: deposits onto the spawned session's open question and
+        echoes the answer into the thread."""
+        mock_store.get_conversation.return_value = self._linked_conversation()
+        fake_session_store = MagicMock()
+        fake_session_store.deposit_answer_by_session_id.return_value = True
+
+        with patch("api.routes.conversations.get_store", return_value=mock_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=fake_session_store):
+            response = client.post(
+                "/api/conversations/conv-403/answer",
+                json={"answer": "the lifeos repo"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["session_id"] == "sess_abc"
+        fake_session_store.deposit_answer_by_session_id.assert_called_once_with(
+            "sess_abc", "the lifeos repo"
+        )
+        # The answer is echoed into the conversation thread.
+        mock_store.add_message.assert_called_once()
+
+    def test_answer_empty_is_400(self, client, mock_store):
+        mock_store.get_conversation.return_value = self._linked_conversation()
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.post(
+                "/api/conversations/conv-403/answer", json={"answer": "   "}
+            )
+        assert response.status_code == 400
+
+    def test_answer_conversation_not_found_is_404(self, client, mock_store):
+        mock_store.get_conversation.return_value = None
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.post(
+                "/api/conversations/missing/answer", json={"answer": "hi"}
+            )
+        assert response.status_code == 404
+
+    def test_answer_no_spawned_session_is_409(self, client, mock_store, sample_conversation):
+        # sample_conversation has agent_session_id=None (no spawned session).
+        mock_store.get_conversation.return_value = sample_conversation
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.post(
+                "/api/conversations/conv-123/answer", json={"answer": "hi"}
+            )
+        assert response.status_code == 409
+        assert "no spawned session" in response.json()["detail"].lower()
+
+    def test_answer_no_open_question_is_409(self, client, mock_store):
+        """Session exists but has no open question (never asked, already
+        answered, or timed out) → 409, idempotent, never crashes."""
+        mock_store.get_conversation.return_value = self._linked_conversation()
+        fake_session_store = MagicMock()
+        fake_session_store.deposit_answer_by_session_id.return_value = False
+        with patch("api.routes.conversations.get_store", return_value=mock_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=fake_session_store):
+            response = client.post(
+                "/api/conversations/conv-403/answer", json={"answer": "hi"}
+            )
+        assert response.status_code == 409
+        assert "no open question" in response.json()["detail"].lower()
+        # Nothing echoed into the thread when there was nothing to answer.
+        mock_store.add_message.assert_not_called()
+
+
+@pytest.mark.unit
+class TestPendingQuestionSurfacing:
+    """GET /api/conversations/{id} surfaces an open [CLARIFY]/[GOAL]."""
+
+    def test_pending_question_surfaced_when_open(self, client, mock_store, sample_messages):
+        now = datetime.now()
+        conv = Conversation(
+            id="conv-403", title="Doctor", created_at=now, updated_at=now,
+            message_count=1, persona_id="doctor", agent_session_id="sess_abc",
+        )
+        mock_store.get_conversation.return_value = conv
+        mock_store.get_messages.return_value = sample_messages
+        fake_session_store = MagicMock()
+        fake_session_store.get_open_question_by_session_id.return_value = {
+            "question": "Which repo?", "kind": "clarification",
+        }
+        with patch("api.routes.conversations.get_store", return_value=mock_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=fake_session_store):
+            response = client.get("/api/conversations/conv-403")
+
+        assert response.status_code == 200
+        pq = response.json()["pending_question"]
+        assert pq["session_id"] == "sess_abc"
+        assert pq["question"] == "Which repo?"
+        assert pq["kind"] == "clarification"
+
+    def test_no_pending_question_when_unlinked(
+        self, client, mock_store, sample_conversation, sample_messages
+    ):
+        """A conversation with no spawned session never touches SessionStore
+        and reports pending_question=null (existing behavior unchanged)."""
+        mock_store.get_conversation.return_value = sample_conversation
+        mock_store.get_messages.return_value = sample_messages
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.get("/api/conversations/conv-123")
+        assert response.status_code == 200
+        assert response.json()["pending_question"] is None
