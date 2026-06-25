@@ -1296,6 +1296,42 @@ class Worker:
         )
         return self._managed_executor
 
+    def _cli_subprocess_launch_count(
+        self, session_id: str, spawn_kind: str, not_found_kind: str
+    ) -> int:
+        """How many times a CLI subprocess *actually launched* for this session.
+
+        Defense-in-depth signal for the CLI dispatch fork (#400). The executor
+        writes ``spawn_kind`` immediately *before* the spawn call — but on a
+        missing-binary misconfig it then writes ``not_found_kind`` and the
+        subprocess never launched (no side effects, safe to re-execute). So a raw
+        spawn count over-counts: we subtract the not-found events, leaving only
+        spawns where a subprocess truly started. A positive result with a NULL CLI
+        session id means a subprocess launched but ``init`` never persisted —
+        re-executing could repeat side effects.
+
+        Note: a genuine worker crash mid-run is already finalized by
+        ``resume_pending()`` at startup (RUNNING/CLAIMED → FAILED before the tick
+        loop), so this guard's real role is catching a *non-restart* re-dispatch
+        of a session that already launched a subprocess. Append-only transcript
+        reads tolerate a missing/empty file (returns []).
+        """
+        try:
+            spawns = 0
+            not_found = 0
+            for e in self.transcript_store.read(session_id):
+                kind = e.get("kind")
+                if kind == spawn_kind:
+                    spawns += 1
+                elif kind == not_found_kind:
+                    not_found += 1
+            return max(spawns - not_found, 0)
+        except Exception as exc:
+            # A read failure must not strand dispatch; fall back to the old
+            # behavior (treat as not-yet-launched) rather than crash the worker.
+            logger.warning("spawn-marker read failed for %s: %s", session_id, exc)
+            return 0
+
     def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
 
@@ -1333,6 +1369,49 @@ class Worker:
         # resumes carry plain reply text (enqueued by `_resume_as_followup`
         # below or by the Telegram reply hook).
         is_resume = bool(session.claude_code_session_id)
+
+        # Defense-in-depth: don't re-execute a fresh spawn whose subprocess
+        # already launched once (#400). The fresh-spawn branch below calls
+        # execute() with the original prompt; the CLI session UUID only persists
+        # on the `init` event (executor :615), which fires *after* the subprocess
+        # spawns. A genuine worker crash mid-run is already handled — resume_pending()
+        # finalizes RUNNING/CLAIMED → FAILED at startup, before this tick loop —
+        # so the real case this guards is a *non-restart* re-dispatch of a session
+        # that already launched a subprocess (init never persisted ⇒ session id
+        # still NULL). Re-running could repeat side effects (for a doctor turn:
+        # re-file the issue / restart /implement), and there's no UUID to resume
+        # with (`-r` needs it), so the only safe disposition is to FAIL it for
+        # operator attention: mark FAILED, append an audit event, best-effort
+        # notify. The launch count subtracts binary-not-found events so a missing
+        # `claude` binary (spawn event written, but no subprocess) is NOT
+        # misdiagnosed as a side-effecting interruption — that case re-executes
+        # safely once Fix A (terminal-status persistence below) stops the loop.
+        # Scope: claude_code only. The codex path (_dispatch_codex_session) has
+        # the same spawn-before-init window unguarded — intentionally out of #400
+        # (doctor == claude_code); tracked as a follow-up.
+        prior_launches = self._cli_subprocess_launch_count(
+            sid, "claude_code_spawn", "claude_code_binary_not_found"
+        )
+        if not is_resume and prior_launches:
+            self.transcript_store.append(sid, "claude_code_reexecute_averted", {
+                "reason": "subprocess launched but init never persisted — not "
+                          "re-executing to avoid duplicate side effects; "
+                          "re-trigger to retry",
+                "prior_launch_count": prior_launches,
+            })
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            try:
+                _send(
+                    "⚠️ A code session: a previous attempt may have already "
+                    "started, so it wasn't retried automatically (to avoid "
+                    "repeating side effects). It was marked failed — re-trigger "
+                    "it if you want to retry."
+                )
+            except Exception as exc:  # best-effort; the surface may be down
+                logger.warning("re-execute-averted notify failed: %s", exc)
+            self._reconcile_vault_terminal(session, STATUS_FAILED)
+            return
+
         if is_resume:
             resume_message = pending[0]["content"] if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
@@ -1472,6 +1551,15 @@ class Worker:
             _send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
             _send(f"⚠️ {label} failed: {outcome.reason}.")
+        # Persist the terminal status to the session ROW (#400). The executor
+        # sets RUNNING on launch but doesn't always flip to a terminal status on
+        # failure (e.g. the binary-not-found path returns FAILED while leaving the
+        # row CLAIMED/RUNNING). _reconcile_vault_terminal only touches the vault,
+        # so for an operator/child session (no vault row) it's a no-op — without
+        # this the row stays non-terminal and _dispatch_spawned_sessions re-picks
+        # it every tick → infinite re-dispatch. update_status is idempotent, so
+        # this is harmless for vault sessions the executor already finalized.
+        self.session_store.update_status(session.task_id, outcome.status)
         self._reconcile_vault_terminal(session, outcome.status)
 
     def _get_claude_code_executor(self, bot: str | None = None):
