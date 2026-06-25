@@ -1506,9 +1506,8 @@ class Worker:
         # `claude` binary (spawn event written, but no subprocess) is NOT
         # misdiagnosed as a side-effecting interruption — that case re-executes
         # safely once Fix A (terminal-status persistence below) stops the loop.
-        # Scope: claude_code only. The codex path (_dispatch_codex_session) has
-        # the same spawn-before-init window unguarded — intentionally out of #400
-        # (doctor == claude_code); tracked as a follow-up.
+        # The codex path (_dispatch_codex_session) carries the same guard via the
+        # shared _cli_subprocess_launch_count helper (#411).
         prior_launches = self._cli_subprocess_launch_count(
             sid, "claude_code_spawn", "claude_code_binary_not_found"
         )
@@ -1728,6 +1727,34 @@ class Worker:
         sid = session.session_id
 
         is_resume = bool(session.claude_code_session_id)
+
+        # Re-execute guard (#411) — mirrors the claude_code dispatch (#400/#408).
+        # The codex executor writes `codex_spawn` immediately before launching the
+        # subprocess and only persists the session id on `codex_init`. A spawn with
+        # a still-NULL claude_code_session_id (the reused session-id column) means a
+        # subprocess launched but init never persisted — a non-restart re-dispatch
+        # would re-run the original prompt and repeat side effects. (A genuine crash
+        # is finalized by resume_pending() at startup; a missing codex binary is
+        # excluded by the launch-count's not-found subtraction.)
+        if not is_resume and self._cli_subprocess_launch_count(
+            sid, "codex_spawn", "codex_binary_not_found"
+        ) > 0:
+            self.transcript_store.append(sid, "codex_reexecute_averted", {
+                "reason": "subprocess launched without a persisted session id "
+                          "(interrupted before init); not re-executing to avoid repeating side effects",
+            })
+            self.session_store.update_status(session.task_id, STATUS_FAILED)
+            try:
+                self._telegram_send(
+                    "⚠️ A codex session may have already started before it could be "
+                    "resumed safely, so it wasn't retried automatically. It's marked "
+                    "failed — re-trigger it to retry."
+                )
+            except Exception as exc:  # best-effort; the surface may be down
+                logger.warning("codex re-execute-prevented notify failed: %s", exc)
+            self._reconcile_vault_terminal(session, STATUS_FAILED)
+            return
+
         if is_resume:
             resume_message = pending[0]["content"] if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
@@ -1788,6 +1815,10 @@ class Worker:
             self._telegram_send(f"⚠️ {label} hit its budget ({outcome.reason}).")
         elif outcome.status == STATUS_FAILED:
             self._telegram_send(f"⚠️ {label} failed: {outcome.reason}.")
+        # Persist the terminal status to the session row so an operator/child codex
+        # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
+        # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
+        self.session_store.update_status(session.task_id, outcome.status)
         self._reconcile_vault_terminal(session, outcome.status)
 
     def _get_codex_executor(self):

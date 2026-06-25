@@ -18,6 +18,7 @@ import pytest
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
+    STATUS_FAILED,
     SessionStore,
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
@@ -113,3 +114,78 @@ def test_codex_completion_empty_final_registers_no_anchor(tmp_path: Path):
 
     assert withid_sends == []
     assert worker.session_store.get_open_question_by_message_id(777) is None
+
+
+# ---------------------------------------------------------------------------
+# Crash-before-init re-execute guard + terminal-status persistence (#411,
+# mirroring #400/#408 for the claude_code path)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ResumableStubCodexExecutor(_StubCodexExecutor):
+    resume_calls: list = field(default_factory=list)
+
+    def resume(self, session, message):
+        self.resume_calls.append((session.task_id, message))
+        return self.outcome
+
+
+def test_codex_crash_before_init_does_not_reexecute(tmp_path: Path):
+    """A codex session whose subprocess launched once (a `codex_spawn` event is
+    present) but never persisted its session id must NOT re-run the original
+    prompt on redispatch — re-execution could repeat side effects."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    # COMPLETED makes a regression obvious: if the guard fails to fire, execute()
+    # runs and the session would end COMPLETED instead of FAILED.
+    stub = _ResumableStubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run")
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-crash", routing="codex", origin="operator")
+    worker.transcript_store.append(session.session_id, "codex_spawn", {"resume": False})
+
+    worker._dispatch_codex_session(session, [{"content": "file the report"}])
+
+    assert stub.calls == [] and stub.resume_calls == []  # neither re-ran the prompt
+    assert worker.session_store.get("cx-crash").status == STATUS_FAILED
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "codex_reexecute_averted" in kinds
+    assert any("already started" in s for s in plain_sends)
+
+
+def test_codex_binary_not_found_does_not_trip_guard(tmp_path: Path):
+    """A missing codex binary writes `codex_spawn` then `codex_binary_not_found`,
+    but no subprocess launched — the guard must NOT misread that as a crashed run.
+    Execute still runs; FAILED is persisted to the row (FIX A)."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="binary_not_found"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-bn", routing="codex", origin="operator")
+    worker.transcript_store.append(session.session_id, "codex_spawn", {"resume": False})
+    worker.transcript_store.append(session.session_id, "codex_binary_not_found", {"error": "no codex"})
+
+    worker._dispatch_codex_session(session, [{"content": "do it"}])
+
+    assert stub.calls == [("cx-bn", "do it")]  # guard skipped → execute ran
+    assert worker.session_store.get("cx-bn").status == STATUS_FAILED
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "codex_reexecute_averted" not in kinds
+
+
+def test_codex_failed_finalizes_session_row(tmp_path: Path):
+    """A FAILED codex outcome persists the terminal status to the session row, so
+    an operator codex session isn't left CLAIMED and re-dispatched every tick."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-fail", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "do a thing"}])
+
+    assert stub.calls == [("cx-fail", "do a thing")]
+    assert worker.session_store.get("cx-fail").status == STATUS_FAILED
+    assert any("failed" in s.lower() for s in plain_sends)
