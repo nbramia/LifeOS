@@ -104,6 +104,10 @@ def _delegation_header(session_id: str) -> str:
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
+# #379: parity with ClaudeCodeExecutor — an operator kill flips the row to
+# FAILED and signals this subprocess; we exit silently under this reason so the
+# worker skips the spurious "session failed" notice.
+REASON_KILLED = "killed"
 
 
 @dataclass
@@ -311,6 +315,10 @@ class CodexExecutor:
                 cwd=working_dir,
                 text=True,
                 env=self._clean_env(),
+                # #379: own process-group leader so the operator kill can
+                # `os.killpg(pgid, ...)` codex + its children without touching
+                # the worker process. Mirrors ClaudeCodeExecutor.
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             self.transcript_store.append(sid, "codex_binary_not_found", {"error": str(exc)})
@@ -318,6 +326,15 @@ class CodexExecutor:
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_BINARY_NOT_FOUND)
 
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
+
+        # #379: record the subprocess pid + pgid so the operator kill endpoint
+        # (a separate process) can signal it via the transcript. Mirrors the
+        # claude_code path; teardown scans for `codex_pid` too.
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:  # pragma: no cover — defensive; fall back to the pid
+            pgid = proc.pid
+        self.transcript_store.append(sid, "codex_pid", {"pid": proc.pid, "pgid": pgid})
 
         state = _RunState()
         timed_out = threading.Event()
@@ -353,6 +370,24 @@ class CodexExecutor:
             except OSError:
                 pass
         self._cleanup_tempfile(last_msg_path)
+
+        # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
+        # the row is already FAILED *and the subprocess did not exit cleanly*, the
+        # operator killed us mid-run — exit silently so the worker skips the
+        # spurious "session failed" notice (the killpg'd subprocess returns a
+        # negative returncode that would otherwise hit the FAILED path below).
+        #
+        # Two legitimate writers flip the row FAILED mid-run: the operator kill
+        # (signals the subprocess → non-zero/negative returncode) and
+        # `LocalExecutor._cascade_kill_lineage` on a lineage-budget breach
+        # (routing-agnostic — it flips non-terminal CLI descendants too). The
+        # returncode gate keeps a clean completion (returncode 0 → work finished)
+        # from being mis-tagged REASON_KILLED if a cascade races the FAILED flip:
+        # it falls through to the COMPLETED path below.
+        current = self.session_store.get(session.task_id)
+        if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
+            self.transcript_store.append(sid, "codex_killed", {"returncode": proc.returncode})
+            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
         if timed_out.is_set():
             self.session_store.update_status(session.task_id, STATUS_FAILED)
@@ -493,6 +528,12 @@ class CodexExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
+        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # (in execute(), after proc.wait()) keys on the row being FAILED to detect
+        # an operator kill; a timed-out session must still be RUNNING when the
+        # guard checks so the timeout path — not REASON_KILLED — claims it. This
+        # only sets the timed_out flag and terminates the OS process; execute()
+        # owns the row transition.
         timed_out.set()
         if proc.poll() is None:
             try:

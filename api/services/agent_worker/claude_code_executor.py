@@ -216,6 +216,10 @@ REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
 REASON_AWAITING_GOAL_APPROVAL = "awaiting_goal_approval"
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
+# #379: the operator kill endpoint flips the session row to FAILED and signals
+# our subprocess. When `proc.wait()` returns after such a kill, we exit silently
+# under this reason so the worker doesn't fire a spurious "session failed" notice.
+REASON_KILLED = "killed"
 
 
 @dataclass
@@ -466,6 +470,10 @@ class ClaudeCodeExecutor:
                 cwd=working_dir,
                 text=True,
                 env=self._clean_env(),
+                # #379: own session/process-group leader so the operator kill can
+                # `os.killpg(pgid, ...)` the CLI + every child it spawns WITHOUT
+                # touching this worker process (which shares the worker's group).
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             self.transcript_store.append(sid, "claude_code_binary_not_found", {"error": str(exc)})
@@ -478,6 +486,17 @@ class ClaudeCodeExecutor:
         # RUNNING for the duration of the subprocess so an /agents-page
         # observer sees the correct status.
         self.session_store.update_status(session.task_id, STATUS_RUNNING)
+
+        # #379: record the subprocess PID + process-group id so the operator
+        # kill endpoint (a separate process) can signal it. `start_new_session`
+        # makes pid==pgid, but resolve the pgid explicitly so the teardown can
+        # `killpg` the whole group. Separate from the `claude_code_spawn` marker
+        # above, which is the #400 crash-guard written *before* the Popen.
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:  # pragma: no cover — defensive; fall back to the pid
+            pgid = proc.pid
+        self.transcript_store.append(sid, "claude_code_pid", {"pid": proc.pid, "pgid": pgid})
 
         state = _RunState(plan_mode=plan_mode, is_child=bool(session.parent_session_id))
         timed_out = threading.Event()
@@ -509,6 +528,26 @@ class ClaudeCodeExecutor:
         finally:
             watchdog.cancel()
             stop_heartbeat.set()
+
+        # #379: the kill endpoint flips status to FAILED and signals our
+        # subprocess. If the row is already FAILED *and the subprocess did not
+        # exit cleanly*, treat it as an operator kill — exit silently
+        # (REASON_KILLED) so the worker doesn't fire a spurious "session failed"
+        # notice (the killpg'd subprocess returns a negative returncode, which
+        # would otherwise fall through to the FAILED path below).
+        #
+        # The row can be flipped to FAILED mid-run by two legitimate writers: the
+        # operator kill (signals the subprocess → non-zero/negative returncode)
+        # and `LocalExecutor._cascade_kill_lineage` on a lineage-budget breach
+        # (routing-agnostic — it flips non-terminal CLI descendants too). The
+        # returncode gate keeps these from clobbering a clean completion: a
+        # subprocess that exited 0 *finished its work* and falls through to the
+        # COMPLETED path so its final_text is persisted (a parent reads it via
+        # _child_final_text), even if a cascade raced the FAILED flip in.
+        current = self.session_store.get(session.task_id)
+        if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
+            self.transcript_store.append(sid, "claude_code_killed", {"returncode": proc.returncode})
+            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
         if timed_out.is_set():
             self.session_store.update_status(session.task_id, STATUS_FAILED)
@@ -783,6 +822,12 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
+        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # (in execute(), after proc.wait()) keys on the row being FAILED to detect
+        # an operator kill; a timed-out session must still be RUNNING when the
+        # guard checks so the timeout path — not REASON_KILLED — claims it. This
+        # only sets the timed_out flag and terminates the OS process; execute()
+        # owns the row transition.
         timed_out.set()
         if proc.poll() is None:
             try:

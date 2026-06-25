@@ -1494,6 +1494,7 @@ class Worker:
             REASON_AWAITING_CLARIFICATION,
             REASON_AWAITING_GOAL_APPROVAL,
             REASON_AWAITING_PLAN_APPROVAL,
+            REASON_KILLED,
         )
         from api.services.agent_worker.claude_code_spawn import parse_claude_code_spawn_payload
 
@@ -1701,7 +1702,12 @@ class Worker:
         notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             notice = f"⚠️ {label} hit its budget ({outcome.reason})."
-        elif outcome.status == STATUS_FAILED:
+        elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
+            # #379: an operator-killed session must NOT emit a post-kill notice —
+            # the operator stopped it deliberately. The row is already FAILED and
+            # the kill endpoint owns the operator_killed transcript event; here we
+            # just skip the spurious "failed" notice + web mirror. (Status
+            # persistence and vault reconciliation below still run.)
             notice = f"⚠️ {label} failed: {outcome.reason}."
         if notice:
             _send(notice)
@@ -1763,6 +1769,7 @@ class Worker:
         chat and registers it as a follow-up anchor so a threaded reply
         resumes the session.
         """
+        from api.services.agent_worker.codex_executor import REASON_KILLED
         from api.services.agent_worker.codex_spawn import parse_codex_spawn_payload
 
         codex = self._get_codex_executor()
@@ -1865,7 +1872,11 @@ class Worker:
         notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             notice = f"⚠️ {label} hit its budget ({outcome.reason})."
-        elif outcome.status == STATUS_FAILED:
+        elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
+            # #379: an operator-killed codex session must NOT emit a post-kill
+            # notice — the operator stopped it deliberately. Parity with the
+            # claude_code dispatch; status persistence + vault reconciliation
+            # below still run.
             notice = f"⚠️ {label} failed: {outcome.reason}."
         if notice:
             self._telegram_send(notice)

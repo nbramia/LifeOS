@@ -187,6 +187,58 @@ def test_kill_calls_managed_driver_when_present(client, stores, monkeypatch):
     assert called_remote_ids == {"managed-parent", "managed-child"}
 
 
+@pytest.mark.unit
+def test_operator_kill_signals_local_claude_code_subprocess(client, stores, monkeypatch):
+    """#379: an operator kill of a routing='claude_code' session with a recorded
+    pid must signal the worker-owned subprocess (killpg on the pgid) while
+    preserving the cascade, the operator_killed/cascade_killed transcript events,
+    and the `{"killed": [...], "failures": [...]}` response shape."""
+    import signal as _signal
+
+    session_store, transcript_store = stores
+    # A local CLI parent (with a recorded subprocess pid) + a managed child, so we
+    # exercise both the local-subprocess kill and the cascade in one call.
+    parent = session_store.create(
+        task_id="cc-parent", status=STATUS_RUNNING, routing="claude_code",
+    )
+    transcript_store.append(parent.session_id, "claude_code_pid", {"pid": 5151, "pgid": 5151})
+    child = session_store.create(
+        task_id="cc-child", status=STATUS_RUNNING, routing="claude_code",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    transcript_store.append(child.session_id, "claude_code_pid", {"pid": 5252, "pgid": 5252})
+
+    killpg_calls: list[tuple[int, int]] = []
+    # os.kill(pid, 0) liveness checks all report "alive" so SIGTERM fires; we
+    # collapse the grace window to force the SIGKILL fallback deterministically.
+    monkeypatch.setattr(inter_agent.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(inter_agent.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(inter_agent, "_LOCAL_KILL_GRACE_S", 0.0)
+
+    r = client.post(f"/api/agents/sessions/{parent.session_id}/kill", json={"reason": "runaway"})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["killed"]) == {parent.session_id, child.session_id}
+    assert body["failures"] == []
+
+    # Both subprocesses were signalled on their pgids (SIGTERM then SIGKILL each).
+    signalled_pgids = {pgid for pgid, _sig in killpg_calls}
+    assert signalled_pgids == {5151, 5252}
+    assert _signal.SIGTERM in {sig for _pgid, sig in killpg_calls}
+    assert _signal.SIGKILL in {sig for _pgid, sig in killpg_calls}
+
+    # Cascade + transcript events preserved.
+    assert session_store.get_by_session_id(parent.session_id).status == STATUS_FAILED
+    assert session_store.get_by_session_id(child.session_id).status == STATUS_FAILED
+    parent_kinds = [e["kind"] for e in transcript_store.read(parent.session_id)]
+    child_kinds = [e["kind"] for e in transcript_store.read(child.session_id)]
+    assert "operator_killed" in parent_kinds
+    assert "local_subprocess_killed" in parent_kinds
+    assert "cascade_killed" in child_kinds
+    assert "local_subprocess_killed" in child_kinds
+
+
 # ---------------------------------------------------------------------------
 # Shared helper — used by both inter_agent.kill (agent-to-agent) and the
 # operator kill HTTP endpoint. Confirms the agent path still works.

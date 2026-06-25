@@ -5,16 +5,19 @@ The worker's resume/dispatch loop is tested separately in test_agent_worker_loop
 """
 from __future__ import annotations
 
+import signal as _signal_module
 from pathlib import Path
 
 import pytest
 
+from api.services.agent_worker import inter_agent
 from api.services.agent_worker.inter_agent import (
     Caps,
     InterAgentContext,
     DEFAULT_MAX_DESCENDANTS_PER_ROOT,
     DEFAULT_MAX_SPAWN_DEPTH,
     dispatch,
+    teardown_session,
 )
 from api.services.agent_worker.session_store import (
     STATUS_CLAIMED,
@@ -591,3 +594,233 @@ def test_dispatch_handles_handler_exception(store, transcript, parent, monkeypat
     assert not result["ok"]
     assert result["error"] == "crashed"
     assert "kaboom" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# #379 — teardown_session reaps the local CLI subprocess
+# ---------------------------------------------------------------------------
+
+
+class _SignalRecorder:
+    """Records os.kill / os.killpg calls and scripts liveness.
+
+    `alive_for` controls how many `os.kill(pid, 0)` liveness probes return
+    "alive" before the process is considered gone (ProcessLookupError). A
+    large value keeps it alive through the whole grace window so the SIGKILL
+    fallback fires; a small value simulates a clean exit under SIGTERM.
+
+    `group_gone_after` controls the #379 SIGKILL sweep: once the leader pid has
+    been reported gone (its liveness probe raised), `killpg` raises
+    ProcessLookupError to model a fully-exited group (no lingering children). If
+    left None, killpg always succeeds — modelling a group child that outlived the
+    leader, so the sweep lands.
+    """
+
+    def __init__(self, alive_for: int = 1000, initial_lookup_error: bool = False,
+                 group_gone_when_leader_gone: bool = False):
+        self.killpg_calls: list[tuple[int, int]] = []
+        self._liveness_probes = 0
+        self._alive_for = alive_for
+        self._initial_lookup_error = initial_lookup_error
+        self._group_gone_when_leader_gone = group_gone_when_leader_gone
+        self._leader_gone = False
+
+    def kill(self, pid, sig):
+        # Liveness probe (sig == 0). The first probe is the up-front liveness
+        # check; subsequent ones poll during the SIGTERM grace window.
+        if sig == 0:
+            if self._initial_lookup_error:
+                self._leader_gone = True
+                raise ProcessLookupError
+            self._liveness_probes += 1
+            if self._liveness_probes > self._alive_for:
+                self._leader_gone = True
+                raise ProcessLookupError
+            return None
+        raise AssertionError(f"unexpected os.kill signal {sig}")
+
+    def killpg(self, pgid, sig):
+        # Model a fully-gone group for the SIGKILL sweep: once the leader is gone
+        # and the test asked for it, killpg raises (no children left to reap).
+        if (self._group_gone_when_leader_gone and self._leader_gone
+                and sig == _signal_module.SIGKILL):
+            raise ProcessLookupError
+        self.killpg_calls.append((pgid, sig))
+
+
+def _seed_claude_code_with_pid(store, transcript, parent, *, pid=4242, pgid=4242):
+    target = store.create(
+        task_id="cc_target", status=STATUS_RUNNING, routing="claude_code",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+    )
+    transcript.append(target.session_id, "claude_code_pid", {"pid": pid, "pgid": pgid})
+    return store.get_by_session_id(target.session_id)
+
+
+@pytest.mark.unit
+def test_teardown_kills_local_subprocess_sigterm_then_sigkill(
+    store, transcript, parent, monkeypatch
+):
+    """A claude_code session with a recorded pid is SIGTERM'd then — when still
+    alive through the grace window — SIGKILL'd, both on the pgid."""
+    import signal as _signal
+
+    target = _seed_claude_code_with_pid(store, transcript, parent, pid=4242, pgid=4242)
+    rec = _SignalRecorder(alive_for=1000)  # never dies → SIGKILL fallback
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+    monkeypatch.setattr(inter_agent.time, "sleep", lambda _s: None)
+    # Collapse the grace window so the loop exits to the SIGKILL branch fast.
+    monkeypatch.setattr(inter_agent, "_LOCAL_KILL_GRACE_S", 0.0)
+
+    teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    signals = [sig for _pgid, sig in rec.killpg_calls]
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
+    assert all(pgid == 4242 for pgid, _sig in rec.killpg_calls)
+    # The kill is audited.
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "local_subprocess_killed" in kinds
+    assert store.get_by_session_id(target.session_id).status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_teardown_local_subprocess_clean_exit_no_sigkill(
+    store, transcript, parent, monkeypatch
+):
+    """If the leader AND its whole group exit during the SIGTERM grace window,
+    the SIGKILL sweep is a no-op (group already gone) — only SIGTERM lands."""
+    import signal as _signal
+
+    target = _seed_claude_code_with_pid(store, transcript, parent, pid=7, pgid=7)
+    # alive_for=1: the up-front liveness check passes, then the first in-grace
+    # probe reports the leader gone → clean exit under SIGTERM. With
+    # group_gone_when_leader_gone the #379 sweep's killpg(SIGKILL) raises
+    # ProcessLookupError (no lingering children), so no SIGKILL is recorded.
+    rec = _SignalRecorder(alive_for=1, group_gone_when_leader_gone=True)
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+    monkeypatch.setattr(inter_agent.time, "sleep", lambda _s: None)
+
+    teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    signals = [sig for _pgid, sig in rec.killpg_calls]
+    assert signals == [_signal.SIGTERM]
+    assert _signal.SIGKILL not in signals
+    # The kill is still audited as a SIGTERM exit.
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "local_subprocess_killed" in kinds
+
+
+@pytest.mark.unit
+def test_teardown_sigkill_sweep_reaps_lingering_group_child(
+    store, transcript, parent, monkeypatch
+):
+    """#379: if the leader exits under SIGTERM but a group child lingers, the
+    SIGKILL sweep still fires on the pgid so the survivor is reaped. (The old
+    grace loop `break`'d on the leader exiting and skipped the SIGKILL.)"""
+    import signal as _signal
+
+    target = _seed_claude_code_with_pid(store, transcript, parent, pid=55, pgid=55)
+    # Leader gone after the first in-grace probe, but group_gone_when_leader_gone
+    # left False → killpg(SIGKILL) lands (a child outlived the leader).
+    rec = _SignalRecorder(alive_for=1)
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+    monkeypatch.setattr(inter_agent.time, "sleep", lambda _s: None)
+
+    teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    signals = [sig for _pgid, sig in rec.killpg_calls]
+    # The sweep escalated to SIGKILL even though the leader had exited.
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
+    assert all(pgid == 55 for pgid, _sig in rec.killpg_calls)
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "local_subprocess_killed" in kinds
+
+
+@pytest.mark.unit
+def test_teardown_stale_pid_does_not_raise_or_signal(
+    store, transcript, parent, monkeypatch
+):
+    """A stale pid (the process already exited — `os.kill(pid, 0)` raises
+    ProcessLookupError) is handled gracefully: no killpg, no raise, and teardown
+    still flips status + writes the kill transcript event."""
+    target = _seed_claude_code_with_pid(store, transcript, parent, pid=999, pgid=999)
+    rec = _SignalRecorder(initial_lookup_error=True)
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+
+    # Must not raise.
+    teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    assert rec.killpg_calls == []  # nothing signalled
+    # Teardown's other effects still happened.
+    assert store.get_by_session_id(target.session_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "operator_killed" in kinds
+    assert "local_subprocess_killed" not in kinds  # no kill recorded for a dead proc
+
+
+@pytest.mark.unit
+def test_teardown_managed_session_skips_local_kill_but_does_managed(
+    store, transcript, parent, monkeypatch
+):
+    """A pure managed/cloud session (routing='claude', no pid event) must NOT
+    attempt a local kill, but MUST still flip status, append the transcript
+    event, and call the managed driver's kill_session."""
+    target = store.create(
+        task_id="m_target", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+    )
+    store.set_managed_session_id("m_target", "remote_xyz")
+    target = store.get_by_session_id(target.session_id)
+
+    rec = _SignalRecorder()
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+
+    managed_calls = []
+    class _FakeDriver:
+        def kill_session(self, sid, reason=""):
+            managed_calls.append((sid, reason))
+
+    result = teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=_FakeDriver(),
+    )
+
+    assert result["managed_failure"] is None
+    # No local signal attempt at all (routing is not a CLI route).
+    assert rec.killpg_calls == []
+    # Managed kill still happened.
+    assert managed_calls == [("remote_xyz", "stop")]
+    # Status flip + transcript event still happened.
+    assert store.get_by_session_id(target.session_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "operator_killed" in kinds
+    assert "local_subprocess_killed" not in kinds

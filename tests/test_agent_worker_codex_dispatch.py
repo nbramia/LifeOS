@@ -194,6 +194,43 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
     assert any("failed" in s.lower() for s in plain_sends)
 
 
+def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):
+    """#379 parity: a FAILED codex outcome carrying reason=REASON_KILLED is the
+    executor's signal that the operator deliberately killed the session. The
+    dispatch path must NOT send the "⚠️ ... failed" Telegram notice (the kill
+    endpoint already wrote operator_killed), while still persisting FAILED."""
+    from api.services.agent_worker.codex_executor import REASON_KILLED
+
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-killed", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "long task"}])
+
+    # No operator-facing failure notice.
+    assert not any("failed" in s.lower() for s in plain_sends)
+    # Row still persisted terminal (idempotent with the kill's flip).
+    assert worker.session_store.get("cx-killed").status == STATUS_FAILED
+
+
+def test_codex_operator_killed_does_not_mirror_to_web(tmp_path: Path):
+    """#379 + #311 parity: a REASON_KILLED FAILED codex outcome must NOT mirror a
+    failure notice into the linked web/voice conversation."""
+    from api.services.agent_worker.codex_executor import REASON_KILLED
+
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED))
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    session = worker.session_store.create(task_id="cx-web-killed", routing="codex", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_codex_session(session, [{"content": "long task"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
 # ---------------------------------------------------------------------------
 # Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
 # terminal completion/failure mirror is the whole web round-trip for it.
