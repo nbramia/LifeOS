@@ -164,26 +164,37 @@ export async function sendMessage() {
             const label = engine === 'codex' ? 'Codex' : 'Claude Code';
             fullContent = '🤝 Handing off to ' + label + '…';
             updateMessage(msgId, fullContent);
+            // Pin the conversation this handoff targets BEFORE the in-flight
+            // POST: the server links the spawned session to exactly this
+            // conversation, so the post-await poll must target it too. Reading
+            // state.currentConversationId again inside the `.then()` would poll
+            // the wrong thread if the user navigated mid-POST.
+            const handoffConversationId = state.currentConversationId;
             fetch(endpoints.handoff, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 engine: engine,
                 task: data.task || '',
-                conversation_id: state.currentConversationId,
+                conversation_id: handoffConversationId,
               }),
             }).then(r => r.json()).then(d => {
               fullContent = (d && d.message)
                 ? d.message
                 : '⚠️ Handoff to ' + label + ' failed.';
               updateMessage(msgId, fullContent);
-              // #311: the handoff linked the spawned session to this
-              // conversation server-side, so poll for the session's streamed
-              // progress + terminal result and render them into this thread
-              // (parity with the orchestrating-persona path below). Only on a
+              // #311: the handoff linked the spawned session to the conversation
+              // it targeted server-side, so poll THAT conversation for the
+              // session's streamed progress + terminal result and render them
+              // into the thread (parity with the orchestrating-persona path
+              // below). The seen-message seed in startPendingQuestionPolling
+              // assumes the handoff ack message is already persisted server-side
+              // (chat_handoff writes it synchronously before returning) when the
+              // first poll fires — if ack persistence ever becomes async, the
+              // seed must be revisited or the ack would render twice. Only on a
               // successful spawn with a conversation to land results in.
-              if (d && d.ok && state.currentConversationId) {
-                startPendingQuestionPolling(state.currentConversationId);
+              if (d && d.ok && handoffConversationId) {
+                startPendingQuestionPolling(handoffConversationId);
               }
             }).catch(() => {
               fullContent = '⚠️ Handoff to ' + label + ' failed.';
