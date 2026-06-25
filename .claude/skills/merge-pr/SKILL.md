@@ -1,17 +1,21 @@
 ---
 name: merge-pr
 description: Merge a PR and update upstream GitHub issues with progress
-argument-hint: <pr-number>
+argument-hint: <pr-number> [--base <branch>]
 ---
 
 # Merge PR and Update Issues
 
-Merge PR #$ARGUMENTS and update all linked GitHub issues with what was delivered.
+Merge the PR named by the leading token of $ARGUMENTS and update all linked GitHub issues with what was delivered.
+
+**Arguments.** The leading token is the PR number. An optional `--base <branch>` may follow; it is informational only — the authoritative base is `baseRefName` from the PR metadata below (the branch the PR actually targets). Default base is `main`. The base determines whether the post-merge timestamp-normalization step runs (see Step 2).
 
 ## PR Context
 
-- PR metadata: !`gh pr view $ARGUMENTS --json number,title,body,state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefName,baseRefName,additions,deletions,changedFiles`
-- PR checks: !`gh pr checks $ARGUMENTS 2>/dev/null || echo "NO_CHECKS"`
+The PR number is the first whitespace-separated token of `$ARGUMENTS` (anything after it, e.g. `--base <branch>`, is stripped here):
+
+- PR metadata: !`gh pr view $(echo "$ARGUMENTS" | awk '{print $1}') --json number,title,body,state,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefName,baseRefName,additions,deletions,changedFiles`
+- PR checks: !`gh pr checks $(echo "$ARGUMENTS" | awk '{print $1}') 2>/dev/null || echo "NO_CHECKS"`
 
 ## Instructions
 
@@ -31,17 +35,17 @@ Check that the PR is safe to merge. For each check, determine pass/fail:
 
 ### Step 2: Merge
 
-Squash-merge the PR and delete the remote branch:
+Squash-merge the PR into its base branch and delete the remote branch. `gh pr merge` targets the PR's own base (`baseRefName`), so this works for any base. Use only the PR number (first token):
 
 ```
-gh pr merge $ARGUMENTS --squash --delete-branch
+gh pr merge <pr-number> --squash --delete-branch
 ```
 
 If the merge fails, report the error and stop.
 
-**Normalize commit timestamp** (privacy: hides work schedule):
+**Normalize commit timestamp** (privacy: hides work schedule) — **only when the base is `main`.**
 
-After the merge succeeds, pull the merge commit and normalize its timestamp to 12:00 UTC on the same date. This matches the post-commit hook behavior, which doesn't run for GitHub-side merges.
+After a merge into `main` succeeds, pull the merge commit and normalize its timestamp to 12:00 UTC on the same date. This matches the post-commit hook behavior, which doesn't run for GitHub-side merges.
 
 ```bash
 git checkout main && git pull origin main
@@ -52,6 +56,8 @@ git push --force-with-lease origin main
 ```
 
 If the force-push fails (e.g., another commit landed), warn the user but do not retry. The merge itself already succeeded.
+
+**If the base is not `main`** (a stacked sub-PR landing on an integration branch), **skip the normalize-and-force-push step entirely.** Force-pushing an amended commit to a shared integration branch would clobber other sub-PRs that may be landing concurrently, and the final integration→`main` PR's own merge will get its timestamp normalized when it lands on `main` anyway. The squash-merge into the integration branch is sufficient.
 
 ### Step 3: Update Linked Issues
 

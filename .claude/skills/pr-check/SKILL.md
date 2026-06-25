@@ -12,11 +12,12 @@ Pre-flight validation for PR quality.
 
 - Current branch: !`git branch --show-current`
 - PR data: !`gh pr view $ARGUMENTS --json title,body,additions,deletions,changedFiles,commits,baseRefName,number 2>/dev/null || echo "NO_PR_FOUND"`
-- Commits since main: !`git log --oneline main..HEAD`
+- Base branch: !`gh pr view $ARGUMENTS --json baseRefName --jq .baseRefName 2>/dev/null || echo "main"`
+- Commits since base: !`BASE="$(gh pr view $ARGUMENTS --json baseRefName --jq .baseRefName 2>/dev/null || echo main)"; git log --oneline "origin/$BASE..HEAD" 2>/dev/null || git log --oneline "$BASE..HEAD"`
 
 ## Instructions
 
-Validate the current PR against each standard below. If no PR number was provided and `NO_PR_FOUND` appears above, check only what can be validated locally (branch name, commits, diff size) and note that no PR exists yet.
+Validate the current PR against each standard below. The **base branch** is `baseRefName` from the PR data (the branch the PR targets); it defaults to `main` when no PR exists. All "since base" comparisons below diff against this base, not a hardcoded `main` — so a stacked sub-PR targeting an integration branch is sized and scanned against that branch, not against `main`. If no PR number was provided and `NO_PR_FOUND` appears above, check only what can be validated locally (branch name, commits, diff size against the default base `main`) and note that no PR exists yet.
 
 For each check, output one of:
 - **PASS** — Meets the standard
@@ -56,7 +57,7 @@ This project is open-source. The diff MUST NOT contain any of the following. FAI
 - **Real personal names or emails** — real people's names, email addresses, phone numbers, or other PII in code or test fixtures. Synthetic/obviously fake data is OK (e.g., "John Doe", "test@example.com"). Names in git commit metadata, CLAUDE.md, and AGENTS.md are exempt.
 - **Internal infrastructure details** — Tailscale IPs, internal hostnames, or private network addresses in code (their presence in CLAUDE.md/AGENTS.md for developer setup is OK).
 
-To check, read the full diff: !`git diff main..HEAD -- ':!CLAUDE.md' ':!AGENTS.md'`
+To check, read the full diff against the base branch: !`BASE="$(gh pr view $ARGUMENTS --json baseRefName --jq .baseRefName 2>/dev/null || echo main)"; git diff "origin/$BASE..HEAD" -- ':!CLAUDE.md' ':!AGENTS.md' 2>/dev/null || git diff "$BASE..HEAD" -- ':!CLAUDE.md' ':!AGENTS.md'`
 
 ### Output Format
 
