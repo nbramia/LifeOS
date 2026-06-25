@@ -45,7 +45,7 @@ Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orc
 - **Escalation respected.** If `/implement` can't resolve its review findings after its rounds, the doctor leaves the PR open and reports the escalation instead of merging.
 - **Isolation.** Implementation happens in throwaway worktrees off `origin/main` (pre-flight-cleaned via `scripts/cleanup-worktrees.sh` so a prior crashed run can't block the `add`), so the canonical checkout other agents share is never left on a feature branch.
 - **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout before restarting, so the running server actually reflects the change.
-- **Safe self-restart.** The doctor runs *inside* `lifeos-agent-worker`. It uses `scripts/classify-change` to tell an API-only change (plain `lifeos-api` restart; its session survives) from an agent-worker change (which would kill it mid-run). For the latter it uses `./scripts/server.sh restart-worker-detached`, which flushes the final notice and marks the restart deliberate **before** bouncing the worker in a detached process — so the "Shipped" notice always lands and the run isn't surfaced as a spurious failure.
+- **Safe self-restart.** The doctor runs *inside* `lifeos-agent-worker`. It uses `./scripts/server.sh classify-change` to tell an API-only change (plain `lifeos-api` restart; its session survives) from an agent-worker change (which would kill it mid-run). For the latter it uses `./scripts/server.sh restart-worker-detached`, which flushes the final notice and marks the restart deliberate **before** bouncing the worker in a detached process — so the "Shipped" notice always lands and the run isn't surfaced as a spurious failure.
 
 ## Adding another orchestration bot
 

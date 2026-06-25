@@ -24,7 +24,7 @@ This **is** the single human gate. The user approves it (locking the goal) or re
 First **file the work as GitHub issue(s)** via `/draft-issue` (capture the numbers/URLs — this is your durable memory; `/goal` is session-scoped and you must not rely on it to remember state). Then choose the branch topology:
 
 - **Small goal (one cohesive change):** one feature branch off `origin/main` → run `/implement <issue>` → it opens one PR → merges to `main`.
-- **Multi-part goal:** create an **integration branch** off `origin/main` (a new branch; the integration target). Land each part as a **sub-PR onto the integration branch** via `/implement <issue> --base <integration-branch>`. When all parts are in, open **one** PR from the integration branch → `main`. After it merges, delete the integration branch and its worktree.
+- **Multi-part goal:** create an **integration branch** off `origin/main` (a new branch; the integration target). Land each part as a **sub-PR onto the integration branch** via `/implement <issue> --base <integration-branch>`. Run those `/implement` calls **sequentially from inside the one integration worktree** — `/implement` branches in place, so each sub-PR is a branch off the integration branch within that same worktree; don't spin up a separate worktree per sub-PR. When all parts are in, open **one** PR from the integration branch → `main`. After it merges, delete the integration branch and its worktree.
 
 **Worktree hygiene (every branch/worktree you create):**
 - Pre-flight before `git worktree add`, always run `scripts/cleanup-worktrees.sh <path> [<branch>]` so a stale directory/branch left by a prior crashed run can't make the `add` fail.
@@ -50,9 +50,9 @@ Full-auto from the locked goal through the final merge. There is exactly **one**
 
 ## Restarting (the change must take effect)
 
-Use `scripts/classify-change <range>` to decide which restart you need:
-- **API-only change** (`classify-change` prints `api`): `cd ~/Code/LifeOS && ./scripts/server.sh restart`. This restarts `lifeos-api` only; your own session (inside `lifeos-agent-worker`) survives.
-- **Agent-worker change** (prints `worker`, i.e. the change touched `api/services/agent_worker/`): restarting the worker would kill you mid-run. Use the detached primitive so your final notice lands first: `./scripts/server.sh restart-worker-detached --session <your-session-id> --notify "Shipped: …" --bot doctor`. It flushes the notice, marks the restart deliberate (so you aren't surfaced as a failed/rolled-back task), then restarts the worker in a detached process that outlives your SIGTERM. Send the "Shipped" `[NOTIFY]` as part of this — don't send it separately and then bounce.
+Run `./scripts/server.sh classify-change <range>` to decide which restart you need:
+- **API-only change** (it prints `api`): `cd ~/Code/LifeOS && ./scripts/server.sh restart`. This restarts `lifeos-api` only; your own session (inside `lifeos-agent-worker`) survives.
+- **Agent-worker change** (it prints `worker`, i.e. the change touched `api/services/agent_worker/`): restarting the worker would kill you mid-run. Use the detached primitive so your final notice lands first: `./scripts/server.sh restart-worker-detached --session <your-session-id> --notify "Shipped: …" --bot doctor`. It flushes the notice, marks the restart deliberate (so you aren't surfaced as a failed/rolled-back task), then restarts the worker in a detached process that outlives your SIGTERM. Send the "Shipped" `[NOTIFY]` as part of this — don't send it separately and then bounce.
 
 ## Edge cases
 
