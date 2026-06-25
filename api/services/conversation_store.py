@@ -70,9 +70,26 @@ class ConversationStore:
         self.db_path = db_path or get_conversation_db_path()
         self._init_db()
 
+    def _connect(self) -> sqlite3.Connection:
+        """Open a connection with a generous busy timeout.
+
+        This PR adds the agent worker as a SECOND concurrent writer to
+        conversations.db (it mirrors a spawned session's output into the linked
+        thread, #311) alongside the web /chat process. Under WAL two writers can
+        still collide on the single write lock; without a busy timeout the loser
+        gets an immediate "database is locked", and the mirror's best-effort
+        try/except would silently drop the message. A 10s busy timeout (matching
+        SessionStore._connect) lets the loser wait out the brief write instead.
+        `sqlite3.connect`'s `timeout=` sets exactly this at the driver level —
+        Python's default is 5s, so this widens it and makes the intent explicit.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.execute("PRAGMA busy_timeout = 10000")
+        return conn
+
     def _init_db(self):
         """Create database tables if they don't exist."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
@@ -141,7 +158,7 @@ class ConversationStore:
         title = title or "New Conversation"
         now = datetime.now()
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             conn.execute(
                 "INSERT INTO conversations (id, title, persona_id, created_at, updated_at) "
@@ -171,7 +188,7 @@ class ConversationStore:
         Returns:
             Conversation or None if not found
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             cursor = conn.execute(
                 """
@@ -225,7 +242,7 @@ class ConversationStore:
             params.append(persona_id)
         params.append(limit)
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             cursor = conn.execute(
                 f"""
@@ -266,7 +283,7 @@ class ConversationStore:
         Returns:
             True if deleted, False if not found
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             # Check if exists
             cursor = conn.execute(
@@ -317,7 +334,7 @@ class ConversationStore:
         sources_json = json.dumps(sources) if sources else None
         routing_json = json.dumps(routing) if routing else None
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             conn.execute(
                 """
@@ -360,7 +377,7 @@ class ConversationStore:
         Returns:
             List of messages in chronological order
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             if limit:
                 # Get last N messages
@@ -415,7 +432,7 @@ class ConversationStore:
         Returns:
             True if updated, False if not found
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             cursor = conn.execute(
                 "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
@@ -435,7 +452,7 @@ class ConversationStore:
         overwrites any prior link (a fresh spawn supersedes). Returns True if
         the conversation row was updated.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             cursor = conn.execute(
                 "UPDATE conversations SET agent_session_id = ?, updated_at = ? "
@@ -459,7 +476,7 @@ class ConversationStore:
         """
         if not session_id:
             return None
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
             row = conn.execute(
                 "SELECT id FROM conversations WHERE agent_session_id = ? LIMIT 1",
