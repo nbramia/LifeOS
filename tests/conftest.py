@@ -259,6 +259,27 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_telegram_state_file(tmp_path, monkeypatch):
+    """Keep tests off the production Telegram offset file (#357).
+
+    ``TelegramBotListener._STATE_FILE`` defaults to the process-global relative
+    path ``data/telegram_state.json``. Any listener built without patching it —
+    notably the ones ``api.main``'s lifespan starts for a real ``TestClient``
+    app — reads and (via ``_save_last_update_id``) writes that shared file, which
+    is the suspected source of the order-dependent flake in
+    ``test_primary_uses_legacy_state_file``. Redirect the legacy/primary state
+    file to a per-test tmp path so no test touches or leaks the shared default;
+    the telegram tests that patch ``_STATE_FILE`` themselves simply nest over
+    this. Mirrors ``_isolate_vault_indexer_stores`` above.
+    """
+    from api.services.telegram import TelegramBotListener
+
+    monkeypatch.setattr(
+        TelegramBotListener, "_STATE_FILE", tmp_path / "telegram_state.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_conversation_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and migrating) the production conversations DB.
 
