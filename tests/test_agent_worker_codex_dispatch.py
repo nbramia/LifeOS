@@ -259,3 +259,40 @@ def test_codex_failure_mirrors_notice_into_linked_conversation(tmp_path: Path):
 
     msgs = conv_store.get_messages(conv.id)
     assert any(m.role == "assistant" and "failed" in m.content.lower() for m in msgs)
+
+
+def test_codex_child_completion_does_not_mirror(tmp_path: Path):
+    """A codex child (has a parent — codex is in SPAWN_MODELS, so it IS
+    dispatchable as a child) must not mirror its result into a conversation,
+    even one linked to the child. Parity with the claude_code child gate."""
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="child codex result")
+    )
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    parent = worker.session_store.create(task_id="cx-parent", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child", routing="codex", parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_codex_session(child, [{"content": "do it"}])
+
+    assert conv_store.get_messages(conv.id) == []
+
+
+def test_codex_child_failure_does_not_mirror(tmp_path: Path):
+    """A codex child's failure/budget notice must not mirror into a linked
+    conversation either (parity with the claude_code failure gate)."""
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
+    parent = worker.session_store.create(task_id="cx-parent-2", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child-2", routing="codex", parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_codex_session(child, [{"content": "do it"}])
+
+    assert conv_store.get_messages(conv.id) == []

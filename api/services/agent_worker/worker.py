@@ -1849,9 +1849,12 @@ class Worker:
                 # #311: mirror the final result into the web/voice thread that
                 # spawned this codex session (no-op for Telegram-origin). Codex
                 # has no rich [NOTIFY] stream, so this terminal mirror is the
-                # whole web round-trip for it. Children have no parent here
-                # (codex isn't spawned as a child), so no extra gate is needed.
-                self._mirror_to_conversation(sid, body)
+                # whole web round-trip for it. Non-child only, for parity with
+                # the claude_code path: codex CAN be a child (it's in
+                # inter_agent.SPAWN_MODELS), and a child is never
+                # conversation-linked — so this is both correct and defensive.
+                if not session.parent_session_id:
+                    self._mirror_to_conversation(sid, body)
             self.transcript_store.append(sid, "codex_handled_completion", {
                 "final_chars": len(body),
             })
@@ -1867,8 +1870,11 @@ class Worker:
         if notice:
             self._telegram_send(notice)
             # #311: mirror the same failure/budget notice into the web/voice
-            # thread (no-op for Telegram-origin).
-            self._mirror_to_conversation(sid, notice)
+            # thread (no-op for Telegram-origin). Non-child only, for parity
+            # with the claude_code path (codex can be a child via
+            # inter_agent.SPAWN_MODELS; a child is never conversation-linked).
+            if not session.parent_session_id:
+                self._mirror_to_conversation(sid, notice)
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
         # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
