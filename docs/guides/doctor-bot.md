@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-06-25
+**Last Updated:** 2026-06-26
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -46,7 +46,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 - **Always PR-gated, always revertable.** Even the smallest fix goes branch → PR → `main` with tests + docs + review; the doctor never pushes to `main`, and each change lands as a single revertable merge commit whose `gh pr revert` handle it reports.
 - **Escalation respected.** If `/implement` can't resolve its review findings after its rounds, the doctor leaves the PR open and reports the escalation instead of merging.
 - **Isolation.** Implementation happens in throwaway worktrees off `origin/main` (pre-flight-cleaned via `scripts/cleanup-worktrees.sh` so a prior crashed run can't block the `add`), so the canonical checkout other agents share is never left on a feature branch.
-- **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout before restarting, so the running server actually reflects the change.
+- **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout, then runs `./scripts/server.sh verify-deployed` to confirm the checkout is a real work tree on the merged commit **before** restarting — so a silently-failed pull (e.g. a bare/misconfigured checkout) is reported as a deploy failure instead of a false "Shipped" (#419). Only on success does it restart, so the running server actually reflects the change.
 - **Safe self-restart.** The doctor runs *inside* `lifeos-agent-worker`. It uses `./scripts/server.sh classify-change` to tell an API-only change (plain `lifeos-api` restart; its session survives) from an agent-worker change (which would kill it mid-run). For the latter it uses `./scripts/server.sh restart-worker-detached`, which flushes the final notice and marks the restart deliberate **before** bouncing the worker in a detached process — so the "Shipped" notice always lands and the run isn't surfaced as a spurious failure.
 
 ## Adding another orchestration bot
