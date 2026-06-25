@@ -194,3 +194,117 @@ def test_resume_as_followup_for_code_session_flips_to_claimed(tmp_path: Path, mo
     # The reply was queued for the resume dispatch.
     pending = w.session_store.drain_pending_messages(session.session_id)
     assert [p["content"] for p in pending] == ["yes do that"]
+
+
+def test_web_session_keyed_clarify_answer_resumes_via_existing_path(tmp_path: Path, monkeypatch):
+    """#403: a web/voice-spawned session's open [CLARIFY] (kind='followup') can be
+    answered with NO Telegram message_id — the session-keyed deposit feeds the
+    SAME `_process_clarification_answers` tick, flipping the session to CLAIMED
+    and queuing the answer for resume. No second resume mechanism."""
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
+        status=STATUS_BLOCKED, reason=REASON_AWAITING_CLARIFICATION, final_text="which repo?",
+    ))
+    w = _make_worker(tmp_path, stub, monkeypatch)
+    session = _seed_fresh_code_session(w.session_store)
+    w.session_store.drain_pending_messages(session.session_id)
+    w.session_store.set_claude_code_session_id(session.task_id, "cli-web")
+    # The worker registered a clarification followup keyed to a *Telegram* id,
+    # but the web user has no way to reply to it. They answer by session instead.
+    w.session_store.create_pending_question(
+        session_id=session.session_id,
+        task_id=session.task_id,
+        question="which repo?",
+        sent_message_id=6600,
+        sent_message_ids=[6600],
+        kind="followup",
+        bot="doctor",
+    )
+
+    # No Telegram message_id — answer keyed purely on the session.
+    deposited = w.session_store.deposit_answer_by_session_id(session.session_id, "the lifeos repo")
+    assert deposited is True
+
+    w._process_clarification_answers()
+
+    refreshed = w.session_store.get(session.task_id)
+    assert refreshed.status == STATUS_CLAIMED
+    pending = w.session_store.drain_pending_messages(session.session_id)
+    assert [p["content"] for p in pending] == ["the lifeos repo"]
+
+
+def test_web_session_keyed_goal_answer_resumes_via_existing_path(tmp_path: Path, monkeypatch):
+    """#403: a web/voice-spawned session's [GOAL] (kind='goal_approval') answered
+    by session deposits onto the *existing* row, so the worker routes it through
+    `_resume_goal` (which injects `/goal <condition>` on a yes)."""
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="done",
+    ))
+    w = _make_worker(tmp_path, stub, monkeypatch)
+    session = _seed_fresh_code_session(w.session_store)
+    w.session_store.drain_pending_messages(session.session_id)
+    w.session_store.set_claude_code_session_id(session.task_id, "cli-goal")
+    # The session proposed a goal; the worker recorded the awaiting-approval
+    # transcript event and a kind='goal_approval' question.
+    w.transcript_store.append(
+        session.session_id, "claude_code_awaiting_goal_approval",
+        {"condition": "the doctor report is filed"},
+    )
+    w.session_store.create_pending_question(
+        session_id=session.session_id,
+        task_id=session.task_id,
+        question="Reply 'yes' to lock this goal and start, or send changes to refine it.",
+        sent_message_id=7700,
+        sent_message_ids=[7700],
+        kind="goal_approval",
+        bot="doctor",
+    )
+
+    assert w.session_store.deposit_answer_by_session_id(session.session_id, "yes") is True
+    w._process_clarification_answers()
+
+    refreshed = w.session_store.get(session.task_id)
+    assert refreshed.status == STATUS_CLAIMED
+    pending = w.session_store.drain_pending_messages(session.session_id)
+    # `_resume_goal` injected the locked /goal, proving the goal_approval kind
+    # was preserved (a generic followup would have queued the bare "yes").
+    assert [p["content"] for p in pending] == ["/goal the doctor report is filed"]
+
+
+def test_session_keyed_deposit_ignores_no_open_question(tmp_path: Path, monkeypatch):
+    """Depositing by session when there's no open question (never asked, or
+    already answered) is a no-op returning False — never resurrects a stale row
+    or fabricates a new one."""
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(status=STATUS_COMPLETED))
+    w = _make_worker(tmp_path, stub, monkeypatch)
+    session = _seed_fresh_code_session(w.session_store)
+    # No pending question exists yet.
+    assert w.session_store.deposit_answer_by_session_id(session.session_id, "hello") is False
+    # Now create + answer one; a second deposit must also be a no-op.
+    w.session_store.create_pending_question(
+        session_id=session.session_id, task_id=session.task_id,
+        question="?", sent_message_id=8800, sent_message_ids=[8800], kind="followup",
+    )
+    assert w.session_store.deposit_answer_by_session_id(session.session_id, "first") is True
+    assert w.session_store.deposit_answer_by_session_id(session.session_id, "second") is False
+    # The first answer stuck; the second was dropped.
+    q = w.session_store.get_question_by_message_id(8800)
+    assert q["answer"] == "first"
+
+
+def test_telegram_deposit_path_unchanged_alongside_session_keyed(tmp_path: Path, monkeypatch):
+    """The session-keyed deposit lives beside the message-id deposit; a Telegram
+    reply still matches by message id and `get_open_question_by_message_id`
+    behaves exactly as before."""
+    stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(status=STATUS_COMPLETED))
+    w = _make_worker(tmp_path, stub, monkeypatch)
+    session = _seed_fresh_code_session(w.session_store)
+    w.session_store.create_pending_question(
+        session_id=session.session_id, task_id=session.task_id,
+        question="?", sent_message_id=9900, sent_message_ids=[9900], kind="followup",
+        bot="doctor",
+    )
+    # Telegram path still works (bot-scoped), unchanged.
+    assert w.session_store.get_open_question_by_message_id(9900, bot="doctor") is not None
+    assert w.session_store.deposit_answer(9900, "telegram answer", bot="doctor") is True
+    # And it's the same row the session lookup would have found.
+    assert w.session_store.get_open_question_by_session_id(session.session_id) is None  # now answered

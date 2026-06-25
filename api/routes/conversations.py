@@ -49,6 +49,13 @@ class MessageResponse(BaseModel):
     routing: Optional[dict] = None
 
 
+class PendingQuestionResponse(BaseModel):
+    """An open [CLARIFY]/[GOAL] from this conversation's spawned session (#403)."""
+    session_id: str
+    question: str
+    kind: str  # clarification | goal_approval | followup
+
+
 class ConversationDetailResponse(BaseModel):
     """Response with full conversation including messages."""
     id: str
@@ -56,6 +63,10 @@ class ConversationDetailResponse(BaseModel):
     created_at: str
     updated_at: str
     messages: list[MessageResponse]
+    # Present only when an orchestrating-persona session spawned by this
+    # conversation is currently awaiting an answer (#403). The client renders
+    # an answer affordance and POSTs to `{id}/answer`. Absent/None otherwise.
+    pending_question: Optional[PendingQuestionResponse] = None
 
 
 class ConversationListResponse(BaseModel):
@@ -66,6 +77,11 @@ class ConversationListResponse(BaseModel):
 class AskRequest(BaseModel):
     """Request to ask a question in a conversation."""
     question: str
+
+
+class AnswerRequest(BaseModel):
+    """Request to answer a spawned session's open [CLARIFY]/[GOAL] question."""
+    answer: str
 
 
 @router.get("", response_model=ConversationListResponse)
@@ -127,6 +143,23 @@ async def get_conversation(conversation_id: str):
 
     messages = store.get_messages(conversation_id)
 
+    # Surface an open [CLARIFY]/[GOAL] from a session this conversation spawned
+    # (#403) so the client can show an answer affordance. Best-effort: a lookup
+    # failure (or no spawned session) just omits it — never breaks the read.
+    pending_question = None
+    if conv.agent_session_id:
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            q = SessionStore().get_open_question_by_session_id(conv.agent_session_id)
+            if q:
+                pending_question = PendingQuestionResponse(
+                    session_id=conv.agent_session_id,
+                    question=q.get("question") or "",
+                    kind=q.get("kind") or "clarification",
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("pending-question lookup failed", exc_info=True)
+
     return ConversationDetailResponse(
         id=conv.id,
         title=conv.title,
@@ -142,7 +175,8 @@ async def get_conversation(conversation_id: str):
                 routing=m.routing
             )
             for m in messages
-        ]
+        ],
+        pending_question=pending_question,
     )
 
 
@@ -265,3 +299,54 @@ async def ask_in_conversation(conversation_id: str, request: AskRequest):
             "Connection": "keep-alive",
         }
     )
+
+
+@router.post("/{conversation_id}/answer")
+async def answer_in_conversation(conversation_id: str, request: AnswerRequest):
+    """Answer the [CLARIFY]/[GOAL] question of the session this conversation spawned.
+
+    Web/voice parity for orchestrating personas (#403). When an orchestrating
+    persona (e.g. doctor) is selected on `/api/ask/stream`, the turn spawns a
+    background Claude Code session and links it to this conversation. If that
+    session emits `[CLARIFY]`/`[GOAL]`, the worker registers an open
+    `pending_questions` row keyed on the session. This endpoint deposits the
+    answer onto that existing row via the **session-keyed** deposit — preserving
+    its `kind` so the worker's existing tick resumes it through the same path a
+    Telegram reply takes (`_resume_goal` / `_resume_as_followup`). No second
+    resume mechanism, no Telegram `message_id` needed.
+
+    The complementary output direction (streaming the session's results back
+    into this thread) is #311.
+    """
+    text = (request.answer or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="answer cannot be empty")
+
+    store = get_store()
+    conv = store.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    session_id = conv.agent_session_id
+    if not session_id:
+        raise HTTPException(
+            status_code=409,
+            detail="this conversation has no spawned session awaiting an answer",
+        )
+
+    from api.services.agent_worker.session_store import SessionStore
+    session_store = SessionStore()
+    deposited = session_store.deposit_answer_by_session_id(session_id, text)
+    if not deposited:
+        # No open question — either the session never asked, already got an
+        # answer, or the question timed out. Idempotent: a second answer to an
+        # already-answered question is a no-op, surfaced as a 409 (not a crash).
+        raise HTTPException(
+            status_code=409,
+            detail="no open question to answer for this conversation's session",
+        )
+
+    # Echo the answer into the conversation so the thread reflects the
+    # round-trip (the session's resumed output arrives separately, #311).
+    store.add_message(conversation_id, "user", text)
+    return {"ok": True, "session_id": session_id, "status": "answer_deposited"}
