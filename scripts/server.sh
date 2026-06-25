@@ -336,6 +336,13 @@ classify_change() {
 # and exits 1, so the doctor reports a deploy failure instead of a false success.
 verify_deployed() {
     local expected="${1:-}"
+    # Reject an ambiguously-short explicit sha: a 1-2 char prefix could match an
+    # unrelated HEAD and yield a false "deployed". Require full or git-abbrev
+    # (>=7 chars); omit the arg to compare against origin/main instead.
+    if [ -n "$expected" ] && [ "${#expected}" -lt 7 ]; then
+        echo "verify-deployed: expected sha '$expected' is too short to be unambiguous (need >=7 chars, or omit to use origin/main)" >&2
+        return 2
+    fi
     # A bare repo (core.bare=true) or non-work-tree can't pull/checkout, so a
     # "successful" deploy there never changed the code on disk.
     if [ "$(git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then

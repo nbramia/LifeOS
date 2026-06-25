@@ -415,6 +415,16 @@ def test_verify_deployed_checks_worktree_and_head(tmp_path: Path):
     assert r.returncode == 1
     assert "not-deployed" in r.stderr
 
+    # ambiguously-short explicit sha → rejected (non-zero), never a false match
+    r = _verify("5")
+    assert r.returncode != 0
+    assert "too short" in r.stderr
+
+    # no arg + no origin/main yet → cannot resolve → exit 1 (the "fetch first" branch)
+    r = _verify()
+    assert r.returncode == 1
+    assert "origin/main" in r.stderr
+
     # bare repo (core.bare=true) can't pull/checkout → not a work tree → exit 1
     _git("config", "core.bare", "true")
     r = _verify(head)
