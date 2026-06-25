@@ -68,6 +68,13 @@ class _FakeApi:
             tags[tags.index(from_tag)] = to_tag
             task["tags"] = tags
             return httpx.Response(200, json={"swapped": True})
+        if request.method == "PUT" and path.endswith("/complete"):
+            task_id = path.split("/")[-2]
+            task = self.tasks.get(task_id)
+            if not task:
+                return httpx.Response(404)
+            task["status"] = "done"
+            return httpx.Response(200, json=task)
         if request.method == "PUT" and path.startswith("/api/tasks/"):
             task_id = path.split("/")[-1]
             task = self.tasks.get(task_id)
@@ -153,6 +160,10 @@ def test_resume_pending_self_restart_finalizes_quietly(tmp_path: Path):
     # Tag advanced to completed, NOT rolled back to #agent.
     assert COMPLETED_TAG in api.tasks["doctor_task"]["tags"]
     assert AGENT_TAG not in api.tasks["doctor_task"]["tags"]
+    # Vault checkbox advanced to done ([x]) too — not left stuck at in_progress
+    # ([/]). The quiet-finalize path must call _complete_task like every other
+    # COMPLETED path (#401 review).
+    assert api.tasks["doctor_task"]["status"] == "done"
     # Transcript records the deliberate restart, not a resume_failed.
     kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
     assert "resume_self_restart" in kinds

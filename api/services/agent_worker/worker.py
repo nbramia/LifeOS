@@ -155,7 +155,14 @@ def write_self_restart_marker(
     `python -m api.services.agent_worker.worker --mark-self-restart …`) so the
     bash primitive and the worker share one marker format. Returns the path
     written. `db_path` defaults to the SessionStore default so the caller
-    doesn't need to know where the DB lives."""
+    doesn't need to know where the DB lives.
+
+    The production primitive names the doctor's run by `session_id` (a single-use
+    UUID that never recurs), not `task_id`. That matters: a stale marker (one not
+    consumed for any reason) naming a session_id can match nothing on a later
+    startup, whereas task_ids are vault-stable and could quiet a future real
+    crash of a session reusing that id. The `task_ids` path exists for the
+    CLI/tests; prefer `session_ids` for anything that writes a real marker."""
     from pathlib import Path as _Path
     from api.services.agent_worker.session_store import DEFAULT_DB_PATH
     resolved = _Path(db_path) if db_path is not None else DEFAULT_DB_PATH
@@ -486,7 +493,15 @@ class Worker:
                     {"prior_status": session.status},
                 )
                 self.session_store.update_status(session.task_id, STATUS_COMPLETED)
-                if not session.parent_session_id:
+                # Mirror the canonical COMPLETED path (see _handle_outcome /
+                # _finalize_terminal): advance the vault checkbox to done ([x])
+                # AND swap the tag — gated on has_vault_task. Operator-spawned
+                # roots and spawned children carry a synthetic task_id with no
+                # vault row, so both vault ops are skipped for them (#401 review).
+                # The session-row update_status above stays unconditional.
+                has_vault_task = session.origin != "operator" and not session.parent_session_id
+                if has_vault_task:
+                    self._complete_task(session.task_id)
                     self._swap_tag(session.task_id, RUNNING_TAG, COMPLETED_TAG)
                 logger.info(
                     "session %s finalized after a deliberate self-restart "

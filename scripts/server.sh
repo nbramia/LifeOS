@@ -306,6 +306,12 @@ sctl() {
 # Prints "worker" if any changed file is under WORKER_CODE_PATH, else "api".
 # Default range is the last commit (HEAD~1..HEAD); pass an explicit range
 # (e.g. "main..HEAD") to classify a whole branch.
+#
+# This is a path-prefix HEURISTIC, not a guarantee: a change that alters worker
+# behavior from outside api/services/agent_worker/ (e.g. config/settings.py,
+# which the worker imports) classifies as "api" and would leave the worker on
+# stale code. Acceptable because the doctor ships localized PRs; widen
+# WORKER_CODE_PATH or add paths if that assumption stops holding.
 classify_change() {
     local range="${1:-HEAD~1..HEAD}"
     local changed
@@ -369,8 +375,13 @@ PYEOF
             systemctl restart "$WORKER_UNIT" \
             || log_error "systemd-run restart failed"
     else
-        # Fallback: setsid detaches into a new session so it survives the
-        # worker's process-group teardown; nohup ignores SIGHUP.
+        # Fallback for non-systemd hosts (no systemd-run). setsid+nohup detach
+        # into a new session that survives the worker's process-group teardown
+        # and SIGHUP — but, unlike the systemd-run path, this does NOT move the
+        # restarter into its own cgroup, so a cgroup-level kill of the worker
+        # could still reach it. This branch only runs where `systemctl restart`
+        # itself wouldn't apply anyway, so it's a best-effort degraded path, not
+        # an equivalent guarantee.
         setsid nohup sudo systemctl restart "$WORKER_UNIT" \
             >> "$PROJECT_DIR/logs/worker-restart.log" 2>&1 &
         disown 2>/dev/null || true
