@@ -922,8 +922,11 @@ async def chat_handoff(request: HandoffRequest):
     from api.services.agent_worker.session_store import SessionStore
 
     working_dir = resolve_working_directory(task)
-    # Route the worker's completion notification to the operator's Telegram (the
-    # web thread can't receive an async result yet). None if Telegram isn't set.
+    # Also route the worker's completion notification to the operator's Telegram.
+    # As of #311 the spawned session's progress + result are mirrored back into
+    # this web/voice thread too (the conversation is linked to the session
+    # below), so Telegram is now an additional delivery channel, not the only
+    # one. None if Telegram isn't set.
     chat_id = getattr(settings, "telegram_chat_id", "") or None
 
     if engine == "codex":
