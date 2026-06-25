@@ -7,8 +7,9 @@ import { state, config, elements, endpoints, hooks } from './session.js';
 import { addMessage, updateMessage, setStatus } from './thread.js';
 import { clearAttachments } from './attachments.js';
 import { loadConversations } from './conversations.js';
-import { personaSupportsHandoff } from './persona.js';
+import { personaSupportsHandoff, personaOrchestrates } from './persona.js';
 import { setStoredConversationId } from './backend.js';
+import { startPendingQuestionPolling } from './pending-question.js';
 
 // Low-level SSE transport. Builds the request body, opens the stream, and calls
 // `on(data)` for each parsed `data:` event. If `on` returns `true`, processing
@@ -244,6 +245,20 @@ export async function sendMessage() {
           }
 
           loadConversations();
+
+          // Orchestrating-persona spawn (#403/#412): this turn started a
+          // background Claude Code session (routed to `claude_code`, the
+          // doctor spawn path) and the conversation is now linked to it. Begin
+          // polling for a `[CLARIFY]`/`[GOAL]` so it can be answered here
+          // without Telegram. Gated on BOTH the routing and the orchestrating
+          // persona: `claude_code` is also emitted by plain handoffs (model
+          // picker / inferred-terminal / escalation ladder) that never link a
+          // session, and only an orchestrating persona's turn is a spawn — so
+          // this excludes those handoffs and never polls on a normal turn.
+          if (routingSources.includes('claude_code') && personaOrchestrates()
+              && state.currentConversationId) {
+            startPendingQuestionPolling(state.currentConversationId);
+          }
         } else if (data.type === 'error') {
           // Handle error from server
           const errorMsg = data.message || 'An error occurred';

@@ -8,6 +8,8 @@ import { state, config, elements, endpoints } from './session.js';
 import { addMessage, setStatus } from './thread.js';
 import { loadConversations } from './conversations.js';
 import { setStoredConversationId } from './backend.js';
+import { personaOrchestrates } from './persona.js';
+import { startPendingQuestionPolling } from './pending-question.js';
 
 const VOICE_MODE_KEY = 'lifeos:chat:voice_mode';
 const DOCK_SETTINGS_KEY = 'lifeos:chat:dock_settings';
@@ -813,6 +815,14 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
       state.currentConversationId = data.conversation_id;
       setStoredConversationId(data.conversation_id);  // per-backend persistence
       loadConversations();
+      // Orchestrating-persona voice turn (#412): the relay's `done` payload
+      // doesn't surface the `claude_code` routing the text path keys off, so
+      // gate on the selected persona instead — only an orchestrating bot (e.g.
+      // doctor) spawns a session that can ask. Poll the linked conversation so
+      // a `[CLARIFY]`/`[GOAL]` can be answered here without Telegram.
+      if (personaOrchestrates()) {
+        startPendingQuestionPolling(data.conversation_id);
+      }
     }
     clearThinking();
     if (data.transcript) addMessage(data.transcript, 'user');

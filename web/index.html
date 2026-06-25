@@ -371,6 +371,90 @@
             border: 1px solid var(--border);
         }
 
+        /* Answer affordance for an orchestrating-persona session awaiting a
+           [CLARIFY]/[GOAL] (#412). Appended inside #messages, styled like an
+           assistant bubble but accented so it reads as an action, not a reply. */
+        .pending-question {
+            align-self: flex-start;
+            max-width: min(85%, 700px);
+            padding: 1rem;
+            border-radius: 12px;
+            background: var(--assistant-bubble);
+            border: 1px solid var(--accent);
+            display: flex;
+            flex-direction: column;
+            gap: 0.625rem;
+        }
+
+        .pending-question .pq-heading {
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .pending-question .pq-question {
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+
+        .pending-question .pq-row {
+            display: flex;
+            gap: 0.5rem;
+            align-items: stretch;
+        }
+
+        .pending-question .pq-input {
+            flex: 1;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            font-family: inherit;
+        }
+
+        .pending-question .pq-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .pending-question .pq-send {
+            background: var(--accent);
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 0.95rem;
+            padding: 0 1rem;
+            cursor: pointer;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+
+        .pending-question .pq-send:hover:not(:disabled) {
+            background: var(--accent-hover);
+        }
+
+        .pending-question .pq-send:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .pending-question .pq-hint {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .pending-question .pq-status {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            min-height: 1em;
+        }
+
+        .pending-question .pq-status:empty {
+            display: none;
+        }
+
         .message-content {
             white-space: pre-wrap;
             word-break: break-word;

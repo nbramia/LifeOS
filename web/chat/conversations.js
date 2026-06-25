@@ -4,6 +4,7 @@
 
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, escapeHtml } from './thread.js';
+import { startPendingQuestionPolling, stopPendingQuestionPolling } from './pending-question.js';
 
 export function toggleSidebar() {
   elements.sidebar.classList.toggle('open');
@@ -166,6 +167,9 @@ function renderConversations(conversations, isPartial = false) {
 export async function loadConversation(id) {
   state.currentConversationId = id;
   closeSidebar();
+  // Drop any answer affordance/poll from the previously-open conversation; if
+  // this one has an outstanding question, polling restarts below (#412).
+  stopPendingQuestionPolling();
 
   try {
     const response = await fetch(`${endpoints.conversations}/${id}`);
@@ -180,6 +184,12 @@ export async function loadConversation(id) {
           // Sources are stored directly on the message, not in metadata
           addMessage(msg.content, msg.role, msg.sources || []);
         });
+      }
+
+      // If this conversation spawned an orchestrating-persona session that is
+      // awaiting an answer, re-show the affordance and resume polling (#412).
+      if (data.pending_question) {
+        startPendingQuestionPolling(id);
       }
 
       loadConversations(); // Refresh list to show active
@@ -206,6 +216,7 @@ export async function deleteConversation(id) {
 export function newChat() {
   state.currentConversationId = null;
   state.currentAgentThread = null; // leave agent-thread mode (#236)
+  stopPendingQuestionPolling();   // no active conversation → no answer affordance (#412)
   elements.inputField.placeholder = 'Ask a question...';
   elements.chatTitle.textContent = 'New conversation';
   elements.messagesEl.innerHTML = `
