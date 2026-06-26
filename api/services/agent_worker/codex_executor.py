@@ -372,13 +372,20 @@ class CodexExecutor:
         self._cleanup_tempfile(last_msg_path)
 
         # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
-        # the row is already FAILED, the operator killed us mid-run — exit
-        # silently so the worker skips the spurious "session failed" notice (the
-        # killpg'd subprocess returns a negative returncode that would otherwise
-        # hit the FAILED path below). Only the operator kill can flip the row to
-        # FAILED while we run — the executor itself set RUNNING just after spawn.
+        # the row is already FAILED *and the subprocess did not exit cleanly*, the
+        # operator killed us mid-run — exit silently so the worker skips the
+        # spurious "session failed" notice (the killpg'd subprocess returns a
+        # negative returncode that would otherwise hit the FAILED path below).
+        #
+        # Two legitimate writers flip the row FAILED mid-run: the operator kill
+        # (signals the subprocess → non-zero/negative returncode) and
+        # `LocalExecutor._cascade_kill_lineage` on a lineage-budget breach
+        # (routing-agnostic — it flips non-terminal CLI descendants too). The
+        # returncode gate keeps a clean completion (returncode 0 → work finished)
+        # from being mis-tagged REASON_KILLED if a cascade races the FAILED flip:
+        # it falls through to the COMPLETED path below.
         current = self.session_store.get(session.task_id)
-        if current is not None and current.status == STATUS_FAILED:
+        if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
             self.transcript_store.append(sid, "codex_killed", {"returncode": proc.returncode})
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
@@ -521,6 +528,12 @@ class CodexExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
+        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # (in execute(), after proc.wait()) keys on the row being FAILED to detect
+        # an operator kill; a timed-out session must still be RUNNING when the
+        # guard checks so the timeout path — not REASON_KILLED — claims it. This
+        # only sets the timed_out flag and terminates the OS process; execute()
+        # owns the row transition.
         timed_out.set()
         if proc.poll() is None:
             try:

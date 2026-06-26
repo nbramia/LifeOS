@@ -1000,3 +1000,48 @@ def test_operator_kill_mid_run_exits_silently(tmp_path: Path):
     # The spurious failure / completion paths must NOT have run.
     assert "claude_code_failed" not in kinds
     assert "claude_code_completed" not in kinds
+
+
+def test_clean_completion_wins_over_raced_failed_flip(tmp_path: Path):
+    """#379 cascade-race guard: the row can be flipped to FAILED mid-run by a
+    second legitimate writer (LocalExecutor._cascade_kill_lineage on a
+    lineage-budget breach, which is routing-agnostic). If our subprocess exits 0
+    at that instant — it finished its work — the COMPLETED path must win so the
+    final_text is persisted (a parent reads it via _child_final_text). The
+    returncode gate (FAILED *and* returncode != 0 → REASON_KILLED) keeps the
+    silent guard from clobbering a clean completion."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "all done."},
+    ]
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    session = _seed_session(store)
+
+    def _flip_to_failed():
+        # The cascade races our clean exit, flipping the row FAILED.
+        store.update_status(session.task_id, STATUS_FAILED)
+
+    # returncode=0 → the subprocess completed cleanly despite the FAILED flip.
+    spawn_fn = _spawn_with(events, returncode=0, on_wait=_flip_to_failed)
+    executor = ClaudeCodeExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        spawn_fn=spawn_fn,
+        binary_resolver=lambda: "/usr/bin/true",
+        timeout_seconds=30,
+        heartbeat_interval=3600,
+    )
+
+    outcome = executor.execute(session, {"description": "task"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.reason != REASON_KILLED
+    assert outcome.final_text == "all done."
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    # The completion path ran and persisted final_text; the silent guard did not.
+    assert "claude_code_completed" in kinds
+    assert "claude_code_killed" not in kinds
+    completed = [e for e in _read_transcript(transcripts, session.session_id)
+                 if e["kind"] == "claude_code_completed"]
+    assert completed[0]["payload"]["final_text"] == "all done."

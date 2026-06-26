@@ -530,14 +530,22 @@ class ClaudeCodeExecutor:
             stop_heartbeat.set()
 
         # #379: the kill endpoint flips status to FAILED and signals our
-        # subprocess. If the row is already FAILED, the operator killed us
-        # mid-run — exit silently (REASON_KILLED) so the worker doesn't fire a
-        # spurious "session failed" notice (the killpg'd subprocess returns a
-        # negative returncode, which would otherwise fall through to the FAILED
-        # path below). Only the operator kill can flip the row to FAILED while we
-        # run — the executor itself set RUNNING just after the spawn.
+        # subprocess. If the row is already FAILED *and the subprocess did not
+        # exit cleanly*, treat it as an operator kill — exit silently
+        # (REASON_KILLED) so the worker doesn't fire a spurious "session failed"
+        # notice (the killpg'd subprocess returns a negative returncode, which
+        # would otherwise fall through to the FAILED path below).
+        #
+        # The row can be flipped to FAILED mid-run by two legitimate writers: the
+        # operator kill (signals the subprocess → non-zero/negative returncode)
+        # and `LocalExecutor._cascade_kill_lineage` on a lineage-budget breach
+        # (routing-agnostic — it flips non-terminal CLI descendants too). The
+        # returncode gate keeps these from clobbering a clean completion: a
+        # subprocess that exited 0 *finished its work* and falls through to the
+        # COMPLETED path so its final_text is persisted (a parent reads it via
+        # _child_final_text), even if a cascade raced the FAILED flip in.
         current = self.session_store.get(session.task_id)
-        if current is not None and current.status == STATUS_FAILED:
+        if current is not None and current.status == STATUS_FAILED and proc.returncode != 0:
             self.transcript_store.append(sid, "claude_code_killed", {"returncode": proc.returncode})
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
 
@@ -814,6 +822,12 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
+        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # (in execute(), after proc.wait()) keys on the row being FAILED to detect
+        # an operator kill; a timed-out session must still be RUNNING when the
+        # guard checks so the timeout path — not REASON_KILLED — claims it. This
+        # only sets the timed_out flag and terminates the OS process; execute()
+        # owns the row transition.
         timed_out.set()
         if proc.poll() is None:
             try:
