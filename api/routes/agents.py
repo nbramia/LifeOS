@@ -859,36 +859,44 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
     try:
         from api.services.agent_worker.inter_agent import teardown_session as _teardown
 
-        killed: list[str] = []
-        failures: list[dict[str, str]] = []
-        for idx, s in enumerate(subtree):
-            if s.status in TERMINAL_STATUSES:
-                continue
-            if idx == 0:
-                kind = "operator_killed"
-                payload = {
-                    "reason": reason,
-                    "managed_remote": s.managed_agent_session_id,
-                }
-            else:
-                kind = "cascade_killed"
-                payload = {
-                    "root": target.session_id,
-                    "reason": reason,
-                    "managed_remote": s.managed_agent_session_id,
-                }
-            result = _teardown(
-                session_store, transcript_store, s,
-                transcript_kind=kind,
-                transcript_payload=payload,
-                managed_driver=driver,
-            )
-            killed.append(s.session_id)
-            if result.get("managed_failure"):
-                failures.append({
-                    "session_id": s.session_id,
-                    "reason": result["managed_failure"],
-                })
+        def _run_teardown() -> tuple[list[str], list[dict[str, str]]]:
+            # #379: the per-CLI-child subprocess reap inside teardown_session does
+            # a blocking SIGTERM→grace(up to ~2s)→SIGKILL. Run the whole subtree
+            # teardown off the event loop (mirror spawn_agent's asyncio.to_thread)
+            # so a multi-node kill can't stall all HTTP for N×grace seconds.
+            killed: list[str] = []
+            failures: list[dict[str, str]] = []
+            for idx, s in enumerate(subtree):
+                if s.status in TERMINAL_STATUSES:
+                    continue
+                if idx == 0:
+                    kind = "operator_killed"
+                    payload = {
+                        "reason": reason,
+                        "managed_remote": s.managed_agent_session_id,
+                    }
+                else:
+                    kind = "cascade_killed"
+                    payload = {
+                        "root": target.session_id,
+                        "reason": reason,
+                        "managed_remote": s.managed_agent_session_id,
+                    }
+                result = _teardown(
+                    session_store, transcript_store, s,
+                    transcript_kind=kind,
+                    transcript_payload=payload,
+                    managed_driver=driver,
+                )
+                killed.append(s.session_id)
+                if result.get("managed_failure"):
+                    failures.append({
+                        "session_id": s.session_id,
+                        "reason": result["managed_failure"],
+                    })
+            return killed, failures
+
+        killed, failures = await asyncio.to_thread(_run_teardown)
         return {"killed": killed, "failures": failures}
     finally:
         if driver is not None:
