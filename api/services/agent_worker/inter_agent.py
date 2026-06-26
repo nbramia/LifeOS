@@ -521,7 +521,13 @@ def _kill_local_subprocess(
         pgid = pid
 
     try:
-        os.kill(pid, 0)  # liveness check — guards against pid reuse / already-dead
+        # Best-effort liveness check. If the pid is already gone we skip
+        # signalling entirely. This only *narrows* the pid-reuse TOCTOU window —
+        # it does not eliminate it: the pid could be reused between this probe
+        # and the killpg below. Acceptable because killpg targets the recorded
+        # pgid (the CLI's own process group via start_new_session), so a reused
+        # pid would have to also lead an identically-numbered group to be hit.
+        os.kill(pid, 0)
     except ProcessLookupError:
         return  # already gone — nothing to signal
     except (PermissionError, OSError) as exc:
@@ -531,19 +537,26 @@ def _kill_local_subprocess(
     sig_used = "SIGTERM"
     try:
         os.killpg(pgid, signal.SIGTERM)
-        # Bounded grace for a clean exit, then SIGKILL the group if still alive.
+        # Bounded grace for a clean exit, polling the group LEADER pid.
         deadline = time.monotonic() + _LOCAL_KILL_GRACE_S
         while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                break  # exited cleanly under SIGTERM
+                break  # leader exited under SIGTERM
             time.sleep(_LOCAL_KILL_POLL_S)
-        else:
+        # SIGKILL sweep the whole group regardless: the grace loop only watches
+        # the leader, but a group child can outlive the leader (the leader exits
+        # while a spawned grandchild lingers). The sweep reaps any survivors.
+        # ProcessLookupError means the group is already fully gone (leader exited
+        # cleanly, no lingering children) — that's the no-op success path.
+        try:
             os.killpg(pgid, signal.SIGKILL)
             sig_used = "SIGKILL"
+        except ProcessLookupError:
+            pass  # group already gone — clean exit under SIGTERM
     except ProcessLookupError:
-        pass  # raced to exit between the liveness check and the signal — fine
+        pass  # raced to exit between the liveness check and the SIGTERM — fine
     except (PermissionError, OSError) as exc:
         logger.warning("local kill: killpg(%s) failed: %s", pgid, exc)
         return

@@ -5,6 +5,7 @@ The worker's resume/dispatch loop is tested separately in test_agent_worker_loop
 """
 from __future__ import annotations
 
+import signal as _signal_module
 from pathlib import Path
 
 import pytest
@@ -607,27 +608,43 @@ class _SignalRecorder:
     "alive" before the process is considered gone (ProcessLookupError). A
     large value keeps it alive through the whole grace window so the SIGKILL
     fallback fires; a small value simulates a clean exit under SIGTERM.
+
+    `group_gone_after` controls the #379 SIGKILL sweep: once the leader pid has
+    been reported gone (its liveness probe raised), `killpg` raises
+    ProcessLookupError to model a fully-exited group (no lingering children). If
+    left None, killpg always succeeds — modelling a group child that outlived the
+    leader, so the sweep lands.
     """
 
-    def __init__(self, alive_for: int = 1000, initial_lookup_error: bool = False):
+    def __init__(self, alive_for: int = 1000, initial_lookup_error: bool = False,
+                 group_gone_when_leader_gone: bool = False):
         self.killpg_calls: list[tuple[int, int]] = []
         self._liveness_probes = 0
         self._alive_for = alive_for
         self._initial_lookup_error = initial_lookup_error
+        self._group_gone_when_leader_gone = group_gone_when_leader_gone
+        self._leader_gone = False
 
     def kill(self, pid, sig):
         # Liveness probe (sig == 0). The first probe is the up-front liveness
         # check; subsequent ones poll during the SIGTERM grace window.
         if sig == 0:
             if self._initial_lookup_error:
+                self._leader_gone = True
                 raise ProcessLookupError
             self._liveness_probes += 1
             if self._liveness_probes > self._alive_for:
+                self._leader_gone = True
                 raise ProcessLookupError
             return None
         raise AssertionError(f"unexpected os.kill signal {sig}")
 
     def killpg(self, pgid, sig):
+        # Model a fully-gone group for the SIGKILL sweep: once the leader is gone
+        # and the test asked for it, killpg raises (no children left to reap).
+        if (self._group_gone_when_leader_gone and self._leader_gone
+                and sig == _signal_module.SIGKILL):
+            raise ProcessLookupError
         self.killpg_calls.append((pgid, sig))
 
 
@@ -677,13 +694,16 @@ def test_teardown_kills_local_subprocess_sigterm_then_sigkill(
 def test_teardown_local_subprocess_clean_exit_no_sigkill(
     store, transcript, parent, monkeypatch
 ):
-    """If the process exits during the SIGTERM grace window, no SIGKILL fires."""
+    """If the leader AND its whole group exit during the SIGTERM grace window,
+    the SIGKILL sweep is a no-op (group already gone) — only SIGTERM lands."""
     import signal as _signal
 
     target = _seed_claude_code_with_pid(store, transcript, parent, pid=7, pgid=7)
     # alive_for=1: the up-front liveness check passes, then the first in-grace
-    # probe reports gone → clean exit under SIGTERM.
-    rec = _SignalRecorder(alive_for=1)
+    # probe reports the leader gone → clean exit under SIGTERM. With
+    # group_gone_when_leader_gone the #379 sweep's killpg(SIGKILL) raises
+    # ProcessLookupError (no lingering children), so no SIGKILL is recorded.
+    rec = _SignalRecorder(alive_for=1, group_gone_when_leader_gone=True)
     monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
     monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
     monkeypatch.setattr(inter_agent.time, "sleep", lambda _s: None)
@@ -698,6 +718,42 @@ def test_teardown_local_subprocess_clean_exit_no_sigkill(
     signals = [sig for _pgid, sig in rec.killpg_calls]
     assert signals == [_signal.SIGTERM]
     assert _signal.SIGKILL not in signals
+    # The kill is still audited as a SIGTERM exit.
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "local_subprocess_killed" in kinds
+
+
+@pytest.mark.unit
+def test_teardown_sigkill_sweep_reaps_lingering_group_child(
+    store, transcript, parent, monkeypatch
+):
+    """#379: if the leader exits under SIGTERM but a group child lingers, the
+    SIGKILL sweep still fires on the pgid so the survivor is reaped. (The old
+    grace loop `break`'d on the leader exiting and skipped the SIGKILL.)"""
+    import signal as _signal
+
+    target = _seed_claude_code_with_pid(store, transcript, parent, pid=55, pgid=55)
+    # Leader gone after the first in-grace probe, but group_gone_when_leader_gone
+    # left False → killpg(SIGKILL) lands (a child outlived the leader).
+    rec = _SignalRecorder(alive_for=1)
+    monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
+    monkeypatch.setattr(inter_agent.os, "killpg", rec.killpg)
+    monkeypatch.setattr(inter_agent.time, "sleep", lambda _s: None)
+
+    teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    signals = [sig for _pgid, sig in rec.killpg_calls]
+    # The sweep escalated to SIGKILL even though the leader had exited.
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
+    assert all(pgid == 55 for pgid, _sig in rec.killpg_calls)
+    kinds = [e["kind"] for e in transcript.read(target.session_id)]
+    assert "local_subprocess_killed" in kinds
 
 
 @pytest.mark.unit
