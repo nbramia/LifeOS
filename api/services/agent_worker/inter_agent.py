@@ -28,6 +28,9 @@ Security model: no-sandbox per AGENTS.md. The MCP-side wrapping passes
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -471,6 +474,85 @@ def yield_until(ctx: InterAgentContext, args: dict) -> dict:
     return _ok({"yielded": True, "waiting_on": children})
 
 
+# How long to wait between a SIGTERM and the follow-up SIGKILL when reaping a
+# local CLI subprocess (#379) — a brief grace for the process to exit cleanly.
+_LOCAL_KILL_GRACE_S = 2.0
+_LOCAL_KILL_POLL_S = 0.1
+
+
+def _kill_local_subprocess(
+    transcript_store: TranscriptStore, target: Session,
+) -> None:
+    """Best-effort terminate the local CLI subprocess owned by a LOCAL session.
+
+    The `claude_code` / `codex` executors run a `subprocess.Popen` in the
+    *worker* process and record its pid/process-group id via a `claude_code_pid`
+    / `codex_pid` transcript event (the subprocess is its own session leader via
+    `start_new_session=True`). The operator kill runs in the *API* process, so it
+    can only reach that subprocess by signalling the recorded pgid. Same-user
+    `killpg` is permitted; the worker's `proc.wait()` reaps the dead child.
+
+    Best-effort by contract: a missing pid event, a stale pid (process already
+    gone), or a signalling error must NOT break teardown — the managed kill, DB
+    flip, and transcript event have already run by the time this is called.
+    """
+    if target.routing not in CLI_ROUTINGS:
+        return  # pure managed/cloud sessions own no local subprocess
+
+    # Find the most recent pid event in the transcript. Codex records `codex_pid`;
+    # claude_code records `claude_code_pid`. The latest wins (a resumed session
+    # spawns a fresh subprocess and appends a newer event).
+    pid: int | None = None
+    pgid: int | None = None
+    try:
+        for ev in reversed(transcript_store.read(target.session_id)):
+            if ev.get("kind") in ("claude_code_pid", "codex_pid"):
+                payload = ev.get("payload") or {}
+                pid = payload.get("pid")
+                pgid = payload.get("pgid", pid)
+                break
+    except Exception as exc:  # noqa: BLE001 — never break teardown on a read error
+        logger.warning("local kill: transcript read for %s failed: %s",
+                       target.session_id, exc)
+        return
+    if pid is None:
+        return  # subprocess never recorded a pid (e.g. crashed before spawn)
+    if pgid is None:
+        pgid = pid
+
+    try:
+        os.kill(pid, 0)  # liveness check — guards against pid reuse / already-dead
+    except ProcessLookupError:
+        return  # already gone — nothing to signal
+    except (PermissionError, OSError) as exc:
+        logger.warning("local kill: liveness check for pid %s failed: %s", pid, exc)
+        return
+
+    sig_used = "SIGTERM"
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        # Bounded grace for a clean exit, then SIGKILL the group if still alive.
+        deadline = time.monotonic() + _LOCAL_KILL_GRACE_S
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break  # exited cleanly under SIGTERM
+            time.sleep(_LOCAL_KILL_POLL_S)
+        else:
+            os.killpg(pgid, signal.SIGKILL)
+            sig_used = "SIGKILL"
+    except ProcessLookupError:
+        pass  # raced to exit between the liveness check and the signal — fine
+    except (PermissionError, OSError) as exc:
+        logger.warning("local kill: killpg(%s) failed: %s", pgid, exc)
+        return
+
+    transcript_store.append(target.session_id, "local_subprocess_killed", {
+        "pid": pid, "pgid": pgid, "signal": sig_used,
+    })
+
+
 def teardown_session(
     session_store: SessionStore,
     transcript_store: TranscriptStore,
@@ -480,7 +562,8 @@ def teardown_session(
     managed_driver: Any | None = None,
 ) -> dict[str, Any]:
     """Tear down a single session: kill the managed remote (best-effort),
-    flip the local DB status to FAILED, and append a transcript event.
+    flip the local DB status to FAILED, append a transcript event, and
+    (for local CLI sessions) terminate the worker-owned subprocess.
 
     Shared between agent-initiated `kill()` (this module) and the operator
     HTTP kill endpoint (`api/routes/agents.py`). Authorization is the
@@ -504,6 +587,12 @@ def teardown_session(
             )
     session_store.update_status(target.task_id, STATUS_FAILED)
     transcript_store.append(target.session_id, transcript_kind, transcript_payload)
+    # #379: flipping the DB to FAILED is what the executor's silent-guard keys on,
+    # so the row is updated *before* we signal the subprocess. The status flip
+    # alone doesn't stop the OS process (the worker's `claude -p` keeps running
+    # until the next poll) — this reaps it promptly so an operator kill actually
+    # stops compute within seconds.
+    _kill_local_subprocess(transcript_store, target)
     return {"managed_failure": managed_failure}
 
 

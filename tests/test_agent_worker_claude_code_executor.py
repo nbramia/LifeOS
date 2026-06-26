@@ -24,6 +24,7 @@ from api.services.agent_worker.claude_code_executor import (
     REASON_AWAITING_GOAL_APPROVAL,
     REASON_AWAITING_PLAN_APPROVAL,
     REASON_BINARY_NOT_FOUND,
+    REASON_KILLED,
     ClaudeCodeExecutor,
 )
 from api.services.agent_worker.session_store import (
@@ -70,16 +71,27 @@ class _FakeStderr:
 
 
 class _FakeProc:
-    """Stand-in for `subprocess.Popen` with predetermined stdout + returncode."""
+    """Stand-in for `subprocess.Popen` with predetermined stdout + returncode.
 
-    def __init__(self, events: Iterable[dict], returncode: int = 0, stderr: str = ""):
+    `pid` is set so the executor's #379 pid-recording (os.getpgid(proc.pid))
+    has something to read; an `on_wait` hook lets a test simulate the operator
+    flipping the session row to FAILED while `wait()` blocks (the kill-mid-run
+    case).
+    """
+
+    def __init__(self, events: Iterable[dict], returncode: int = 0, stderr: str = "",
+                 pid: int = 4242, on_wait=None):
         self.stdout = _FakeStdout(events)
         self.stderr = _FakeStderr(stderr)
         self.returncode = returncode
+        self.pid = pid
+        self._on_wait = on_wait
         self.terminated = False
         self.killed = False
 
     def wait(self, timeout: float | None = None) -> int:
+        if self._on_wait is not None:
+            self._on_wait()
         return self.returncode
 
     def poll(self) -> int | None:
@@ -92,11 +104,11 @@ class _FakeProc:
         self.killed = True
 
 
-def _spawn_with(events, returncode: int = 0, stderr: str = ""):
+def _spawn_with(events, returncode: int = 0, stderr: str = "", pid: int = 4242, on_wait=None):
     """Build a `spawn_fn` callable that returns a fresh _FakeProc per call."""
 
     def _spawn_fn(*_args, **_kwargs):
-        return _FakeProc(events, returncode=returncode, stderr=stderr)
+        return _FakeProc(events, returncode=returncode, stderr=stderr, pid=pid, on_wait=on_wait)
 
     return _spawn_fn
 
@@ -909,3 +921,82 @@ def test_clarify_takes_precedence_over_goal_in_same_turn(tmp_path: Path):
     # The goal proposal did NOT produce a goal-approval block this turn.
     kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
     assert "claude_code_awaiting_goal_approval" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# #379 — operator kill terminates the local subprocess promptly
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_records_pid_event_and_new_session(tmp_path: Path):
+    """#379: a successful spawn records a `claude_code_pid` event carrying the
+    subprocess pid/pgid, and passes `start_new_session=True` to the spawn_fn so
+    the subprocess is its own process-group leader (killable via killpg without
+    touching the worker)."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "done."},
+    ]
+    captured_kwargs: dict = {}
+
+    def _capturing_spawn(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeProc(events, pid=98765)
+
+    executor, store, transcripts = _build_executor(tmp_path, spawn_fn=_capturing_spawn)
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "print a haiku"})
+
+    assert outcome.status == STATUS_COMPLETED
+    # The spawn was asked to start a new session/process-group.
+    assert captured_kwargs.get("start_new_session") is True
+    # The pid event was recorded with both pid and pgid.
+    pid_events = [
+        e for e in _read_transcript(transcripts, session.session_id)
+        if e["kind"] == "claude_code_pid"
+    ]
+    assert len(pid_events) == 1
+    assert pid_events[0]["payload"]["pid"] == 98765
+    assert "pgid" in pid_events[0]["payload"]
+
+
+def test_operator_kill_mid_run_exits_silently(tmp_path: Path):
+    """#379: when the operator kill flips the session row to FAILED while the
+    subprocess runs, `proc.wait()` returns and the executor must exit silently —
+    REASON_KILLED, a `claude_code_killed` event, and NEITHER a
+    `claude_code_failed` nor a COMPLETED transition."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+    ]
+    # Build the store/session first so the on_wait hook can flip its status,
+    # simulating the operator kill endpoint reaching the row mid-run.
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    session = _seed_session(store)
+
+    def _flip_to_failed():
+        store.update_status(session.task_id, STATUS_FAILED)
+
+    # A negative returncode mimics a process killed by a signal (killpg/SIGKILL).
+    spawn_fn = _spawn_with(events, returncode=-9, on_wait=_flip_to_failed)
+    notifications: list[str] = []
+    executor = ClaudeCodeExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        notification_callback=lambda msg: notifications.append(msg),
+        spawn_fn=spawn_fn,
+        binary_resolver=lambda: "/usr/bin/true",
+        timeout_seconds=30,
+        heartbeat_interval=3600,
+    )
+
+    outcome = executor.execute(session, {"description": "long task"})
+
+    assert outcome.status == STATUS_FAILED
+    assert outcome.reason == REASON_KILLED
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "claude_code_killed" in kinds
+    # The spurious failure / completion paths must NOT have run.
+    assert "claude_code_failed" not in kinds
+    assert "claude_code_completed" not in kinds

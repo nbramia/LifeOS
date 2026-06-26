@@ -470,3 +470,49 @@ def test_child_completion_does_not_mirror(tmp_path: Path):
     worker._dispatch_claude_code_session(child, [{"content": "list matches"}])
 
     assert conv_store.get_messages(conv.id) == []
+
+
+# =============================================================================
+# #379 — operator-killed session emits no post-kill notice
+# =============================================================================
+
+
+def test_operator_killed_failed_outcome_sends_no_telegram_notice(tmp_path: Path):
+    """A FAILED outcome carrying reason=REASON_KILLED is the executor's signal
+    that the operator deliberately killed the session mid-run. The dispatch path
+    must NOT send the "⚠️ Code session failed" Telegram notice (the operator
+    knows they killed it; the kill endpoint already wrote operator_killed)."""
+    from api.services.agent_worker.claude_code_executor import REASON_KILLED
+
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
+    )
+    worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="op-killed-1", routing="claude_code", origin="operator")
+    store.enqueue_message(session.session_id, "operator", "long task")
+
+    worker._dispatch_claude_code_session(session, [{"content": "long task"}])
+
+    # No operator-facing failure notice.
+    assert not any("failed" in s.lower() for s in sent)
+    # The session row is still persisted terminal (idempotent with the kill's flip).
+    assert store.get("op-killed-1").status == STATUS_FAILED
+
+
+def test_operator_killed_failed_outcome_does_not_mirror_to_web(tmp_path: Path):
+    """Parity for the web/voice thread: a REASON_KILLED FAILED outcome must NOT
+    mirror a failure notice into the linked conversation (#379 + #311)."""
+    from api.services.agent_worker.claude_code_executor import REASON_KILLED
+
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED)
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="web-killed-1", routing="claude_code", origin="operator")
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, session.session_id)
+
+    worker._dispatch_claude_code_session(session, [{"content": "long task"}])
+
+    # Nothing about a failure landed in the thread.
+    assert conv_store.get_messages(conv.id) == []
