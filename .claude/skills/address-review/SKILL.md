@@ -73,18 +73,23 @@ After addressing all feedback:
 - Keep fix commits separate from each other when they address unrelated feedback (easier to review the re-review)
 - Push to the PR branch
 
-### Step 6: Post Summary and Re-request Review
+### Step 6: Post Summary (and Maybe Re-request Review)
 
-Post a comment on the PR summarizing how each finding was addressed, then re-request review from the original reviewer(s):
+Post a comment on the PR summarizing how each finding was addressed:
 
 ```
 gh pr comment $ARGUMENTS --body "<summary>"
+```
 
-# Re-request review from original reviewer(s)
+Then, **only if you were invoked directly by a human** (your task prompt does NOT say "Do NOT re-request review" — the implement orchestrator's prompts do), re-request review from the original reviewer(s):
+
+```
 gh pr view $ARGUMENTS --json reviews,reviewRequests \
   --jq '([.reviews[].author.login] + [.reviewRequests[].login]) | unique | .[]' \
   | while read reviewer; do gh pr edit $ARGUMENTS --add-reviewer "$reviewer"; done
 ```
+
+If you were launched by the `implement` skill's review loop, skip re-requesting entirely — the orchestrator controls whether and when another reviewer is spawned.
 
 Use this format for the summary:
 
