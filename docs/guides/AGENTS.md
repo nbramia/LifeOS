@@ -12,6 +12,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `scheduler.md` — Scheduler (triggers + actions): cron/one-off, notify/prompt/endpoint/agent
 - `scripts.md` — Available scripts and their usage
 - `apple-health.md` — Apple Health/Fitness ingestion (HealthBridge app + iOS Shortcut fallback)
+- `operations.md` — Operational reference: Apple Data Agent, Monarch re-auth, perf-trace commands, alerting
 - `troubleshooting.md` — Common issues and solutions
 - `claude-code-orchestration.md` — Claude Code multi-agent orchestration patterns
 - `doctor-bot.md` — Self-repair Telegram bot: report a problem → issue → implement → ship
