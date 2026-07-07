@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-06-18
+> **Last Updated:** 2026-07-07
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -69,6 +69,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
 | How do I import Apple Health/Fitness data? | [guides/apple-health.md](docs/guides/apple-health.md) |
+| How do I run the Apple Data Agent / re-auth Monarch / check alerting? | [guides/operations.md](docs/guides/operations.md) |
 | What does `/agents` show? | [specs/product/agent-viz.md](docs/specs/product/agent-viz.md) |
 | How does the `/agents` page work internally? | [specs/technical/agent-viz.md](docs/specs/technical/agent-viz.md) |
 | What does the CRM do (overview)? | [specs/product/crm-ui.md](docs/specs/product/crm-ui.md) |
@@ -181,8 +182,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 | Tier | Action |
 |------|--------|
-| **Always** | Run full test suite before commit |
-| **Always** | Restart server after Python changes |
+| **Always** | Run full test suite before commit (on the server — see § Testing) |
+| **Always** | Restart server after **deploying** Python changes (test-only runs in isolated copies don't need it) |
 | **Always** | Use `./scripts/server.sh` for server management |
 | **Always** | Use obviously synthetic data in tests and docs |
 | **Ask first** | Database schema changes (new or altered tables) |
@@ -192,7 +193,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | **Ask first** | Changes to MCP tool definitions |
 | **Ask first** | Breaking changes to HTTP client contract — see [client-surfaces.md](docs/specs/technical/client-surfaces.md) |
 | **Never** | Commit secrets, credentials, or API keys |
-| **Never** | Force push to main |
+| **Never** | Force push to main (sole exception: `merge-pr`'s post-merge timestamp normalization) |
 | **Never** | Skip pre-commit hooks (`--no-verify`) |
 | **Never** | Log, print, or expose real personal data |
 | **Never** | Run uvicorn directly (use `./scripts/server.sh`) |
@@ -208,6 +209,8 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 3. **Test manually** or run tests: `./scripts/test.sh`
 4. **Deploy**: `./scripts/deploy.sh "Your commit message"`
 
+`deploy.sh` is the direct-to-main hotfix path. PR-based work (e.g. `/implement`) uses feature branches + `merge-pr` and never calls `deploy.sh`.
+
 ---
 
 ## Key Files
@@ -220,6 +223,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/routes/tasks.py` | Task CRUD API endpoints |
 | `config/settings.py` | Environment configuration |
 | `config/people_dictionary.json` | Known people and aliases (restart required after edits) |
+| `web/` | Vanilla HTML/JS frontend served as static files (`index.html`, `home.html`, `crm.html`; SPA at `/chat`) |
 | `README.md` | Architecture overview with diagrams |
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
@@ -259,6 +263,10 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 ./scripts/test.sh smoke        # Unit + critical browser (used by deploy)
 ./scripts/test.sh all          # Full test suite
 ```
+
+- **Most checkouts have no venv** — `./scripts/test.sh` only works on the server (nathan-linux). Get a green run on the server **before** committing; rsync the tree to an isolated temp dir there if the branch isn't pushed. Committing/pushing first "so tests can run" is not allowed.
+- **Parallelism:** unit tests run under pytest-xdist (`-n auto --dist loadscope`) — reproduce flakes in that mode, not sequentially.
+- **Browser tests:** the web SPA is served at `/chat` (not `/`); `test.sh browser` covers only `test_ui_browser.py` and `test_e2e_flow.py` — run new browser test files directly with pytest.
 
 ---
 
@@ -370,57 +378,9 @@ Prefer `lifeos_*` tools for search/synthesis; reach for `gws` for direct Google 
 
 ---
 
-## Apple Data Agent (optional, macOS only)
+## Operations Pointers
 
-If you have a Mac with iMessage/phone data, it can export Apple ecosystem data and sync it to the Linux server nightly via `scripts/apple_data_agent.sh`.
-
-### macOS FDA (Full Disk Access)
-
-`/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. macOS cron cannot access `~/Library/Messages/` without FDA, so the Apple Data Agent cron job routes through this wrapper.
-
-If adding new cron jobs or scripts on macOS that need to access protected directories, route them through `LifeOS exec`.
-
-### Monarch Money (Financial Data)
-
-Auth uses a cached session token at `data/monarch_session.pickle`. Monthly sync runs on the 1st via `run_all_syncs.py` (phase 5). Live queries at `/api/monarch/*`.
-
-Re-authenticate when token expires (401/525):
-```bash
-~/.venvs/lifeos/bin/python -c "
-import asyncio
-from monarchmoney import MonarchMoney
-mm = MonarchMoney()
-asyncio.run(mm.interactive_login())
-mm.save_session('data/monarch_session.pickle')
-print('Session saved!')
-"
-```
-
----
-
-## Performance Tracing
-
-Every chat request is traced with per-stage timing. Traces stored in SQLite (`data/perf_traces.db`), exposed via API. See [specs/technical/observability.md](docs/specs/technical/observability.md) for full details.
-
-```bash
-curl http://localhost:8000/api/perf/stats | jq                    # Aggregate stats
-curl "http://localhost:8000/api/perf/traces?limit=10" | jq        # Recent traces
-curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
-```
-
----
-
-## Observability & Alerting
-
-| Severity | When Sent | Examples |
-|----------|-----------|----------|
-| **CRITICAL** | Immediately (rate-limited) | ChromaDB down, embedding model failed, vault inaccessible |
-| **WARNING** | Batched nightly (7 AM ET) | LLM API errors, backup failed, >5 degradation events |
-| **INFO** | Log only | Telegram retry, config defaults used |
-
-Set `LIFEOS_ALERT_EMAIL` in `.env` for alerts. Telegram backup via `telegram_bot_token` + `telegram_chat_id`.
-
-Services are tracked on-use, not by polling. Degradation events (fallback usage) are collected and reported in the nightly health check if there are 5+ in 24 hours.
+Operational procedures live in [guides/operations.md](docs/guides/operations.md): the Apple Data Agent (macOS export + FDA wrapper), Monarch Money re-auth, perf-tracing quick commands, and alerting severities. Perf/monitoring design: [specs/technical/observability.md](docs/specs/technical/observability.md).
 
 ---
 
