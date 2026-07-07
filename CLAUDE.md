@@ -30,22 +30,8 @@ Available as slash commands. See `.claude/skills/` for full details.
 ## Quick Reference
 
 **Read these first:**
-- [AGENTS.md](AGENTS.md) — Full project reference (principles, key files, common tasks)
+- [AGENTS.md](AGENTS.md) — Full project reference (principles, invariants, key files, commands)
 - [docs/AGENTS.md](docs/AGENTS.md) — Documentation standards
-
-**Key commands:**
-```bash
-./scripts/server.sh restart           # After code changes
-./scripts/test.sh                     # Run unit tests
-./scripts/deploy.sh "message"         # Test → restart → commit → push
-curl http://localhost:8000/health/full | jq   # Health check
-```
-
-## Critical Invariants
-
-- **Never run uvicorn directly** — always use `./scripts/server.sh`
-- **Always restart server after Python changes** — no auto-reload
-- **Venv lives on the server** at `~/.venvs/lifeos` — don't create one elsewhere
 
 ## Common Mistakes
 
