@@ -483,6 +483,45 @@ def test_build_command_defaults_to_opus(tmp_path: Path):
     assert cmd[cmd.index("--model") + 1] == "opus"
 
 
+def _captured_system_prompt(tmp_path: Path, session_factory) -> str:
+    """Run the executor with a capture spawn_fn and return the value passed
+    to --append-system-prompt."""
+    captured: dict = {}
+
+    def _spawn_capture(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc([
+            {"type": "system", "subtype": "init", "session_id": "cli-1"},
+            {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "ok"},
+        ])
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_capture)
+    session = session_factory(store)
+    executor.execute(session, {"description": "anything"})
+    cmd = captured["cmd"]
+    return cmd[cmd.index("--append-system-prompt") + 1]
+
+
+def test_operator_system_prompt_keeps_pause_and_relay_clarify_wording(tmp_path: Path):
+    """Operator /claude sessions do pause on [CLARIFY] (BLOCKED + Telegram
+    question) — their prompt must keep promising exactly that."""
+    prompt = _captured_system_prompt(tmp_path, _seed_session)
+    assert "Your session will pause and the user's" in prompt
+    assert "answer will be relayed back to you" in prompt
+    assert "parent agent" not in prompt
+
+
+def test_child_system_prompt_describes_parent_clarify_routing(tmp_path: Path):
+    """A spawned child's [CLARIFY] folds into its output and the turn ends
+    (#356) — its prompt must describe that honestly instead of promising an
+    operator pause-and-relay that never happens."""
+    prompt = _captured_system_prompt(tmp_path, _seed_child_session)
+    assert "Your session will pause and the user's" not in prompt
+    assert "parent agent" in prompt
+    # The child is still told to stop after asking.
+    assert "STOP" in prompt
+
+
 def test_tool_use_records_transcript_event(tmp_path: Path):
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},

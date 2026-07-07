@@ -21,6 +21,24 @@ def test_preamble_contains_session_id_and_core_mechanic():
         assert tool in p
 
 
+def test_preamble_explains_child_clarification_reopen():
+    """A parent must learn from its prompt what a child's
+    '[needs clarification]' output means and how to answer it: send the
+    answer (which reopens the child with full context), THEN yield again."""
+    p = delegation.delegation_preamble("SID-1", trigger="To do X,", model='"local"')
+    assert "[needs clarification]" in p
+    assert delegation.SEND in p
+    assert delegation.YIELD_UNTIL in p
+    # Ordering matters: a yielded parent can't send, so the answer goes first.
+    assert "before" in p.lower()
+
+
+def test_inter_agent_block_explains_child_clarification_reopen():
+    block = delegation.INTER_AGENT_BLOCK
+    assert "[needs clarification]" in block
+    assert delegation.SEND in block
+
+
 def test_inter_agent_block_references_full_protocol():
     block = delegation.INTER_AGENT_BLOCK
     for tool in (
@@ -46,7 +64,10 @@ def test_inter_agent_block_text_is_pinned():
         "`lifeos_agent_check`. When you have nothing to do until specific children\n"
         "finish, call `lifeos_agent_yield_until(children=[...])` — this ends your\n"
         "session cleanly (no idle billing) and resumes you when the children are\n"
-        "done. Prefer `yield_until` over polling.\n"
+        "done. Prefer `yield_until` over polling. If a child's output contains\n"
+        "\"[needs clarification] …\", it stopped mid-task to ask you a question:\n"
+        "answer with `lifeos_agent_send` (this reopens the child with its full prior\n"
+        "context), then yield on it again — send the answer before yielding.\n"
         "</inter_agent>"
     )
 

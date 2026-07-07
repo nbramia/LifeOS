@@ -281,6 +281,127 @@ def test_send_rejects_terminal_session(ctx, store, parent):
     assert result["error"] == "terminal"
 
 
+def _seed_completed_cli_child(
+    store, parent, *, task_id="cli_child", routing="claude_code",
+    status=STATUS_COMPLETED, cli_session_id="cli-abc-123",
+):
+    """A CLI child that finished a turn — the reopen-on-send target shape."""
+    child = store.create(
+        task_id=task_id, status=status, routing=routing,
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    if cli_session_id:
+        store.set_claude_code_session_id(task_id, cli_session_id)
+    return child
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("routing", ["claude_code", "codex"])
+def test_send_reopens_own_completed_cli_child(ctx, store, transcript, parent, routing):
+    """A parent answering its completed CLI child's [needs clarification]
+    question reopens it: message enqueued, status flipped back to CLAIMED so
+    the spawned-session dispatcher resumes it via the persisted CLI session id."""
+    child = _seed_completed_cli_child(store, parent, routing=routing)
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "use API v2",
+    })
+    assert result["ok"]
+    assert result["reopened"] is True
+    refreshed = store.get_by_session_id(child.session_id)
+    assert refreshed.status == STATUS_CLAIMED
+    pending = store.drain_pending_messages(child.session_id)
+    assert len(pending) == 1
+    assert pending[0]["content"] == "use API v2"
+    assert pending[0]["sender_id"] == parent.session_id
+    kinds = [e["kind"] for e in transcript.read(child.session_id)]
+    assert "inter_agent_send_reopen" in kinds
+
+
+@pytest.mark.unit
+def test_send_reopen_message_enqueued_before_status_flip(ctx, store, parent, monkeypatch):
+    """The pending message must exist by the time the child turns CLAIMED —
+    otherwise the dispatch tick could resume the child with an empty prompt."""
+    child = _seed_completed_cli_child(store, parent)
+    calls: list[str] = []
+    original_enqueue = store.enqueue_message
+    original_update = store.update_status
+    monkeypatch.setattr(store, "enqueue_message",
+                        lambda *a, **k: (calls.append("enqueue"), original_enqueue(*a, **k))[1])
+    monkeypatch.setattr(store, "update_status",
+                        lambda *a, **k: (calls.append("status"), original_update(*a, **k))[1])
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "answer",
+    })
+    assert result["ok"]
+    assert calls.index("enqueue") < calls.index("status")
+
+
+@pytest.mark.unit
+def test_send_rejects_reopen_of_failed_child(ctx, store, parent):
+    """Only COMPLETED children reopen — a FAILED child stays terminal."""
+    child = _seed_completed_cli_child(store, parent, status=STATUS_FAILED)
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "try again",
+    })
+    assert not result["ok"]
+    assert result["error"] == "terminal"
+    assert store.get_by_session_id(child.session_id).status == STATUS_FAILED
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("routing", ["local", "claude"])
+def test_send_rejects_reopen_of_non_cli_child(ctx, store, parent, routing):
+    """local/managed children have no CLI resume path — reopen is CLI-only."""
+    child = _seed_completed_cli_child(store, parent, routing=routing)
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "hello",
+    })
+    assert not result["ok"]
+    assert result["error"] == "terminal"
+    assert store.get_by_session_id(child.session_id).status == STATUS_COMPLETED
+
+
+@pytest.mark.unit
+def test_send_rejects_reopen_without_cli_session_id(ctx, store, parent):
+    """A completed child whose init never persisted a CLI session id can't be
+    resumed (`-r` needs the UUID) — reopen must refuse, not strand it CLAIMED."""
+    child = _seed_completed_cli_child(store, parent, cli_session_id=None)
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": child.session_id, "message": "hello",
+    })
+    assert not result["ok"]
+    assert result["error"] == "terminal"
+    assert store.get_by_session_id(child.session_id).status == STATUS_COMPLETED
+
+
+@pytest.mark.unit
+def test_send_rejects_reopen_of_non_direct_child(ctx, store, parent):
+    """Only the direct parent may reopen — a same-lineage grandparent or
+    sibling sending to a completed session still gets the terminal error."""
+    middle = store.create(
+        task_id="mid", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    grandchild = store.create(
+        task_id="gc", status=STATUS_COMPLETED, routing="claude_code",
+        parent_session_id=middle.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=2,
+    )
+    store.set_claude_code_session_id("gc", "cli-gc-1")
+    # ctx's caller is `parent` — the grandparent of `grandchild`.
+    result = dispatch(ctx, "lifeos_agent_send", {
+        "session_id": grandchild.session_id, "message": "hi",
+    })
+    assert not result["ok"]
+    assert result["error"] == "terminal"
+    assert store.get_by_session_id(grandchild.session_id).status == STATUS_COMPLETED
+
+
 @pytest.mark.unit
 def test_check_returns_session_metadata(ctx, store, parent):
     child = store.create(
