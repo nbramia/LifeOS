@@ -246,6 +246,54 @@ class TestHandleUpdate:
         assert "no, that was 145" in sent_text
 
     @pytest.mark.asyncio
+    async def test_primary_bot_prepends_reply_quote_when_hooks_miss(self):
+        """Issue #435: a reply to an ordinary primary-bot message (not a
+        claude-code/agent-worker thread) carries the quoted text into chat."""
+        listener = self._listener("primary", "999")
+        update = {"message": {
+            "text": "what does the third bullet mean?",
+            "chat": {"id": 999},
+            "message_id": 10,
+            "reply_to_message": {"message_id": 9, "text": "Tonight's priorities:\n- a\n- b\n- c"},
+        }}
+        with patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock, return_value=False), \
+             patch.object(listener, "_maybe_deposit_agent_answer", return_value=False), \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "It means c", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "replying to my earlier message" in sent_text
+        assert "Tonight's priorities" in sent_text
+        assert "what does the third bullet mean?" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_long_quoted_reply_is_truncated(self):
+        from api.services.telegram import MAX_QUOTED_REPLY_CHARS
+        listener = self._listener("primary", "999")
+        long_quote = "x" * (MAX_QUOTED_REPLY_CHARS + 500)
+        update = {"message": {
+            "text": "explain that",
+            "chat": {"id": 999},
+            "message_id": 11,
+            "reply_to_message": {"message_id": 9, "text": long_quote},
+        }}
+        with patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock, return_value=False), \
+             patch.object(listener, "_maybe_deposit_agent_answer", return_value=False), \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "x" * MAX_QUOTED_REPLY_CHARS + "…" in sent_text
+        assert "x" * (MAX_QUOTED_REPLY_CHARS + 1) not in sent_text
+        assert "explain that" in sent_text
+
+    @pytest.mark.asyncio
     async def test_plain_message_has_no_reply_context(self):
         listener = self._listener("fitness", "999", persona="P")
         update = {"message": {"text": "bench 135x8", "chat": {"id": 999}, "message_id": 8}}
