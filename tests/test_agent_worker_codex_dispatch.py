@@ -307,6 +307,32 @@ def test_codex_child_budget_notice_gated(tmp_path: Path):
     assert reasons == ["wall_seconds"]
 
 
+def test_codex_child_executor_crash_records_failure_reason(tmp_path: Path):
+    """An executor crash (execute() raising) bypasses the dispatch tail via
+    the except-handler's early return — the crash handler must still record
+    the child's failure reason so the parent's resume turn carries a
+    `reason:` line (#433 review round 1). Parity with the claude_code test."""
+    class _CrashingCodexExecutor:
+        def execute(self, session, task):
+            raise RuntimeError("synthetic launch crash")
+
+        def resume(self, session, message):
+            raise RuntimeError("synthetic launch crash")
+
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    worker = _make_worker(tmp_path, codex_executor=_CrashingCodexExecutor(),
+                          plain_sends=plain_sends, withid_sends=withid_sends)
+    child = _seed_codex_child(worker)
+
+    worker._dispatch_codex_session(child, [{"content": "sub-task"}])
+
+    assert worker.session_store.get("cx-child").status == STATUS_FAILED
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
+    assert reasons == ["codex execute crashed: synthetic launch crash"]
+
+
 def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):
     """#379 parity: a FAILED codex outcome carrying reason=REASON_KILLED is the
     executor's signal that the operator deliberately killed the session. The

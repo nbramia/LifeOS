@@ -633,6 +633,37 @@ def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
     assert reasons == ["wall_seconds"]
 
 
+def test_child_executor_crash_records_failure_reason(tmp_path: Path):
+    """An executor crash (execute() raising) bypasses the dispatch tail via
+    the except-handler's early return — the crash handler must still record
+    the child's failure reason so the parent's resume turn carries a
+    `reason:` line (#433 review round 1)."""
+    class _CrashingExecutor:
+        def execute(self, session, task):
+            raise RuntimeError("synthetic launch crash")
+
+        def resume(self, session, message):
+            raise RuntimeError("synthetic launch crash")
+
+    worker, store, _, sent = _capturing_worker(
+        tmp_path, claude_code_executor=_CrashingExecutor())
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-crash", routing="claude_code",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+    worker._dispatch_claude_code_session(child, [{"content": "sub-task"}])
+
+    assert sent == []  # crash path sends no operator notice
+    assert store.get("child-crash").status == STATUS_FAILED
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
+    assert reasons == ["claude_code execute crashed: synthetic launch crash"]
+
+
 def test_child_failure_does_not_mirror(tmp_path: Path):
     """A child's failure notice must not mirror into a linked conversation
     either (#431) — pins the restructure that moved the child protection from

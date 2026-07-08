@@ -650,6 +650,86 @@ def test_resume_message_carries_failed_child_reason(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_resume_message_latest_failure_event_wins(tmp_path: Path):
+    """A child that hit budget, was reopened (#428), then failed shows the
+    NEWER failed reason in the parent's resume turn — _child_failure_reason
+    is latest-event-wins across both child_*_internal kinds."""
+    api = FakeApi(tasks=[
+        {"id": "p1", "description": "orchestrate the thing",
+         "status": "in_progress", "tags": [RUNNING_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="wrapped up",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    parent = w.session_store.create(
+        task_id="p1", routing="local", status=STATUS_YIELDED, expected_output="text",
+    )
+    child = w.session_store.create(
+        task_id="c_retry", routing="claude_code", status=STATUS_FAILED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    w.transcript_store.append(child.session_id, "child_budget_exceeded_internal", {
+        "parent_session_id": parent.session_id, "reason": "budget exceeded (wall_seconds)",
+    })
+    w.transcript_store.append(child.session_id, "child_failed_internal", {
+        "parent_session_id": parent.session_id, "reason": "tests failed on retry",
+    })
+    w.session_store.set_yield_waiting_for("p1", [child.session_id])
+
+    w._resume_yielded_for_children()
+
+    user_msgs = [m for m in w.session_store.get_messages(parent.session_id)
+                 if m["role"] == "user"]
+    assert user_msgs, "resume should have appended a user turn"
+    resume = user_msgs[-1]["content"]
+    assert "reason: tests failed on retry" in resume
+    assert "wall_seconds" not in resume
+    assert resume.count("reason:") == 1
+
+
+@pytest.mark.unit
+def test_completed_child_leftover_failure_event_no_reason_line(tmp_path: Path):
+    """A COMPLETED child carrying a leftover child_*_internal event (e.g. from
+    a failed run before a #428 reopen) contributes NO reason line — the status
+    gate in _build_resume_message keeps reason lines failed/budget-only."""
+    api = FakeApi(tasks=[
+        {"id": "p1", "description": "orchestrate the thing",
+         "status": "in_progress", "tags": [RUNNING_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="wrapped up",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    parent = w.session_store.create(
+        task_id="p1", routing="local", status=STATUS_YIELDED, expected_output="text",
+    )
+    child = w.session_store.create(
+        task_id="c_reopened", routing="claude_code", status=STATUS_COMPLETED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    w.transcript_store.append(child.session_id, "child_failed_internal", {
+        "parent_session_id": parent.session_id, "reason": "stale failure from first run",
+    })
+    w.session_store.set_yield_waiting_for("p1", [child.session_id])
+
+    w._resume_yielded_for_children()
+
+    user_msgs = [m for m in w.session_store.get_messages(parent.session_id)
+                 if m["role"] == "user"]
+    assert user_msgs, "resume should have appended a user turn"
+    resume = user_msgs[-1]["content"]
+    assert f"[{STATUS_COMPLETED}]" in resume
+    assert "reason:" not in resume
+
+
+@pytest.mark.unit
 def test_cloud_yield_resume_creates_fresh_managed_session_with_children_output(tmp_path: Path):
     """Live bug: cloud parents that called yield_until ended up in FAILED
     because `_resume_yielded_for_children` short-circuited non-local
