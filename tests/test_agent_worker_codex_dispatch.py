@@ -277,6 +277,10 @@ def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
     assert not any("failed" in s.lower() for s in plain_sends)
     assert withid_sends == []
     assert worker.session_store.get("cx-child").status == STATUS_FAILED
+    # #433: the reason is persisted for the parent's resume turn.
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
+    assert reasons == ["boom"]
 
 
 def test_codex_child_budget_notice_gated(tmp_path: Path):
@@ -296,6 +300,11 @@ def test_codex_child_budget_notice_gated(tmp_path: Path):
 
     assert not any("budget" in s.lower() for s in plain_sends)
     assert worker.session_store.get("cx-child").status == STATUS_BUDGET_EXCEEDED
+    # #433: the reason is persisted for the parent's resume turn.
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"]
+               for e in events if e["kind"] == "child_budget_exceeded_internal"]
+    assert reasons == ["wall_seconds"]
 
 
 def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):

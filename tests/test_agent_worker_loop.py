@@ -593,6 +593,63 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_resume_message_carries_failed_child_reason(tmp_path: Path):
+    """A parent resuming after failed/budget children sees WHY each one died
+    (#433): the resume turn appends a `reason:` line under the status header,
+    read from the child's `child_*_internal` transcript event. A failed child
+    with no such event (pre-#433 CLI transcripts) gets no reason line."""
+    api = FakeApi(tasks=[
+        {"id": "p1", "description": "orchestrate the thing",
+         "status": "in_progress", "tags": [RUNNING_TAG, "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="wrapped up",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    parent = w.session_store.create(
+        task_id="p1", routing="local", status=STATUS_YIELDED, expected_output="text",
+    )
+    failed_child = w.session_store.create(
+        task_id="c_fail", routing="claude_code", status=STATUS_FAILED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    budget_child = w.session_store.create(
+        task_id="c_budget", routing="codex", status=STATUS_BUDGET_EXCEEDED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    legacy_child = w.session_store.create(
+        task_id="c_legacy", routing="claude_code", status=STATUS_FAILED,
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+    w.transcript_store.append(failed_child.session_id, "child_failed_internal", {
+        "parent_session_id": parent.session_id, "reason": "claude exited with code 2",
+    })
+    w.transcript_store.append(budget_child.session_id, "child_budget_exceeded_internal", {
+        "parent_session_id": parent.session_id, "reason": "budget exceeded (wall_seconds)",
+    })
+    # legacy_child deliberately has no child_*_internal event.
+    w.session_store.set_yield_waiting_for(
+        "p1", [failed_child.session_id, budget_child.session_id, legacy_child.session_id],
+    )
+
+    w._resume_yielded_for_children()
+
+    user_msgs = [m for m in w.session_store.get_messages(parent.session_id)
+                 if m["role"] == "user"]
+    assert user_msgs, "resume should have appended a user turn"
+    resume = user_msgs[-1]["content"]
+    assert "reason: claude exited with code 2" in resume
+    assert "reason: budget exceeded (wall_seconds)" in resume
+    # Exactly two reason lines — the eventless legacy child contributes none.
+    assert resume.count("reason:") == 2
+
+
+@pytest.mark.unit
 def test_cloud_yield_resume_creates_fresh_managed_session_with_children_output(tmp_path: Path):
     """Live bug: cloud parents that called yield_until ended up in FAILED
     because `_resume_yielded_for_children` short-circuited non-local

@@ -599,6 +599,10 @@ def test_child_failure_sends_no_operator_notice(tmp_path: Path):
 
     assert not any("failed" in s.lower() for s in sent)
     assert store.get("child-fail").status == STATUS_FAILED
+    # #433: the reason is persisted for the parent's resume turn.
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
+    assert reasons == ["boom"]
 
 
 def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
@@ -622,6 +626,11 @@ def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
 
     assert not any("budget" in s.lower() for s in sent)
     assert store.get("child-budget").status == STATUS_BUDGET_EXCEEDED
+    # #433: the reason is persisted for the parent's resume turn.
+    events = worker.transcript_store.read(child.session_id)
+    reasons = [e["payload"]["reason"]
+               for e in events if e["kind"] == "child_budget_exceeded_internal"]
+    assert reasons == ["wall_seconds"]
 
 
 def test_child_failure_does_not_mirror(tmp_path: Path):
