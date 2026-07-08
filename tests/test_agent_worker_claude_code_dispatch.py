@@ -574,6 +574,28 @@ def test_child_completion_does_not_mirror(tmp_path: Path):
     assert conv_store.get_messages(conv.id) == []
 
 
+def test_child_failure_sends_no_operator_notice(tmp_path: Path):
+    """A spawned child (parent set) that FAILS must not send the operator a
+    "⚠️ … failed" Telegram notice (#431) — the parent's resume turn already
+    carries the child's [failed] status header. FAILED is still persisted."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
+    )
+    worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-fail", routing="claude_code",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+    worker._dispatch_claude_code_session(child, [{"content": "sub-task"}])
+
+    assert not any("failed" in s.lower() for s in sent)
+    assert store.get("child-fail").status == STATUS_FAILED
+
+
 # =============================================================================
 # #379 — operator-killed session emits no post-kill notice
 # =============================================================================

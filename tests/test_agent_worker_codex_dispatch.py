@@ -252,6 +252,52 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
     assert any("failed" in s.lower() for s in plain_sends)
 
 
+def _seed_codex_child(worker):
+    parent = worker.session_store.create(task_id="parent-1", routing="local")
+    return worker.session_store.create(
+        task_id="cx-child", routing="codex",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+
+def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
+    """A spawned codex child that FAILS must not send the operator a
+    "⚠️ … failed" notice (#431) — the parent's resume turn already carries
+    the child's [failed] status header. FAILED is still persisted."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    child = _seed_codex_child(worker)
+
+    worker._dispatch_codex_session(child, [{"content": "sub-task"}])
+
+    assert not any("failed" in s.lower() for s in plain_sends)
+    assert withid_sends == []
+    assert worker.session_store.get("cx-child").status == STATUS_FAILED
+
+
+def test_codex_child_budget_notice_gated(tmp_path: Path):
+    """A spawned codex child that exceeds budget must not send the operator a
+    "⚠️ … budget" notice (#431); the terminal status is still persisted."""
+    from api.services.agent_worker.session_store import STATUS_BUDGET_EXCEEDED
+
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason="wall_seconds")
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    child = _seed_codex_child(worker)
+
+    worker._dispatch_codex_session(child, [{"content": "sub-task"}])
+
+    assert not any("budget" in s.lower() for s in plain_sends)
+    assert worker.session_store.get("cx-child").status == STATUS_BUDGET_EXCEEDED
+
+
 def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):
     """#379 parity: a FAILED codex outcome carrying reason=REASON_KILLED is the
     executor's signal that the operator deliberately killed the session. The
