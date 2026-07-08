@@ -403,6 +403,11 @@ class CodexExecutor:
                 "model": state.model,
                 "tool_call_count": state.tool_call_count,
                 "final_chars": len(state.final_text),
+                # Persist the text itself so a parent that spawned this session
+                # can read it via _child_final_text — a child's completion never
+                # streams to the operator (#429), so this is its only path out
+                # (parity with claude_code_completed, #349).
+                "final_text": state.final_text,
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,

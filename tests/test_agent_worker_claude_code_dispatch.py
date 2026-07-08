@@ -184,6 +184,22 @@ def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
     assert "Match 1: A vs B at noon." in worker._child_final_text(child)
 
 
+def test_child_final_text_reads_codex_completed_event(tmp_path: Path):
+    """The parent pulls a codex child's final_text from the codex_completed
+    transcript event — the child's only path out now that the codex completion
+    send is child-gated too (#429, parity with #349)."""
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="codex", parent_session_id=parent.session_id,
+    )
+    transcripts.append(child.session_id, "codex_completed", {
+        "final_chars": 13, "final_text": "Child result.",
+    })
+
+    assert worker._child_final_text(child) == "Child result."
+
+
 def test_resume_delivers_all_pending_messages(tmp_path: Path):
     """A resume dispatch must carry EVERY drained pending message, in order —
     not just pending[0]. Reopen-on-send (#428) makes multi-enqueue likely

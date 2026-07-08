@@ -169,6 +169,43 @@ def test_executor_handles_full_stream(stores, monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_codex_completed_event_persists_final_text(stores, tmp_path):
+    """The `codex_completed` transcript event carries the final text itself
+    (#429): a spawned codex child never streams to the operator, so this event
+    is the parent's only path to the child's output (via _child_final_text) —
+    parity with claude_code_completed (#349)."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-ft", session_id="sess_codex_ft", status="claimed",
+        routing="codex", origin="operator",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-ft"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "Child result."}},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 10, "cached_input_tokens": 0,
+            "output_tokens": 5, "reasoning_output_tokens": 0,
+        }},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        notification_callback=lambda _msg: None,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    outcome = executor.execute(session, {"description": "sub-task", "working_dir": str(tmp_path)})
+    assert outcome.status == STATUS_COMPLETED
+    completed = [
+        e for e in tr_store.read(session.session_id) if e["kind"] == "codex_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["final_text"] == "Child result."
+    assert completed[0]["payload"]["final_chars"] == len("Child result.")
+
+
+@pytest.mark.unit
 def test_high_cost_does_not_cap_subscription_route(stores, monkeypatch, tmp_path):
     """Codex is subscription-billed — a high reported cost must NOT cap the task.
     Only the managed/API route enforces a dollar cap. Here the turn reports
