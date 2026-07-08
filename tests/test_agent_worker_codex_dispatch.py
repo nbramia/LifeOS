@@ -134,6 +134,31 @@ class _ResumableStubCodexExecutor(_StubCodexExecutor):
         return self.outcome
 
 
+def test_codex_resume_delivers_all_pending_messages(tmp_path: Path):
+    """A codex resume dispatch carries EVERY drained pending message in order —
+    not just pending[0]. A codex child can collect both an operator threaded
+    reply and a parent reopen answer (#428) before the tick claims it; each
+    send already returned delivered=true."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _ResumableStubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="resumed.")
+    )
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    worker.session_store.create(task_id="cx-resume", routing="codex", origin="operator")
+    # A persisted CLI session id routes dispatch into the resume branch.
+    worker.session_store.set_claude_code_session_id("cx-resume", "codex-uuid-1")
+    session = worker.session_store.get("cx-resume")
+
+    worker._dispatch_codex_session(session, [
+        {"content": "first follow-up"},
+        {"content": "second follow-up"},
+    ])
+
+    assert stub.calls == []  # resume, never a fresh execute
+    assert stub.resume_calls == [("cx-resume", "first follow-up\n\nsecond follow-up")]
+
+
 def test_codex_crash_before_init_does_not_reexecute(tmp_path: Path):
     """A codex session whose subprocess launched once (a `codex_spawn` event is
     present) but never persisted its session id must NOT re-run the original

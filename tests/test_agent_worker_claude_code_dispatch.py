@@ -184,6 +184,73 @@ def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
     assert "Match 1: A vs B at noon." in worker._child_final_text(child)
 
 
+def test_resume_delivers_all_pending_messages(tmp_path: Path):
+    """A resume dispatch must carry EVERY drained pending message, in order —
+    not just pending[0]. Reopen-on-send (#428) makes multi-enqueue likely
+    (e.g. a parent sends twice before the dispatch tick claims the reopened
+    child), and each send already returned delivered=true."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="resumed.")
+    )
+    worker, store, _, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    # A persisted CLI session id is what routes dispatch into the resume branch.
+    store.set_claude_code_session_id("child-1", "cli-uuid-1")
+    child = store.get("child-1")
+
+    worker._dispatch_claude_code_session(child, [
+        {"content": "use the staging repo"},
+        {"content": "and target the v2 branch"},
+    ])
+
+    assert stub.calls == []  # resume, never a fresh execute
+    assert stub.resume_calls == [
+        ("child-1", "use the staging repo\n\nand target the v2 branch"),
+    ]
+
+
+def test_child_final_text_latest_completed_event_wins_even_when_empty(tmp_path: Path):
+    """The LATEST completed event's final_text wins even when empty (#428):
+    a reopened child whose second run completes with no final text must not
+    re-deliver the first run's '[needs clarification] …' question to the
+    parent — that would invite a re-answer loop."""
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    transcripts.append(child.session_id, "claude_code_completed", {
+        "final_chars": 33, "final_text": "[needs clarification] which repo?",
+    })
+    transcripts.append(child.session_id, "claude_code_completed", {
+        "final_chars": 0, "final_text": "",
+    })
+
+    assert worker._child_final_text(child) == ""
+
+
+def test_child_final_text_legacy_event_without_key_does_not_clobber(tmp_path: Path):
+    """A legacy completed event that never carried a `final_text` key (pre-#349
+    payloads recorded final_chars only) must not wipe a real value from an
+    earlier event."""
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
+    )
+    transcripts.append(child.session_id, "claude_code_completed", {
+        "final_chars": 24, "final_text": "Match 1: A vs B at noon.",
+    })
+    transcripts.append(child.session_id, "claude_code_completed", {
+        "final_chars": 0,  # legacy: no final_text key at all
+    })
+
+    assert worker._child_final_text(child) == "Match 1: A vs B at noon."
+
+
 def test_vault_claude_task_marked_complete_on_finish(tmp_path: Path):
     """A vault-routed ``#agent #claude`` task (origin != 'operator', no parent)
     must be reconciled in the vault when the Claude Code session completes:
