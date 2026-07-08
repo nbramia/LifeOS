@@ -1548,6 +1548,10 @@ class Worker:
                           "re-trigger to retry",
                 "prior_launch_count": prior_launches,
             })
+            self._record_child_failure_reason(
+                session, STATUS_FAILED,
+                "not re-executed after prior subprocess launch — possible "
+                "duplicate side effects")
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             try:
                 _send(
@@ -1577,6 +1581,8 @@ class Worker:
                 outcome = claude_code.resume(session, resume_message)
             except Exception as exc:
                 logger.exception("claude_code resume crashed for %s: %s", session.task_id, exc)
+                self._record_child_failure_reason(
+                    session, STATUS_FAILED, f"claude_code resume crashed: {exc}")
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
         else:
@@ -1597,6 +1603,8 @@ class Worker:
                 outcome = claude_code.execute(session, task)
             except Exception as exc:
                 logger.exception("claude_code execute crashed for %s: %s", session.task_id, exc)
+                self._record_child_failure_reason(
+                    session, STATUS_FAILED, f"claude_code execute crashed: {exc}")
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
 
@@ -1726,6 +1734,9 @@ class Worker:
             # thread (no-op for Telegram-origin); a child is never
             # conversation-linked, so the child gate above also keeps this correct.
             self._mirror_to_conversation(sid, notice)
+        # #433: persist the failure reason so the parent's resume turn can
+        # carry a `reason:` line (no-op for non-children).
+        self._record_child_failure_reason(session, outcome.status, outcome.reason)
         # Persist the terminal status to the session ROW (#400). The executor
         # sets RUNNING on launch but doesn't always flip to a terminal status on
         # failure (e.g. the binary-not-found path returns FAILED while leaving the
@@ -1803,6 +1814,10 @@ class Worker:
                 "reason": "subprocess launched without a persisted session id "
                           "(interrupted before init); not re-executing to avoid repeating side effects",
             })
+            self._record_child_failure_reason(
+                session, STATUS_FAILED,
+                "not re-executed after prior subprocess launch — possible "
+                "duplicate side effects")
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             try:
                 self._telegram_send(
@@ -1829,6 +1844,8 @@ class Worker:
                 outcome = codex.resume(session, resume_message)
             except Exception as exc:
                 logger.exception("codex resume crashed for %s: %s", session.task_id, exc)
+                self._record_child_failure_reason(
+                    session, STATUS_FAILED, f"codex resume crashed: {exc}")
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
         else:
@@ -1848,6 +1865,8 @@ class Worker:
                 outcome = codex.execute(session, task)
             except Exception as exc:
                 logger.exception("codex execute crashed for %s: %s", session.task_id, exc)
+                self._record_child_failure_reason(
+                    session, STATUS_FAILED, f"codex execute crashed: {exc}")
                 self.session_store.update_status(session.task_id, STATUS_FAILED)
                 return
 
@@ -1907,6 +1926,9 @@ class Worker:
             # thread (no-op for Telegram-origin). A child is never
             # conversation-linked, so the child gate above also keeps this correct.
             self._mirror_to_conversation(sid, notice)
+        # #433: persist the failure reason for the parent's resume turn —
+        # parity with the claude_code branch (no-op for non-children).
+        self._record_child_failure_reason(session, outcome.status, outcome.reason)
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
         # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
@@ -2174,7 +2196,7 @@ class Worker:
             else:
                 self.transcript_store.append(sid, "child_budget_exceeded_internal", {
                     "parent_session_id": session.parent_session_id,
-                    "reason": outcome.reason,
+                    "reason": outcome.reason or "",
                 })
             return
 
@@ -2192,7 +2214,7 @@ class Worker:
             else:
                 self.transcript_store.append(sid, "child_failed_internal", {
                     "parent_session_id": session.parent_session_id,
-                    "reason": outcome.reason,
+                    "reason": outcome.reason or "",
                 })
             return
 
@@ -2503,6 +2525,13 @@ class Worker:
             )
             header = f"- [{c.status}] {c.session_id} — {tokens} tokens, ${c.total_dollars:.4f}"
             parts.append(header)
+            if c.status in (STATUS_FAILED, STATUS_BUDGET_EXCEEDED):
+                # #433: tell the parent WHY the child died so it can decide
+                # retry vs re-spawn vs escalate — status alone can't
+                # distinguish "binary not found" from "tests failed".
+                reason = self._child_failure_reason(c)
+                if reason:
+                    parts.append(f"  reason: {reason}")
             body = self._child_final_text(c)
             if body:
                 # Cap each child body so the combined message stays
@@ -2513,6 +2542,37 @@ class Worker:
                 for line in body.splitlines():
                     parts.append(f"  {line}")
         return "\n".join(parts)
+
+    def _child_failure_reason(self, child: Session) -> str:
+        """Pull a failed/budget child's failure reason from its transcript —
+        the `child_failed_internal` / `child_budget_exceeded_internal` events
+        written by _handle_outcome (local/managed children) and
+        _record_child_failure_reason (CLI failure paths, #433). Latest event
+        wins; returns "" when absent (transcripts from before the CLI paths
+        wrote these)."""
+        path = self.transcript_store.dir / f"{child.session_id}.jsonl"
+        reason = ""
+        for d in _iter_transcript(path):
+            if d.get("kind", "") in (
+                "child_failed_internal", "child_budget_exceeded_internal",
+            ):
+                reason = (d.get("payload", {}) or {}).get("reason") or ""
+        return reason
+
+    def _record_child_failure_reason(
+        self, session: Session, status: str, reason: str | None
+    ) -> None:
+        """#433: persist a child's failure reason for the parent's resume turn —
+        same child_*_internal vocabulary _handle_outcome writes for local/managed
+        children; read back by _child_failure_reason. No-op for non-children."""
+        if not session.parent_session_id:
+            return
+        kind = ("child_budget_exceeded_internal"
+                if status == STATUS_BUDGET_EXCEEDED else "child_failed_internal")
+        self.transcript_store.append(session.session_id, kind, {
+            "parent_session_id": session.parent_session_id,
+            "reason": reason or "",
+        })
 
     def _child_final_text(self, child: Session) -> str:
         """Pull the child's final_text from the cache (cloud) or transcript
