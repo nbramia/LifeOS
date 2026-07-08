@@ -119,6 +119,39 @@ def test_codex_completion_empty_final_registers_no_anchor(tmp_path: Path):
     assert worker.session_store.get_open_question_by_message_id(777) is None
 
 
+def test_codex_child_completion_stays_silent_to_operator(tmp_path: Path):
+    """A spawned codex child (parent set) must not stream its completion to
+    the operator nor register an operator-replyable followup anchor (#429 —
+    the #349 gate the codex path never got). Its output reaches the parent
+    via the codex_completed transcript event / _child_final_text instead."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Child result.")
+    )
+    worker = _make_worker(
+        tmp_path, codex_executor=stub,
+        plain_sends=plain_sends, withid_sends=withid_sends,
+    )
+    parent = worker.session_store.create(task_id="parent-1", routing="local")
+    child = worker.session_store.create(
+        task_id="cx-child", routing="codex",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+    worker._dispatch_codex_session(child, [{"content": "do the sub-task"}])
+
+    # Silent to the operator: no completion send on either sender, no anchor.
+    assert withid_sends == []
+    assert "Child result." not in plain_sends
+    assert worker.session_store.get_open_question_by_message_id(777) is None
+    # The dispatch still finalizes normally.
+    kinds = [e["kind"] for e in worker.transcript_store.read(child.session_id)]
+    assert "codex_handled_completion" in kinds
+
+
 # ---------------------------------------------------------------------------
 # Crash-before-init re-execute guard + terminal-status persistence (#411,
 # mirroring #400/#408 for the claude_code path)

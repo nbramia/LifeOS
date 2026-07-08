@@ -1848,8 +1848,15 @@ class Worker:
                 return
 
         if outcome.status == STATUS_COMPLETED:
+            # Spawned children (have a parent) stay silent to the operator —
+            # the parent relays their findings in its own completion message
+            # (#429, the #349 gate the codex path never got). The child's
+            # final_text reaches the parent via the codex_completed transcript
+            # event / _child_final_text instead. Gating the followup anchor too
+            # matters for reopen-on-send (#428): an operator threaded reply and
+            # a parent answer must not both enqueue against the same child.
             body = outcome.final_text.strip() if outcome.final_text else ""
-            if body:
+            if body and not session.parent_session_id:
                 try:
                     sent_ids = self._telegram_send_with_id(body) or []
                 except Exception as exc:
@@ -1867,12 +1874,10 @@ class Worker:
                 # #311: mirror the final result into the web/voice thread that
                 # spawned this codex session (no-op for Telegram-origin). Codex
                 # has no rich [NOTIFY] stream, so this terminal mirror is the
-                # whole web round-trip for it. Non-child only, for parity with
-                # the claude_code path: codex CAN be a child (it's in
-                # inter_agent.SPAWN_MODELS), and a child is never
-                # conversation-linked — so this is both correct and defensive.
-                if not session.parent_session_id:
-                    self._mirror_to_conversation(sid, body)
+                # whole web round-trip for it. A child is never
+                # conversation-linked, so the child gate above also keeps this
+                # correct.
+                self._mirror_to_conversation(sid, body)
             self.transcript_store.append(sid, "codex_handled_completion", {
                 "final_chars": len(body),
             })
@@ -2515,18 +2520,20 @@ class Worker:
         if cached:
             return cached
         # Fallback: scan the transcript for `completed` / `managed_completed` /
-        # `claude_code_completed` events. The LATEST event's final_text wins —
-        # even when empty — so a reopened child's second run can't re-carry the
-        # first run's "[needs clarification] …" question into the parent's
-        # resume turn (#428). All three kinds persist a `final_text` key today;
-        # the key-presence guard keeps a legacy pre-#349 event (final_chars
-        # only) from clobbering a real value.
+        # `claude_code_completed` / `codex_completed` events. The LATEST
+        # event's final_text wins — even when empty — so a reopened child's
+        # second run can't re-carry the first run's "[needs clarification] …"
+        # question into the parent's resume turn (#428). All four kinds
+        # persist a `final_text` key today; the key-presence guard keeps a
+        # legacy event (final_chars only, pre-#349 claude_code / pre-#429
+        # codex) from clobbering a real value.
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
         last_text = ""
         for d in _iter_transcript(path):
             kind = d.get("kind", "")
             payload = d.get("payload", {}) or {}
-            if kind in ("completed", "managed_completed", "claude_code_completed"):
+            if kind in ("completed", "managed_completed", "claude_code_completed",
+                        "codex_completed"):
                 if "final_text" in payload:
                     last_text = payload.get("final_text") or ""
         return last_text

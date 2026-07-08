@@ -370,6 +370,11 @@ class CodexExecutor:
             except OSError:
                 pass
         self._cleanup_tempfile(last_msg_path)
+        # Normalize once so the codex_completed payload, final_chars, and the
+        # outcome all agree with the worker's stripped `body` — a whitespace-only
+        # final_text must read as empty (no blank "output:" block in a parent's
+        # resume turn, no anchor-less operator send).
+        state.final_text = state.final_text.strip()
 
         # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
         # the row is already FAILED *and the subprocess did not exit cleanly*, the
@@ -403,6 +408,11 @@ class CodexExecutor:
                 "model": state.model,
                 "tool_call_count": state.tool_call_count,
                 "final_chars": len(state.final_text),
+                # Persist the text itself so a parent that spawned this session
+                # can read it via _child_final_text — a child's completion never
+                # streams to the operator (#429), so this is its only path out
+                # (parity with claude_code_completed, #349).
+                "final_text": state.final_text,
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,
