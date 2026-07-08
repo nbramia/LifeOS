@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-07-08
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -259,7 +259,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 | Tool | Purpose |
 |---|---|
 | `lifeos_agent_spawn` | Create a new agent session (local or claude). Returns `session_id`. Optional `tier` (`haiku`/`sonnet`/`opus`) picks the Claude Code child's CLI model — see [Delegation tier + single-message (#349)](#delegation-tier--single-message-349). |
-| `lifeos_agent_send` | Post a message to a child session's queue. |
+| `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |
 | `lifeos_agent_yield_until` | Pause the caller until specific children reach terminal state — preferred over polling (no idle billing). |
 | `lifeos_agent_kill` | Terminate a child early. |
@@ -330,6 +330,10 @@ For local sessions, the parent session resumes via the existing pending_messages
 For managed sessions, a new remote session is created with the resolved routing.
 
 Clarifications older than `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` (default 72h) are abandoned with a Telegram heads-up; the transcript stays preserved.
+
+### Child clarifications (#422 / #428)
+
+Spawned CLI children never enter the Telegram flow above — the operator owns no thread to a child, and a BLOCKED child would strand its yielded parent (which only resumes once every child is terminal). Instead, a child's `[CLARIFY]` is folded into its output as `[needs clarification] …` and the child COMPLETES (`_effective_final_text` / `claude_code_child_clarify_folded`). The parent reads the question in the child's relayed output on resume and answers via `lifeos_agent_send`, which reopens the completed child (see [Inter-agent coordination](#inter-agent-coordination)); the parent then `yield_until`s the child again. Operator `/claude` sessions keep the pause-and-reply behavior: their `[CLARIFY]` goes BLOCKED and waits on a threaded Telegram reply.
 
 ### Replyable terminal threads
 
