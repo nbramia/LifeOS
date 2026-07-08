@@ -574,6 +574,11 @@ def test_child_completion_does_not_mirror(tmp_path: Path):
     assert conv_store.get_messages(conv.id) == []
 
 
+# =============================================================================
+# #431 — child failure/budget notices stay silent to the operator
+# =============================================================================
+
+
 def test_child_failure_sends_no_operator_notice(tmp_path: Path):
     """A spawned child (parent set) that FAILS must not send the operator a
     "⚠️ … failed" Telegram notice (#431) — the parent's resume turn already
@@ -594,6 +599,51 @@ def test_child_failure_sends_no_operator_notice(tmp_path: Path):
 
     assert not any("failed" in s.lower() for s in sent)
     assert store.get("child-fail").status == STATUS_FAILED
+
+
+def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
+    """A spawned child that exceeds budget must not send the operator a
+    "⚠️ … budget" notice (#431); the terminal status is still persisted."""
+    from api.services.agent_worker.session_store import STATUS_BUDGET_EXCEEDED
+
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason="wall_seconds")
+    )
+    worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-budget", routing="claude_code",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+        spawn_depth=1,
+    )
+
+    worker._dispatch_claude_code_session(child, [{"content": "sub-task"}])
+
+    assert not any("budget" in s.lower() for s in sent)
+    assert store.get("child-budget").status == STATUS_BUDGET_EXCEEDED
+
+
+def test_child_failure_does_not_mirror(tmp_path: Path):
+    """A child's failure notice must not mirror into a linked conversation
+    either (#431) — pins the restructure that moved the child protection from
+    the inner mirror gate to the outer notice gate. Parity with
+    test_codex_child_failure_does_not_mirror."""
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
+    )
+    worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-fail-web", routing="claude_code",
+        parent_session_id=parent.session_id,
+    )
+    conv = conv_store.create_conversation(title="Web thread")
+    conv_store.set_agent_session_id(conv.id, child.session_id)
+
+    worker._dispatch_claude_code_session(child, [{"content": "sub-task"}])
+
+    assert conv_store.get_messages(conv.id) == []
 
 
 # =============================================================================
