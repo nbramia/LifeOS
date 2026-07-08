@@ -200,6 +200,25 @@ def test_child_final_text_reads_codex_completed_event(tmp_path: Path):
     assert worker._child_final_text(child) == "Child result."
 
 
+def test_child_final_text_legacy_codex_event_without_key_does_not_clobber(tmp_path: Path):
+    """A legacy `codex_completed` event that predates #429 (final_chars only,
+    no `final_text` key) must not wipe a real value from an earlier event —
+    the key-presence guard is per-event, not per-kind."""
+    worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
+    parent = store.create(task_id="parent-1", routing="local")
+    child = store.create(
+        task_id="child-1", routing="codex", parent_session_id=parent.session_id,
+    )
+    transcripts.append(child.session_id, "codex_completed", {
+        "final_chars": 13, "final_text": "Child result.",
+    })
+    transcripts.append(child.session_id, "codex_completed", {
+        "final_chars": 0,  # legacy: no final_text key at all
+    })
+
+    assert worker._child_final_text(child) == "Child result."
+
+
 def test_resume_delivers_all_pending_messages(tmp_path: Path):
     """A resume dispatch must carry EVERY drained pending message, in order —
     not just pending[0]. Reopen-on-send (#428) makes multi-enqueue likely

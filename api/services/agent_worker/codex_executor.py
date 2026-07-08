@@ -370,6 +370,11 @@ class CodexExecutor:
             except OSError:
                 pass
         self._cleanup_tempfile(last_msg_path)
+        # Normalize once so the codex_completed payload, final_chars, and the
+        # outcome all agree with the worker's stripped `body` — a whitespace-only
+        # final_text must read as empty (no blank "output:" block in a parent's
+        # resume turn, no anchor-less operator send).
+        state.final_text = state.final_text.strip()
 
         # #379: operator-kill silent guard (parity with ClaudeCodeExecutor). If
         # the row is already FAILED *and the subprocess did not exit cleanly*, the
