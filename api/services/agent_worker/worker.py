@@ -1716,12 +1716,16 @@ class Worker:
             # just skip the spurious "failed" notice + web mirror. (Status
             # persistence and vault reconciliation below still run.)
             notice = f"⚠️ {label} failed: {outcome.reason}."
-        if notice:
+        # #431: spawned children stay silent to the operator on failure/budget
+        # too — the parent's resume turn carries the child's [failed] /
+        # [budget_exceeded] status header, so the notice would be duplicate
+        # noise for a session the operator never directly started.
+        if notice and not session.parent_session_id:
             _send(notice)
             # #311: mirror the same failure/budget notice into the web/voice
-            # thread (no-op for Telegram-origin); a child session has no thread.
-            if not session.parent_session_id:
-                self._mirror_to_conversation(sid, notice)
+            # thread (no-op for Telegram-origin); a child is never
+            # conversation-linked, so the child gate above also keeps this correct.
+            self._mirror_to_conversation(sid, notice)
         # Persist the terminal status to the session ROW (#400). The executor
         # sets RUNNING on launch but doesn't always flip to a terminal status on
         # failure (e.g. the binary-not-found path returns FAILED while leaving the
@@ -1894,14 +1898,15 @@ class Worker:
             # claude_code dispatch; status persistence + vault reconciliation
             # below still run.
             notice = f"⚠️ {label} failed: {outcome.reason}."
-        if notice:
+        # #431: spawned children stay silent to the operator on failure/budget
+        # too — parity with the claude_code branch; the parent's resume turn
+        # carries the child's terminal status header.
+        if notice and not session.parent_session_id:
             self._telegram_send(notice)
             # #311: mirror the same failure/budget notice into the web/voice
-            # thread (no-op for Telegram-origin). Non-child only, for parity
-            # with the claude_code path (codex can be a child via
-            # inter_agent.SPAWN_MODELS; a child is never conversation-linked).
-            if not session.parent_session_id:
-                self._mirror_to_conversation(sid, notice)
+            # thread (no-op for Telegram-origin). A child is never
+            # conversation-linked, so the child gate above also keeps this correct.
+            self._mirror_to_conversation(sid, notice)
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
         # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
