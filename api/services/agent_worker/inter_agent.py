@@ -7,7 +7,10 @@ core primitives are:
   - **spawn**: create a child session (Claude or local) with budget drawn from
     the caller's lineage budget. Returns immediately with a `child_session_id`.
   - **send**: append a user-role message to a peer/child session. For yielded
-    sessions, the message is queued for the next resume.
+    sessions, the message is queued for the next resume. Sending to your own
+    completed CLI child reopens it (the message becomes its next turn, resumed
+    with full prior context) — the answer path for a child that completed with
+    a "[needs clarification]" question (#356 follow-up).
   - **check**: non-blocking status snapshot of any session.
   - **yield_until**: terminate the caller's session until specified children
     reach a terminal state; on resume, children's outputs are injected as a
@@ -37,6 +40,7 @@ from typing import Any
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
+    STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_YIELDED,
     TERMINAL_STATUSES,
@@ -155,7 +159,7 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "lifeos_agent_send",
-        "description": "Append a user-role message to another agent session. For sessions that are yielded or sleeping, the message is queued and delivered on resume.",
+        "description": "Append a user-role message to another agent session. For sessions that are yielded or sleeping, the message is queued and delivered on resume. Sending to your own COMPLETED claude_code/codex child REOPENS it: your message becomes its next turn and it resumes with its full prior context. Use this to answer a child whose output contains '[needs clarification] ...', then wait on it again with `lifeos_agent_yield_until` (send the answer BEFORE yielding).",
         "input_schema": _with_caller({
             "session_id": {"type": "string"},
             "message": {"type": "string"},
@@ -356,7 +360,24 @@ def send(ctx: InterAgentContext, args: dict) -> dict:
     target = ctx.session_store.get_by_session_id(target_id)
     if target is None:
         return _err(f"session {target_id} not found", code="not_found")
-    if target.status in TERMINAL_STATUSES:
+    # Reopen-on-send (#356 follow-up): a spawned CLI child that hits a genuine
+    # fork folds "[needs clarification] …" into its output and COMPLETES (a
+    # BLOCKED child would strand its yielded parent). But its CLI session
+    # persists on disk under claude_code_session_id, so the direct parent can
+    # answer by just sending: the message is queued as the child's next turn
+    # and the status flips back to CLAIMED, which the spawned-session
+    # dispatcher resumes via `-r <claude_code_session_id>` — full prior
+    # context, no re-derivation. Restricted to COMPLETED (a FAILED child has
+    # nothing coherent to continue), to CLI routings (local/managed have no
+    # on-disk resume path here), and to a persisted CLI session id (`-r`
+    # needs the UUID; without it the child would strand CLAIMED).
+    reopen = (
+        target.status == STATUS_COMPLETED
+        and target.parent_session_id == ctx.caller_session_id
+        and target.routing in CLI_ROUTINGS
+        and bool(target.claude_code_session_id)
+    )
+    if target.status in TERMINAL_STATUSES and not reopen:
         return _err(f"session {target_id} is terminal ({target.status})", code="terminal")
 
     # Same-root lineage check — agents can't inject messages into unrelated
@@ -379,6 +400,15 @@ def send(ctx: InterAgentContext, args: dict) -> dict:
     ctx.transcript_store.append(target_id, "inter_agent_send", {
         "from": ctx.caller_session_id, "chars": len(message),
     })
+    if reopen:
+        # Flip AFTER the enqueue so the dispatch tick can never claim the
+        # child before its resume message exists (an empty resume prompt).
+        ctx.session_store.update_status(target.task_id, STATUS_CLAIMED)
+        ctx.transcript_store.append(target_id, "inter_agent_send_reopen", {
+            "from": ctx.caller_session_id,
+            "claude_code_session_id": target.claude_code_session_id,
+        })
+        return _ok({"delivered": True, "message_id": msg_id, "reopened": True})
     return _ok({"delivered": True, "message_id": msg_id, "queued": target.status == STATUS_YIELDED})
 
 

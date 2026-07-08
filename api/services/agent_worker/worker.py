@@ -1485,7 +1485,8 @@ class Worker:
 
         Handles both the fresh-spawn case (``claude_code_session_id`` is NULL
         — call ``execute()``) and the resume case (``claude_code_session_id``
-        set — call ``resume(message)`` with the latest drained pending message).
+        set — call ``resume(message)`` with ALL drained pending messages
+        concatenated in order).
         On a BLOCKED outcome the operator-facing reply prompt is sent via the
         id-capturing Telegram sender and registered in ``pending_questions``
         so a threaded reply round-trips through ``_resume_as_followup``.
@@ -1561,7 +1562,13 @@ class Worker:
             return
 
         if is_resume:
-            resume_message = pending[0]["content"] if pending else ""
+            # Every drained message rides the resume turn, in order. Draining
+            # returns ALL pending rows, and reopen-on-send (#428) makes
+            # multi-enqueue likely (e.g. a parent answers twice before the
+            # dispatch tick claims the reopened child) — resuming with only
+            # pending[0] would silently drop messages `lifeos_agent_send`
+            # already acknowledged as delivered.
+            resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "claude_code_user_prompt", {
                 "text": resume_message, "resume": True,
@@ -1805,7 +1812,11 @@ class Worker:
             return
 
         if is_resume:
-            resume_message = pending[0]["content"] if pending else ""
+            # All drained messages ride the resume turn in order — same
+            # multi-enqueue rationale as the claude_code dispatch above
+            # (a codex child can collect both an operator threaded reply
+            # and a parent reopen answer before the tick claims it, #428).
+            resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "codex_user_prompt", {
                 "text": resume_message, "resume": True,
@@ -2503,17 +2514,21 @@ class Worker:
             cached = None
         if cached:
             return cached
-        # Fallback: scan the transcript for a `completed`, `managed_completed`,
-        # or `claude_code_completed` event with non-empty `final_text`.
+        # Fallback: scan the transcript for `completed` / `managed_completed` /
+        # `claude_code_completed` events. The LATEST event's final_text wins —
+        # even when empty — so a reopened child's second run can't re-carry the
+        # first run's "[needs clarification] …" question into the parent's
+        # resume turn (#428). All three kinds persist a `final_text` key today;
+        # the key-presence guard keeps a legacy pre-#349 event (final_chars
+        # only) from clobbering a real value.
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
         last_text = ""
         for d in _iter_transcript(path):
             kind = d.get("kind", "")
             payload = d.get("payload", {}) or {}
             if kind in ("completed", "managed_completed", "claude_code_completed"):
-                ft = payload.get("final_text") or ""
-                if ft:
-                    last_text = ft
+                if "final_text" in payload:
+                    last_text = payload.get("final_text") or ""
         return last_text
 
     def _resume_cloud_parent(

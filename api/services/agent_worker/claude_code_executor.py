@@ -169,9 +169,7 @@ the surrounding system. If you discover the task is bigger than expected
 the minimal safe change.
 
 CLARIFICATION:
-- Use [CLARIFY] to ask a question. Your session will pause and the user's
-  answer will be relayed back to you. After sending [CLARIFY], STOP and do
-  not continue working.
+{clarification}
 
 PERSISTENCE:
 - If your first approach doesn't work, try alternatives before giving up.
@@ -198,6 +196,23 @@ NOTIFICATIONS — use [NOTIFY] for:
 DELEGATION:
 You already have a browser (--chrome), filesystem, and shell. {delegation}
 """
+
+
+# Operator sessions really do pause on [CLARIFY] — the worker goes BLOCKED and
+# relays the Telegram reply. A spawned child does NOT (#356): its question is
+# folded into its output as "[needs clarification] …" and the turn completes;
+# the parent may answer via lifeos_agent_send, which resumes the child's CLI
+# session. Each variant states only what actually happens to that session.
+_CLARIFY_OPERATOR = """\
+- Use [CLARIFY] to ask a question. Your session will pause and the user's
+  answer will be relayed back to you. After sending [CLARIFY], STOP and do
+  not continue working."""
+
+_CLARIFY_CHILD = """\
+- Use [CLARIFY] to ask a question. Your turn will end and the question is
+  delivered to the parent agent that spawned you; if it answers, you will be
+  resumed with the answer as your next turn. After sending [CLARIFY], STOP
+  and do not continue working."""
 
 
 _PLAN_PREFIX = """\
@@ -384,6 +399,7 @@ class ClaudeCodeExecutor:
         resume_session_id: Optional[str],
         session_id: str = "",
         model: str = "opus",
+        is_child: bool = False,
     ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
@@ -404,6 +420,7 @@ class ClaudeCodeExecutor:
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
+                clarification=_CLARIFY_CHILD if is_child else _CLARIFY_OPERATOR,
                 delegation=delegation_preamble(
                     session_id,
                     trigger="To run background work in parallel,",
@@ -454,6 +471,7 @@ class ClaudeCodeExecutor:
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
             model=session.claude_code_model or "opus",
+            is_child=bool(session.parent_session_id),
         )
 
         self.transcript_store.append(sid, "claude_code_spawn", {

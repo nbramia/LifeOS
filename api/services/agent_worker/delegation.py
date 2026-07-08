@@ -39,7 +39,12 @@ def delegation_preamble(session_id: str, *, trigger: str, model: str) -> str:
         f"Your LifeOS agent session id is {session_id}. {trigger} delegate it "
         f"with the `{SPAWN}` MCP tool (caller_session_id={session_id}, "
         f"model={model}). Monitor the child with `{CHECK}` and read its result "
-        f"with `{TRANSCRIPT_READ}`."
+        f"with `{TRANSCRIPT_READ}`. If a child's output contains "
+        f"\"[needs clarification] …\", it stopped mid-task to ask you a "
+        f"question: answer with `{SEND}` (session_id=child, message=answer) — "
+        f"this reopens the child with its full prior context — then wait on it "
+        f"again with `{YIELD_UNTIL}`. Send the answer before yielding; a "
+        f"yielded session can't send."
     )
 
 
@@ -53,5 +58,8 @@ message them with `{SEND}`, check status with
 `{CHECK}`. When you have nothing to do until specific children
 finish, call `{YIELD_UNTIL}(children=[...])` — this ends your
 session cleanly (no idle billing) and resumes you when the children are
-done. Prefer `yield_until` over polling.
+done. Prefer `yield_until` over polling. If a child's output contains
+"[needs clarification] …", it stopped mid-task to ask you a question:
+answer with `{SEND}` (this reopens the child with its full prior
+context), then yield on it again — send the answer before yielding.
 </inter_agent>"""
