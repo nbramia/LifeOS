@@ -59,6 +59,7 @@ LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
+AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
 
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
@@ -69,6 +70,11 @@ esac
 case "$(echo "$AGENT_WORKER_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
     *)          AGENT_WORKER_AUTOSTART="false" ;;
+esac
+
+case "$(echo "$AUTODEPLOY_ENABLED" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) AUTODEPLOY_ENABLED="true" ;;
+    *)          AUTODEPLOY_ENABLED="false" ;;
 esac
 
 if [ "$LLM_AUTOSTART" = "true" ]; then
@@ -114,6 +120,7 @@ else
     echo "  MCP HTTP:   disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
 echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
+echo "  Auto-Deploy:  $AUTODEPLOY_ENABLED"
 echo ""
 
 # Install unit files with variable substitution
@@ -197,6 +204,18 @@ else
     systemctl disable lifeos-agent-worker.service 2>/dev/null || true
     systemctl stop lifeos-agent-worker.service 2>/dev/null || true
     echo "  lifeos-agent-worker: disabled (set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable)"
+fi
+
+# Auto-deploy is opt-in via LIFEOS_AUTODEPLOY_ENABLED. Off by default so a fresh
+# clone never silently pulls + restarts on its own. When on, the timer polls
+# origin/main every 10 min and ff-deploys new commits (see scripts/auto-deploy.sh).
+if [ "$AUTODEPLOY_ENABLED" = "true" ]; then
+    systemctl enable --now lifeos-autodeploy.timer
+    echo "  lifeos-autodeploy.timer: $(systemctl is-active lifeos-autodeploy.timer) (autostart enabled)"
+else
+    systemctl disable lifeos-autodeploy.timer 2>/dev/null || true
+    systemctl stop lifeos-autodeploy.timer 2>/dev/null || true
+    echo "  lifeos-autodeploy.timer: disabled (set LIFEOS_AUTODEPLOY_ENABLED=true to enable)"
 fi
 
 # Install logrotate config with substitution

@@ -1,0 +1,12 @@
+[Unit]
+Description=LifeOS Auto-Deploy — ff-pulls main and restarts changed services
+After=network-online.target lifeos-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the repo owner (not root): git pull uses the user's SSH key; service
+# restarts go through the passwordless sudoers rule from setup-systemd.sh.
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/auto-deploy.sh

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-07-07
+> **Last Updated:** 2026-07-08
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -56,6 +56,33 @@ curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 Set `LIFEOS_ALERT_EMAIL` in `.env` for alerts. Telegram backup via `telegram_bot_token` + `telegram_chat_id`.
 
 Services are tracked on-use, not by polling. Degradation events (fallback usage) are collected and reported in the nightly health check if there are 5+ in 24 hours.
+
+---
+
+## Auto-Deploy (self-hosted redeploy on push to main)
+
+When you push to `main` from another machine, the self-hosted host can pull and redeploy itself instead of you doing it by hand. This is the `lifeos-autodeploy.timer` — a polling systemd timer, off by default.
+
+**How it works:** every 10 minutes `scripts/auto-deploy.sh` runs `git fetch`; if `origin/main` advanced, it fast-forward pulls and restarts the currently-active code services (`lifeos-api`, and if running, `lifeos-agent-worker` / `lifeos-mcp-http`). Docs/tests/frontend-only changes pull without a restart. If `requirements.txt` changed it `pip install`s first. It runs as the repo owner (git pull uses the user's SSH key; restarts use the passwordless sudoers rule).
+
+Pull-based on purpose: it needs no inbound network, so it works on a WiFi-only host and just catches up on the next tick after any outage. Latency is up to the poll interval (~10 min).
+
+**Guards** (any tripped → the run changes nothing): must be on `main`, working tree must be clean (never clobbers local edits on the host), and the pull is `--ff-only` (a diverged `main` alerts instead of resetting).
+
+**Enable it:**
+
+```bash
+# in .env
+LIFEOS_AUTODEPLOY_ENABLED=true
+LIFEOS_AUTODEPLOY_NOTIFY=failure   # failure (default) | always | never
+
+sudo ./scripts/setup-systemd.sh    # installs + enables the timer
+systemctl list-timers lifeos-autodeploy.timer
+```
+
+**Watch it:** `tail -f logs/auto-deploy.log`. Failures (fetch, diverged pull, pip, restart, or `/health` not recovering post-deploy) send a Telegram alert.
+
+**Caveat:** it deploys whatever lands on `main` *without* re-running the test suite — safe only because merged `main` is expected to be green. It does not gate on tests by design (running the suite would take the API down and thrash the shared server).
 
 ---
 
