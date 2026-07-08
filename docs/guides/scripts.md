@@ -179,6 +179,7 @@ Example:
 | `backup.sh` | Backup data directory |
 | `chromadb-watchdog.sh` | ChromaDB health check and auto-restart |
 | `clear-caches.sh` | Clear embedding and search caches |
+| `network-watchdog.sh` | WiFi link health check and self-heal (re-activate → bounce radio → reload driver → restart NetworkManager) |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |

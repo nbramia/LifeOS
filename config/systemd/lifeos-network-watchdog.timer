@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS Network Watchdog Timer (every 2 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=20s
+
+[Install]
+WantedBy=timers.target
