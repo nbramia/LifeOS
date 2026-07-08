@@ -1,0 +1,9 @@
+[Unit]
+Description=LifeOS Network Watchdog — self-heals a dead WiFi link (WiFi-only host has no wired fallback)
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+# Runs as root (no User=): repair needs nmcli/ip/modprobe/systemctl restart.
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/network-watchdog.sh
