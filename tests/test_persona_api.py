@@ -8,6 +8,7 @@ on POST /api/ask/stream, and persona-scoped conversation storage/listing.
 import json
 import os
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -639,3 +640,50 @@ class TestConversationsListPersonaParam:
             resp = client.get("/api/conversations?persona_id=fitness")
         assert resp.status_code == 200
         assert mock_store.list_conversations.call_args.kwargs.get("persona_id") == "fitness"
+
+
+# ---------------------------------------------------------------------------
+# Financial Advisor persona (#458) — validate the shipped config directly (the
+# live registry depends on the token being set, which a fresh clone won't have).
+# ---------------------------------------------------------------------------
+
+_ADVISOR_FILE = Path(__file__).parent.parent / "config" / "personas" / "advisor.md"
+_BOTS_FILE = Path(__file__).parent.parent / "config" / "telegram_bots.json"
+
+
+@pytest.mark.unit
+def test_advisor_persona_parses_to_body_and_voice():
+    from config.settings import _parse_persona
+    body, voice, model = _parse_persona(_ADVISOR_FILE.read_text(), "advisor")
+    assert body.strip(), "advisor persona has a non-empty preamble"
+    assert "id: advisor" not in body, "frontmatter must be stripped from the preamble"
+    assert isinstance(voice, tuple) and voice, "voice rules parsed for spoken turns"
+
+
+@pytest.mark.unit
+def test_advisor_persona_grounded_in_investments():
+    body = _ADVISOR_FILE.read_text().lower()
+    assert "investments" in body and "portfolio" in body
+    assert "tax" in body           # tax buckets / harvesting
+    assert "monarch" in body       # the secondary source
+
+
+@pytest.mark.unit
+def test_advisor_persona_no_leaked_financial_values():
+    """Open-source guard: the committed persona must not hardcode real balances,
+    account numbers, or the private dashboard URL — live numbers come from tools."""
+    import re
+    text = _ADVISOR_FILE.read_text()
+    assert not re.search(r"\$\s?\d[\d,]{2,}", text), "no hardcoded dollar amounts"
+    assert "quickstage" not in text.lower(), "no private dashboard URL"
+    assert not re.search(r"\b\d{4}\b", text), "no account-number-like 4-digit fragments"
+
+
+@pytest.mark.unit
+def test_advisor_registered_in_bot_registry():
+    entries = json.loads(_BOTS_FILE.read_text())
+    advisor = next((e for e in entries if e.get("name") == "advisor"), None)
+    assert advisor is not None, "advisor registered in telegram_bots.json"
+    assert advisor["token_env"] == "TELEGRAM_ADVISOR_BOT_TOKEN"
+    assert advisor["persona_file"] == "config/personas/advisor.md"
+    assert not advisor.get("orchestrates"), "advisor is pure-chat, not an orchestrator"

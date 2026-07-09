@@ -17,5 +17,11 @@
     "chat_id_env": "TELEGRAM_DOCTOR_CHAT_ID",
     "persona_file": "config/personas/doctor.md",
     "orchestrates": true
+  },
+  {
+    "name": "advisor",
+    "token_env": "TELEGRAM_ADVISOR_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_ADVISOR_CHAT_ID",
+    "persona_file": "config/personas/advisor.md"
   }
 ]
