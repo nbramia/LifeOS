@@ -44,6 +44,78 @@ class TestSlackSyncExitCodes:
         with patch("api.services.slack_integration.is_slack_enabled", return_value=True):
             main([])  # no SystemExit
 
+    def test_errors_with_zero_work_exit_nonzero(self):
+        """Errors and no work done (e.g. dead token at API-call time) → exit 1.
+
+        full_sync/incremental_sync report this as status "partial", so status
+        alone can't distinguish a total failure from a mostly-good run.
+        """
+        from scripts.sync_slack import main
+
+        total_failure = {
+            "status": "partial",
+            "errors": ["invalid_auth: token revoked"],
+            "users": {},
+            "messages": {"channels_synced": 0, "messages_indexed": 0, "interactions_created": 0},
+        }
+        with patch("scripts.sync_slack.run_slack_sync", return_value=total_failure):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["--execute"])
+
+        assert exc_info.value.code == 1
+
+    def test_errors_with_real_work_do_not_fail_the_run(self):
+        """Partial errors alongside real work remain success (like gmail's
+        per-message error tolerance)."""
+        from scripts.sync_slack import main
+
+        partial_with_work = {
+            "status": "partial",
+            "errors": ["one channel failed"],
+            "users": {},
+            "messages": {"channels_synced": 5, "messages_indexed": 120, "interactions_created": 40},
+        }
+        with patch("scripts.sync_slack.run_slack_sync", return_value=partial_with_work):
+            main(["--execute"])  # no SystemExit
+
+
+class TestGoogleDocsSyncExitCodes:
+    """scripts/sync_google_docs.py must fail loudly when the sync dies outright.
+
+    google_docs is the third documented casualty of issue #438 — its typical
+    ~12s duration sits below the 60s duration-collapse gate, so the exit code
+    is the only defense.
+    """
+
+    def test_error_status_exits_nonzero(self):
+        """sync_gdocs raising (e.g. expired OAuth) → exit code 1."""
+        from scripts.sync_google_docs import main
+
+        # sync_gdocs is imported inside sync_google_docs(), so patch the
+        # source module attribute.
+        with patch(
+            "api.services.gdoc_sync.sync_gdocs",
+            side_effect=RuntimeError("invalid_grant: Token has been expired"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["--execute"])
+
+        assert exc_info.value.code == 1
+
+    def test_healthy_execute_exits_cleanly(self):
+        """A successful sync completes without raising."""
+        from scripts.sync_google_docs import main
+
+        healthy = {"synced": 2, "failed": 0, "skipped": 0, "documents": []}
+        with patch("api.services.gdoc_sync.sync_gdocs", return_value=healthy):
+            main(["--execute"])  # no SystemExit
+
+    def test_dry_run_exits_cleanly(self):
+        """Dry run never calls sync_gdocs and never exits nonzero."""
+        from scripts.sync_google_docs import main
+
+        main([])  # no SystemExit
+
 
 class TestGmailCalendarSyncExitCodes:
     """scripts/sync_gmail_calendar_interactions.py must fail loudly on

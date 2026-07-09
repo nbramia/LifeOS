@@ -120,6 +120,19 @@ def main(argv=None):
         )
         sys.exit(2)
 
+    # Errors with zero work done = total failure (e.g. a dead token at
+    # API-call time). full_sync/incremental_sync report that as status
+    # "partial", so status alone can't distinguish it from a run that mostly
+    # worked. Partial errors WITH real work remain success, consistent with
+    # gmail's per-message error tolerance — issue #438.
+    msgs = results.get("messages") or {}
+    if results.get("errors") and not msgs.get("channels_synced") and not msgs.get("messages_indexed"):
+        logger.error(
+            "Slack sync reported errors and completed no work — "
+            "exiting nonzero so the orchestrator records a failure"
+        )
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
