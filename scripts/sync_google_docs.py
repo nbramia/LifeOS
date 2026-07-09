@@ -48,9 +48,24 @@ def sync_google_docs(dry_run: bool = True) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser(description='Sync Google Docs to vault')
     parser.add_argument('--execute', action='store_true', help='Actually sync docs')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    sync_google_docs(dry_run=not args.execute)
+    results = sync_google_docs(dry_run=not args.execute)
+
+    # A sync that died outright (e.g. expired OAuth before any doc synced)
+    # must exit nonzero so run_all_syncs records FAILED and alerts instead of
+    # silent success — issue #438. The duration-collapse backstop can't catch
+    # this source: its typical ~12s is below the 60s detection gate.
+    if results.get("status") == "error":
+        logger.error(
+            f"Google Docs sync failed ({results.get('error', 'unknown')}) — "
+            f"exiting nonzero so the orchestrator records a failure"
+        )
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

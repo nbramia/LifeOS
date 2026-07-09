@@ -19,10 +19,14 @@ Options:
     --trigger TYPE    How sync was triggered: scheduled (default), manual, startup
 """
 # Load environment variables from .env FIRST, before any other imports
-# This is critical for launchd/cron which don't have access to shell environment
+# This is critical for launchd/cron which don't have access to shell environment.
+# override=True: the .env file deterministically wins over inherited env vars.
+# A present-but-empty inherited var (e.g. SLACK_USER_TOKEN="") would otherwise
+# shadow the file value here AND in config.settings (which merges os.environ
+# over dotenv_values), silently disabling credential syncs — issue #438.
 from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 import argparse
 import json
@@ -48,6 +52,7 @@ from api.services.sync_health import (
     record_sync_error,
     get_sync_health,
     get_sync_summary,
+    get_typical_duration_seconds,
     check_sync_health,
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
@@ -436,7 +441,8 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         duration_str = "N/A"
 
     # Build message
-    status_emoji = "✅" if result["failed"] == 0 else "⚠️"
+    collapsed_sources = result.get("duration_collapsed_sources", [])
+    status_emoji = "✅" if result["failed"] == 0 and not collapsed_sources else "⚠️"
     lines = [
         f"{status_emoji} *LifeOS Sync Complete*",
         f"Trigger: {trigger}",
@@ -450,6 +456,19 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append(f"*Failed ({result['failed']}):*")
         for src in result.get("failed_sources", []):
             lines.append(f"  • {src}")
+
+    # Suspiciously fast completions (possible silent no-ops — issue #438)
+    if collapsed_sources:
+        lines.append("")
+        lines.append(f"*Suspiciously fast ({len(collapsed_sources)}):*")
+        for src in collapsed_sources:
+            info = result.get("results", {}).get(src, {}).get("duration_collapse", {})
+            elapsed = info.get("elapsed_seconds")
+            typical = info.get("typical_seconds")
+            if elapsed is not None and typical is not None:
+                lines.append(f"  • {src}: {elapsed:.1f}s vs typical {typical:.0f}s — possible silent no-op")
+            else:
+                lines.append(f"  • {src}: possible silent no-op")
 
     # Dependency-skipped sources
     dep_skipped_sources = result.get("dep_skipped_sources", [])
@@ -721,6 +740,39 @@ def get_disabled_work_sources() -> set[str]:
     return disabled
 
 
+# Duration-collapse detection (issue #438): a source that historically takes
+# minutes completing in a fraction of a second is the signature of a silent
+# no-op (e.g. credentials missing from the child env). Exit-code hardening in
+# the sync scripts catches the known skip paths; this catches unknown ones.
+DURATION_COLLAPSE_MIN_TYPICAL_SECONDS = 60.0
+# Floor of the relative elapsed threshold: a run is "collapsed" when it
+# finishes under max(this floor, 5% of typical), shrinking the blind spot
+# for slow sources (e.g. a 450s-typical sync no-oping in 10s).
+DURATION_COLLAPSE_MAX_ELAPSED_SECONDS = 2.0
+
+
+def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | None:
+    """Return collapse info if this run finished suspiciously fast, else None.
+
+    Never raises — a sync_health DB hiccup must not fail the sync itself.
+    """
+    try:
+        typical = get_typical_duration_seconds(source)
+    except Exception as e:
+        logger.warning(f"Duration-collapse check failed for {source}: {e}")
+        return None
+
+    if typical is None:
+        return None
+    elapsed_threshold = max(DURATION_COLLAPSE_MAX_ELAPSED_SECONDS, 0.05 * typical)
+    if typical > DURATION_COLLAPSE_MIN_TYPICAL_SECONDS and elapsed_seconds < elapsed_threshold:
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "typical_seconds": typical,
+        }
+    return None
+
+
 def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     """
     Run a single sync operation.
@@ -764,6 +816,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         timeout_seconds = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT)
 
         # Run subprocess
+        sync_started_monotonic = time.monotonic()
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -813,6 +866,21 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             return False, {"error": error_msg, **stats}
 
         logger.info(f"Sync completed for {source}: {stats}")
+
+        # Check for duration collapse BEFORE recording completion, so the
+        # current run (still status=running) can't contaminate the history.
+        elapsed_seconds = time.monotonic() - sync_started_monotonic
+        collapse = _detect_duration_collapse(source, elapsed_seconds)
+        if collapse:
+            stats["duration_collapse"] = collapse
+            msg = (
+                f"Duration collapse for {source}: completed in "
+                f"{collapse['elapsed_seconds']:.1f}s but typically takes "
+                f"{collapse['typical_seconds']:.0f}s — possible silent no-op "
+                f"(e.g. missing credentials)"
+            )
+            logger.error(msg)
+            record_sync_error(source, msg, error_type="duration_collapse")
 
         record_sync_complete(
             run_id,
@@ -1063,6 +1131,7 @@ def run_all_syncs(
     results = {}
     failed = []
     dep_skipped = set()  # Sources skipped because a dependency failed
+    duration_collapsed = []  # Sources that "succeeded" suspiciously fast
     start_time = datetime.now()
 
     # Check for disabled work integrations
@@ -1225,6 +1294,8 @@ def run_all_syncs(
 
             if not success:
                 failed.append(source)
+            elif stats.get("duration_collapse"):
+                duration_collapsed.append(source)
 
             # Restart LLM after last embedding phase completes (if we stopped it)
             if source in EMBEDDING_SOURCES and _llm_stopped_for_sync:
@@ -1319,6 +1390,7 @@ def run_all_syncs(
         "people_by_source": people_by_source,
         "interactions_by_source": interactions_by_source,
         "dep_skipped_sources": sorted(dep_skipped),
+        "duration_collapsed_sources": duration_collapsed,
     }
 
     # Exit maintenance mode now that sync is complete

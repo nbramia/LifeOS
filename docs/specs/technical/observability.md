@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 
 Performance tracing and alerting for LifeOS.
 
@@ -126,6 +126,10 @@ While in maintenance mode, CRITICAL alerts from `service_health` are suppressed.
 When a service fails and a fallback is used, this is recorded as a "degradation event". These are collected and reported in the nightly health check if there are 5+ in 24 hours.
 
 Services are tracked on-use, not by polling. Status updates when a service is actually called.
+
+### Sync Duration-Collapse Detection
+
+`run_all_syncs` flags a successful sync run that completed suspiciously fast — the source typically takes >60s but finished in under max(2s, 5% of typical) — the signature of a silent no-op. Detection records a `duration_collapse` row in `sync_errors` and adds a "Suspiciously fast" section to the Telegram sync summary; the `sync_runs` row stays `success`, so the health dashboard still shows green for that run.
 
 ## Related Documents
 
