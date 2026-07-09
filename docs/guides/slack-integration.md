@@ -11,9 +11,12 @@ Setup guide for Slack message search and sync.
 ## Overview
 
 LifeOS integrates with Slack to:
-- Index DM messages for semantic search
+- Index messages for semantic search:
+  - **DMs and group DMs** — full history, for users linked to CRM people
+  - **Public/private channels you are a member of** — 90-day window on first sync, incremental after (enumerated via `users.conversations`; archived channels excluded)
+  - **Thread replies** — fetched via `conversations.replies`; incremental runs rescan the last 7 days of parents so replies to older messages are still caught
 - Sync user profiles to CRM
-- Track interaction history with colleagues
+- Track interaction history with colleagues (DMs only)
 
 ---
 
@@ -34,8 +37,10 @@ LifeOS integrates with Slack to:
 2. Under **User Token Scopes**, add:
    - `users:read` - List users
    - `users:read.email` - Get user emails (for CRM linking)
-   - `im:history` - Read DM messages
-   - `im:read` - List DMs
+   - `im:history` / `im:read` - Read and list DMs
+   - `mpim:history` / `mpim:read` - Read and list group DMs
+   - `channels:history` / `channels:read` - Read and list public channels you're in
+   - `groups:history` / `groups:read` - Read and list private channels you're in
 
 **Note**: Use **User Token Scopes**, not Bot Token Scopes. LifeOS needs to access your messages as you, not as a bot.
 
@@ -94,7 +99,7 @@ SLACK_TEAM_ID=T02XXXXX
 
 This will:
 1. Sync all Slack users to SourceEntity
-2. Index DM messages to ChromaDB
+2. Index DM, member-channel, and thread-reply messages to ChromaDB
 3. Link Slack users to existing PersonEntity records by email
 
 ---
