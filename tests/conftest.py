@@ -18,8 +18,18 @@ Run categories:
 - pytest -n auto              # Parallel execution (requires pytest-xdist)
 """
 import gc
+import os
 
 import pytest
+
+# git exports GIT_DIR (absolute when the invoker is a linked worktree) to hook
+# subprocesses — and the pre-push hook runs this suite. Tests that spawn `git`
+# in tmp fixture repos would inherit it and silently operate on the REAL repo:
+# committing fixture files onto real branches, flipping core.bare, rewriting
+# user identity. Scrub before any test runs so fixture git calls always
+# resolve via their own cwd.
+for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+    os.environ.pop(_var, None)
 
 
 def pytest_configure(config):
