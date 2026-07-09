@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-06-25
+**Last Updated:** 2026-07-09
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -355,6 +355,37 @@ Semantic search across Slack messages.
   "user_id": "optional"
 }
 ```
+
+### GET /api/slack/my-messages
+
+Every message the user sent on a given day — DMs, group DMs, public/private channels, thread replies. Exact source-of-truth pull via Slack's `search.messages` (independent of the sync index). Day boundaries follow the user's Slack timezone. Requires the `search:read` user-token scope.
+
+**Query parameters:** `date` (required, zero-padded `YYYY-MM-DD`), `user` (optional Slack user ID; defaults to the token owner).
+
+**Response:**
+```json
+{
+  "date": "2026-07-08",
+  "user_id": "U12AB34CD",
+  "total": 2,
+  "truncated": false,
+  "total_available": 2,
+  "messages": [
+    {
+      "ts": "1751980000.000100",
+      "timestamp": "2026-07-08T14:26:40+00:00",
+      "text": "hello team",
+      "channel_id": "C123",
+      "channel_name": "general",
+      "channel_type": "channel",
+      "thread_ts": null,
+      "permalink": "https://example.slack.com/archives/C123/p1751980000000100"
+    }
+  ]
+}
+```
+
+`truncated: true` means the day exceeded the pagination cap (1,000 messages); `total_available` is Slack's full match count.
 
 ### GET /api/slack/conversations
 
