@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
 MAX_MESSAGE_LENGTH = 4096
+# Cap on quoted text prepended to threaded replies. Generous enough to keep a
+# full nightly priorities summary (~1,000 chars) intact — truncating below that
+# would cut off the bullet a follow-up question is asking about (#435).
+MAX_QUOTED_REPLY_CHARS = 1500
 
 # The bot token for the message currently being handled. A listener sets this
 # once at the top of _handle_update so every outbound send during that update —
@@ -780,14 +784,17 @@ class TelegramBotListener:
             await self._handle_orchestration_message(text, chat_id)
             return
 
-        # Threaded-reply context for specialized bots: when the user replies to
-        # one of the bot's own messages (e.g. correcting a "Logged: …" line), pass
-        # the quoted text as context so the orchestrator can correlate the
-        # correction to the right earlier item, not just the latest. Primary-bot
-        # threaded replies are handled above (agent/Claude-Code resumption).
+        # Threaded-reply context: when the user replies to one of the bot's own
+        # messages (e.g. correcting a "Logged: …" line, or asking about a bullet
+        # in a summary sent via the raw Bot API), pass the quoted text as context
+        # so the orchestrator can resolve deictic questions about it (#435).
+        # Primary-bot agent/Claude-Code reply threads short-circuited above, so
+        # this only sees replies to ordinary messages.
         effective_text = text
-        if not self._is_primary and reply_to and reply_to.get("text"):
+        if reply_to and reply_to.get("text"):
             quoted = reply_to["text"].strip()
+            if len(quoted) > MAX_QUOTED_REPLY_CHARS:
+                quoted = quoted[:MAX_QUOTED_REPLY_CHARS] + "…"
             effective_text = f'[replying to my earlier message: "{quoted}"]\n{text}'
 
         # Send through chat pipeline (intent classification happens there)
