@@ -178,7 +178,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `5.00` |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
-| `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `claude-sonnet-4-6` |
+| `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `claude-sonnet-5` |
 
 ---
 

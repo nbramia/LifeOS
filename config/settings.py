@@ -199,11 +199,11 @@ class Settings(BaseSettings):
 
     # Anthropic model for specialist calls (relationship insights, fact
     # extraction, tone analysis) — Sonnet-tier for quality, independent of the
-    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-4-6),
+    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-5),
     # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
     # returning 404, silently breaking every specialist feature (#470).
     anthropic_specialist_model: str = Field(
-        default="claude-sonnet-4-6", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+        default="claude-sonnet-5", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
     )
 
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
@@ -290,7 +290,7 @@ class Settings(BaseSettings):
                     "classifies #agent tasks (budget, routing, ambiguity, sanity)."
     )
     agent_managed_model: str = Field(
-        default="claude-sonnet-4-6",
+        default="claude-sonnet-5",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
         description="Anthropic model the Managed Agents executor uses for "
                     "Claude-routed #agent tasks. Informational only — the "
@@ -315,7 +315,7 @@ class Settings(BaseSettings):
                     "pushing back ('do research', 'you're wrong'). Empty (default) "
                     "disables escalation — safe for fresh clones and the local "
                     "backend. Set to a stronger model than LIFEOS_ANTHROPIC_MODEL "
-                    "(e.g. claude-sonnet-4-6 or claude-opus-4-8) to enable. Only "
+                    "(e.g. claude-sonnet-5 or claude-opus-4-8) to enable. Only "
                     "applies to the Anthropic backend."
     )
     agent_escalation_ladder: str = Field(
@@ -328,7 +328,7 @@ class Settings(BaseSettings):
                     "from LIFEOS_AGENT_ESCALATION_MODEL: [that model, claude_code] "
                     "— so the Claude Code handoff lands on the 2nd pushback. "
                     "Override to insert rungs, e.g. "
-                    "'claude-sonnet-4-6,claude-opus-4-8,claude_code'."
+                    "'claude-sonnet-5,claude-opus-4-8,claude_code'."
     )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,

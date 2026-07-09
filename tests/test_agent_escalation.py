@@ -165,14 +165,14 @@ def test_resolve_no_escalation_when_not_triggered():
     ("use opus please", "claude-opus-4-8"),
     ("with claude opus", "claude-opus-4-8"),
     ("retry on opus", "claude-opus-4-8"),
-    ("use sonnet", "claude-sonnet-4-6"),
-    ("switch to sonnet", "claude-sonnet-4-6"),
+    ("use sonnet", "claude-sonnet-5"),
+    ("switch to sonnet", "claude-sonnet-5"),
     ("use haiku for this", "claude-haiku-4-5"),
 ])
 def test_named_tier_directive_selects_that_model(question, expected):
     # No history / no refusal — the directive alone drives the choice. Base is a
     # model different from the target so escalation is observable.
-    base = "claude-haiku-4-5" if expected != "claude-haiku-4-5" else "claude-sonnet-4-6"
+    base = "claude-haiku-4-5" if expected != "claude-haiku-4-5" else "claude-sonnet-5"
     model, escalated = resolve_orchestrator_model([], question, base_model=base, escalation_model="")
     assert (model, escalated) == (expected, True)
 
@@ -194,9 +194,9 @@ def test_named_tier_works_without_escalation_model_configured():
 ])
 def test_generic_directive_falls_back_to_configured_model(question):
     model, escalated = resolve_orchestrator_model(
-        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5"
     )
-    assert (model, escalated) == ("claude-sonnet-4-6", True)
+    assert (model, escalated) == ("claude-sonnet-5", True)
 
 
 @pytest.mark.parametrize("question", [
@@ -213,7 +213,7 @@ def test_negated_question_and_engine_directives_do_not_escalate(question):
     """Negations, meta-questions, unsupported-engine names, and non-model uses of
     'escalate' must not trigger a model swap."""
     model, escalated = resolve_orchestrator_model(
-        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+        [], question, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5"
     )
     assert (model, escalated) == ("claude-haiku-4-5", False)
 
@@ -223,7 +223,7 @@ def test_contrastive_directive_still_honors_named_model():
     model, escalated = resolve_orchestrator_model(
         [], "use sonnet instead of opus", base_model="claude-haiku-4-5", escalation_model=""
     )
-    assert (model, escalated) == ("claude-sonnet-4-6", True)
+    assert (model, escalated) == ("claude-sonnet-5", True)
 
 
 def test_generic_directive_noops_when_unconfigured():
@@ -245,7 +245,7 @@ def test_directive_beats_auto_heuristic_without_refusal():
     model, escalated = resolve_orchestrator_model(
         [FakeMessage("assistant", "Here are your three games.")],
         "actually, use opus",
-        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
     assert (model, escalated) == ("claude-opus-4-8", True)
 
@@ -279,14 +279,14 @@ def _refusal_history(n):
 
 
 @pytest.mark.parametrize("n_refusals, expected", [
-    (1, "claude-sonnet-4-6"),   # rung 0 — the escalation model (1st pushback)
+    (1, "claude-sonnet-5"),   # rung 0 — the escalation model (1st pushback)
     (2, "claude_code"),         # rung 1 — engine handoff (2nd pushback)
     (3, "claude_code"),         # capped at the top rung
 ])
 def test_ladder_climbs_with_each_refusal(n_refusals, expected):
     model, escalated = resolve_orchestrator_model(
         _refusal_history(n_refusals), _PUSHBACK,
-        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
     assert (model, escalated) == (expected, True)
 
@@ -302,9 +302,9 @@ def test_user_directive_overrides_ladder_rung():
     # Even three deep into the ladder, an explicit "use sonnet" wins.
     model, escalated = resolve_orchestrator_model(
         _refusal_history(3), "use sonnet",
-        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
-    assert (model, escalated) == ("claude-sonnet-4-6", True)
+    assert (model, escalated) == ("claude-sonnet-5", True)
 
 
 def test_escalation_cycles_breaks_on_normal_exchange():
@@ -335,9 +335,9 @@ def test_stale_refusals_do_not_jump_to_engine_rung():
         FakeMessage("assistant", _REFUSAL),     # fresh refusal, user about to push back
     ]
     model, escalated = resolve_orchestrator_model(
-        history, _PUSHBACK, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6"
+        history, _PUSHBACK, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5"
     )
-    assert (model, escalated) == ("claude-sonnet-4-6", True)  # rung 0, not the engine
+    assert (model, escalated) == ("claude-sonnet-5", True)  # rung 0, not the engine
 
 
 def test_engine_handoff_recovers_original_request():
@@ -356,11 +356,11 @@ def test_base_model_filtered_from_ladder(monkeypatch):
     # climb going instead of stalling on the rung that equals base.
     monkeypatch.setattr(
         "api.services.agent_loop.settings.agent_escalation_ladder",
-        "claude-sonnet-4-6,claude-opus-4-8,claude_code", raising=False,
+        "claude-sonnet-5,claude-opus-4-8,claude_code", raising=False,
     )
     model, escalated = resolve_orchestrator_model(
         _refusal_history(2), _PUSHBACK,
-        base_model="claude-opus-4-8", escalation_model="claude-sonnet-4-6",
+        base_model="claude-opus-4-8", escalation_model="claude-sonnet-5",
     )
     # ladder after filtering opus = [sonnet, claude_code]; cycles=1 → rung 1.
     assert (model, escalated) == ("claude_code", True)
@@ -369,12 +369,12 @@ def test_base_model_filtered_from_ladder(monkeypatch):
 def test_explicit_ladder_setting_overrides_default(monkeypatch):
     monkeypatch.setattr(
         "api.services.agent_loop.settings.agent_escalation_ladder",
-        "claude-sonnet-4-6,claude-opus-4-8", raising=False,
+        "claude-sonnet-5,claude-opus-4-8", raising=False,
     )
     # Custom ladder has no engine rung — 3rd refusal caps at opus.
     model, _ = resolve_orchestrator_model(
         _refusal_history(3), _PUSHBACK,
-        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-4-6",
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
     assert model == "claude-opus-4-8"
 
@@ -476,7 +476,7 @@ def test_select_client_ignores_model_on_local_backend(monkeypatch):
 
 @pytest.mark.parametrize("name,expected", [
     ("haiku", "claude-haiku-4-5"),
-    ("sonnet", "claude-sonnet-4-6"),
+    ("sonnet", "claude-sonnet-5"),
     ("opus", "claude-opus-4-8"),
     ("Opus", "claude-opus-4-8"),            # case-insensitive
     ("claude-opus-4-8", "claude-opus-4-8"),  # a full id passes through

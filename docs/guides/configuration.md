@@ -56,7 +56,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). Recorded in ADR-009. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
 | `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Stronger model a chat turn escalates to when the user pushes back on a refusal, or asks ("escalate to opus"). Empty disables escalation. Anthropic backend only. |
-| `LIFEOS_AGENT_ESCALATION_LADDER` | str | — (derived) | Comma-separated escalation rungs (models / engine names `codex`,`claude_code`). Empty derives `[escalation_model, claude_code]` — so a 2nd pushback hands off to Claude Code. Override e.g. `claude-sonnet-4-6,claude-opus-4-8,claude_code`. |
+| `LIFEOS_AGENT_ESCALATION_LADDER` | str | — (derived) | Comma-separated escalation rungs (models / engine names `codex`,`claude_code`). Empty derives `[escalation_model, claude_code]` — so a 2nd pushback hands off to Claude Code. Override e.g. `claude-sonnet-5,claude-opus-4-8,claude_code`. |
 | `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also used by specialized calls regardless of backend (relationship insights, fact extraction, web search). |
 | `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
@@ -119,7 +119,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
 | `LIFEOS_AGENT_OUTPUT_DIR` | path | `LifeOS/Tasks/Agent Output` | Vault-relative folder where the worker writes an Agent Output note on every successful task completion (one note per one-off task; one shared, prepended note per recurring cron schedule). |
 | `LIFEOS_AGENT_PREFLIGHT_MODEL` | str | `claude-haiku-4-5` | Model used for preflight (budget parsing, routing, ambiguity, sanity). |
-| `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-4-6` | Informational — actual model lives in the Anthropic Console preset. |
+| `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-5` | Informational — actual model lives in the Anthropic Console preset. |
 | `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS` | str | — | Override for test runs. |
 | `LIFEOS_AGENT_MAX_SPAWN_DEPTH` | int | varies | Hard cap on nested spawn depth (parent → child → grandchild). |
 | `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT` | int | varies | Total descendants per root session. |

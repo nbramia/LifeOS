@@ -55,7 +55,7 @@ def test_specialist_model_default_is_current_alias():
     from config.settings import Settings
 
     default = Settings.model_fields["anthropic_specialist_model"].default
-    assert default == "claude-sonnet-4-6"
+    assert default == "claude-sonnet-5"
     assert not re.search(r"-20\d{6}$", default), (
         "specialist model default is a dated snapshot — pin an alias instead "
         "(snapshots retire and 404)"

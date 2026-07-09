@@ -179,7 +179,7 @@ class ManagedExecutor:
         agent_id: str,
         environment_id: str,
         vault_ids: list[str] | None = None,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-sonnet-5",
     ):
         self.session_store = session_store
         self.transcript_store = transcript_store

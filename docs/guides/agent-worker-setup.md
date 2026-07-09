@@ -194,7 +194,7 @@ Workspace → Agents → New. Paste the YAML below (replace the LifeOS hostname 
 name: LifeOS Worker
 description: Autonomous executor for agent-tagged tasks from LifeOS.
 model:
-  id: claude-sonnet-4-6
+  id: claude-sonnet-5
   speed: standard
 system: |-
   <role>
@@ -308,7 +308,7 @@ Every `mcp_servers` entry must have a matching `mcp_toolset` in `tools` (and vic
 LIFEOS_AGENT_PRESET_ID=agent_<your_agent_id>
 LIFEOS_AGENT_ENVIRONMENT_ID=env_<your_environment_id>
 LIFEOS_AGENT_VAULT_ID=vlt_<your_vault_id>
-LIFEOS_AGENT_MANAGED_MODEL=claude-sonnet-4-6   # informational; actual model lives in the preset
+LIFEOS_AGENT_MANAGED_MODEL=claude-sonnet-5   # informational; actual model lives in the preset
 ANTHROPIC_API_KEY=sk-ant-...                    # already required for the Haiku preflight
 ```
 
