@@ -225,12 +225,17 @@ class TestChannelIndexing:
     def test_channel_messages_indexed_without_interactions(self, sync_with_mocks):
         """A public channel gets indexed to ChromaDB but never creates CRM
         interactions — channel chatter isn't a 1:1 interaction."""
-        from api.services.slack_integration import SlackChannel
+        from datetime import datetime, timezone
+        from api.services.slack_integration import SlackChannel, SlackMessage
 
         sync = sync_with_mocks
         channel = SlackChannel(channel_id="C123", name="general")
+        message = SlackMessage(
+            ts="1700000000.000100", channel_id="C123", user_id="U1",
+            text="hello", timestamp=datetime.now(timezone.utc),
+        )
         sync.client.list_channels.return_value = [channel]
-        sync.client.get_all_channel_history.return_value = [MagicMock()]
+        sync.client.get_all_channel_history.return_value = [message]
         sync.indexer.get_latest_timestamp.return_value = None
         sync.indexer.index_messages.return_value = 1
         sync._create_interactions_for_channel = MagicMock()
@@ -277,3 +282,145 @@ class TestChannelIndexing:
 
         assert stats["channels_skipped"] == 1  # the unlinked DM
         assert stats["channels_processed"] == 1  # the public channel
+
+
+class TestThreadReplySync:
+    """Issue #440: thread replies must be fetched via conversations.replies and
+    indexed like normal messages — conversations.history only returns
+    top-level messages, so replies were invisible to the index."""
+
+    def _parent(self, ts="1700000000.000100", reply_count=2, latest_reply=None):
+        from datetime import datetime, timezone
+        from api.services.slack_integration import SlackMessage
+
+        return SlackMessage(
+            ts=ts, channel_id="C123", user_id="U1", text="parent",
+            timestamp=datetime.fromtimestamp(float(ts), tz=timezone.utc),
+            thread_ts=ts if reply_count else None,
+            reply_count=reply_count, latest_reply=latest_reply,
+        )
+
+    def _reply(self, ts="1700000100.000200"):
+        from datetime import datetime, timezone
+        from api.services.slack_integration import SlackMessage
+
+        return SlackMessage(
+            ts=ts, channel_id="C123", user_id="U2", text="a reply",
+            timestamp=datetime.fromtimestamp(float(ts), tz=timezone.utc),
+            thread_ts="1700000000.000100",
+        )
+
+    def _channel(self):
+        from api.services.slack_integration import SlackChannel
+        return SlackChannel(channel_id="C123", name="general")
+
+    def test_full_sync_fetches_replies_for_threaded_parents(self, sync_with_mocks):
+        sync = sync_with_mocks
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.return_value = [self._parent(reply_count=2)]
+        sync.client.get_thread_replies.return_value = [self._reply()]
+        sync.indexer.index_messages.return_value = 1
+
+        stats = sync.sync_messages(full=True, dm_only=False)
+
+        kwargs = sync.client.get_thread_replies.call_args.kwargs
+        assert kwargs["thread_ts"] == "1700000000.000100"
+        assert kwargs["oldest"] is None  # full sync pulls entire threads
+        # main history + replies both indexed
+        assert sync.indexer.index_messages.call_count == 2
+        assert stats["messages_indexed"] == 2
+
+    def test_no_thread_fetch_without_replies(self, sync_with_mocks):
+        sync = sync_with_mocks
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.return_value = [self._parent(reply_count=0)]
+        sync.indexer.index_messages.return_value = 1
+
+        sync.sync_messages(full=True, dm_only=False)
+
+        sync.client.get_thread_replies.assert_not_called()
+
+    def test_incremental_catches_reply_to_old_parent(self, sync_with_mocks):
+        """A reply posted today to a week-old parent: the parent doesn't appear
+        in the cursor-windowed history fetch, so a rescan of recent parents
+        must find it via latest_reply."""
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        now = datetime.now(timezone.utc)
+        cursor = now - timedelta(days=1)
+        old_parent_ts = f"{(now - timedelta(days=5)).timestamp():.6f}"
+        new_reply_ts = f"{(now - timedelta(hours=2)).timestamp():.6f}"
+
+        old_parent = self._parent(
+            ts=old_parent_ts, reply_count=3, latest_reply=new_reply_ts)
+
+        sync.client.list_channels.return_value = [self._channel()]
+        # First call: main incremental fetch (empty — no new top-level messages).
+        # Second call: thread rescan window returns the old parent.
+        sync.client.get_all_channel_history.side_effect = [[], [old_parent]]
+        sync.client.get_thread_replies.return_value = [self._reply(ts=new_reply_ts)]
+        sync.indexer.get_latest_timestamp.return_value = cursor
+        sync.indexer.index_messages.return_value = 1
+
+        stats = sync.sync_messages(full=False, dm_only=False)
+
+        kwargs = sync.client.get_thread_replies.call_args.kwargs
+        assert kwargs["thread_ts"] == old_parent_ts
+        # only new replies are fetched
+        expected_oldest = cursor - timedelta(seconds=1)
+        assert abs((kwargs["oldest"] - expected_oldest).total_seconds()) < 2
+        assert stats["messages_indexed"] == 1
+
+    def test_incremental_skips_threads_without_new_replies(self, sync_with_mocks):
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        now = datetime.now(timezone.utc)
+        cursor = now - timedelta(days=1)
+        stale_parent = self._parent(
+            ts=f"{(now - timedelta(days=5)).timestamp():.6f}",
+            reply_count=3,
+            latest_reply=f"{(now - timedelta(days=3)).timestamp():.6f}",  # before cursor
+        )
+
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.side_effect = [[], [stale_parent]]
+        sync.indexer.get_latest_timestamp.return_value = cursor
+
+        sync.sync_messages(full=False, dm_only=False)
+
+        sync.client.get_thread_replies.assert_not_called()
+
+    def test_parent_in_both_fetch_and_rescan_fetched_once(self, sync_with_mocks):
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        now = datetime.now(timezone.utc)
+        cursor = now - timedelta(days=1)
+        new_ts = f"{(now - timedelta(hours=3)).timestamp():.6f}"
+        parent = self._parent(ts=new_ts, reply_count=1,
+                              latest_reply=f"{(now - timedelta(hours=1)).timestamp():.6f}")
+
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.side_effect = [[parent], [parent]]
+        sync.client.get_thread_replies.return_value = [self._reply()]
+        sync.indexer.get_latest_timestamp.return_value = cursor
+        sync.indexer.index_messages.return_value = 1
+
+        sync.sync_messages(full=False, dm_only=False)
+
+        assert sync.client.get_thread_replies.call_count == 1
+
+    def test_thread_fetch_failure_does_not_kill_channel(self, sync_with_mocks):
+        sync = sync_with_mocks
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.return_value = [self._parent(reply_count=2)]
+        sync.client.get_thread_replies.side_effect = RuntimeError("ratelimited")
+        sync.indexer.index_messages.return_value = 1
+
+        stats = sync.sync_messages(full=True, dm_only=False)
+
+        # main history still indexed; channel not recorded as a hard failure
+        assert stats["messages_indexed"] == 1
+        assert stats["channels_processed"] == 1

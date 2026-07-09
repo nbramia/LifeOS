@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 # Default sync configuration
 DEFAULT_DM_HISTORY_DAYS = None  # Full history for DMs
 DEFAULT_CHANNEL_HISTORY_DAYS = 90  # 90 days for channels
+# Incremental thread-reply rescan window: how far back to re-check parents
+# for new replies. A reply to a parent older than this is missed by the
+# nightly sync (trade-off documented in issue #440).
+THREAD_RESCAN_DAYS = 7
 
 
 class SlackSync:
@@ -290,18 +294,29 @@ class SlackSync:
             oldest=oldest,
         )
 
+        if messages:
+            logger.debug(f"Fetched {len(messages)} messages from {channel.channel_id}")
+
+            # Index messages
+            indexed = self.indexer.index_messages(
+                messages=messages,
+                channel=channel,
+                workspace_id=self._workspace_id,
+            )
+            stats["messages_indexed"] = indexed
+
+        # Fetch + index thread replies. Runs even when the main fetch is
+        # empty: a reply posted today to an old parent doesn't surface the
+        # parent in a cursor-windowed conversations.history call — issue #440.
+        stats["messages_indexed"] += self._sync_thread_replies(
+            channel=channel,
+            messages=messages,
+            oldest=oldest,
+            full=full,
+        )
+
         if not messages:
             return stats
-
-        logger.debug(f"Fetched {len(messages)} messages from {channel.channel_id}")
-
-        # Index messages
-        indexed = self.indexer.index_messages(
-            messages=messages,
-            channel=channel,
-            workspace_id=self._workspace_id,
-        )
-        stats["messages_indexed"] = indexed
 
         # Create interactions for DMs
         if create_interactions and (channel.is_im or channel.is_mpim):
@@ -318,6 +333,96 @@ class SlackSync:
                 stats["message_counts"][person_id] = stats["message_counts"].get(person_id, 0) + count
 
         return stats
+
+    def _sync_thread_replies(
+        self,
+        channel: SlackChannel,
+        messages: list[SlackMessage],
+        oldest: Optional[datetime],
+        full: bool,
+    ) -> int:
+        """
+        Fetch and index thread replies for a channel (issue #440).
+
+        Thread parents come from two sources:
+        1. The main history fetch — any message with ``reply_count > 0``.
+        2. Incremental only: a rescan of the last ``THREAD_RESCAN_DAYS`` of
+           parents. A new reply does not resurface its parent in a
+           cursor-windowed history call, so replies to parents older than the
+           cursor would otherwise be missed permanently.
+
+        Incremental runs pass ``oldest`` to ``conversations.replies`` so only
+        new replies are fetched; threads whose ``latest_reply`` predates the
+        cursor are skipped without an API call. Replies are indexed for search
+        only — they don't feed CRM interactions or message counts.
+
+        Returns:
+            Number of thread replies indexed
+        """
+        candidates: dict[str, SlackMessage] = {
+            m.ts: m for m in messages if m.reply_count > 0
+        }
+
+        reply_oldest = None if full else oldest
+
+        # Incremental rescan for replies to parents older than the cursor.
+        # Skipped when the main fetch's window already covers the rescan
+        # window (first sync of a channel).
+        if not full and oldest is not None:
+            rescan_start = datetime.now(timezone.utc) - timedelta(days=THREAD_RESCAN_DAYS)
+            if oldest > rescan_start:
+                try:
+                    recent_parents = self.client.get_all_channel_history(
+                        channel_id=channel.channel_id,
+                        workspace_id=self._workspace_id,
+                        oldest=rescan_start,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Thread rescan failed for {channel.channel_id}: {e}"
+                    )
+                    recent_parents = []
+                for m in recent_parents:
+                    if m.ts in candidates or m.reply_count <= 0:
+                        continue
+                    candidates[m.ts] = m
+
+        indexed = 0
+        for ts, parent in candidates.items():
+            # Skip threads with no replies newer than the cursor.
+            if (
+                not full
+                and oldest is not None
+                and parent.latest_reply
+                and float(parent.latest_reply) <= oldest.timestamp()
+            ):
+                continue
+
+            try:
+                replies = self.client.get_thread_replies(
+                    channel_id=channel.channel_id,
+                    thread_ts=ts,
+                    workspace_id=self._workspace_id,
+                    oldest=reply_oldest,
+                )
+            except Exception as e:
+                # A single thread failing shouldn't fail the whole channel.
+                logger.warning(
+                    f"Failed to fetch thread {ts} in {channel.channel_id}: {e}"
+                )
+                continue
+
+            if replies:
+                indexed += self.indexer.index_messages(
+                    messages=replies,
+                    channel=channel,
+                    workspace_id=self._workspace_id,
+                )
+
+            # Rate limit: small delay between thread fetches
+            time.sleep(0.1)
+
+        return indexed
 
     def _create_interactions_for_channel(
         self,
