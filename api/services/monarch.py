@@ -141,6 +141,29 @@ class MonarchClient:
             })
         return result
 
+    async def get_holdings(self, account_id: str) -> list[dict]:
+        """Investment holdings for one account (via Plaid, where supported).
+
+        Added 2026-07-09 for the Schwab-portfolio dashboard: Guideline 401(k)
+        has no consumer API, but Plaid supplies fund-level holdings through
+        Monarch for many institutions. Returns [] rather than erroring when
+        the institution provides no holdings data.
+        """
+        mm = await self._get_client()
+        data = await mm.get_account_holdings(int(account_id))
+        holdings = []
+        for edge in (data.get("portfolio", {}).get("aggregateHoldings", {}).get("edges", []) or []):
+            node = edge.get("node", {}) or {}
+            sec = node.get("security") or {}
+            holdings.append({
+                "ticker": sec.get("ticker") or "",
+                "name": sec.get("name") or node.get("name") or "",
+                "quantity": node.get("quantity"),
+                "price": (sec.get("currentPrice") if sec else None) or node.get("lastSyncedPrice"),
+                "value": node.get("totalValue"),
+            })
+        return holdings
+
     async def get_transactions(
         self,
         start_date: Optional[str] = None,

@@ -40,6 +40,19 @@ async def list_accounts():
         raise HTTPException(status_code=502, detail=f"Monarch API error: {e}")
 
 
+@router.get("/holdings")
+async def account_holdings(account_id: str):
+    """Investment holdings for one account (empty list if the institution
+    does not supply holdings through Plaid)."""
+    try:
+        client = get_monarch_client()
+        holdings = await client.get_holdings(account_id)
+        return {"holdings": holdings, "count": len(holdings)}
+    except Exception as e:
+        logger.error(f"Failed to fetch Monarch holdings for {account_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Monarch API error: {e}")
+
+
 @router.get("/transactions")
 async def list_transactions(
     start_date: Optional[str] = None,
