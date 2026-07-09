@@ -351,11 +351,11 @@ class TestSingleton:
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test-key"
             mock_settings.anthropic_model = "claude-haiku-4-5"
-            mock_settings.anthropic_specialist_model = "claude-sonnet-4-6"
+            mock_settings.anthropic_specialist_model = "claude-sonnet-5"
             try:
                 client = get_anthropic_llm()
                 assert isinstance(client, AnthropicLLMClient)
-                assert client._model == "claude-sonnet-4-6"
+                assert client._model == "claude-sonnet-5"
                 assert client._model != mock_settings.anthropic_model  # independent
             except ImportError:
                 pytest.skip("anthropic package not installed")

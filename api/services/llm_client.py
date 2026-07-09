@@ -644,7 +644,7 @@ def get_anthropic_llm() -> AnthropicLLMClient:
     API regardless of the LIFEOS_LLM_BACKEND setting.
 
     Sonnet-tier for quality — resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL
-    (default claude-sonnet-4-6), independent of the orchestrator model
+    (default claude-sonnet-5), independent of the orchestrator model
     (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated snapshot
     claude-sonnet-4-20250514, which retired and 404'd every caller (#470).
     """

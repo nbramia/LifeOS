@@ -400,7 +400,7 @@ def _cost_from_usage(usage: dict[str, Any], model: str) -> float:
     out_tok = int(usage.get(_USAGE_OUTPUT, 0) or 0)
     cache_creation = int(usage.get(_USAGE_CACHE_CREATION, 0) or 0)
     cache_read = int(usage.get(_USAGE_CACHE_READ, 0) or 0)
-    use_model = model or "claude-sonnet-4-6"  # safer default than the Opus fallback
+    use_model = model or "claude-sonnet-5"  # safer default than the Opus fallback
     return cost_for(
         use_model,
         in_tok,

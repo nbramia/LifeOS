@@ -166,7 +166,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
     (comma-separated model ids / engine names), else derives a default from
     ``escalation_model``: [escalation_model, claude_code] — so the engine
     handoff lands on the 2nd pushback (1st → stronger model, 2nd → Claude Code).
-    Set the env var to e.g. 'claude-sonnet-4-6,claude-opus-4-8,claude_code' to
+    Set the env var to e.g. 'claude-sonnet-5,claude-opus-4-8,claude_code' to
     insert an opus rung in between. Empty when escalation isn't configured.
     Deduped, order preserved."""
     raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
@@ -189,7 +189,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
 # account is pinned to a different opus release.
 _MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-5",
     "opus": "claude-opus-4-8",
 }
 # A directive verb immediately followed by a tier word: "escalate to opus",
