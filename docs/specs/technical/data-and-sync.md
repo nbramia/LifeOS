@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-07-09
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -72,7 +72,7 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 03:02          └─ LinkedIn (connections CSV export)
 03:03          └─ Contacts (Apple Contacts, native API)
 03:04          └─ WhatsApp (wacli database)
-03:05          └─ Slack (users + DM messages)
+03:05          └─ Slack (users + DM and member-channel messages)
 
 02:50          Apple Data Agent export (Mac Mini → Linux server via rsync)
                └─ Exports contacts, phone calls, iMessage, photos
@@ -183,7 +183,7 @@ All sync scripts in `scripts/` follow the pattern:
 | `sync_apple_contacts.py` | Sync Apple Contacts | Apple Data Agent export |
 | `sync_phone_calls.py` | Sync phone calls | Apple Data Agent export |
 | `sync_imessage_interactions.py` | Sync iMessage | Apple Data Agent export |
-| `sync_slack.py` | Sync Slack users and DMs | Slack API |
+| `sync_slack.py` | Sync Slack users, DMs, and member channels | Slack API |
 
 ### Apple Data Agent
 
@@ -331,7 +331,9 @@ SLACK_TEAM_ID=T02XXXXXXXX      # Your workspace ID
 ```
 
 **Sync Process:**
-1. `sync_slack.py` - Syncs Slack users to SourceEntity, indexes DMs to ChromaDB
+1. `sync_slack.py` - Syncs Slack users to SourceEntity, indexes messages to ChromaDB:
+   - **DMs** — full history, restricted to users linked to CRM people
+   - **Channels** (public + private, member only) — 90-day window on first sync, incremental after; enumerated via `users.conversations` (archived channels excluded); indexed for search only, no CRM Interactions
 2. `link_slack_entities.py` - Links Slack users to PersonEntity by matching email addresses
 
 **Entity Linking:**
@@ -353,7 +355,7 @@ The unified sync runner (`run_all_syncs.py`) executes in this order:
 3. `linkedin` - LinkedIn connections
 4. `contacts` - Apple Contacts (via Apple Data Agent export)
 5. `whatsapp` - WhatsApp contacts and messages
-6. `slack` - Slack users and DMs
+6. `slack` - Slack users, DMs, and member channels
 
 **Note:** `phone` and `imessage` data is exported from the Mac Mini via the Apple Data Agent at 2:50 AM (before the main pipeline) and imported on the Linux server.
 
