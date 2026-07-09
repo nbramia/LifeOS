@@ -1,5 +1,5 @@
 """
-Tests for web search service.
+Tests for the web search service (real search on every backend — #467).
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -8,16 +8,14 @@ pytestmark = pytest.mark.unit
 
 
 class TestWebSearch:
-    """Tests for web search service functions."""
+    """Tests for the result formatter."""
 
     def test_format_web_results_empty(self):
-        """Empty results should return informative message."""
         from api.services.web_search import format_web_results_for_context
         result = format_web_results_for_context([])
         assert "No web search results found" in result
 
     def test_format_web_results_single(self):
-        """Single result should format correctly."""
         from api.services.web_search import format_web_results_for_context
         results = [
             {"title": "Test Title", "url": "https://example.com", "snippet": "Test snippet"}
@@ -28,7 +26,6 @@ class TestWebSearch:
         assert "Test snippet" in result
 
     def test_format_web_results_multiple(self):
-        """Multiple results should be numbered."""
         from api.services.web_search import format_web_results_for_context
         results = [
             {"title": "First", "url": "https://first.com", "snippet": "First result"},
@@ -39,70 +36,86 @@ class TestWebSearch:
         assert "2. **Second**" in result
 
     def test_format_web_results_missing_fields(self):
-        """Should handle missing optional fields."""
         from api.services.web_search import format_web_results_for_context
-        results = [
-            {"title": "Title Only", "url": "", "snippet": ""}
-        ]
+        results = [{"title": "Title Only", "url": "", "snippet": ""}]
         result = format_web_results_for_context(results)
         assert "Title Only" in result
 
 
-class TestSearchWeb:
-    """Tests for the search_web function."""
+def _fake_ddgs(hits):
+    """Build a DDGS() context manager whose .text() returns `hits`."""
+    inner = MagicMock()
+    inner.text.return_value = hits
+    cm = MagicMock()
+    cm.__enter__.return_value = inner
+    cm.__exit__.return_value = False
+    return cm
+
+
+class TestDuckDuckGoSearch:
+    """The backend-independent DuckDuckGo path."""
+
+    def test_ddg_search_maps_fields(self):
+        from api.services import web_search
+        cm = _fake_ddgs([{"title": "T", "href": "https://x.com", "body": "snip"}])
+        with patch("ddgs.DDGS", return_value=cm):
+            out = web_search._ddg_search("q")
+        assert out == [{"title": "T", "url": "https://x.com", "snippet": "snip"}]
+
+    def test_ddg_search_non_fatal_on_error(self):
+        from api.services import web_search
+        with patch("ddgs.DDGS", side_effect=Exception("rate limited")):
+            assert web_search._ddg_search("q") == []
 
     @pytest.mark.asyncio
-    async def test_search_web_returns_list(self):
-        """search_web should return a list."""
-        mock_response = MagicMock()
-        mock_response.text = "Here are the results..."
-
-        mock_client = MagicMock()
-        mock_client.create.return_value = mock_response
-
-        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
-            from api.services.web_search import search_web
-            results = await search_web("test query")
-            assert isinstance(results, list)
-
-    @pytest.mark.asyncio
-    async def test_search_web_handles_error(self):
-        """search_web should handle errors gracefully."""
-        mock_client = MagicMock()
-        mock_client.create.side_effect = Exception("API Error")
-
-        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
-            from api.services.web_search import search_web
-            results = await search_web("test query")
-            assert results == []
+    async def test_search_web_offloads_to_ddg(self):
+        from api.services import web_search
+        with patch.object(web_search, "_ddg_search", return_value=[{"title": "T", "url": "u", "snippet": "s"}]):
+            out = await web_search.search_web("q")
+        assert out == [{"title": "T", "url": "u", "snippet": "s"}]
 
 
 class TestSearchWebWithSynthesis:
-    """Tests for the search_web_with_synthesis function."""
+    """The hybrid entry point: native on Anthropic, DuckDuckGo elsewhere."""
 
     @pytest.mark.asyncio
-    async def test_returns_tuple(self):
-        """Should return tuple of (synthesized, results)."""
-        mock_response = MagicMock()
-        mock_response.text = "The answer is 42."
-
-        mock_client = MagicMock()
-        mock_client.create.return_value = mock_response
-
-        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
-            from api.services.web_search import search_web_with_synthesis
-            synthesized, results = await search_web_with_synthesis("test query")
-            assert isinstance(synthesized, str)
-            assert isinstance(results, list)
+    async def test_anthropic_backend_uses_native(self):
+        from api.services import web_search
+        with patch.object(web_search, "_use_native_anthropic", return_value=True), \
+             patch.object(web_search, "_anthropic_native_search", new=AsyncMock(return_value="Live answer, sourced.")):
+            synthesized, results = await web_search.search_web_with_synthesis("who won today")
+        assert synthesized == "Live answer, sourced."
+        assert isinstance(results, list) and results
 
     @pytest.mark.asyncio
-    async def test_handles_error_gracefully(self):
-        """Should return error message on failure."""
-        mock_client = MagicMock()
-        mock_client.create.side_effect = Exception("API Error")
+    async def test_local_backend_uses_ddg(self):
+        from api.services import web_search
+        native = AsyncMock()
+        with patch.object(web_search, "_use_native_anthropic", return_value=False), \
+             patch.object(web_search, "_anthropic_native_search", new=native), \
+             patch.object(web_search, "search_web", new=AsyncMock(return_value=[
+                 {"title": "AMD price", "url": "https://finance.example/amd", "snippet": "AMD is up 5.8%"}])):
+            synthesized, results = await web_search.search_web_with_synthesis("amd price")
+        native.assert_not_awaited()                     # local backend never calls Claude
+        assert "AMD price" in synthesized and "finance.example" in synthesized
+        assert results and results[0]["title"] == "AMD price"
 
-        with patch('api.services.web_search.get_anthropic_llm', return_value=mock_client):
-            from api.services.web_search import search_web_with_synthesis
-            synthesized, results = await search_web_with_synthesis("test query")
-            assert "couldn't" in synthesized.lower() or "error" in synthesized.lower()
-            assert results == []
+    @pytest.mark.asyncio
+    async def test_native_failure_falls_back_to_ddg(self):
+        from api.services import web_search
+        with patch.object(web_search, "_use_native_anthropic", return_value=True), \
+             patch.object(web_search, "_anthropic_native_search", new=AsyncMock(side_effect=Exception("anthropic down"))), \
+             patch.object(web_search, "search_web", new=AsyncMock(return_value=[
+                 {"title": "Fallback", "url": "https://x", "snippet": "ddg result"}])):
+            synthesized, results = await web_search.search_web_with_synthesis("q")
+        assert "Fallback" in synthesized                # degraded to DuckDuckGo, not an error string
+        assert results and results[0]["title"] == "Fallback"
+
+    @pytest.mark.asyncio
+    async def test_empty_search_returns_empty_not_fabricated(self):
+        from api.services import web_search
+        with patch.object(web_search, "_use_native_anthropic", return_value=False), \
+             patch.object(web_search, "search_web", new=AsyncMock(return_value=[])):
+            synthesized, results = await web_search.search_web_with_synthesis("q")
+        assert synthesized == ""                          # honest "nothing found", never invented
+        assert results == []

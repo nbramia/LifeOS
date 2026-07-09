@@ -54,5 +54,8 @@ psutil
 monarchmoneycommunity>=1.3.0  # Community fork with api.monarch.com domain fix
 yfinance>=0.2.40  # Yahoo Finance day-change quotes for the big-mover alert (#463)
 
+# Web Search
+ddgs>=9.0  # DuckDuckGo web search (no API key) — backend-agnostic search_web (#467)
+
 # macOS Integrations (optional)
 pyobjc-framework-Contacts>=10.0; sys_platform == "darwin"  # Apple Contacts integration
