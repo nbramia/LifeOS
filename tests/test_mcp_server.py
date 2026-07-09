@@ -114,6 +114,7 @@ class TestMCPServerToolDiscovery:
             "lifeos_ask",
             "lifeos_search",
             "lifeos_health",
+            "lifeos_slack_my_messages",
         }
 
         for expected in expected_tools:

@@ -129,6 +129,11 @@ CURATED_ENDPOINTS = {
         "description": "Semantic search across Slack DMs, group DMs, and channels. Returns channel, user, content.",
         "method": "POST"
     },
+    "/api/slack/my-messages": {
+        "name": "lifeos_slack_my_messages",
+        "description": "Pull every Slack message the user sent on a date (DMs, group DMs, channels, threads) via search.messages — source-of-truth, not the sync index. date: YYYY-MM-DD (Slack timezone); optional user.",
+        "method": "GET"
+    },
     "/api/crm/people/{person_id}/facts": {
         "name": "lifeos_person_facts",
         "description": "Get extracted facts about a person (family, interests, work, dates, travel) with confidence scores. Requires entity_id. Use before drafting personalized messages.",
@@ -625,6 +630,14 @@ class LifeOSMCPServer:
                     "user_id": {"type": "string", "description": "Filter by specific user ID"}
                 },
                 "required": ["query"]
+            },
+            "lifeos_slack_my_messages": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Day to pull, YYYY-MM-DD (user's Slack timezone)"},
+                    "user": {"type": "string", "description": "Slack user ID to pull messages for (defaults to the token owner)"}
+                },
+                "required": ["date"]
             },
             "lifeos_person_facts": {
                 "type": "object",
