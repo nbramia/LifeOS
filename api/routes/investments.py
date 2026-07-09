@@ -71,9 +71,11 @@ def check_investments_freshness() -> Optional[str]:
     lands in the batched health report — not raised, not a CRITICAL page.
     """
     path = os.path.join(SYNC_DIR, "summary.json")
-    if not os.path.exists(path):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        # Missing / never-synced / vanished mid-check — not an error.
         return None
-    mtime = os.path.getmtime(path)
     age_days = (datetime.now().timestamp() - mtime) / 86400
     if age_days > STALENESS_WARNING_DAYS:
         synced = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")

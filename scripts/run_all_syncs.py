@@ -442,7 +442,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
 
     # Build message
     collapsed_sources = result.get("duration_collapsed_sources", [])
-    status_emoji = "✅" if result["failed"] == 0 and not collapsed_sources else "⚠️"
+    status_emoji = "✅" if result["failed"] == 0 and not collapsed_sources and not result.get("investments_stale") else "⚠️"
     lines = [
         f"{status_emoji} *LifeOS Sync Complete*",
         f"Trigger: {trigger}",
@@ -511,6 +511,14 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
                 lines.append("  Manual review needed — threshold exceeded")
             else:
                 lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
+
+    # Investments-snapshot freshness (#448) — surface the stale WARNING here so
+    # it reaches the operator (the bare log line does not feed any batched report).
+    investments_stale = result.get("investments_stale")
+    if investments_stale:
+        lines.append("")
+        lines.append("⚠️ *Investments snapshot stale:*")
+        lines.append(f"  {investments_stale}")
 
     try:
         success = send_message("\n".join(lines))
@@ -1343,13 +1351,15 @@ def run_all_syncs(
         logger.warning(f"Source-entity drift detector failed: {e}")
 
     # Investments-snapshot freshness (#448): the Schwab pipeline delivers
-    # summary.json via Syncthing (weekday ~18:30 refresh); warn (batched) if it
-    # has gone stale. Non-fatal, and skipped silently when the file is absent.
+    # summary.json via Syncthing (weekday ~18:30 refresh); warn if it has gone
+    # stale. Non-fatal and skipped silently when absent. Surfaced in the nightly
+    # Telegram summary (via result["investments_stale"]) so it reaches the operator.
+    investments_stale = None
     try:
         from api.routes.investments import check_investments_freshness
-        stale_msg = check_investments_freshness()
-        if stale_msg:
-            logger.warning(stale_msg)
+        investments_stale = check_investments_freshness()
+        if investments_stale:
+            logger.warning(investments_stale)
     except Exception as e:
         logger.warning(f"Investments freshness check failed: {e}")
 
@@ -1402,6 +1412,7 @@ def run_all_syncs(
         "interactions_by_source": interactions_by_source,
         "dep_skipped_sources": sorted(dep_skipped),
         "duration_collapsed_sources": duration_collapsed,
+        "investments_stale": investments_stale,
     }
 
     # Exit maintenance mode now that sync is complete

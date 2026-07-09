@@ -49,3 +49,17 @@ def test_freshness_missing_file_is_not_an_error(tmp_path, monkeypatch):
     """A never-synced snapshot returns None (skip), not a warning or an error."""
     monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))  # empty dir, no file
     assert inv.check_investments_freshness() is None
+
+
+def test_freshness_just_under_threshold_does_not_warn(tmp_path, monkeypatch):
+    """3.9 days (just under the 4-day threshold) must not warn — pins the boundary."""
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
+    _write_summary(tmp_path, age_days=inv.STALENESS_WARNING_DAYS - 0.1)
+    assert inv.check_investments_freshness() is None
+
+
+def test_freshness_just_over_threshold_warns(tmp_path, monkeypatch):
+    """4.5 days (just over the threshold) warns — pins the boundary."""
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
+    _write_summary(tmp_path, age_days=inv.STALENESS_WARNING_DAYS + 0.5)
+    assert inv.check_investments_freshness() is not None
