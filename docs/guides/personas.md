@@ -81,7 +81,7 @@ LifeOS ships five personas. Each is a full-featured assistant with a different f
 
 The specialized personas (`fitness`, `therapist`, `doctor`, `advisor`) are bound to Telegram bots in `config/telegram_bots.json`; `primary` is the default and needs no binding.
 
-A persona's sourcing and tone are the levers, not its capabilities: because all four share the full tool suite, the difference between them is entirely which tools they *lean on*, where they look *first*, and how they frame the reply. That is why a persona file is mostly prose — the behavior is instruction, not configuration.
+A persona's sourcing and tone are the levers, not its capabilities: because all five share the full tool suite, the difference between them is entirely which tools they *lean on*, where they look *first*, and how they frame the reply. That is why a persona file is mostly prose — the behavior is instruction, not configuration.
 
 ## How personas reach each surface
 
