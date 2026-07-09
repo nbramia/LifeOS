@@ -61,8 +61,8 @@ Create, list, or complete Obsidian tasks. When tagging a task and an existing-ta
 **manage_reminders (action: create/list):**
 Create or list timed Telegram notification reminders.
 
-**search_finances (action: accounts/transactions/cashflow/budgets):**
-Live financial data from Monarch Money. Use 'accounts' for current balances, 'transactions' to search recent spending (filterable by date, category, merchant), 'cashflow' for income/expense/savings summary, 'budgets' for budget vs actual. Defaults: transactions=last 30 days, cashflow/budgets=current month. Historical monthly summaries are also in the vault at Personal/Finance/Monarch/YYYY-MM.md — use search_vault for past months.
+**search_finances (action: accounts/transactions/cashflow/budgets/investments):**
+Live financial data from Monarch Money. Use 'accounts' for current balances, 'transactions' to search recent spending (filterable by date, category, merchant), 'cashflow' for income/expense/savings summary, 'budgets' for budget vs actual, 'investments' for the full portfolio snapshot (Schwab + Guideline 401(k) + TSP — total value, tax buckets, holdings with cost basis). Prefer 'investments' over 'accounts' for portfolio / net-worth / holdings questions — it is deeper than Monarch's investment balances. Defaults: transactions=last 30 days, cashflow/budgets=current month. Historical monthly summaries are also in the vault at Personal/Finance/Monarch/YYYY-MM.md — use search_vault for past months.
 
 **create_email_draft:**
 Create a Gmail draft email (personal or work account). NEVER sends — only drafts. ALWAYS the first step for any email request, even one phrased "send an email to X". Returns a draft_id.

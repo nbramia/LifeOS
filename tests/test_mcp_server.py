@@ -400,3 +400,117 @@ def test_call_api_skips_cache_when_session_id_missing():
     server._call_api("lifeos_calendar_upcoming", {"days": 7})
     # Both calls round-trip — no session, no cache.
     assert fake.get.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Investments snapshot tool (#447)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_investments_tool_curated():
+    """lifeos_investments is a curated GET tool on the summary endpoint, with a
+    description inside the 30-word cache budget."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cfg = next((c for c in module.CURATED_ENDPOINTS.values()
+                if c["name"] == "lifeos_investments"), None)
+    assert cfg is not None, "lifeos_investments missing from CURATED_ENDPOINTS"
+    assert cfg["method"] == "GET"
+    assert len(cfg["description"].split()) <= 30
+
+
+@pytest.mark.unit
+def test_investments_format_digest():
+    """_format_response renders a portfolio digest that surfaces synced_at."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+    data = {
+        "synced_at": "2026-07-09T03:26:00",
+        "as_of": "2026-07-09",
+        "totals": {
+            "all_investments": 1234567, "schwab": 1000000, "external_retirement": 234567,
+            "tax_buckets": {"pretax": 500000, "roth": 300000, "taxable": 434567},
+        },
+        "accounts": [
+            {"key": "brokerage", "name": "Schwab Brokerage", "value": 1000000, "external": False},
+            {"key": "401k", "name": "Guideline 401(k)", "value": 234567, "external": True},
+        ],
+        "positions": [
+            {"symbol": "VTI", "value": 500000, "weight_pct": 40, "unrealized": 120000},
+            {"symbol": "GFND", "value": 234567, "weight_pct": 19},  # external: no unrealized
+        ],
+        "taxable_unrealized": {"long_term": 80000, "short_term": 5000, "harvestable_losses": -2000},
+    }
+    out = server._format_response("lifeos_investments", data)
+    assert "Investment portfolio" in out
+    assert "2026-07-09T03:26:00" in out       # synced_at surfaced
+    assert "$1,234,567" in out                 # total value
+    assert "Schwab Brokerage" in out
+    assert "(external)" in out                 # external account tagged
+    assert "VTI" in out and "unrealized" in out
+
+
+@pytest.mark.unit
+def test_investments_not_synced_is_graceful():
+    """A missing snapshot yields a friendly message, not an 'Error:' string."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+    out = server._format_response(
+        "lifeos_investments",
+        {"error": 'API error 404: {"detail":"summary.json not synced yet — run the macbook refresh"}'},
+    )
+    assert not out.startswith("Error:")
+    assert "not synced yet" in out.lower()
+
+
+@pytest.mark.unit
+def test_investments_format_tolerates_null_fields():
+    """A partial snapshot — present-but-null numbers, or a whole null section —
+    degrades to $0 instead of raising (external accounts can lack figures, and a
+    partial write can null a section)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+    # null numeric leaves within present sections
+    data = {
+        "synced_at": "2026-07-09T03:26:00", "as_of": "2026-07-09",
+        "totals": {"all_investments": None, "schwab": None, "external_retirement": None,
+                   "tax_buckets": {"pretax": None, "roth": None, "taxable": None}},
+        "accounts": [{"key": "401k", "name": "Guideline 401(k)", "value": None, "external": True}],
+        "positions": [{"symbol": "GFND", "value": None, "weight_pct": None}],
+        "taxable_unrealized": {"long_term": None, "short_term": None, "harvestable_losses": None},
+    }
+    out = server._format_response("lifeos_investments", data)  # must not raise
+    assert "Investment portfolio" in out
+    assert "$0" in out
+    assert "None" not in out
+    # whole null sections (plausible on a partial write)
+    out2 = server._format_response(
+        "lifeos_investments",
+        {"synced_at": "x", "as_of": "y", "totals": None, "accounts": None,
+         "positions": None, "taxable_unrealized": None},
+    )
+    assert "Investment portfolio" in out2  # must not raise
+
+
+@pytest.mark.unit
+def test_investments_route_404_matches_mcp_not_synced_branch(tmp_path, monkeypatch):
+    """The MCP graceful branch keys on 'not synced' in the route's 404 detail;
+    guard that cross-file coupling so a reword of the route message can't
+    silently drop the graceful handling."""
+    from fastapi import HTTPException
+    from api.routes import investments as inv_route
+    monkeypatch.setattr(inv_route, "SYNC_DIR", str(tmp_path))  # empty dir → file missing
+    with pytest.raises(HTTPException) as ei:
+        inv_route._load("summary.json")
+    assert "not synced" in str(ei.value.detail).lower()
