@@ -639,9 +639,10 @@ class SlackClient:
 
         ``conversations.history`` returns only top-level messages, so thread
         replies are invisible to it — this is the only way to fetch them
-        (issue #440). The parent message (ts == thread_ts) is returned by the
-        API as the first item and is excluded here: the parent is already
-        indexed from the history fetch.
+        (issue #440). The parent message (ts == thread_ts) is excluded
+        whenever the API returns it — it leads the response on unwindowed
+        calls, while with ``oldest`` set it is typically absent entirely.
+        The parent is already indexed from the history fetch.
 
         Args:
             channel_id: Channel containing the thread
@@ -664,7 +665,13 @@ class SlackClient:
             if cursor:
                 params["cursor"] = cursor
 
-            data = self._api_call("conversations.replies", workspace_id, **params)
+            # max_retries=5 (vs. the default 3): replies fetches are the
+            # rate-limit hot path during a backfill, and retry exhaustion
+            # surfaces as a partial sync that needs a manual full sync to
+            # heal — buy extra headroom.
+            data = self._api_call(
+                "conversations.replies", workspace_id, max_retries=5, **params
+            )
 
             for msg in data.get("messages", []):
                 if msg.get("type") != "message":
