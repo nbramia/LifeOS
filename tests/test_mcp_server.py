@@ -469,3 +469,48 @@ def test_investments_not_synced_is_graceful():
     )
     assert not out.startswith("Error:")
     assert "not synced yet" in out.lower()
+
+
+@pytest.mark.unit
+def test_investments_format_tolerates_null_fields():
+    """A partial snapshot — present-but-null numbers, or a whole null section —
+    degrades to $0 instead of raising (external accounts can lack figures, and a
+    partial write can null a section)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+    # null numeric leaves within present sections
+    data = {
+        "synced_at": "2026-07-09T03:26:00", "as_of": "2026-07-09",
+        "totals": {"all_investments": None, "schwab": None, "external_retirement": None,
+                   "tax_buckets": {"pretax": None, "roth": None, "taxable": None}},
+        "accounts": [{"key": "401k", "name": "Guideline 401(k)", "value": None, "external": True}],
+        "positions": [{"symbol": "GFND", "value": None, "weight_pct": None}],
+        "taxable_unrealized": {"long_term": None, "short_term": None, "harvestable_losses": None},
+    }
+    out = server._format_response("lifeos_investments", data)  # must not raise
+    assert "Investment portfolio" in out
+    assert "$0" in out
+    assert "None" not in out
+    # whole null sections (plausible on a partial write)
+    out2 = server._format_response(
+        "lifeos_investments",
+        {"synced_at": "x", "as_of": "y", "totals": None, "accounts": None,
+         "positions": None, "taxable_unrealized": None},
+    )
+    assert "Investment portfolio" in out2  # must not raise
+
+
+@pytest.mark.unit
+def test_investments_route_404_matches_mcp_not_synced_branch(tmp_path, monkeypatch):
+    """The MCP graceful branch keys on 'not synced' in the route's 404 detail;
+    guard that cross-file coupling so a reword of the route message can't
+    silently drop the graceful handling."""
+    from fastapi import HTTPException
+    from api.routes import investments as inv_route
+    monkeypatch.setattr(inv_route, "SYNC_DIR", str(tmp_path))  # empty dir → file missing
+    with pytest.raises(HTTPException) as ei:
+        inv_route._load("summary.json")
+    assert "not synced" in str(ei.value.detail).lower()

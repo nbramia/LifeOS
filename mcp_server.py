@@ -1603,14 +1603,14 @@ class LifeOSMCPServer:
         elif tool_name == "lifeos_investments":
             # Household portfolio snapshot from the Schwab pipeline (synced from
             # nathan-macbook). Mirrors the search_finances 'investments' digest.
-            totals = data.get("totals", {})
-            tb = totals.get("tax_buckets", {})
+            totals = data.get("totals") or {}
+            tb = totals.get("tax_buckets") or {}
             lines = [
                 f"**Investment portfolio** (as of {data.get('as_of', '?')}, synced {data.get('synced_at', '?')})",
                 "",
-                f"- Total: ${totals.get('all_investments', 0):,.0f} "
-                f"(Schwab ${totals.get('schwab', 0):,.0f} + external retirement ${totals.get('external_retirement', 0):,.0f})",
-                f"- Tax buckets: pre-tax ${tb.get('pretax', 0):,.0f} · Roth ${tb.get('roth', 0):,.0f} · taxable ${tb.get('taxable', 0):,.0f}",
+                f"- Total: ${(totals.get('all_investments') or 0):,.0f} "
+                f"(Schwab ${(totals.get('schwab') or 0):,.0f} + external retirement ${(totals.get('external_retirement') or 0):,.0f})",
+                f"- Tax buckets: pre-tax ${(tb.get('pretax') or 0):,.0f} · Roth ${(tb.get('roth') or 0):,.0f} · taxable ${(tb.get('taxable') or 0):,.0f}",
             ]
             accounts = data.get("accounts", [])
             if accounts:
@@ -1625,12 +1625,12 @@ class LifeOSMCPServer:
                     unrl = (f", unrealized ${pos['unrealized']:+,.0f}"
                             if pos.get("unrealized") is not None else "")
                     lines.append(f"- {pos.get('symbol', '')}: ${(pos.get('value') or 0):,.0f} "
-                                 f"({pos.get('weight_pct', 0)}%{unrl})")
+                                 f"({pos.get('weight_pct') or 0}%{unrl})")
             tu = data.get("taxable_unrealized")
             if tu:
-                lines += ["", (f"Taxable unrealized: LT ${tu.get('long_term', 0):,.0f} · "
-                               f"ST ${tu.get('short_term', 0):,.0f} · "
-                               f"harvestable ${tu.get('harvestable_losses', 0):,.0f}")]
+                lines += ["", (f"Taxable unrealized: LT ${(tu.get('long_term') or 0):,.0f} · "
+                               f"ST ${(tu.get('short_term') or 0):,.0f} · "
+                               f"harvestable ${(tu.get('harvestable_losses') or 0):,.0f}")]
             lines.append("\nFull detail (positions incl. lots/flows, wealth history): "
                          "GET /api/investments/portfolio.")
             return "\n".join(lines)
