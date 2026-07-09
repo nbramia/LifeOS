@@ -347,6 +347,95 @@ class TestDoctorListener:
         mock_resume.assert_awaited_once()
         mock_spawn.assert_not_called()
 
+    def _seed_goal_question(self, tmp_path, message_id=5000):
+        """A BLOCKED doctor session with an open goal_approval question
+        anchored to `message_id`, on an isolated store."""
+        from api.services.agent_worker.session_store import STATUS_BLOCKED, SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        session = store.create(
+            task_id="t-goal", routing="claude_code", origin="operator",
+            bot="doctor", status=STATUS_BLOCKED,
+        )
+        store.create_pending_question(
+            session_id=session.session_id, task_id="t-goal",
+            question="goal body + reply instructions", sent_message_id=message_id,
+            sent_message_ids=[message_id], kind="goal_approval", bot="doctor",
+        )
+        return store
+
+    @pytest.mark.asyncio
+    async def test_goal_approval_yes_acks_immediately(self, tmp_path):
+        """A threaded 'yes' on the goal message deposits the answer AND gets a
+        deposit-time ack. The worker only drains answers on its next tick (up
+        to poll_seconds later) and the agent may then work silently for
+        minutes — without this ack the operator can't tell the 'yes' landed."""
+        store = self._seed_goal_question(tmp_path)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None):
+            sent.append(text)
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            consumed = await listener._maybe_handle_claude_code_reply(5000, "yes", "999")
+
+        assert consumed is True
+        assert any("Goal locked" in s for s in sent)
+        # The answer is queued for the worker's goal_approval resume path.
+        answered = store.list_answered_unprocessed_questions()
+        assert [q["answer"] for q in answered] == ["yes"]
+
+    @pytest.mark.asyncio
+    async def test_goal_approval_refinement_acks_with_rework(self, tmp_path):
+        """A non-affirmative threaded reply is a refinement: deposited for the
+        worker, acked as a rework (not as a lock)."""
+        store = self._seed_goal_question(tmp_path)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None):
+            sent.append(text)
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            consumed = await listener._maybe_handle_claude_code_reply(
+                5000, "make it also require lint", "999")
+
+        assert consumed is True
+        assert any("reworking the goal" in s for s in sent)
+        assert not any("Goal locked" in s for s in sent)
+        answered = store.list_answered_unprocessed_questions()
+        assert [q["answer"] for q in answered] == ["make it also require lint"]
+
+    @pytest.mark.asyncio
+    async def test_goal_approval_duplicate_reply_consumed_not_respawned(self, tmp_path):
+        """A second reply to an already-answered goal message is consumed with
+        an "already have an answer" notice — it must NOT fall through to the
+        orchestration handler and spawn a fresh session (the yes/yes/approved
+        fan-out failure mode)."""
+        store = self._seed_goal_question(tmp_path)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None):
+            sent.append(text)
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            first = await listener._maybe_handle_claude_code_reply(5000, "yes", "999")
+            second = await listener._maybe_handle_claude_code_reply(5000, "yes", "999")
+
+        assert first is True and second is True
+        assert any("already have your answer" in s for s in sent)
+        # Only ONE answer reached the queue.
+        answered = store.list_answered_unprocessed_questions()
+        assert len(answered) == 1
+
     @pytest.mark.asyncio
     async def test_pure_chat_bot_never_spawns(self):
         listener = self._listener("fitness", "999", persona="P", orchestrates=False)
@@ -569,8 +658,12 @@ class TestGoalApproval:
         assert not _is_affirmative("yes, also require lint")
 
     def test_goal_block_registers_goal_approval_question(self, tmp_path):
-        """A goal-approval BLOCKED outcome registers a kind='goal_approval'
-        pending question scoped to the doctor bot, with the goal prompt."""
+        """A goal-approval BLOCKED outcome sends ONE anchored message — the
+        goal body plus the threaded-reply instructions — and registers it as a
+        kind='goal_approval' pending question scoped to the doctor bot. (The
+        goal used to stream as its own message with a separate instruction
+        message as the reply anchor, which made "reply yes — to which
+        message?" ambiguous.)"""
         from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
 
         w = self._make_worker(tmp_path, self._goal_blocked_stub())
@@ -582,7 +675,10 @@ class TestGoalApproval:
         assert w._sent_with_ids, "no id-captured message was sent"
         msg_id, text, bot = w._sent_with_ids[-1]
         assert bot == "doctor"
+        # The goal itself is ON the anchored message the operator replies to.
+        assert "all tests pass" in text
         assert "lock this goal" in text.lower()
+        assert "reply to this message" in text.lower()
         q = w.session_store.get_open_question_by_message_id(msg_id, bot="doctor")
         assert q is not None
         assert q["kind"] == "goal_approval"

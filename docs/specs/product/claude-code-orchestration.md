@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** Orchestrator
-**Last Updated:** 2026-06-25
+**Last Updated:** 2026-07-09
 
 LifeOS spawns a **Claude Code** subprocess from Telegram when the operator sends `/claude <task>` (or when a natural-language message is classified as requiring terminal / filesystem / browser access). The subprocess runs the task on the server, streams progress back as Telegram messages, and terminates. The operator can monitor (`/claude_status`) and cancel (`/claude_cancel`) the active session.
 
@@ -122,16 +122,15 @@ While a clarification is pending, all non-command Telegram messages route as the
 
 ## Goal approval
 
-For longer or fuzzier objectives, Claude can propose a **success condition** with `[GOAL] <condition>` before it starts working. The proposed goal is relayed to the operator, the session pauses, and the operator either approves it or replies with changes.
+For longer or fuzzier objectives, Claude can propose a **success condition** with `[GOAL] <condition>` before it starts working. The session pauses and the goal is relayed to the operator as **one message** carrying both the proposed condition and how to answer it — the operator's threaded reply lands on the message that shows the goal itself.
 
 **Flow:**
 
-1. Claude: `[GOAL] All unit tests pass and the linter is clean.`
-2. LifeOS: "Reply 'yes' to lock this goal and start, or send changes to refine it."
-3. Operator: `yes` → the worker locks the goal (it arms Claude Code's native goal mode by injecting `/goal <condition>` on resume) and Claude begins.
-   Or: `make it also require the docs to build` → treated as a refinement; the raw reply goes back to Claude, which re-proposes an updated `[GOAL]`.
+1. LifeOS (single message): the proposed goal, followed by "Reply to this message with 'yes' to lock this goal and start, or with changes to refine it." The instruction spells out that only a **threaded reply** (Telegram's Reply on that message) reaches the session — a plain chat message doesn't.
+2. Operator replies `yes` on that message → LifeOS immediately acks ("✅ Goal locked — starting work now…"), then the worker locks the goal (it arms Claude Code's native goal mode by injecting `/goal <condition>` on resume) and Claude begins.
+   Or: `make it also require the docs to build` → acked as a rework; the raw reply goes back to Claude, which re-proposes an updated `[GOAL]`.
 
-Approval is recognized from short affirmatives (`yes`, `approve`, `go ahead`, `sounds good`, `lgtm`, …). A reply that also asks for changes (`yes, but make it stricter`) is treated as a refinement, not a lock.
+Approval is recognized from short affirmatives (`yes`, `approve`, `go ahead`, `sounds good`, `lgtm`, …). A reply that also asks for changes (`yes, but make it stricter`) is treated as a refinement, not a lock. A reply landing on a goal message that already has an answer is acknowledged ("already in motion") rather than treated as a new report.
 
 **Note:** `[GOAL]` is a first-class protocol tag with its own pending state (`REASON_AWAITING_GOAL_APPROVAL`). The doctor persona emits it as the gate of its goal-first pipeline (see [doctor-bot.md](../../guides/doctor-bot.md)).
 
@@ -145,7 +144,7 @@ Claude sends three kinds of messages via Telegram:
 |--------|------|---------|
 | `[NOTIFY] ...` | Progress checkpoint or completion summary | `[NOTIFY] Created backup script at ~/scripts/backup.sh and added daily cron job at 2am.` |
 | `[CLARIFY] ...` | Claude needs an answer | `[CLARIFY] Which backlog section — Work or Personal?` |
-| `[GOAL] ...` | Claude proposes a success condition to lock before starting | `[GOAL] All unit tests pass and the linter is clean.` |
+| `[GOAL] ...` | Claude proposes a success condition to lock before starting; delivered as one message with the reply instructions when the session blocks | `[GOAL] All unit tests pass and the linter is clean.` |
 | heartbeat | Every 5 minutes while running | `Still working... (5m elapsed)` |
 
 Only `[NOTIFY]`, `[CLARIFY]`, and `[GOAL]` lines are relayed. All other output (tool calls, file reads, intermediate steps) stays in the subprocess. The heartbeat is sent by the orchestrator (not Claude) so the operator always knows the session is alive even when Claude is busy without notifying.
