@@ -188,3 +188,58 @@ def test_scheduler_endpoint_prefers_scheduler_message_field():
     dumped = _format_endpoint_result({"status": "ok", "message": "done"})
     assert '"status"' in dumped and '"message"' in dumped   # generic {message} left as JSON
     assert '"foo"' in _format_endpoint_result({"foo": 1})
+
+
+# ---------------------------------------------------------------------------
+# On-demand movers via search_finances (#468)
+# ---------------------------------------------------------------------------
+
+async def test_search_finances_movers_action(monkeypatch):
+    """search_finances(action='movers') returns the on-demand day-movers digest,
+    reusing investments_movers — tickers + % only, no dollar amounts."""
+    from unittest.mock import AsyncMock
+    from api.services.agent_tools import _tool_search_finances
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
+    monkeypatch.setattr(inv, "investments_movers", AsyncMock(return_value={
+        "scheduler_message": "Positions moving more than 5% today:\n- AMD: ▲ +5.8%", "count": 1}))
+    out = await _tool_search_finances({"action": "movers"})
+    assert "AMD" in out and "5.8%" in out
+    assert "$" not in out
+
+
+async def test_search_finances_movers_none_today(monkeypatch):
+    """When nothing moved past the (custom) threshold, the tool answers plainly
+    rather than returning an empty string."""
+    from unittest.mock import AsyncMock
+    from api.services.agent_tools import _tool_search_finances
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
+    monkeypatch.setattr(inv, "investments_movers", AsyncMock(return_value={
+        "scheduler_message": "", "count": 0}))
+    out = await _tool_search_finances({"action": "movers", "threshold": 3})
+    assert "No held position moved more than 3% today" in out
+
+
+async def test_search_finances_movers_threshold_zero_uses_default(monkeypatch):
+    """An explicit threshold of 0 (or non-positive/non-numeric) falls back to the
+    5% default rather than listing every position that moved at all."""
+    from api.services.agent_tools import _tool_search_finances
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
+    captured = {}
+
+    async def fake(threshold):
+        captured["threshold"] = threshold
+        return {"scheduler_message": "", "count": 0}
+
+    monkeypatch.setattr(inv, "investments_movers", fake)
+    out = await _tool_search_finances({"action": "movers", "threshold": 0})
+    assert captured["threshold"] == inv.MOVER_THRESHOLD_PCT
+    assert "more than 5% today" in out
+
+
+async def test_search_finances_movers_snapshot_not_synced(monkeypatch):
+    """On-demand: a missing snapshot says 'couldn't check' — distinct from a
+    genuinely quiet day, so the user isn't misled that the market was flat."""
+    from api.services.agent_tools import _tool_search_finances
+    monkeypatch.setattr(inv, "_held_tickers", lambda: [])
+    out = await _tool_search_finances({"action": "movers"})
+    assert "couldn't check" in out.lower() or "isn't available" in out.lower()

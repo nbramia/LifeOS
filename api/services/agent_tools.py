@@ -445,6 +445,8 @@ TOOL_DEFINITIONS = [
             "'investments' (Nathan's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
             "buckets, per-position holdings with cost basis, savings by year, wealth trend, taxable "
             "unrealized gains; aggregated nightly by the investments pipeline). "
+            "'movers' (which held positions moved most today — live day-change % for the snapshot's "
+            "tickers, past an optional 'threshold' percent, default 5). "
             "For historical monthly summaries, use search_vault with 'finance' or 'spending'."
         ),
         "input_schema": {
@@ -452,7 +454,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["accounts", "transactions", "cashflow", "budgets", "investments"],
+                    "enum": ["accounts", "transactions", "cashflow", "budgets", "investments", "movers"],
                     "description": "What financial data to retrieve.",
                 },
                 "start_date": {
@@ -470,6 +472,10 @@ TOOL_DEFINITIONS = [
                 "search": {
                     "type": "string",
                     "description": "Search transactions by merchant name.",
+                },
+                "threshold": {
+                    "type": "number",
+                    "description": "For action 'movers': only positions whose absolute day change exceeds this percent (default 5).",
                 },
             },
             "required": ["action"],
@@ -1801,6 +1807,23 @@ async def _tool_search_finances(inp: dict) -> str:
         ]
         return "\n".join(lines)
 
+    if action == "movers":
+        # On-demand "which of my positions moved most today?" — reuses the noon
+        # big-mover check (live day-change via yfinance for the snapshot's tickers).
+        from api.routes.investments import MOVER_THRESHOLD_PCT, _held_tickers, investments_movers
+        threshold = inp.get("threshold")
+        if not isinstance(threshold, (int, float)) or threshold <= 0:
+            threshold = MOVER_THRESHOLD_PCT
+        if not _held_tickers():
+            # Distinguish "couldn't check" from a genuinely quiet day — on an
+            # on-demand ask, an empty count from a missing snapshot shouldn't read
+            # as "the market was flat."
+            return "Couldn't check movers right now — the investments snapshot isn't available."
+        result = await investments_movers(threshold=threshold)
+        if result.get("count"):
+            return result["scheduler_message"]
+        return f"No held position moved more than {threshold:g}% today."
+
     client = get_monarch_client()
 
     if action == "accounts":
@@ -1933,6 +1956,7 @@ TOOL_STATUS_MESSAGES = {
     "search_finances.transactions": "Searching transactions...",
     "search_finances.cashflow": "Loading cashflow summary...",
     "search_finances.budgets": "Checking budgets...",
+    "search_finances.movers": "Checking today's movers...",
     "create_email_draft": "Drafting email...",
     "send_email_draft": "Sending email...",
     "create_calendar_event": "Creating calendar event...",
