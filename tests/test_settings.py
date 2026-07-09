@@ -38,3 +38,35 @@ def test_local_llm_model_from_env(monkeypatch):
     from config.settings import Settings
     s = Settings()
     assert s.local_llm_model == "some-org/qwen3-32b-GGUF"
+
+
+def test_specialist_model_default_is_current_alias():
+    """#470 regression pin: the specialist-call model must be a model ALIAS,
+    never a dated snapshot. The previous pin (claude-sonnet-4-20250514)
+    retired and returned 404 on every relationship-insights / fact-extraction /
+    tone-analysis call — silently, since callers swallow per-item errors.
+    Aliases track the serving model and don't retire out from under us.
+
+    Asserts the FIELD default (env-independent), not the live instance — a
+    host may legitimately override via LIFEOS_ANTHROPIC_SPECIALIST_MODEL.
+    """
+    import re
+
+    from config.settings import Settings
+
+    default = Settings.model_fields["anthropic_specialist_model"].default
+    assert default == "claude-sonnet-4-6"
+    assert not re.search(r"-20\d{6}$", default), (
+        "specialist model default is a dated snapshot — pin an alias instead "
+        "(snapshots retire and 404)"
+    )
+
+
+def test_orchestrator_model_default_is_alias_not_snapshot():
+    """Same rule for the orchestrator default (#470 guard, defense in depth)."""
+    import re
+
+    from config.settings import Settings
+
+    default = Settings.model_fields["anthropic_model"].default
+    assert not re.search(r"-20\d{6}$", default)
