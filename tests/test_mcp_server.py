@@ -30,14 +30,16 @@ def api_client():
 
 
 @pytest.fixture(scope="module")
-def openapi_spec(api_client):
-    """Fetch OpenAPI spec from running API."""
-    try:
-        resp = api_client.get("/openapi.json")
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.RequestError:
-        pytest.skip("LifeOS API not running on localhost:8000")
+def openapi_spec():
+    """OpenAPI spec of the code under test (in-process, no server needed).
+
+    Built from api.main.app rather than fetched from localhost:8000 — a
+    running server may be on older code than this checkout, which would
+    make the curated-endpoint sync checks fail for any PR that adds an
+    endpoint and its curated entry together.
+    """
+    from api.main import app
+    return app.openapi()
 
 
 class TestOpenAPIAvailability:
@@ -100,20 +102,29 @@ class TestMCPServerToolDiscovery:
             assert "inputSchema" in tool
             assert tool["inputSchema"].get("type") == "object"
 
-    def test_mcp_server_tool_names(self):
-        """MCP server tools should have expected names."""
+    def test_mcp_server_tool_names(self, openapi_spec):
+        """MCP server tools should have expected names.
+
+        Builds the tool list from this checkout's OpenAPI spec — a running
+        server may be on older code without newly added endpoints.
+        """
         import importlib.util
+        from unittest.mock import patch
         spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        server = module.LifeOSMCPServer()
+        with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+            server = module.LifeOSMCPServer()
+        server.openapi_spec = openapi_spec
+        server._build_tools_from_spec()
         tool_names = {t["name"] for t in server.tools}
 
         expected_tools = {
             "lifeos_ask",
             "lifeos_search",
             "lifeos_health",
+            "lifeos_slack_my_messages",
         }
 
         for expected in expected_tools:

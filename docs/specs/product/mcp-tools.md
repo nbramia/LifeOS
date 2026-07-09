@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -65,6 +65,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 | `lifeos_drive_search` | Search Google Drive files |
 | `lifeos_imessage_search` | Search iMessage/SMS history |
 | `lifeos_slack_search` | Semantic search Slack messages |
+| `lifeos_slack_my_messages` | Every Slack message sent on a date (source-of-truth day pull) |
 
 ### People & CRM Tools
 | Tool | Description |
@@ -292,6 +293,16 @@ Semantic search across Slack messages.
 | top_k | integer | No | Number of results (1-50, default: 20) |
 | channel_id | string | No | Filter by channel ID |
 | user_id | string | No | Filter by user ID |
+
+### lifeos_slack_my_messages
+
+Every message the user sent on a given day (DMs, group DMs, channels, thread replies) via Slack's `search.messages` — exact source-of-truth pull, independent of the sync index.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| date | string | Yes | Day to pull, YYYY-MM-DD (user's Slack timezone) |
+| user | string | No | Slack user ID (defaults to the token owner) |
 
 ### lifeos_people_search
 

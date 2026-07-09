@@ -46,6 +46,7 @@ SLACK_SCOPES = [
     "im:history",           # Read DM messages
     "mpim:read",            # List group DMs
     "mpim:history",         # Read group DM messages
+    "search:read",          # search.messages (day-pull endpoint — issue #441)
 ]
 
 # Token storage path
@@ -237,6 +238,7 @@ class SlackClient:
         self._direct_token = token
         self._http_client: Optional[httpx.Client] = None
         self._user_cache: dict[str, SlackUser] = {}
+        self._auth_identity: dict[str, dict] = {}
 
     @property
     def http_client(self) -> httpx.Client:
@@ -700,6 +702,117 @@ class SlackClient:
                 break
 
         return replies
+
+    def auth_test(self, workspace_id: str = "default") -> dict:
+        """
+        Call ``auth.test`` — identifies the user the token belongs to.
+
+        The identity is constant for a given token, so the response is cached
+        on the client instance per workspace (mirrors ``_user_cache``).
+
+        Returns:
+            API response dict (notably ``user_id`` and ``user``)
+        """
+        if workspace_id not in self._auth_identity:
+            self._auth_identity[workspace_id] = self._api_call("auth.test", workspace_id)
+        return self._auth_identity[workspace_id]
+
+    def search_messages(
+        self,
+        query: str,
+        workspace_id: str = "default",
+        sort: str = "timestamp",
+        sort_dir: str = "asc",
+        max_pages: int = 10,
+    ) -> dict:
+        """
+        Search messages via ``search.messages`` with page-number pagination.
+
+        Requires the ``search:read`` user-token scope and a **user** token —
+        bot tokens cannot call this method. Unlike the conversations APIs,
+        ``search.messages`` paginates by page number (``paging.pages``), not
+        cursors, and searches everything the user can see — including thread
+        replies — in one call (issue #441).
+
+        Args:
+            query: Slack search query (e.g. ``from:<@U123> on:2026-07-08``)
+            workspace_id: Workspace ID
+            sort: Sort field (``timestamp`` or ``score``)
+            sort_dir: ``asc`` or ``desc``
+            max_pages: Safety limit on pages fetched (100 matches per page)
+
+        Returns:
+            Dict with:
+            - ``matches``: list of raw match dicts (ts, text, user, username,
+              channel, permalink)
+            - ``truncated``: True if more pages existed beyond ``max_pages``
+            - ``total_available``: Slack's ``paging.total`` for the query
+        """
+        import time
+
+        token = self._get_token(workspace_id)
+        if not token:
+            raise SlackAPIError(f"No token available for workspace {workspace_id}")
+
+        matches: list[dict] = []
+        page = 1
+        retry_delay = 2
+        max_retries = 3
+        truncated = False
+        total_available = 0
+
+        while page <= max_pages:
+            params = {
+                "query": query,
+                "count": 100,  # Max per page
+                "page": page,
+                "sort": sort,
+                "sort_dir": sort_dir,
+            }
+
+            # search.messages only accepts form/query encoding, not JSON —
+            # use GET with params like the conversations list calls.
+            for attempt in range(max_retries + 1):
+                response = self.http_client.get(
+                    f"{self.BASE_URL}/search.messages",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                )
+                data = response.json()
+
+                if data.get("ok"):
+                    break
+
+                error = data.get("error", "Unknown API error")
+                if error == "ratelimited" and attempt < max_retries:
+                    retry_after = int(response.headers.get("Retry-After", retry_delay))
+                    logger.warning(f"Rate limited on search.messages, waiting {retry_after}s")
+                    time.sleep(retry_after)
+                    retry_delay *= 2
+                    continue
+
+                raise SlackAPIError(error)
+
+            payload = data.get("messages", {})
+            matches.extend(payload.get("matches", []))
+
+            paging = payload.get("paging", {})
+            total_available = paging.get("total", len(matches))
+            total_pages = paging.get("pages", 1)
+            if page >= total_pages:
+                break
+            if page >= max_pages:
+                # More pages exist but the safety limit stops here — signal
+                # it so callers don't mistake a capped pull for "everything".
+                truncated = True
+                break
+            page += 1
+
+        return {
+            "matches": matches,
+            "truncated": truncated,
+            "total_available": total_available,
+        }
 
     def get_user_cached(self, user_id: str, workspace_id: str = "default") -> Optional[SlackUser]:
         """Get user with caching to reduce API calls."""
