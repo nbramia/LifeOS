@@ -121,21 +121,34 @@ def test_freshness_just_over_threshold_warns(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_movers_reports_positions_past_threshold(monkeypatch):
+    import re
     monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI", "NVDA"])
     monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": -7.2, "VTI": 1.1, "NVDA": 6.5})
     out = await inv.investments_movers(threshold=5)
     assert out["count"] == 2
-    assert "AMD" in out["message"] and "NVDA" in out["message"]
-    assert "VTI" not in out["message"]        # under threshold
-    assert "$" not in out["message"]          # tickers + % only, no dollar amounts
-    assert "-7.2%" in out["message"]
+    msg = out["scheduler_message"]
+    assert "AMD" in msg and "NVDA" in msg
+    assert "VTI" not in msg            # under threshold
+    assert "-7.2%" in msg
+    # Privacy: every mover line is exactly "- TICKER: ▲/▼ ±N.N%" — no dollar
+    # amount, share count, or weight can structurally appear in the digest.
+    for line in msg.splitlines()[1:]:
+        assert re.match(r"^- [A-Z.]+: [▲▼] [+-]\d+\.\d%$", line), line
+
+
+async def test_movers_strict_threshold_excludes_exactly_5(monkeypatch):
+    """'More than 5%' is strict: a position at exactly the threshold is not a mover."""
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
+    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": 5.0})
+    out = await inv.investments_movers(threshold=5)
+    assert out == {"scheduler_message": "", "count": 0}
 
 
 async def test_movers_silent_when_nothing_moves(monkeypatch):
     monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI"])
     monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": 1.0, "VTI": -2.4})
     out = await inv.investments_movers(threshold=5)
-    assert out == {"message": "", "count": 0}   # empty => scheduler stays silent
+    assert out == {"scheduler_message": "", "count": 0}   # empty => scheduler stays silent
 
 
 async def test_movers_non_fatal_on_fetch_failure(monkeypatch):
@@ -146,7 +159,7 @@ async def test_movers_non_fatal_on_fetch_failure(monkeypatch):
 
     monkeypatch.setattr(inv, "_day_changes", boom)
     out = await inv.investments_movers(threshold=5)
-    assert out == {"message": "", "count": 0}   # degrades to no-alert, not a 500
+    assert out == {"scheduler_message": "", "count": 0}   # degrades to no-alert, not a 500
 
 
 def test_held_tickers_excludes_external_and_blanks(tmp_path, monkeypatch):
@@ -158,15 +171,20 @@ def test_held_tickers_excludes_external_and_blanks(tmp_path, monkeypatch):
     assert inv._held_tickers() == ["VTI"]
 
 
-def test_held_tickers_empty_when_not_synced(tmp_path, monkeypatch):
-    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))   # empty dir, no file
+def test_held_tickers_empty_when_not_synced_or_malformed(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
+    assert inv._held_tickers() == []                      # empty dir, no file
+    (tmp_path / "summary.json").write_text("[1, 2, 3]")   # non-dict top-level
     assert inv._held_tickers() == []
 
 
-def test_scheduler_endpoint_prefers_message_field():
-    """The endpoint action sends a ready {'message': ...} verbatim (empty =>
-    suppressed by the fire loop), instead of dumping raw JSON (#463)."""
+def test_scheduler_endpoint_prefers_scheduler_message_field():
+    """The endpoint action sends a ready {'scheduler_message': ...} verbatim
+    (empty => suppressed), and does NOT hijack a generic {message} response
+    from other routes (#463)."""
     from api.services.scheduler_store import _format_endpoint_result
-    assert _format_endpoint_result({"message": "AMD -7%", "count": 1}) == "AMD -7%"
-    assert _format_endpoint_result({"message": "", "count": 0}) == ""
-    assert '"foo"' in _format_endpoint_result({"foo": 1})   # fallback JSON dump
+    assert _format_endpoint_result({"scheduler_message": "AMD -7%", "count": 1}) == "AMD -7%"
+    assert _format_endpoint_result({"scheduler_message": "", "count": 0}) == ""
+    dumped = _format_endpoint_result({"status": "ok", "message": "done"})
+    assert '"status"' in dumped and '"message"' in dumped   # generic {message} left as JSON
+    assert '"foo"' in _format_endpoint_result({"foo": 1})

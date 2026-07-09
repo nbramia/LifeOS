@@ -1107,12 +1107,14 @@ class SchedulerScheduler:
 def _format_endpoint_result(data) -> str:
     """Turn an endpoint's JSON response into the message to send.
 
-    An endpoint may return a ready-to-send ``{"message": "..."}`` — use it
-    verbatim, so an empty message suppresses the notification via the fire
-    loop's ``if message:`` guard. Otherwise fall back to a pretty JSON dump.
+    An endpoint may return a ready-to-send ``{"scheduler_message": "..."}`` —
+    it's used verbatim (an empty value then suppresses the notification via the
+    fire loop's ``if message:`` guard). The key is deliberately specific so it
+    doesn't collide with routes that return a generic ``message`` field among
+    others. Otherwise fall back to a pretty JSON dump.
     """
-    if isinstance(data, dict) and "message" in data:
-        return data["message"]
+    if isinstance(data, dict) and "scheduler_message" in data:
+        return str(data["scheduler_message"])[:3500]
     return json.dumps(data, indent=2, default=str)[:3500]
 
 
