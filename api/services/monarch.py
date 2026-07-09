@@ -164,6 +164,19 @@ class MonarchClient:
             })
         return holdings
 
+    async def get_history(self, account_id: str) -> list[dict]:
+        """Daily balance snapshots for one account.
+
+        Added 2026-07-10 for the Schwab-portfolio dashboard: external
+        accounts (Guideline 401(k)) have no ledger, but Monarch records a
+        balance snapshot per day, which the dashboard folds into its
+        wealth-over-time history.
+        """
+        mm = await self._get_client()
+        snaps = await mm.get_account_history(int(account_id))
+        return [{"date": s.get("date"), "balance": s.get("signedBalance")}
+                for s in (snaps or []) if s.get("date")]
+
     async def get_transactions(
         self,
         start_date: Optional[str] = None,

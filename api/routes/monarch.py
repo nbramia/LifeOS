@@ -53,6 +53,20 @@ async def account_holdings(account_id: str):
         raise HTTPException(status_code=502, detail=f"Monarch API error: {e}")
 
 
+@router.get("/history")
+async def account_history(account_id: str, start_date: Optional[str] = None):
+    """Daily balance snapshots for one account (date, balance)."""
+    try:
+        client = get_monarch_client()
+        snaps = await client.get_history(account_id)
+        if start_date:
+            snaps = [s for s in snaps if (s.get("date") or "") >= start_date]
+        return {"history": snaps, "count": len(snaps)}
+    except Exception as e:
+        logger.error(f"Failed to fetch Monarch history for {account_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Monarch API error: {e}")
+
+
 @router.get("/transactions")
 async def list_transactions(
     start_date: Optional[str] = None,
