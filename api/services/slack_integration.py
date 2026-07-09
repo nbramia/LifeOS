@@ -51,6 +51,27 @@ SLACK_SCOPES = [
 # Token storage path
 SLACK_TOKEN_PATH = Path("data/slack_tokens.json")
 
+# Channel system-message subtypes skipped during bulk history fetch (sync path).
+# These are membership/metadata noise ("X has joined the channel") that would
+# otherwise each become a searchable indexed document. Deliberately does NOT
+# include bot_message or thread_broadcast — those can carry substantive content.
+NOISE_MESSAGE_SUBTYPES = frozenset({
+    "channel_join",
+    "channel_leave",
+    "channel_topic",
+    "channel_purpose",
+    "channel_name",
+    "channel_archive",
+    "channel_unarchive",
+    "group_join",
+    "group_leave",
+    "group_topic",
+    "group_purpose",
+    "group_name",
+    "group_archive",
+    "group_unarchive",
+})
+
 
 @dataclass
 class SlackUser:
@@ -407,13 +428,27 @@ class SlackClient:
         except SlackAPIError:
             return None
 
-    def list_channels(self, workspace_id: str = "default", include_dms: bool = True) -> list[SlackChannel]:
+    def list_channels(
+        self,
+        workspace_id: str = "default",
+        include_dms: bool = True,
+        member_only: bool = False,
+    ) -> list[SlackChannel]:
         """
-        List all accessible channels with pagination.
+        List accessible channels with pagination.
 
         Args:
             workspace_id: Workspace ID
             include_dms: If True, include DMs (im, mpim). If False, only regular channels.
+            member_only: If True, enumerate via ``users.conversations`` (only
+                channels the authed user is a member of) instead of
+                ``conversations.list`` (every channel in the workspace).
+                Membership scoping avoids ``not_in_channel`` errors on history
+                calls and cuts API volume on large workspaces — issue #439.
+                Archived channels are excluded (``exclude_archived``) so
+                channels the user was ever a member of don't cost a nightly
+                history call. Note: ``users.conversations`` does not return
+                ``num_members``, so ``member_count`` is 0 in this mode.
 
         Returns:
             List of SlackChannel objects
@@ -422,6 +457,7 @@ class SlackClient:
 
         channels = []
         cursor = None
+        endpoint = "users.conversations" if member_only else "conversations.list"
 
         # Determine types to fetch
         # Note: Slack API returns different results for different type combinations
@@ -442,13 +478,17 @@ class SlackClient:
                 "types": ",".join(types_list),
                 "limit": 200,  # Max per request
             }
+            if member_only:
+                # users.conversations defaults to including archived channels
+                # the user was ever a member of — skip them.
+                params["exclude_archived"] = "true"
             if cursor:
                 params["cursor"] = cursor
 
-            # Use GET with params for conversations.list (more reliable)
+            # Use GET with params (more reliable for the conversations APIs)
             for attempt in range(max_retries + 1):
                 response = self.http_client.get(
-                    f"{self.BASE_URL}/conversations.list",
+                    f"{self.BASE_URL}/{endpoint}",
                     headers={"Authorization": f"Bearer {token}"},
                     params=params,
                 )
@@ -460,7 +500,7 @@ class SlackClient:
                 error = data.get("error", "Unknown API error")
                 if error == "ratelimited" and attempt < max_retries:
                     retry_after = int(response.headers.get("Retry-After", retry_delay))
-                    logger.warning(f"Rate limited on conversations.list, waiting {retry_after}s")
+                    logger.warning(f"Rate limited on {endpoint}, waiting {retry_after}s")
                     time.sleep(retry_after)
                     retry_delay *= 2
                     continue
@@ -558,6 +598,11 @@ class SlackClient:
 
             for msg in data.get("messages", []):
                 if msg.get("type") != "message":
+                    continue
+
+                # Skip channel membership/metadata system messages (join,
+                # leave, topic, etc.) — noise in the search index.
+                if msg.get("subtype") in NOISE_MESSAGE_SUBTYPES:
                     continue
 
                 ts = float(msg["ts"])

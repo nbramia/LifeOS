@@ -181,9 +181,12 @@ class SlackSync:
             logger.info(f"Found {len(linked_user_ids)} linked Slack users")
 
         try:
-            # Get list of accessible channels
-            channels = self.client.list_channels(self._workspace_id)
-            logger.info(f"Found {len(channels)} accessible channels")
+            # Enumerate only channels the authed user is a member of
+            # (users.conversations): messages can only exist where the user is
+            # a member, it avoids not_in_channel on history calls, and it cuts
+            # API volume vs listing the whole workspace — issue #439.
+            channels = self.client.list_channels(self._workspace_id, member_only=True)
+            logger.info(f"Found {len(channels)} member channels")
 
             for channel in channels:
                 # Skip non-DM channels if dm_only is True
@@ -191,10 +194,11 @@ class SlackSync:
                     continue
 
                 # Skip unlinked DM users if linked_only is True
-                # Note: mpim (group DMs) are not filtered because conversations.list
-                # does not return member IDs — filtering would require an extra API
-                # call per channel. Incremental sync handles them efficiently since
-                # channels with no new messages return quickly.
+                # Note: mpim (group DMs) are not filtered because the channel
+                # enumeration call does not return member IDs — filtering would
+                # require an extra API call per channel. Incremental sync handles
+                # them efficiently since channels with no new messages return
+                # quickly.
                 if linked_only and channel.is_im:
                     if channel.name not in linked_user_ids:
                         stats["channels_skipped"] += 1
@@ -468,8 +472,8 @@ class SlackSync:
 
         This includes:
         1. Sync all users to SourceEntity
-        2. Index all DM history to ChromaDB
-        3. Create Interaction records
+        2. Index all DM history + member-channel history (90-day window) to ChromaDB
+        3. Create Interaction records (DMs/group DMs only)
 
         Args:
             create_interactions: If True, create CRM Interaction records
@@ -499,7 +503,7 @@ class SlackSync:
         try:
             results["messages"] = self.sync_messages(
                 full=True,
-                dm_only=True,  # DMs only
+                dm_only=False,  # DMs (full history) + member channels (90-day window)
                 create_interactions=create_interactions,
                 linked_only=True,  # Only sync DMs for users linked to CRM people
             )
@@ -543,7 +547,8 @@ class SlackSync:
             ``source_entities WHERE source_type='slack'`` silently stops
             growing. ``users.list`` is cheap (~1s for thousands of users)
             and ``add_or_update`` is idempotent.
-        Step 2: Sync new DM messages (only for users linked to CRM people).
+        Step 2: Sync new messages — DMs (only for users linked to CRM people)
+            plus public/private channels the user is a member of (#439).
 
         Args:
             create_interactions: If True, create CRM Interaction records
@@ -576,7 +581,7 @@ class SlackSync:
         try:
             results["messages"] = self.sync_messages(
                 full=False,
-                dm_only=True,
+                dm_only=False,  # DMs + member channels — issue #439
                 create_interactions=create_interactions,
                 linked_only=True,
             )

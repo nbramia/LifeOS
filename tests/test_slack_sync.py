@@ -171,3 +171,109 @@ class TestIncrementalSyncCallsSyncUsers:
         # Either positional or keyword — accept both shapes.
         passed_counts = args[0] if args else kwargs.get("message_counts")
         assert passed_counts == {"alice": 3}
+
+
+class TestChannelIndexing:
+    """Issue #439: nightly entry points must index channel messages, not just DMs.
+
+    The index historically contained zero public/private channel messages
+    because full_sync/incremental_sync hardcoded ``dm_only=True``.
+    """
+
+    def _messages_payload(self):
+        return {
+            "channels_processed": 1, "messages_indexed": 5,
+            "interactions_created": 0, "errors": [],
+            "message_counts": {}, "affected_person_ids": set(),
+        }
+
+    def test_full_sync_includes_channels(self, sync_with_mocks):
+        sync = sync_with_mocks
+        sync.sync_users = MagicMock(return_value={"total": 0, "created": 0, "updated": 0})
+        sync.sync_messages = MagicMock(return_value=self._messages_payload())
+
+        sync.full_sync()
+
+        kwargs = sync.sync_messages.call_args.kwargs
+        assert kwargs["dm_only"] is False
+        assert kwargs["linked_only"] is True  # DM filtering semantics unchanged
+
+    def test_incremental_sync_includes_channels(self, sync_with_mocks):
+        sync = sync_with_mocks
+        sync.sync_users = MagicMock(return_value={"total": 0, "created": 0, "updated": 0})
+        sync.sync_messages = MagicMock(return_value=self._messages_payload())
+
+        sync.incremental_sync()
+
+        kwargs = sync.sync_messages.call_args.kwargs
+        assert kwargs["dm_only"] is False
+        assert kwargs["linked_only"] is True
+
+    def test_sync_messages_enumerates_member_channels_only(self, sync_with_mocks):
+        """Channel enumeration must use membership (users.conversations), not
+        the full workspace list — Nathan can only have messages where he's a
+        member, and the full list burns rate limit (a catch-up sync 429'd on
+        page 3 of conversations.list)."""
+        sync = sync_with_mocks
+        sync.client.list_channels.return_value = []
+
+        sync.sync_messages(dm_only=False)
+
+        kwargs = sync.client.list_channels.call_args.kwargs
+        assert kwargs.get("member_only") is True
+
+    def test_channel_messages_indexed_without_interactions(self, sync_with_mocks):
+        """A public channel gets indexed to ChromaDB but never creates CRM
+        interactions — channel chatter isn't a 1:1 interaction."""
+        from api.services.slack_integration import SlackChannel
+
+        sync = sync_with_mocks
+        channel = SlackChannel(channel_id="C123", name="general")
+        sync.client.list_channels.return_value = [channel]
+        sync.client.get_all_channel_history.return_value = [MagicMock()]
+        sync.indexer.get_latest_timestamp.return_value = None
+        sync.indexer.index_messages.return_value = 1
+        sync._create_interactions_for_channel = MagicMock()
+
+        stats = sync.sync_messages(dm_only=False, create_interactions=True)
+
+        assert stats["messages_indexed"] == 1
+        assert stats["channels_processed"] == 1
+        sync._create_interactions_for_channel.assert_not_called()
+
+    def test_channel_history_limited_to_window(self, sync_with_mocks):
+        """First sync of a channel is bounded by the 90-day window (oldest
+        passed to the API), unlike DMs which pull full history."""
+        from datetime import datetime, timedelta, timezone
+        from api.services.slack_integration import SlackChannel
+
+        sync = sync_with_mocks
+        channel = SlackChannel(channel_id="C123", name="general")
+        sync.client.list_channels.return_value = [channel]
+        sync.client.get_all_channel_history.return_value = []
+        sync.indexer.get_latest_timestamp.return_value = None
+
+        sync.sync_messages(dm_only=False, channel_history_days=90)
+
+        kwargs = sync.client.get_all_channel_history.call_args.kwargs
+        oldest = kwargs["oldest"]
+        expected = datetime.now(timezone.utc) - timedelta(days=90)
+        assert abs((oldest - expected).total_seconds()) < 60
+
+    def test_linked_only_still_filters_dms_but_not_channels(self, sync_with_mocks):
+        """linked_only applies to 1:1 DMs only; channels are indexed
+        regardless of CRM linkage."""
+        from api.services.slack_integration import SlackChannel
+
+        sync = sync_with_mocks
+        unlinked_dm = SlackChannel(channel_id="D1", name="U_UNLINKED", is_im=True)
+        channel = SlackChannel(channel_id="C1", name="general")
+        sync.client.list_channels.return_value = [unlinked_dm, channel]
+        sync.client.get_all_channel_history.return_value = []
+        sync.indexer.get_latest_timestamp.return_value = None
+        sync._get_linked_slack_user_ids = MagicMock(return_value=set())
+
+        stats = sync.sync_messages(dm_only=False, linked_only=True)
+
+        assert stats["channels_skipped"] == 1  # the unlinked DM
+        assert stats["channels_processed"] == 1  # the public channel
