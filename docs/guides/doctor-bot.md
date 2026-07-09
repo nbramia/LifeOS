@@ -10,7 +10,7 @@ Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orc
 
 ## Surfaces
 
-- **Telegram** (primary): a dedicated `@BotFather` bot. Full round-trip — reply to a `[CLARIFY]`/`[GOAL]` message (swipe-to-reply) to answer; a fresh, non-threaded message starts a **new** repair.
+- **Telegram** (primary): a dedicated `@BotFather` bot. Full round-trip — reply to a `[CLARIFY]`/`[GOAL]` message (swipe-to-reply) to answer, and reply to **any** other doctor message (status updates, heartbeats, acks, "On it") to drop a context note into that session's thread. Messages end with "↩️ reply in thread" or "🚫 do not reply" so the affordance is explicit. A fresh, non-threaded message starts a **new** repair.
 - **Web / voice**: selecting the `doctor` persona in web chat (or via whisper-relay) spawns the same orchestrating session. You can answer its `[CLARIFY]`/`[GOAL]` from the web conversation too (`POST /api/conversations/{id}/answer`); notices also surface on the doctor's Telegram thread and the `/agents` page.
 
 ## The flow

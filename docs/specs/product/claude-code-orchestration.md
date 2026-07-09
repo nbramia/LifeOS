@@ -105,13 +105,13 @@ While a plan is pending, normal Telegram messages still reach the chat pipeline 
 
 ## Clarification questions
 
-If a task is vague or ambiguous, Claude asks a clarifying question instead of guessing. The question is relayed via Telegram and the session pauses until the operator answers.
+If a task is vague or ambiguous, Claude asks a clarifying question instead of guessing. The session pauses and the question is relayed via Telegram as **one message** carrying both the question and "Answer by replying to this message" — the operator's threaded reply lands on the message that shows the question itself.
 
 **Flow:**
 
 1. Operator: `/claude add this to the backlog`
-2. Claude: "The backlog has two sections (Work and Personal). Which one?"
-3. Operator: `Work`
+2. Claude (single message): "The backlog has two sections (Work and Personal). Which one? — Answer by replying to this message."
+3. Operator replies `Work` on that message.
 4. Claude resumes with the answer and completes the task.
 
 While a clarification is pending, all non-command Telegram messages route as the answer. The operator uses `/claude_cancel` if they want to chat normally instead.
@@ -148,6 +148,18 @@ Claude sends three kinds of messages via Telegram:
 | heartbeat | Every 5 minutes while running | `Still working... (5m elapsed)` |
 
 Only `[NOTIFY]`, `[CLARIFY]`, and `[GOAL]` lines are relayed. All other output (tool calls, file reads, intermediate steps) stays in the subprocess. The heartbeat is sent by the orchestrator (not Claude) so the operator always knows the session is alive even when Claude is busy without notifying.
+
+---
+
+## Threaded replies — every session message is an anchor
+
+Every operator-facing message a session sends — streamed `[NOTIFY]` updates, heartbeats, blocked prompts (clarify / plan / goal), completion and failure notices, and the acks LifeOS sends back — registers its Telegram message id against the session. A **threaded reply to any of them** routes back into that session:
+
+- Replies to a blocked prompt answer it (clarification answer, plan approve/reject, goal yes/refine).
+- Replies to a completion or failure notice reopen the session as a follow-up turn with full prior context.
+- Replies to anything else (a status update, a heartbeat, an ack) are queued as a **context note** — quoted with the message being replied to — and delivered at the session's next turn boundary. A mid-run reply gets an instant "Noted — I'll pass this to the session at its next checkpoint" ack; a reply to a finished session wakes it back up.
+
+Every message ends with a footer naming its affordance: **"↩️ reply in thread"** when a threaded reply reaches the session, or **"🚫 do not reply"** when it can't (e.g. a dead, unresumable session). A plain, non-threaded message never reaches a session — on an orchestration bot it starts a new one.
 
 ---
 

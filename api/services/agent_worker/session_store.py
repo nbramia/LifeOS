@@ -1011,6 +1011,61 @@ class SessionStore:
             )
         return cur.lastrowid
 
+    def add_reply_anchors(
+        self,
+        session_id: str,
+        task_id: str,
+        message_ids: list[int],
+        bot: str | None = None,
+    ) -> None:
+        """Register operator-facing message ids as reply anchors for a session.
+
+        Every message a session sends to Telegram (streamed [NOTIFY] bodies,
+        heartbeats, acks) registers here so a threaded reply to ANY of them can
+        be routed back into the session as a context note. One always-open
+        ``kind='status_anchor'`` row per session accumulates the ids in its
+        ``sent_message_ids`` JSON list — reusing the pending_questions matching
+        machinery without new schema. The row is excluded from deposit_answer,
+        the web open-question lookup, and the timeout sweep: it is a routing
+        index, not a question.
+        """
+        if not message_ids:
+            return
+        ids = [int(i) for i in message_ids]
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, sent_message_ids FROM pending_questions "
+                "WHERE session_id = ? AND kind = 'status_anchor' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO pending_questions (
+                        session_id, task_id, question, sent_message_id, sent_at,
+                        kind, sent_message_ids, bot
+                    ) VALUES (?, ?, ?, ?, ?, 'status_anchor', ?, ?)
+                    """,
+                    (session_id, task_id, "(session reply anchors)", ids[0],
+                     _now(), json.dumps(ids), bot),
+                )
+            else:
+                existing = json.loads(row["sent_message_ids"] or "[]")
+                merged = existing + [i for i in ids if i not in existing]
+                conn.execute(
+                    "UPDATE pending_questions SET sent_message_ids = ? WHERE id = ?",
+                    (json.dumps(merged), row["id"]),
+                )
+
+    def has_pending_messages(self, session_id: str) -> bool:
+        """True when undelivered pending messages exist for `session_id`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_messages WHERE session_id = ? AND delivered = 0 LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def register_completion_followup(
         self,
         session_id: str,
@@ -1065,6 +1120,7 @@ class SessionStore:
             row = conn.execute(
                 "SELECT id FROM pending_questions "
                 "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor' "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +
@@ -1095,6 +1151,7 @@ class SessionStore:
             row = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE session_id = ? AND answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor' "
                 "ORDER BY id ASC LIMIT 1",
                 (session_id,),
             ).fetchone()
@@ -1238,7 +1295,8 @@ class SessionStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM pending_questions "
-                "WHERE answered_at IS NULL AND timed_out = 0 AND sent_at < ?",
+                "WHERE answered_at IS NULL AND timed_out = 0 AND sent_at < ? "
+                "AND kind != 'status_anchor'",
                 (int(before_ts),),
             ).fetchall()
         return [dict(r) for r in rows]
