@@ -367,6 +367,114 @@ class TestStatusAnchorReplies:
         assert any(t.endswith(REPLYABLE_FOOTER) for t in sent)
 
 
+class TestOnItAnchor:
+    @pytest.mark.asyncio
+    async def test_on_it_ack_registers_against_spawned_session(self, tmp_path):
+        """Replying to the doctor's "On it" reaches the session it spawned:
+        the ack is sent with id capture and registered as a status anchor once
+        the spawn returns a session id."""
+        from unittest.mock import MagicMock
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+
+        listener = TelegramBotListener(TelegramBotConfig(
+            name="doctor", token="TOK", chat_id="999", persona="P", orchestrates=True,
+        ))
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        sent: list[str] = []
+
+        def _capture_ids(text, chat_id=None, bot=None):
+            sent.append(text)
+            return [4242]
+
+        spawn = MagicMock(return_value={
+            "ok": True, "session_id": "sess-onit", "task_id": "t-onit",
+        })
+        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids):
+            await listener._handle_orchestration_message("search is broken", "999")
+
+        assert sent and sent[0].endswith(REPLYABLE_FOOTER)
+        assert "On it" in sent[0]
+        q = store.get_open_question_by_message_id(4242, bot="doctor")
+        assert q is not None and q["kind"] == "status_anchor"
+        assert q["session_id"] == "sess-onit"
+
+
+class TestNoteRidesGateAnswer:
+    @pytest.mark.asyncio
+    async def test_blocked_session_note_rides_the_goal_answer(self, tmp_path):
+        """A status-anchor reply on a BLOCKED session must not bypass the gate:
+        the note queues without a status flip, and when the goal answer later
+        arrives, BOTH drain in order onto the same resume turn."""
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+
+        w = _make_worker(tmp_path)
+        store = w.session_store
+        s = store.create(
+            task_id="t1", routing="claude_code", origin="operator",
+            bot="doctor", status=STATUS_BLOCKED,
+        )
+        store.set_claude_code_session_id("t1", "cli-1")
+        store.update_status("t1", STATUS_BLOCKED)
+        # The blocked goal gate: proposed condition + its open question.
+        w.transcript_store.append(
+            s.session_id, "claude_code_awaiting_goal_approval",
+            {"condition": "all tests pass", "condition_chars": 14},
+        )
+        store.create_pending_question(
+            session_id=s.session_id, task_id="t1", question="goal + instructions",
+            sent_message_id=5000, sent_message_ids=[5000],
+            kind="goal_approval", bot="doctor",
+        )
+        # An earlier status update registered as an anchor.
+        store.add_reply_anchors(s.session_id, "t1", [7000], bot="doctor")
+
+        listener = TelegramBotListener(TelegramBotConfig(
+            name="doctor", token="TOK", chat_id="999", persona="P", orchestrates=True,
+        ))
+
+        def _capture_ids(text, chat_id=None, bot=None):
+            return [8001]
+
+        async def _capture_async(text, chat_id=None, bot=None):
+            return True
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids), \
+             patch("api.services.telegram.send_message_async",
+                   side_effect=_capture_async):
+            # 1. Operator replies to the status update while the gate is open.
+            noted = await listener._maybe_handle_claude_code_reply(
+                7000, "also check the cron logs", "999",
+                quoted_text="Investigating the digest",
+            )
+            # 2. Then answers the goal gate itself.
+            approved = await listener._maybe_handle_claude_code_reply(
+                5000, "yes", "999",
+            )
+
+        assert noted is True and approved is True
+        # The note did NOT bypass the gate.
+        assert store.get("t1").status == STATUS_BLOCKED
+        # The worker processes the gate answer → /goal injected, CLAIMED.
+        w._process_clarification_answers()
+        assert store.get("t1").status == STATUS_CLAIMED
+        pending = store.drain_pending_messages(s.session_id)
+        contents = [m["content"] for m in pending]
+        assert len(contents) == 2
+        assert "also check the cron logs" in contents[0]      # note first
+        assert "Investigating the digest" in contents[0]      # with quoted context
+        assert contents[1] == "/goal all tests pass"          # gate answer after
+        # Both ride the SAME resume turn (dispatch joins drained messages).
+
+
 def test_footer_helper_shapes():
     assert _with_reply_footer("body").endswith(f"\n\n{REPLYABLE_FOOTER}")
     assert _with_reply_footer("body", replyable=False).endswith(f"\n\n{NO_REPLY_FOOTER}")
