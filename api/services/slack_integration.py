@@ -238,6 +238,7 @@ class SlackClient:
         self._direct_token = token
         self._http_client: Optional[httpx.Client] = None
         self._user_cache: dict[str, SlackUser] = {}
+        self._auth_identity: dict[str, dict] = {}
 
     @property
     def http_client(self) -> httpx.Client:
@@ -706,10 +707,15 @@ class SlackClient:
         """
         Call ``auth.test`` — identifies the user the token belongs to.
 
+        The identity is constant for a given token, so the response is cached
+        on the client instance per workspace (mirrors ``_user_cache``).
+
         Returns:
             API response dict (notably ``user_id`` and ``user``)
         """
-        return self._api_call("auth.test", workspace_id)
+        if workspace_id not in self._auth_identity:
+            self._auth_identity[workspace_id] = self._api_call("auth.test", workspace_id)
+        return self._auth_identity[workspace_id]
 
     def search_messages(
         self,
@@ -718,7 +724,7 @@ class SlackClient:
         sort: str = "timestamp",
         sort_dir: str = "asc",
         max_pages: int = 10,
-    ) -> list[dict]:
+    ) -> dict:
         """
         Search messages via ``search.messages`` with page-number pagination.
 
@@ -736,7 +742,11 @@ class SlackClient:
             max_pages: Safety limit on pages fetched (100 matches per page)
 
         Returns:
-            List of raw match dicts (ts, text, user, username, channel, permalink)
+            Dict with:
+            - ``matches``: list of raw match dicts (ts, text, user, username,
+              channel, permalink)
+            - ``truncated``: True if more pages existed beyond ``max_pages``
+            - ``total_available``: Slack's ``paging.total`` for the query
         """
         import time
 
@@ -748,6 +758,8 @@ class SlackClient:
         page = 1
         retry_delay = 2
         max_retries = 3
+        truncated = False
+        total_available = 0
 
         while page <= max_pages:
             params = {
@@ -785,11 +797,22 @@ class SlackClient:
             matches.extend(payload.get("matches", []))
 
             paging = payload.get("paging", {})
-            if page >= paging.get("pages", 1):
+            total_available = paging.get("total", len(matches))
+            total_pages = paging.get("pages", 1)
+            if page >= total_pages:
+                break
+            if page >= max_pages:
+                # More pages exist but the safety limit stops here — signal
+                # it so callers don't mistake a capped pull for "everything".
+                truncated = True
                 break
             page += 1
 
-        return matches
+        return {
+            "matches": matches,
+            "truncated": truncated,
+            "total_available": total_available,
+        }
 
     def get_user_cached(self, user_id: str, workspace_id: str = "default") -> Optional[SlackUser]:
         """Get user with caching to reduce API calls."""

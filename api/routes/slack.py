@@ -4,6 +4,7 @@ Slack API endpoints for LifeOS.
 Provides search and conversation access to Slack data.
 Supports both vector search (semantic) and metadata filtering.
 """
+import re
 import time
 from typing import Optional
 from datetime import datetime, timezone
@@ -111,6 +112,8 @@ class SlackMyMessagesResponse(BaseModel):
     date: str
     user_id: str
     total: int
+    truncated: bool = False  # True if Slack had more matches than were pulled
+    total_available: int = 0  # Slack's paging.total for the query
     messages: list[SlackDayMessage]
 
 
@@ -366,12 +369,9 @@ def _thread_ts_from_permalink(permalink: Optional[str]) -> Optional[str]:
     """
     if not permalink or "thread_ts=" not in permalink:
         return None
-    try:
-        from urllib.parse import parse_qs, urlparse
-        values = parse_qs(urlparse(permalink).query).get("thread_ts")
-        return values[0] if values else None
-    except Exception:
-        return None
+    from urllib.parse import parse_qs, urlparse
+    values = parse_qs(urlparse(permalink).query).get("thread_ts")
+    return values[0] if values else None
 
 
 @router.get("/my-messages", response_model=SlackMyMessagesResponse)
@@ -400,16 +400,30 @@ async def get_my_messages_for_day(
       not UTC.
     - Requires the `search:read` user-token scope (403 with instructions
       if missing).
+    - If the day has more messages than the pagination cap (1,000), the
+      response sets `truncated: true` and `total_available` to Slack's
+      full match count.
     """
     _require_slack_enabled()
 
-    # Validate date format
+    # Validate date format — strict zero-padded YYYY-MM-DD (strptime alone
+    # would accept e.g. "2026-7-8").
     try:
-        datetime.strptime(date, "%Y-%m-%d")
+        parsed = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
+        parsed = None
+    if parsed is None or parsed.strftime("%Y-%m-%d") != date:
         raise HTTPException(
             status_code=400,
             detail="Invalid date — expected YYYY-MM-DD",
+        )
+
+    # Validate user — it is interpolated into the Slack search query, so a
+    # crafted value could replace the from: filter with arbitrary search terms.
+    if user is not None and not re.fullmatch(r"[UW][A-Z0-9]{2,}", user):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid user — expected a Slack user ID (e.g. U12AB34CD)",
         )
 
     client = get_slack_client()
@@ -422,7 +436,7 @@ async def get_my_messages_for_day(
                 detail="Could not resolve the token owner via auth.test",
             )
 
-        matches = client.search_messages(query=f"from:<@{user_id}> on:{date}")
+        result = client.search_messages(query=f"from:<@{user_id}> on:{date}")
     except SlackAPIError as e:
         error = str(e)
         if error in ("missing_scope", "not_allowed_token_type"):
@@ -438,7 +452,7 @@ async def get_my_messages_for_day(
         raise HTTPException(status_code=502, detail=f"Slack API error: {e}")
 
     messages = []
-    for m in matches:
+    for m in result["matches"]:
         channel = m.get("channel") or {}
         permalink = m.get("permalink")
         ts = m.get("ts", "")
@@ -461,6 +475,8 @@ async def get_my_messages_for_day(
         date=date,
         user_id=user_id,
         total=len(messages),
+        truncated=result["truncated"],
+        total_available=result["total_available"],
         messages=messages,
     )
 

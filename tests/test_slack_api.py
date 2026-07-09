@@ -596,10 +596,16 @@ class TestSlackMyMessages:
             "permalink": permalink or "https://example.slack.com/archives/C123/p1751980000000100",
         }
 
-    def _mock_client(self, matches=None, user_id="U08GTEST001"):
+    def _mock_client(self, matches=None, user_id="U08GTEST001",
+                     truncated=False, total_available=None):
+        matches = matches if matches is not None else []
         mock = MagicMock()
         mock.auth_test.return_value = {"ok": True, "user_id": user_id, "user": "testuser"}
-        mock.search_messages.return_value = matches if matches is not None else []
+        mock.search_messages.return_value = {
+            "matches": matches,
+            "truncated": truncated,
+            "total_available": total_available if total_available is not None else len(matches),
+        }
         return mock
 
     def test_when_disabled(self, client):
@@ -613,6 +619,28 @@ class TestSlackMyMessages:
             response = client.get("/api/slack/my-messages?date=July-8th")
 
         assert response.status_code == 400
+
+    def test_non_zero_padded_date_rejected(self, client):
+        """strptime alone would accept 2026-7-8 — the endpoint must not."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True):
+            response = client.get("/api/slack/my-messages?date=2026-7-8")
+
+        assert response.status_code == 400
+
+    def test_malformed_user_rejected(self, client):
+        """user is interpolated into the Slack query — a crafted value must
+        not be able to replace the from: filter."""
+        mock = self._mock_client()
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get(
+                "/api/slack/my-messages",
+                params={"date": "2026-07-08", "user": "foo bar on:2020-01-01"},
+            )
+
+        assert response.status_code == 400
+        mock.search_messages.assert_not_called()
 
     def test_success_builds_query_from_auth_test(self, client):
         mock = self._mock_client(matches=[self._match()])
@@ -630,6 +658,8 @@ class TestSlackMyMessages:
         assert data["date"] == "2026-07-08"
         assert data["user_id"] == "U08GTEST001"
         assert data["total"] == 1
+        assert data["truncated"] is False
+        assert data["total_available"] == 1
         assert data["messages"][0]["text"] == "hello team"
         assert data["messages"][0]["channel_id"] == "C123"
         assert data["messages"][0]["channel_name"] == "general"
@@ -645,6 +675,20 @@ class TestSlackMyMessages:
         mock.auth_test.assert_not_called()
         query = mock.search_messages.call_args.kwargs["query"]
         assert "from:<@U99EXPLICIT>" in query
+
+    def test_truncated_pull_surfaced_in_response(self, client):
+        """A >max_pages day must not masquerade as a complete pull."""
+        mock = self._mock_client(matches=[self._match()],
+                                 truncated=True, total_available=1234)
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        data = response.json()
+        assert data["truncated"] is True
+        assert data["total_available"] == 1234
+        assert data["total"] == 1
 
     def test_missing_scope_gives_actionable_403(self, client):
         from api.services.slack_integration import SlackAPIError

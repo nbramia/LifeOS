@@ -513,9 +513,11 @@ class TestSearchMessages:
     def test_single_page(self):
         client, http = self._client_with_pages([self._page(["msg one"], 1, 1)])
 
-        matches = client.search_messages(query="from:<@U1> on:2026-07-08")
+        result = client.search_messages(query="from:<@U1> on:2026-07-08")
 
-        assert [m["text"] for m in matches] == ["msg one"]
+        assert [m["text"] for m in result["matches"]] == ["msg one"]
+        assert result["truncated"] is False
+        assert result["total_available"] == 1
         url = http.get.call_args.args[0]
         assert url.endswith("/search.messages")
         params = http.get.call_args.kwargs["params"]
@@ -527,11 +529,46 @@ class TestSearchMessages:
             self._page(["page2 msg"], 2, 2),
         ])
 
-        matches = client.search_messages(query="q")
+        result = client.search_messages(query="q")
 
-        assert [m["text"] for m in matches] == ["page1 msg", "page2 msg"]
+        assert [m["text"] for m in result["matches"]] == ["page1 msg", "page2 msg"]
+        assert result["truncated"] is False
         assert http.get.call_count == 2
         assert http.get.call_args_list[1].kwargs["params"]["page"] == 2
+
+    def test_truncation_signaled_when_pages_exceed_max(self):
+        """More pages available than max_pages → stop at the cap and say so."""
+        pages = [self._page([f"page{i} msg"], i, 3) for i in (1, 2)]
+        # Slack reports the true total across all pages.
+        for p in pages:
+            p["messages"]["paging"]["total"] = 3
+        client, http = self._client_with_pages(pages)
+
+        result = client.search_messages(query="q", max_pages=2)
+
+        assert http.get.call_count == 2
+        assert [m["text"] for m in result["matches"]] == ["page1 msg", "page2 msg"]
+        assert result["truncated"] is True
+        assert result["total_available"] == 3
+
+    def test_rate_limit_retry(self):
+        """A ratelimited response with Retry-After is retried after sleeping."""
+        rate_limited = MagicMock()
+        rate_limited.json.return_value = {"ok": False, "error": "ratelimited"}
+        rate_limited.headers = {"Retry-After": "7"}
+
+        ok = MagicMock()
+        ok.json.return_value = self._page(["after retry"], 1, 1)
+
+        client, http = self._client_with_pages([])
+        http.get.side_effect = [rate_limited, ok]
+
+        with patch("time.sleep") as mock_sleep:
+            result = client.search_messages(query="q")
+
+        assert [m["text"] for m in result["matches"]] == ["after retry"]
+        assert http.get.call_count == 2
+        mock_sleep.assert_called_once_with(7)
 
     def test_api_error_raises(self):
         from api.services.slack_integration import SlackAPIError
@@ -551,6 +588,19 @@ class TestSearchMessages:
 
         assert identity["user_id"] == "U08GTEST001"
         client._api_call.assert_called_once_with("auth.test", "default")
+
+    def test_auth_test_cached_per_instance(self):
+        """The token identity never changes — repeat calls skip the API."""
+        client, http = self._client_with_pages([])
+        client._api_call = MagicMock(return_value={
+            "ok": True, "user_id": "U08GTEST001", "user": "testuser",
+        })
+
+        first = client.auth_test()
+        second = client.auth_test()
+
+        assert first == second
+        client._api_call.assert_called_once()
 
     def test_search_read_scope_declared(self):
         from api.services.slack_integration import SLACK_SCOPES
