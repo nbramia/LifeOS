@@ -636,3 +636,37 @@ class TestDurationCollapse:
         message = send_mock.call_args[0][0]
         assert "silent no-op" not in message
         assert "✅" in message
+
+
+def test_sync_summary_surfaces_investments_stale():
+    """A stale investments snapshot must reach the user via the nightly Telegram
+    summary — a bare logger.warning feeds no batched report (#448)."""
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "results": {}, "duration_seconds": 12,
+        "investments_stale": (
+            "Investments snapshot is 6.0 days old (last synced 2026-07-03T18:30:00); "
+            "the weekday refresh (~18:30) or Syncthing may have stalled."
+        ),
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "Investments snapshot" in message
+    assert "stale" in message.lower()
+    assert message.startswith("⚠️")  # stale flips the top-line status
+
+
+def test_sync_summary_omits_investments_when_fresh():
+    """No investments section (and a clean status) when the snapshot is fresh."""
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "results": {}, "duration_seconds": 12, "investments_stale": None,
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "Investments snapshot stale" not in message
+    assert message.startswith("✅")
