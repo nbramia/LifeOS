@@ -37,6 +37,13 @@ DEFAULT_CHANNEL_HISTORY_DAYS = 90  # 90 days for channels
 # for new replies. A reply to a parent older than this is missed by the
 # nightly sync (trade-off documented in issue #440).
 THREAD_RESCAN_DAYS = 7
+# Inter-thread pacing for conversations.replies (Slack Tier 3 is ~50 req/min).
+# A backfill (no reply cursor) walks every thread in a channel, so it paces
+# well under the limit — correctness over speed on a rare manual run.
+# Incremental fetches are bounded by nightly activity, so a short delay
+# suffices.
+THREAD_FETCH_DELAY_BACKFILL = 1.2
+THREAD_FETCH_DELAY_INCREMENTAL = 0.1
 
 
 class SlackSync:
@@ -220,6 +227,10 @@ class SlackSync:
                     stats["messages_indexed"] += channel_stats["messages_indexed"]
                     stats["interactions_created"] += channel_stats["interactions_created"]
                     stats["affected_person_ids"].update(channel_stats.get("affected_person_ids", set()))
+                    # Surface non-fatal channel errors (e.g. a thread fetch
+                    # that exhausted retries) so the run reports "partial"
+                    # instead of silently dropping data.
+                    stats["errors"].extend(channel_stats.get("errors", []))
                     # Aggregate message counts from each channel
                     for person_id, count in channel_stats.get("message_counts", {}).items():
                         stats["message_counts"][person_id] = stats["message_counts"].get(person_id, 0) + count
@@ -271,7 +282,14 @@ class SlackSync:
             "messages_indexed": 0,
             "interactions_created": 0,
             "affected_person_ids": set(),
+            "errors": [],
         }
+
+        # Captured before the main history fetch: replies posted after this
+        # instant are deferred to the next run, so indexing them can't advance
+        # the channel cursor past a top-level message posted mid-run that the
+        # main fetch never saw (issue #445 review).
+        sync_start = datetime.now(timezone.utc)
 
         # Determine oldest timestamp for fetch
         oldest = None
@@ -308,12 +326,15 @@ class SlackSync:
         # Fetch + index thread replies. Runs even when the main fetch is
         # empty: a reply posted today to an old parent doesn't surface the
         # parent in a cursor-windowed conversations.history call — issue #440.
-        stats["messages_indexed"] += self._sync_thread_replies(
+        replies_indexed, reply_errors = self._sync_thread_replies(
             channel=channel,
             messages=messages,
             oldest=oldest,
             full=full,
+            sync_start=sync_start,
         )
+        stats["messages_indexed"] += replies_indexed
+        stats["errors"].extend(reply_errors)
 
         if not messages:
             return stats
@@ -340,7 +361,8 @@ class SlackSync:
         messages: list[SlackMessage],
         oldest: Optional[datetime],
         full: bool,
-    ) -> int:
+        sync_start: datetime,
+    ) -> tuple[int, list[str]]:
         """
         Fetch and index thread replies for a channel (issue #440).
 
@@ -356,14 +378,33 @@ class SlackSync:
         cursor are skipped without an API call. Replies are indexed for search
         only — they don't feed CRM interactions or message counts.
 
+        Replies with a timestamp after ``sync_start`` are deferred: indexing
+        them would advance the channel cursor past top-level messages posted
+        during this run that the main fetch never saw. Deferred replies are
+        recovered next run — the cursor stays behind them, so their parent's
+        ``latest_reply > cursor`` re-triggers the fetch.
+
+        Fetch failures are collected and returned rather than raised, so a
+        single thread can't fail the whole channel while still surfacing in
+        sync stats (status "partial"). There is no persistent retry queue:
+        the healing path is the nightly summary flagging the partial run
+        and, if needed, a manual full sync re-walking every thread.
+
         Returns:
-            Number of thread replies indexed
+            Tuple of (number of thread replies indexed, error strings)
         """
+        errors: list[str] = []
         candidates: dict[str, SlackMessage] = {
             m.ts: m for m in messages if m.reply_count > 0
         }
 
         reply_oldest = None if full else oldest
+        # No reply cursor means a backfill that walks every thread — pace it.
+        delay = (
+            THREAD_FETCH_DELAY_BACKFILL
+            if reply_oldest is None
+            else THREAD_FETCH_DELAY_INCREMENTAL
+        )
 
         # Incremental rescan for replies to parents older than the cursor.
         # Skipped when the main fetch's window already covers the rescan
@@ -378,9 +419,9 @@ class SlackSync:
                         oldest=rescan_start,
                     )
                 except Exception as e:
-                    logger.warning(
-                        f"Thread rescan failed for {channel.channel_id}: {e}"
-                    )
+                    error_msg = f"Thread rescan failed for {channel.channel_id}: {e}"
+                    logger.warning(error_msg)
+                    errors.append(error_msg)
                     recent_parents = []
                 for m in recent_parents:
                     if m.ts in candidates or m.reply_count <= 0:
@@ -406,23 +447,30 @@ class SlackSync:
                     oldest=reply_oldest,
                 )
             except Exception as e:
-                # A single thread failing shouldn't fail the whole channel.
-                logger.warning(
-                    f"Failed to fetch thread {ts} in {channel.channel_id}: {e}"
-                )
+                # A single thread failing shouldn't fail the whole channel,
+                # but the loss must be visible: this run's main fetch advances
+                # the cursor, so a silently skipped thread is filtered out of
+                # every future incremental run by the latest_reply check above.
+                error_msg = f"Failed to fetch thread {ts} in {channel.channel_id}: {e}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
                 continue
 
             if replies:
-                indexed += self.indexer.index_messages(
-                    messages=replies,
-                    channel=channel,
-                    workspace_id=self._workspace_id,
-                )
+                # Drop replies posted after sync_start (see docstring) —
+                # they're picked up by the next run.
+                fresh = [r for r in replies if r.timestamp <= sync_start]
+                if fresh:
+                    indexed += self.indexer.index_messages(
+                        messages=fresh,
+                        channel=channel,
+                        workspace_id=self._workspace_id,
+                    )
 
-            # Rate limit: small delay between thread fetches
-            time.sleep(0.1)
+            # Rate limit: delay between thread fetches
+            time.sleep(delay)
 
-        return indexed
+        return indexed, errors
 
     def _create_interactions_for_channel(
         self,

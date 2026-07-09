@@ -4,13 +4,17 @@ from unittest.mock import MagicMock
 
 
 @pytest.fixture
-def sync_with_mocks():
+def sync_with_mocks(monkeypatch):
     """A SlackSync wired up with mock client/indexer/entity_store/interaction_store.
 
     Patches the heavy collaborators so we can assert on call ordering and
-    return shape without touching the network or any SQLite store.
+    return shape without touching the network or any SQLite store. The
+    rate-limit pacing sleeps (inter-channel and inter-thread — up to 1.2s
+    per thread on backfills) are zeroed out so tests stay fast.
     """
     from api.services.slack_sync import SlackSync
+
+    monkeypatch.setattr("api.services.slack_sync.time.sleep", lambda _s: None)
 
     mock_client = MagicMock()
     mock_indexer = MagicMock()
@@ -413,6 +417,10 @@ class TestThreadReplySync:
         assert sync.client.get_thread_replies.call_count == 1
 
     def test_thread_fetch_failure_does_not_kill_channel(self, sync_with_mocks):
+        """A failed thread fetch must not fail the channel, but it must be
+        visible: the same run's main fetch advances the cursor, so a silently
+        skipped thread is filtered out of every future incremental run —
+        silent success would be permanent silent loss."""
         sync = sync_with_mocks
         sync.client.list_channels.return_value = [self._channel()]
         sync.client.get_all_channel_history.return_value = [self._parent(reply_count=2)]
@@ -424,3 +432,92 @@ class TestThreadReplySync:
         # main history still indexed; channel not recorded as a hard failure
         assert stats["messages_indexed"] == 1
         assert stats["channels_processed"] == 1
+        # ... but the loss is surfaced: run reports partial with an error
+        assert stats["status"] == "partial"
+        assert any("thread" in e.lower() and "ratelimited" in e
+                   for e in stats["errors"])
+
+    def test_rescan_failure_surfaces_in_stats(self, sync_with_mocks):
+        """A failed 7-day rescan fetch has the same permanent-loss property
+        as a failed thread fetch — it must reach stats["errors"]."""
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        cursor = datetime.now(timezone.utc) - timedelta(days=1)
+        sync.client.list_channels.return_value = [self._channel()]
+        # First call: main incremental fetch. Second call: rescan blows up.
+        sync.client.get_all_channel_history.side_effect = [
+            [], RuntimeError("ratelimited")]
+        sync.indexer.get_latest_timestamp.return_value = cursor
+
+        stats = sync.sync_messages(full=False, dm_only=False)
+
+        assert stats["channels_processed"] == 1
+        assert stats["status"] == "partial"
+        assert any("rescan" in e.lower() for e in stats["errors"])
+
+    def test_reply_after_sync_start_deferred(self, sync_with_mocks):
+        """A reply posted during the sync run (ts after sync-start) must not
+        be indexed this run: indexing it would advance the channel cursor
+        past top-level messages posted mid-run that the main fetch never saw,
+        permanently skipping them. The deferred reply is recovered next run
+        (its parent's latest_reply stays above the cursor)."""
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        now = datetime.now(timezone.utc)
+        past_reply = self._reply(ts=f"{(now - timedelta(minutes=5)).timestamp():.6f}")
+        future_reply = self._reply(ts=f"{(now + timedelta(minutes=5)).timestamp():.6f}")
+
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.return_value = [self._parent(reply_count=2)]
+        sync.client.get_thread_replies.return_value = [past_reply, future_reply]
+        sync.indexer.index_messages.side_effect = lambda messages, **kw: len(messages)
+
+        stats = sync.sync_messages(full=True, dm_only=False)
+
+        # 1 parent from main history + only the pre-sync-start reply
+        assert stats["messages_indexed"] == 2
+        reply_call_kwargs = sync.indexer.index_messages.call_args_list[-1].kwargs
+        assert reply_call_kwargs["messages"] == [past_reply]
+
+    def test_rescan_history_window_is_rescan_days(self, sync_with_mocks):
+        """The rescan's history call must be bounded to THREAD_RESCAN_DAYS —
+        not the channel cursor, and not unbounded."""
+        from datetime import datetime, timedelta, timezone
+        from api.services.slack_sync import THREAD_RESCAN_DAYS
+
+        sync = sync_with_mocks
+        cursor = datetime.now(timezone.utc) - timedelta(days=1)
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.side_effect = [[], []]
+        sync.indexer.get_latest_timestamp.return_value = cursor
+
+        sync.sync_messages(full=False, dm_only=False)
+
+        assert sync.client.get_all_channel_history.call_count == 2
+        rescan_kwargs = sync.client.get_all_channel_history.call_args_list[1].kwargs
+        expected = datetime.now(timezone.utc) - timedelta(days=THREAD_RESCAN_DAYS)
+        assert abs((rescan_kwargs["oldest"] - expected).total_seconds()) < 60
+
+    def test_rescan_skipped_when_cursor_covers_window(self, sync_with_mocks):
+        """No second history call when the main fetch's window already covers
+        the rescan window: first incremental sync of a channel (no cursor,
+        90-day history_days window) and a cursor older than the window."""
+        from datetime import datetime, timedelta, timezone
+
+        sync = sync_with_mocks
+        sync.client.list_channels.return_value = [self._channel()]
+        sync.client.get_all_channel_history.return_value = []
+
+        # Case 1: first incremental sync — no cursor, history_days window.
+        sync.indexer.get_latest_timestamp.return_value = None
+        sync.sync_messages(full=False, dm_only=False, channel_history_days=90)
+        assert sync.client.get_all_channel_history.call_count == 1
+
+        # Case 2: cursor older than the rescan window start.
+        sync.client.get_all_channel_history.reset_mock()
+        sync.indexer.get_latest_timestamp.return_value = (
+            datetime.now(timezone.utc) - timedelta(days=30))
+        sync.sync_messages(full=False, dm_only=False)
+        assert sync.client.get_all_channel_history.call_count == 1
