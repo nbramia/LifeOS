@@ -86,6 +86,10 @@ async def _anthropic_native_search(query: str) -> str:
     pinned to a now-retired model. We declare the basic ``web_search_20250305``
     variant, which every current Claude model supports. Returns the synthesized
     answer text, or "" if the search produced nothing usable.
+
+    A rare ``pause_turn`` (server hit its search-iteration cap) yields empty or
+    partial text — which degrades to the DuckDuckGo path or a real-but-shorter
+    answer, never a fabricated one — so it needs no explicit resume here.
     """
     from api.services.llm_client import get_local_llm
 

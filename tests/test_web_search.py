@@ -119,3 +119,37 @@ class TestSearchWebWithSynthesis:
             synthesized, results = await web_search.search_web_with_synthesis("q")
         assert synthesized == ""                          # honest "nothing found", never invented
         assert results == []
+
+
+class TestNativeAnswerAccumulation:
+    """The native path returns Claude's full cited answer, not its last fragment."""
+
+    def test_parse_anthropic_response_accumulates_text_blocks(self):
+        """A cited web-search answer spans multiple text blocks (split at citation
+        boundaries) interleaved with server-tool blocks — all text must survive,
+        not just the last block (the #469 truncation bug)."""
+        from api.services.llm_client import AnthropicLLMClient
+        # Skip __init__ (needs an API key) — _parse_anthropic_response uses no self state.
+        client = AnthropicLLMClient.__new__(AnthropicLLMClient)
+
+        def blk(btype, **kw):
+            b = MagicMock()
+            b.type = btype
+            for k, v in kw.items():
+                setattr(b, k, v)
+            return b
+
+        resp = MagicMock()
+        resp.content = [
+            blk("text", text="AMD is trading at $210"),
+            blk("server_tool_use"),
+            blk("web_search_tool_result"),
+            blk("text", text=" as of the July 9 close."),
+        ]
+        resp.usage = MagicMock(input_tokens=10, output_tokens=20,
+                               cache_creation_input_tokens=0, cache_read_input_tokens=0)
+        resp.model = "claude-haiku-4-5"
+        resp.stop_reason = "end_turn"
+
+        out = client._parse_anthropic_response(resp)
+        assert out.text == "AMD is trading at $210 as of the July 9 close."

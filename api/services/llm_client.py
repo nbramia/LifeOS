@@ -572,7 +572,10 @@ class AnthropicLLMClient:
         tool_calls = None
         for block in resp.content:
             if block.type == "text":
-                text = block.text
+                # Accumulate: a response may carry multiple text blocks (e.g. a
+                # native web-search answer split at citation boundaries). Keeping
+                # only the last would truncate the answer to its final fragment.
+                text += block.text
             elif block.type == "tool_use":
                 if tool_calls is None:
                     tool_calls = []
