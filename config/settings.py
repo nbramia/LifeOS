@@ -197,6 +197,15 @@ class Settings(BaseSettings):
     # Anthropic model for orchestration
     anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
 
+    # Anthropic model for specialist calls (relationship insights, fact
+    # extraction, tone analysis) — Sonnet-tier for quality, independent of the
+    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-4-6),
+    # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
+    # returning 404, silently breaking every specialist feature (#470).
+    anthropic_specialist_model: str = Field(
+        default="claude-sonnet-4-6", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+    )
+
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
     local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
