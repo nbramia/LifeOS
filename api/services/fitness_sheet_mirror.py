@@ -26,7 +26,7 @@ SESSIONS_TAB = "Sessions"
 SETS_TAB = "Sets"
 
 _SESSIONS_HEADER = ["id", "date", "kind", "title", "source", "notes", "created_at"]
-_SETS_HEADER = ["session_id", "date", "exercise", "set_index", "reps", "weight", "weight_unit", "rpe", "notes"]
+_SETS_HEADER = ["session_id", "date", "exercise", "set_index", "reps", "weight", "weight_unit", "rpe", "time", "notes"]
 
 _state_lock = threading.Lock()
 _running = False
@@ -43,6 +43,16 @@ def _cell(v):
     return "" if v is None else v
 
 
+def _time_cell(seconds) -> str:
+    """Duration as M:SS (or H:MM:SS) for the sheet's time column."""
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def build_tabs(store) -> dict[str, list[list]]:
     """Build the full tab contents (header + rows) from the store."""
     sessions = store.list_sessions(limit=100000)
@@ -53,7 +63,8 @@ def build_tabs(store) -> dict[str, list[list]]:
         for st in s.sets:
             set_rows.append([
                 s.id, s.date, st.exercise, st.set_index,
-                _cell(st.reps), _cell(st.weight), st.weight_unit, _cell(st.rpe), st.notes,
+                _cell(st.reps), _cell(st.weight), st.weight_unit, _cell(st.rpe),
+                _time_cell(st.duration_seconds), st.notes,
             ])
     return {SESSIONS_TAB: sess_rows, SETS_TAB: set_rows}
 

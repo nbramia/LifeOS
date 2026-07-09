@@ -63,6 +63,7 @@ class WorkoutSet:
     weight: Optional[float] = None
     weight_unit: str = "lb"
     rpe: Optional[float] = None
+    duration_seconds: Optional[int] = None
     notes: str = ""
 
 
@@ -136,10 +137,15 @@ class FitnessStore:
                     weight REAL,
                     weight_unit TEXT DEFAULT 'lb',
                     rpe REAL,
+                    duration_seconds INTEGER,
                     notes TEXT DEFAULT '',
                     FOREIGN KEY (session_id) REFERENCES workout_sessions(id) ON DELETE CASCADE
                 )
             """)
+            # Migration: add duration_seconds to workout_sets created before it existed.
+            set_cols = {r[1] for r in conn.execute("PRAGMA table_info(workout_sets)")}
+            if "duration_seconds" not in set_cols:
+                conn.execute("ALTER TABLE workout_sets ADD COLUMN duration_seconds INTEGER")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS health_metrics (
                     id TEXT PRIMARY KEY,
@@ -219,12 +225,12 @@ class FitnessStore:
             count = max(1, count)
             for _ in range(count):
                 conn.execute(
-                    "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, weight_unit, rpe, notes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, weight_unit, rpe, duration_seconds, notes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         uuid.uuid4().hex[:12], session_id, exercise, idx,
                         s.get("reps"), s.get("weight"), s.get("weight_unit") or "lb",
-                        s.get("rpe"), s.get("notes", ""),
+                        s.get("rpe"), s.get("duration_seconds"), s.get("notes", ""),
                     ),
                 )
                 idx += 1
@@ -248,12 +254,12 @@ class FitnessStore:
 
     def _fetch_sets(self, conn, session_id: str) -> list[WorkoutSet]:
         rows = conn.execute(
-            "SELECT exercise, set_index, reps, weight, weight_unit, rpe, notes "
+            "SELECT exercise, set_index, reps, weight, weight_unit, rpe, duration_seconds, notes "
             "FROM workout_sets WHERE session_id = ? ORDER BY set_index", (session_id,)
         ).fetchall()
         return [
             WorkoutSet(exercise=r[0], set_index=r[1], reps=r[2], weight=r[3],
-                       weight_unit=r[4], rpe=r[5], notes=r[6] or "")
+                       weight_unit=r[4], rpe=r[5], duration_seconds=r[6], notes=r[7] or "")
             for r in rows
         ]
 
@@ -379,7 +385,7 @@ class FitnessStore:
         conn = sqlite3.connect(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT s.date, ws.reps, ws.weight, ws.weight_unit, ws.rpe, s.id "
+                "SELECT s.date, ws.reps, ws.weight, ws.weight_unit, ws.rpe, ws.duration_seconds, s.id "
                 "FROM workout_sets ws JOIN workout_sessions s ON ws.session_id = s.id "
                 "WHERE ws.exercise = ? ORDER BY s.date DESC, ws.set_index ASC LIMIT ?",
                 (canonical, limit),
@@ -387,7 +393,8 @@ class FitnessStore:
         finally:
             conn.close()
         return [
-            {"date": r[0], "reps": r[1], "weight": r[2], "weight_unit": r[3], "rpe": r[4], "session_id": r[5]}
+            {"date": r[0], "reps": r[1], "weight": r[2], "weight_unit": r[3], "rpe": r[4],
+             "duration_seconds": r[5], "session_id": r[6]}
             for r in rows
         ]
 

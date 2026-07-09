@@ -92,6 +92,50 @@ class TestUpdate:
         assert store.update_session(target="latest", notes="x") is None
 
 
+# -- duration --
+
+class TestDuration:
+    def test_duration_roundtrip(self, store):
+        s = store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}])
+        assert s.sets[0].exercise == "Stairs"
+        assert s.sets[0].reps == 500
+        assert s.sets[0].duration_seconds == 421
+
+    def test_duration_defaults_to_none(self, store):
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}])
+        assert s.sets[0].duration_seconds is None
+
+    def test_exercise_history_includes_duration(self, store):
+        store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}], date="2026-06-10")
+        hist = store.exercise_history("stairs")
+        assert hist[0]["duration_seconds"] == 421
+
+    def test_migrates_pre_duration_db(self, tmp_path):
+        # A workout_sets table created before the duration_seconds column
+        # existed must be ALTERed on open, and logging with duration must work.
+        import sqlite3
+        db = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE workout_sets (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                exercise TEXT NOT NULL,
+                set_index INTEGER NOT NULL,
+                reps INTEGER,
+                weight REAL,
+                weight_unit TEXT DEFAULT 'lb',
+                rpe REAL,
+                notes TEXT DEFAULT ''
+            )
+        """)
+        conn.commit()
+        conn.close()
+        store = FitnessStore(db_path=db)
+        s = store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}])
+        assert store.get_session(s.id).sets[0].duration_seconds == 421
+
+
 # -- metrics --
 
 class TestMetrics:

@@ -77,6 +77,20 @@ def test_build_tabs_shapes(wired):
         assert "None" not in [str(c) for c in row]
 
 
+def test_time_column_renders_duration(wired):
+    store, _ = wired
+    store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}], date="2026-06-10")
+    tabs = mirror.build_tabs(store)
+    header = tabs["Sets"][0]
+    assert "time" in header
+    time_idx = header.index("time")
+    stairs_row = next(r for r in tabs["Sets"][1:] if r[2] == "Stairs")
+    assert stairs_row[time_idx] == "7:01"
+    # untimed sets leave the column empty
+    bench_row = next(r for r in tabs["Sets"][1:] if r[2] == "Bench Press")
+    assert bench_row[time_idx] == ""
+
+
 def test_sync_writes_both_tabs(wired):
     _, fake = wired
     assert mirror.sync() is True
