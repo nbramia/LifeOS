@@ -470,7 +470,8 @@ def test_investments_format_lists_all_positions():
          "unrealized": 1000}
         for i in range(19)
     ]
-    positions.append({"symbol": "SPCX", "value": 3050, "weight_pct": 0.37})
+    positions.append({"symbol": "SPCX", "desc": "SpaceX Class A (SPV)",
+                      "value": 3050, "weight_pct": 0.37})
     data = {
         "synced_at": "2026-07-09T03:26:00", "as_of": "2026-07-09",
         "totals": {"all_investments": 1234567, "schwab": 1000000,
@@ -486,6 +487,10 @@ def test_investments_format_lists_all_positions():
     assert "SPCX" in out                 # beyond-top-15 holding is present
     assert "Positions (20):" in out      # header reflects the full count
     assert "Top positions:" not in out   # old truncating header is gone
+    # Ticker + security name, so company-name questions are a text match
+    # (stale world knowledge otherwise overrides an unrecognized ticker).
+    assert "SPCX — SpaceX Class A (SPV)" in out
+    assert "FIL01:" in out               # desc-less positions keep bare ticker
 
 
 @pytest.mark.unit
