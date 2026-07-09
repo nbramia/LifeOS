@@ -71,16 +71,17 @@ _(Your main LifeOS bot is better suited for this.)_ Never refuse.
 
 ## Built-in personas
 
-LifeOS ships four personas. Each is a full-featured assistant with a different framing.
+LifeOS ships five personas. Each is a full-featured assistant with a different framing.
 
 - **`primary`** — the general-purpose default surface, answering across every domain (knowledge, people, calendar, email, finances, tasks, the web). Concise and direct; offers the obvious next action instead of stopping at the answer. This is the persona used when no other is selected.
 - **`therapist`** — an advice-oriented, private surface for personal and relational challenges. Leads with concrete recommendations rather than validation, grounds its answers in your own therapy notes and recent messages with close contacts, routes between individual and relational context, and follows strict privacy rules for the sensitive data it sees. Prefers reading and advising over taking actions.
 - **`fitness`** — a clinical, log-first training surface. Records workouts from plain-text messages before reporting back, gives trainer-grade programming and recovery advice on request grounded in your logged data, and periodically refreshes baseline metrics. Terse, no cheerleading.
 - **`doctor`** — the self-repair orchestrator (`orchestrates: true`). You message it when LifeOS itself misbehaves; it turns the report into a shipped, tested, reviewed fix through the project's issue and implementation pipeline. Unlike the others, selecting it does not answer inline — it spawns a background session (see below). Details in [doctor-bot.md](doctor-bot.md).
+- **`advisor`** — a financial-planning surface (Financial Advisor). Analytical and numbers-first, it grounds retirement, tax, allocation, and savings planning in the reconciled investments snapshot (Schwab + 401(k) + TSP — cost basis, tax buckets, harvestable losses) plus Monarch cashflow, preferring the deeper investments source over Monarch for portfolio and tax questions. Plans and recommends — it doesn't place trades.
 
-The specialized personas (`fitness`, `therapist`, `doctor`) are bound to Telegram bots in `config/telegram_bots.json`; `primary` is the default and needs no binding.
+The specialized personas (`fitness`, `therapist`, `doctor`, `advisor`) are bound to Telegram bots in `config/telegram_bots.json`; `primary` is the default and needs no binding.
 
-A persona's sourcing and tone are the levers, not its capabilities: because all four share the full tool suite, the difference between them is entirely which tools they *lean on*, where they look *first*, and how they frame the reply. That is why a persona file is mostly prose — the behavior is instruction, not configuration.
+A persona's sourcing and tone are the levers, not its capabilities: because all five share the full tool suite, the difference between them is entirely which tools they *lean on*, where they look *first*, and how they frame the reply. That is why a persona file is mostly prose — the behavior is instruction, not configuration.
 
 ## How personas reach each surface
 
