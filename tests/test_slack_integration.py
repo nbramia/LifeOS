@@ -279,3 +279,48 @@ class TestCreateSlackSourceEntity:
 
         entity2 = create_slack_source_entity(user2)
         assert entity2.observed_name == "jdoe"
+
+
+@patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
+class TestListChannelsMemberOnly:
+    """Issue #439: member_only=True must enumerate via users.conversations
+    (channels the authed user belongs to) instead of conversations.list
+    (every channel in the workspace)."""
+
+    def _client_with_capture(self):
+        from api.services.slack_integration import SlackClient
+
+        store = MagicMock()
+        store.get_token.return_value = "xoxp-test-fake-token"
+        client = SlackClient(token_store=store)
+
+        response = MagicMock()
+        response.json.return_value = {
+            "ok": True,
+            "channels": [
+                {"id": "C1", "name": "general", "is_private": False},
+                {"id": "D1", "user": "U123", "is_im": True},
+            ],
+            "response_metadata": {},
+        }
+        http = MagicMock()
+        http.get.return_value = response
+        client._http_client = http
+        return client, http
+
+    def test_member_only_uses_users_conversations(self):
+        client, http = self._client_with_capture()
+
+        channels = client.list_channels(member_only=True)
+
+        url = http.get.call_args.args[0]
+        assert url.endswith("/users.conversations")
+        assert len(channels) == 2
+
+    def test_default_uses_conversations_list(self):
+        client, http = self._client_with_capture()
+
+        client.list_channels()
+
+        url = http.get.call_args.args[0]
+        assert url.endswith("/conversations.list")

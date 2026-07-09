@@ -407,13 +407,23 @@ class SlackClient:
         except SlackAPIError:
             return None
 
-    def list_channels(self, workspace_id: str = "default", include_dms: bool = True) -> list[SlackChannel]:
+    def list_channels(
+        self,
+        workspace_id: str = "default",
+        include_dms: bool = True,
+        member_only: bool = False,
+    ) -> list[SlackChannel]:
         """
-        List all accessible channels with pagination.
+        List accessible channels with pagination.
 
         Args:
             workspace_id: Workspace ID
             include_dms: If True, include DMs (im, mpim). If False, only regular channels.
+            member_only: If True, enumerate via ``users.conversations`` (only
+                channels the authed user is a member of) instead of
+                ``conversations.list`` (every channel in the workspace).
+                Membership scoping avoids ``not_in_channel`` errors on history
+                calls and cuts API volume on large workspaces — issue #439.
 
         Returns:
             List of SlackChannel objects
@@ -422,6 +432,7 @@ class SlackClient:
 
         channels = []
         cursor = None
+        endpoint = "users.conversations" if member_only else "conversations.list"
 
         # Determine types to fetch
         # Note: Slack API returns different results for different type combinations
@@ -445,10 +456,10 @@ class SlackClient:
             if cursor:
                 params["cursor"] = cursor
 
-            # Use GET with params for conversations.list (more reliable)
+            # Use GET with params (more reliable for the conversations APIs)
             for attempt in range(max_retries + 1):
                 response = self.http_client.get(
-                    f"{self.BASE_URL}/conversations.list",
+                    f"{self.BASE_URL}/{endpoint}",
                     headers={"Authorization": f"Bearer {token}"},
                     params=params,
                 )
@@ -460,7 +471,7 @@ class SlackClient:
                 error = data.get("error", "Unknown API error")
                 if error == "ratelimited" and attempt < max_retries:
                     retry_after = int(response.headers.get("Retry-After", retry_delay))
-                    logger.warning(f"Rate limited on conversations.list, waiting {retry_after}s")
+                    logger.warning(f"Rate limited on {endpoint}, waiting {retry_after}s")
                     time.sleep(retry_after)
                     retry_delay *= 2
                     continue
