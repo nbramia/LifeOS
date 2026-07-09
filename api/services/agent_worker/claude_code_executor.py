@@ -762,23 +762,25 @@ class ClaudeCodeExecutor:
                     if state.plan_mode and not state.awaiting_approval:
                         state.plan_text += body + "\n"
                 for body in scan.goal:
-                    # The agent proposed a success condition (#398). Stream it so
-                    # the operator can SEE what they're approving, then the result
-                    # event flips the session to BLOCKED awaiting their yes/no.
-                    # Child sessions stay silent to the operator like [NOTIFY].
+                    # The agent proposed a success condition (#398). NOT
+                    # streamed to Telegram here: the worker sends ONE anchored
+                    # message — goal body + reply instructions — when the
+                    # session blocks, so the operator's threaded reply lands on
+                    # the message that shows the goal itself (previously the
+                    # goal streamed as its own message and a separate
+                    # instruction message was the reply anchor, which made
+                    # "reply yes — but to which message?" ambiguous). The web
+                    # thread still gets the body live via the mirror. The
+                    # notify timestamps still advance so the heartbeat doesn't
+                    # race the blocked-prompt send with a "Still working".
                     state.pending_goal = body
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
-                    if not state.is_child:
-                        try:
-                            self._notify(body)
+                    if not state.is_child and self._conversation_mirror:
+                        try:  # #311: stream into the web thread
+                            self._conversation_mirror(session.session_id, body)
                         except Exception as exc:  # pragma: no cover — defensive
-                            logger.warning("notification callback raised: %s", exc)
-                        if self._conversation_mirror:  # #311: stream into the web thread
-                            try:
-                                self._conversation_mirror(session.session_id, body)
-                            except Exception as exc:  # pragma: no cover — defensive
-                                logger.warning("conversation mirror raised: %s", exc)
+                            logger.warning("conversation mirror raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_goal", {
                         "body": body, "body_chars": len(body),
                     })

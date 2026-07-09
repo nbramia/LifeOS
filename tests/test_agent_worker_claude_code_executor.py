@@ -337,8 +337,10 @@ def test_child_clarify_folds_into_final_text_and_does_not_block(tmp_path: Path):
 
 def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
     """#311: when a conversation_mirror is wired, the executor calls it with
-    (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] — the same
-    bodies it relays to Telegram — so the web thread mirrors live progress."""
+    (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] so the web
+    thread mirrors live progress. [NOTIFY]/[CLARIFY] also relay to Telegram;
+    [GOAL] is mirror-only — its Telegram delivery is the worker's single
+    anchored goal + reply-instructions message at block time."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -365,14 +367,15 @@ def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
 
     executor.execute(session, {"description": "do the thing"})
 
-    # Every streamed body is mirrored with the session id, in order, matching
-    # exactly what Telegram received.
+    # Every streamed body is mirrored with the session id, in order. Telegram
+    # received everything except the goal (delivered by the worker at block
+    # time instead).
     assert mirror_calls == [
         (session.session_id, "Reading the file."),
         (session.session_id, "Which repo?"),
         (session.session_id, "Tests pass."),
     ]
-    assert [b for _, b in mirror_calls] == notifications
+    assert notifications == ["Reading the file.", "Which repo?"]
 
 
 def test_child_session_does_not_mirror(tmp_path: Path):
@@ -878,10 +881,13 @@ def test_scan_ignores_empty_goal_body():
     assert scan.narrative.strip() == ""
 
 
-def test_goal_returns_blocked_streams_and_records(tmp_path: Path):
+def test_goal_returns_blocked_without_streaming_and_records(tmp_path: Path):
     """End-to-end: an assistant [GOAL] then a result event yields a BLOCKED
-    outcome awaiting approval, the body is streamed to the operator, and the
-    transcript records the proposed condition."""
+    outcome awaiting approval, carrying the condition as final_text, and the
+    transcript records it. The body is NOT streamed as its own Telegram
+    notification — the worker delivers goal + reply instructions as ONE
+    anchored message at block time, so the operator replies to the message
+    that shows the goal itself."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -900,9 +906,10 @@ def test_goal_returns_blocked_streams_and_records(tmp_path: Path):
 
     assert outcome.status == STATUS_BLOCKED
     assert outcome.reason == REASON_AWAITING_GOAL_APPROVAL
+    # The condition rides the outcome so the worker can compose the single
+    # goal + instructions message the operator replies to.
     assert outcome.final_text == "all tests pass"
-    # The operator must SEE the proposed goal to approve it.
-    assert notifications == ["all tests pass"]
+    assert notifications == []  # no separate streamed goal message
     assert store.get(session.task_id).status == STATUS_BLOCKED
     events_out = _read_transcript(transcripts, session.session_id)
     awaiting = [e for e in events_out if e["kind"] == "claude_code_awaiting_goal_approval"]

@@ -1614,7 +1614,20 @@ class Worker:
             elif outcome.reason == REASON_AWAITING_CLARIFICATION:
                 prompt = "Awaiting your reply — answer the question above to continue."
             elif outcome.reason == REASON_AWAITING_GOAL_APPROVAL:
-                prompt = "Reply 'yes' to lock this goal and start, or send changes to refine it."
+                # ONE anchored message: the goal body (the executor defers its
+                # Telegram delivery to here) plus how to answer it. Only a
+                # THREADED reply to this message reaches the session — on an
+                # orchestration bot a plain chat message spawns a fresh
+                # session instead — so the instruction names the mechanics
+                # and lives on the same message as the goal it gates.
+                goal_body = (outcome.final_text or "").strip()
+                instruction = (
+                    "Reply to this message with 'yes' to lock this goal and "
+                    "start, or with changes to refine it. (Use Telegram's "
+                    "Reply on this message — a plain chat message won't "
+                    "reach this session.)"
+                )
+                prompt = f"{goal_body}\n\n{instruction}" if goal_body else instruction
             else:
                 prompt = "Awaiting your reply to continue."
             # Goal-approval replies route through `_resume_goal` (which injects

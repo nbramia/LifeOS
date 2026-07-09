@@ -962,7 +962,13 @@ class TelegramBotListener:
         the answer is enough — the worker's ``_resume_as_followup`` picks it
         up on the next tick and routes through the right executor's resume().
 
-        Returns True if the reply was consumed as a CLI follow-up.
+        ``kind='goal_approval'`` replies are also consumed here, with an
+        immediate ack: the worker only drains the answer on its next tick (up
+        to poll_seconds later) and the agent may not emit anything for minutes
+        after that, so without a deposit-time ack the operator can't tell
+        whether their 'yes' landed at all.
+
+        Returns True if the reply was consumed.
         """
         try:
             from api.services.agent_worker.session_store import SessionStore
@@ -971,7 +977,47 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"cli reply lookup failed: {exc}")
             return False
-        if not q or q.get("kind") != "followup":
+        if not q:
+            # A reply landing on an ALREADY-answered goal message must not fall
+            # through — on an orchestration bot it would spawn a brand-new
+            # session with the bare reply as its "report" (the yes/yes/approved
+            # fan-out). Consume it with a pointer instead.
+            try:
+                done = store.get_open_question_by_message_id(
+                    reply_to_message_id, bot=self._bot.name, include_answered=True,
+                )
+            except Exception as exc:
+                logger.warning(f"answered-question lookup failed: {exc}")
+                done = None
+            if done and done.get("answered_at") and done.get("kind") == "goal_approval":
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            return False
+        if q.get("kind") == "goal_approval":
+            # Same affirmative parser the worker's _resume_goal uses, so the
+            # ack never disagrees with what the worker will actually do.
+            from api.services.agent_worker.worker import _is_affirmative
+            if not store.deposit_answer(reply_to_message_id, text, bot=self._bot.name):
+                # Race: answered between the lookup above and this deposit.
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            if _is_affirmative(text):
+                ack = ("✅ Goal locked — starting work now. "
+                       "I'll post updates here as I go.")
+            else:
+                ack = ("✏️ Got it — reworking the goal with your changes. "
+                       "I'll propose an updated version shortly.")
+            await send_message_async(ack, chat_id=chat_id)
+            return True
+        if q.get("kind") != "followup":
             return False
         session_id = q.get("session_id")
         if not session_id:

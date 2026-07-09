@@ -1188,7 +1188,8 @@ class SessionStore:
         return dict(row) if row else None
 
     def get_open_question_by_message_id(
-        self, sent_message_id: int, bot: str | None = None
+        self, sent_message_id: int, bot: str | None = None,
+        include_answered: bool = False,
     ) -> dict | None:
         """Return the open (unanswered, not-timed-out) question a reply to
         `sent_message_id` matches — on any chunk — or None.
@@ -1196,13 +1197,18 @@ class SessionStore:
         Read-only sibling of `deposit_answer`: lets a caller inspect the matched
         row's `kind` before recording an answer (e.g. so the Telegram listener
         can recognize a ``routing='code'`` follow-up). When `bot` is given, the
-        match is scoped to that bot (see :meth:`_bot_scope_clause`).
+        match is scoped to that bot (see :meth:`_bot_scope_clause`). With
+        ``include_answered=True`` the answered_at filter is dropped, so a
+        caller can recognize a reply landing on an ALREADY-answered question
+        (check ``answered_at`` on the returned row) instead of treating it as
+        unrelated.
         """
         bot_clause, bot_params = self._bot_scope_clause(bot)
+        answered_clause = "" if include_answered else "answered_at IS NULL AND "
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_questions "
-                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "WHERE " + answered_clause + "timed_out = 0 "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +

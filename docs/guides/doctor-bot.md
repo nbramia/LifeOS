@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-06-26
+**Last Updated:** 2026-07-09
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -19,7 +19,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 
 1. **You report a problem**, e.g. _"the calendar tool returns last week's events when I ask for this week."_
 2. **Clarify the goal.** The doctor investigates the code and asks the minimum `[CLARIFY]` questions needed to pin down what "done" means. No work starts yet.
-3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** Reply **yes** to lock it (which arms the session's `/goal`), or send changes to refine it.
+3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** The goal arrives as one message that ends with the reply instructions; use Telegram's **Reply on that message** with **yes** to lock it (which arms the session's `/goal`), or with changes to refine it. Your reply is acked immediately ("Goal locked — starting work now"). A plain, non-threaded message starts a **new** repair instead of answering.
 4. **Execute.** On approval it files the issue(s) via `/draft-issue`, then ships — adaptive to size:
    - **Small goal:** one branch → `/implement` → one PR → `main`.
    - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
