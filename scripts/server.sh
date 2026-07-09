@@ -452,6 +452,9 @@ case "${1:-status}" in
     stop)
         if is_systemd_managed; then
             log_info "Delegating to systemd..."
+            # No unit cascade anymore (see lifeos-agent-worker.service) — stop
+            # the worker explicitly so "stop" still means everything down.
+            systemctl is-active --quiet lifeos-agent-worker && sctl stop lifeos-agent-worker
             sctl stop lifeos-api
         else
             stop_server

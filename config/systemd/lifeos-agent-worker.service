@@ -1,14 +1,15 @@
 [Unit]
 Description=LifeOS Agent Worker
 After=network.target lifeos-api.service
-# `Requires=` cascades a stop when lifeos-api stops; `BindsTo=` plus
-# `PartOf=` add the reverse — the worker restarts when lifeos-api
-# restarts, instead of just stopping and staying down. Without these
-# the post-commit hook (which restarts lifeos-api whenever api/ or
-# config/ files change) would leave the worker stopped indefinitely.
-Requires=lifeos-api.service
-BindsTo=lifeos-api.service
-PartOf=lifeos-api.service
+# Deliberately NO Requires=/BindsTo=/PartOf= on lifeos-api: the cascade made
+# EVERY api restart (post-commit hook, `server.sh restart`, manual systemctl)
+# SIGTERM the worker — killing every in-flight agent session, including the
+# doctor session whose own commit or deploy step triggered the restart
+# (three self-kills on 2026-07-09). The worker only polls the API over HTTP
+# and retries through outages, so it doesn't need to follow api restarts;
+# it restarts only when ITS code changes — auto-deploy restarts each active
+# unit explicitly, and the doctor uses `server.sh restart-worker-detached`.
+# `server.sh stop` stops the worker explicitly (no cascade to rely on).
 # StartLimit* belongs in [Unit] in modern systemd — putting it in
 # [Service] gets silently ignored. Circuit breaker: if the worker
 # crashes more than 5 times in 5 minutes, systemd backs off and the

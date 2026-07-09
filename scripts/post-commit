@@ -22,8 +22,9 @@ fi
 
 # A commit in a linked worktree doesn't change the code the services run —
 # they execute from the primary checkout — so a restart would be pure
-# disruption (it cascades to lifeos-agent-worker via `Requires=`, killing any
-# in-flight agent session, including the one that just made the commit).
+# disruption. (Historically it also cascaded to lifeos-agent-worker via
+# `Requires=`, killing the committing agent session; the cascade is gone,
+# but a pointless api restart is still churn worth skipping.)
 # Detect BEFORE cd'ing away from the hook's starting cwd; GIT_DIR is exported
 # to hooks, and --absolute-git-dir resolves it either way.
 IN_WORKTREE=""
@@ -48,8 +49,8 @@ if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
 fi
 
 # Restart the API server if api/ or config/ files changed. server.sh
-# restarts lifeos-api, which cascades to lifeos-agent-worker via
-# `Requires=lifeos-api.service` in its unit file.
+# restarts lifeos-api only — the agent worker deliberately does NOT follow
+# (see lifeos-agent-worker.service), so in-flight agent sessions survive.
 CHANGED_API=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
 
 if [ -n "$IN_WORKTREE" ]; then
