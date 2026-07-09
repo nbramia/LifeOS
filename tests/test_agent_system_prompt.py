@@ -119,3 +119,11 @@ def test_blank_persona_adds_no_block(tm):
     base = build_system_prompt()
     spaced = build_system_prompt(persona="   ")
     assert len(spaced) == len(base)
+
+
+def test_search_finances_prompt_advertises_investments(tm):
+    """The orchestrator prompt must list the 'investments' action so agents
+    prefer the portfolio snapshot over Monarch for net-worth questions (#447)."""
+    text = "\n".join(_text_blocks(build_system_prompt()))
+    assert "accounts/transactions/cashflow/budgets/investments" in text
+    assert "'investments'" in text
