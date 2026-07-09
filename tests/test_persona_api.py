@@ -686,4 +686,5 @@ def test_advisor_registered_in_bot_registry():
     assert advisor is not None, "advisor registered in telegram_bots.json"
     assert advisor["token_env"] == "TELEGRAM_ADVISOR_BOT_TOKEN"
     assert advisor["persona_file"] == "config/personas/advisor.md"
+    assert advisor["label"] == "Finance", "advisor displays as 'Finance' in the chat UI"
     assert not advisor.get("orchestrates"), "advisor is pure-chat, not an orchestrator"
