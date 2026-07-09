@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-07-09
 > **Audience:** Operators
 
 Reference for all LifeOS scripts with usage examples.
@@ -81,7 +81,7 @@ Run test suites.
 
 ### run_all_syncs.py
 
-Orchestrate all data sync operations.
+Orchestrate all data sync operations. On Linux the nightly run is driven by the `lifeos-sync.timer` systemd timer (installed by `setup-systemd.sh`) — not a raw crontab. Check its schedule with `systemctl list-timers lifeos-sync.timer`. On macOS the equivalent is the `com.lifeos.crm-sync` launchd agent. The commands below run it manually.
 
 ```bash
 # Check sync status
@@ -180,6 +180,11 @@ Example:
 | `chromadb-watchdog.sh` | ChromaDB health check and auto-restart |
 | `clear-caches.sh` | Clear embedding and search caches |
 | `network-watchdog.sh` | WiFi link health check and self-heal (re-activate → bounce radio → reload driver → restart NetworkManager) |
+| `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
+| `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
+| `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
+| `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format (and copy native Codex skills) into `~/.codex/skills/`. Re-run after editing source skills. |
+| `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
@@ -210,28 +215,49 @@ Manage system services (systemd on Linux, launchd on macOS).
 
 ### setup-systemd.sh
 
-Configure systemd services on Linux.
+Configure systemd services on Linux. Reads toggles from `.env`, substitutes templates from `config/systemd/`, then enables and starts the units. Re-run after changing any autostart toggle in `.env`.
 
 ```bash
 sudo ./scripts/setup-systemd.sh
 ```
 
-Creates and enables systemd units for the LifeOS API server and ChromaDB.
+Installs and enables:
+
+- **Services** — `lifeos-api`, `lifeos-chromadb`, `lifeos-llm` (local LLM; enabled only when `LIFEOS_LOCAL_LLM_AUTOSTART=true`), `lifeos-mcp-http` (enabled only when `LIFEOS_MCP_BEARER_TOKEN` is set), `lifeos-agent-worker` (enabled only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`).
+- **Timers** — `lifeos-watchdog`, `lifeos-server-watchdog`, `lifeos-gpu-watchdog`, `lifeos-network-watchdog`, `lifeos-sync` (nightly unified sync), and `lifeos-autodeploy` (enabled only when `LIFEOS_AUTODEPLOY_ENABLED=true`).
+- **Supporting config** — a logrotate rule (`/etc/logrotate.d/lifeos`), a passwordless-`systemctl` sudoers rule (`/etc/sudoers.d/lifeos`) so `server.sh` and the sync scripts can manage units without a password, and an 8 GB swap file as an OOM safety net (created only if no swap is already active).
 
 ---
 
 ### setup-launchd.sh
 
-Configure launchd services from templates (macOS only).
+Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
 
 ```bash
-./scripts/setup-launchd.sh
+./scripts/setup-launchd.sh                 # prompts for vault path
+./scripts/setup-launchd.sh ~/Notes --yes   # pass vault path, skip confirmation
 ```
 
-Interactive script that:
-1. Prompts for vault path
-2. Generates plist files from templates
-3. Installs to `~/Library/LaunchAgents/`
+---
+
+### setup-tailscale.sh
+
+Expose LifeOS on the tailnet HTTPS front (port 443) via `tailscale serve`, so `/chat` voice works (the mic needs a secure context). Reverse-proxies to the local API; whisper-relay stays on localhost. Reads `LIFEOS_PORT` / `TAILNET_HTTPS_URL` from the environment.
+
+```bash
+./scripts/setup-tailscale.sh
+```
+
+---
+
+### install-systemd-tailscale.sh
+
+Generate a `--user` systemd unit (`lifeos-tailscale.service`) that runs `setup-tailscale.sh` once the API is healthy, so the Tailscale Serve proxy survives reboot.
+
+```bash
+./scripts/install-systemd-tailscale.sh
+systemctl --user enable --now lifeos-tailscale.service
+```
 
 ---
 
