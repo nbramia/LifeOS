@@ -19,10 +19,10 @@
     "orchestrates": true
   },
   {
-    "name": "advisor",
+    "name": "finance",
     "label": "Finance",
-    "token_env": "TELEGRAM_ADVISOR_BOT_TOKEN",
-    "chat_id_env": "TELEGRAM_ADVISOR_CHAT_ID",
-    "persona_file": "config/personas/advisor.md"
+    "token_env": "TELEGRAM_FINANCE_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_FINANCE_CHAT_ID",
+    "persona_file": "config/personas/finance.md"
   }
 ]
