@@ -6,7 +6,7 @@ Supports both vector search (semantic) and metadata filtering.
 """
 import time
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -92,6 +92,26 @@ class SlackStatusResponse(BaseModel):
     connected: bool
     indexed_messages: int
     indexed_channels: int
+
+
+class SlackDayMessage(BaseModel):
+    """A single message from the day-pull endpoint."""
+    ts: str
+    timestamp: str
+    text: str
+    channel_id: str
+    channel_name: str
+    channel_type: str  # im, mpim, group (private channel), or channel
+    thread_ts: Optional[str] = None
+    permalink: Optional[str] = None
+
+
+class SlackMyMessagesResponse(BaseModel):
+    """Response for the day-pull endpoint."""
+    date: str
+    user_id: str
+    total: int
+    messages: list[SlackDayMessage]
 
 
 # Helper Functions
@@ -325,6 +345,124 @@ async def sync_slack(full: bool = False):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
+
+
+def _derive_channel_type(channel: dict) -> str:
+    """Map a search-result channel object to im/mpim/group/channel."""
+    if channel.get("is_im"):
+        return "im"
+    if channel.get("is_mpim"):
+        return "mpim"
+    if channel.get("is_private"):
+        return "group"
+    return "channel"
+
+
+def _thread_ts_from_permalink(permalink: Optional[str]) -> Optional[str]:
+    """Extract thread_ts from a message permalink, if present.
+
+    search.messages matches don't carry thread_ts directly; replies embed it
+    in the permalink query string.
+    """
+    if not permalink or "thread_ts=" not in permalink:
+        return None
+    try:
+        from urllib.parse import parse_qs, urlparse
+        values = parse_qs(urlparse(permalink).query).get("thread_ts")
+        return values[0] if values else None
+    except Exception:
+        return None
+
+
+@router.get("/my-messages", response_model=SlackMyMessagesResponse)
+async def get_my_messages_for_day(
+    date: str = Query(..., description="Day to pull, YYYY-MM-DD"),
+    user: Optional[str] = Query(
+        None,
+        description="Slack user ID to pull messages for (defaults to the token owner)",
+    ),
+):
+    """
+    **Pull every Slack message the user sent on a given day** — across DMs,
+    group DMs, and public and private channels, including thread replies.
+
+    Uses Slack's search.messages API (`from:<@user> on:<date>`) as an exact,
+    on-demand source-of-truth query — unlike /search, this does not depend on
+    the sync index. Results are sorted chronologically.
+
+    Use this for:
+    - "What did I send on Slack yesterday?"
+    - "Show me everything I told people on 2026-07-08"
+    - Reconstructing a day's activity or writing a daily summary
+
+    Notes:
+    - Day boundaries follow the searching user's Slack timezone setting,
+      not UTC.
+    - Requires the `search:read` user-token scope (403 with instructions
+      if missing).
+    """
+    _require_slack_enabled()
+
+    # Validate date format
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date — expected YYYY-MM-DD",
+        )
+
+    client = get_slack_client()
+
+    try:
+        user_id = user or client.auth_test().get("user_id")
+        if not user_id:
+            raise HTTPException(
+                status_code=502,
+                detail="Could not resolve the token owner via auth.test",
+            )
+
+        matches = client.search_messages(query=f"from:<@{user_id}> on:{date}")
+    except SlackAPIError as e:
+        error = str(e)
+        if error in ("missing_scope", "not_allowed_token_type"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Slack token lacks the search:read user scope. Add "
+                    "search:read under User Token Scopes at api.slack.com/apps "
+                    "and reinstall the app, then update SLACK_USER_TOKEN if it "
+                    "was reissued."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"Slack API error: {e}")
+
+    messages = []
+    for m in matches:
+        channel = m.get("channel") or {}
+        permalink = m.get("permalink")
+        ts = m.get("ts", "")
+        try:
+            iso = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            iso = ""
+        messages.append(SlackDayMessage(
+            ts=ts,
+            timestamp=iso,
+            text=m.get("text", ""),
+            channel_id=channel.get("id", ""),
+            channel_name=channel.get("name", ""),
+            channel_type=_derive_channel_type(channel),
+            thread_ts=_thread_ts_from_permalink(permalink),
+            permalink=permalink,
+        ))
+
+    return SlackMyMessagesResponse(
+        date=date,
+        user_id=user_id,
+        total=len(messages),
+        messages=messages,
+    )
 
 
 @router.get("/channels/{channel_id}/messages")

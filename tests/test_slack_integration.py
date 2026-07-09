@@ -473,3 +473,86 @@ class TestGetThreadReplies:
         messages = client.get_all_channel_history("C123")
 
         assert messages[0].latest_reply == "1700009999.000500"
+
+
+@patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
+class TestSearchMessages:
+    """Issue #441: search.messages client — page-number pagination, GET form."""
+
+    def _client_with_pages(self, pages):
+        from api.services.slack_integration import SlackClient
+
+        store = MagicMock()
+        store.get_token.return_value = "xoxp-test-fake-token"
+        client = SlackClient(token_store=store)
+
+        responses = []
+        for page in pages:
+            r = MagicMock()
+            r.json.return_value = page
+            responses.append(r)
+        http = MagicMock()
+        http.get.side_effect = responses
+        client._http_client = http
+        return client, http
+
+    def _page(self, texts, page, pages):
+        return {
+            "ok": True,
+            "messages": {
+                "matches": [
+                    {"type": "message", "ts": f"175198000{i}.00010{i}",
+                     "text": t, "user": "U1",
+                     "channel": {"id": "C1", "name": "general"}}
+                    for i, t in enumerate(texts)
+                ],
+                "paging": {"count": 100, "total": len(texts), "page": page, "pages": pages},
+            },
+        }
+
+    def test_single_page(self):
+        client, http = self._client_with_pages([self._page(["msg one"], 1, 1)])
+
+        matches = client.search_messages(query="from:<@U1> on:2026-07-08")
+
+        assert [m["text"] for m in matches] == ["msg one"]
+        url = http.get.call_args.args[0]
+        assert url.endswith("/search.messages")
+        params = http.get.call_args.kwargs["params"]
+        assert params["query"] == "from:<@U1> on:2026-07-08"
+
+    def test_paginates_all_pages(self):
+        client, http = self._client_with_pages([
+            self._page(["page1 msg"], 1, 2),
+            self._page(["page2 msg"], 2, 2),
+        ])
+
+        matches = client.search_messages(query="q")
+
+        assert [m["text"] for m in matches] == ["page1 msg", "page2 msg"]
+        assert http.get.call_count == 2
+        assert http.get.call_args_list[1].kwargs["params"]["page"] == 2
+
+    def test_api_error_raises(self):
+        from api.services.slack_integration import SlackAPIError
+
+        client, _ = self._client_with_pages([{"ok": False, "error": "missing_scope"}])
+
+        with pytest.raises(SlackAPIError, match="missing_scope"):
+            client.search_messages(query="q")
+
+    def test_auth_test_returns_identity(self):
+        client, http = self._client_with_pages([])
+        client._api_call = MagicMock(return_value={
+            "ok": True, "user_id": "U08GTEST001", "user": "testuser",
+        })
+
+        identity = client.auth_test()
+
+        assert identity["user_id"] == "U08GTEST001"
+        client._api_call.assert_called_once_with("auth.test", "default")
+
+    def test_search_read_scope_declared(self):
+        from api.services.slack_integration import SLACK_SCOPES
+
+        assert "search:read" in SLACK_SCOPES
