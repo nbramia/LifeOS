@@ -528,6 +528,29 @@ class Worker:
                 )
                 recovered += 1
                 continue
+            # #198: a remote Managed Agents session survives a worker restart —
+            # it keeps running on Anthropic's infrastructure, making MCP tool
+            # calls with real side effects (task creation, vault writes, sends)
+            # long after this rollback tells the operator the task was rolled
+            # back. Kill it before finalizing. Best-effort: a kill failure
+            # (404, network) must not block the rollback.
+            if session.managed_agent_session_id:
+                managed = self._get_managed_executor()
+                if managed is not None and managed.driver is not None:
+                    try:
+                        managed.driver.kill_session(
+                            session.managed_agent_session_id,
+                            reason="worker_restart_rollback",
+                        )
+                        self.transcript_store.append(
+                            sid, "orphan_remote_session_killed", {
+                                "managed_agent_session_id": session.managed_agent_session_id,
+                            })
+                    except Exception as exc:
+                        logger.warning(
+                            "kill_session %s on restart rollback failed: %s",
+                            session.managed_agent_session_id, exc,
+                        )
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             # Spawned children belong to a parent's lineage — they have no

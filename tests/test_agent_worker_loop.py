@@ -883,6 +883,79 @@ def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
 
 
 @pytest.mark.unit
+class _FakeManagedDriver:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.kills: list[tuple[str, str]] = []
+
+    def kill_session(self, session_id: str, reason: str = "") -> None:
+        if self.fail:
+            raise RuntimeError("remote kill 404")
+        self.kills.append((session_id, reason))
+
+
+class _FakeManagedExecutor:
+    def __init__(self, fail: bool = False):
+        self.driver = _FakeManagedDriver(fail=fail)
+
+
+def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
+    """#198: rolling back a session with a live remote Managed Agents session
+    must kill the remote session — otherwise it keeps running on Anthropic's
+    infrastructure, making MCP tool calls with side effects long after the
+    operator was told the task was rolled back."""
+    from api.services.agent_worker.session_store import STATUS_FAILED, STATUS_RUNNING
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "cloud task", "status": "in_progress",
+         "tags": [RUNNING_TAG, "cloud"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=executor)
+    fake_managed = _FakeManagedExecutor()
+    w._managed_executor = fake_managed
+    w.session_store.create(
+        task_id="t1", routing="claude", status=STATUS_RUNNING, expected_output="text",
+    )
+    w.session_store.set_managed_session_id("t1", "sesn_remote_orphan")
+
+    n = w.resume_pending()
+
+    assert n == 1
+    assert fake_managed.driver.kills == [("sesn_remote_orphan", "worker_restart_rollback")]
+    assert w.session_store.get("t1").status == STATUS_FAILED
+    sid = w.session_store.get("t1").session_id
+    kinds = [e["kind"] for e in w.transcript_store.read(sid)]
+    assert "orphan_remote_session_killed" in kinds
+
+
+def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
+    """#198: a kill failure (remote 404, network error) must not block the
+    local rollback — the session still finalizes FAILED."""
+    from api.services.agent_worker.session_store import STATUS_FAILED, STATUS_RUNNING
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "cloud task", "status": "in_progress",
+         "tags": [RUNNING_TAG, "cloud"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=executor)
+    w._managed_executor = _FakeManagedExecutor(fail=True)
+    w.session_store.create(
+        task_id="t1", routing="claude", status=STATUS_RUNNING, expected_output="text",
+    )
+    w.session_store.set_managed_session_id("t1", "sesn_remote_orphan")
+
+    n = w.resume_pending()
+
+    assert n == 1
+    assert w.session_store.get("t1").status == STATUS_FAILED
+
+
 def test_resume_pending_does_not_telegram_for_spawned_children(tmp_path: Path):
     """Live bug: after a worker restart, the startup-recovery path saw a
     spawned child stuck in RUNNING, rolled it back, and pinged the
