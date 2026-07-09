@@ -6,6 +6,7 @@ health check APIs. Sources must sync at least daily or be flagged as stale.
 """
 import sqlite3
 import logging
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -566,6 +567,43 @@ def record_sync_error(
     conn.commit()
     conn.close()
     logger.error(f"Recorded sync error for {source}: {error_message}")
+
+
+def get_typical_duration_seconds(
+    source: str,
+    n: int = 5,
+    min_duration_seconds: float = 2.0,
+) -> Optional[float]:
+    """Median duration of the last ``n`` eligible successful runs for ``source``.
+
+    Used by run_all_syncs to detect duration collapse: a sync that historically
+    takes minutes suddenly completing in a fraction of a second is the
+    signature of a silent no-op (e.g. credentials missing from the child env —
+    issue #438). Runs shorter than ``min_duration_seconds`` are excluded from
+    the history because they are exactly the pathology being hunted; letting
+    them into the median would make consecutive silent no-ops look "typical"
+    after a few days.
+
+    Returns None when there is no eligible history.
+    """
+    conn = get_sync_health_db()
+    rows = conn.execute(
+        """
+        SELECT duration_seconds FROM sync_runs
+        WHERE source = ?
+          AND status = ?
+          AND duration_seconds IS NOT NULL
+          AND duration_seconds >= ?
+        ORDER BY started_at DESC
+        LIMIT ?
+        """,
+        (source, SyncStatus.SUCCESS.value, min_duration_seconds, n),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return None
+    return float(statistics.median(row["duration_seconds"] for row in rows))
 
 
 def get_sync_health(source: str) -> SyncHealth:

@@ -566,3 +566,82 @@ class TestSyncHealthDailyCheck:
             else:
                 assert config["frequency"] in ["daily", "hourly"], \
                     f"Source {source} must sync at least daily, not {config['frequency']}"
+
+
+class TestTypicalDuration:
+    """Tests for get_typical_duration_seconds (duration-collapse detection)."""
+
+    def _insert_run(self, source, status, duration, started_at):
+        conn = get_sync_health_db()
+        conn.execute(
+            """
+            INSERT INTO sync_runs (source, status, started_at, completed_at, duration_seconds)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source, status, started_at.isoformat(), started_at.isoformat(), duration),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_median_of_recent_successful_runs(self, temp_db):
+        """Returns the median duration of recent successful runs."""
+        from api.services.sync_health import get_typical_duration_seconds
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            for i, duration in enumerate([400.0, 450.0, 500.0]):
+                self._insert_run("slack", "success", duration, base - timedelta(days=i))
+
+            assert get_typical_duration_seconds("slack") == 450.0
+
+    def test_ignores_failed_runs(self, temp_db):
+        """Failed runs don't contribute to the typical duration."""
+        from api.services.sync_health import get_typical_duration_seconds
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            self._insert_run("slack", "success", 400.0, base - timedelta(days=2))
+            self._insert_run("slack", "failed", 3.0, base - timedelta(days=1))
+
+            assert get_typical_duration_seconds("slack") == 400.0
+
+    def test_ignores_collapsed_durations(self, temp_db):
+        """Sub-threshold 'successes' (the silent no-ops we're hunting) don't
+        poison the typical duration."""
+        from api.services.sync_health import get_typical_duration_seconds
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            # 5 recent broken runs (silent no-ops) after 2 real ones
+            for i in range(5):
+                self._insert_run("slack", "success", 0.28, base - timedelta(days=i))
+            self._insert_run("slack", "success", 420.0, base - timedelta(days=6))
+            self._insert_run("slack", "success", 480.0, base - timedelta(days=7))
+
+            assert get_typical_duration_seconds("slack") == 450.0
+
+    def test_returns_none_without_history(self, temp_db):
+        """Returns None when the source has no eligible successful runs."""
+        from api.services.sync_health import get_typical_duration_seconds
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert get_typical_duration_seconds("slack") is None
+
+            base = datetime.now(timezone.utc)
+            self._insert_run("slack", "failed", 300.0, base)
+            assert get_typical_duration_seconds("slack") is None
+
+    def test_only_considers_last_n_runs(self, temp_db):
+        """Old history beyond the window doesn't affect the median."""
+        from api.services.sync_health import get_typical_duration_seconds
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            # 5 recent fast-but-legitimate runs (> collapse floor)
+            for i in range(5):
+                self._insert_run("gmail", "success", 100.0, base - timedelta(days=i))
+            # Ancient slow runs outside the window
+            for i in range(5, 10):
+                self._insert_run("gmail", "success", 5000.0, base - timedelta(days=i))
+
+            assert get_typical_duration_seconds("gmail", n=5) == 100.0

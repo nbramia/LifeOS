@@ -13,8 +13,11 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# override=True: the .env file deterministically wins over inherited env vars.
+# A present-but-empty inherited SLACK_USER_TOKEN would otherwise shadow the
+# file value and silently disable the sync — issue #438.
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 import argparse
 import logging
@@ -99,10 +102,24 @@ def run_slack_sync(full: bool = False, dry_run: bool = True) -> dict:
     return results
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser(description='Sync Slack data to LifeOS')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
     parser.add_argument('--full', action='store_true', help='Run full sync (default: incremental)')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    run_slack_sync(full=args.full, dry_run=not args.execute)
+    results = run_slack_sync(full=args.full, dry_run=not args.execute)
+
+    # A skipped sync (e.g. SLACK_USER_TOKEN missing/empty) must exit nonzero
+    # so run_all_syncs records FAILED and alerts, instead of the silent
+    # success-with-zeros that hid the July 2026 outage — issue #438.
+    if results.get("status") == "skipped":
+        logger.error(
+            f"Slack sync skipped ({results.get('reason', 'unknown')}) — "
+            f"exiting nonzero so the orchestrator records a failure"
+        )
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()
