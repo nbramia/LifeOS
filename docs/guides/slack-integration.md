@@ -1,7 +1,7 @@
 # Slack Integration
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 > **Audience:** Operators
 
 Setup guide for Slack message search and sync.
@@ -71,9 +71,14 @@ curl -H "Authorization: Bearer xoxp-your-token" \
 Add to your `.env`:
 
 ```bash
+LIFEOS_SYNC_SLACK=true
 SLACK_USER_TOKEN=xoxp-your-user-oauth-token
 SLACK_TEAM_ID=T02XXXXX
 ```
+
+**`LIFEOS_SYNC_SLACK=true` is required for the nightly sync.** Setting `SLACK_USER_TOKEN` alone does *not* enable Slack in the nightly unified sync — the `LIFEOS_SYNC_SLACK` toggle defaults to `false` (work data is opt-in), so without it the nightly run skips Slack entirely. You can still run `sync_slack.py` manually with just the token, but scheduled sync stays off.
+
+**Alternative: full OAuth app flow.** Instead of pasting a static `SLACK_USER_TOKEN`, you can wire up the OAuth app flow with `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_REDIRECT_URI` — see the Slack section of [configuration.md](configuration.md#slack) for those variables.
 
 ---
 

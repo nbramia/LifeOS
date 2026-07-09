@@ -1,18 +1,23 @@
 # First Run Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 > **Audience:** New users
 
 Post-installation guide for your first use of LifeOS.
+
+This guide covers the **minimal path** — indexing your vault and confirming search and
+chat work. The optional integrations (Google, Slack, Monarch, Telegram, Apple Data
+Agent, local LLM, voice, agent worker) that populate CRM and relationship features are
+described in [Installation → Start Here](installation.md#start-here-minimal-vs-full-setup).
 
 ---
 
 ## Prerequisites
 
 Before continuing, ensure you have:
-- [x] Completed [Installation](INSTALLATION.md)
-- [x] Configured [Environment](CONFIGURATION.md)
+- [x] Completed [Installation](installation.md)
+- [x] Configured [Environment](configuration.md)
 - [x] Server running: `./scripts/server.sh status`
 - [x] ChromaDB running: `./scripts/chromadb.sh status`
 
@@ -118,8 +123,8 @@ This enables relationship tracking, communication gap analysis, and other CRM fe
 If using Claude Code, add LifeOS as an MCP server:
 
 ```bash
-# Add MCP server
-claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
+# Add MCP server (point at your LifeOS checkout)
+claude mcp add lifeos -s user -- ~/.venvs/lifeos/bin/python ~/LifeOS/mcp_server.py
 ```
 
 Verify tools are available:
@@ -146,7 +151,7 @@ For production use, configure system services for:
 - Nightly data sync at 3 AM
 
 - **Linux**: `sudo ./scripts/setup-systemd.sh`
-- **macOS**: See [Launchd Setup Guide](../guides/LAUNCHD-SETUP.md)
+- **macOS**: See [Launchd Setup Guide](launchd-setup.md)
 
 ---
 
@@ -157,7 +162,7 @@ Run this checklist to ensure everything is working:
 | Check | Command | Expected |
 |-------|---------|----------|
 | Server health | `curl localhost:8000/health/full \| jq` | All services "healthy" |
-| ChromaDB | `curl localhost:8001/api/v1/heartbeat` | `{"nanosecond heartbeat":...}` |
+| ChromaDB | `curl localhost:8001/api/v2/heartbeat` | `{"nanosecond heartbeat":...}` |
 | Local LLM (only if `LIFEOS_LLM_BACKEND=local`) | `curl $LIFEOS_LOCAL_LLM_URL/v1/models \| jq` | Lists the loaded model |
 | Search works | Search via UI | Returns results |
 | Index populated | `curl localhost:8000/api/search -d '{"query":"test"}'` | Non-empty results |
@@ -169,12 +174,12 @@ Run this checklist to ensure everything is working:
 ## Next Steps
 
 1. **Configure integrations**:
-   - [Google OAuth](../guides/GOOGLE-OAUTH.md) for Calendar/Gmail/Drive
-   - [Slack Integration](../guides/SLACK-INTEGRATION.md) for Slack messages
+   - [Google OAuth](google-oauth.md) for Calendar/Gmail/Drive
+   - [Slack Integration](slack-integration.md) for Slack messages
 
 2. **Set up services**:
    - Linux: `sudo ./scripts/setup-systemd.sh`
-   - macOS: [Launchd Setup](../guides/LAUNCHD-SETUP.md) for auto-start
+   - macOS: [Launchd Setup](launchd-setup.md) for auto-start
 
 3. **Learn the API**:
    - [API Reference](../specs/product/api-reference.md)

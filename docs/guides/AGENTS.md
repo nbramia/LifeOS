@@ -8,6 +8,9 @@ This directory contains operational guides — how to set up, configure, and run
 - `configuration.md` — Environment variables and settings reference
 - `google-oauth.md` — Google OAuth setup for Gmail and Calendar
 - `slack-integration.md` — Slack workspace integration
+- `telegram-setup.md` — Telegram bots: primary + persona bots, commands, quoted-reply threading
+- `voice-setup.md` — Voice mode (whisper-relay) inside web `/chat`
+- `personas.md` — Personas: what they are, the built-ins, and creating your own
 - `launchd-setup.md` — macOS launchd service configuration
 - `scheduler.md` — Scheduler (triggers + actions): cron/one-off, notify/prompt/endpoint/agent
 - `scripts.md` — Available scripts and their usage

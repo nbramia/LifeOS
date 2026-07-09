@@ -2,49 +2,100 @@
 
 **Your personal operating system, built from the digital exhaust of your life.**
 
-LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, iMessage, WhatsApp, Slack, Obsidian vault, Granola meeting transcriptions, Google Docs, iPhotos, LinkedIn, and Apple contacts — then makes all of it **available and actionable through natural language.**
+LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, Google Docs/Sheets/Drive, iMessage, phone calls, WhatsApp, Slack, Obsidian vault, Granola meeting transcripts, iPhotos, LinkedIn, Apple contacts, Monarch finances, and Apple Health — then makes all of it **available and actionable through natural language.**
 
-LifeOS is also able to take action in response to requests you send through Telegram: not just creating tasks and reminders, but reading/editing files on your computer and autonomously managing Claude Code to accomplish discrete tasks.
+You can talk to it by text or **voice**, through a web chat, through Telegram, or through any MCP client (Claude Desktop, Claude Code). It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't.
 
-All of your data is indexed and stored locally — your vault, messages, photos, financial summaries, and the like never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic; set `LIFEOS_LLM_BACKEND=local` to route everything through a local llama-server instead. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your knowledge graph fresh.
+All of your data is indexed and stored **locally** — your vault, messages, photos, financial summaries, and health data never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic; set `LIFEOS_LLM_BACKEND=local` to route everything through a local llama-server and keep inference on your own hardware too. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your relationship graph fresh.
+
+> **New here?** Jump to [Quick Start](#quick-start), or the [Installation Guide](docs/guides/installation.md) for the full walkthrough (including a minimal "just an API key and a vault" path).
 
 ---
 
 ## What You Can Do
 
-**Ask questions about your life – search across all the channels you use**:
-- Interface with it conversationally through Telegram, or a dedicated chat UI, or by using Claude Desktop / Claude Code to leverage the MCP tools directly
-- "When did I last talk to Mom?" / "What's the context for my meeting with Acme Corp tomorrow?" and get quick answers and briefs
-- "What were the key recommendations Sarah made on the Acme project last month?" will synthesize and answer from hybrid semantic + keyword search across notes, emails, messages, calendar, and more
-- "What should I get Jane for her birthday" will pull context from up to 10 years of data to generate ideas tailored to her
+### Ask questions about your life
 
-**Manage and complete tasks**
-- "Remind me to follow up with John next Tuesday" creates a reminder (pushed to you through Telegram)
-- "Tomorrow at 3pm, check that the sync completed as expected and shoot me a note to confirm it did" schedules a task and a push notification
-- "Next Wednesday I need to pull down my 1099 from Schwab" creates a task in your task management system
-- "I just saw an error in the sync, can you investigate and get it fixed?" will spin up and manage Claude Code to get things working again
-- "Add an idea to that backlog markdown file in the X project folder - I want the system to be able to do Y" will find and directly edit the right file
+Search and synthesize across every channel you use — notes, emails, messages, calendar, docs, photos, finances — from one prompt:
 
-**Proactive intelligence** — the system doesn't just wait for you to ask:
-- Before meetings, it checks your calendar and pushes a prep briefing with attendee context from your CRM
+- *"When did I last talk to Mom?"* / *"What's the context for my meeting with Acme Corp tomorrow?"* → quick answers and briefs
+- *"What were the key recommendations Sarah made on the Acme project last month?"* → synthesized from hybrid semantic + keyword search across sources
+- *"What should I get Jane for her birthday?"* → pulls context from years of history to generate tailored ideas
+
+It also answers general-knowledge and web questions directly, and routes intelligently between your personal data, the web, and a stronger model when a query needs one.
+
+### Talk to it your way
+
+The same assistant, the same tools, on whichever surface fits the moment — all sharing one stable [client contract](docs/specs/technical/client-surfaces.md):
+
+- **Web chat** at `/chat` — text or **voice**, with a persona picker and a per-turn model picker. See [Chat UI](docs/specs/product/chat-ui.md).
+- **Voice** — tap to talk inside `/chat`, hear the reply. Same personas, models, and conversations as text. Setup: [Voice Guide](docs/guides/voice-setup.md).
+- **Telegram** — a conversational bot plus proactive notifications, with specialized bots for specific personas. Setup: [Telegram Guide](docs/guides/telegram-setup.md).
+- **MCP** — drive LifeOS's tools directly from Claude Desktop or Claude Code. See [MCP Tools](docs/specs/product/mcp-tools.md).
+
+### Meet your assistants (personas)
+
+LifeOS ships several selectable **personas** — one assistant, different personalities and scopes. All keep the full tool suite; they differ in tone, what they draw on, and how they respond:
+
+- **primary** — general-purpose default: concise, proactive.
+- **therapist** — advice-oriented; draws on your own reflections and inner-circle context, with strict privacy rules.
+- **fitness** — a log-first trainer (see [Health & fitness](#health--fitness)).
+- **doctor** — repairs LifeOS itself (see [Self-repair](#self-repair-the-doctor-bot)).
+
+Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave identically. Create your own with a markdown file. See the [Personas Guide](docs/guides/personas.md).
+
+### Manage tasks, reminders, and schedules
+
+- *"Remind me to follow up with John next Tuesday"* → a reminder, delivered on Telegram
+- *"Next Wednesday I need to pull down my 1099 from Schwab"* → a task in your [task system](docs/specs/product/task-management.md) (Obsidian-backed)
+- *"Every weekday at 9am, brief me on my calendar"* → a recurring **schedule**
+
+Schedules go beyond reminders: a trigger (cron or one-off) fires an action — **notify** (a fixed message), **prompt** (run an LLM prompt and send the result), **endpoint** (call an internal API and send the result), or **agent** (hand the work to the autonomous agent). Empty results stay silent, so high-frequency checks don't become noise. See the [Scheduler Guide](docs/guides/scheduler.md).
+
+### Proactive intelligence
+
+The system doesn't just wait for you to ask — and stays quiet when there's nothing to say:
+
+- Before meetings, it pushes a prep briefing with attendee context from your CRM
 - Each morning, it summarizes your day: calendar, tasks, important emails
-- Weekly, it reviews who you haven't been in touch with and nudges you
-- If there's nothing to report, it stays quiet — no noise
+- Weekly, it flags people you've fallen out of touch with and nudges you
 
-**Track relationships**:
-- Visualize and explore your relationships with each person in your life through a CRM UI
-- Track and analyze your relationships with those closest to you, like family and a designated partner
-- Ask "Who am I engaging with less than I used to? Who should I reconnect with?" and see interaction history, communication patterns, and relationship strength over time
+These are seedable [schedule](docs/guides/scheduler.md) entries — you can edit, extend, or add your own.
 
-The assistant also remembers context you share with it across conversations — preferences, facts about people, things you've told it — and uses that context to give better answers over time.
+### Track relationships
 
-You can also interface with it for general queries in the same way you'd interact with any AI model, and it'll intelligently route the query to Opus, Google, your personal data, etc.
+Turn years of interaction history across thousands of contacts into insight — browse it in the [CRM UI](docs/specs/product/crm-ui.md):
+
+- A ranked, searchable directory; per-person pages with contacts, sources, stats, and extracted facts; a [chronological timeline](docs/specs/product/crm-interactions.md) across all sources; and a force-directed [relationship graph](docs/specs/product/crm-graph.md).
+- [Analytics dashboards](docs/specs/product/crm-analytics.md) — **Family**, **Me** (network health), **Birthdays**, and a **Relationship** dashboard for a designated partner.
+- *"Who am I engaging with less than I used to? Who should I reconnect with?"* → interaction history, communication patterns, and relationship strength over time.
+
+### Health & fitness
+
+Log workouts in plain text and get trainer-grade guidance:
+
+- *"bench 135x8, then 5x5 squats @185"* → parsed and recorded (optionally mirrored to a Google Sheet for phone viewing)
+- *"what should I train today?"* → a recommendation informed by recent volume and recovery signals (sleep, resting HR, HRV, body weight) from [Apple Health](docs/guides/apple-health.md)
+
+### Finances
+
+Ask about your money, backed by Monarch:
+
+- *"How much did I spend on restaurants last month?"* / *"Am I over budget on groceries?"* / *"What are my current investment holdings?"* → accounts, transactions, cashflow, budgets, and holdings.
+
+### Remembers what matters
+
+Tell it a fact or preference once — *"remember Jonathan goes by Jon"* — and it recalls it in future conversations, via the same hybrid semantic + keyword recall it uses for everything else.
+
+### Safe by default
+
+Email always **drafts first** and requires an explicit, separate confirmation before anything sends — on every surface.
 
 ---
 
-## Hand Off Tasks to an Autonomous Agent
+## Hand off tasks to an autonomous agent
 
-LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them end-to-end while you're doing something else. Add a line to your task list and walk away — the agent runs it, completes it, marks the task done in your vault, and pings you on Telegram with the result.
+LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them end-to-end while you do something else. Add a line to your task list and walk away — the agent runs it, marks the task done in your vault, and pings you on Telegram with the result and cost.
 
 ```
 - [ ] TODO Summarize my unread emails from the partnership channel and reply with the top 3 by importance #agent
@@ -52,17 +103,22 @@ LifeOS includes an external **agent worker** that picks up tasks you've tagged `
 - [ ] TODO Draft a follow-up to last week's intro with Acme. Budget $0.25 #agent
 ```
 
-What you get:
-
 - **Hands-free completion.** Tag a task and forget it. Telegram tells you when it's done, what it did, and what it cost.
-- **Choose your model.** `#local` routes to your self-hosted Gemma — free, private, fast on workstation-class GPUs. `#cloud` routes to Anthropic's Claude on Managed Agents — slower per-token but pairs with Gmail / Calendar / Drive / Slack / Asana / Ramp connectors out of the box. No tag and the agent infers from the title: tasks that obviously need cloud connectors ("draft an email", "check my calendar") route to Claude; everything else can run locally.
-- **Budgets you can put in the title.** "max $0.50", "5 min", "10k tokens" — parsed in natural language by a tiny preflight pass. Daily and per-task caps enforced from outside the agent loop, so the model can't override them. There's a global daily $-ceiling backstop.
-- **Asks for help when stuck.** Genuinely ambiguous tasks ("reply to Alex") get pushed to Telegram with one targeted question. Reply with Telegram's reply feature and the agent resumes. If you don't answer within 72 hours (configurable), the task is parked and you get a heads-up.
-- **Spawns its own teammates.** Agents can spawn child sessions (`lifeos_agent_spawn`), message them, and yield until they finish — preferred over polling, because yielding ends the session cleanly (no idle billing on cloud) and resumes automatically when children complete. Useful for fan-out research, multi-step pipelines, "go do X and Y in parallel" workflows.
-- **Full audit trail.** Every tool call, every model turn, every cost delta lands in `data/agent_transcripts/<session_id>.jsonl`. Telegram completion summaries point at it if anything looks off.
-- **Restart-safe.** The worker is signal-clean. Crash mid-task and the next start rolls non-terminal sessions back to `#agent` for retry, or resumes any cloud sessions that are still running on Anthropic's side.
+- **Choose your engine.** `#local` runs on your self-hosted Gemma — free, private, fast on workstation-class GPUs. `#cloud` runs on Anthropic's [Managed Agents](docs/specs/product/agent-worker.md) with Gmail / Calendar / Drive / Slack / Asana / Ramp connectors out of the box. `#claude` and `#codex` hand off to those CLI engines. No tag, and the agent infers from the title.
+- **Budgets in the title.** *"max $0.50"*, *"5 min"*, *"10k tokens"* — parsed in natural language. Daily and per-task caps are enforced from outside the agent loop, with a global daily $-ceiling backstop.
+- **Asks when genuinely stuck.** An ambiguous task gets one targeted Telegram question; reply and the agent resumes. No answer within 72 hours (configurable) and the task is parked with a heads-up.
+- **Spawns its own teammates.** Agents can spawn child sessions, message them, and yield until they finish — good for fan-out research and parallel pipelines.
+- **Fully audited and restart-safe.** Every tool call, model turn, and cost delta is captured; a crash mid-task rolls back to `#agent` for retry (or resumes a still-running cloud session).
+
+You can also run terminal, filesystem, and code tasks through **Claude Code** or **Codex** — via `/claude` / `/codex` on Telegram, "use claude code" in chat, or the `/chat` model picker (see [Claude Code / Codex orchestration](docs/specs/product/claude-code-orchestration.md)). Watch every running session — local, cloud, and CLI — on the live [`/agents`](docs/specs/product/agent-viz.md) page.
 
 Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference: [Product](docs/specs/product/agent-worker.md) · [Technical](docs/specs/technical/agent-worker.md).
+
+---
+
+## Self-repair: the doctor bot
+
+When LifeOS itself misbehaves or is missing a capability, you don't file a bug — you tell the **doctor bot**. It talks through the goal with you, gets your one approval, then autonomously files a GitHub issue, ships a tested pull request (branch → review → merge), verifies the deploy landed, and reports back with a one-line revert handle if you want to undo it. See the [Doctor Bot Guide](docs/guides/doctor-bot.md).
 
 ---
 
@@ -71,11 +127,10 @@ Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference:
 | Getting Started | Guides | Reference |
 |-----------------|--------|-----------|
 | [Installation](docs/guides/installation.md) | [Google OAuth](docs/guides/google-oauth.md) | [API Reference](docs/specs/product/api-reference.md) |
-| [Configuration](docs/guides/configuration.md) | [Slack Integration](docs/guides/slack-integration.md) | [Scripts](docs/guides/scripts.md) |
-| [First Run](docs/guides/first-run.md) | [Task Management](docs/specs/product/task-management.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
-|  | [Scheduler](docs/guides/scheduler.md) | [Agent Worker](docs/specs/product/agent-worker.md) |
-|  | [Launchd Setup](docs/guides/launchd-setup.md) (macOS) | |
-|  | [Agent Worker Setup](docs/guides/agent-worker-setup.md) | |
+| [Configuration](docs/guides/configuration.md) | [Telegram](docs/guides/telegram-setup.md) · [Voice](docs/guides/voice-setup.md) | [MCP Tools](docs/specs/product/mcp-tools.md) |
+| [First Run](docs/guides/first-run.md) | [Personas](docs/guides/personas.md) · [Scheduler](docs/guides/scheduler.md) | [Task Management](docs/specs/product/task-management.md) |
+| | [Agent Worker Setup](docs/guides/agent-worker-setup.md) · [Doctor Bot](docs/guides/doctor-bot.md) | [Agent Worker](docs/specs/product/agent-worker.md) |
+| | [Apple Health](docs/guides/apple-health.md) · [Slack](docs/guides/slack-integration.md) | [Troubleshooting](docs/guides/troubleshooting.md) |
 
 ---
 
@@ -83,36 +138,39 @@ Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference:
 
 - **Linux** (primary) or **macOS**
 - **Python 3.11+**
-- **GPU recommended** for local LLM and embedding model (AMD ROCm or NVIDIA CUDA)
-- Obsidian vault (or other markdown notes)
+- **ChromaDB** (installed via `pip`; the only hard external service)
+- An **Obsidian vault** (or any folder of markdown notes)
+- **A Claude API key** on the default backend — *or* a **GPU** (AMD ROCm / NVIDIA CUDA) to run everything locally
 
-macOS is only required if you want native Apple integrations (iMessage, Contacts, Photos). A Mac can also act as an Apple Data Agent satellite, exporting Apple data nightly to a Linux server.
+macOS is only required for native Apple integrations (iMessage, calls, Contacts, Photos). A Mac can also act as an [Apple Data Agent](docs/guides/operations.md) satellite, exporting Apple data nightly to a Linux host.
 
-### LLM Options
+### LLM options
 
-Orchestration and synthesis can run against the Claude API (default) or a local OpenAI-compatible llama-server. Pick what matches your hardware and privacy posture:
+Orchestration and synthesis run against the Claude API (default) or a local OpenAI-compatible llama-server. Pick what matches your hardware and privacy posture:
 
 | Hardware / preference | Config | Notes |
 |----------------------|--------|-------|
-| No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model: `claude-haiku-4-5`. Override via `LIFEOS_ANTHROPIC_MODEL`. Query text + retrieved context is sent to Anthropic. |
-| 8 GB RAM | `LIFEOS_LLM_BACKEND=local` + small llama-server model (~7B params) | Set `LIFEOS_LOCAL_LLM_URL` if not on localhost:8080. |
-| 16–32 GB RAM | `LIFEOS_LLM_BACKEND=local` + medium model (~14–32B params) | |
-| 64 GB+ VRAM | `LIFEOS_LLM_BACKEND=local` + large model (70–120B params) | |
+| No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model `claude-haiku-4-5` (override via `LIFEOS_ANTHROPIC_MODEL`). Query text + retrieved context is sent to Anthropic. |
+| 8 GB RAM | `LIFEOS_LLM_BACKEND=local` + a small (~7B) model | Set `LIFEOS_LOCAL_LLM_URL` if not on `localhost:8080`. |
+| 16–32 GB RAM | `LIFEOS_LLM_BACKEND=local` + a medium (~14–32B) model | |
+| 64 GB+ VRAM | `LIFEOS_LLM_BACKEND=local` + a large (70–120B) model | Default local model: `unsloth/gemma-4-26B-A4B-it-GGUF`. |
 
-To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_URL` at a running llama-server. See the [Configuration Guide](docs/guides/configuration.md) for details.
+To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_URL` at a running llama-server. See the [Configuration Guide](docs/guides/configuration.md).
 
-`LIFEOS_ANTHROPIC_MODEL` is the **base** orchestrator model (every chat round, intent-classification call, and per-tool synthesis hop uses it by default). On top of that, per-query **escalation** lets a turn run on a stronger model or hand off to a CLI engine — Anthropic backend only, off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set:
+`LIFEOS_ANTHROPIC_MODEL` is the **base** orchestrator model. On top of it, per-query **escalation** (Anthropic backend only, off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set) lets a turn run on a stronger model or hand off to a CLI engine:
 
-- **User-directed:** "escalate to opus" / "use sonnet" runs that turn on the named model; "use codex" / "use claude code" hands the task to that CLI worker session.
-- **Automatic:** when a turn refuses and you push back ("do research", "you're wrong"), LifeOS retries on `LIFEOS_AGENT_ESCALATION_MODEL`, then — on a second pushback — hands off to Claude Code. Tune the rungs with `LIFEOS_AGENT_ESCALATION_LADDER`.
+- **User-directed:** *"escalate to opus"* / *"use sonnet"* runs that turn on the named model; *"use codex"* / *"use claude code"* hands off to that CLI worker.
+- **Automatic:** when a turn wrongly refuses and you push back, LifeOS retries on `LIFEOS_AGENT_ESCALATION_MODEL`, then — on a second push — hands off to Claude Code. Tune the rungs with `LIFEOS_AGENT_ESCALATION_LADDER`.
 
 ---
 
 ## Quick Start
 
+The minimal setup is a Claude API key and a folder of notes — everything else (Google, Slack, Telegram, Apple, voice, finances) is optional and layered on later.
+
 ```bash
-# 1. Clone and setup
-git clone https://github.com/yourusername/LifeOS.git
+# 1. Clone and install
+git clone <your-fork-url> LifeOS
 cd LifeOS
 python3 -m venv ~/.venvs/lifeos
 source ~/.venvs/lifeos/bin/activate
@@ -120,74 +178,117 @@ pip install -r requirements.txt
 
 # 2. Configure
 cp .env.example .env
-# Edit .env. Required: LIFEOS_VAULT_PATH and ANTHROPIC_API_KEY
-# (or LIFEOS_LLM_BACKEND=local with a running llama-server on LIFEOS_LOCAL_LLM_URL).
+# Edit .env — minimal required:
+#   LIFEOS_VAULT_PATH   → your Obsidian/markdown folder
+#   ANTHROPIC_API_KEY   → your Claude API key
+# (or LIFEOS_LLM_BACKEND=local with a running llama-server on LIFEOS_LOCAL_LLM_URL)
 
-# 3. Start services
+# 3. Start the vector DB + server
+./scripts/chromadb.sh start
 ./scripts/server.sh start
 
-# 4. Open http://localhost:8000
+# 4. Open the app
+#   http://localhost:8000/chat
 ```
 
-For persistent services on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units.
+For services that persist across reboots on Linux, run `sudo ./scripts/setup-systemd.sh` to install systemd units.
 
-See [Installation Guide](docs/guides/installation.md) for detailed instructions.
+Full walkthrough (including which external accounts each integration needs): [Installation Guide](docs/guides/installation.md).
 
 ---
 
 ## Architecture
 
-![LifeOS Architecture](docs/images/architecture-hero.png)
-
-### Search Pipeline
-
-Different query types are handled by different pipelines:
+Data flows from your sources, through local storage and indexing, into an orchestrator that answers queries and drives autonomous work across every surface:
 
 ```mermaid
 flowchart LR
-    Q["User Query"] --> Intent["Intent Classifier\n(Claude Haiku)"]
+    subgraph Sources["Data Sources"]
+        direction TB
+        S1["Gmail · Calendar<br/>Drive / Docs / Sheets"]
+        S2["iMessage · Calls<br/>Contacts · Photos"]
+        S3["Slack · WhatsApp · LinkedIn"]
+        S4["Obsidian vault · Granola"]
+        S5["Monarch (finance) · Apple Health"]
+    end
 
-    Intent -->|"code"| Code["Claude Code\n(subprocess)"]
-    Intent -->|"ambiguous"| Clarify["Ask user"]
-    Intent -->|"everything else"| Agent["Agent Loop\n(orchestrator LLM)"]
+    subgraph Store["Ingestion &amp; Storage — local"]
+        direction TB
+        Sync["Nightly 7-phase sync"]
+        DB["SQLite (SourceEntity)<br/>Vault .md files"]
+    end
 
-    Agent --> Tools["Up to 5 rounds of tool calls\n(search_vault, search_email,\nsearch_web, manage_tasks, …)"]
-    Tools --> Agent
-    Agent --> Response["Response"]
-    Code --> Response
-    Clarify --> Response
+    subgraph Index["Resolution &amp; Search Index — local"]
+        direction TB
+        ER["Entity resolution<br/>SourceEntity → PersonEntity"]
+        Vec["ChromaDB (vectors)"]
+        BM["SQLite FTS5 (BM25)"]
+    end
+
+    subgraph Brain["Query &amp; Orchestration"]
+        direction TB
+        Orch["Agent loop<br/>Claude API or local llama-server"]
+        Hy["Hybrid search (RRF)"]
+        Esc["Escalation ·<br/>Claude Code / Codex handoff"]
+    end
+
+    subgraph Surfaces["Surfaces"]
+        direction TB
+        Web["Web /chat — text + voice"]
+        Tg["Telegram bots (personas)"]
+        Mcp["MCP — Claude Desktop / Code"]
+        UI["/crm · /agents"]
+    end
+
+    subgraph Auto["Autonomous"]
+        direction TB
+        Worker["Agent worker (#agent)<br/>local Gemma · cloud Managed Agents"]
+        Sched["Scheduler<br/>notify · prompt · endpoint · agent"]
+    end
+
+    Sources --> Store --> Index --> Brain --> Surfaces
+    Brain <--> Auto
 ```
 
-The orchestrator LLM defaults to Claude Haiku via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`). Set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server instead.
+### Query pipeline
 
-**Query types:**
-- **General knowledge**: "What's the capital of France?" → orchestrator answers directly without calling tools
-- **Web search**: "What's the weather in NYC?" → orchestrator calls `search_web`
-- **Personal data**: "What did I discuss with John last week?" → orchestrator calls `search_vault` / `search_email` / `search_calendar`
-- **Compound**: "Look up the trash schedule and remind me the night before" → orchestrator chains `search_web` + `manage_schedules`
+Most queries go straight to the orchestrator, which decides — over multiple rounds of tool calls — what to search and how to answer:
+
+```mermaid
+flowchart LR
+    Q["Your query"] --> Orch["Agent loop<br/>(orchestrator LLM)"]
+    Orch --> Tools["Tool calls over multiple rounds<br/>search_vault · email · calendar · web<br/>tasks · schedules · people · finance …"]
+    Tools --> Orch
+    Orch -->|"general knowledge"| Direct["Answer directly"]
+    Orch -->|"code / 'use claude code'"| CC["Claude Code / Codex<br/>(CLI engine)"]
+    Orch --> R["Response"]
+    Direct --> R
+    CC --> R
+```
+
+The orchestrator defaults to Claude via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`); set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server. Internals: [Search & Indexing](docs/specs/technical/search-indexing.md) · [Architecture](docs/specs/technical/architecture.md).
 
 ### CRM UI
 
-Translates 10 years of interaction history with thousands of contacts into insights and visualizations.
+Translates years of interaction history with thousands of contacts into insight and visualization.
 
-<strong>Pages aggregating contact details and interaction history for each person you know.</strong>
+<strong>Per-person pages aggregating contact details and interaction history.</strong>
 
 ![Person page](docs/images/person.png)
 
-<strong>Visualize how your communication patterns have evolved over the last 10 years.</strong>
+<strong>See how your communication patterns have evolved over the years.</strong>
 
 ![Dashboard page](docs/images/dashboard.png)
 
-<strong>Dive deeper on relationships with your family and partner.</strong>
+<strong>Go deeper on your relationships with family and a designated partner.</strong>
 
-![Dashboard page](docs/images/family.png)
+![Family dashboard](docs/images/family.png)
 
-<strong>Visualize and explore relationships in a dynamic social graph.</strong>
+<strong>Explore your relationships in a dynamic social graph.</strong>
 
-![Close graph page](docs/images/close_graph.png)
+![Close graph](docs/images/close_graph.png)
 
-![Far graph page](docs/images/far_graph.png)
-
+![Far graph](docs/images/far_graph.png)
 
 ---
 
@@ -196,20 +297,27 @@ Translates 10 years of interaction history with thousands of contacts into insig
 | Source | Method | Data |
 |--------|--------|------|
 | Obsidian | File watcher | Notes, mentions |
-| Gmail | Google API | Emails, threads |
-| Calendar | Google API | Events, attendees |
-| iMessage | Apple Data Agent | Messages |
-| Slack | Slack API | DMs, users |
-| Contacts | Apple Data Agent | Names, emails, phones |
+| Gmail (personal + work) | Google API | Emails, threads |
+| Calendar (personal + work) | Google API | Events, attendees |
+| Google Docs / Sheets | Google API | Document + tabular content |
+| Google Drive | Google API | File search / content |
+| iMessage / SMS | Apple Data Agent | Messages |
+| Phone calls | Apple Data Agent | Call history |
+| Contacts | Apple Data Agent | Names, emails, phones, birthdays |
 | Photos | Apple Data Agent | Face recognition |
-| WhatsApp | wacli | Chat history |
+| WhatsApp | wacli → Apple Data Agent | Chat history |
+| Slack | Slack API | DMs, channels, users |
 | LinkedIn | CSV import | Connections |
-| Monarch | API | Financial data |
+| Monarch | Monarch API | Accounts, transactions, holdings |
+| Apple Health | HealthBridge app / iOS Shortcut | Workouts, sleep, HR, HRV, weight |
+| Granola | Vault file | Meeting transcripts |
+
+Sources unify through **two-tier entity resolution** (SourceEntity → PersonEntity, linked by email → phone → fuzzy name) feeding **hybrid search** (ChromaDB vectors + SQLite FTS5/BM25, fused via Reciprocal Rank Fusion). See [Data & Sync](docs/specs/technical/data-and-sync.md) and [Data Model](docs/specs/product/data-model.md).
 
 <details>
-<summary><strong>Sync Phases (Daily 3:30 AM)</strong></summary>
+<summary><strong>Sync phases (nightly)</strong></summary>
 
-The unified daily sync runs in 7 phases with dependencies:
+The unified nightly sync runs in 7 phases with dependencies:
 
 ```mermaid
 flowchart LR
@@ -220,52 +328,44 @@ flowchart LR
         IM[iMessage]
         Sl[Slack]
     end
-
     subgraph P2["2: Entity"]
         direction TB
-        Link["Link sources\nto people"]
+        Link["Link sources<br/>to people"]
     end
-
     subgraph P3["3: Relationships"]
         direction TB
-        Rel["Discover &\ncalculate strength"]
+        Rel["Discover &amp;<br/>calculate strength"]
     end
-
     subgraph P4["4: Indexing"]
         direction TB
-        Idx["ChromaDB +\nBM25 reindex"]
+        Idx["ChromaDB +<br/>BM25 reindex"]
     end
-
     subgraph P5["5: Content"]
         direction TB
-        Con["Google Docs\n& Sheets"]
+        Con["Google Docs<br/>&amp; Sheets"]
     end
-
     subgraph P6["6: Cleanup"]
         direction TB
-        Clean["Entity cleanup\n(auto-hide)"]
+        Clean["Entity cleanup<br/>(auto-hide)"]
     end
-
     subgraph P7["7: Verify"]
         direction TB
-        Ver["Consistency\nchecks"]
+        Ver["Consistency<br/>checks"]
     end
-
     P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
 ```
 
-**Why:**
-1. Data Collection must complete before Entity Processing can link records
-2. Entity Processing must complete before Relationship Building has linked entities
-3. Relationship Building must complete before Vector Indexing has fresh CRM data
-4. Content Sync runs last (indexed on next cycle)
-5. Entity Cleanup auto-hides obvious non-human entities (noreply@, newsletters)
+1. Collection must finish before Entity Processing can link records
+2. Entity Processing must finish before Relationship Building has linked entities
+3. Relationship Building must finish before Indexing has fresh CRM data
+4. Content Sync runs last (indexed on the next cycle)
+5. Entity Cleanup auto-hides obvious non-humans (noreply@, newsletters)
 6. Consistency Verification checks orphaned records, stale merged IDs, and stats mismatches
 
 </details>
 
 <details>
-<summary><strong>Service Dependencies</strong></summary>
+<summary><strong>Service dependencies</strong></summary>
 
 Services are categorized by criticality and fallback behavior:
 
@@ -273,35 +373,28 @@ Services are categorized by criticality and fallback behavior:
 flowchart LR
     subgraph Local["Local (Critical)"]
         direction TB
-        ChromaDB["ChromaDB\n:8001"]
-        Embed["Embedding\nModel"]
-        Vault["Vault\nFilesystem"]
+        ChromaDB["ChromaDB<br/>:8001"]
+        Embed["Embedding<br/>Model"]
+        Vault["Vault<br/>Filesystem"]
     end
-
     subgraph Fallback["With Fallback"]
         direction TB
-        Intent["Intent classifier\n(Claude Haiku)"] -->|fallback| Patterns["Regex\npatterns"]
+        Intent["Intent classifier<br/>(Claude Haiku)"] -->|fallback| Patterns["Regex<br/>patterns"]
         BM25["BM25"] -->|fallback| VecOnly["Vector-only"]
     end
-
     subgraph External["External APIs"]
         direction TB
-        GCal["Google\nCalendar"]
-        Gmail["Google\nGmail"]
-        LLM["LLM Backend\n(Claude API or local llama-server)"]
-        Voice["whisper-relay\nVoice Gateway :9788\n(reverse-proxied)"]
-        Agent["Agent text backend\n(reverse-proxied, optional)"]
+        GCal["Google<br/>Calendar"]
+        Gmail["Google<br/>Gmail"]
+        LLM["LLM Backend<br/>(Claude API or local llama-server)"]
+        Voice["whisper-relay<br/>Voice Gateway :9788"]
     end
-
     style Local fill:#ffcccc
     style Fallback fill:#fff3cd
     style External fill:#d4edda
 ```
 
-**Severity levels:**
-- **CRITICAL**: Sent immediately (ChromaDB down, embedding failed, vault inaccessible)
-- **WARNING**: Batched nightly (LLM API errors, backup failed, repeated degradation events)
-- **INFO**: Log only (Telegram retry, config defaults used)
+**Alert severities:** CRITICAL (sent immediately — ChromaDB down, embedding failed, vault inaccessible) · WARNING (batched nightly — LLM API errors, backup failed) · INFO (log only). See [Operations](docs/guides/operations.md).
 
 </details>
 
@@ -312,14 +405,15 @@ flowchart LR
 | Component | Technology |
 |-----------|------------|
 | Backend | FastAPI (port 8000) |
-| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), or local llama.cpp server (`LIFEOS_LLM_BACKEND=local`) |
-| Embeddings | sentence-transformers (gte-Qwen2-1.5B-instruct) |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), or a local llama.cpp server (`LIFEOS_LLM_BACKEND=local`) |
+| Embeddings | sentence-transformers (`mxbai-embed-large-v1` by default; `gte-Qwen2-1.5B-instruct` is a supported upgrade) |
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
 | Intent classifier | Claude Haiku (Anthropic API), with a regex-pattern fallback |
+| Voice | whisper-relay gateway (STT → orchestrator → TTS), reverse-proxied into `/chat` |
 | Frontend | Vanilla HTML/JS (no build step) |
 | Job Queue | SQLite (background reindex, sync) |
-| Reminders | SQLite + cron scheduler |
+| Scheduler | Markdown source of truth + rebuildable index; 60s cron tick |
 | Service Management | systemd (Linux) / launchd (macOS) |
 | GPU Acceleration | ROCm (AMD) or CUDA (NVIDIA) |
 
@@ -327,23 +421,23 @@ flowchart LR
 
 ## Documentation
 
-### Specifications
-- [Data Model](docs/specs/product/data-model.md) - Two-tier entity model and relationships
-- [API Reference](docs/specs/product/api-reference.md) - API endpoints and MCP tools
-- [Data & Sync](docs/specs/technical/data-and-sync.md) - Sync pipeline and data sources
-- [Search & Indexing](docs/specs/technical/search-indexing.md) - Hybrid search internals
-- [Agent Worker — Technical](docs/specs/technical/agent-worker.md) - Autonomous worker for #agent tasks
-- [Frontend](docs/specs/technical/frontend.md) - UI components
+### Getting started
+- [Installation](docs/guides/installation.md) · [Configuration](docs/guides/configuration.md) · [First Run](docs/guides/first-run.md)
+- [Google OAuth](docs/guides/google-oauth.md) · [Telegram](docs/guides/telegram-setup.md) · [Voice](docs/guides/voice-setup.md) · [Slack](docs/guides/slack-integration.md)
+- [Personas](docs/guides/personas.md) · [Scheduler](docs/guides/scheduler.md) · [Apple Health](docs/guides/apple-health.md)
+- [Agent Worker Setup](docs/guides/agent-worker-setup.md) · [Doctor Bot](docs/guides/doctor-bot.md) · [Operations](docs/guides/operations.md) · [Troubleshooting](docs/guides/troubleshooting.md)
 
-### Product
-- [Chat UI](docs/specs/product/chat-ui.md)
-- [CRM UI](docs/specs/product/crm-ui.md)
-- [MCP Tools](docs/specs/product/mcp-tools.md)
-- [Agent Worker](docs/specs/product/agent-worker.md) - Hands-free task completion via `#agent`
-- [Task Management](docs/specs/product/task-management.md) - Obsidian Tasks integration
+### Product specs
+- [Chat UI](docs/specs/product/chat-ui.md) · [CRM UI](docs/specs/product/crm-ui.md) · [CRM Analytics](docs/specs/product/crm-analytics.md)
+- [Agent Worker](docs/specs/product/agent-worker.md) · [Agent Viz (`/agents`)](docs/specs/product/agent-viz.md) · [Claude Code / Codex](docs/specs/product/claude-code-orchestration.md)
+- [MCP Tools](docs/specs/product/mcp-tools.md) · [Task Management](docs/specs/product/task-management.md) · [Data Model](docs/specs/product/data-model.md) · [API Reference](docs/specs/product/api-reference.md)
 
-### Architecture Decisions
-- [ADR Index](docs/adr/) - Why we chose Python/FastAPI, ChromaDB, hybrid search, and more
+### Technical specs
+- [Architecture](docs/specs/technical/architecture.md) · [Client Surfaces](docs/specs/technical/client-surfaces.md) · [Data & Sync](docs/specs/technical/data-and-sync.md)
+- [Search & Indexing](docs/specs/technical/search-indexing.md) · [Agent Worker (Technical)](docs/specs/technical/agent-worker.md) · [Security & Privacy](docs/specs/technical/security-privacy.md)
+
+### Architecture decisions
+- [ADR Index](docs/adr/) — why Python/FastAPI, ChromaDB, hybrid search, local-first, and more
 
 ---
 
@@ -355,4 +449,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-GNU General Public License v3.0 - see [LICENSE](LICENSE)
+GNU General Public License v3.0 — see [LICENSE](LICENSE)

@@ -1,27 +1,27 @@
 # Agent Worker Setup
 
-> **Status:** Stub — expanded by later issues in the agent-worker series (#98)
-> **Last Updated:** 2026-06-01
+> **Status:** Complete
+> **Last Updated:** 2026-07-09
 > **Audience:** Operators
 
-One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude Opus (Anthropic Managed Agents) or a local Gemma model. This guide covers **prerequisites only** — the worker itself ships in later issues.
+One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
 
 > **Env-var reference:** every `LIFEOS_*` and third-party variable mentioned below is defined in [configuration.md](configuration.md) with its default, type, and "when to change" notes. This guide gives operator-flow context; configuration.md is the catalog.
 
 ---
 
-## What this issue (#99) sets up
+## What this setup covers
 
-- **Local LLM** swapped from `gpt-oss-120b` to `unsloth/gemma-4-26B-A4B-it-GGUF`. Smaller VRAM footprint, leaves headroom for the embedding model to coexist.
+- **Local LLM** set to `unsloth/gemma-4-26B-A4B-it-GGUF`. Smaller VRAM footprint, leaves headroom for the embedding model to coexist.
 - **MCP HTTP transport** on `mcp_server.py` so a remote agent platform (Anthropic Managed Agents) can call LifeOS tools without stdio access to the host.
-- **Bearer-token auth** required by the HTTP transport. The stdio transport (used by local Claude Code) is unchanged and has no token check.
+- **Bearer-token auth** required by the HTTP transport. The stdio transport (used by local Claude Code) has no token check.
 - **Cloudflare Tunnel** exposes the bearer-protected HTTP endpoint to the public internet.
 
 ---
 
 ## Step 1 — Swap the local LLM to Gemma
 
-The `LIFEOS_LLM_MODEL` env var controls which GGUF `llama-server` loads. The default in this repo is now Gemma:
+The `LIFEOS_LLM_MODEL` env var controls which GGUF `llama-server` loads. The repo default is Gemma:
 
 ```bash
 # .env (or .env.example to see the documented options)
@@ -324,9 +324,9 @@ The Vault holds **only credentials**. Live data (Obsidian, photos, monarch, cale
 
 ---
 
-## Step 5 — Enable the agent worker (Issue B)
+## Step 5 — Enable the agent worker
 
-Issue B installs `lifeos-agent-worker.service`, which polls `/api/tasks` for `#agent`-tagged tasks. It's **off by default** so a fresh clone doesn't start consuming tasks before later issues add real execution.
+`setup-systemd.sh` installs `lifeos-agent-worker.service`, which polls `/api/tasks` for `#agent`-tagged tasks. It's **off by default** so a fresh clone doesn't start consuming tasks unless you opt in.
 
 To enable:
 
@@ -346,7 +346,7 @@ sudo systemctl status lifeos-agent-worker
 tail -f logs/agent-worker.log
 ```
 
-At Issue B's scope, claiming a task does nothing except mark it complete with a placeholder Telegram notification ("no-op completion"). Real execution arrives in Issue C (#101) for the local Gemma path and Issue D (#102) for the Claude managed-agents path.
+Once enabled, the worker claims `#agent`-tagged tasks and executes them: `#agent #local` tasks run on the local Gemma path, and other `#agent` tasks route to Claude via the managed-agents path configured in Step 4b.
 
 To smoke-test the claim path:
 
@@ -354,7 +354,7 @@ To smoke-test the claim path:
 # Create a task with the #agent tag
 curl -X POST http://localhost:8000/api/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"description":"scaffolding smoke test","tags":["agent"]}'
+  -d '{"description":"agent worker smoke test","tags":["agent"]}'
 
 # Within ~60s, the worker should:
 #   1. swap #agent → #agent-running on the task
@@ -368,7 +368,7 @@ To pause new claims without stopping the worker, set `LIFEOS_AGENT_DAILY_CAP_DOL
 
 ### Security model
 
-By design, the local executor (Issue C) runs `Bash`, `Read`, `Write`, `Edit`, and `WebFetch` with **no sandbox** — the agent has the same filesystem and shell access as the operator. This is intentional (see [AGENTS.md § Design Principles](../../AGENTS.md)) and means an agent task can:
+By design, the local executor runs `Bash`, `Read`, `Write`, `Edit`, and `WebFetch` with **no sandbox** — the agent has the same filesystem and shell access as the operator. This is intentional (see [AGENTS.md § Design Principles](../../AGENTS.md)) and means an agent task can:
 
 - Read or modify any file the operator can read or modify
 - Execute arbitrary shell commands (including `rm`, `curl`, etc.)

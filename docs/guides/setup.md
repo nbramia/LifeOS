@@ -1,11 +1,18 @@
 # LifeOS New Instance Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 > **Audience:** New users
 
 Read this top-to-bottom. Execute each step, verify the check, then proceed.
 Ask the user where marked **[ASK USER]**. Do not skip verification steps.
+
+> **Minimal vs full setup:** The minimal path (Anthropic API key + a vault + ChromaDB)
+> gives working hybrid search and chat; CRM/relationship features stay empty until an
+> optional data sync runs. See
+> [Installation → Start Here](installation.md#start-here-minimal-vs-full-setup) for the
+> tier breakdown. This guide walks the full interactive setup; skip the optional
+> integration phases you don't need.
 
 ---
 
@@ -25,14 +32,23 @@ system_profiler SPHardwareDataType | grep "Chip\|Total Number of Cores\|Memory"
 sw_vers
 ```
 
-Based on available RAM, recommend a model configuration:
+The orchestration/synthesis LLM runs on the **Anthropic backend by default** (Claude
+via API — no local GPU needed). The embedding model runs locally regardless. Based on
+available RAM, recommend an embedding + reranker configuration:
 
-| RAM | Embedding Model | Ollama Model | Reranker |
-|-----|----------------|--------------|----------|
-| 8 GB | `all-MiniLM-L6-v2` | `qwen2.5:1.5b-instruct` | disabled |
-| 16 GB | `mixedbread-ai/mxbai-embed-large-v1` | `qwen2.5:3b-instruct` | enabled |
-| 32 GB+ | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | `qwen2.5:7b-instruct` | enabled |
-| 64 GB+ (GPU) | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | Local LLM via llama.cpp | enabled |
+| RAM | Embedding Model | Reranker |
+|-----|----------------|----------|
+| 8 GB | `all-MiniLM-L6-v2` (384-dim) | disabled |
+| 16 GB | `mixedbread-ai/mxbai-embed-large-v1` (1024-dim, default) | enabled |
+| 32 GB+ | `mixedbread-ai/mxbai-embed-large-v1` (1024-dim, default) | enabled |
+| 64 GB+ (GPU) | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` (1536-dim, upgrade) | enabled |
+
+The default embedding model is `mixedbread-ai/mxbai-embed-large-v1` (1024-dim).
+`Alibaba-NLP/gte-Qwen2-1.5B-instruct` (1536-dim) is a recommended upgrade for capable
+hardware. On 8 GB, drop to `all-MiniLM-L6-v2`.
+
+A **fully-local LLM** (llama-server instead of the Anthropic backend) is an optional
+alternative for 64 GB+ GPU systems — see [Installation → Local LLM](installation.md#local-llm-optional).
 
 **[ASK USER]** Present the recommended configuration and confirm before proceeding.
 
@@ -107,8 +123,8 @@ cp .env.example .env
 |----------|----------|-------------|
 | `LIFEOS_VAULT_PATH` | Yes | Absolute path to Obsidian vault |
 | `LIFEOS_USER_NAME` | Yes | First name (used in prompts) |
-| `LIFEOS_LLM_BACKEND` | No | `local` (default, uses llama-server) or `anthropic` |
-| `ANTHROPIC_API_KEY` | Only if `anthropic` backend | Claude API key (starts with `sk-ant-`) |
+| `LIFEOS_LLM_BACKEND` | No | `anthropic` (default, uses Claude API) or `local` (uses llama-server — needs a high-VRAM GPU) |
+| `ANTHROPIC_API_KEY` | Yes on default backend | Claude API key (starts with `sk-ant-`); required unless `LIFEOS_LLM_BACKEND=local` |
 | `LIFEOS_PARTNER_NAME` | No | Partner's first name (leave empty to skip) |
 | `LIFEOS_TIMEZONE` | No | IANA timezone (default: `America/New_York`) |
 
@@ -140,16 +156,19 @@ Set all collected values in `.env`. Then set model overrides from Phase 0:
 - If 8 GB RAM:
   ```
   LIFEOS_EMBEDDING_MODEL=all-MiniLM-L6-v2
-  OLLAMA_MODEL=qwen2.5:1.5b-instruct
   LIFEOS_RERANKER_ENABLED=false
   ```
-- If 16 GB RAM:
+- If 16–32 GB RAM: defaults are fine, no overrides needed (embedding stays `mixedbread-ai/mxbai-embed-large-v1`).
+- If 64 GB+ with GPU (upgrade):
   ```
-  OLLAMA_MODEL=qwen2.5:3b-instruct
+  LIFEOS_EMBEDDING_MODEL=Alibaba-NLP/gte-Qwen2-1.5B-instruct
   ```
-- If 32 GB+ RAM: defaults are fine, no overrides needed.
 
-**[VERIFY]** `.env` contains `LIFEOS_VAULT_PATH` with a real value (and `ANTHROPIC_API_KEY` if using the anthropic backend):
+The default LLM backend is `anthropic`, so leave `LIFEOS_LLM_BACKEND` unset (or set it
+to `anthropic`) and provide `ANTHROPIC_API_KEY`. `OLLAMA_*` variables are legacy and
+ignored — do not set them.
+
+**[VERIFY]** `.env` contains `LIFEOS_VAULT_PATH` with a real value (and `ANTHROPIC_API_KEY` unless using the `local` backend):
 
 ```bash
 grep -E "^LIFEOS_VAULT_PATH=|^LIFEOS_LLM_BACKEND=|^ANTHROPIC_API_KEY=" .env
@@ -164,37 +183,22 @@ Copy example configs to their active names:
 ```bash
 cp config/crm_mappings.yaml.example config/crm_mappings.yaml
 cp config/linkedin_industry_mappings.json.example config/linkedin_industry_mappings.json
+cp config/people_dictionary.example.json config/people_dictionary.json
+cp config/family_members.example.json config/family_members.json
 ```
 
-Create `config/people_dictionary.json` with the user's self entry:
+Then personalize the two people-related files:
 
 **[ASK USER]** What is your first name? (Used to exclude self from entity extraction.)
 
-```json
-{
-  "FIRST_NAME": {
-    "canonical": "FIRST_NAME",
-    "aliases": ["FIRST_NAME_LOWER", "me", "I"],
-    "category": "self",
-    "exclude": true
-  }
-}
-```
-
-Replace `FIRST_NAME` and `FIRST_NAME_LOWER` with the user's name.
-
-Create `config/family_members.json`:
+Edit `config/people_dictionary.json` — replace the placeholder self entry with the
+user's first name (as `canonical`) and lowercase aliases, keeping `"category": "self"`
+and `"exclude": true`.
 
 **[ASK USER]** What is your family last name? (Used for family member detection.)
 
-```json
-{
-  "family_last_names": ["LAST_NAME_LOWER"],
-  "family_exact_names": []
-}
-```
-
-Replace `LAST_NAME_LOWER` with the user's family last name in lowercase.
+Edit `config/family_members.json` — add the user's family last name (lowercase) to
+`family_last_names`.
 
 **[VERIFY]** All config files exist:
 
@@ -206,28 +210,16 @@ ls config/crm_mappings.yaml config/linkedin_industry_mappings.json config/people
 
 ## Phase 5: Services
 
-### Install and start Ollama
-
-```bash
-# Linux:
-curl -fsSL https://ollama.com/install.sh | sh
-systemctl start ollama
-
-# macOS:
-brew install ollama
-brew services start ollama
-```
-
-Wait a few seconds for Ollama to start, then pull the selected model:
-
-```bash
-ollama pull MODEL_NAME_FROM_PHASE_0
-```
-
 ### Start ChromaDB
 
 ```bash
 ./scripts/chromadb.sh start
+```
+
+Verify ChromaDB is healthy:
+
+```bash
+curl -s http://localhost:8001/api/v2/heartbeat
 ```
 
 ### Start the LifeOS server
@@ -242,7 +234,7 @@ ollama pull MODEL_NAME_FROM_PHASE_0
 curl -s http://localhost:8000/health/full | python3 -m json.tool
 ```
 
-All services should show healthy status. ChromaDB and Ollama should be connected.
+All services should show healthy status, with ChromaDB connected.
 
 ---
 
@@ -329,13 +321,14 @@ systemctl status lifeos-api lifeos-chromadb
 
 ### macOS (launchd)
 
-Pass the vault path and `--yes` for non-interactive execution:
+> **Note:** launchd is macOS-only and superseded by systemd on Linux — see
+> [ADR-007: Linux Migration](../adr/007-linux-migration.md). Use this only on a macOS host.
+
+`setup-launchd.sh` is interactive and takes no arguments — it prompts for the vault path:
 
 ```bash
-./scripts/setup-launchd.sh "$LIFEOS_VAULT_PATH" --yes
+./scripts/setup-launchd.sh
 ```
-
-(Replace `$LIFEOS_VAULT_PATH` with the actual vault path from `.env`.)
 
 Set up the ChromaDB cron watchdog:
 
@@ -400,7 +393,7 @@ Set up the integrations selected in Phase 3. Skip any that weren't selected.
 
 ### Google OAuth — Personal (Calendar, Gmail, Drive)
 
-Follow `docs/guides/GOOGLE-OAUTH.md`. Key steps:
+Follow [google-oauth.md](google-oauth.md). Key steps:
 1. Create Google Cloud project and enable Calendar/Gmail/Drive APIs
 2. Configure OAuth consent screen and **publish the app** (Audience → Publish)
 3. Create OAuth credentials, save as `config/credentials-personal.json`
@@ -457,9 +450,10 @@ marks WhatsApp as `status: "error"`, the Linux importer logs CRITICAL, and
 ### MCP for Claude Code
 
 **Note:** This command must be run in a separate terminal, not from within Claude Code.
+Point it at your LifeOS checkout (uses stdio transport):
 
 ```bash
-claude mcp add lifeos http://localhost:8000/api/mcp
+claude mcp add lifeos -- ~/.venvs/lifeos/bin/python ~/LifeOS/mcp_server.py
 ```
 
 ### Monarch Money (Financial Data)
