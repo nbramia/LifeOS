@@ -587,19 +587,21 @@ def get_typical_duration_seconds(
     Returns None when there is no eligible history.
     """
     conn = get_sync_health_db()
-    rows = conn.execute(
-        """
-        SELECT duration_seconds FROM sync_runs
-        WHERE source = ?
-          AND status = ?
-          AND duration_seconds IS NOT NULL
-          AND duration_seconds >= ?
-        ORDER BY started_at DESC
-        LIMIT ?
-        """,
-        (source, SyncStatus.SUCCESS.value, min_duration_seconds, n),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """
+            SELECT duration_seconds FROM sync_runs
+            WHERE source = ?
+              AND status = ?
+              AND duration_seconds IS NOT NULL
+              AND duration_seconds >= ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (source, SyncStatus.SUCCESS.value, min_duration_seconds, n),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         return None
