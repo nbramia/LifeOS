@@ -15,6 +15,13 @@ set -e
 PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 cd "$PROJECT_ROOT"
 
+# git exports GIT_DIR (absolute when pushing from a worktree) while running
+# hooks. Test subprocesses that spawn `git` in fixture repos inherit it and
+# operate on THIS repo instead — committing fixture files onto real branches,
+# flipping core.bare, and rewriting user identity. Scrub the family so every
+# git call below (and inside pytest) resolves via cwd.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
 # Detect what's being pushed so we can skip tests on docs-only pushes.
 # git feeds pre-push hooks lines of "local_ref local_sha remote_ref remote_sha" on stdin.
 CHANGED_FILES=""
