@@ -377,8 +377,14 @@ class TestDoctorListener:
         async def _capture(text, chat_id=None):
             sent.append(text)
 
+        def _capture_ids(text, chat_id=None, bot=None):
+            sent.append(text)
+            return [8001]
+
         with patch("api.services.agent_worker.session_store.SessionStore",
                    return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids), \
              patch("api.services.telegram.send_message_async", side_effect=_capture):
             consumed = await listener._maybe_handle_claude_code_reply(5000, "yes", "999")
 
@@ -399,8 +405,14 @@ class TestDoctorListener:
         async def _capture(text, chat_id=None):
             sent.append(text)
 
+        def _capture_ids(text, chat_id=None, bot=None):
+            sent.append(text)
+            return [8001]
+
         with patch("api.services.agent_worker.session_store.SessionStore",
                    return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids), \
              patch("api.services.telegram.send_message_async", side_effect=_capture):
             consumed = await listener._maybe_handle_claude_code_reply(
                 5000, "make it also require lint", "999")
