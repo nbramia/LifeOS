@@ -19,6 +19,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# override=True: the .env file deterministically wins over inherited env vars.
+# A present-but-empty inherited credential var would otherwise shadow the file
+# value (config.settings merges os.environ over dotenv_values) — issue #438.
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
+
 from api.services.gmail import GmailService
 from api.services.calendar import CalendarService
 from api.services.google_auth import GoogleAccount
@@ -456,6 +462,10 @@ def sync_gmail_interactions(
     except Exception as e:
         logger.error(f"Failed to sync Gmail: {e}")
         stats['errors'] += 1
+        # Account-level failure (not a per-message hiccup) — main() exits
+        # nonzero so the orchestrator records FAILED instead of silent
+        # success — issue #438.
+        stats['fatal_error'] = str(e)
 
     conn.close()
 
@@ -647,6 +657,8 @@ def sync_calendar_interactions(
         import traceback
         traceback.print_exc()
         stats['errors'] += 1
+        # Account-level failure — see the matching Gmail handler (issue #438).
+        stats['fatal_error'] = str(e)
 
     conn.close()
 
@@ -773,7 +785,7 @@ def _insert_batch(conn: sqlite3.Connection, batch: list):
     """, batch)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description='Sync Gmail and Calendar to interactions')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
     parser.add_argument('--days', type=int, default=3650, help='Days back to sync')
@@ -784,7 +796,7 @@ def main():
     parser.add_argument('--account', type=str, choices=['personal', 'work', 'work2'], help='Sync a specific account only')
     parser.add_argument('--domain', type=str, help='Filter emails by domain (e.g., gmail.com)')
     parser.add_argument('--before-days', type=int, help='Skip emails newer than this many days ago (for historical backfill)')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     dry_run = not args.execute
 
@@ -883,6 +895,20 @@ def main():
         aggregate["source_entities_created"] += int(stats.get("source_entities_created", 0) or 0)
         aggregate["errors"] += int(stats.get("errors", 0) or 0)
     emit_sync_stats(aggregate)
+
+    # Account-level (fatal) failures must exit nonzero so run_all_syncs
+    # records FAILED and alerts. Per-message errors are tolerated — a few
+    # unparseable emails out of thousands is normal — but a whole account
+    # failing (e.g. expired credentials) is not — issue #438.
+    fatal_failures = {
+        name: stats["fatal_error"]
+        for name, stats in all_stats.items()
+        if isinstance(stats, dict) and stats.get("fatal_error")
+    }
+    if fatal_failures:
+        for name, err in fatal_failures.items():
+            logger.error(f"{name}: fatal sync failure: {err}")
+        sys.exit(1)
 
     return all_stats
 

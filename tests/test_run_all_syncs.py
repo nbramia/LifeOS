@@ -499,3 +499,140 @@ class TestGetAvailableSystemRAM:
             result = _get_available_system_ram_mb()
 
         assert result is None
+
+
+class TestDurationCollapse:
+    """Tests for silent no-op detection via duration collapse."""
+
+    def test_detects_collapse(self):
+        """A source that historically takes minutes finishing in <2s is flagged."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            info = _detect_duration_collapse("slack", 0.28)
+
+        assert info is not None
+        assert info["elapsed_seconds"] == 0.28
+        assert info["typical_seconds"] == 450.0
+
+    def test_no_collapse_without_history(self):
+        """No history → no collapse verdict."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=None):
+            assert _detect_duration_collapse("slack", 0.28) is None
+
+    def test_no_collapse_for_fast_sources(self):
+        """Sources that are typically fast don't alert."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=30.0):
+            assert _detect_duration_collapse("link_slack", 0.5) is None
+
+    def test_no_collapse_for_normal_duration(self):
+        """A normal-length run doesn't alert."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            assert _detect_duration_collapse("slack", 380.0) is None
+
+    def test_relative_threshold_catches_slow_source_collapse(self):
+        """The elapsed threshold scales with typical duration: for a
+        450s-typical source the cutoff is max(2, 0.05*450) = 22.5s, so a
+        10s no-op is flagged even though it's above the 2s floor."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            info = _detect_duration_collapse("slack", 10.0)
+
+        assert info is not None
+        assert info["typical_seconds"] == 450.0
+
+    def test_relative_threshold_allows_fast_but_plausible_run(self):
+        """A run above the relative cutoff (30s vs 22.5s) is not flagged."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            assert _detect_duration_collapse("slack", 30.0) is None
+
+    def test_collapse_check_survives_db_errors(self):
+        """A sync_health DB hiccup must never fail the sync itself."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch(
+            "scripts.run_all_syncs.get_typical_duration_seconds",
+            side_effect=RuntimeError("db locked"),
+        ):
+            assert _detect_duration_collapse("slack", 0.28) is None
+
+    def test_run_all_syncs_collects_collapsed_sources(self):
+        """Collapsed sources surface in the run_all_syncs result dict."""
+        from scripts.run_all_syncs import run_all_syncs
+
+        def side_effect(source, dry_run=False):
+            if source == "source_a":
+                return True, {
+                    "processed": 0,
+                    "duration_collapse": {"elapsed_seconds": 0.3, "typical_seconds": 450.0},
+                }
+            return True, {"processed": 1}
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", TEST_SYNC_SOURCES),
+            patch("scripts.run_all_syncs.SYNC_ORDER", TEST_SYNC_ORDER),
+            patch("scripts.run_all_syncs.run_sync", MagicMock(side_effect=side_effect)),
+            patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+            patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+            patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        ):
+            result = run_all_syncs(dry_run=True)
+
+        assert result["duration_collapsed_sources"] == ["source_a"]
+
+    def test_telegram_summary_includes_collapse_warning(self):
+        """The Telegram summary calls out suspiciously fast completions."""
+        from scripts.run_all_syncs import send_sync_summary_telegram
+
+        result = {
+            "failed": 0,
+            "succeeded": 5,
+            "sources_run": 5,
+            "failed_sources": [],
+            "duration_seconds": 120,
+            "duration_collapsed_sources": ["slack"],
+            "results": {
+                "slack": {
+                    "success": True,
+                    "duration_collapse": {"elapsed_seconds": 0.3, "typical_seconds": 450.0},
+                }
+            },
+        }
+
+        with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+            send_sync_summary_telegram(result, trigger="test")
+
+        message = send_mock.call_args[0][0]
+        assert "slack" in message
+        assert "silent no-op" in message
+        assert "⚠️" in message
+
+    def test_telegram_summary_clean_run_has_no_collapse_section(self):
+        """A clean run keeps the ✅ status and no collapse section."""
+        from scripts.run_all_syncs import send_sync_summary_telegram
+
+        result = {
+            "failed": 0,
+            "succeeded": 5,
+            "sources_run": 5,
+            "failed_sources": [],
+            "duration_seconds": 120,
+            "duration_collapsed_sources": [],
+            "results": {},
+        }
+
+        with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+            send_sync_summary_telegram(result, trigger="test")
+
+        message = send_mock.call_args[0][0]
+        assert "silent no-op" not in message
+        assert "✅" in message
