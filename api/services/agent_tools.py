@@ -1781,8 +1781,8 @@ async def _tool_search_finances(inp: dict) -> str:
         for a in sorted(inv["accounts"], key=lambda x: -x["value"]):
             tag = " (external)" if a["external"] else ""
             lines.append(f"- {a['name']} [{a['key']}]{tag}: ${a['value']:,.0f}")
-        lines += ["", "Top positions:"]
-        for pos in inv["positions"][:15]:
+        lines += ["", f"Positions ({len(inv['positions'])}):"]
+        for pos in inv["positions"]:
             unrl = f", unrealized ${pos['unrealized']:+,.0f}" if pos.get("unrealized") is not None else ""
             lines.append(f"- {pos['symbol']}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
         tu = inv["taxable_unrealized"]
