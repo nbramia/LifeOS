@@ -51,15 +51,23 @@ class TestSessions:
         assert len(s.sets) == 5  # 1 + 3 + 1
         assert s.sets[-1].exercise == "Run"
 
-    def test_cardio_default_unit_and_count(self, store):
+    def test_unweighted_work_gets_no_unit(self, store):
         s = store.add_session(sets=[{"exercise": "run", "notes": "5k"}])
-        assert s.sets[0].weight_unit == "lb"  # default
+        assert s.sets[0].unit == ""  # no weight → no lb
         assert s.sets[0].reps is None
 
-    def test_explicit_null_weight_unit_defaults(self, store):
-        # The LLM may send weight_unit: null explicitly — must still default to lb.
-        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135, "weight_unit": None}])
-        assert s.sets[0].weight_unit == "lb"
+    def test_weighted_set_defaults_to_lb(self, store):
+        # The LLM may send unit: null explicitly — a weighted set still gets lb.
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135, "unit": None}])
+        assert s.sets[0].unit == "lb"
+
+    def test_legacy_weight_unit_key_accepted(self, store):
+        s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 60, "weight_unit": "kg"}])
+        assert s.sets[0].unit == "kg"
+
+    def test_counted_work_unit(self, store):
+        s = store.add_session(sets=[{"exercise": "stairs", "reps": 500, "unit": "steps", "duration_seconds": 421}])
+        assert s.sets[0].unit == "steps"
 
     def test_list_sessions_newest_first(self, store):
         store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}], date="2026-06-01")
@@ -111,8 +119,9 @@ class TestDuration:
         assert hist[0]["duration_seconds"] == 421
 
     def test_migrates_pre_duration_db(self, tmp_path):
-        # A workout_sets table created before the duration_seconds column
-        # existed must be ALTERed on open, and logging with duration must work.
+        # A workout_sets table from before duration_seconds/unit must be
+        # migrated on open: duration column added, weight_unit renamed to unit,
+        # and the old unconditional 'lb' cleared on weightless rows.
         import sqlite3
         db = str(tmp_path / "old.db")
         conn = sqlite3.connect(db)
@@ -129,11 +138,24 @@ class TestDuration:
                 notes TEXT DEFAULT ''
             )
         """)
+        conn.execute(
+            "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, weight_unit) "
+            "VALUES ('a', 's1', 'Stairs', 1, 500, NULL, 'lb')"
+        )
+        conn.execute(
+            "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, weight_unit) "
+            "VALUES ('b', 's1', 'Bench Press', 1, 8, 135, 'lb')"
+        )
         conn.commit()
         conn.close()
         store = FitnessStore(db_path=db)
         s = store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}])
         assert store.get_session(s.id).sets[0].duration_seconds == 421
+        conn = sqlite3.connect(db)
+        units = dict(conn.execute("SELECT id, unit FROM workout_sets WHERE id IN ('a', 'b')"))
+        conn.close()
+        assert units["a"] == ""    # weightless row: lb cleared
+        assert units["b"] == "lb"  # weighted row: unit kept
 
 
 # -- metrics --

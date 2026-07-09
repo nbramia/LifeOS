@@ -24,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_TAB = "Sessions"
 SETS_TAB = "Sets"
+METRICS_TAB = "Metrics"
 
 _SESSIONS_HEADER = ["id", "date", "kind", "title", "source", "notes", "created_at"]
-_SETS_HEADER = ["session_id", "date", "exercise", "set_index", "reps", "weight", "weight_unit", "rpe", "time", "notes"]
+_SETS_HEADER = ["session_id", "date", "exercise", "set_index", "reps", "weight", "unit", "rpe", "time", "notes"]
+_METRICS_HEADER = ["date", "metric_type", "value", "unit"]
 
 _state_lock = threading.Lock()
 _running = False
@@ -63,10 +65,15 @@ def build_tabs(store) -> dict[str, list[list]]:
         for st in s.sets:
             set_rows.append([
                 s.id, s.date, st.exercise, st.set_index,
-                _cell(st.reps), _cell(st.weight), st.weight_unit, _cell(st.rpe),
+                _cell(st.reps), _cell(st.weight), st.unit, _cell(st.rpe),
                 _time_cell(st.duration_seconds), st.notes,
             ])
-    return {SESSIONS_TAB: sess_rows, SETS_TAB: set_rows}
+    # Manually reported metrics only (body weight etc.) — device imports like
+    # intraday Apple Health samples would flood the sheet.
+    metric_rows = [_METRICS_HEADER]
+    for m in store.list_manual_metrics():
+        metric_rows.append([m.start_at[:10], m.metric_type, m.value, m.unit])
+    return {SESSIONS_TAB: sess_rows, SETS_TAB: set_rows, METRICS_TAB: metric_rows}
 
 
 def _hash_tabs(tabs: dict) -> str:

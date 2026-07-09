@@ -703,14 +703,14 @@ TOOL_DEFINITIONS = [
                 },
                 "sets": {
                     "type": "array",
-                    "description": "Exercises (for log/update). Each: {exercise, reps, weight, weight_unit, count, rpe, duration_seconds, notes}. `count` = number of identical sets (default 1).",
+                    "description": "Exercises (for log/update). Each: {exercise, reps, weight, unit, count, rpe, duration_seconds, notes}. `count` = number of identical sets (default 1).",
                     "items": {
                         "type": "object",
                         "properties": {
                             "exercise": {"type": "string", "description": "Exercise name (normalized server-side)."},
                             "reps": {"type": "integer", "description": "Reps per set — also the count for timed work (steps climbed, meters rowed)."},
                             "weight": {"type": "number", "description": "Load."},
-                            "weight_unit": {"type": "string", "description": "'lb' or 'kg' (default lb)."},
+                            "unit": {"type": "string", "description": "'lb'/'kg' for weighted sets (defaults to lb when weight is set); for counted work, what reps counts ('steps', 'm'). Omit otherwise."},
                             "count": {"type": "integer", "description": "Number of identical sets (default 1)."},
                             "rpe": {"type": "number", "description": "Rate of perceived exertion (optional)."},
                             "duration_seconds": {"type": "integer", "description": "Elapsed time in seconds for timed work (stairs, runs, planks, hangs) — '7:01' = 421."},
@@ -1486,7 +1486,7 @@ def _summarize_session(session) -> str:
     """Compact one-line summary, grouping consecutive identical sets."""
     groups: list[list] = []
     for s in session.sets:
-        key = (s.exercise, s.reps, s.weight, s.weight_unit, s.duration_seconds)
+        key = (s.exercise, s.reps, s.weight, s.unit, s.duration_seconds)
         if groups and groups[-1][0] == key:
             groups[-1][1] += 1
         else:
@@ -1498,7 +1498,9 @@ def _summarize_session(session) -> str:
             parts.append(f"{exercise}{dur}")
             continue
         rep_part = f"{count}×{reps}" if count > 1 else f"{_fmt_num(reps)}"
-        w = f" @{_fmt_num(weight)} {unit}" if weight else ""
+        if unit and weight is None:
+            rep_part += f" {unit}"   # counted work: "500 steps"
+        w = f" @{_fmt_num(weight)} {unit or 'lb'}" if weight else ""
         parts.append(f"{exercise} {rep_part}{w}{dur}".strip())
     body = "; ".join(parts) if parts else "(no sets)"
     return f"{session.date}: {body}"
@@ -1567,7 +1569,7 @@ def _workout_history(inp: dict) -> str:
         return f"No history for {canonical}."
     lines = [f"{canonical} — recent sets:"]
     for r in rows:
-        w = f" @{_fmt_num(r['weight'])} {r['weight_unit']}" if r["weight"] else ""
+        w = f" @{_fmt_num(r['weight'])} {r['unit']}" if r["weight"] else ""
         rpe = f" RPE {_fmt_num(r['rpe'])}" if r["rpe"] else ""
         dur = f" in {_fmt_duration(r.get('duration_seconds'))}" if r.get("duration_seconds") else ""
         sid = f" [{r['session_id']}]" if r.get("session_id") else ""

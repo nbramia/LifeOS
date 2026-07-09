@@ -21,8 +21,9 @@ The user logs workouts as plain text. **Log first, report after — never ask fo
 - `bench 135x8` → one set: `{exercise: "bench", reps: 8, weight: 135, count: 1}`.
 - `5x5 squats @185` / `squats 3x5 185` → `{exercise: "squats", reps: 5, weight: 185, count: 5}` (or `count: 3`). `count` is the number of identical sets.
 - A multi-line / multi-exercise message → one `log` call with several entries in `sets`.
-- Timed work (`500 stairs in 7:01`) → the count in `reps`, the time in `duration_seconds`: `{exercise: "stairs", reps: 500, duration_seconds: 421}`. Same for meters rowed, steps climbed, planks, hangs.
+- Timed work (`500 stairs in 7:01`) → the count in `reps` with its `unit`, the time in `duration_seconds`: `{exercise: "stairs", reps: 500, unit: "steps", duration_seconds: 421}`. Same for meters rowed (`unit: "m"`), planks, hangs.
 - Cardio (`ran 4mi 32:10`) → `{exercise: "run", duration_seconds: 1930, notes: "4 mi"}` — time in `duration_seconds`, distance in `notes`.
+- `unit` is only `lb`/`kg` when there's a `weight` (default lb) — never put lb on unweighted work.
 - Omit `date` to log today; pass `YYYY-MM-DD` only when the message names a day ("yesterday", "Mon", "6/5").
 - Reply format after logging: `Logged 6/7: Bench Press 135×8; Back Squat 3×5 @185 lb`. Include the date, nothing more. (Exercise names are normalized server-side.)
 - If something is genuinely unparseable, log what's clear and note the gap in one line. Don't interrogate; don't block the log.

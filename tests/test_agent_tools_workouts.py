@@ -174,6 +174,14 @@ class TestSummaryFormatting:
         out = _summarize_session(session)
         assert "Stairs 500 in 7:01" in out
 
+    def test_counted_work_shows_unit_not_lb(self):
+        session = WorkoutSession(id="x", date="2026-06-20", sets=[
+            WorkoutSet(exercise="Stairs", set_index=1, reps=500, unit="steps", duration_seconds=421),
+        ])
+        out = _summarize_session(session)
+        assert "Stairs 500 steps in 7:01" in out
+        assert "lb" not in out
+
     def test_duration_only_no_reps(self):
         session = WorkoutSession(id="x", date="2026-06-20", sets=[
             WorkoutSet(exercise="Run", set_index=1, duration_seconds=1930, notes="4 mi"),
