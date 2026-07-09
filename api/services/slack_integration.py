@@ -117,6 +117,7 @@ class SlackMessage:
     timestamp: datetime
     thread_ts: Optional[str] = None
     reply_count: int = 0
+    latest_reply: Optional[str] = None  # ts of the newest thread reply (parents only)
     reactions: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -129,6 +130,7 @@ class SlackMessage:
             "timestamp": self.timestamp.isoformat(),
             "thread_ts": self.thread_ts,
             "reply_count": self.reply_count,
+            "latest_reply": self.latest_reply,
             "reactions": self.reactions,
         }
 
@@ -614,6 +616,7 @@ class SlackClient:
                     timestamp=datetime.fromtimestamp(ts, tz=timezone.utc),
                     thread_ts=msg.get("thread_ts"),
                     reply_count=msg.get("reply_count", 0),
+                    latest_reply=msg.get("latest_reply"),
                     reactions=msg.get("reactions", []),
                 ))
 
@@ -622,6 +625,81 @@ class SlackClient:
                 break
 
         return all_messages
+
+    def get_thread_replies(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        workspace_id: str = "default",
+        oldest: Optional[datetime] = None,
+        max_messages: int = 10000,
+    ) -> list[SlackMessage]:
+        """
+        Get a thread's replies via ``conversations.replies`` with pagination.
+
+        ``conversations.history`` returns only top-level messages, so thread
+        replies are invisible to it — this is the only way to fetch them
+        (issue #440). The parent message (ts == thread_ts) is excluded
+        whenever the API returns it — it leads the response on unwindowed
+        calls, while with ``oldest`` set it is typically absent entirely.
+        The parent is already indexed from the history fetch.
+
+        Args:
+            channel_id: Channel containing the thread
+            thread_ts: The parent message's ts
+            workspace_id: Workspace ID
+            oldest: Only fetch replies after this time (incremental sync)
+            max_messages: Maximum replies to fetch (safety limit)
+
+        Returns:
+            List of SlackMessage reply objects (parent excluded)
+        """
+        replies: list[SlackMessage] = []
+        cursor = None
+
+        while len(replies) < max_messages:
+            params = {"channel": channel_id, "ts": thread_ts, "limit": 200}
+
+            if oldest:
+                params["oldest"] = str(oldest.timestamp())
+            if cursor:
+                params["cursor"] = cursor
+
+            # max_retries=5 (vs. the default 3): replies fetches are the
+            # rate-limit hot path during a backfill, and retry exhaustion
+            # surfaces as a partial sync that needs a manual full sync to
+            # heal — buy extra headroom.
+            data = self._api_call(
+                "conversations.replies", workspace_id, max_retries=5, **params
+            )
+
+            for msg in data.get("messages", []):
+                if msg.get("type") != "message":
+                    continue
+                # The parent rides along in the response — skip it.
+                if msg.get("ts") == thread_ts:
+                    continue
+                if msg.get("subtype") in NOISE_MESSAGE_SUBTYPES:
+                    continue
+
+                ts = float(msg["ts"])
+                replies.append(SlackMessage(
+                    ts=msg["ts"],
+                    channel_id=channel_id,
+                    user_id=msg.get("user", ""),
+                    text=msg.get("text", ""),
+                    timestamp=datetime.fromtimestamp(ts, tz=timezone.utc),
+                    thread_ts=msg.get("thread_ts"),
+                    reply_count=msg.get("reply_count", 0),
+                    latest_reply=msg.get("latest_reply"),
+                    reactions=msg.get("reactions", []),
+                ))
+
+            cursor = data.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        return replies
 
     def get_user_cached(self, user_id: str, workspace_id: str = "default") -> Optional[SlackUser]:
         """Get user with caching to reduce API calls."""

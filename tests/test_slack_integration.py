@@ -388,3 +388,88 @@ class TestGetAllChannelHistoryNoiseFiltering:
 
         assert len(messages) == 1
         assert messages[0].text == "Deploy finished: build 42"
+
+
+@patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
+class TestGetThreadReplies:
+    """Issue #440: conversations.replies fetch — paginated, parent excluded."""
+
+    def _client(self, pages):
+        from api.services.slack_integration import SlackClient
+
+        store = MagicMock()
+        store.get_token.return_value = "xoxp-test-fake-token"
+        client = SlackClient(token_store=store)
+        client._api_call = MagicMock(side_effect=pages)
+        return client
+
+    def test_excludes_parent_and_parses_replies(self):
+        client = self._client([{
+            "ok": True,
+            "messages": [
+                {"type": "message", "ts": "1700000000.000100",
+                 "thread_ts": "1700000000.000100", "user": "U1",
+                 "text": "parent message", "reply_count": 2},
+                {"type": "message", "ts": "1700000100.000200",
+                 "thread_ts": "1700000000.000100", "user": "U2",
+                 "text": "first reply"},
+                {"type": "message", "ts": "1700000200.000300",
+                 "thread_ts": "1700000000.000100", "user": "U1",
+                 "text": "second reply"},
+            ],
+            "response_metadata": {},
+        }])
+
+        replies = client.get_thread_replies("C123", "1700000000.000100")
+
+        assert [r.text for r in replies] == ["first reply", "second reply"]
+        assert all(r.thread_ts == "1700000000.000100" for r in replies)
+
+    def test_paginates_with_cursor(self):
+        client = self._client([
+            {"ok": True,
+             "messages": [{"type": "message", "ts": "1700000100.000200",
+                           "thread_ts": "1700000000.000100", "user": "U2",
+                           "text": "reply page 1"}],
+             "response_metadata": {"next_cursor": "cur2"}},
+            {"ok": True,
+             "messages": [{"type": "message", "ts": "1700000200.000300",
+                           "thread_ts": "1700000000.000100", "user": "U1",
+                           "text": "reply page 2"}],
+             "response_metadata": {}},
+        ])
+
+        replies = client.get_thread_replies("C123", "1700000000.000100")
+
+        assert [r.text for r in replies] == ["reply page 1", "reply page 2"]
+        assert client._api_call.call_count == 2
+        second_kwargs = client._api_call.call_args_list[1].kwargs
+        assert second_kwargs["cursor"] == "cur2"
+
+    def test_oldest_is_passed_through(self):
+        from datetime import datetime, timezone
+
+        client = self._client([{"ok": True, "messages": [], "response_metadata": {}}])
+        oldest = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+        client.get_thread_replies("C123", "1700000000.000100", oldest=oldest)
+
+        kwargs = client._api_call.call_args.kwargs
+        assert kwargs["oldest"] == str(oldest.timestamp())
+
+    def test_history_parses_latest_reply(self):
+        """get_all_channel_history must surface latest_reply so the sync can
+        tell which threads have new activity."""
+        client = self._client([{
+            "ok": True,
+            "messages": [
+                {"type": "message", "ts": "1700000000.000100", "user": "U1",
+                 "text": "parent", "reply_count": 3,
+                 "latest_reply": "1700009999.000500"},
+            ],
+            "response_metadata": {},
+        }])
+
+        messages = client.get_all_channel_history("C123")
+
+        assert messages[0].latest_reply == "1700009999.000500"
