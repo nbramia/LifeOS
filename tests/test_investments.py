@@ -114,3 +114,59 @@ def test_freshness_just_over_threshold_warns(tmp_path, monkeypatch):
     monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
     _write_summary(tmp_path, age_days=inv.STALENESS_WARNING_DAYS + 0.5)
     assert inv.check_investments_freshness() is not None
+
+
+# ---------------------------------------------------------------------------
+# Big-mover alert (#463)
+# ---------------------------------------------------------------------------
+
+async def test_movers_reports_positions_past_threshold(monkeypatch):
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI", "NVDA"])
+    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": -7.2, "VTI": 1.1, "NVDA": 6.5})
+    out = await inv.investments_movers(threshold=5)
+    assert out["count"] == 2
+    assert "AMD" in out["message"] and "NVDA" in out["message"]
+    assert "VTI" not in out["message"]        # under threshold
+    assert "$" not in out["message"]          # tickers + % only, no dollar amounts
+    assert "-7.2%" in out["message"]
+
+
+async def test_movers_silent_when_nothing_moves(monkeypatch):
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI"])
+    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": 1.0, "VTI": -2.4})
+    out = await inv.investments_movers(threshold=5)
+    assert out == {"message": "", "count": 0}   # empty => scheduler stays silent
+
+
+async def test_movers_non_fatal_on_fetch_failure(monkeypatch):
+    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
+
+    def boom(syms):
+        raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr(inv, "_day_changes", boom)
+    out = await inv.investments_movers(threshold=5)
+    assert out == {"message": "", "count": 0}   # degrades to no-alert, not a 500
+
+
+def test_held_tickers_excludes_external_and_blanks(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
+    (tmp_path / "summary.json").write_text(
+        '{"positions": [{"symbol": "VTI", "external": false}, '
+        '{"symbol": "GFND", "external": true}, {"symbol": "", "external": false}]}'
+    )
+    assert inv._held_tickers() == ["VTI"]
+
+
+def test_held_tickers_empty_when_not_synced(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))   # empty dir, no file
+    assert inv._held_tickers() == []
+
+
+def test_scheduler_endpoint_prefers_message_field():
+    """The endpoint action sends a ready {'message': ...} verbatim (empty =>
+    suppressed by the fire loop), instead of dumping raw JSON (#463)."""
+    from api.services.scheduler_store import _format_endpoint_result
+    assert _format_endpoint_result({"message": "AMD -7%", "count": 1}) == "AMD -7%"
+    assert _format_endpoint_result({"message": "", "count": 0}) == ""
+    assert '"foo"' in _format_endpoint_result({"foo": 1})   # fallback JSON dump

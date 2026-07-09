@@ -11,6 +11,7 @@ from disk — stale-but-present when the mac is asleep (check synced_at).
 - GET /api/investments/portfolio?section= one top-level section only
 """
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Optional
@@ -18,6 +19,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter(prefix="/api/investments", tags=["investments"])
+
+logger = logging.getLogger(__name__)
 
 SYNC_DIR = os.path.expanduser("~/Code/Sync/investments")
 
@@ -84,3 +87,80 @@ def check_investments_freshness() -> Optional[str]:
             f"the weekday refresh (~18:30) or Syncthing may have stalled."
         )
     return None
+
+
+# --- Big-mover alert (#463) ----------------------------------------------
+
+# Default day-change threshold: a held ticker up or down more than this many
+# percent on the day is a "mover" worth a nudge.
+MOVER_THRESHOLD_PCT = 5.0
+
+
+def _held_tickers() -> list[str]:
+    """Quotable tickers held as of the latest snapshot (non-external only).
+
+    External accounts (Guideline 401(k), TSP) are fund-level with no quotable
+    ticker, so they're excluded. Returns [] when the snapshot isn't synced.
+    """
+    path = os.path.join(SYNC_DIR, "summary.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in data.get("positions", []):
+        sym = (p.get("symbol") or "").strip().upper()
+        if sym and not p.get("external") and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+def _day_changes(symbols: list[str]) -> dict[str, float]:
+    """Map each symbol to its day-change percent (current price vs. prior close)
+    via yfinance. Best-effort: a symbol whose quote can't be resolved is omitted,
+    so a partial or failed fetch degrades to fewer movers rather than an error.
+    """
+    if not symbols:
+        return {}
+    import yfinance as yf
+
+    out: dict[str, float] = {}
+    for sym in symbols:
+        try:
+            fi = yf.Ticker(sym).fast_info
+            last = getattr(fi, "last_price", None)
+            prev = getattr(fi, "previous_close", None)
+            if last and prev and prev > 0:
+                out[sym] = (last - prev) / prev * 100.0
+        except Exception:
+            continue
+    return out
+
+
+@router.get("/movers")
+async def investments_movers(threshold: float = MOVER_THRESHOLD_PCT):
+    """Held positions whose absolute day change exceeds ``threshold`` percent.
+
+    Returns ``{"message": <digest or "">, "count": N}``. The message is a
+    tickers-and-percentages digest (no dollar amounts); it is empty when nothing
+    moved that much — or on any failure (missing snapshot / quote-fetch error) —
+    so a scheduled ``endpoint`` action stays silent on a quiet day.
+    """
+    try:
+        changes = _day_changes(_held_tickers())
+        movers = sorted(
+            ((s, pct) for s, pct in changes.items() if abs(pct) >= threshold),
+            key=lambda sp: -abs(sp[1]),
+        )
+        if not movers:
+            return {"message": "", "count": 0}
+        lines = [f"Positions moving more than {threshold:g}% today:"]
+        for sym, pct in movers:
+            lines.append(f"- {sym}: {'▲' if pct >= 0 else '▼'} {pct:+.1f}%")
+        return {"message": "\n".join(lines), "count": len(movers)}
+    except Exception as e:
+        logger.warning(f"investments movers check failed: {e}")
+        return {"message": "", "count": 0}

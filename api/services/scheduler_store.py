@@ -1099,9 +1099,21 @@ class SchedulerScheduler:
                     return f"API call failed: {resp.status_code}"
 
                 data = resp.json()
-                return json.dumps(data, indent=2, default=str)[:3500]
+                return _format_endpoint_result(data)
         except Exception as e:
             return f"Error calling endpoint: {e}"
+
+
+def _format_endpoint_result(data) -> str:
+    """Turn an endpoint's JSON response into the message to send.
+
+    An endpoint may return a ready-to-send ``{"message": "..."}`` — use it
+    verbatim, so an empty message suppresses the notification via the fire
+    loop's ``if message:`` guard. Otherwise fall back to a pretty JSON dump.
+    """
+    if isinstance(data, dict) and "message" in data:
+        return data["message"]
+    return json.dumps(data, indent=2, default=str)[:3500]
 
 
 # ---------------------------------------------------------------------------
