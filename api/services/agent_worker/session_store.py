@@ -1244,6 +1244,27 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_latest_open_question(
+        self, bot: str | None = None, kind: str | None = None
+    ) -> dict | None:
+        """The most recent open (unanswered, not-timed-out) question, optionally
+        filtered by owning bot and kind. Used to route a bare affirmative sent
+        as a plain message to the goal gate it almost certainly answers (#453)
+        instead of spawning a context-free session."""
+        bot_clause, bot_params = self._bot_scope_clause(bot)
+        kind_clause = " AND kind = ?" if kind else ""
+        params: list = [*bot_params, *([kind] if kind else [])]
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor'"
+                + bot_clause + kind_clause +
+                " ORDER BY id DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_open_question_by_message_id(
         self, sent_message_id: int, bot: str | None = None,
         include_answered: bool = False,

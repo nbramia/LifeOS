@@ -679,6 +679,38 @@ class TelegramBotListener:
         from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
         from api.services.agent_worker.session_store import SessionStore
 
+        # A short bare affirmative ("yes", "approved", "go ahead") is never a
+        # problem report — it's almost certainly a mis-threaded approval of a
+        # pending goal (#453: each such plain message used to spawn a fresh
+        # context-free session). Route it to the most recent open goal gate on
+        # this bot instead; only genuinely unmatched text falls through to a
+        # spawn. The length bound keeps real reports that merely START with
+        # "yes ..." ("yes the calendar tool is broken again") spawning normally.
+        stripped = text.strip()
+        if len(stripped) <= 25:
+            from api.services.agent_worker.worker import _is_affirmative
+            if _is_affirmative(stripped):
+                try:
+                    gate = SessionStore().get_latest_open_question(
+                        bot=self._bot.name, kind="goal_approval",
+                    )
+                except Exception as exc:
+                    logger.warning(f"goal-gate lookup failed: {exc}")
+                    gate = None
+                if gate and await self._maybe_handle_claude_code_reply(
+                    int(gate["sent_message_id"]), stripped, chat_id,
+                ):
+                    return
+                if not gate:
+                    await send_message_async(
+                        f'I got "{stripped}" but there\'s nothing here waiting '
+                        "for an approval — no session was started. If you meant "
+                        "to answer an earlier message, use Telegram's Reply on "
+                        "it; otherwise describe the problem you want me to fix.",
+                        chat_id=chat_id,
+                    )
+                    return
+
         working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
         prompt = (
             f"{self._persona}\n\n"

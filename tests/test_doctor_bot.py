@@ -448,6 +448,99 @@ class TestDoctorListener:
         answered = store.list_answered_unprocessed_questions()
         assert len(answered) == 1
 
+    def _seed_goal_gate(self, tmp_path, message_id=5000):
+        from api.services.agent_worker.session_store import STATUS_BLOCKED, SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        s = store.create(
+            task_id="t-gate", routing="claude_code", origin="operator",
+            bot="doctor", status=STATUS_BLOCKED,
+        )
+        store.create_pending_question(
+            session_id=s.session_id, task_id="t-gate",
+            question="goal + instructions", sent_message_id=message_id,
+            sent_message_ids=[message_id], kind="goal_approval", bot="doctor",
+        )
+        return store, s
+
+    @pytest.mark.asyncio
+    async def test_bare_affirmative_routes_to_open_goal_gate_not_spawn(self, tmp_path):
+        """#453: a plain (non-threaded) "yes" while a goal gate is open must
+        answer THAT gate — not spawn a fresh context-free session (the
+        yes/approved orphan factory of 2026-07-09)."""
+        from unittest.mock import MagicMock
+
+        store, s = self._seed_goal_gate(tmp_path)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None, bot=None):
+            sent.append(text)
+
+        def _capture_ids(text, chat_id=None, bot=None):
+            sent.append(text)
+            return [8001]
+
+        spawn = MagicMock()
+        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            await listener._handle_orchestration_message("Yes", "999")
+
+        spawn.assert_not_called()
+        assert any("Goal locked" in t for t in sent)
+        answered = store.list_answered_unprocessed_questions()
+        assert [q["answer"] for q in answered] == ["Yes"]
+
+    @pytest.mark.asyncio
+    async def test_bare_affirmative_with_no_gate_is_consumed_not_spawned(self, tmp_path):
+        """#453: "yes" with nothing awaiting approval must not spawn a session
+        whose entire "report" is the word yes — it gets a clear pointer back."""
+        from unittest.mock import MagicMock
+        from api.services.agent_worker.session_store import SessionStore
+
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None, bot=None):
+            sent.append(text)
+
+        spawn = MagicMock()
+        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            await listener._handle_orchestration_message("approved", "999")
+
+        spawn.assert_not_called()
+        assert any("nothing here waiting" in t for t in sent)
+
+    @pytest.mark.asyncio
+    async def test_report_starting_with_yes_still_spawns(self, tmp_path):
+        """A real report that merely STARTS with an affirmative word ("yes the
+        calendar tool is broken again") exceeds the bare-affirmative bound and
+        spawns a session as before."""
+        from unittest.mock import MagicMock
+
+        store, s = self._seed_goal_gate(tmp_path)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+
+        spawn = MagicMock(return_value={"ok": True, "session_id": "sess-n", "task_id": "t-n"})
+        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=lambda t, c=None, bot=None: [1]), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
+            await listener._handle_orchestration_message(
+                "yes the calendar tool is broken again", "999")
+
+        spawn.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_pure_chat_bot_never_spawns(self):
         listener = self._listener("fitness", "999", persona="P", orchestrates=False)
