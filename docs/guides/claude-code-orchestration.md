@@ -146,7 +146,7 @@ Only one session runs at a time. If you send `/claude` while a session is active
 
 ## How It Works
 
-Implementation moved to the [technical spec](../specs/technical/claude-code-orchestration.md) — that covers subprocess spawning, stream parsing, `[NOTIFY]`/`[CLARIFY]` extraction, the system prompt, the heartbeat timer, and budget enforcement. Operator-facing summary: it's a one-shot `claude` subprocess with `--output-format stream-json --dangerously-skip-permissions`, parsed in real time, with `[NOTIFY]` checkpoints relayed to Telegram and a 5-minute heartbeat so you always know it's alive.
+Implementation moved to the [technical spec](../specs/product/claude-code-orchestration.md) — that covers subprocess spawning, stream parsing, `[NOTIFY]`/`[CLARIFY]` extraction, the system prompt, the heartbeat timer, and budget enforcement. Operator-facing summary: it's a one-shot `claude` subprocess with `--output-format stream-json --dangerously-skip-permissions`, parsed in real time, with `[NOTIFY]` checkpoints relayed to Telegram and a 5-minute heartbeat so you always know it's alive.
 
 ---
 
@@ -209,7 +209,7 @@ If Claude is working in the wrong directory, make your task description more exp
 ## Related Documents
 
 - [Claude Code Orchestration — Product](../specs/product/claude-code-orchestration.md) -- What `/claude` does (consumer view); plan mode; clarifications; budgets
-- [Claude Code Orchestration — Technical](../specs/technical/claude-code-orchestration.md) -- Implementation: subprocess, stream parsing, system prompt, cancellation
+- [Claude Code Orchestration — Spec](../specs/product/claude-code-orchestration.md) -- Implementation: subprocess, stream parsing, system prompt, cancellation
 - [Configuration](configuration.md) -- `LIFEOS_CLAUDE_*` env vars
 - [MCP Tools](../specs/product/mcp-tools.md) -- MCP tools available to Claude Code sessions
 - [Doctor Bot](doctor-bot.md) -- The self-repair bot, which drives a Claude Code session per the same orchestration machinery

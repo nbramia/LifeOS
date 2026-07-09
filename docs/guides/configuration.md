@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-07-09
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -24,7 +24,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
 | `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/claude` orchestrator path resolution. |
 | `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
-| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://nathanramia-linux.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
+| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
@@ -37,6 +37,15 @@ systemctl --user disable --now whisper-relay-tailscale.service
 ```
 
 This binds Tailscale **HTTPS :443 → LifeOS :8000**. whisper-relay stays on localhost; voice calls go through LifeOS same-origin.
+
+## Auto-Deploy
+
+Optional pull-based deploy loop: `lifeos-autodeploy.timer` polls `origin/main` every 10 minutes and, when it advances, fast-forward pulls and restarts the code services that changed. Guarded — it only acts on the `main` branch, with a clean working tree, and only `--ff-only`. Off by default so a fresh clone never silently pulls and restarts. Run `sudo ./scripts/setup-systemd.sh` after changing these. Read by `scripts/auto-deploy.sh` and `setup-systemd.sh` (not Pydantic Settings).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_AUTODEPLOY_ENABLED` | bool | `false` | Enable the `lifeos-autodeploy.timer`. |
+| `LIFEOS_AUTODEPLOY_NOTIFY` | str | `failure` | Telegram notifications from auto-deploy: `failure` (default), `always`, or `never`. |
 
 ## LLM Backend — Synthesis and Orchestration
 
@@ -62,24 +71,26 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `LIFEOS_EMBEDDING_MODEL` | str | `Alibaba-NLP/gte-Qwen2-1.5B-instruct` | Sentence-transformers encoder. Changing this requires reindexing the ChromaDB collection (dimension changes). |
+| `LIFEOS_EMBEDDING_MODEL` | str | `mixedbread-ai/mxbai-embed-large-v1` | Sentence-transformers encoder (1024-dim, ~335M params — the fresh-clone default). Changing this requires reindexing the ChromaDB collection (dimension changes). |
 | `LIFEOS_EMBEDDING_CACHE` | path | — | Embedding cache directory (empty = HuggingFace default `~/.cache/huggingface`). |
 | `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
 | `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
 | `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
+| `HF_HUB_OFFLINE` | bool | `1` | Standard HuggingFace flag. `1` forces the embedding loader to use the local model cache only, skipping the huggingface.co etag round-trip on every model load. Set in `.env.example` to avoid DNS-failure retry storms during the nightly sync window (model files are pinned by `requirements.txt`). Honored directly by the HuggingFace libraries, not a Pydantic Setting. |
+| `TRANSFORMERS_OFFLINE` | bool | `1` | Companion to `HF_HUB_OFFLINE` for the `transformers` library. Same rationale. |
 
-**When to change `LIFEOS_EMBEDDING_MODEL`:** if your hardware can't hold the default (~15-22 GB transient). Smaller options: `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~80 MB) or `mixedbread-ai/mxbai-embed-large-v1` (1024-dim, ~1.3 GB, previous default).
+**When to change `LIFEOS_EMBEDDING_MODEL`:** the default `mxbai-embed-large-v1` (1024-dim) is a stable, well-tested encoder that fits modest hardware. On a high-VRAM machine, `Alibaba-NLP/gte-Qwen2-1.5B-instruct` (1536-dim) is a recommended quality upgrade (larger transient footprint, ~15-22 GB). On constrained hardware, drop to `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~80 MB). Any change requires a full reindex.
 
-## Ollama — Intent Classifier
+## Ollama — Legacy Timeout Aliases
 
-Local-LLM-backed intent classifier for the chat pipeline. Decision in [ADR-006](../adr/006-ollama-query-routing.md).
+**These `OLLAMA_*` variables are legacy aliases.** LifeOS no longer runs Ollama — routing and summarization go through the unified LLM client (the Anthropic API or a local `llama-server`, per `LIFEOS_LLM_BACKEND`). The variable names are retained only so existing operator `.env` files don't break. Of the four, only the two timeout vars still have any effect (read as generic request timeouts); `OLLAMA_HOST` and `OLLAMA_MODEL` are vestigial and read by nothing. Historical decision: [ADR-006](../adr/006-ollama-query-routing.md).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `OLLAMA_HOST` | str | `http://localhost:11434` | Ollama server endpoint. |
-| `OLLAMA_MODEL` | str | `gemma4:26b` | Model used for classification. |
-| `OLLAMA_TIMEOUT` | int | `45` | Per-request timeout, seconds. |
-| `OLLAMA_RETRY_TIMEOUT` | int | `60` | Retry timeout, seconds. |
+| `OLLAMA_TIMEOUT` | int | `45` | Per-request timeout, seconds (still read). |
+| `OLLAMA_RETRY_TIMEOUT` | int | `60` | Retry timeout, seconds (still read). |
+| `OLLAMA_HOST` | str | `http://localhost:11434` | Vestigial — read by nothing. |
+| `OLLAMA_MODEL` | str | `gemma4:26b` | Vestigial — read by nothing. |
 
 ## MCP HTTP Transport
 
@@ -204,6 +215,7 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | `LIFEOS_CURRENT_WORK_PATH` | str | `Work/` | Work folder prefix in the vault. |
 | `LIFEOS_PERSONAL_ARCHIVE_PATH` | str | `Personal/zArchive/` | Personal archive folder prefix. |
 | `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
+| `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` | date | — | For undated notes, trust the file's mtime as the interaction date only when the mtime is strictly later than this `YYYY-MM-DD` cutoff; otherwise the note falls back to the 1970 "undated" sentinel. Set to a date after your last bulk migration (clone/restore/mass-rename) so migration-era mtimes don't show up as recent activity. Leave unset to keep all undated notes on the sentinel. Read directly from the environment by `api/services/indexer.py` (not a Pydantic Setting). |
 
 ## Multi-Account Sync
 
@@ -222,6 +234,16 @@ All work toggles default to `false` — work data is not indexed unless explicit
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_PHOTOS_PATH` | path | `~/Pictures/Photos Library.photoslibrary` | Apple Photos library path. Read by the Apple Data Agent on macOS (see [ADR-010](../adr/010-apple-data-agent.md)). |
+
+## Fitness & Health
+
+Apple Health/Fitness ingestion. See [apple-health.md](apple-health.md) for the end-to-end flow.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_HEALTH_EXPORT_PATH` | path | `data/apple-imports/health.json` | Path to the Apple Health export JSON written by the iOS Shortcut. Imported nightly. Point at a synced location (e.g. `~/Code/Sync/health/health.json`) for automation. |
+| `LIFEOS_HEALTH_INGEST_TOKEN` | str | — | Bearer token for `POST /api/fitness/health/ingest` (the HealthBridge app's POST delivery mode). Empty disables the endpoint (503). Generate with `openssl rand -hex 32`. |
+| `LIFEOS_FITNESS_SHEET_ID` | str | — | Google Sheet ID to mirror the workout log into (optional; mirror is off if unset). Requires the read-write Sheets OAuth scope — re-run the Google auth flow after enabling. |
 
 ## Notifications
 

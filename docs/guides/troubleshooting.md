@@ -1,7 +1,7 @@
 # Troubleshooting
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 > **Audience:** Operators
 
 Common issues and solutions organized by category.
@@ -60,10 +60,11 @@ kill -9 <PID>
 # Check error logs
 tail -50 logs/lifeos-api-error.log
 
-# Try running directly for better error output
-source ~/.venvs/lifeos/bin/activate
-uvicorn api.main:app --host 0.0.0.0 --port 8000
+# Run in the foreground to watch startup errors live (Ctrl+C to stop)
+./scripts/server.sh foreground
 ```
+
+Never run `uvicorn api.main:app` directly — it binds only localhost and creates a ghost server on a different interface than the script's `0.0.0.0` bind.
 
 **Common Causes**:
 - ChromaDB not running
@@ -119,7 +120,7 @@ pgrep -f "chroma run"
 ./scripts/chromadb.sh start
 
 # Verify
-curl http://localhost:8001/api/v1/heartbeat
+curl http://localhost:8001/api/v2/heartbeat
 ```
 
 ---
@@ -138,48 +139,6 @@ tail -50 logs/chromadb-error.log
 source ~/.venvs/lifeos/bin/activate
 chroma run --path ./data/chromadb --port 8001
 ```
-
----
-
-## Ollama Issues
-
-### Model Not Found
-
-**Symptom**: `model 'qwen2.5:7b-instruct' not found`
-
-**Solution**:
-```bash
-# Pull the model
-ollama pull qwen2.5:7b-instruct
-
-# Verify
-ollama list
-```
-
----
-
-### Ollama Not Running
-
-**Symptom**: `connection refused` on port 11434.
-
-**Solution**:
-```bash
-# Start Ollama
-ollama serve &
-
-# Verify
-curl http://localhost:11434/api/tags | jq
-```
-
----
-
-### Slow Query Routing
-
-**Symptom**: First query takes 30+ seconds.
-
-**Cause**: Ollama loading model into memory.
-
-**Solution**: This is normal on first query. Subsequent queries will be faster. Keep Ollama running.
 
 ---
 
@@ -355,9 +314,6 @@ curl -X POST http://localhost:8000/api/admin/reindex/sync
 # ChromaDB
 ./scripts/chromadb.sh status
 
-# Ollama
-curl -s http://localhost:11434/api/tags | jq '.models[].name'
-
 # Full health check
 curl http://localhost:8000/health/full | jq
 ```
@@ -393,7 +349,7 @@ tail -f logs/crm-sync.log
 If these solutions don't work:
 
 1. Check the error logs for specific messages
-2. Search existing issues: https://github.com/yourusername/LifeOS/issues
+2. Search existing issues: https://github.com/<your-fork>/LifeOS/issues
 3. Open a new issue with:
    - Error message
    - Steps to reproduce

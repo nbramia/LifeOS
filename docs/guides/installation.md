@@ -1,13 +1,46 @@
 # Installation Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-07-09
 > **Audience:** New users
 
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
-> [SETUP.md](setup.md) -- it will walk you through the full setup interactively.
+> [setup.md](setup.md) -- it will walk you through the full setup interactively.
 
 Complete walkthrough for setting up LifeOS on Linux or macOS.
+
+---
+
+## Start Here: Minimal vs Full Setup
+
+LifeOS has two setup tiers. Do the minimal path first, confirm it works, then add
+integrations as needed.
+
+**Minimal setup** — a working hybrid-search corpus and chat at `/chat`:
+
+1. An **Anthropic API key** (the default LLM backend calls Claude).
+2. A **Markdown / Obsidian vault** to index (`LIFEOS_VAULT_PATH`).
+3. **ChromaDB** running for vector search (`./scripts/chromadb.sh start`).
+
+That's enough to index the vault, run semantic + keyword search, and chat over it.
+CRM, relationship insights, and communication-gap features stay empty until a data
+sync runs — they're populated by the optional integrations below, not by vault
+indexing.
+
+**Full setup** — layer these on when you want them (all optional, all addable later):
+
+- **Google OAuth** — Gmail, Calendar, Drive sync
+- **Slack** — workspace message sync
+- **Monarch Money** — account balances, transactions, budgets
+- **Telegram bot(s)** — chat interface and push notifications
+- **Apple Data Agent** (macOS) — iMessage, phone calls, contacts
+- **Local llama-server** — fully local LLM instead of the Anthropic backend (needs a high-VRAM GPU)
+- **whisper-relay** — voice input
+- **Agent worker** — autonomous execution of `#agent`-tagged tasks
+
+The minimal path is Steps 1–8 below. The full-setup integrations are covered in
+[Configuration](configuration.md), [Google OAuth](google-oauth.md),
+[Slack Integration](slack-integration.md), and the interactive [Setup](setup.md) guide.
 
 ---
 
@@ -15,8 +48,7 @@ Complete walkthrough for setting up LifeOS on Linux or macOS.
 
 - **Linux** (primary) or **macOS** (required only for Apple Data Agent: iMessage, Contacts, Photos)
 - **Python 3.11+**
-- **Ollama** (for query routing; install via package manager or [ollama.com](https://ollama.com))
-- **Anthropic API key** (optional — only needed if you prefer Claude over a local LLM; set `LIFEOS_LLM_BACKEND=anthropic` in `.env`)
+- **Anthropic API key** — required for the default LLM backend (`LIFEOS_LLM_BACKEND=anthropic`), which handles orchestration and synthesis. Only optional if you run the fully-local path instead (`LIFEOS_LLM_BACKEND=local` + llama-server + a high-VRAM GPU — see [Local LLM (optional)](#local-llm-optional)).
 
 ---
 
@@ -49,32 +81,7 @@ pip install -r requirements.txt
 
 ---
 
-## Step 3: Install Ollama
-
-Ollama provides local LLM for query routing (determining if a query needs semantic search, keyword search, or both).
-
-```bash
-# Install Ollama
-# Linux:
-curl -fsSL https://ollama.com/install.sh | sh
-# macOS:
-brew install ollama
-
-# Start Ollama service
-ollama serve &
-
-# Pull the routing model
-ollama pull qwen2.5:7b-instruct
-```
-
-Verify Ollama is running:
-```bash
-curl http://localhost:11434/api/tags | jq
-```
-
----
-
-## Step 4: Set Up ChromaDB
+## Step 3: Set Up ChromaDB
 
 ChromaDB stores vector embeddings for semantic search. It runs as a separate server.
 
@@ -84,7 +91,7 @@ On Linux, ChromaDB can be managed via systemd (see `setup-systemd.sh`). On macOS
 
 ```bash
 # Add to crontab (crontab -e)
-*/5 * * * * pgrep -f "chroma run" || (cd /path/to/LifeOS && ./scripts/chromadb.sh start)
+*/5 * * * * pgrep -f "chroma run" || (cd ~/LifeOS && ./scripts/chromadb.sh start)
 ```
 
 ### Option B: Manual Start
@@ -95,12 +102,12 @@ On Linux, ChromaDB can be managed via systemd (see `setup-systemd.sh`). On macOS
 
 Verify ChromaDB is running:
 ```bash
-curl http://localhost:8001/api/v1/heartbeat
+curl http://localhost:8001/api/v2/heartbeat
 ```
 
 ---
 
-## Step 5: Configure Environment
+## Step 4: Configure Environment
 
 Copy the example environment file:
 
@@ -124,9 +131,11 @@ LIFEOS_USER_NAME=YourFirstName
 
 The full env-var reference (defaults, types, when-to-change notes for every `LIFEOS_*` and third-party variable) lives in [configuration.md](configuration.md).
 
+> **Note:** `OLLAMA_*` variables are legacy and ignored — Ollama is no longer part of LifeOS. Do not install it.
+
 ---
 
-## Step 6: Run Preflight Check
+## Step 5: Run Preflight Check
 
 ```bash
 # Validate all prerequisites before starting
@@ -137,7 +146,7 @@ Fix any failures before proceeding. Warnings are non-blocking.
 
 ---
 
-## Step 7: Start Server
+## Step 6: Start Server
 
 ```bash
 # Start the server (ALWAYS use this script, never run uvicorn directly)
@@ -151,7 +160,7 @@ Web UI available at: http://localhost:8000
 
 ---
 
-## Step 8: Verify Installation
+## Step 7: Verify Installation
 
 Run the verification checklist:
 
@@ -160,38 +169,39 @@ Run the verification checklist:
 curl http://localhost:8000/health/full | jq
 
 # 2. Check ChromaDB connection
-curl http://localhost:8001/api/v1/heartbeat
+curl http://localhost:8001/api/v2/heartbeat
 
-# 3. Check Ollama
-curl http://localhost:11434/api/tags | jq '.models[].name'
-
-# 4. Run tests
+# 3. Run tests
 ./scripts/test.sh
 ```
 
-All checks should pass. If any fail, see [Troubleshooting](../reference/TROUBLESHOOTING.md).
+All checks should pass. If any fail, see [Troubleshooting](troubleshooting.md).
 
 ---
 
 ## Next Steps
 
-1. **Configure integrations**: See [Configuration](CONFIGURATION.md)
-2. **Set up Google OAuth**: See [Google OAuth Guide](../guides/GOOGLE-OAUTH.md)
+1. **Configure integrations**: See [Configuration](configuration.md)
+2. **Set up Google OAuth**: See [Google OAuth Guide](google-oauth.md)
 3. **Set up systemd services** (Linux): `sudo ./scripts/setup-systemd.sh`
 4. **Set up FDA wrapper** (macOS, for Apple Data Agent): `./scripts/create-lifeos-app.sh` — see [ADR-010: Apple Data Agent](../adr/010-apple-data-agent.md) for the design context (why a `.app` bundle, why rsync, what fails when)
 5. **Configure launchd services** (macOS, legacy only — see [launchd-setup.md](launchd-setup.md) for why it's superseded post-Linux-migration)
-6. **Run your first sync**: See [First Run Guide](FIRST-RUN.md)
+6. **Run your first sync**: See [First Run Guide](first-run.md)
 
 ---
 
-## Local LLM Model Selection
+## Local LLM (optional)
 
-LifeOS supports any GGUF model via llama-server. Two models are pre-configured:
+The default backend is Anthropic (Claude via API). Running a fully-local LLM is an
+**optional alternative** — set `LIFEOS_LLM_BACKEND=local` and run a llama-server
+alongside LifeOS. It needs a high-VRAM GPU. LifeOS supports any GGUF model via
+llama-server; a few are pre-configured:
 
-| Model | VRAM | Quality | Embeddings coexist? |
-|-------|------|---------|---------------------|
-| `ggml-org/gpt-oss-120b-GGUF` (default) | ~59 GB | Highest | No — sync stops LLM automatically |
-| `Qwen/Qwen3-32B-GGUF` | ~20 GB | Good | Yes — both fit in 80 GB GPU |
+| Model | VRAM | Notes |
+|-------|------|-------|
+| `unsloth/gemma-4-26B-A4B-it-GGUF` (default) | ~16 GB (Q4_K_M) | MoE — pairs well with the embedding model |
+| `Qwen/Qwen3-32B-GGUF` | ~20 GB (Q4_K_M) | Strong general-purpose option |
+| `ggml-org/gpt-oss-120b-GGUF` | ~59 GB (MXFP4) | Highest quality, but starves embeddings (sync stops the LLM automatically) |
 
 ### Switching models
 
@@ -206,7 +216,7 @@ sudo ./scripts/setup-systemd.sh
 sudo systemctl restart lifeos-llm
 ```
 
-The first start with a new model downloads the GGUF file (~20 GB for Qwen3-32B Q4_K_M). Subsequent starts use the cached file in `~/.cache/llama.cpp/`.
+The first start with a new model downloads the GGUF file. Subsequent starts use the cached file in `~/.cache/llama.cpp/`.
 
 ---
 
@@ -217,7 +227,7 @@ If running a local LLM on an AMD APU with unified memory (e.g., Ryzen AI MAX+), 
 **Recommended allocation: 80 GB GPU** (for systems with 96+ GB total). This gives:
 - ~59 GB for gpt-oss-120b (MXFP4) with 21 GB GPU headroom
 - ~20 GB for Qwen3-32B (Q4_K_M) with 60 GB GPU headroom
-- ~46 GB visible to the CPU (vs ~30 GB at 96 GB GPU allocation)
+- More RAM visible to the CPU than a larger GPU allocation would leave
 
 The setup script creates an 8 GB swap file as an OOM safety net. The nightly sync pipeline automatically stops the LLM before embedding phases if GPU memory is insufficient, and restarts it afterward.
 
@@ -236,9 +246,8 @@ sudo systemd-run --scope -p MemoryMax=16G --user bash
 | Issue | Solution |
 |-------|----------|
 | ChromaDB won't start | Check port 8001 isn't in use: `lsof -i :8001` |
-| Ollama connection refused | Start Ollama: `ollama serve &` |
 | Server won't start | Check port 8000: `./scripts/server.sh status` |
-| Tests failing | Ensure ChromaDB and Ollama are running |
+| Tests failing | Ensure ChromaDB is running |
 
 See [Troubleshooting](troubleshooting.md) for detailed solutions.
 
