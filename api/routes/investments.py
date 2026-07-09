@@ -21,6 +21,12 @@ router = APIRouter(prefix="/api/investments", tags=["investments"])
 
 SYNC_DIR = os.path.expanduser("~/Code/Sync/investments")
 
+# Freshness alerting (#448): the macbook pipeline refreshes on weekdays (~18:30)
+# and Syncthing delivers here. A weekend plus the weekday cadence can leave the
+# file ~3 days old legitimately, so warn only past this threshold — enough to
+# catch a genuinely stuck pipeline / Syncthing without false-alarming on Mondays.
+STALENESS_WARNING_DAYS = 4
+
 
 def _load(name: str):
     path = os.path.join(SYNC_DIR, name)
@@ -52,3 +58,27 @@ async def investments_portfolio(section: Optional[str] = None):
                                 detail=f"no section '{section}'; available: {sorted(data)}")
         return {"synced_at": synced, "section": section, "data": data[section]}
     return {"synced_at": synced, **data}
+
+
+def check_investments_freshness() -> Optional[str]:
+    """Return a staleness warning message if the snapshot is older than
+    STALENESS_WARNING_DAYS, else None.
+
+    Stale-but-present semantics: a missing / never-synced file is NOT an error
+    (returns None) — the pipeline may simply not be set up on this host. Only a
+    present-but-old snapshot warrants a warning (the weekday refresh or Syncthing
+    likely stalled). Intended to be logged at WARNING by the nightly runner so it
+    lands in the batched health report — not raised, not a CRITICAL page.
+    """
+    path = os.path.join(SYNC_DIR, "summary.json")
+    if not os.path.exists(path):
+        return None
+    mtime = os.path.getmtime(path)
+    age_days = (datetime.now().timestamp() - mtime) / 86400
+    if age_days > STALENESS_WARNING_DAYS:
+        synced = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+        return (
+            f"Investments snapshot is {age_days:.1f} days old (last synced {synced}); "
+            f"the weekday refresh (~18:30) or Syncthing may have stalled."
+        )
+    return None

@@ -1342,6 +1342,17 @@ def run_all_syncs(
     except Exception as e:
         logger.warning(f"Source-entity drift detector failed: {e}")
 
+    # Investments-snapshot freshness (#448): the Schwab pipeline delivers
+    # summary.json via Syncthing (weekday ~18:30 refresh); warn (batched) if it
+    # has gone stale. Non-fatal, and skipped silently when the file is absent.
+    try:
+        from api.routes.investments import check_investments_freshness
+        stale_msg = check_investments_freshness()
+        if stale_msg:
+            logger.warning(stale_msg)
+    except Exception as e:
+        logger.warning(f"Investments freshness check failed: {e}")
+
     # Calculate duration
     end_time = datetime.now()
     duration_seconds = (end_time - start_time).total_seconds()
