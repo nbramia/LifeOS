@@ -745,6 +745,9 @@ def get_disabled_work_sources() -> set[str]:
 # no-op (e.g. credentials missing from the child env). Exit-code hardening in
 # the sync scripts catches the known skip paths; this catches unknown ones.
 DURATION_COLLAPSE_MIN_TYPICAL_SECONDS = 60.0
+# Floor of the relative elapsed threshold: a run is "collapsed" when it
+# finishes under max(this floor, 5% of typical), shrinking the blind spot
+# for slow sources (e.g. a 450s-typical sync no-oping in 10s).
 DURATION_COLLAPSE_MAX_ELAPSED_SECONDS = 2.0
 
 
@@ -761,7 +764,8 @@ def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | Non
 
     if typical is None:
         return None
-    if typical > DURATION_COLLAPSE_MIN_TYPICAL_SECONDS and elapsed_seconds < DURATION_COLLAPSE_MAX_ELAPSED_SECONDS:
+    elapsed_threshold = max(DURATION_COLLAPSE_MAX_ELAPSED_SECONDS, 0.05 * typical)
+    if typical > DURATION_COLLAPSE_MIN_TYPICAL_SECONDS and elapsed_seconds < elapsed_threshold:
         return {
             "elapsed_seconds": elapsed_seconds,
             "typical_seconds": typical,

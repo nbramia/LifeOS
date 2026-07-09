@@ -536,6 +536,25 @@ class TestDurationCollapse:
         with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
             assert _detect_duration_collapse("slack", 380.0) is None
 
+    def test_relative_threshold_catches_slow_source_collapse(self):
+        """The elapsed threshold scales with typical duration: for a
+        450s-typical source the cutoff is max(2, 0.05*450) = 22.5s, so a
+        10s no-op is flagged even though it's above the 2s floor."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            info = _detect_duration_collapse("slack", 10.0)
+
+        assert info is not None
+        assert info["typical_seconds"] == 450.0
+
+    def test_relative_threshold_allows_fast_but_plausible_run(self):
+        """A run above the relative cutoff (30s vs 22.5s) is not flagged."""
+        from scripts.run_all_syncs import _detect_duration_collapse
+
+        with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
+            assert _detect_duration_collapse("slack", 30.0) is None
+
     def test_collapse_check_survives_db_errors(self):
         """A sync_health DB hiccup must never fail the sync itself."""
         from scripts.run_all_syncs import _detect_duration_collapse
