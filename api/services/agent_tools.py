@@ -439,9 +439,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_finances",
         "description": (
-            "Query live financial data from Monarch Money. "
+            "Query live financial data. "
             "Actions: 'accounts' (current balances), 'transactions' (recent spending, filterable), "
-            "'cashflow' (income/expenses/savings summary), 'budgets' (budget vs actual by category). "
+            "'cashflow' (income/expenses/savings summary), 'budgets' (budget vs actual by category), "
+            "'investments' (Nathan's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
+            "buckets, per-position holdings with cost basis, savings by year, wealth trend, taxable "
+            "unrealized gains; aggregated nightly by the investments pipeline). "
             "For historical monthly summaries, use search_vault with 'finance' or 'spending'."
         ),
         "input_schema": {
@@ -449,7 +452,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["accounts", "transactions", "cashflow", "budgets"],
+                    "enum": ["accounts", "transactions", "cashflow", "budgets", "investments"],
                     "description": "What financial data to retrieve.",
                 },
                 "start_date": {
@@ -1756,6 +1759,41 @@ async def _tool_search_finances(inp: dict) -> str:
     from api.services.monarch import get_monarch_client
 
     action = inp["action"]
+
+    if action == "investments":
+        # Schwab pipeline snapshot, synced from nathan-macbook via Syncthing
+        # (see api/routes/investments.py). Read from disk — no client needed.
+        import json as _json
+        import os as _os
+        path = _os.path.expanduser("~/Code/Sync/investments/summary.json")
+        if not _os.path.exists(path):
+            return "Investments snapshot not synced yet (macbook refresh hasn't run)."
+        with open(path) as f:
+            inv = _json.load(f)
+        synced = datetime.fromtimestamp(_os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+        t = inv["totals"]
+        lines = [
+            f"Investments (as of {inv['as_of']}, synced {synced}):",
+            f"- Total: ${t['all_investments']:,.0f} (Schwab ${t['schwab']:,.0f} + external retirement ${t['external_retirement']:,.0f})",
+            f"- Tax buckets: pre-tax ${t['tax_buckets']['pretax']:,.0f} · Roth ${t['tax_buckets']['roth']:,.0f} · taxable ${t['tax_buckets']['taxable']:,.0f}",
+            "", "Accounts:",
+        ]
+        for a in sorted(inv["accounts"], key=lambda x: -x["value"]):
+            tag = " (external)" if a["external"] else ""
+            lines.append(f"- {a['name']} [{a['key']}]{tag}: ${a['value']:,.0f}")
+        lines += ["", "Top positions:"]
+        for pos in inv["positions"][:15]:
+            unrl = f", unrealized ${pos['unrealized']:+,.0f}" if pos.get("unrealized") is not None else ""
+            lines.append(f"- {pos['symbol']}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
+        tu = inv["taxable_unrealized"]
+        lines += [
+            "",
+            f"Taxable unrealized: LT ${tu['long_term']:,.0f} · ST ${tu['short_term']:,.0f} · harvestable ${tu['harvestable_losses']:,.0f}",
+            f"Net saved by year: {inv['savings_net_by_year']}",
+            "Full detail: GET /api/investments/portfolio (positions incl. lots/flows, wealth history).",
+        ]
+        return "\n".join(lines)
+
     client = get_monarch_client()
 
     if action == "accounts":
