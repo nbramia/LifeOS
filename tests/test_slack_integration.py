@@ -324,3 +324,67 @@ class TestListChannelsMemberOnly:
 
         url = http.get.call_args.args[0]
         assert url.endswith("/conversations.list")
+
+    def test_member_only_excludes_archived(self):
+        client, http = self._client_with_capture()
+
+        client.list_channels(member_only=True)
+
+        params = http.get.call_args.kwargs["params"]
+        assert params["exclude_archived"] == "true"
+
+    def test_default_does_not_exclude_archived(self):
+        client, http = self._client_with_capture()
+
+        client.list_channels()
+
+        params = http.get.call_args.kwargs["params"]
+        assert "exclude_archived" not in params
+
+
+@patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
+class TestGetAllChannelHistoryNoiseFiltering:
+    """Channel membership/metadata system messages (channel_join,
+    channel_topic, ...) must not be returned by the sync bulk-fetch path —
+    each would otherwise become a searchable indexed document."""
+
+    def _client_with_history(self, messages):
+        from api.services.slack_integration import SlackClient
+
+        store = MagicMock()
+        store.get_token.return_value = "xoxp-test-fake-token"
+        client = SlackClient(token_store=store)
+        client._api_call = MagicMock(return_value={
+            "ok": True,
+            "messages": messages,
+            "response_metadata": {},
+        })
+        return client
+
+    def test_noise_subtypes_are_skipped(self):
+        client = self._client_with_history([
+            {"type": "message", "ts": "1700000003.000000",
+             "user": "U1", "text": "Real discussion message"},
+            {"type": "message", "ts": "1700000002.000000", "user": "U2",
+             "subtype": "channel_join",
+             "text": "<@U2> has joined the channel"},
+            {"type": "message", "ts": "1700000001.000000", "user": "U1",
+             "subtype": "channel_topic",
+             "text": "<@U1> set the channel topic: standup notes"},
+        ])
+
+        messages = client.get_all_channel_history("C123")
+
+        assert len(messages) == 1
+        assert messages[0].text == "Real discussion message"
+
+    def test_bot_messages_are_kept(self):
+        client = self._client_with_history([
+            {"type": "message", "ts": "1700000004.000000", "user": "",
+             "subtype": "bot_message", "text": "Deploy finished: build 42"},
+        ])
+
+        messages = client.get_all_channel_history("C123")
+
+        assert len(messages) == 1
+        assert messages[0].text == "Deploy finished: build 42"

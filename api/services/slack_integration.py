@@ -51,6 +51,27 @@ SLACK_SCOPES = [
 # Token storage path
 SLACK_TOKEN_PATH = Path("data/slack_tokens.json")
 
+# Channel system-message subtypes skipped during bulk history fetch (sync path).
+# These are membership/metadata noise ("X has joined the channel") that would
+# otherwise each become a searchable indexed document. Deliberately does NOT
+# include bot_message or thread_broadcast — those can carry substantive content.
+NOISE_MESSAGE_SUBTYPES = frozenset({
+    "channel_join",
+    "channel_leave",
+    "channel_topic",
+    "channel_purpose",
+    "channel_name",
+    "channel_archive",
+    "channel_unarchive",
+    "group_join",
+    "group_leave",
+    "group_topic",
+    "group_purpose",
+    "group_name",
+    "group_archive",
+    "group_unarchive",
+})
+
 
 @dataclass
 class SlackUser:
@@ -424,6 +445,10 @@ class SlackClient:
                 ``conversations.list`` (every channel in the workspace).
                 Membership scoping avoids ``not_in_channel`` errors on history
                 calls and cuts API volume on large workspaces — issue #439.
+                Archived channels are excluded (``exclude_archived``) so
+                channels the user was ever a member of don't cost a nightly
+                history call. Note: ``users.conversations`` does not return
+                ``num_members``, so ``member_count`` is 0 in this mode.
 
         Returns:
             List of SlackChannel objects
@@ -453,6 +478,10 @@ class SlackClient:
                 "types": ",".join(types_list),
                 "limit": 200,  # Max per request
             }
+            if member_only:
+                # users.conversations defaults to including archived channels
+                # the user was ever a member of — skip them.
+                params["exclude_archived"] = "true"
             if cursor:
                 params["cursor"] = cursor
 
@@ -569,6 +598,11 @@ class SlackClient:
 
             for msg in data.get("messages", []):
                 if msg.get("type") != "message":
+                    continue
+
+                # Skip channel membership/metadata system messages (join,
+                # leave, topic, etc.) — noise in the search index.
+                if msg.get("subtype") in NOISE_MESSAGE_SUBTYPES:
                     continue
 
                 ts = float(msg["ts"])
