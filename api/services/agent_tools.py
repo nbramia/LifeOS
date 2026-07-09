@@ -1784,7 +1784,14 @@ async def _tool_search_finances(inp: dict) -> str:
         lines += ["", f"Positions ({len(inv['positions'])}):"]
         for pos in inv["positions"]:
             unrl = f", unrealized ${pos['unrealized']:+,.0f}" if pos.get("unrealized") is not None else ""
-            lines.append(f"- {pos['symbol']}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
+            # Include the security name alongside the ticker: the model's
+            # world knowledge can be stale (a recently-IPO'd company reads as
+            # "private, can't be in a portfolio"), so a bare ticker it doesn't
+            # recognize gets overridden by that prior. The desc makes
+            # "do I own <company>?" a literal text match.
+            desc = (pos.get("desc") or "").strip()
+            label = f"{pos['symbol']} — {desc}" if desc else pos["symbol"]
+            lines.append(f"- {label}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
         tu = inv["taxable_unrealized"]
         lines += [
             "",

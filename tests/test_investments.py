@@ -26,7 +26,8 @@ def _snapshot_with_many_positions():
          "weight_pct": 5, "unrealized": 1000}
         for i in range(19)
     ]
-    positions.append({"symbol": "SPCX", "value": 3050, "weight_pct": 0.37})
+    positions.append({"symbol": "SPCX", "desc": "SpaceX Class A (SPV)",
+                      "value": 3050, "weight_pct": 0.37})
     return {
         "as_of": "2026-07-09",
         "totals": {
@@ -56,6 +57,12 @@ async def test_search_finances_investments_lists_all_positions(tmp_path, monkeyp
     assert "SPCX" in out                 # beyond-top-15 holding is present
     assert "Positions (20):" in out      # header reflects the full count
     assert "Top positions:" not in out   # old truncating header is gone
+    # The security NAME rides along with the ticker: a bare ticker the model
+    # doesn't recognize loses to stale world knowledge ("SpaceX is private"),
+    # so "do I own SpaceX?" must be answerable by literal text match.
+    assert "SPCX — SpaceX Class A (SPV)" in out
+    # Positions without a desc (the FIL fillers) keep the bare-ticker line.
+    assert "FIL01:" in out
 
 
 def _write_summary(tmp_path, age_days: float):
