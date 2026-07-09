@@ -342,17 +342,21 @@ class TestSingleton:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
 
-    def test_specialist_client_pinned_to_sonnet(self):
-        """get_anthropic_llm() specialist client stays on Sonnet regardless of LIFEOS_ANTHROPIC_MODEL."""
+    def test_specialist_client_resolves_model_from_settings(self):
+        """get_anthropic_llm() resolves LIFEOS_ANTHROPIC_SPECIALIST_MODEL,
+        independent of the orchestrator model (#470 — was a hardcoded dated
+        snapshot that retired and 404'd every specialist caller)."""
         from api.services.llm_client import get_anthropic_llm, reset_local_llm, AnthropicLLMClient
         reset_local_llm()
         with patch("api.services.llm_client.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test-key"
             mock_settings.anthropic_model = "claude-haiku-4-5"
+            mock_settings.anthropic_specialist_model = "claude-sonnet-4-6"
             try:
                 client = get_anthropic_llm()
                 assert isinstance(client, AnthropicLLMClient)
-                assert client._model == "claude-sonnet-4-20250514"
+                assert client._model == "claude-sonnet-4-6"
+                assert client._model != mock_settings.anthropic_model  # independent
             except ImportError:
                 pytest.skip("anthropic package not installed")
         reset_local_llm()
