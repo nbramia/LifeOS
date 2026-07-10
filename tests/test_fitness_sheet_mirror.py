@@ -65,9 +65,10 @@ def test_disabled_when_no_sheet_id(monkeypatch):
 def test_build_tabs_shapes(wired):
     store, _ = wired
     tabs = mirror.build_tabs(store)
-    assert set(tabs) == {"Sessions", "Sets"}
+    assert set(tabs) == {"Sessions", "Sets", "Metrics"}
     assert tabs["Sessions"][0] == mirror._SESSIONS_HEADER
     assert tabs["Sets"][0] == mirror._SETS_HEADER
+    assert tabs["Metrics"][0] == mirror._METRICS_HEADER
     # 2 sessions + header
     assert len(tabs["Sessions"]) == 3
     # 1 + 3 set rows + header
@@ -77,20 +78,34 @@ def test_build_tabs_shapes(wired):
         assert "None" not in [str(c) for c in row]
 
 
-def test_sync_writes_both_tabs(wired):
+def test_time_column_renders_duration(wired):
+    store, _ = wired
+    store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}], date="2026-06-10")
+    tabs = mirror.build_tabs(store)
+    header = tabs["Sets"][0]
+    assert "time" in header
+    time_idx = header.index("time")
+    stairs_row = next(r for r in tabs["Sets"][1:] if r[2] == "Stairs")
+    assert stairs_row[time_idx] == "7:01"
+    # untimed sets leave the column empty
+    bench_row = next(r for r in tabs["Sets"][1:] if r[2] == "Bench Press")
+    assert bench_row[time_idx] == ""
+
+
+def test_sync_writes_all_tabs(wired):
     _, fake = wired
     assert mirror.sync() is True
     written_tabs = {rng.split("!")[0] for _, rng, _ in fake.updated}
-    assert written_tabs == {"Sessions", "Sets"}
+    assert written_tabs == {"Sessions", "Sets", "Metrics"}
     # cleared before writing
-    assert len(fake.cleared) == 2
+    assert len(fake.cleared) == 3
 
 
 def test_hash_shortcircuits_second_sync(wired):
     _, fake = wired
     assert mirror.sync() is True
     assert mirror.sync() is False  # unchanged → no write
-    assert len(fake.updated) == 2  # only the first sync wrote
+    assert len(fake.updated) == 3  # only the first sync wrote
 
 
 def test_change_triggers_rewrite(wired):
@@ -98,7 +113,32 @@ def test_change_triggers_rewrite(wired):
     mirror.sync()
     store.add_session(sets=[{"exercise": "deadlift", "reps": 5, "weight": 315}], date="2026-06-09")
     assert mirror.sync() is True
-    assert len(fake.updated) == 4  # two more tab writes
+    assert len(fake.updated) == 6  # three more tab writes
+
+
+def test_metrics_tab_manual_only(wired):
+    store, _ = wired
+    store.log_metric("body_weight", 178.4, unit="lb", start_at="2026-07-09T08:00:00-04:00")
+    store.bulk_insert_metrics([{
+        "metric_type": "steps", "value": 900, "unit": "count",
+        "start_at": "2026-07-09T09:00:00-04:00", "source": "apple_health",
+    }])
+    tabs = mirror.build_tabs(store)
+    rows = tabs["Metrics"][1:]
+    assert ["2026-07-09", "body_weight", 178.4, "lb"] in rows
+    assert not any(r[1] == "steps" for r in rows)  # device imports excluded
+
+
+def test_unit_empty_for_unweighted_sets(wired):
+    store, _ = wired
+    store.add_session(sets=[{"exercise": "stairs", "reps": 500, "unit": "steps", "duration_seconds": 421}], date="2026-06-10")
+    tabs = mirror.build_tabs(store)
+    header = tabs["Sets"][0]
+    unit_idx = header.index("unit")
+    stairs_row = next(r for r in tabs["Sets"][1:] if r[2] == "Stairs")
+    assert stairs_row[unit_idx] == "steps"
+    bench_row = next(r for r in tabs["Sets"][1:] if r[2] == "Bench Press")
+    assert bench_row[unit_idx] == "lb"
 
 
 def test_force_rewrites_even_if_unchanged(wired):

@@ -165,3 +165,45 @@ class TestSummaryFormatting:
         ])
         out = _summarize_session(session)
         assert "Run" in out
+
+    def test_timed_work_reps_and_duration(self):
+        # 500 stairs in 7:01 — count in reps, time rendered M:SS
+        session = WorkoutSession(id="x", date="2026-06-20", sets=[
+            WorkoutSet(exercise="Stairs", set_index=1, reps=500, duration_seconds=421),
+        ])
+        out = _summarize_session(session)
+        assert "Stairs 500 in 7:01" in out
+
+    def test_counted_work_shows_unit_not_lb(self):
+        session = WorkoutSession(id="x", date="2026-06-20", sets=[
+            WorkoutSet(exercise="Stairs", set_index=1, reps=500, unit="steps", duration_seconds=421),
+        ])
+        out = _summarize_session(session)
+        assert "Stairs 500 steps in 7:01" in out
+        assert "lb" not in out
+
+    def test_duration_only_no_reps(self):
+        session = WorkoutSession(id="x", date="2026-06-20", sets=[
+            WorkoutSet(exercise="Run", set_index=1, duration_seconds=1930, notes="4 mi"),
+        ])
+        out = _summarize_session(session)
+        assert "Run in 32:10" in out
+
+
+class TestDurationThroughTool:
+    def test_log_with_duration(self, temp_store):
+        out = _tool_manage_workouts({
+            "action": "log",
+            "sets": [{"exercise": "stairs", "reps": 500, "duration_seconds": 421}],
+        })
+        assert out.startswith("Logged —")
+        assert "in 7:01" in out
+        assert temp_store.get_latest_session().sets[0].duration_seconds == 421
+
+    def test_history_shows_duration(self, temp_store):
+        _tool_manage_workouts({
+            "action": "log",
+            "sets": [{"exercise": "stairs", "reps": 500, "duration_seconds": 421}],
+        })
+        out = _tool_manage_workouts({"action": "history", "exercise": "stairs"})
+        assert "in 7:01" in out
