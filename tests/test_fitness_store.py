@@ -113,6 +113,13 @@ class TestDuration:
         s = store.add_session(sets=[{"exercise": "bench", "reps": 8, "weight": 135}])
         assert s.sets[0].duration_seconds is None
 
+    def test_format_duration_rendering(self, store):
+        from api.services.fitness_store import format_duration
+        assert format_duration(421) == "7:01"
+        assert format_duration(3721) == "1:02:01"  # H:MM:SS branch
+        assert format_duration(0) == ""
+        assert format_duration(None) == ""
+
     def test_exercise_history_includes_duration(self, store):
         store.add_session(sets=[{"exercise": "stairs", "reps": 500, "duration_seconds": 421}], date="2026-06-10")
         hist = store.exercise_history("stairs")

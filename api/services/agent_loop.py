@@ -63,16 +63,21 @@ def _looks_like_giving_up(text: str) -> bool:
 # Phantom-write guard: a reply that opens with "Logged …" / "Updated …" claims a
 # state change. If the turn made ZERO tool calls, nothing was written — the model
 # pattern-matched earlier confirmation lines in the conversation history instead
-# of calling the tool (observed with the fitness bot on Haiku: replies like
-# "Logged 6/20: Pec Fly Machine 3×12" with tool_rounds=0 silently lost sets).
+# of calling the tool (observed with the fitness bot on a weak model: "Logged …"
+# replies with tool_rounds=0 silently lost sets). Scope: only the zero-tool-call
+# turn is caught; a turn that makes a READ call and then claims a write still
+# passes — that variant hasn't been observed and distinguishing reads from
+# writes here isn't worth the tool-registry coupling yet.
 _WRITE_CLAIM_PATTERN = re.compile(r"(?i)^\s*(logged|updated|recorded|saved)\b")
 
 PHANTOM_WRITE_NUDGE = (
     "Stop — you replied as if something was recorded, but you made NO tool call "
-    "this turn, so nothing was saved. If the user's message contains data to "
-    "record (a workout, a metric, a task…), call the appropriate tool NOW to "
-    "actually record it, then confirm. If nothing needed recording, rephrase "
-    "your answer without claiming anything was logged or updated."
+    "this turn, so nothing was saved. If the user's CURRENT message contains new "
+    "data to record (a workout, a metric, a task…), call the appropriate tool NOW "
+    "to actually record it, then confirm. If it was already recorded in a "
+    "PREVIOUS turn, do NOT record it again — just answer the question. If "
+    "nothing needed recording, rephrase your answer without claiming anything "
+    "was logged or updated."
 )
 
 

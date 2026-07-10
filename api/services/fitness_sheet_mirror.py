@@ -47,12 +47,8 @@ def _cell(v):
 
 def _time_cell(seconds) -> str:
     """Duration as M:SS (or H:MM:SS) for the sheet's time column."""
-    if not seconds:
-        return ""
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    from api.services.fitness_store import format_duration
+    return format_duration(seconds)
 
 
 def build_tabs(store) -> dict[str, list[list]]:

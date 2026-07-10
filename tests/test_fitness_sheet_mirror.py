@@ -118,14 +118,14 @@ def test_change_triggers_rewrite(wired):
 
 def test_metrics_tab_manual_only(wired):
     store, _ = wired
-    store.log_metric("body_weight", 212.0, unit="lb", start_at="2026-07-09T08:00:00-04:00")
+    store.log_metric("body_weight", 178.4, unit="lb", start_at="2026-07-09T08:00:00-04:00")
     store.bulk_insert_metrics([{
         "metric_type": "steps", "value": 900, "unit": "count",
         "start_at": "2026-07-09T09:00:00-04:00", "source": "apple_health",
     }])
     tabs = mirror.build_tabs(store)
     rows = tabs["Metrics"][1:]
-    assert ["2026-07-09", "body_weight", 212.0, "lb"] in rows
+    assert ["2026-07-09", "body_weight", 178.4, "lb"] in rows
     assert not any(r[1] == "steps" for r in rows)  # device imports excluded
 
 

@@ -92,6 +92,17 @@ class HealthMetric:
     source: str = "manual"
 
 
+def format_duration(seconds) -> str:
+    """Render a set duration in seconds as M:SS (or H:MM:SS); '' for falsy.
+    Single source of truth for session summaries and the sheet mirror."""
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def _load_aliases() -> dict:
     try:
         data = json.loads(_ALIASES_FILE.read_text())
@@ -148,9 +159,12 @@ class FitnessStore:
                 conn.execute("ALTER TABLE workout_sets ADD COLUMN duration_seconds INTEGER")
             if "weight_unit" in set_cols:
                 conn.execute("ALTER TABLE workout_sets RENAME COLUMN weight_unit TO unit")
-                # The old column defaulted to 'lb' unconditionally; a unit is
-                # meaningless without a weight, so clear it on weightless rows.
-                conn.execute("UPDATE workout_sets SET unit = '' WHERE weight IS NULL AND unit = 'lb'")
+            # The old weight_unit column defaulted to 'lb' unconditionally; a
+            # lb/kg unit is meaningless without a weight, so clear it on
+            # weightless rows. Unconditional (not gated on the rename) so a
+            # crash between the RENAME (DDL, autocommits) and this commit
+            # can't strand rows — the UPDATE is idempotent.
+            conn.execute("UPDATE workout_sets SET unit = '' WHERE weight IS NULL AND unit IN ('lb', 'kg')")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS health_metrics (
                     id TEXT PRIMARY KEY,
@@ -231,7 +245,10 @@ class FitnessStore:
             # lb/kg only make sense with a weight; counted work may carry its
             # own unit ('steps', 'm'). Accept the legacy 'weight_unit' key.
             unit = s.get("unit") or s.get("weight_unit") or ""
-            if not unit and s.get("weight") is not None:
+            if s.get("weight") is None:
+                if unit in ("lb", "kg"):
+                    unit = ""  # models habitually send lb — enforce the invariant
+            elif not unit:
                 unit = "lb"
             for _ in range(count):
                 conn.execute(
