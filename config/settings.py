@@ -183,6 +183,15 @@ class Settings(BaseSettings):
         alias="LIFEOS_EMBEDDING_CACHE",
         description="Directory for caching embedding model files (leave empty for HuggingFace default)"
     )
+    embedding_batch_size: int = Field(
+        default=8,
+        alias="LIFEOS_EMBEDDING_BATCH_SIZE",
+        description="Max texts per model.encode() batch. Bounds peak VRAM per "
+                    "embedding call so a large document's chunks can't spike GPU "
+                    "memory in one allocation and exhaust the iGPU's SDMA queues, "
+                    "freezing the host (issue #483). Semantically neutral — "
+                    "batching changes only peak memory, not the embedding values."
+    )
 
     # Chunking
     chunk_size: int = 500  # tokens
