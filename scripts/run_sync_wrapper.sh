@@ -21,6 +21,22 @@ LOG="$LIFEOS_DIR/logs/crm-sync-error.log"
 # reason, this watchdog kills it so launchd can fire the next night's run.
 MAX_RUNTIME=21600
 
+# --- Free RAM before the heavy sync (opt-in) -----------------------------------
+# The embedding/reindex phase co-resident with a memory-hungry desktop app (e.g.
+# Chrome, tens of GB across tabs) has pushed this host into an OOM cascade that
+# killed the desktop. Operators can list process-name patterns to gracefully
+# quit first via LIFEOS_SYNC_QUIT_PROCS (space-separated, default empty = no-op;
+# injected from .env by the systemd unit's EnvironmentFile). Reopen them later —
+# SIGTERM lets the app save its session so tabs are restored.
+if [ -n "${LIFEOS_SYNC_QUIT_PROCS:-}" ]; then
+    LOG="$LIFEOS_DIR/logs/crm-sync-error.log"
+    for proc in $LIFEOS_SYNC_QUIT_PROCS; do
+        if pkill -TERM -f "$proc" 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Quit '$proc' to free RAM for sync" >> "$LOG"
+        fi
+    done
+fi
+
 # --- NVMe pre-flight check ---
 
 MAX_RETRIES=3

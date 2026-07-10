@@ -66,6 +66,23 @@ case "$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false" | tr '[:upper:]' '[:lower:
     *) exit 0 ;;
 esac
 
+# --- Defer while the nightly sync is running ------------------------------------
+# Restarting lifeos-api mid-sync SIGTERMs the running reindex, and the restart's
+# fresh allocations landing on top of the still-resident embedding process has
+# OOM-frozen the host (killed the desktop). Never deploy during a sync — the next
+# 10-min tick catches up once it finishes.
+sync_in_progress() {
+    case "$(systemctl show lifeos-sync.service -p ActiveState --value 2>/dev/null)" in
+        activating|active|deactivating|reloading) return 0 ;;
+    esac
+    # Also catch a sync launched manually (not via the systemd unit).
+    pgrep -f "[r]un_all_syncs\.py" >/dev/null 2>&1
+}
+if sync_in_progress; then
+    log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
+    exit 0
+fi
+
 # --- Guards: only auto-deploy a clean main --------------------------------------
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 if [ "$BRANCH" != "main" ]; then
