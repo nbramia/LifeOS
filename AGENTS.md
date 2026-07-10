@@ -264,7 +264,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 ./scripts/test.sh all          # Full test suite
 ```
 
-- **Most checkouts have no venv** — `./scripts/test.sh` only works on the server (nathan-linux). Get a green run on the server **before** committing; rsync the tree to an isolated temp dir there if the branch isn't pushed. Committing/pushing first "so tests can run" is not allowed.
+- **No local venv (the MacBook)** — `./scripts/test.sh` only runs where a venv exists (the server). From the Mac, run **`./scripts/remote-test.sh`**: it rsyncs your uncommitted working tree to an isolated branch-keyed dir on nathan-linux and runs the same `test.sh auto` scope there. Get a green run **before** committing — no push required, and committing/pushing "so tests can run" is neither necessary nor allowed.
 - **Parallelism:** unit tests run under pytest-xdist (`-n auto --dist loadscope`) — reproduce flakes in that mode, not sequentially.
 - **Browser tests:** the web SPA is served at `/chat` (not `/`); `test.sh browser` covers only `test_ui_browser.py` and `test_e2e_flow.py` — run new browser test files directly with pytest.
 

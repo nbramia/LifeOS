@@ -31,6 +31,11 @@ This skill runs five phases. You **MUST** use task tracking (TaskCreate/TaskUpda
 4. **Parallel agents need isolated worktrees** — never two active agents in one working directory (see Phase 2).
 5. **Name spawns for auditability:** set `description` to `"<role> PR #<number> round <N> — <lens>"`.
 
+**Usage limits (check before every spawn wave):**
+1. **Pre-wave window check.** Before launching an implement or review wave, gauge remaining usage headroom (5-hour and weekly). A limit hit mid-wave strands worktrees and loses the referee thread — don't start a multi-subagent fan-out you can't finish.
+2. **Don't fan out under a low window.** When headroom is low, take the cheaper path Phase 4 already allows: self-review the diff from the main context instead of spawning reviewer/addresser subagents.
+3. **On a limit hit, schedule your own resume — proactively.** If a subagent's entire output is the usage-limit message (or the parent is about to hit one), parse the reset time from it and `ScheduleWakeup` at that time to auto-continue the lifecycle. Do this the moment the limit is in view — a parent that is already limit-dead cannot schedule its own wake. Put the current phase/round and the next concrete action in the wakeup payload so the resumed session picks up without re-deriving state.
+
 **Entry point — identify the target:**
 1. If the leading token of `$ARGUMENTS` is a number or starts with `#`, it is a GitHub issue. Fetch the issue with `gh issue view <number> --comments` to get the full description and acceptance criteria. If the output is empty (a gh quirk on some issues), retry without `--comments`.
 2. Otherwise, run `gh pr list --head <current-branch> --json number,title --jq '.[0]'`. If a PR exists, verify it relates to the current task (check title/description alignment). If it does, record the PR number and treat the target as that PR. If it appears unrelated, ignore it.
@@ -71,9 +76,12 @@ Modifiers compose (e.g. `no-plan quick` skips Phase 1 and Phase 4). If the targe
 1. **Create a branch** if not already on a feature branch: `<type>/<short-description>` per AGENTS.md § Development Workflow. Branch off `<base>` (default `main`): `git fetch origin <base> && git checkout -b <type>/<desc> origin/<base>`. **Do this before opening any file for editing** — working-tree edits made on `main` risk landing on the wrong base or being lost to a concurrent push.
 2. **Write tests first** for identified test cases. They should fail until implementation is complete.
 3. **Write production code** to make tests pass. Follow existing patterns. Surgical changes only. Read every file before editing it (issue the Reads in parallel; Edit errors on unread files). After an edit that reshapes code, re-read before composing the next edit's old_string — prior edits invalidate stale snippets.
-4. **Run the test suite** on the server: `./scripts/test.sh auto` — picks scope (unit/browser/slow/skip) from the git diff and runs it in parallel. All tests must pass before proceeding. **Hard gate: never commit until a green run is in hand — pushing "so tests can run elsewhere" is not a substitute.**
-   - **No local venv (the MacBook):** run tests on nathan-linux in an isolated copy — never the live checkout at `~/Code/lifeos`, which may be stale. Push the branch, then: `ssh nathan-linux-ts 'cd ~/Code/lifeos && git fetch origin <branch> && git worktree add /tmp/wt-<branch> origin/<branch> && cd /tmp/wt-<branch> && ~/.venvs/lifeos/bin/python -m pytest -m unit -q'`.
-   - **Waiting on long runs:** one blocking call with a long timeout, or one background job waited on with `until grep -qE "passed|failed|error" $OUT; do sleep 5; done`. Never repeatedly Read an unchanged output file; never start a second run before the first finishes. (`grep -c` exits 1 on zero matches — don't chain it with `&&`.)
+4. **Run the test suite.** Scope (unit/browser/slow/skip) is picked from the git diff and run in parallel.
+   - **On a checkout with a venv (the server):** `./scripts/test.sh auto`.
+   - **On the MacBook (no local venv):** `./scripts/remote-test.sh` — rsyncs your *uncommitted* working tree to an isolated branch-keyed dir on nathan-linux and runs the same `test.sh auto` scope there, streaming output back. No commit or push required, so it never stales against the live checkout. Pass a mode to override (e.g. `remote-test.sh unit`).
+
+   All tests must pass before proceeding. **Hard gate: never commit until a green run is in hand — pushing "so tests can run elsewhere" is not a substitute** (`remote-test.sh` gets you that green run without committing).
+   - **Waiting on long runs:** one blocking call with a long timeout, or run `remote-test.sh` as a background job and wait on it with `until grep -q "\[remote-test\] DONE" $OUT; do sleep 5; done`. Never repeatedly Read an unchanged output file; never start a second run before the first finishes.
 5. **Self-review your diff.** Read every changed file. Check for: unused imports, style mismatches, missing error handling, changes that do not trace to the task.
 
 **Delegating implementation (3+ files, or parallel issues).** Phase 2 may be delegated to an implementation subagent:
@@ -129,6 +137,7 @@ Subagent spawns are not free — each costs context and wall time. Reading the d
 Spawn via the **Agent tool** (`subagent_type: "general-purpose"`) — the prompt directs the subagent to invoke the `review-pr` skill itself. Do NOT pre-load the skill content into the prompt — the subagent will load the methodology itself.
 
 **Before spawning:**
+- **Check the usage window first** (see "Usage limits" above). If headroom is low, self-review the diff from the main context instead of fanning out reviewers.
 - Verify the number is a PR: `gh pr view <number>` must succeed. If it resolves to an issue instead, find the real PR with `gh pr list --head <branch>`.
 - Check no round-<N> review already exists on the PR (look for a "Review Round <N>" comment) — if one does, skip straight to Step B using its content. Never spawn a duplicate reviewer for the same round.
 - Record which worktree/branch has the PR checked out (`git worktree list`) and note any uncommitted changes (`git status --short`) — if a parallel address pass is in flight, say so in the spawn prompt and instruct reviewers to review the committed diff, not the working tree.
