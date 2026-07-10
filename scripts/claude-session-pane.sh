@@ -57,32 +57,18 @@ if [[ -z "$SESSION_ID" ]]; then
     exit 0
 fi
 
-# Candidate API URLs, tried in order until one accepts the bind. localhost
-# first so the common case — running ON the API host (e.g. nathan-linux) — is a
-# single fast round-trip; fall back to $LIFEOS_API_URL when localhost is down.
-# On the MacBook the API is remote, so localhost:8000 has no listener and the
-# Tailscale $LIFEOS_API_URL (if provided to the hook) is what actually binds.
-URLS=("http://localhost:8000")
-if [[ -n "${LIFEOS_API_URL:-}" && "${LIFEOS_API_URL}" != "http://localhost:8000" ]]; then
-    URLS+=("$LIFEOS_API_URL")
-fi
+LIFEOS_URL="${LIFEOS_API_URL:-http://localhost:8000}"
 
-BODY="$(jq -nc \
-    --arg sid "$SESSION_ID" \
-    --argjson pid "$WEZTERM_PANE" \
-    --arg cwd "$CWD" \
-    '{session_id: $sid, pane_id: $pid, cwd: $cwd}')"
-
-# Fire-and-forget. Short timeout so a stalled/absent server never holds up the
-# user's prompt. Stop at the first URL that accepts the POST.
-for url in "${URLS[@]}"; do
-    if curl -fsS --max-time 2 \
-        -X POST "${url}/api/agents/cc-pane-bind" \
-        -H "Content-Type: application/json" \
-        -d "$BODY" \
-        >/dev/null 2>&1; then
-        break
-    fi
-done
+# Fire-and-forget. Short timeout so a stalled server never holds up the
+# user's prompt. `|| true` swallows curl's non-zero exit on network error.
+curl -fsS --max-time 2 \
+    -X POST "${LIFEOS_URL}/api/agents/cc-pane-bind" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc \
+        --arg sid "$SESSION_ID" \
+        --argjson pid "$WEZTERM_PANE" \
+        --arg cwd "$CWD" \
+        '{session_id: $sid, pane_id: $pid, cwd: $cwd}')" \
+    >/dev/null 2>&1 || true
 
 exit 0
