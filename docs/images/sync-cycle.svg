@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 1010" width="1160" height="1010" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+<defs>
+<linearGradient id="panelBg" x1="0" y1="0" x2="0" y2="1">
+  <stop offset="0" stop-color="#0d1226"/><stop offset="0.55" stop-color="#0a0e20"/><stop offset="1" stop-color="#080b18"/></linearGradient>
+<linearGradient id="panelStroke" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#38bdf8" stop-opacity="0.55"/><stop offset="0.5" stop-color="#a78bfa" stop-opacity="0.35"/><stop offset="1" stop-color="#fb7185" stop-opacity="0.45"/></linearGradient>
+<radialGradient id="vignette" cx="0.5" cy="0.42" r="0.75">
+  <stop offset="0" stop-color="#141b3a" stop-opacity="0.55"/><stop offset="0.6" stop-color="#0b1024" stop-opacity="0"/><stop offset="1" stop-color="#05070f" stop-opacity="0.5"/></radialGradient>
+<radialGradient id="brainGlow" cx="0.5" cy="0.5" r="0.5">
+  <stop offset="0" stop-color="#fbbf24" stop-opacity="0.26"/><stop offset="0.4" stop-color="#a855f7" stop-opacity="0.12"/><stop offset="1" stop-color="#a855f7" stop-opacity="0"/></radialGradient>
+<radialGradient id="coreDisc" cx="0.42" cy="0.35" r="0.85">
+  <stop offset="0" stop-color="#fde68a"/><stop offset="0.35" stop-color="#fbbf24"/><stop offset="0.7" stop-color="#b45309"/><stop offset="1" stop-color="#7c2d12"/></radialGradient>
+<radialGradient id="dot-src" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#22d3ee"/><stop offset="0.55" stop-color="#22d3ee" stop-opacity="0.85"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-src" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#22d3ee" stop-opacity="0.11"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-core" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#34d399"/><stop offset="0.55" stop-color="#34d399" stop-opacity="0.85"/><stop offset="1" stop-color="#34d399" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-core" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#34d399" stop-opacity="0.11"/><stop offset="1" stop-color="#34d399" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-brain" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.55" stop-color="#fbbf24" stop-opacity="0.85"/><stop offset="1" stop-color="#fbbf24" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-brain" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fbbf24" stop-opacity="0.11"/><stop offset="1" stop-color="#fbbf24" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-surf" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#a78bfa"/><stop offset="0.55" stop-color="#a78bfa" stop-opacity="0.85"/><stop offset="1" stop-color="#a78bfa" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-surf" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#a78bfa" stop-opacity="0.11"/><stop offset="1" stop-color="#a78bfa" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-auto" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fb7185"/><stop offset="0.55" stop-color="#fb7185" stop-opacity="0.85"/><stop offset="1" stop-color="#fb7185" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-auto" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fb7185" stop-opacity="0.11"/><stop offset="1" stop-color="#fb7185" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-web" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#38bdf8"/><stop offset="0.55" stop-color="#38bdf8" stop-opacity="0.85"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-web" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#38bdf8" stop-opacity="0.11"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+</defs>
+<rect x="1.5" y="1.5" width="1157" height="1007" rx="22" fill="url(#panelBg)" stroke="url(#panelStroke)" stroke-width="1.5"/><rect x="1.5" y="1.5" width="1157" height="1007" rx="22" fill="url(#vignette)"/><circle cx="580" cy="510" r="430" fill="url(#brainGlow)"/>
+<defs><marker id="r0" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#22d3ee"/></marker><marker id="r1" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#34d399"/></marker><marker id="r2" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#fbbf24"/></marker><marker id="r3" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#a78bfa"/></marker><marker id="r4" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#38bdf8"/></marker><marker id="r5" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#fb7185"/></marker><marker id="r6" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#22d3ee"/></marker></defs>
+<circle cx="580" cy="510" r="372" fill="none" stroke="#38bdf8" stroke-opacity="0.12" stroke-width="1.5" stroke-dasharray="2 10" stroke-linecap="round"/>
+<defs><linearGradient id="sg36" x1="731" y1="170" x2="811" y2="219" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs>
+<path d="M 731.3 170.2 A 372 372 0 0 1 811.2 218.6" fill="none" stroke="#22d3ee" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 731.3 170.2 A 372 372 0 0 1 811.2 218.6" fill="none" stroke="url(#sg36)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r0)"/>
+<defs><linearGradient id="sg37" x1="913" y1="344" x2="952" y2="522" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#fbbf24"/></linearGradient></defs>
+<path d="M 912.7 343.6 A 372 372 0 0 1 951.8 522.1" fill="none" stroke="#34d399" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 912.7 343.6 A 372 372 0 0 1 951.8 522.1" fill="none" stroke="url(#sg37)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r1)"/>
+<defs><linearGradient id="sg38" x1="920" y1="660" x2="832" y2="783" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+<path d="M 920.2 660.5 A 372 372 0 0 1 832.3 783.3" fill="none" stroke="#fbbf24" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 920.2 660.5 A 372 372 0 0 1 832.3 783.3" fill="none" stroke="url(#sg38)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r2)"/>
+<defs><linearGradient id="sg39" x1="603" y1="881" x2="557" y2="881" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>
+<path d="M 602.7 881.3 A 372 372 0 0 1 557.3 881.3" fill="none" stroke="#a78bfa" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 602.7 881.3 A 372 372 0 0 1 557.3 881.3" fill="none" stroke="url(#sg39)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r3)"/>
+<defs><linearGradient id="sg40" x1="328" y1="783" x2="240" y2="660" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#fb7185"/></linearGradient></defs>
+<path d="M 327.7 783.3 A 372 372 0 0 1 239.8 660.5" fill="none" stroke="#38bdf8" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 327.7 783.3 A 372 372 0 0 1 239.8 660.5" fill="none" stroke="url(#sg40)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r4)"/>
+<defs><linearGradient id="sg41" x1="208" y1="522" x2="247" y2="344" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fb7185"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+<path d="M 208.2 522.1 A 372 372 0 0 1 247.3 343.6" fill="none" stroke="#fb7185" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
+<path d="M 208.2 522.1 A 372 372 0 0 1 247.3 343.6" fill="none" stroke="url(#sg41)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r5)"/>
+<rect x="463.6" y="106.0" width="232.8" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#22d3ee" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="493.6" cy="138.0" r="17" fill="url(#dot-src)"/><circle cx="493.6" cy="138.0" r="14" fill="#0b1024" stroke="#22d3ee" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="493.6" y="143.0" text-anchor="middle" font-size="15" font-weight="800" fill="#22d3ee">1</text>
+<text x="519.6" y="132.0" font-size="15" font-weight="700" fill="#e8ecf8">Collection</text>
+<text x="519.6" y="151.0" font-size="11" fill="#8b96b5">Gmail · iMessage · Slack</text>
+<rect x="761.1" y="246.1" width="219.4" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="791.1" cy="278.1" r="17" fill="url(#dot-core)"/><circle cx="791.1" cy="278.1" r="14" fill="#0b1024" stroke="#34d399" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="791.1" y="283.1" text-anchor="middle" font-size="15" font-weight="800" fill="#34d399">2</text>
+<text x="817.1" y="272.1" font-size="15" font-weight="700" fill="#e8ecf8">Entity</text>
+<text x="817.1" y="291.1" font-size="11" fill="#8b96b5">Link sources to people</text>
+<rect x="833.0" y="560.8" width="219.4" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#fbbf24" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="863.0" cy="592.8" r="17" fill="url(#dot-brain)"/><circle cx="863.0" cy="592.8" r="14" fill="#0b1024" stroke="#fbbf24" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="863.0" y="597.8" text-anchor="middle" font-size="15" font-weight="800" fill="#fbbf24">3</text>
+<text x="889.0" y="586.8" font-size="15" font-weight="700" fill="#e8ecf8">Relationships</text>
+<text x="889.0" y="605.8" font-size="11" fill="#8b96b5">Score &amp; graph strength</text>
+<rect x="628.4" y="813.2" width="226.1" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#a78bfa" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="658.4" cy="845.2" r="17" fill="url(#dot-surf)"/><circle cx="658.4" cy="845.2" r="14" fill="#0b1024" stroke="#a78bfa" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="658.4" y="850.2" text-anchor="middle" font-size="15" font-weight="800" fill="#a78bfa">4</text>
+<text x="684.4" y="839.2" font-size="15" font-weight="700" fill="#e8ecf8">Indexing</text>
+<text x="684.4" y="858.2" font-size="11" fill="#8b96b5">ChromaDB + BM25 reindex</text>
+<rect x="315.6" y="813.2" width="206.0" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#38bdf8" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="345.6" cy="845.2" r="17" fill="url(#dot-web)"/><circle cx="345.6" cy="845.2" r="14" fill="#0b1024" stroke="#38bdf8" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="345.6" y="850.2" text-anchor="middle" font-size="15" font-weight="800" fill="#38bdf8">5</text>
+<text x="371.6" y="839.2" font-size="15" font-weight="700" fill="#e8ecf8">Content</text>
+<text x="371.6" y="858.2" font-size="11" fill="#8b96b5">Google Docs &amp; Sheets</text>
+<rect x="114.3" y="560.8" width="206.0" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#fb7185" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="144.3" cy="592.8" r="17" fill="url(#dot-auto)"/><circle cx="144.3" cy="592.8" r="14" fill="#0b1024" stroke="#fb7185" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="144.3" y="597.8" text-anchor="middle" font-size="15" font-weight="800" fill="#fb7185">6</text>
+<text x="170.3" y="586.8" font-size="15" font-weight="700" fill="#e8ecf8">Cleanup</text>
+<text x="170.3" y="605.8" font-size="11" fill="#8b96b5">Auto-hide non-humans</text>
+<rect x="192.9" y="246.1" width="192.6" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#22d3ee" stroke-opacity="0.6" stroke-width="1.4"/>
+<circle cx="222.9" cy="278.1" r="17" fill="url(#dot-src)"/><circle cx="222.9" cy="278.1" r="14" fill="#0b1024" stroke="#22d3ee" stroke-opacity="0.8" stroke-width="1.4"/>
+<text x="222.9" y="283.1" text-anchor="middle" font-size="15" font-weight="800" fill="#22d3ee">7</text>
+<text x="248.9" y="272.1" font-size="15" font-weight="700" fill="#e8ecf8">Verify</text>
+<text x="248.9" y="291.1" font-size="11" fill="#8b96b5">Consistency checks</text>
+<circle cx="580" cy="510" r="102" fill="#a855f7" fill-opacity="0.10"/><circle cx="580" cy="510" r="84" fill="none" stroke="#fbbf24" stroke-opacity="0.22" stroke-width="1"/><circle cx="580" cy="510" r="72" fill="url(#coreDisc)" stroke="#fde68a" stroke-opacity="0.6" stroke-width="1.5"/><text x="580" y="495" text-anchor="middle" font-size="15" font-weight="800" fill="#3b1e05">Nightly</text><text x="580" y="514" text-anchor="middle" font-size="15" font-weight="800" fill="#3b1e05">sync</text><text x="580" y="535" text-anchor="middle" font-size="9.5" font-weight="600" fill="#7c2d12">7 phases · nightly</text>
+</svg>
