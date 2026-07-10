@@ -1,31 +1,34 @@
 #!/bin/bash
-# LifeOS Network Watchdog
-# Runs every 2 minutes to detect and self-heal a dead network link.
+# LifeOS Network Watchdog — gentle WiFi re-activation
+# Runs every 2 minutes to detect a dead link and nudge it back online.
 #
 # The incident this guards against (2026-06-30 → 2026-07-08): the WiFi radio
 # was deauthenticated from the AP (4WAY_HANDSHAKE_TIMEOUT), NetworkManager's
 # activation then "failed", and the interface sat `disconnected` for 8 days.
 # Autoconnect never resumed on its own — it only recovered when the operator
-# manually re-activated the connection. Because this box is WiFi-only (no
-# wired fallback), that took every remote surface offline: Tailscale, the
-# Anthropic API, Google sync, AND every alert channel. Nothing local watches
-# connectivity, so nothing noticed.
+# manually re-activated the connection (`nmcli device connect`). Because this
+# box is WiFi-only (no wired fallback), that took every remote surface offline:
+# Tailscale, the Anthropic API, Google sync, AND every alert channel.
 #
-# This watchdog pings the gateway + a public target; if BOTH are unreachable
-# for consecutive ticks it escalates repair: re-activate the connection →
-# bounce the radio → reload the WiFi driver module → restart NetworkManager.
-# It backs off between levels so a momentary blip self-heals cheaply.
+# GENTLE BY DESIGN (rewritten 2026-07-10). This watchdog does exactly ONE repair
+# action: re-activate the connection (`nmcli device connect`) — the same manual
+# step that recovered the outage above. It deliberately does NOT bounce the
+# radio, reload the driver module, or restart NetworkManager. On the MediaTek
+# MT7925 (`mt7925e`), those station-remove operations can deadlock the driver
+# inside `mt7925_mac_sta_remove`, wedging NetworkManager in an unkillable
+# D-state and forcing a HARD POWER-OFF (observed 2026-07-10, repeatedly). A
+# gentle re-activate can't fix a truly wedged radio — but it also can't take the
+# whole box down, which is the right trade for a WiFi-only host. A wedged driver
+# is a reboot / kernel-update problem, not something a watchdog should fight.
 #
-# Alerting is best-effort by design: while the link is down NO channel can
-# reach out (that gap is what an external heartbeat/dead-man's-switch would
-# cover). Instead this posts a *recovery* notice once connectivity returns,
-# reporting how long the link was down and which step fixed it — so sustained
-# outages are visible after the fact even though they self-heal.
+# Opt-in: does nothing unless LIFEOS_NETWORK_WATCHDOG_ENABLED=true in .env. It
+# runs as root (system oneshot) to call nmcli, so it stays off by default.
 #
-# Runs as root (system oneshot) because repair needs nmcli/ip/modprobe/
-# systemctl. Interface, WiFi profile, gateway, and driver module are all
-# derived at runtime — nothing machine-specific is hardcoded, so this is a
-# no-op on hosts without a managed WiFi device.
+# Alerting is best-effort: while the link is down NO channel can reach out, so
+# this posts a *recovery* notice once connectivity returns, reporting how long
+# the link was down. Interface, WiFi profile, and gateway are derived at runtime
+# — nothing machine-specific is hardcoded, so it is a no-op on hosts without a
+# managed WiFi device.
 #
 # Linux: triggered by lifeos-network-watchdog.timer (installed by
 # setup-systemd.sh). macOS: not applicable (launchd/networkd differ).
@@ -44,11 +47,28 @@ ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 # The default gateway is added automatically when a default route exists.
 PUBLIC_TARGETS="${LIFEOS_NET_WATCHDOG_TARGETS:-1.1.1.1 8.8.8.8}"
 # Only post a recovery notice for outages at/above this many seconds, so
-# sub-tick blips that self-heal at level 1 don't generate noise.
+# sub-tick blips that self-heal don't generate noise.
 NOTIFY_MIN_SECONDS="${LIFEOS_NET_WATCHDOG_NOTIFY_MIN_SECONDS:-180}"
-# Set to 1 to skip all repair actions (detect + log only). Useful for
-# running the watchdog unprivileged to verify detection.
+# Set to 1 to skip the repair action (detect + log only). Useful for running
+# the watchdog unprivileged to verify detection.
 CHECK_ONLY="${LIFEOS_NET_WATCHDOG_CHECK_ONLY:-0}"
+
+# Read a KEY's value from .env, stripping whitespace. Pipefail/`set -e` safe:
+# a missing key or absent file yields the empty string, never a failure.
+_read_env() {
+    local key="$1"
+    [ -f "$ENV_FILE" ] || { echo ""; return 0; }
+    grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- \
+        | tr -d '[:space:]' || true
+}
+
+# --- Opt-in gate: a root service that pokes the WiFi link stays off unless
+# --- explicitly enabled (open-source-safe default; also lets the operator
+# --- kill it via .env without touching systemd). ---
+case "$(_read_env LIFEOS_NETWORK_WATCHDOG_ENABLED | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) ;;
+    *) exit 0 ;;
+esac
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -68,10 +88,9 @@ get_down_count() {
 send_telegram() {
     # Best-effort. Only useful once the link is back — see header note.
     local message="$1"
-    [ -f "$ENV_FILE" ] || return 1
     local bot_token chat_id
-    bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
-    chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
+    bot_token=$(_read_env TELEGRAM_BOT_TOKEN)
+    chat_id=$(_read_env TELEGRAM_CHAT_ID)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 1
     /usr/bin/curl -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
@@ -118,7 +137,7 @@ if is_online; then
         log "Link recovered after $DOWN down tick(s) (~${DOWN_FOR}s offline)"
         if [ "$DOWN_FOR" -ge "$NOTIFY_MIN_SECONDS" ]; then
             MINS=$(( DOWN_FOR / 60 ))
-            send_telegram "$(printf '✅ *LifeOS Network Recovered*\n\nWiFi (%s) was offline ~%d min and the watchdog restored it. If this repeats, the MediaTek link is the culprit.' "$WIFI_DEV" "$MINS")" \
+            send_telegram "$(printf '✅ *LifeOS Network Recovered*\n\nWiFi (%s) was offline ~%d min; the watchdog re-activated the link. If this repeats, the MediaTek radio/driver is the culprit — a kernel update, not the watchdog, is the fix.' "$WIFI_DEV" "$MINS")" \
                 || log "Recovery Telegram POST failed (will not retry)"
         fi
     fi
@@ -140,60 +159,19 @@ if [ "$CHECK_ONLY" = "1" ]; then
     exit 0
 fi
 
-# Graduated repair, one level per down tick, gentlest first. Each command is
-# guarded so a failure (expected while the link is down) doesn't abort the
-# script under `set -e`, and we re-probe after each so we stop escalating the
-# moment connectivity returns.
-attempt() {
-    local desc="$1"; shift
-    log "Repair L${DOWN}: $desc"
-    "$@" >> "$LOG_FILE" 2>&1 || true
-    sleep 3
-    if is_online; then
-        log "Connectivity restored after: $desc"
-        return 0
-    fi
-    return 1
-}
-
-case "$DOWN" in
-    1)
-        attempt "nmcli device connect $WIFI_DEV" nmcli device connect "$WIFI_DEV" || true
-        ;;
-    2)
-        # Bounce the radio, then re-activate.
-        log "Repair L2: cycling WiFi radio"
-        nmcli radio wifi off >> "$LOG_FILE" 2>&1 || true
-        sleep 3
-        nmcli radio wifi on >> "$LOG_FILE" 2>&1 || true
-        sleep 3
-        attempt "nmcli device connect $WIFI_DEV (post radio cycle)" nmcli device connect "$WIFI_DEV" || true
-        ;;
-    3)
-        # Reload the WiFi driver module — recovers a wedged firmware/driver,
-        # the most likely root of a handshake-timeout that never clears.
-        MODULE=$(basename "$(readlink -f "/sys/class/net/$WIFI_DEV/device/driver/module" 2>/dev/null)" 2>/dev/null || true)
-        if [ -n "$MODULE" ] && [ "$MODULE" != "." ]; then
-            log "Repair L3: reloading driver module '$MODULE'"
-            modprobe -r "$MODULE" >> "$LOG_FILE" 2>&1 || true
-            sleep 2
-            modprobe "$MODULE" >> "$LOG_FILE" 2>&1 || true
-            sleep 4
-            attempt "nmcli device connect $WIFI_DEV (post module reload)" nmcli device connect "$WIFI_DEV" || true
-        else
-            log "Repair L3: could not resolve driver module for $WIFI_DEV — skipping to NM restart"
-            attempt "systemctl restart NetworkManager" systemctl restart NetworkManager || true
-        fi
-        ;;
-    *)
-        # Sustained outage. Restart NetworkManager, but only every 3rd tick so
-        # we don't thrash the whole stack every 2 minutes.
-        if [ $(( DOWN % 3 )) -eq 1 ]; then
-            attempt "systemctl restart NetworkManager (sustained outage)" systemctl restart NetworkManager || true
-        else
-            attempt "nmcli device connect $WIFI_DEV (retry)" nmcli device connect "$WIFI_DEV" || true
-        fi
-        ;;
-esac
+# Gentle recovery ONLY — re-activate the connection so a brief deauth/roam that
+# NetworkManager didn't auto-recover gets nudged back online. This is the exact
+# manual step that recovered the 2026-06/07 outage, and it is idempotent: if the
+# AP is genuinely down it fails harmlessly and we retry on the next tick.
+#
+# We do NOT escalate to radio-bounce / module-reload / NetworkManager-restart:
+# on the MT7925 those station-remove paths can deadlock the driver and force a
+# hard power-off (see header). A wedged radio is out of scope for a watchdog.
+log "Repair: nmcli device connect $WIFI_DEV (gentle re-activate)"
+nmcli device connect "$WIFI_DEV" >> "$LOG_FILE" 2>&1 || true
+sleep 3
+if is_online; then
+    log "Connectivity restored after gentle re-activate"
+fi
 
 exit 0
