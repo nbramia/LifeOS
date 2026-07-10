@@ -229,3 +229,66 @@ class TestGpuToCpuFallback:
 
         state = get_service_health().get_state("embedding_model")
         assert state.status.value == "healthy"
+
+
+class TestBatchSizeCap:
+    """The encode batch is bounded so a large document can't spike VRAM in one
+    allocation and exhaust the iGPU's SDMA queues, freezing the host (#483)."""
+
+    @staticmethod
+    def _fake_encode(data, **kwargs):
+        # Mirror sentence-transformers: a list in → a vector per item; a single
+        # string in → one vector. Each vector exposes .tolist().
+        if isinstance(data, list):
+            return [MagicMock(tolist=lambda: [0.1, 0.2]) for _ in data]
+        return MagicMock(tolist=lambda: [0.1, 0.2])
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_embed_texts_passes_configured_batch_size(self, mock_st_class):
+        from api.services.embeddings import EmbeddingService
+        from config.settings import settings
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        svc = EmbeddingService(model_name="test-model")
+        svc.embed_texts(["a", "b", "c"])
+
+        _, kwargs = model.encode.call_args
+        assert kwargs["batch_size"] == settings.embedding_batch_size
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_embed_text_passes_configured_batch_size(self, mock_st_class):
+        from api.services.embeddings import EmbeddingService
+        from config.settings import settings
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        svc = EmbeddingService(model_name="test-model")
+        svc.embed_text("hello")
+
+        _, kwargs = model.encode.call_args
+        assert kwargs["batch_size"] == settings.embedding_batch_size
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_caller_can_override_batch_size(self, mock_st_class):
+        """setdefault means an explicit batch_size still wins."""
+        from api.services.embeddings import EmbeddingService
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        svc = EmbeddingService(model_name="test-model")
+        svc._encode_with_fallback(["a"], convert_to_numpy=True, batch_size=1)
+
+        _, kwargs = model.encode.call_args
+        assert kwargs["batch_size"] == 1
+
+    def test_default_batch_size_is_bounded(self):
+        """Guard against a future edit restoring a dangerously large default."""
+        from config.settings import settings
+        assert 1 <= settings.embedding_batch_size <= 32

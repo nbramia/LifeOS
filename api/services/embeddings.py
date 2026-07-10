@@ -197,6 +197,13 @@ class EmbeddingService:
         If the model was loaded on GPU and encode() raises a GPU error,
         the model is reloaded on CPU and the encode is retried.
         """
+        # Bound the batch so a large document's chunks are encoded in small
+        # groups instead of one giant allocation. An unbounded batch of a
+        # multi-MB note's chunks spiked ~10GB of VRAM in a single call, which
+        # exhausted the gfx1151 iGPU's SDMA queues and froze the host (#483).
+        # This is semantically neutral: batching changes only peak memory, not
+        # the resulting vectors. Callers may still override batch_size.
+        kwargs.setdefault("batch_size", settings.embedding_batch_size)
         try:
             return self.model.encode(data, **kwargs)
         except RuntimeError as e:
