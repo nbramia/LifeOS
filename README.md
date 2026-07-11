@@ -262,8 +262,7 @@ Translates years of interaction history with thousands of contacts into insight 
 
 Sources unify through **two-tier entity resolution** (SourceEntity → PersonEntity, linked by email → phone → fuzzy name) feeding **hybrid search** (ChromaDB vectors + SQLite FTS5/BM25, fused via Reciprocal Rank Fusion). See [Data & Sync](docs/specs/technical/data-and-sync.md) and [Data Model](docs/specs/product/data-model.md).
 
-<details>
-<summary><strong>Sync phases (nightly)</strong></summary>
+### Sync phases (nightly)
 
 The unified nightly sync runs in 7 phases with dependencies:
 
@@ -278,10 +277,7 @@ The unified nightly sync runs in 7 phases with dependencies:
 5. Entity Cleanup auto-hides obvious non-humans (noreply@, newsletters)
 6. Consistency Verification checks orphaned records, stale merged IDs, and stats mismatches
 
-</details>
-
-<details>
-<summary><strong>Service dependencies</strong></summary>
+### Service dependencies
 
 Services are categorized by criticality and fallback behavior:
 
@@ -290,8 +286,6 @@ Services are categorized by criticality and fallback behavior:
 </p>
 
 **Alert severities:** CRITICAL (sent immediately — ChromaDB down, embedding failed, vault inaccessible) · WARNING (batched nightly — LLM API errors, backup failed) · INFO (log only). See [Operations](docs/guides/operations.md).
-
-</details>
 
 ---
 
