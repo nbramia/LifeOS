@@ -40,6 +40,7 @@ LifeOS ships several selectable **personas** — one assistant, different person
 - **primary** — general-purpose default: concise, proactive.
 - **therapist** — advice-oriented; draws on your own reflections and inner-circle context, with strict privacy rules.
 - **fitness** — a log-first trainer (see [Health & fitness](#health--fitness)).
+- **finance** — a numbers-first financial planner: retirement, tax, allocation, and savings planning grounded in your real portfolio (see [Finances](#finances)).
 - **doctor** — repairs LifeOS itself (see [Self-repair](#self-repair-the-doctor-bot)).
 
 Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave identically. Create your own with a markdown file. See the [Personas Guide](docs/guides/personas.md).
@@ -201,70 +202,17 @@ Full walkthrough (including which external accounts each integration needs): [In
 
 Data flows from your sources, through local storage and indexing, into an orchestrator that answers queries and drives autonomous work across every surface:
 
-```mermaid
-flowchart LR
-    subgraph Sources["Data Sources"]
-        direction TB
-        S1["Gmail · Calendar<br/>Drive / Docs / Sheets"]
-        S2["iMessage · Calls<br/>Contacts · Photos"]
-        S3["Slack · WhatsApp · LinkedIn"]
-        S4["Obsidian vault · Granola"]
-        S5["Monarch (finance) · Apple Health"]
-    end
-
-    subgraph Store["Ingestion &amp; Storage — local"]
-        direction TB
-        Sync["Nightly 7-phase sync"]
-        DB["SQLite (SourceEntity)<br/>Vault .md files"]
-    end
-
-    subgraph Index["Resolution &amp; Search Index — local"]
-        direction TB
-        ER["Entity resolution<br/>SourceEntity → PersonEntity"]
-        Vec["ChromaDB (vectors)"]
-        BM["SQLite FTS5 (BM25)"]
-    end
-
-    subgraph Brain["Query &amp; Orchestration"]
-        direction TB
-        Orch["Agent loop<br/>Claude API or local llama-server"]
-        Hy["Hybrid search (RRF)"]
-        Esc["Escalation ·<br/>Claude Code / Codex handoff"]
-    end
-
-    subgraph Surfaces["Surfaces"]
-        direction TB
-        Web["Web /chat — text + voice"]
-        Tg["Telegram bots (personas)"]
-        Mcp["MCP — Claude Desktop / Code"]
-        UI["/crm · /agents"]
-    end
-
-    subgraph Auto["Autonomous"]
-        direction TB
-        Worker["Agent worker (#agent)<br/>local Gemma · cloud Managed Agents"]
-        Sched["Scheduler<br/>notify · prompt · endpoint · agent"]
-    end
-
-    Sources --> Store --> Index --> Brain --> Surfaces
-    Brain <--> Auto
-```
+<p align="center">
+  <img src="docs/images/architecture.svg" width="920" alt="LifeOS architecture: data sources (Gmail, iMessage, Slack, Obsidian, Monarch, Apple Health) feed a local ingest-store-index core, which flows into a central orchestration agent loop that drives every surface (web, Telegram, MCP, CRM/agents) and orbits the autonomous worker and scheduler.">
+</p>
 
 ### Query pipeline
 
 Most queries go straight to the orchestrator, which decides — over multiple rounds of tool calls — what to search and how to answer:
 
-```mermaid
-flowchart LR
-    Q["Your query"] --> Orch["Agent loop<br/>(orchestrator LLM)"]
-    Orch --> Tools["Tool calls over multiple rounds<br/>search_vault · email · calendar · web<br/>tasks · schedules · people · finance …"]
-    Tools --> Orch
-    Orch -->|"general knowledge"| Direct["Answer directly"]
-    Orch -->|"code / 'use claude code'"| CC["Claude Code / Codex<br/>(CLI engine)"]
-    Orch --> R["Response"]
-    Direct --> R
-    CC --> R
-```
+<p align="center">
+  <img src="docs/images/query-pipeline.svg" width="940" alt="Query pipeline: input surfaces (web, Telegram, voice, MCP) on the left feed a query into the central orchestrator agent loop; the top shows the intra-query tool-call loop (search_vault, email, calendar, web, tasks, people) repeated over multiple rounds; the bottom shows model handoff — the agent loop runs on a local Gemma or cloud Haiku base, and Haiku escalates to Sonnet or Opus or hands off to the Claude Code or Codex CLI engines; the right shows the response returning to the same surface.">
+</p>
 
 The orchestrator defaults to Claude via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`); set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server. Internals: [Search & Indexing](docs/specs/technical/search-indexing.md) · [Architecture](docs/specs/technical/architecture.md).
 
@@ -319,41 +267,9 @@ Sources unify through **two-tier entity resolution** (SourceEntity → PersonEnt
 
 The unified nightly sync runs in 7 phases with dependencies:
 
-```mermaid
-flowchart LR
-    subgraph P1["1: Collection"]
-        direction TB
-        G1[Gmail]
-        C1[Calendar]
-        IM[iMessage]
-        Sl[Slack]
-    end
-    subgraph P2["2: Entity"]
-        direction TB
-        Link["Link sources<br/>to people"]
-    end
-    subgraph P3["3: Relationships"]
-        direction TB
-        Rel["Discover &amp;<br/>calculate strength"]
-    end
-    subgraph P4["4: Indexing"]
-        direction TB
-        Idx["ChromaDB +<br/>BM25 reindex"]
-    end
-    subgraph P5["5: Content"]
-        direction TB
-        Con["Google Docs<br/>&amp; Sheets"]
-    end
-    subgraph P6["6: Cleanup"]
-        direction TB
-        Clean["Entity cleanup<br/>(auto-hide)"]
-    end
-    subgraph P7["7: Verify"]
-        direction TB
-        Ver["Consistency<br/>checks"]
-    end
-    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
-```
+<p align="center">
+  <img src="docs/images/sync-cycle.svg" width="600" alt="Nightly sync cycle: seven phases run in a loop — 1 Collection, 2 Entity, 3 Relationships, 4 Indexing, 5 Content, 6 Cleanup, 7 Verify — each feeding the next around a central nightly-sync hub.">
+</p>
 
 1. Collection must finish before Entity Processing can link records
 2. Entity Processing must finish before Relationship Building has linked entities
@@ -369,30 +285,9 @@ flowchart LR
 
 Services are categorized by criticality and fallback behavior:
 
-```mermaid
-flowchart LR
-    subgraph Local["Local (Critical)"]
-        direction TB
-        ChromaDB["ChromaDB<br/>:8001"]
-        Embed["Embedding<br/>Model"]
-        Vault["Vault<br/>Filesystem"]
-    end
-    subgraph Fallback["With Fallback"]
-        direction TB
-        Intent["Intent classifier<br/>(Claude Haiku)"] -->|fallback| Patterns["Regex<br/>patterns"]
-        BM25["BM25"] -->|fallback| VecOnly["Vector-only"]
-    end
-    subgraph External["External APIs"]
-        direction TB
-        GCal["Google<br/>Calendar"]
-        Gmail["Google<br/>Gmail"]
-        LLM["LLM Backend<br/>(Claude API or local llama-server)"]
-        Voice["whisper-relay<br/>Voice Gateway :9788"]
-    end
-    style Local fill:#ffcccc
-    style Fallback fill:#fff3cd
-    style External fill:#d4edda
-```
+<p align="center">
+  <img src="docs/images/services.svg" width="920" alt="Service resilience tiers by failure impact: Critical local services with no fallback (ChromaDB, embedding model, vault filesystem) alert immediately and take LifeOS offline if they fail; Graceful services degrade to a fallback (intent classifier → regex patterns, BM25 → vector-only) with no outage; External third-party APIs (Google APIs, Slack, Monarch, LLM backend, whisper-relay) only pause the feature they power.">
+</p>
 
 **Alert severities:** CRITICAL (sent immediately — ChromaDB down, embedding failed, vault inaccessible) · WARNING (batched nightly — LLM API errors, backup failed) · INFO (log only). See [Operations](docs/guides/operations.md).
 
