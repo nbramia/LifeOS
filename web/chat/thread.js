@@ -43,29 +43,7 @@ export function addMessage(content, type, sources = [], messageId = null, target
   let html = `<div class="message-content">${formatContent(content)}</div>`;
 
   if (type === 'assistant' && content && sources.length > 0) {
-    // Add collapsed class if more than 3 sources
-    const collapsedClass = sources.length > 3 ? ' collapsed' : '';
-    html += `<div class="message-meta"><div class="sources${collapsedClass}">`;
-    sources.forEach(src => {
-      const fileName = src.file_name || src;
-      const sourceType = src.source_type || 'vault';
-
-      if (sourceType === 'calendar' && src.url) {
-        // Calendar sources use Google Calendar URL
-        html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
-      } else {
-        // Vault sources use Obsidian URL
-        const obsidianPath = src.obsidian_path || fileName;
-        const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-        html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
-      }
-    });
-    // Add toggle button if more than 3 sources
-    if (sources.length > 3) {
-      const hiddenCount = sources.length - 3;
-      html += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
-    }
-    html += `</div></div>`;
+    html += `<div class="message-meta">${buildSourcesHtml(sources)}</div>`;
   }
 
   msg.innerHTML = html;
@@ -96,20 +74,37 @@ export function formatContent(content) {
     .replace(/\n/g, '<br>');
 }
 
+// Build the compact, collapsed-by-default "📄 N sources" block shared by the
+// live stream (ask-stream.js) and the history render (addMessage). The file
+// chips are hidden until the user clicks the toggle; returns '' when there are
+// no sources so no empty block is rendered.
+export function buildSourcesHtml(sources) {
+  if (!sources || sources.length === 0) return '';
+  const label = sources.length === 1 ? '1 source' : `${sources.length} sources`;
+  let html = `<div class="sources collapsed">`
+    + `<button class="sources-toggle" onclick="toggleSources(this)">📄 ${label} <span class="sources-caret">▾</span></button>`
+    + `<div class="source-chips">`;
+  sources.forEach(src => {
+    const fileName = src.file_name || src;
+    const sourceType = src.source_type || 'vault';
+
+    if (sourceType === 'calendar' && src.url) {
+      // Calendar sources use Google Calendar URL
+      html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
+    } else {
+      // Vault sources use Obsidian URL
+      const obsidianPath = src.obsidian_path || fileName;
+      const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
+      html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
+    }
+  });
+  html += `</div></div>`;
+  return html;
+}
+
 export function toggleSources(btn) {
   const sourcesDiv = btn.closest('.sources');
-  const isCollapsed = sourcesDiv.classList.contains('collapsed');
-  const sourceLinks = sourcesDiv.querySelectorAll('.source-link');
-  const totalCount = sourceLinks.length;
-  const hiddenCount = totalCount - 3;
-
-  if (isCollapsed) {
-    // Expand
-    sourcesDiv.classList.remove('collapsed');
-    btn.textContent = 'Show less';
-  } else {
-    // Collapse
-    sourcesDiv.classList.add('collapsed');
-    btn.textContent = `Show ${hiddenCount} more...`;
-  }
+  const isCollapsed = sourcesDiv.classList.toggle('collapsed');
+  const caret = btn.querySelector('.sources-caret');
+  if (caret) caret.textContent = isCollapsed ? '▾' : '▴';
 }
