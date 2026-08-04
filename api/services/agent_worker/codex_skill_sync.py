@@ -13,11 +13,16 @@ checked into `.agents/skills/` without conversion. It is import-safe and
 side-effect-free until an install function is called, so transforms can be
 unit-tested without touching the filesystem.
 
-Only engine-agnostic skills are ported. The Claude-orchestration skills
-(`review-pr`, `address-review`, `mine-for-ideas`) drive Claude's `Task`/`Skill`
-subagent loop and are deliberately left Claude-only; `tune` edits the LifeOS
-Claude-orchestrator internals and is also excluded. `implement` has a separate
-native Codex rewrite under `.agents/skills/implement`.
+Only engine-agnostic skills are ported. `mine-for-ideas` drives Claude's
+`Task`/`Skill` subagent loop and is deliberately left Claude-only; `tune` edits
+the LifeOS Claude-orchestrator internals and is also excluded.
+
+The implementation lifecycle (planning, issue drafting, PR checks, review,
+merge) is not synced from here at all: it comes from the
+`benjamcalvin/bootstraps` marketplace, which ships a Codex-compatible plugin
+(`implement-lifecycle`, `issue-management`) installed through Codex's own
+plugin browser. `implement` additionally has a native Codex rewrite under
+`.agents/skills/implement`.
 """
 from __future__ import annotations
 
@@ -38,9 +43,6 @@ PORTABLE_SKILLS = (
     "catchup",
     "stale",
     "sync-health",
-    "draft-issue",
-    "pr-check",
-    "merge-pr",
     "remove-worktree",
 )
 

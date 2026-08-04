@@ -422,8 +422,8 @@ context-blind runs.
 ### Codex skills (`#codex` parity with `#claude`)
 
 The engine-agnostic LifeOS workflow skills (`/standup`, `/catchup`, `/stale`,
-`/sync-health`, `/draft-issue`, `/pr-check`, `/merge-pr`, `/remove-worktree`)
-can be installed for Codex. Codex discovers skills only from
+`/sync-health`, `/remove-worktree`) can be installed for Codex. Codex
+discovers skills only from
 `~/.codex/skills/` (or `$CODEX_HOME/skills`) — there's no project-level skills
 dir — so this is a machine-local install, like the MCP block above:
 
@@ -434,10 +434,19 @@ dir — so this is a machine-local install, like the MCP block above:
 
 The script converts each skill from Claude Code's slash-command dialect
 (`$ARGUMENTS`, `` !`cmd` `` injection) into Codex's `SKILL.md` format. Re-run
-after editing the source skills under `.claude/skills/`. The Claude-orchestration
-skills (`/implement`, `/review-pr`, `/address-review`, `/mine-for-ideas`, `/tune`)
-are intentionally **not** ported — they drive Claude's subagent loop or the
-LifeOS orchestrator internals and have no Codex equivalent.
+after editing the source skills under `.claude/skills/`. `/mine-for-ideas` and
+`/tune` are intentionally **not** ported — they drive Claude's subagent loop or
+the LifeOS orchestrator internals and have no Codex equivalent.
+
+### Implementation lifecycle skills
+
+`/implement`, `/draft-issue`, `/pr-check`, `/merge-pr`, `/review-pr`, and
+`/address-review` come from the `benjamcalvin/bootstraps` marketplace, not from
+this repo. The marketplace is cross-compatible: its `implement-lifecycle` and
+`issue-management` plugins install in Codex through Codex's plugin browser, and
+in Claude Code at **user scope** (`/plugin` → add the `benjamcalvin/bootstraps`
+marketplace). `scripts/install_codex_skills.py` does not sync them, so a Codex
+machine needs the plugin installed to have them.
 
 ### Codex computer use — NOT available to the worker (use delegation)
 
