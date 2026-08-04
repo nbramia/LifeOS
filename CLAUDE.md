@@ -11,7 +11,9 @@
 
 ## Skills
 
-Repo skills are surfaced automatically as slash commands (their descriptions come from `.claude/skills/`); `/implement <task>` is the primary entry point — full lifecycle: plan → implement → PR → adversarial review → merge.
+Repo skills live in `.claude/skills/` and are surfaced automatically as slash commands (their descriptions come from each skill's own definition). These are LifeOS-specific — health checks, housekeeping, and reporting.
+
+The development lifecycle comes from elsewhere: the user-scope `implement-lifecycle` and `issue-management` plugins, which read this repo's AGENTS.md, CLAUDE.md, and `docs/` at runtime rather than carrying LifeOS knowledge of their own. `/implement <task>` is the primary entry point — full lifecycle: plan → implement → PR → adversarial review → merge. `/pr-check` and `/merge-pr` run standalone; review and follow-up are scoped invocations of `/implement` (`/implement <pr> just review`, `/implement <pr> address the review feedback`).
 
 ## Quick Reference
 

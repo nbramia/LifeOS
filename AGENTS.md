@@ -81,7 +81,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
 | Why was X chosen over Y? | `docs/adr/` (specific ADR) |
-| How do we review PRs? | `/review-pr`, `/pr-check`, `/implement` skills in `.claude/skills/` |
+| How do we review PRs? | `/implement <pr> just review`, `/pr-check`, `/merge-pr` — from the user-scope `implement-lifecycle` plugin |
 
 ---
 
