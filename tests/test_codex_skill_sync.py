@@ -116,7 +116,7 @@ def test_install_skills_writes_portable_set(tmp_path: Path):
     claude_dir = tmp_path / "claude_skills"
     codex_dir = tmp_path / "codex_skills"
     # Seed two portable skills + one that isn't on the allowlist.
-    for name in ("standup", "pr-check", "implement"):
+    for name in ("standup", "catchup", "implement"):
         d = claude_dir / name
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(_SAMPLE.replace("standup", name), encoding="utf-8")
@@ -124,7 +124,7 @@ def test_install_skills_writes_portable_set(tmp_path: Path):
     installed = install_skills(claude_dir, codex_dir)
 
     assert "standup" in installed
-    assert "pr-check" in installed
+    assert "catchup" in installed
     # Claude-orchestration skill is not on the allowlist → never installed.
     assert "implement" not in installed
     assert not (codex_dir / "implement").exists()
@@ -171,6 +171,23 @@ def test_install_native_codex_skills_copies_skill_directory(tmp_path: Path):
 def test_orchestration_skills_excluded_from_allowlist():
     for excluded in ("implement", "review-pr", "address-review", "tune", "mine-for-ideas"):
         assert excluded not in PORTABLE_SKILLS
+
+
+def test_lifecycle_skills_excluded_from_allowlist():
+    """The implementation lifecycle ships as the `benjamcalvin/bootstraps`
+    plugin, installed in Codex through its own plugin browser. Listing those
+    skills here would point the converter at sources this repo does not hold."""
+    for excluded in ("draft-issue", "pr-check", "merge-pr"):
+        assert excluded not in PORTABLE_SKILLS
+
+
+def test_every_portable_skill_has_a_source_in_the_repo():
+    """`install_skills` skips a missing source silently, so an allowlist entry
+    with no `.claude/skills/<name>/SKILL.md` never reaches Codex and never
+    raises. Pin the allowlist to skills that this repo actually carries."""
+    repo_skills = Path(__file__).resolve().parent.parent / ".claude" / "skills"
+    missing = [n for n in PORTABLE_SKILLS if not (repo_skills / n / "SKILL.md").is_file()]
+    assert not missing, f"allowlisted skills with no source: {missing}"
 
 
 def test_native_codex_skills_include_implement_only():

@@ -168,6 +168,11 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
 
+    # The HTTPS front `tailscale serve` publishes (scripts/setup-tailscale.sh).
+    # Also the one non-local origin CORS allows, so a browser loading the UI from
+    # the tailnet hostname can call the API. Empty simply drops it from the list.
+    tailnet_https_url: str = Field(default="", alias="TAILNET_HTTPS_URL")
+
     # API Keys (no prefix - standard env var names)
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 

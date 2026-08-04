@@ -184,10 +184,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for local development
+# CORS: an explicit allowlist of the addresses this app answers on.
+#
+# The web UI does not depend on any of this — it is served by this app and
+# addresses it with root-relative paths, so its requests are same-origin and
+# never consult these rules. The list covers a page loaded at one of these
+# addresses that calls the API at another.
+#
+# A wildcard here was both ineffective and dangerous. Browsers reject `*` on
+# credentialed requests, so it never granted what it appeared to; and because
+# this app has no authentication of its own, `*` widened the security boundary
+# from "the tailnet" to "any page a tailnet device happens to have open".
+_cors_origins = [
+    f"http://localhost:{settings.port}",
+    f"http://127.0.0.1:{settings.port}",
+]
+if settings.tailnet_https_url:
+    _cors_origins.append(settings.tailnet_https_url.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
