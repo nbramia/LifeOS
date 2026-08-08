@@ -99,12 +99,19 @@ send_telegram() {
 }
 
 # --- Identify the managed WiFi device (portable; no hardcoded ifname) ---
-WIFI_DEV=$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null \
-    | awk -F: '$2=="wifi"{print $1; exit}')
-
-if [ -z "$WIFI_DEV" ]; then
-    # No managed WiFi device — nothing for this watchdog to do (wired-only
-    # host, macOS, container, etc.). Silent no-op.
+# Distinguish "nmcli worked, no wifi device" (healthy no-op: wired-only host,
+# macOS, container) from "nmcli itself failed" (NetworkManager dead or wedged).
+# During the 2026-07 outage NM died and every tick took the silent no-op path
+# for 18 days — the log showed nothing. A dead NM can't be fixed from here
+# (that's the net-reboot-watchdog's job) but it must be LOUD, not silent.
+if NMCLI_OUT=$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null); then
+    WIFI_DEV=$(echo "$NMCLI_OUT" | awk -F: '$2=="wifi"{print $1; exit}')
+    if [ -z "$WIFI_DEV" ]; then
+        # nmcli healthy, genuinely no WiFi device — silent no-op.
+        exit 0
+    fi
+else
+    log "nmcli cannot reach NetworkManager — NM dead/wedged; gentle repair impossible (reboot watchdog is the recovery path)"
     exit 0
 fi
 
