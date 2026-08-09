@@ -107,31 +107,21 @@ def _parse_abcdp_contact(plist_data: dict, identifier: str) -> dict | None:
     }
 
 
-def export_contacts(dry_run: bool = False) -> dict:
-    """Export Apple Contacts by reading .abcdp plist files directly.
+def _read_abcdp_contacts(addressbook_dir: Path) -> list[dict]:
+    """Read contacts from legacy per-person .abcdp plist files, if any exist.
 
-    Reads from ~/Library/Application Support/AddressBook/Sources/*/Metadata/
-    which requires Full Disk Access but NOT the Contacts TCC permission.
-    This works over SSH and in cron — no per-app Contacts grant needed.
+    On current macOS this glob matches nothing (contacts moved to the
+    AddressBook-v22.abcddb SQLite databases — see issue #514) but older
+    macOS versions still write one .abcdp file per contact under
+    Sources/*/Metadata/, so this path is kept as a fallback.
     """
-    addressbook_dir = Path.home() / "Library" / "Application Support" / "AddressBook"
-    if not addressbook_dir.exists():
-        logger.warning(f"AddressBook directory not found: {addressbook_dir}")
-        return {"status": "skipped", "reason": "AddressBook not found"}
-
-    # Glob all .abcdp person files across all sources
     abcdp_files = list(addressbook_dir.glob("Sources/*/Metadata/*:ABPerson.abcdp"))
     logger.info(f"Found {len(abcdp_files)} .abcdp contact files")
-
     if not abcdp_files:
-        return {"status": "ok", "count": 0, "path": ""}
+        return []
 
-    if dry_run:
-        return {"status": "dry_run", "count": len(abcdp_files)}
-
-    # Parse each file; deduplicate by identifier (UUID from filename)
     seen_ids: set[str] = set()
-    export = []
+    contacts = []
     errors = 0
     for path in abcdp_files:
         try:
@@ -146,25 +136,253 @@ def export_contacts(dry_run: bool = False) -> dict:
 
             contact = _parse_abcdp_contact(plist_data, identifier)
             if contact:
-                export.append(contact)
+                contacts.append(contact)
         except Exception as e:
             errors += 1
             if errors <= 5:
                 logger.warning(f"Error parsing {path.name}: {e}")
 
     if errors:
-        logger.warning(f"Skipped {errors} contacts due to parse errors")
+        logger.warning(f"Skipped {errors} .abcdp contacts due to parse errors")
+
+    return contacts
+
+
+def _strip_abcddb_label(label: str | None) -> str:
+    """Strip AddressBook's plist-style label wrapper: _$!<Mobile>!$_ -> Mobile."""
+    label = label or ""
+    if label.startswith("_$!<") and label.endswith(">!$_"):
+        label = label[4:-4]
+    return label or "other"
+
+
+def _find_abcddb_paths(addressbook_dir: Path) -> list[Path]:
+    """List every AddressBook-v22.abcddb: the root DB plus one per account source.
+
+    The root DB (directly under AddressBook/) is typically empty — each
+    account source (iCloud, Exchange, "On My Mac", ...) keeps its own copy
+    under Sources/<uuid>/. Both are read the same way.
+    """
+    candidates = [addressbook_dir / "AddressBook-v22.abcddb"]
+    candidates += sorted(addressbook_dir.glob("Sources/*/AddressBook-v22.abcddb"))
+    return [p for p in candidates if p.exists()]
+
+
+def _fetch_abcddb_contacts(db_path: Path) -> list[dict]:
+    """Read contacts (with phones/emails) from one AddressBook-v22.abcddb file.
+
+    ZABCDRECORD is a shared table for several Core Data entity subtypes
+    (contacts, groups, containers, ...); the contact rows are the ones whose
+    Z_ENT matches the 'ABCDContact' entity registered in Z_PRIMARYKEY. That
+    id isn't a stable literal across macOS versions, so it's looked up by
+    name rather than hardcoded. Phone numbers and email addresses live in
+    separate tables keyed by ZOWNER = ZABCDRECORD.Z_PK.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.DatabaseError as e:
+        logger.warning(f"Cannot open {db_path}: {e}")
+        return []
+
+    try:
+        ent_row = conn.execute(
+            "SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = 'ABCDContact'"
+        ).fetchone()
+        if not ent_row:
+            return []
+        contact_ent = ent_row["Z_ENT"]
+
+        records = conn.execute(
+            """
+            SELECT Z_PK, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION,
+                   ZNICKNAME, ZJOBTITLE, ZDEPARTMENT, ZBIRTHDAY
+            FROM ZABCDRECORD
+            WHERE Z_ENT = ?
+            ORDER BY Z_PK
+            """,
+            (contact_ent,),
+        ).fetchall()
+
+        phones_by_owner: dict[int, list[dict]] = {}
+        for row in conn.execute("SELECT ZOWNER, ZLABEL, ZFULLNUMBER FROM ZABCDPHONENUMBER"):
+            if not row["ZFULLNUMBER"]:
+                continue
+            phones_by_owner.setdefault(row["ZOWNER"], []).append(
+                {"label": _strip_abcddb_label(row["ZLABEL"]), "value": row["ZFULLNUMBER"]}
+            )
+
+        emails_by_owner: dict[int, list[dict]] = {}
+        for row in conn.execute("SELECT ZOWNER, ZLABEL, ZADDRESS FROM ZABCDEMAILADDRESS"):
+            if not row["ZADDRESS"]:
+                continue
+            emails_by_owner.setdefault(row["ZOWNER"], []).append(
+                {"label": _strip_abcddb_label(row["ZLABEL"]), "value": row["ZADDRESS"]}
+            )
+    except sqlite3.DatabaseError as e:
+        logger.warning(f"Error reading {db_path}: {e}")
+        return []
+    finally:
+        conn.close()
+
+    # Core Data reference date: seconds since 2001-01-01, same epoch used
+    # elsewhere in this file (e.g. export_phone_calls' CORE_DATA_EPOCH).
+    core_data_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+    contacts = []
+    for r in records:
+        first = r["ZFIRSTNAME"] or ""
+        last = r["ZLASTNAME"] or ""
+        organization = r["ZORGANIZATION"] or ""
+        if not first and not last and not organization:
+            continue
+
+        full_name = " ".join(p for p in [first, last] if p) or organization
+
+        birthday = None
+        bd = r["ZBIRTHDAY"]
+        if bd is not None:
+            try:
+                birthday = (core_data_epoch + timedelta(seconds=bd)).isoformat()
+            except (OverflowError, OSError, ValueError):
+                birthday = None
+
+        contacts.append({
+            "identifier": f"abcddb:{r['ZUNIQUEID'] or r['Z_PK']}",
+            "given_name": first,
+            "family_name": last,
+            "full_name": full_name,
+            "nickname": r["ZNICKNAME"] or "",
+            "organization": organization,
+            "job_title": r["ZJOBTITLE"] or "",
+            "department": r["ZDEPARTMENT"] or "",
+            "emails": emails_by_owner.get(r["Z_PK"], []),
+            "phones": phones_by_owner.get(r["Z_PK"], []),
+            "addresses": [],  # Postal addresses have complex plist structure; omit for now
+            "social_profiles": [],
+            "note": "",  # Notes may contain sensitive data; omit from export
+            "image_available": False,
+            "birthday": birthday,
+        })
+
+    return contacts
+
+
+def _read_abcddb_contacts(addressbook_dir: Path) -> list[dict]:
+    """Read contacts from every AddressBook-v22.abcddb (root + each account source)."""
+    contacts: list[dict] = []
+    for db_path in _find_abcddb_paths(addressbook_dir):
+        contacts.extend(_fetch_abcddb_contacts(db_path))
+    return contacts
+
+
+def _normalize_contact_key(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().casefold())
+
+
+def _dedupe_contacts(contacts: list[dict]) -> list[dict]:
+    """Merge contacts that appear in more than one account source.
+
+    The same real contact is commonly synced into several account sources
+    (iCloud, Exchange, "On My Mac", ...) and shows up as a separate row in
+    each. The schema has no reliable cross-source join key — ZLINKID doesn't
+    span sources and ZUNIQUEID is generated per-source — so contacts are
+    grouped by normalized full name (falling back to organization for
+    company-only cards, which have no personal name). That's the field most
+    likely to be identical across a synced copy of the same real contact,
+    and it's simple: no fuzzy phone/email matching heuristics to get wrong.
+    Contacts with neither a usable name nor organization can't be grouped
+    and pass through unmerged.
+
+    Merging unions emails/phones by value and backfills any other field
+    that's empty on the first-seen copy, so no data from either source is
+    lost.
+    """
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    passthrough: list[dict] = []
+
+    for contact in contacts:
+        key = _normalize_contact_key(contact.get("full_name") or contact.get("organization") or "")
+        if not key:
+            passthrough.append(contact)
+            continue
+
+        if key not in merged:
+            target = dict(contact)
+            target["emails"] = list(contact.get("emails") or [])
+            target["phones"] = list(contact.get("phones") or [])
+            merged[key] = target
+            order.append(key)
+            continue
+
+        target = merged[key]
+        seen_emails = {e["value"].lower() for e in target["emails"]}
+        for e in contact.get("emails") or []:
+            if e["value"].lower() not in seen_emails:
+                target["emails"].append(e)
+                seen_emails.add(e["value"].lower())
+
+        seen_phones = {p["value"] for p in target["phones"]}
+        for p in contact.get("phones") or []:
+            if p["value"] not in seen_phones:
+                target["phones"].append(p)
+                seen_phones.add(p["value"])
+
+        for field in ("organization", "job_title", "department", "nickname", "birthday", "given_name", "family_name"):
+            if not target.get(field) and contact.get(field):
+                target[field] = contact[field]
+
+    return [merged[k] for k in order] + passthrough
+
+
+def export_contacts(dry_run: bool = False) -> dict:
+    """Export Apple Contacts by reading AddressBook's local files directly.
+
+    Contacts currently live in AddressBook-v22.abcddb SQLite databases (the
+    root DB plus one per account source under Sources/*/) — see issue #514.
+    Older macOS instead wrote one .abcdp plist per contact under
+    Sources/*/Metadata/, which is kept as a fallback for that case.
+
+    Either way this reads files directly rather than going through the
+    Contacts framework, which needs only Full Disk Access — not the
+    per-app Contacts TCC grant — so it works over SSH and in cron.
+    """
+    addressbook_dir = Path.home() / "Library" / "Application Support" / "AddressBook"
+    if not addressbook_dir.exists():
+        logger.warning(f"AddressBook directory not found: {addressbook_dir}")
+        return {"status": "skipped", "reason": "AddressBook not found"}
+
+    contacts = _read_abcddb_contacts(addressbook_dir)
+    source_method = "abcddb"
+    if not contacts:
+        contacts = _read_abcdp_contacts(addressbook_dir)
+        source_method = "abcdp"
+
+    contacts = _dedupe_contacts(contacts)
+    logger.info(f"Found {len(contacts)} contacts via {source_method} (after cross-source dedup)")
+
+    if not contacts:
+        return {
+            "status": "error",
+            "count": 0,
+            "path": "",
+            "reason": "no contacts found via abcddb or abcdp",
+        }
+
+    if dry_run:
+        return {"status": "dry_run", "count": len(contacts)}
 
     out_path = EXPORT_DIR / "contacts.json"
     with open(out_path, "w") as f:
         json.dump({
             "exported_at": datetime.now(timezone.utc).isoformat(),
-            "count": len(export),
-            "contacts": export,
+            "count": len(contacts),
+            "contacts": contacts,
         }, f, indent=2)
 
-    logger.info(f"Exported {len(export)} contacts to {out_path}")
-    return {"status": "ok", "count": len(export), "path": str(out_path)}
+    logger.info(f"Exported {len(contacts)} contacts to {out_path}")
+    return {"status": "ok", "count": len(contacts), "path": str(out_path)}
 
 
 def export_imessage(dry_run: bool = False) -> dict:

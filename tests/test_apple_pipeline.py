@@ -2,6 +2,7 @@
 import json
 import logging
 import plistlib
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -236,6 +237,401 @@ class TestContactsExport:
         assert result["count"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Contacts .abcddb (SQLite AddressBook) parsing — issue #514
+# ---------------------------------------------------------------------------
+
+def _build_abcddb(
+    path: Path,
+    contacts: list[dict],
+    contact_ent: int = 22,
+    other_ent: int = 19,
+    other_ent_name: str = "ABCDGroup",
+):
+    """Build a synthetic AddressBook-v22.abcddb with the real table/column
+    shape (verified read-only against the real schema) but entirely
+    synthetic data. Each item in `contacts` is a dict with keys: pk, uid,
+    first, last, org, nickname, job_title, department, birthday (seconds
+    since Core Data epoch or None), phones (list of (label, value)),
+    emails (list of (label, value)).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER PRIMARY KEY, Z_NAME VARCHAR)")
+    conn.execute("INSERT INTO Z_PRIMARYKEY VALUES (?, 'ABCDContact')", (contact_ent,))
+    conn.execute("INSERT INTO Z_PRIMARYKEY VALUES (?, ?)", (other_ent, other_ent_name))
+    conn.execute(
+        """CREATE TABLE ZABCDRECORD (
+            Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZUNIQUEID VARCHAR,
+            ZFIRSTNAME VARCHAR, ZLASTNAME VARCHAR, ZORGANIZATION VARCHAR,
+            ZNICKNAME VARCHAR, ZJOBTITLE VARCHAR, ZDEPARTMENT VARCHAR,
+            ZBIRTHDAY TIMESTAMP
+        )"""
+    )
+    conn.execute(
+        "CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZLABEL VARCHAR, ZFULLNUMBER VARCHAR)"
+    )
+    conn.execute(
+        "CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZLABEL VARCHAR, ZADDRESS VARCHAR)"
+    )
+
+    for c in contacts:
+        conn.execute(
+            """INSERT INTO ZABCDRECORD
+               (Z_PK, Z_ENT, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION,
+                ZNICKNAME, ZJOBTITLE, ZDEPARTMENT, ZBIRTHDAY)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                c["pk"], c.get("ent", contact_ent), c["uid"],
+                c.get("first"), c.get("last"), c.get("org"),
+                c.get("nickname"), c.get("job_title"), c.get("department"),
+                c.get("birthday"),
+            ),
+        )
+        for label, value in c.get("phones", []):
+            conn.execute(
+                "INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZLABEL, ZFULLNUMBER) VALUES (?,?,?)",
+                (c["pk"], label, value),
+            )
+        for label, value in c.get("emails", []):
+            conn.execute(
+                "INSERT INTO ZABCDEMAILADDRESS (ZOWNER, ZLABEL, ZADDRESS) VALUES (?,?,?)",
+                (c["pk"], label, value),
+            )
+
+    # An unrelated group row (different Z_ENT) with no phone/email — must
+    # never surface as a contact.
+    conn.execute(
+        "INSERT INTO ZABCDRECORD (Z_PK, Z_ENT, ZUNIQUEID, ZFIRSTNAME) VALUES (999, ?, 'group-uid', 'Not A Person')",
+        (other_ent,),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestAbcddbContactsParsing:
+    """Test _fetch_abcddb_contacts against a synthetic AddressBook-v22.abcddb."""
+
+    def test_fetch_basic_contact_with_phone_and_email(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {
+                "pk": 1, "uid": "SYNTH-UID-1", "first": "Alex", "last": "Chen",
+                "org": "Example Corp", "job_title": "Engineer",
+                "phones": [("_$!<Mobile>!$_", "+15555550101")],
+                "emails": [("_$!<Work>!$_", "alex.chen@example.com")],
+            },
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        assert len(contacts) == 1
+        c = contacts[0]
+        assert c["full_name"] == "Alex Chen"
+        assert c["organization"] == "Example Corp"
+        assert c["job_title"] == "Engineer"
+        assert c["identifier"] == "abcddb:SYNTH-UID-1"
+        assert c["phones"] == [{"label": "Mobile", "value": "+15555550101"}]
+        assert c["emails"] == [{"label": "Work", "value": "alex.chen@example.com"}]
+
+    def test_fetch_excludes_non_contact_entity_rows(self, tmp_path):
+        """Rows in ZABCDRECORD whose Z_ENT isn't the looked-up ABCDContact
+        entity (groups, containers, ...) must not be treated as contacts."""
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-2", "first": "Priya", "last": "Kapoor"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        names = {c["full_name"] for c in contacts}
+        assert names == {"Priya Kapoor"}
+        assert "Not A Person" not in names
+
+    def test_fetch_org_only_contact(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-3", "org": "Fictional Widgets Inc"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        assert len(contacts) == 1
+        assert contacts[0]["full_name"] == "Fictional Widgets Inc"
+        assert contacts[0]["given_name"] == ""
+
+    def test_fetch_no_name_or_org_skipped(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-4"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+        assert contacts == []
+
+    def test_fetch_birthday_roundtrip(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        core_data_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+        birthday_seconds = 100_000_000  # ~3.17 years after the epoch
+        expected = (core_data_epoch + timedelta(seconds=birthday_seconds)).isoformat()
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-5", "first": "Sam", "birthday": birthday_seconds},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+        assert contacts[0]["birthday"] == expected
+
+    def test_fetch_missing_file_returns_empty(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        contacts = _fetch_abcddb_contacts(tmp_path / "does-not-exist.abcddb")
+        assert contacts == []
+
+    def test_fetch_corrupt_db_returns_empty(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        bad_db = tmp_path / "corrupt.abcddb"
+        bad_db.write_bytes(b"not a sqlite file")
+
+        contacts = _fetch_abcddb_contacts(bad_db)
+        assert contacts == []
+
+
+class TestContactsDedup:
+    """Test _dedupe_contacts, the cross-source merge logic for #514."""
+
+    def _contact(self, full_name="", org="", emails=None, phones=None, **extra):
+        c = {
+            "identifier": extra.pop("identifier", "id"),
+            "given_name": extra.pop("given_name", ""),
+            "family_name": extra.pop("family_name", ""),
+            "full_name": full_name,
+            "nickname": extra.pop("nickname", ""),
+            "organization": org,
+            "job_title": extra.pop("job_title", ""),
+            "department": extra.pop("department", ""),
+            "emails": emails or [],
+            "phones": phones or [],
+            "addresses": [],
+            "social_profiles": [],
+            "note": "",
+            "image_available": False,
+            "birthday": extra.pop("birthday", None),
+        }
+        c.update(extra)
+        return c
+
+    def test_merges_same_name_across_sources(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        icloud = self._contact(
+            identifier="icloud-1", full_name="Jordan Lee",
+            phones=[{"label": "Mobile", "value": "+15555550111"}],
+        )
+        exchange = self._contact(
+            identifier="exchange-1", full_name="Jordan Lee",
+            emails=[{"label": "Work", "value": "jordan.lee@example.com"}],
+        )
+
+        result = _dedupe_contacts([icloud, exchange])
+
+        assert len(result) == 1
+        merged = result[0]
+        assert merged["phones"] == [{"label": "Mobile", "value": "+15555550111"}]
+        assert merged["emails"] == [{"label": "Work", "value": "jordan.lee@example.com"}]
+
+    def test_merge_is_case_and_whitespace_insensitive(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="  Taylor Morgan  ")
+        b = self._contact(identifier="b", full_name="taylor   morgan")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 1
+
+    def test_does_not_merge_different_names(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="Morgan Reed")
+        b = self._contact(identifier="b", full_name="Casey Reed")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 2
+
+    def test_dedup_by_organization_when_no_name(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", org="Fictional Widgets Inc")
+        b = self._contact(identifier="b", org="Fictional Widgets Inc")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 1
+
+    def test_no_name_or_org_passes_through_unmerged(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a")
+        b = self._contact(identifier="b")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 2
+
+    def test_dedup_backfills_empty_fields(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="Riley Park", job_title="")
+        b = self._contact(identifier="b", full_name="Riley Park", job_title="Analyst")
+
+        result = _dedupe_contacts([a, b])
+        assert result[0]["job_title"] == "Analyst"
+
+    def test_dedup_deduplicates_repeated_email_value(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(
+            identifier="a", full_name="Nina Okafor",
+            emails=[{"label": "Home", "value": "nina@example.com"}],
+        )
+        b = self._contact(
+            identifier="b", full_name="Nina Okafor",
+            emails=[{"label": "Work", "value": "NINA@EXAMPLE.COM"}],
+        )
+
+        result = _dedupe_contacts([a, b])
+        assert len(result[0]["emails"]) == 1
+
+
+class TestContactsExportAbcddbIntegration:
+    """End-to-end export_contacts() coverage for the .abcddb path, including
+    the .abcdp fallback and the both-empty error case (issue #514)."""
+
+    def _lib_ab(self, tmp_path: Path) -> Path:
+        return tmp_path / "Library" / "Application Support" / "AddressBook"
+
+    def test_export_reads_abcddb_when_present(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])  # empty root DB
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-1" / "AddressBook-v22.abcddb",
+            [
+                {
+                    "pk": 1, "uid": "SRC1-UID-1", "first": "Morgan", "last": "Diallo",
+                    "phones": [("_$!<Mobile>!$_", "+15555550199")],
+                    "emails": [("_$!<Home>!$_", "morgan.diallo@example.com")],
+                },
+            ],
+        )
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        contact = data["contacts"][0]
+        assert contact["full_name"] == "Morgan Diallo"
+        assert len(contact["phones"]) == 1
+        assert len(contact["emails"]) == 1
+
+    def test_export_dedupes_across_two_source_dbs(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        # Same real contact synced into two account sources (e.g. iCloud +
+        # Exchange), each with different contact info.
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-A" / "AddressBook-v22.abcddb",
+            [{
+                "pk": 1, "uid": "SRC-A-UID-1", "first": "Sasha", "last": "Ivanov",
+                "phones": [("_$!<Mobile>!$_", "+15555550177")],
+            }],
+        )
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-B" / "AddressBook-v22.abcddb",
+            [{
+                "pk": 1, "uid": "SRC-B-UID-1", "first": "Sasha", "last": "Ivanov",
+                "emails": [("_$!<Work>!$_", "sasha.ivanov@example.com")],
+            }],
+        )
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["count"] == 1
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        contact = data["contacts"][0]
+        assert len(contact["phones"]) == 1
+        assert len(contact["emails"]) == 1
+
+    def test_abcdp_fallback_used_when_abcddb_yields_nothing(self, tmp_path):
+        """If .abcddb files exist but contain no contact rows, .abcdp files
+        (if present) must still be read."""
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])  # no contacts
+
+        meta_dir = lib_ab / "Sources" / "LEGACY-SRC" / "Metadata"
+        meta_dir.mkdir(parents=True)
+        with open(meta_dir / "LEGACY-UID:ABPerson.abcdp", "wb") as f:
+            plistlib.dump({"First": "Dana", "Last": "Osei"}, f)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        assert data["contacts"][0]["full_name"] == "Dana Osei"
+
+    def test_both_abcddb_and_abcdp_empty_returns_error(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])
+        (lib_ab / "Sources" / "SRC-EMPTY" / "Metadata").mkdir(parents=True)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "error"
+        assert result["count"] == 0
+        assert result["path"] == ""
+        assert not (export_dir / "contacts.json").exists()
+
+
 class TestExportResultFinalization:
     """_finalize_result guards against a source reporting "ok" with no
     actual output. Issue #505's secondary finding: export_contacts returned
@@ -280,7 +676,13 @@ class TestExportResultFinalization:
 
     def test_export_contacts_no_abcdp_files_gets_finalized_to_error(self, tmp_path):
         """Full-loop check: export_contacts's own empty-result, run through
-        _finalize_result exactly as main() does, becomes an error."""
+        _finalize_result exactly as main() does, stays an error.
+
+        Historically (issue #505) export_contacts returned {"status": "ok",
+        "count": 0, "path": ""} here and _finalize_result had to catch it.
+        Issue #514 made export_contacts itself report "error" directly when
+        neither the .abcddb nor the .abcdp path yields any contacts, so this
+        is now a no-op pass-through rather than a state flip."""
         from scripts.apple_data_export import export_contacts
 
         lib_ab = tmp_path / "Library" / "Application Support" / "AddressBook"
@@ -289,8 +691,9 @@ class TestExportResultFinalization:
         with patch("scripts.apple_data_export.Path.home", return_value=tmp_path):
             raw = export_contacts(dry_run=False)
 
-        # This is the exact historical bug shape from issue #505.
-        assert raw == {"status": "ok", "count": 0, "path": ""}
+        assert raw["status"] == "error"
+        assert raw["count"] == 0
+        assert raw["path"] == ""
 
         finalized = self._finalize()(raw)
         assert finalized["status"] == "error"
