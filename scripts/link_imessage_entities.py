@@ -137,12 +137,22 @@ def link_imessage_entities(dry_run: bool = True) -> dict:
 
     conn.close()
 
-    logger.info(f"\n=== iMessage Entity Linking Summary ===")
+    logger.info("\n=== iMessage Entity Linking Summary ===")
     logger.info(f"Handles checked: {stats['handles_checked']}")
     logger.info(f"Already linked: {stats['already_linked']}")
     logger.info(f"Newly linked: {stats['newly_linked']}")
     logger.info(f"No match found: {stats['no_match']}")
     logger.info(f"Messages updated: {stats['messages_updated']}")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output. "Newly
+    # linked" / "Messages updated" match none of the fallback regexes, so a
+    # night that linked thousands of rows still reported 0/0/0 (#497).
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(stats.get("handles_checked", 0) or 0),
+        "people_updated": int(stats.get("newly_linked", 0) or 0),
+        "updated": int(stats.get("messages_updated", 0) or 0),
+    })
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")

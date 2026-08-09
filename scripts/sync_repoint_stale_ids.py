@@ -116,6 +116,15 @@ def main():
     print(f"Interactions affected: {result['stale_count']}")
     print(f"Interactions repointed: {result['repointed']}")
 
+    # Canonical line consumed by run_all_syncs._parse_sync_output. "repointed"
+    # matches none of the fallback regexes, so a night that repointed hundreds
+    # of interactions would still have recorded 0/0/0 (#497).
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(result.get("stale_count", 0) or 0),
+        "updated": int(result.get("repointed", 0) or 0),
+    })
+
 
 if __name__ == "__main__":
     main()

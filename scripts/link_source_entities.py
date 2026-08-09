@@ -35,12 +35,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
 from api.services.source_entity import (
-    SourceEntityStore,
-    SourceEntity,
     get_source_entity_store,
     LINK_STATUS_AUTO,
 )
@@ -99,7 +96,6 @@ def link_source_entities(
     # We fetch in large batches to build the complete list
     logger.info("Fetching all eligible entities...")
     all_entities = []
-    offset = 0
     fetch_limit = 10000  # Fetch in large chunks
 
     while True:
@@ -204,7 +200,7 @@ def link_source_entities(
 
     # Print summary
     logger.info(f"\n{'='*50}")
-    logger.info(f"Source Entity Linking Summary")
+    logger.info("Source Entity Linking Summary")
     logger.info(f"{'='*50}")
     logger.info(f"Entities processed:    {stats['entities_processed']:,}")
     logger.info(f"Newly linked:          {stats['newly_linked']:,}")
@@ -212,18 +208,28 @@ def link_source_entities(
     logger.info(f"No match found:        {stats['no_match_found']:,}")
     logger.info(f"Errors:                {stats['errors']:,}")
 
+    # Canonical line consumed by run_all_syncs._parse_sync_output. The prose
+    # above uses {n:,} thousands separators, which the \d+ fallback patterns
+    # can never match — so real work reported 0/0/0 (#497).
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(stats.get("entities_processed", 0) or 0),
+        "people_updated": int(stats.get("newly_linked", 0) or 0),
+        "errors": int(stats.get("errors", 0) or 0),
+    })
+
     if stats['by_source']:
-        logger.info(f"\nProcessed by source:")
+        logger.info("\nProcessed by source:")
         for source, count in sorted(stats['by_source'].items(), key=lambda x: -x[1]):
             logger.info(f"  {source}: {count:,}")
 
     if stats['by_match_type']:
-        logger.info(f"\nLinked by match type:")
+        logger.info("\nLinked by match type:")
         for match_type, count in sorted(stats['by_match_type'].items(), key=lambda x: -x[1]):
             logger.info(f"  {match_type}: {count:,}")
 
     if dry_run:
-        logger.info(f"\nDRY RUN - no changes made. Use --execute to apply.")
+        logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
 
     return stats
 
