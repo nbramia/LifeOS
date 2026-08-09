@@ -16,6 +16,14 @@ Example:
 - 29 gmail source entities with alex@oldcompany.com are UNLINKED
 - This script will find and link those entities to Alex's person record.
 
+Manual escape hatch: this script queries ALL unlinked entities directly and
+ignores match_attempted_at/match_attempt_count entirely — it neither respects
+the nightly cap/backoff in scripts/link_source_entities.py nor increments the
+counter on a miss. Use it when you want an immediate, unthrottled full sweep
+(e.g. right after a large batch of new PersonEntities was created) instead of
+waiting for the nightly backoff schedule to make capped entities eligible
+again (#507).
+
 Usage:
     # Dry run (default) - see what would be linked
     python scripts/relink_source_entities.py
