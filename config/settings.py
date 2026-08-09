@@ -977,13 +977,22 @@ class Settings(BaseSettings):
 
     @property
     def photos_db_path(self) -> str:
-        """Get path to Photos.sqlite database."""
-        return f"{self.photos_library_path}/database/Photos.sqlite"
+        """Get path to Photos.sqlite database.
+
+        Expands ``~`` so the tilde-prefixed default resolves — without this the
+        default configuration could never work, even on a Mac with a stock
+        library, because ``Path("~/...").exists()`` is always False.
+        """
+        from pathlib import Path
+        library = str(Path(self.photos_library_path).expanduser())
+        return f"{library}/database/Photos.sqlite"
 
     @property
     def photos_enabled(self) -> bool:
         """Check if Photos database is available."""
         from pathlib import Path
+        if not self.photos_library_path:
+            return False
         return Path(self.photos_db_path).exists()
 
 

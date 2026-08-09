@@ -31,10 +31,18 @@ def main():
         return
 
     result = update_all_strengths()
-    logger.info(f"\n=== Strength Update Summary ===")
+    logger.info("\n=== Strength Update Summary ===")
     logger.info(f"Updated: {result['updated']}")
     logger.info(f"Failed: {result['failed']}")
     logger.info(f"Total: {result['total']}")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output (#496).
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "people_updated": int(result.get("updated", 0) or 0),
+        "processed": int(result.get("total", 0) or 0),
+        "errors": int(result.get("failed", 0) or 0),
+    })
 
 
 if __name__ == '__main__':

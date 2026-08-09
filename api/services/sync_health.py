@@ -608,6 +608,122 @@ def get_typical_duration_seconds(
     return float(statistics.median(row["duration_seconds"] for row in rows))
 
 
+def _row_yield(row) -> int:
+    """Total records a run produced. The stats columns overlap by design
+    (``records_created`` already absorbs people/interactions/source-entities via
+    the max() rollup in run_all_syncs), so take the largest signal rather than
+    summing — summing would double-count and inflate the median."""
+    return max(
+        row["records_created"] or 0,
+        row["records_updated"] or 0,
+        row["interactions_created"] or 0,
+        row["records_processed"] or 0,
+    )
+
+
+def get_typical_yield(source: str, n: int = 10) -> Optional[float]:
+    """Median records produced across the last ``n`` *productive* runs of ``source``.
+
+    Complements :func:`get_typical_duration_seconds`. Duration collapse only
+    catches sources that *used* to be slow; a source that always finishes
+    instantly (and always produces nothing) is invisible to it. Yield measures
+    the thing we actually care about — did this run do anything.
+
+    Zero-yield runs are excluded from the history for the same reason
+    :func:`get_typical_duration_seconds` excludes instant runs: they are the
+    pathology being hunted. Including them lets a few days of silent no-ops
+    redefine "typical" as zero, after which nothing can ever look wrong —
+    exactly how `entity_cleanup` went unnoticed from Feb 2026.
+
+    Returns None when the source has no productive history to compare against.
+    """
+    conn = get_sync_health_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT records_created, records_updated, interactions_created,
+                   records_processed
+            FROM sync_runs
+            WHERE source = ? AND status = ?
+              AND (COALESCE(records_created, 0) > 0
+                   OR COALESCE(records_updated, 0) > 0
+                   OR COALESCE(interactions_created, 0) > 0
+                   OR COALESCE(records_processed, 0) > 0)
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (source, SyncStatus.SUCCESS.value, n),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+    return float(statistics.median(_row_yield(row) for row in rows))
+
+
+def get_consecutive_zero_yield_runs(source: str, limit: int = 50) -> int:
+    """How many of the most recent successful runs produced nothing, in a row.
+
+    A single empty run is normal (a quiet night with no new mail). A *streak*
+    of them from a source that normally produces records is a silent failure.
+    """
+    conn = get_sync_health_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT records_created, records_updated, interactions_created,
+                   records_processed
+            FROM sync_runs
+            WHERE source = ? AND status = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (source, SyncStatus.SUCCESS.value, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    streak = 0
+    for row in rows:
+        if _row_yield(row) > 0:
+            break
+        streak += 1
+    return streak
+
+
+def get_yield_history(source: str) -> dict:
+    """Lifetime yield stats for ``source``: run count and best run ever.
+
+    Used to spot a source that has *never* produced anything across many runs —
+    the signature of a dead or misconfigured source that no per-run check can
+    see, because every run looks exactly like the last one.
+    """
+    conn = get_sync_health_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS runs,
+                   MAX(MAX(COALESCE(records_created, 0),
+                           COALESCE(records_updated, 0),
+                           COALESCE(interactions_created, 0),
+                           COALESCE(records_processed, 0))) AS best,
+                   AVG(COALESCE(duration_seconds, 0)) AS avg_duration
+            FROM sync_runs
+            WHERE source = ? AND status = ?
+            """,
+            (source, SyncStatus.SUCCESS.value),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return {
+        "runs": (row["runs"] if row else 0) or 0,
+        "best_yield": (row["best"] if row else 0) or 0,
+        "avg_duration_seconds": float((row["avg_duration"] if row else 0) or 0.0),
+    }
+
+
 def get_sync_health(source: str) -> SyncHealth:
     """Get health status for a specific source."""
     source_info = SYNC_SOURCES.get(source, {
