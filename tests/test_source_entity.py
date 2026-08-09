@@ -1,7 +1,8 @@
 """Tests for SourceEntity and SourceEntityStore."""
+import sqlite3
 import tempfile
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from api.services.source_entity import (
     SourceEntity,
@@ -260,6 +261,134 @@ class TestSourceEntityStore:
         assert stats["unlinked_entities"] == 1
         assert stats["by_source"]["gmail"] == 3
         assert stats["by_source"]["calendar"] == 1
+
+
+class TestRematchingEligibility:
+    """Tests for the #507 backoff retry policy on capped source entities.
+
+    `store.add()` never persists match_attempted_at/match_attempt_count (those
+    are only ever set via `record_match_attempt`), so tests write them
+    directly via raw SQL to simulate an entity with a specific attempt
+    history at a specific point in the past.
+    """
+
+    def _set_attempts(self, store, entity_id, count, days_ago):
+        """Backdate an entity's match attempt bookkeeping for test setup."""
+        attempted_at = (
+            datetime.now(timezone.utc) - timedelta(days=days_ago)
+        ).isoformat()
+        conn = sqlite3.connect(store.db_path)
+        try:
+            conn.execute(
+                "UPDATE source_entities SET match_attempt_count = ?, "
+                "match_attempted_at = ? WHERE id = ?",
+                (count, attempted_at, entity_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_fresh_entity_still_eligible_after_min_days(self, store):
+        """No regression: an entity with 0 prior attempts behaves as before."""
+        entity = SourceEntity(source_type="gmail", source_id="fresh1")
+        store.add(entity)
+        self._set_attempts(store, entity.id, count=0, days_ago=31)
+
+        results = store.get_unlinked_for_rematching(min_days_since_attempt=30, max_attempts=3)
+        assert entity.id in [e.id for e in results]
+
+    def test_fresh_entity_not_eligible_within_min_days(self, store):
+        """No regression: an entity attempted 5 days ago is still on cooldown."""
+        entity = SourceEntity(source_type="gmail", source_id="fresh2")
+        store.add(entity)
+        self._set_attempts(store, entity.id, count=1, days_ago=5)
+
+        results = store.get_unlinked_for_rematching(min_days_since_attempt=30, max_attempts=3)
+        assert entity.id not in [e.id for e in results]
+
+    def test_capped_entity_outside_backoff_window_not_eligible(self, store):
+        """A capped entity (count=3) attempted only 10 days ago must wait."""
+        entity = SourceEntity(source_type="gmail", source_id="capped_recent")
+        store.add(entity)
+        self._set_attempts(store, entity.id, count=3, days_ago=10)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, backoff_multiplier=3,
+        )
+        assert entity.id not in [e.id for e in results]
+
+    def test_capped_entity_past_backoff_window_is_eligible(self, store):
+        """A capped entity (count=3) past the 30-day window (attempt 4) is eligible again."""
+        entity = SourceEntity(source_type="gmail", source_id="capped_past")
+        store.add(entity)
+        self._set_attempts(store, entity.id, count=3, days_ago=31)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, backoff_multiplier=3,
+        )
+        assert entity.id in [e.id for e in results]
+
+    def test_backoff_grows_with_attempt_count(self, store):
+        """count=4 (attempt 5) needs the *next* backoff tier (90d), not just 30d."""
+        entity = SourceEntity(source_type="gmail", source_id="capped_grown")
+        store.add(entity)
+        # Past the count=3 tier's 30-day window, but not past count=4's 90-day window.
+        self._set_attempts(store, entity.id, count=4, days_ago=40)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, backoff_multiplier=3,
+        )
+        assert entity.id not in [e.id for e in results]
+
+        # Same entity, but now 91 days since last attempt clears the 90-day tier.
+        self._set_attempts(store, entity.id, count=4, days_ago=91)
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, backoff_multiplier=3,
+        )
+        assert entity.id in [e.id for e in results]
+
+    def test_per_run_cap_limits_capped_entities(self, store):
+        """max_capped_per_run bounds how many capped entities surface per call."""
+        ids = []
+        for i in range(10):
+            entity = SourceEntity(source_type="gmail", source_id=f"capped_bulk{i}")
+            store.add(entity)
+            # All well past the 30-day window for count=3, so all are eligible
+            # under backoff alone.
+            self._set_attempts(store, entity.id, count=3, days_ago=60)
+            ids.append(entity.id)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, max_capped_per_run=4,
+        )
+        assert len(results) == 4
+        assert all(r.id in ids for r in results)
+
+    def test_per_run_cap_does_not_limit_uncapped_entities(self, store):
+        """The per-run cap only applies to capped (count >= max_attempts) entities."""
+        for i in range(5):
+            entity = SourceEntity(source_type="gmail", source_id=f"uncapped{i}")
+            store.add(entity)
+            self._set_attempts(store, entity.id, count=1, days_ago=31)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3, max_capped_per_run=0,
+        )
+        assert len(results) == 5
+
+    def test_count_capped_backlog(self, store):
+        """count_capped_backlog reports the total stuck population, not just eligible."""
+        for i in range(3):
+            entity = SourceEntity(source_type="gmail", source_id=f"backlog{i}")
+            store.add(entity)
+            # Recent attempt — not eligible under backoff, but still "capped".
+            self._set_attempts(store, entity.id, count=3, days_ago=1)
+
+        uncapped = SourceEntity(source_type="gmail", source_id="not_capped")
+        store.add(uncapped)
+        self._set_attempts(store, uncapped.id, count=1, days_ago=1)
+
+        assert store.count_capped_backlog(max_attempts=3) == 3
 
 
 class TestLinkMethod:

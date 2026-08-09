@@ -10,7 +10,10 @@ Key behaviors:
 - Does NOT create new people (create_if_missing=False)
 - Skips entities from blocklisted domains (marketing, newsletters, etc.)
 - Skips entities that were recently attempted (within 30 days)
-- Skips entities with 3+ failed attempts (considered unmatchable)
+- Entities with 3+ failed attempts are NOT locked out forever: they're retried
+  under exponential backoff (attempt 4 at 30d, 5 at 90d, 6 at 270d, ...), capped
+  at `max_capped_per_run` retries per run so a large backlog drains gradually
+  instead of spiking one night's fuzzy-match cost (#507)
 - Records match attempts to avoid re-processing
 
 This script is the "safety net" that catches source entities that:
@@ -54,6 +57,8 @@ def link_source_entities(
     batch_size: int = 1000,
     min_days_since_attempt: int = 30,
     max_attempts: int = 3,
+    backoff_multiplier: int = 3,
+    max_capped_per_run: int = 200,
 ) -> dict:
     """
     Link unlinked source entities to existing person entities.
@@ -66,7 +71,12 @@ def link_source_entities(
         dry_run: If True, don't actually update anything
         batch_size: Number of entities to process per batch
         min_days_since_attempt: Skip if attempted within this many days
-        max_attempts: Skip if attempted this many times or more
+        max_attempts: Attempts before exponential backoff kicks in (see
+            SourceEntityStore.get_unlinked_for_rematching) instead of a hard
+            stop (#507)
+        backoff_multiplier: Growth factor applied per attempt past max_attempts
+        max_capped_per_run: Max capped (attempt_count >= max_attempts) entities
+            to retry in a single run, so a large backlog drains gradually
 
     Returns:
         Statistics dict with counts
@@ -84,6 +94,13 @@ def link_source_entities(
         'errors': 0,
         'by_source': {},
         'by_match_type': {},
+        # Total backlog stuck at/above max_attempts, regardless of whether
+        # backoff currently makes any of it eligible. Surfacing this is the
+        # whole point of #507 — without it, a saturated backlog silently
+        # looks identical to "nothing to do".
+        'capped_backlog': source_store.count_capped_backlog(
+            source_type=source_type, max_attempts=max_attempts,
+        ),
     }
 
     # Get all eligible entities upfront to avoid re-fetching in dry run mode
@@ -98,6 +115,8 @@ def link_source_entities(
             min_days_since_attempt=min_days_since_attempt,
             max_attempts=max_attempts,
             limit=fetch_limit,
+            backoff_multiplier=backoff_multiplier,
+            max_capped_per_run=max_capped_per_run,
         )
         if not batch:
             break
@@ -110,7 +129,20 @@ def link_source_entities(
             break
 
     stats['eligible_for_matching'] = len(all_entities)
+    stats['capped_retried_this_run'] = sum(
+        1 for e in all_entities if (e.match_attempt_count or 0) >= max_attempts
+    )
+    stats['capped_deferred'] = max(
+        0, stats['capped_backlog'] - stats['capped_retried_this_run']
+    )
     logger.info(f"Found {stats['eligible_for_matching']:,} unlinked entities eligible for matching")
+    if stats['capped_backlog']:
+        logger.info(
+            f"Capped backlog: {stats['capped_backlog']:,} entities at/above "
+            f"{max_attempts} attempts ({stats['capped_retried_this_run']:,} "
+            f"retried this run, {stats['capped_deferred']:,} still deferred "
+            "by backoff)"
+        )
     if source_type:
         logger.info(f"Filtering to source type: {source_type}")
 
@@ -121,7 +153,13 @@ def link_source_entities(
         # early — the exact reason sync_apple_contacts never reported (#497).
         # An explicit zero here is meaningful: it says "ran, nothing eligible".
         from api.services.sync_health import emit_sync_stats
-        emit_sync_stats({"processed": 0, "people_updated": 0, "errors": 0})
+        emit_sync_stats({
+            "processed": 0,
+            "people_updated": 0,
+            "errors": 0,
+            "capped_backlog": stats['capped_backlog'],
+            "capped_deferred": stats['capped_backlog'],
+        })
         return stats
 
     # Process in batches
@@ -216,6 +254,8 @@ def link_source_entities(
         "processed": int(stats.get("entities_processed", 0) or 0),
         "people_updated": int(stats.get("newly_linked", 0) or 0),
         "errors": int(stats.get("errors", 0) or 0),
+        "capped_backlog": int(stats.get("capped_backlog", 0) or 0),
+        "capped_deferred": int(stats.get("capped_deferred", 0) or 0),
     })
 
     if stats['by_source']:
@@ -284,7 +324,22 @@ Examples:
         '--max-attempts',
         type=int,
         default=3,
-        help='Skip entities with this many or more attempts (default: 3)'
+        help='Attempts before exponential backoff kicks in, instead of a hard '
+             'stop (default: 3)'
+    )
+    parser.add_argument(
+        '--backoff-multiplier',
+        type=int,
+        default=3,
+        help='Growth factor applied per attempt past --max-attempts '
+             '(default: 3, e.g. attempt 4 at 30d, 5 at 90d, 6 at 270d)'
+    )
+    parser.add_argument(
+        '--max-capped-per-run',
+        type=int,
+        default=200,
+        help='Max capped (attempt_count >= max-attempts) entities to retry '
+             'per run, so a large backlog drains gradually (default: 200)'
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -303,6 +358,8 @@ Examples:
         batch_size=args.batch_size,
         min_days_since_attempt=args.min_days,
         max_attempts=args.max_attempts,
+        backoff_multiplier=args.backoff_multiplier,
+        max_capped_per_run=args.max_capped_per_run,
     )
 
 
