@@ -22,6 +22,7 @@ import json
 import shutil
 import logging
 import argparse
+import subprocess
 import uuid
 import sqlite3
 import plistlib
@@ -621,6 +622,31 @@ def _finalize_result(result: dict) -> dict:
     return result
 
 
+def _get_agent_sha() -> str | None:
+    """Return the git HEAD SHA of this checkout, or None if it can't be determined.
+
+    Recorded in the manifest so the Linux side (issue #509) can tell which
+    revision of the export pipeline produced a given export without SSHing to
+    the Mac Mini — e.g. to notice the agent's self-update silently stopped
+    working. Best-effort: a shallow clone, missing git binary, or non-repo
+    checkout must never break the export itself.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export Apple ecosystem data")
     parser.add_argument("--execute", action="store_true", help="Actually export (not dry-run)")
@@ -665,6 +691,7 @@ def main():
     manifest = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "hostname": __import__("socket").gethostname(),
+        "agent_sha": _get_agent_sha(),
         "results": results,
     }
 

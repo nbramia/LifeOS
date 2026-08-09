@@ -22,6 +22,7 @@ import re
 import shutil
 import logging
 import argparse
+import subprocess
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -44,6 +45,29 @@ IMPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 STALENESS_WARNING_HOURS = 48
 STALENESS_CRITICAL_HOURS = 168  # 7 days
+
+
+def _get_local_main_sha() -> str | None:
+    """Return this host's current `main` SHA, or None if it can't be determined.
+
+    Used only to flag a stale Mac Mini agent (issue #509) — best-effort and
+    non-fatal, since a detached HEAD, missing git binary, or any other
+    lookup failure here must never affect the import itself.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "main"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def check_manifest() -> dict | None:
@@ -105,6 +129,19 @@ def check_manifest() -> dict | None:
                     f"Mac Mini export failed for {source_name}: {reason}. "
                     f"Check wacli/tooling on the Mac Mini."
                 )
+
+    # Flag a Mac Mini agent whose self-update (issue #509) has fallen behind.
+    # `agent_sha` is absent on manifests written before this change — that's
+    # expected and not a problem, so only compare when it's actually present.
+    agent_sha = manifest.get("agent_sha")
+    if agent_sha:
+        local_sha = _get_local_main_sha()
+        if local_sha and agent_sha != local_sha:
+            logger.warning(
+                f"Apple Data Agent exported from {agent_sha[:7]}, which differs from "
+                f"this host's main ({local_sha[:7]}) — its self-update may have failed. "
+                f"Check the agent log on the Mac Mini."
+            )
 
     return manifest
 

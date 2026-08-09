@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-07-08
+> **Last Updated:** 2026-08-09
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -18,6 +18,12 @@ If you have a Mac with iMessage/phone data, it can export Apple ecosystem data a
 `/Applications/LifeOS.app` is a bash-script-based .app bundle with **Full Disk Access**. macOS cron cannot access `~/Library/Messages/` without FDA, so the Apple Data Agent cron job routes through this wrapper.
 
 If adding new cron jobs or scripts on macOS that need to access protected directories, route them through `LifeOS exec`.
+
+### Self-update (issue #509)
+
+The Mac Mini runs `apple_data_agent.sh` from its own separate checkout, which nothing else ever pulls — a fix to the export pipeline on `main` would otherwise silently never reach it. Step 0 of the agent script self-updates that checkout before exporting, using the same guards as `auto-deploy.sh`: only on the `main` branch, only with a clean working tree, and only via `git pull --ff-only` (never force, never reset). If any guard trips or the pull fails, the agent logs a warning (and, on an actual pull failure, sends a Telegram alert) and **continues with the existing checkout** — a slightly stale export is better than a skipped one, as long as the staleness is visible.
+
+The before/after SHA is logged in the agent's own log, and the export's `manifest.json` records the SHA it ran from as `agent_sha`. On the Linux side, `apple_data_import.py`'s `check_manifest()` compares `agent_sha` against the host's own `main` SHA and logs a warning on mismatch — so a stuck self-update is diagnosable from the import log without SSHing to the Mac Mini. Manifests written before this change simply lack `agent_sha`, which is treated as "nothing to compare" rather than a warning.
 
 ## Monarch Money (Financial Data)
 
