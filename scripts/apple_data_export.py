@@ -600,6 +600,27 @@ def export_whatsapp(dry_run: bool = False) -> dict:
     }
 
 
+def _finalize_result(result: dict) -> dict:
+    """Guard against a source reporting "ok" with no actual output.
+
+    Observed for `contacts` (issue #505): when no .abcdp files were found,
+    export_contacts returned {"status": "ok", "count": 0, "path": ""} —
+    indistinguishable from a healthy empty result. A source that claims "ok"
+    but produced neither a count nor an output path didn't actually export
+    anything, so treat that combination as an error. This makes the
+    manifest accurate for the Linux side's _manifest_source_errored() check.
+    """
+    if (
+        result.get("status") == "ok"
+        and result.get("count") == 0
+        and result.get("path") == ""
+    ):
+        result = dict(result)
+        result["status"] = "error"
+        result["reason"] = "reported ok with zero count and no output path"
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export Apple ecosystem data")
     parser.add_argument("--execute", action="store_true", help="Actually export (not dry-run)")
@@ -635,7 +656,7 @@ def main():
     for name, func in sources.items():
         logger.info(f"{'[DRY RUN] ' if dry_run else ''}Exporting {name}...")
         try:
-            results[name] = func(dry_run=dry_run)
+            results[name] = _finalize_result(func(dry_run=dry_run))
         except Exception as e:
             logger.error(f"Failed to export {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}

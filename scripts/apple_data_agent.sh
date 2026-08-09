@@ -75,6 +75,24 @@ retry_with_backoff() {
 # Total wall time on full failure ≈ 30 + 90 + 180 = 5 min before giving up.
 RETRY_DELAYS="30,90,180"
 
+# Send a Telegram alert. Best-effort (`|| true`) — a notification failure
+# must never mask the real error or crash the script. Mirrors the pattern in
+# run_sync_wrapper.sh / auto-deploy.sh: token/chat id are read from the
+# project .env, never hardcoded, and the call is a no-op if either is unset.
+send_telegram() {
+    local message="$1"
+    local env_file="${LIFEOS_DIR}/.env"
+    [[ -f "${env_file}" ]] || return 0
+    local bot_token chat_id
+    bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "${env_file}" | cut -d= -f2)
+    chat_id=$(grep '^TELEGRAM_CHAT_ID=' "${env_file}" | cut -d= -f2)
+    [[ -n "${bot_token}" && -n "${chat_id}" ]] || return 0
+    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        -d "chat_id=${chat_id}" \
+        -d "text=${message}" \
+        -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+}
+
 # Only run on macOS
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "This script only runs on macOS (Apple Data Agent)."
@@ -121,7 +139,16 @@ if "${LIFEOS_APP}" run "${PYTHON}" scripts/apple_data_export.py --execute >> "${
     log "Export: OK"
 else
     log "Export: FAILED"
-    # Continue anyway — rsync whatever we have
+    # Do NOT proceed to rsync/import: shipping yesterday's exports makes a
+    # hard export failure look like a successful sync downstream (this is
+    # the exact silent-failure class fixed by issue #505 — a stale file is
+    # worse than no file, because it launders a failure into an apparent
+    # success on the Linux side). Alert and abort instead.
+    send_telegram "🚨 *LifeOS Apple Export Failed*
+Export step failed on $(hostname).
+Rsync and import were skipped to avoid shipping stale data.
+See ${LOG_FILE} for details."
+    exit 1
 fi
 
 # -------------------------------------------------------------------

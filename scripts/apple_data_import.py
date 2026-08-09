@@ -122,10 +122,24 @@ def _manifest_source_errored(manifest: dict | None, source: str) -> bool:
     return source_result.get("status") == "error"
 
 
-def import_contacts(dry_run: bool = False) -> dict:
-    """Import contacts from JSON export."""
+def import_contacts(dry_run: bool = False, manifest: dict | None = None) -> dict:
+    """Import contacts from JSON export.
+
+    Manifest-aware like import_whatsapp: if the Mac-side export marked
+    contacts as errored (e.g. the zero-count/empty-path pattern from
+    issue #505), propagate that as a failure here too instead of quietly
+    returning "skipped" — a manifest error must not look like a healthy
+    no-op.
+    """
     contacts_path = IMPORT_DIR / "contacts.json"
+    manifest_errored = _manifest_source_errored(manifest, "contacts")
+
     if not contacts_path.exists():
+        if manifest_errored:
+            return {
+                "status": "error",
+                "reason": "contacts.json not found and Mac export marked contacts as error",
+            }
         return {"status": "skipped", "reason": "contacts.json not found"}
 
     with open(contacts_path) as f:
@@ -135,7 +149,11 @@ def import_contacts(dry_run: bool = False) -> dict:
     logger.info(f"Found {len(contacts)} contacts to import (exported {data.get('exported_at', '?')})")
 
     if dry_run:
-        return {"status": "dry_run", "count": len(contacts)}
+        result = {"status": "dry_run", "count": len(contacts)}
+        if manifest_errored:
+            result["status"] = "error"
+            result["reason"] = "Mac export marked contacts as error (stale file used for dry-run counts)"
+        return result
 
     from api.services.source_entity import (
         get_source_entity_store, SourceEntity, LINK_STATUS_AUTO,
@@ -223,7 +241,11 @@ def import_contacts(dry_run: bool = False) -> dict:
             linked += 1
 
     logger.info(f"Contacts: {created} created, {updated} updated, {linked} linked")
-    return {"status": "ok", "created": created, "updated": updated, "linked": linked}
+    result = {"status": "ok", "created": created, "updated": updated, "linked": linked}
+    if manifest_errored:
+        result["status"] = "error"
+        result["reason"] = "Mac export marked contacts as error; imported stale contacts.json"
+    return result
 
 
 def import_imessage(dry_run: bool = False) -> dict:
@@ -777,11 +799,14 @@ def main():
     # Some sources need the manifest to distinguish "nothing exported" from
     # "export attempted and failed". Keep the uniform (dry_run,) signature for
     # the rest so the dispatch stays simple.
+    def _import_contacts_wrapper(dry_run: bool = False) -> dict:
+        return import_contacts(dry_run=dry_run, manifest=manifest)
+
     def _import_whatsapp_wrapper(dry_run: bool = False) -> dict:
         return import_whatsapp(dry_run=dry_run, manifest=manifest)
 
     sources = {
-        "contacts": import_contacts,
+        "contacts": _import_contacts_wrapper,
         "imessage": import_imessage,
         "phone": import_phone_calls,
         "photos": import_photos_faces,
