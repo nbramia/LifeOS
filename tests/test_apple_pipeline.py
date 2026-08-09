@@ -4,7 +4,7 @@ import logging
 import plistlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +474,191 @@ class TestStalenessAlerting:
         assert result is not None
         assert "fresh" in caplog.text.lower()
         assert not any("Cannot parse" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Agent self-update SHA (issue #509) — export side
+# ---------------------------------------------------------------------------
+
+class TestAgentShaExport:
+    """_get_agent_sha and the manifest's agent_sha field from apple_data_export."""
+
+    def test_get_agent_sha_returns_stripped_sha(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=0, stdout="abc123def456\n")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() == "abc123def456"
+
+    def test_get_agent_sha_none_on_nonzero_exit(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=128, stdout="")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() is None
+
+    def test_get_agent_sha_none_on_empty_output(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=0, stdout="\n")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() is None
+
+    def test_get_agent_sha_none_when_git_missing(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        with patch("scripts.apple_data_export.subprocess.run", side_effect=FileNotFoundError()):
+            assert _get_agent_sha() is None
+
+    def test_main_writes_agent_sha_to_manifest(self, tmp_path, monkeypatch):
+        """main() records the checked-out SHA in manifest.json (issue #509) so the
+        Linux side can tell which revision produced an export without SSHing."""
+        import scripts.apple_data_export as export_mod
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "deadbeef1234")
+        monkeypatch.setattr(export_mod.sys, "argv", ["apple_data_export.py", "--execute"])
+
+        def fake_source(dry_run=False):
+            return {"status": "ok", "count": 1, "path": "fake"}
+
+        for name in (
+            "export_contacts",
+            "export_imessage",
+            "export_phone_calls",
+            "export_photos_faces",
+            "export_whatsapp",
+        ):
+            monkeypatch.setattr(export_mod, name, fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["agent_sha"] == "deadbeef1234"
+
+    def test_main_writes_null_agent_sha_when_undeterminable(self, tmp_path, monkeypatch):
+        """A non-git checkout (or missing git binary) must not break the export —
+        agent_sha is simply null in that case."""
+        import scripts.apple_data_export as export_mod
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: None)
+        monkeypatch.setattr(export_mod.sys, "argv", ["apple_data_export.py", "--execute"])
+
+        def fake_source(dry_run=False):
+            return {"status": "ok", "count": 1, "path": "fake"}
+
+        for name in (
+            "export_contacts",
+            "export_imessage",
+            "export_phone_calls",
+            "export_photos_faces",
+            "export_whatsapp",
+        ):
+            monkeypatch.setattr(export_mod, name, fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["agent_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# Agent self-update SHA (issue #509) — import side
+# ---------------------------------------------------------------------------
+
+class TestAgentShaImport:
+    """check_manifest flags a Mac Mini export whose agent_sha differs from this
+    host's main — non-fatal, warning-level only, and silent when the field is
+    absent (older manifests) or the local SHA can't be determined."""
+
+    def _write_manifest(self, import_dir: Path, agent_sha=None):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "hostname": "test-host",
+            "results": {},
+        }
+        if agent_sha is not None:
+            manifest["agent_sha"] = agent_sha
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+    def test_get_local_main_sha_returns_stripped_sha(self):
+        from scripts.apple_data_import import _get_local_main_sha
+
+        fake_result = MagicMock(returncode=0, stdout="def5678\n")
+        with patch("scripts.apple_data_import.subprocess.run", return_value=fake_result):
+            assert _get_local_main_sha() == "def5678"
+
+    def test_get_local_main_sha_none_on_failure(self):
+        from scripts.apple_data_import import _get_local_main_sha
+
+        with patch("scripts.apple_data_import.subprocess.run", side_effect=FileNotFoundError()):
+            assert _get_local_main_sha() is None
+
+    def test_matching_sha_no_warning(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="abc1234"):
+            with caplog.at_level(logging.WARNING):
+                check_manifest()
+
+        assert not any("differs from" in r.message for r in caplog.records)
+
+    def test_mismatched_sha_warns(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="def5678"):
+            with caplog.at_level(logging.WARNING):
+                check_manifest()
+
+        assert any(
+            r.levelno == logging.WARNING and "differs from" in r.message
+            for r in caplog.records
+        )
+
+    def test_missing_agent_sha_handled_silently(self, tmp_path, caplog):
+        """Manifests written before this change have no agent_sha — must not
+        warn or crash."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha=None)
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="def5678"):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert not any("differs from" in r.message for r in caplog.records)
+
+    def test_local_sha_lookup_failure_handled_silently(self, tmp_path, caplog):
+        """If the local main SHA can't be determined, skip the comparison
+        rather than crash or false-warn."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value=None):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert not any("differs from" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
