@@ -23,7 +23,25 @@ If adding new cron jobs or scripts on macOS that need to access protected direct
 
 Auth uses a cached session token at `data/monarch_session.pickle`. Monthly sync runs on the 1st via `run_all_syncs.py` (phase 5). Live queries at `/api/monarch/*`.
 
-Re-authenticate when token expires (401/525):
+Re-authenticate when the token expires (401/525), or when the nightly sync warns
+that the session is old. Run from the project root — the session path is relative.
+
+**Preferred (works in any shell, including agent/non-TTY sessions):** reads
+`MONARCH_EMAIL` / `MONARCH_PASSWORD` from `.env` and takes the MFA code as an
+argument. TOTP codes expire in ~30s, so read the code and run promptly.
+
+```bash
+~/.venvs/lifeos/bin/python scripts/monarch_reauth.py <6-digit-code>
+```
+
+It verifies the new session with a live authenticated call before reporting
+success — a saved pickle alone does not prove the session works. On success it
+prints how many accounts are reachable.
+
+**Interactive alternative (requires a real TTY):** prompts for email, password,
+and MFA code. This fails with `EOFError: EOF when reading a line` in any
+non-interactive shell, including Claude Code's `!` prefix.
+
 ```bash
 ~/.venvs/lifeos/bin/python -c "
 import asyncio
@@ -34,6 +52,9 @@ mm.save_session('data/monarch_session.pickle')
 print('Session saved!')
 "
 ```
+
+The running API server picks up the refreshed session without a restart; verify
+with `curl -s localhost:8000/api/monarch/accounts | head -c 200`.
 
 ## Performance Tracing — Quick Commands
 
