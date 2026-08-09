@@ -5,7 +5,7 @@
 // record → multipart POST /api/voice/turn/stream → SSE → done data → playback.
 
 import { state, config, elements, endpoints } from './session.js';
-import { addMessage, setStatus } from './thread.js';
+import { addMessage, escapeHtml, setStatus } from './thread.js';
 import { loadConversations } from './conversations.js';
 import { setStoredConversationId } from './backend.js';
 import { personaOrchestrates } from './persona.js';
@@ -157,16 +157,25 @@ function resolveExplicitVoiceMode() {
   return null;
 }
 
+// GET /chat/config, once per page load. Both the default-mode resolution and the
+// insecure-context escape hatch read this, and either may run first, so the
+// promise is cached rather than re-fetched. Always resolves — an unreachable
+// config degrades to {} (text mode, no HTTPS link).
+let chatConfigPromise = null;
+
+function fetchChatConfig() {
+  if (!chatConfigPromise) {
+    chatConfigPromise = fetch(endpoints.chatConfig)
+      .then((resp) => (resp.ok ? resp.json() : {}))
+      .catch(() => ({}));
+  }
+  return chatConfigPromise;
+}
+
 // The server-configured default mode (LIFEOS_CHAT_DEFAULT_VOICE). Off by default
 // so a fresh clone without a voice gateway stays on text.
 async function fetchDefaultVoiceMode() {
-  try {
-    const resp = await fetch(endpoints.chatConfig);
-    if (resp.ok) return !!(await resp.json()).default_voice;
-  } catch (e) {
-    /* config unavailable — keep text */
-  }
-  return false;
+  return !!(await fetchChatConfig()).default_voice;
 }
 
 function storeVoiceMode(on) {
@@ -195,13 +204,48 @@ function pickMimeType() {
   return '';
 }
 
-function canRecordAudio() {
-  return (
-    window.isSecureContext &&
-    !!navigator.mediaDevices?.getUserMedia &&
-    typeof MediaRecorder !== 'undefined' &&
-    (useWebAudioRecorder || pickMimeType() !== '')
-  );
+// Which recording precondition failed, or '' when the mic is usable. These used
+// to collapse into one boolean reported as "HTTPS required", which sent users
+// chasing a TLS problem for three causes that have nothing to do with TLS
+// (#516). Order matters: an insecure context also hides getUserMedia, so it must
+// be checked first to be named as the real cause.
+const MIC_BLOCK_MESSAGES = {
+  insecure_context: 'Mic blocked — this page is not on HTTPS',
+  no_getusermedia: 'Mic unavailable — this browser exposes no microphone API',
+  no_mediarecorder: 'Mic unavailable — this browser has no MediaRecorder',
+  no_mime: 'Mic unavailable — no supported audio format in this browser',
+};
+
+function micBlockReason() {
+  if (!window.isSecureContext) return 'insecure_context';
+  if (!navigator.mediaDevices?.getUserMedia) return 'no_getusermedia';
+  if (typeof MediaRecorder === 'undefined') return 'no_mediarecorder';
+  if (!useWebAudioRecorder && pickMimeType() === '') return 'no_mime';
+  return '';
+}
+
+// Report the specific blocked reason in the thread. For an insecure context the
+// fix is reachable — the same app is fronted over HTTPS at `secure_url`
+// (TAILNET_HTTPS_URL) — so offer a tappable link to this same page there. The
+// user taps it; we never auto-redirect. With no configured secure_url (a fresh
+// clone, no Tailscale) the message stands alone.
+async function reportMicBlocked(reason) {
+  const message = MIC_BLOCK_MESSAGES[reason];
+  setStatus('error', message);
+  const secureUrl = reason === 'insecure_context'
+    ? ((await fetchChatConfig()).secure_url || '').replace(/\/+$/, '')
+    : '';
+  if (!secureUrl) {
+    addMessage('⚠️ ' + message, 'assistant');
+    return;
+  }
+  const target = secureUrl + window.location.pathname + window.location.search;
+  const el = addMessage('', 'assistant');
+  const content = el.querySelector('.message-content');
+  if (content) {
+    content.innerHTML = `⚠️ ${escapeHtml(message)}. `
+      + `<a class="source-link" href="${escapeHtml(target)}">🔒 Open over HTTPS</a>`;
+  }
 }
 
 function formatMicError(err) {
@@ -269,8 +313,9 @@ function setTalkActive(on) {
 function onTalkClick(event) {
   event.preventDefault();
   unlockTtsAudio();
-  if (!canRecordAudio()) {
-    setStatus('error', 'Mic unavailable (HTTPS required)');
+  const blocked = micBlockReason();
+  if (blocked) {
+    reportMicBlocked(blocked);
     return;
   }
   if (voiceBusy || state.isLoading) return;
@@ -309,11 +354,11 @@ async function acquireMicStream() {
 }
 
 function requestMicInGesture() {
-  if (!window.isSecureContext) {
-    return Promise.reject(new Error('Microphone requires HTTPS.'));
-  }
-  if (!navigator.mediaDevices?.getUserMedia) {
-    return Promise.reject(new Error('Microphone not available.'));
+  // Same reasons, same wording as the talk-button guard — this path is also
+  // reached without a tap (auto-continue), so it can't assume onTalkClick ran.
+  const blocked = micBlockReason();
+  if (blocked) {
+    return Promise.reject(new Error(MIC_BLOCK_MESSAGES[blocked]));
   }
   if (micStream?.getAudioTracks().some((t) => t.readyState === 'live')) {
     return Promise.resolve(micStream);

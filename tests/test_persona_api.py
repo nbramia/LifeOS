@@ -481,10 +481,35 @@ class TestPersonasEndpoint:
 
 class TestChatConfigEndpoint:
     def test_default_voice_reflects_setting(self, client, monkeypatch):
+        monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", False, raising=False)
-        assert client.get("/api/chat/config").json() == {"default_voice": False}
+        assert client.get("/api/chat/config").json() == {
+            "default_voice": False, "secure_url": ""}
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
-        assert client.get("/api/chat/config").json() == {"default_voice": True}
+        assert client.get("/api/chat/config").json() == {
+            "default_voice": True, "secure_url": ""}
+
+    # secure_url is the web client's one-tap escape from an insecure context to
+    # the HTTPS origin the mic needs (#516).
+    def test_secure_url_reflects_tailnet_setting(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "api.routes.chat.settings.tailnet_https_url",
+            "https://your-machine.your-tailnet.ts.net", raising=False)
+        assert (client.get("/api/chat/config").json()["secure_url"]
+                == "https://your-machine.your-tailnet.ts.net")
+
+    def test_secure_url_strips_trailing_slash(self, client, monkeypatch):
+        """Clients concatenate a path onto it, so it must not end in '/'."""
+        monkeypatch.setattr(
+            "api.routes.chat.settings.tailnet_https_url",
+            "https://your-machine.your-tailnet.ts.net/", raising=False)
+        assert (client.get("/api/chat/config").json()["secure_url"]
+                == "https://your-machine.your-tailnet.ts.net")
+
+    def test_secure_url_empty_when_unset(self, client, monkeypatch):
+        """A fresh clone with no Tailscale must degrade to no link, not break."""
+        monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
+        assert client.get("/api/chat/config").json()["secure_url"] == ""
 
 
 # ---------------------------------------------------------------------------

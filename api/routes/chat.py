@@ -245,8 +245,17 @@ async def list_personas():
 @router.get("/chat/config")
 async def chat_config():
     """Client-facing /chat defaults. `default_voice` drives the web client's
-    default input mode when there's no ?mode= param or stored preference."""
-    return {"default_voice": bool(settings.chat_default_voice)}
+    default input mode when there's no ?mode= param or stored preference.
+
+    `secure_url` is the HTTPS origin (TAILNET_HTTPS_URL) the web client offers as
+    a one-tap escape when the mic is blocked by an insecure context (#516).
+    Trailing slash stripped so clients can append a path directly; "" when unset,
+    in which case the client just reports the insecure context without a link.
+    """
+    return {
+        "default_voice": bool(settings.chat_default_voice),
+        "secure_url": (settings.tailnet_https_url or "").rstrip("/"),
+    }
 
 
 # Attachment configuration

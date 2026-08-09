@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-09
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
@@ -48,7 +48,7 @@ systemctl --user enable --now lifeos-tailscale.service
 
 `install-systemd-tailscale.sh` writes a user systemd unit (`lifeos-tailscale.service`) that waits for the local API to report healthy, then runs `scripts/setup-tailscale.sh` — which calls `tailscale serve` to publish LifeOS on the tailnet HTTPS front. After this, open `/chat` at your tailnet HTTPS URL (`https://<your-machine>.<your-tailnet>.ts.net/chat`); voice will not work over plain `http://` or a bare LAN IP.
 
-`TAILNET_HTTPS_URL` is an **optional** env var. It is read only for a printed bookmark hint by `scripts/setup-tailscale.sh` and `scripts/server.sh` — it configures nothing. Set it to your tailnet URL if you want those scripts to echo a ready-to-open `/chat` link.
+`TAILNET_HTTPS_URL` is an **optional** env var. `scripts/setup-tailscale.sh` and `scripts/server.sh` echo it as a bookmark hint, and `GET /api/chat/config` returns it as `secure_url` so the web client can offer a one-tap **Open over HTTPS** link when the mic is blocked by an insecure context. Leave it unset and that link is simply omitted — nothing else changes.
 
 ### 3. Configure LifeOS env vars
 
@@ -97,7 +97,8 @@ Selecting an **orchestrating** persona (for example the `doctor` self-repair bot
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| No microphone prompt / "insecure context" | Not on HTTPS. Open `/chat` via the tailnet HTTPS URL, not `http://` or a LAN IP. Confirm `lifeos-tailscale.service` is active. |
+| "Mic blocked — this page is not on HTTPS" | Not on HTTPS. If `TAILNET_HTTPS_URL` is set, the message carries an **Open over HTTPS** link to this same page on that origin — tap it. Otherwise reopen `/chat` on your tailnet HTTPS URL, not `http://` or a LAN IP, and confirm `lifeos-tailscale.service` is active. |
+| "Mic unavailable — …" (no microphone API / no MediaRecorder / no supported audio format) | Not an HTTPS problem: the browser itself lacks a recording capability. Use a current Chrome, Safari, or Firefox; in-app webviews and stripped-down browsers often omit these. |
 | Dock present but turns error immediately | whisper-relay isn't running on `LIFEOS_VOICE_GATEWAY_URL` (default `:9788`). Start the gateway; check `curl http://127.0.0.1:9788` locally. |
 | Voice dock never appears | Voice is opt-in per browser. Toggle to Voice with the mic control, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
