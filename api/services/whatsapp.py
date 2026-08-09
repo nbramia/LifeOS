@@ -124,16 +124,127 @@ def parse_message_timestamp(ts) -> datetime:
 # Contact processing
 # ---------------------------------------------------------------------------
 
-def process_whatsapp_contacts(contacts: list[dict], dry_run: bool = False) -> dict:
+def _upsert_contact_source(
+    source_store,
+    person_store,
+    resolver,
+    stats: dict,
+    source_id: str,
+    existing_source: Optional[SourceEntity],
+    observed_name: str,
+    observed_phone: str,
+    metadata: dict,
+    dry_run: bool,
+) -> bool:
+    """Create/update a WhatsApp SourceEntity and resolve+link it to a PersonEntity.
+
+    Shared by the classic-contact and LID-contact branches of
+    process_whatsapp_contacts so both paths get identical resolve/link/
+    person-update behavior and stats counting. Returns True if a new
+    SourceEntity was created (False on update), so callers can layer their
+    own creation counters (e.g. lid_entities_created) on top.
+    """
+    source_entity = SourceEntity(
+        source_type=SOURCE_WHATSAPP,
+        source_id=source_id,
+        observed_name=observed_name,
+        observed_phone=observed_phone,
+        metadata=metadata,
+        observed_at=datetime.now(timezone.utc),
+    )
+
+    created = False
+    if existing_source:
+        if not dry_run:
+            existing_source.observed_name = source_entity.observed_name
+            existing_source.observed_phone = source_entity.observed_phone
+            existing_source.metadata = source_entity.metadata
+            existing_source.observed_at = datetime.now(timezone.utc)
+            source_store.update(existing_source)
+        stats["source_entities_updated"] += 1
+        source_entity = existing_source
+    else:
+        if not dry_run:
+            source_entity = source_store.add(source_entity)
+        stats["source_entities_created"] += 1
+        created = True
+
+    result = resolver.resolve(
+        name=observed_name,
+        phone=observed_phone,
+        create_if_missing=True,
+    )
+
+    if result and result.entity:
+        person = result.entity
+        person_updated = False
+
+        if not existing_source or existing_source.canonical_person_id != person.id:
+            if not dry_run:
+                source_store.link_to_person(
+                    source_entity.id,
+                    person.id,
+                    confidence=0.95,
+                    status=LINK_STATUS_AUTO,
+                )
+            stats["persons_linked"] += 1
+
+        if observed_phone and observed_phone not in person.phone_numbers:
+            person.phone_numbers.append(observed_phone)
+            if not person.phone_primary:
+                person.phone_primary = observed_phone
+            person_updated = True
+
+        if SOURCE_WHATSAPP not in person.sources:
+            person.sources.append(SOURCE_WHATSAPP)
+            person_updated = True
+
+        if not dry_run:
+            new_count = source_store.count_for_person(person.id)
+            if person.source_entity_count != new_count:
+                person.source_entity_count = new_count
+                person_updated = True
+
+        if person_updated:
+            if not dry_run:
+                person_store.update(person)
+            stats["persons_updated"] += 1
+
+        if result.is_new:
+            stats["persons_created"] += 1
+
+    return created
+
+
+def process_whatsapp_contacts(
+    contacts: list[dict],
+    lid_contacts: Optional[list[dict]] = None,
+    lid_phones: Optional[dict[str, str]] = None,
+    dry_run: bool = False,
+) -> dict:
     """Create/update SourceEntity and PersonEntity records from WhatsApp contacts.
+
+    Also processes `lid_contacts` (WhatsApp's LID privacy migration means new
+    contacts arrive here instead of in `contacts` — see module docstring).
+    Each LID entry needs a non-empty push_name AND a phone resolvable via
+    `lid_phones`; entries missing either are skipped, mirroring the nameless-
+    number filter on the classic branch below. Before creating a new
+    LID-keyed entity, checks whether a classic `whatsapp_{phone-jid}` entity
+    already exists for the same phone and updates that instead — avoids
+    creating a duplicate person for someone who's already a classic contact.
 
     Args:
         contacts: List of contact dicts with keys JID, Phone, Name, Alias.
+        lid_contacts: List of {jid, push_name} for @lid contacts.
+        lid_phones: Map of bare LID → raw phone (from whatsmeow lid_map).
         dry_run: If True, count what would happen without writing.
 
     Returns:
         Stats dict.
     """
+    lid_contacts = lid_contacts or []
+    lid_phones = lid_phones or {}
+
     stats = {
         "contacts_read": len(contacts),
         "source_entities_created": 0,
@@ -143,6 +254,10 @@ def process_whatsapp_contacts(contacts: list[dict], dry_run: bool = False) -> di
         "persons_updated": 0,
         "skipped": 0,
         "errors": 0,
+        "lid_contacts_read": len(lid_contacts),
+        "lid_entities_created": 0,
+        "lid_merged_into_classic": 0,
+        "lid_skipped": 0,
     }
 
     source_store = get_source_entity_store()
@@ -169,9 +284,13 @@ def process_whatsapp_contacts(contacts: list[dict], dry_run: bool = False) -> di
             source_id = f"whatsapp_{jid}"
             existing_source = source_store.get_by_source(SOURCE_WHATSAPP, source_id)
 
-            source_entity = SourceEntity(
-                source_type=SOURCE_WHATSAPP,
+            _upsert_contact_source(
+                source_store,
+                person_store,
+                resolver,
+                stats,
                 source_id=source_id,
+                existing_source=existing_source,
                 observed_name=display_name,
                 observed_phone=phone,
                 metadata={
@@ -179,69 +298,64 @@ def process_whatsapp_contacts(contacts: list[dict], dry_run: bool = False) -> di
                     "alias": alias,
                     "raw_phone": phone_raw,
                 },
-                observed_at=datetime.now(timezone.utc),
+                dry_run=dry_run,
             )
-
-            if existing_source:
-                if not dry_run:
-                    existing_source.observed_name = source_entity.observed_name
-                    existing_source.observed_phone = source_entity.observed_phone
-                    existing_source.metadata = source_entity.metadata
-                    existing_source.observed_at = datetime.now(timezone.utc)
-                    source_store.update(existing_source)
-                stats["source_entities_updated"] += 1
-                source_entity = existing_source
-            else:
-                if not dry_run:
-                    source_entity = source_store.add(source_entity)
-                stats["source_entities_created"] += 1
-
-            result = resolver.resolve(
-                name=display_name,
-                phone=phone,
-                create_if_missing=True,
-            )
-
-            if result and result.entity:
-                person = result.entity
-                person_updated = False
-
-                if not existing_source or existing_source.canonical_person_id != person.id:
-                    if not dry_run:
-                        source_store.link_to_person(
-                            source_entity.id,
-                            person.id,
-                            confidence=0.95,
-                            status=LINK_STATUS_AUTO,
-                        )
-                    stats["persons_linked"] += 1
-
-                if phone and phone not in person.phone_numbers:
-                    person.phone_numbers.append(phone)
-                    if not person.phone_primary:
-                        person.phone_primary = phone
-                    person_updated = True
-
-                if SOURCE_WHATSAPP not in person.sources:
-                    person.sources.append(SOURCE_WHATSAPP)
-                    person_updated = True
-
-                if not dry_run:
-                    new_count = source_store.count_for_person(person.id)
-                    if person.source_entity_count != new_count:
-                        person.source_entity_count = new_count
-                        person_updated = True
-
-                if person_updated:
-                    if not dry_run:
-                        person_store.update(person)
-                    stats["persons_updated"] += 1
-
-                if result.is_new:
-                    stats["persons_created"] += 1
 
         except Exception as e:
             logger.error(f"Error processing contact: {e}")
+            stats["errors"] += 1
+
+    for entry in lid_contacts:
+        try:
+            lid_jid = entry.get("jid", "")
+            push_name = (entry.get("push_name") or "").strip()
+            if not push_name:
+                stats["lid_skipped"] += 1
+                continue
+
+            phone = resolve_lid_phone(lid_jid, lid_phones)
+            if not phone:
+                stats["lid_skipped"] += 1
+                continue
+
+            # Dedup: a classic {phone}@s.whatsapp.net entity for the same
+            # phone already exists → update it, don't create a LID duplicate.
+            classic_jid = f"{phone.lstrip('+')}@s.whatsapp.net"
+            classic_source_id = f"whatsapp_{classic_jid}"
+            existing_classic = source_store.get_by_source(SOURCE_WHATSAPP, classic_source_id)
+
+            if existing_classic:
+                source_id = classic_source_id
+                existing_source = existing_classic
+                stats["lid_merged_into_classic"] += 1
+            else:
+                source_id = f"whatsapp_{lid_jid}"
+                existing_source = source_store.get_by_source(SOURCE_WHATSAPP, source_id)
+
+            bare_lid = lid_jid.split("@")[0].split(":")[0] if lid_jid else ""
+
+            created = _upsert_contact_source(
+                source_store,
+                person_store,
+                resolver,
+                stats,
+                source_id=source_id,
+                existing_source=existing_source,
+                observed_name=push_name,
+                observed_phone=phone,
+                metadata={
+                    "jid": lid_jid,
+                    "lid": True,
+                    "raw_phone": lid_phones.get(bare_lid, ""),
+                },
+                dry_run=dry_run,
+            )
+
+            if created and not existing_classic:
+                stats["lid_entities_created"] += 1
+
+        except Exception as e:
+            logger.error(f"Error processing LID contact: {e}")
             stats["errors"] += 1
 
     if not dry_run:
