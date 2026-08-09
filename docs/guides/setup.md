@@ -1,7 +1,7 @@
 # LifeOS New Instance Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-09
 > **Audience:** New users
 
 Read this top-to-bottom. Execute each step, verify the check, then proceed.
@@ -227,6 +227,13 @@ curl -s http://localhost:8001/api/v2/heartbeat
 ```bash
 ./scripts/server.sh start
 ```
+
+**Note:** LifeOS is designed to run its API server on exactly one machine; every
+other machine should be a client pointed at it via `LIFEOS_API_URL`, not run its
+own copy of the server. If you have multiple machines and want to enforce this,
+set `LIFEOS_SERVER_HOSTNAME=<your-host>` (the output of `hostname` on the
+designated machine) in `.env` — the server then refuses to start anywhere else.
+Leave it unset for a single-machine setup; the default never blocks a start.
 
 **[VERIFY]** All services are healthy:
 
