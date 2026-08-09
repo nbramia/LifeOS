@@ -9,13 +9,16 @@ import sqlite3
 from unittest.mock import MagicMock, patch
 
 from api.services.whatsapp import (
+    SOURCE_WHATSAPP,
     extract_phone_from_jid,
     is_group_jid,
     normalize_phone,
     parse_message_timestamp,
+    process_whatsapp_contacts,
     process_whatsapp_messages,
     resolve_lid_phone,
 )
+from api.services.source_entity import SourceEntity
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +554,195 @@ class TestProcessWhatsAppMessagesLidPhone:
         resolver.resolve.assert_called_with(
             name="Jonathan", phone="+12125550142", create_if_missing=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# Contact processing — LID contacts becoming source entities (#503)
+# ---------------------------------------------------------------------------
+
+class _FakePerson:
+    """Minimal PersonEntity stand-in with real (not MagicMock) list attrs.
+
+    process_whatsapp_contacts mutates person.phone_numbers/sources in place
+    and compares person.source_entity_count, so a MagicMock's auto-generated
+    attributes won't behave correctly here.
+    """
+
+    def __init__(self, person_id: str):
+        self.id = person_id
+        self.phone_numbers = []
+        self.phone_primary = None
+        self.sources = []
+        self.source_entity_count = 0
+
+
+def _mock_contact_stores(get_by_source_result=None, resolved_person: str = "person-x"):
+    """Build source_store/person_store/resolver mocks for process_whatsapp_contacts.
+
+    get_by_source_result: value (or side_effect callable) returned by
+    source_store.get_by_source — None means no existing entity anywhere.
+    """
+    source_store = MagicMock()
+    if callable(get_by_source_result):
+        source_store.get_by_source.side_effect = get_by_source_result
+    else:
+        source_store.get_by_source.return_value = get_by_source_result
+    source_store.add.side_effect = lambda entity: entity
+    source_store.count_for_person.return_value = 1
+
+    person_store = MagicMock()
+
+    person = _FakePerson(resolved_person)
+    result = MagicMock(entity=person, is_new=False)
+    resolver = MagicMock()
+    resolver.resolve.return_value = result
+
+    return source_store, person_store, resolver, person
+
+
+class TestProcessWhatsAppContactsLid:
+    """LID contacts (#503) must produce source entities, deduped against classic ones."""
+
+    def test_lid_with_name_and_resolvable_phone_creates_entity(self):
+        source_store, person_store, resolver, person = _mock_contact_stores(
+            get_by_source_result=None, resolved_person="person-priya",
+        )
+        lid_contacts = [{"jid": "246698660126807@lid", "push_name": "Priya"}]
+        lid_phones = {"246698660126807": "12125550142"}
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(
+                contacts=[], lid_contacts=lid_contacts, lid_phones=lid_phones, dry_run=False,
+            )
+
+        assert stats["lid_contacts_read"] == 1
+        assert stats["lid_entities_created"] == 1
+        assert stats["source_entities_created"] == 1
+        assert stats["lid_skipped"] == 0
+        assert stats["lid_merged_into_classic"] == 0
+        resolver.resolve.assert_called_once_with(
+            name="Priya", phone="+12125550142", create_if_missing=True,
+        )
+        added_entity = source_store.add.call_args.args[0]
+        assert added_entity.source_id == "whatsapp_246698660126807@lid"
+        assert added_entity.observed_name == "Priya"
+        assert added_entity.observed_phone == "+12125550142"
+
+    def test_lid_without_push_name_skipped(self):
+        source_store, person_store, resolver, _ = _mock_contact_stores()
+        lid_contacts = [{"jid": "246698660126807@lid", "push_name": ""}]
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(
+                contacts=[], lid_contacts=lid_contacts, lid_phones={}, dry_run=False,
+            )
+
+        assert stats["lid_skipped"] == 1
+        assert stats["lid_entities_created"] == 0
+        resolver.resolve.assert_not_called()
+
+    def test_lid_with_unresolvable_phone_skipped(self):
+        source_store, person_store, resolver, _ = _mock_contact_stores()
+        lid_contacts = [{"jid": "999999999999@lid", "push_name": "Bob"}]
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(
+                contacts=[], lid_contacts=lid_contacts, lid_phones={}, dry_run=False,
+            )
+
+        assert stats["lid_skipped"] == 1
+        assert stats["lid_entities_created"] == 0
+        resolver.resolve.assert_not_called()
+
+    def test_lid_matching_classic_contact_updates_classic_no_duplicate(self):
+        classic_source_id = "whatsapp_12125550142@s.whatsapp.net"
+        existing_classic = SourceEntity(
+            source_type=SOURCE_WHATSAPP,
+            source_id=classic_source_id,
+            observed_name="Priya Old Name",
+            observed_phone="+12125550142",
+            canonical_person_id="person-priya",
+        )
+
+        def get_by_source(source_type, source_id):
+            return existing_classic if source_id == classic_source_id else None
+
+        source_store, person_store, resolver, person = _mock_contact_stores(
+            get_by_source_result=get_by_source, resolved_person="person-priya",
+        )
+        lid_contacts = [{"jid": "246698660126807@lid", "push_name": "Priya"}]
+        lid_phones = {"246698660126807": "12125550142"}
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(
+                contacts=[], lid_contacts=lid_contacts, lid_phones=lid_phones, dry_run=False,
+            )
+
+        assert stats["lid_merged_into_classic"] == 1
+        assert stats["lid_entities_created"] == 0
+        assert stats["source_entities_created"] == 0
+        assert stats["source_entities_updated"] == 1
+        source_store.add.assert_not_called()
+        source_store.update.assert_called_once()
+        updated_entity = source_store.update.call_args.args[0]
+        assert updated_entity.source_id == classic_source_id
+        assert updated_entity.observed_name == "Priya"
+
+    def test_lid_idempotent_second_run_updates_not_creates(self):
+        lid_source_id = "whatsapp_246698660162027@lid"
+        existing_lid_entity = SourceEntity(
+            source_type=SOURCE_WHATSAPP,
+            source_id=lid_source_id,
+            observed_name="Priya",
+            observed_phone="+12125550142",
+            canonical_person_id="person-priya",
+        )
+
+        def get_by_source(source_type, source_id):
+            # No classic entity anywhere; the LID entity from a prior run exists.
+            return existing_lid_entity if source_id == lid_source_id else None
+
+        source_store, person_store, resolver, person = _mock_contact_stores(
+            get_by_source_result=get_by_source, resolved_person="person-priya",
+        )
+        lid_contacts = [{"jid": "246698660162027@lid", "push_name": "Priya"}]
+        lid_phones = {"246698660162027": "12125550142"}
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(
+                contacts=[], lid_contacts=lid_contacts, lid_phones=lid_phones, dry_run=False,
+            )
+
+        assert stats["lid_entities_created"] == 0
+        assert stats["source_entities_created"] == 0
+        assert stats["source_entities_updated"] == 1
+        assert stats["lid_merged_into_classic"] == 0
+        source_store.add.assert_not_called()
+        source_store.update.assert_called_once()
+
+    def test_classic_contact_unaffected_by_lid_processing(self):
+        """Baseline: a classic contact with no LID entries still creates as before."""
+        source_store, person_store, resolver, person = _mock_contact_stores(
+            get_by_source_result=None, resolved_person="person-jordan",
+        )
+        contacts = [{"JID": "15551234567@s.whatsapp.net", "Phone": "15551234567", "Name": "Jordan"}]
+
+        with patch("api.services.whatsapp.get_source_entity_store", return_value=source_store), \
+             patch("api.services.whatsapp.get_person_entity_store", return_value=person_store), \
+             patch("api.services.whatsapp.get_entity_resolver", return_value=resolver):
+            stats = process_whatsapp_contacts(contacts=contacts, dry_run=False)
+
+        assert stats["source_entities_created"] == 1
+        assert stats["lid_contacts_read"] == 0
+        assert stats["lid_entities_created"] == 0
+        assert stats["skipped"] == 0

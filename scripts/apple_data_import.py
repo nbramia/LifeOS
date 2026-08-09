@@ -675,12 +675,21 @@ def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict
         process_whatsapp_messages,
     )
 
-    contact_stats = process_whatsapp_contacts(contacts, dry_run=dry_run)
+    contact_stats = process_whatsapp_contacts(
+        contacts,
+        lid_contacts=lid_contacts,
+        lid_phones=lid_phones,
+        dry_run=dry_run,
+    )
     logger.info(
         f"WhatsApp contacts: {contact_stats['source_entities_created']} created, "
         f"{contact_stats['source_entities_updated']} updated, "
         f"{contact_stats['persons_linked']} linked, "
-        f"{contact_stats['skipped']} skipped"
+        f"{contact_stats['skipped']} skipped, "
+        f"{contact_stats['lid_contacts_read']} lid contacts read "
+        f"({contact_stats['lid_entities_created']} created, "
+        f"{contact_stats['lid_merged_into_classic']} merged into classic, "
+        f"{contact_stats['lid_skipped']} skipped)"
     )
 
     message_stats = process_whatsapp_messages(
