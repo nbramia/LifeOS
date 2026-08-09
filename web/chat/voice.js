@@ -224,6 +224,11 @@ function micBlockReason() {
   return '';
 }
 
+// The reason already written to the thread, so repeated taps on a blocked talk
+// button don't stack identical bubbles. Keyed by reason, not a plain boolean, so
+// a *different* cause still gets reported.
+let reportedMicBlock = '';
+
 // Report the specific blocked reason in the thread. For an insecure context the
 // fix is reachable — the same app is fronted over HTTPS at `secure_url`
 // (TAILNET_HTTPS_URL) — so offer a tappable link to this same page there. The
@@ -231,7 +236,9 @@ function micBlockReason() {
 // clone, no Tailscale) the message stands alone.
 async function reportMicBlocked(reason) {
   const message = MIC_BLOCK_MESSAGES[reason];
-  setStatus('error', message);
+  setStatus('error', message);  // every tap gets feedback…
+  if (reportedMicBlock === reason) return;  // …but the thread bubble lands once
+  reportedMicBlock = reason;  // set before awaiting, so a fast second tap loses
   const secureUrl = reason === 'insecure_context'
     ? ((await fetchChatConfig()).secure_url || '').replace(/\/+$/, '')
     : '';

@@ -128,3 +128,36 @@ class TestMicBlockReasons:
         _open_voice_chat(page, chat_base_url, env_script=NO_MIME)
         expect(page.locator("#statusText")).to_have_text(
             "Mic unavailable — no supported audio format in this browser")
+
+
+class TestReportedOncePerReason:
+    """Tapping a blocked button repeatedly must not stack identical bubbles."""
+
+    def test_repeat_taps_append_one_bubble_but_keep_updating_status(
+            self, page: Page, chat_base_url):
+        _open_voice_chat(page, chat_base_url, env_script=INSECURE)
+        expect(page.locator(".message.assistant")).to_have_count(1)
+
+        # Clear the pill so we can prove the next tap still writes to it.
+        page.evaluate("document.getElementById('statusText').textContent = ''")
+        for _ in range(3):
+            page.locator("#voiceTalkBtn").click()
+
+        expect(page.locator("#statusText")).to_have_text("Mic blocked — this page is not on HTTPS")
+        expect(page.locator(".message.assistant")).to_have_count(1)
+        expect(page.locator(".message.assistant a.source-link")).to_have_count(1)
+
+    def test_a_different_reason_is_still_reported(self, page: Page, chat_base_url):
+        """The guard is keyed by reason, so a changed cause isn't swallowed."""
+        _open_voice_chat(page, chat_base_url, env_script=INSECURE)
+        expect(page.locator(".message.assistant")).to_have_count(1)
+
+        # Same page, mic now blocked for a different reason: the secure-context
+        # check passes and getUserMedia is the thing missing.
+        page.evaluate("Object.defineProperty(window, 'isSecureContext', { value: true });"
+                      "Object.defineProperty(navigator, 'mediaDevices', { value: undefined });")
+        page.locator("#voiceTalkBtn").click()
+
+        expect(page.locator("#statusText")).to_have_text(
+            "Mic unavailable — this browser exposes no microphone API")
+        expect(page.locator(".message.assistant")).to_have_count(2)
