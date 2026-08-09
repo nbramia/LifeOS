@@ -236,6 +236,150 @@ class TestContactsExport:
         assert result["count"] == 1
 
 
+class TestExportResultFinalization:
+    """_finalize_result guards against a source reporting "ok" with no
+    actual output. Issue #505's secondary finding: export_contacts returned
+    {"status": "ok", "count": 0, "path": ""} when no .abcdp files existed —
+    indistinguishable from a genuinely healthy empty result."""
+
+    def _finalize(self):
+        from scripts.apple_data_export import _finalize_result
+        return _finalize_result
+
+    def test_ok_zero_count_empty_path_becomes_error(self):
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 0, "path": ""})
+        assert result["status"] == "error"
+        assert "reason" in result
+
+    def test_ok_with_real_output_is_unaffected(self):
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 3, "path": "/tmp/contacts.json"})
+        assert result == {"status": "ok", "count": 3, "path": "/tmp/contacts.json"}
+
+    def test_ok_zero_count_but_written_path_is_unaffected(self):
+        """A genuinely empty but successfully-written export (e.g. 0 phone
+        calls, but phone_calls.json was still written) must not be flagged —
+        only the count-0-AND-path-empty combination means nothing happened."""
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 0, "path": "/tmp/phone_calls.json"})
+        assert result["status"] == "ok"
+
+    def test_non_ok_status_is_unaffected(self):
+        finalize = self._finalize()
+        result = finalize({"status": "skipped", "reason": "AddressBook not found"})
+        assert result == {"status": "skipped", "reason": "AddressBook not found"}
+
+    def test_ok_without_count_or_path_keys_is_unaffected(self):
+        """Sources like imessage/photos/whatsapp use different result
+        shapes (size_mb, people/faces, contacts/messages) and must not be
+        caught by this contacts-shaped check."""
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "size_mb": 12.3, "path": "/tmp/imessage.db"})
+        assert result["status"] == "ok"
+
+    def test_export_contacts_no_abcdp_files_gets_finalized_to_error(self, tmp_path):
+        """Full-loop check: export_contacts's own empty-result, run through
+        _finalize_result exactly as main() does, becomes an error."""
+        from scripts.apple_data_export import export_contacts
+
+        lib_ab = tmp_path / "Library" / "Application Support" / "AddressBook"
+        (lib_ab / "Sources" / "SOURCE-1" / "Metadata").mkdir(parents=True)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path):
+            raw = export_contacts(dry_run=False)
+
+        # This is the exact historical bug shape from issue #505.
+        assert raw == {"status": "ok", "count": 0, "path": ""}
+
+        finalized = self._finalize()(raw)
+        assert finalized["status"] == "error"
+
+
+class TestContactsImportManifestAware:
+    """import_contacts must not report success/skip when the Mac-side
+    export marked contacts as errored (issue #505 acceptance criteria:
+    "the Linux import surfaces it rather than reporting success")."""
+
+    def _write_contacts(self, import_dir: Path, contacts: list[dict]):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        with open(import_dir / "contacts.json", "w") as f:
+            json.dump({"contacts": contacts, "exported_at": "2026-01-01T00:00:00+00:00"}, f)
+
+    def _errored_manifest(self):
+        return {
+            "results": {
+                "contacts": {
+                    "status": "error",
+                    "reason": "reported ok with zero count and no output path",
+                }
+            }
+        }
+
+    def test_missing_file_no_manifest_error_is_still_skipped(self, tmp_path):
+        """Regression check: unrelated to #505, unchanged behavior."""
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=False, manifest=None)
+
+        assert result == {"status": "skipped", "reason": "contacts.json not found"}
+
+    def test_missing_file_with_manifest_error_is_error(self, tmp_path):
+        """The exact issue #505 scenario: export never wrote contacts.json
+        (zero .abcdp files found), the export-side fix now marks that as an
+        error in the manifest, and the import must surface an error instead
+        of a benign "skipped"."""
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=False, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert "contacts.json not found" in result["reason"]
+
+    def test_dry_run_with_manifest_error_is_error(self, tmp_path):
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_contacts(import_dir, [{"identifier": "u1", "full_name": "Jane Doe"}])
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=True, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert result["count"] == 1
+
+    def test_execute_with_manifest_error_still_imports_but_flags_error(self, tmp_path):
+        """A stale contacts.json from a previous good run should still be
+        imported (data is better than nothing) but the run must be flagged
+        as errored so it doesn't look like a clean success — mirrors
+        import_whatsapp's existing manifest-aware behavior."""
+        from scripts.apple_data_import import import_contacts
+        from unittest.mock import MagicMock
+        from api.services.source_entity import SourceEntityStore
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_contacts(import_dir, [{"identifier": "u1", "full_name": "Jane Doe"}])
+
+        se_store = SourceEntityStore(db_path=str(tmp_path / "crm.db"))
+        mock_resolver = MagicMock()
+        mock_pe_store = MagicMock()
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+             patch("api.services.source_entity.get_source_entity_store", return_value=se_store), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver), \
+             patch("api.services.person_entity.get_person_entity_store", return_value=mock_pe_store):
+            result = import_contacts(dry_run=False, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert result["created"] == 1
+        assert "stale contacts.json" in result["reason"]
+
+
 # ---------------------------------------------------------------------------
 # Staleness alerting
 # ---------------------------------------------------------------------------
