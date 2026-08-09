@@ -38,7 +38,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Add project root to path
@@ -56,6 +56,7 @@ from api.services.sync_health import (
     get_typical_yield,
     get_yield_history,
     get_consecutive_zero_yield_runs,
+    get_recent_errors,
     check_sync_health,
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
@@ -861,6 +862,41 @@ def _detect_never_yielded(source: str, stats: dict) -> dict | None:
     }
 
 
+# A chronic never-yielded source (link_slack, repoint_stale_ids, google_sheets,
+# etc.) is a fixed, known-benign condition every night — issue #494's
+# acceptance criterion was "report once, not nightly", not "warn every night
+# forever". Re-warn periodically so a genuinely-fixed source's silence isn't
+# permanent, but damp the common case.
+NEVER_YIELDED_REWARN_DAYS = 7
+
+
+def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED_REWARN_DAYS) -> bool:
+    """True if a ``never_yielded`` warning was already recorded for ``source``
+    within the last ``within_days`` days.
+
+    Never raises — a sync_health DB hiccup must not fail the sync. On error we
+    fall through to "not recently warned", since a duplicate warning is
+    harmless while a silently-dropped one defeats the point of the check.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
+        for err in get_recent_errors(source=source, limit=20):
+            if err.get("error_type") != "never_yielded":
+                continue
+            ts = err.get("timestamp")
+            if not ts:
+                continue
+            err_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if err_dt.tzinfo is None:
+                err_dt = err_dt.replace(tzinfo=timezone.utc)
+            if err_dt >= cutoff:
+                return True
+    except Exception as e:
+        logger.warning(f"Never-yielded rewarn check failed for {source}: {e}")
+        return False
+    return False
+
+
 def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     """
     Run a single sync operation.
@@ -991,12 +1027,19 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             never_yielded = _detect_never_yielded(source, stats)
             if never_yielded:
                 stats["never_yielded"] = never_yielded
-                logger.warning(
-                    f"{source} has never produced records in "
-                    f"{never_yielded['runs']} runs (avg "
-                    f"{never_yielded['avg_duration_seconds']:.1f}s) — likely "
-                    f"dead or misconfigured"
-                )
+                # Damped (#494 follow-up): only warn when the condition is
+                # newly true, or periodically — not every night for the same
+                # chronic sources.
+                if not _recently_warned_never_yielded(source):
+                    msg = (
+                        f"{source} has never produced records in "
+                        f"{never_yielded['runs']} runs (avg "
+                        f"{never_yielded['avg_duration_seconds']:.1f}s) — likely "
+                        f"dead or misconfigured"
+                    )
+                    logger.warning(msg)
+                    record_sync_error(source, msg, error_type="never_yielded")
+                    stats["never_yielded_warned"] = True
 
         if skipped_reason:
             stats["skipped"] = True
@@ -1436,7 +1479,7 @@ def run_all_syncs(
                     duration_collapsed.append(source)
                 if stats.get("yield_collapse"):
                     yield_collapsed.append(source)
-                if stats.get("never_yielded"):
+                if stats.get("never_yielded_warned"):
                     never_yielded_sources.append(source)
 
             # Restart LLM after last embedding phase completes (if we stopped it)

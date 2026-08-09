@@ -984,7 +984,17 @@ def check_sync_health() -> tuple[bool, str]:
     summary = get_sync_summary()
 
     if summary["all_healthy"]:
-        return True, f"All {summary['total_sources']} sources are healthy"
+        total = summary["total_sources"]
+        disabled = summary["disabled"]
+        if disabled:
+            # Self-explanatory breakdown (issue #494 follow-up): total tracked
+            # sources includes ones that are intentionally disabled (e.g.
+            # macOS-only "phone" on a Linux host) and therefore don't appear
+            # in the nightly run order — without the breakdown this line
+            # looked like it contradicted "Total sources: N" a few lines up.
+            enabled = summary["enabled_sources"]
+            return True, f"All {total} tracked sources healthy ({enabled} active + {disabled} disabled)"
+        return True, f"All {total} sources are healthy"
 
     issues = []
     if summary["stale"]:

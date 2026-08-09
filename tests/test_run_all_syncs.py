@@ -768,6 +768,107 @@ class TestNeverYielded:
             assert _detect_never_yielded("contacts", {"created": 0}) is None
 
 
+class TestNeverYieldedDamping:
+    """Never-yielded warning must fire once, not nightly (#494 follow-up):
+    a chronic source (link_slack, repoint_stale_ids, google_sheets) should
+    only re-warn every ``NEVER_YIELDED_REWARN_DAYS`` days, not every run."""
+
+    def test_no_prior_warning_not_recently_warned(self):
+        from scripts.run_all_syncs import _recently_warned_never_yielded
+
+        with patch("scripts.run_all_syncs.get_recent_errors", return_value=[]):
+            assert _recently_warned_never_yielded("link_slack") is False
+
+    def test_recent_warning_suppresses(self):
+        from datetime import datetime, timezone, timedelta
+        from scripts.run_all_syncs import _recently_warned_never_yielded
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        errors = [{"error_type": "never_yielded", "timestamp": recent}]
+        with patch("scripts.run_all_syncs.get_recent_errors", return_value=errors):
+            assert _recently_warned_never_yielded("link_slack") is True
+
+    def test_warning_older_than_window_rewarns(self):
+        from datetime import datetime, timezone, timedelta
+        from scripts.run_all_syncs import _recently_warned_never_yielded
+
+        stale = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        errors = [{"error_type": "never_yielded", "timestamp": stale}]
+        with patch("scripts.run_all_syncs.get_recent_errors", return_value=errors):
+            assert _recently_warned_never_yielded("link_slack") is False
+
+    def test_other_error_types_ignored(self):
+        from datetime import datetime, timezone
+        from scripts.run_all_syncs import _recently_warned_never_yielded
+
+        now = datetime.now(timezone.utc).isoformat()
+        errors = [{"error_type": "yield_collapse", "timestamp": now}]
+        with patch("scripts.run_all_syncs.get_recent_errors", return_value=errors):
+            assert _recently_warned_never_yielded("link_slack") is False
+
+    def test_db_error_never_raises(self):
+        from scripts.run_all_syncs import _recently_warned_never_yielded
+
+        with patch("scripts.run_all_syncs.get_recent_errors", side_effect=RuntimeError("db gone")):
+            assert _recently_warned_never_yielded("link_slack") is False
+
+    def test_run_sync_skips_warning_and_error_when_recently_warned(self):
+        """End-to-end through run_sync: when damped, neither the WARNING log
+        nor a new sync_errors row should be produced, and the source must not
+        land in the nightly 'Never produced records' rollup."""
+        import subprocess
+        from scripts.run_all_syncs import run_sync, SYNC_SCRIPTS
+
+        source = next(iter(SYNC_SCRIPTS))
+        never_yielded_info = {"runs": 185, "avg_duration_seconds": 3.0}
+
+        completed = subprocess.CompletedProcess(args=["fake"], returncode=0, stdout="", stderr="")
+        with (
+            patch("scripts.run_all_syncs.subprocess.run", return_value=completed),
+            patch("scripts.run_all_syncs.record_sync_start", return_value=999),
+            patch("scripts.run_all_syncs.record_sync_complete"),
+            patch("scripts.run_all_syncs.record_sync_error") as record_error_mock,
+            patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_never_yielded", return_value=never_yielded_info),
+            patch("scripts.run_all_syncs._recently_warned_never_yielded", return_value=True),
+        ):
+            success, stats = run_sync(source, dry_run=False)
+
+        assert success is True
+        assert stats["never_yielded"] == never_yielded_info
+        assert "never_yielded_warned" not in stats
+        record_error_mock.assert_not_called()
+
+    def test_run_sync_warns_and_records_error_when_not_recently_warned(self):
+        """When not damped, run_sync must log the warning, record a
+        sync_errors row with error_type='never_yielded', and mark the stats
+        so the nightly rollup line includes this source."""
+        import subprocess
+        from scripts.run_all_syncs import run_sync, SYNC_SCRIPTS
+
+        source = next(iter(SYNC_SCRIPTS))
+        never_yielded_info = {"runs": 185, "avg_duration_seconds": 3.0}
+
+        completed = subprocess.CompletedProcess(args=["fake"], returncode=0, stdout="", stderr="")
+        with (
+            patch("scripts.run_all_syncs.subprocess.run", return_value=completed),
+            patch("scripts.run_all_syncs.record_sync_start", return_value=999),
+            patch("scripts.run_all_syncs.record_sync_complete"),
+            patch("scripts.run_all_syncs.record_sync_error") as record_error_mock,
+            patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_never_yielded", return_value=never_yielded_info),
+            patch("scripts.run_all_syncs._recently_warned_never_yielded", return_value=False),
+        ):
+            success, stats = run_sync(source, dry_run=False)
+
+        assert success is True
+        assert stats["never_yielded_warned"] is True
+        record_error_mock.assert_called_once()
+        assert record_error_mock.call_args.kwargs.get("error_type") == "never_yielded"
+
+
 class TestSkippedMarker:
     """SYNC_SKIPPED marker parsing (#494/#495): an unconfigured source must not
     be recorded as a healthy success."""
