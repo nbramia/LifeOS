@@ -75,7 +75,6 @@ def link_source_entities(
     resolver = get_entity_resolver()
 
     stats = {
-        'total_unlinked': 0,
         'eligible_for_matching': 0,
         'entities_processed': 0,
         'newly_linked': 0,
@@ -86,11 +85,6 @@ def link_source_entities(
         'by_source': {},
         'by_match_type': {},
     }
-
-    # Get counts
-    stats['total_unlinked'] = source_store.count() - sum(
-        1 for _ in range(1)  # placeholder - we'll get actual count
-    )
 
     # Get all eligible entities upfront to avoid re-fetching in dry run mode
     # We fetch in large batches to build the complete list
@@ -122,6 +116,12 @@ def link_source_entities(
 
     if stats['eligible_for_matching'] == 0:
         logger.info("No unlinked entities to process!")
+        # Emit on the early-return path too. A stats call that only runs at the
+        # bottom of the function is invisible whenever the function returns
+        # early — the exact reason sync_apple_contacts never reported (#497).
+        # An explicit zero here is meaningful: it says "ran, nothing eligible".
+        from api.services.sync_health import emit_sync_stats
+        emit_sync_stats({"processed": 0, "people_updated": 0, "errors": 0})
         return stats
 
     # Process in batches
