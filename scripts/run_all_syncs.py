@@ -620,8 +620,8 @@ SYNC_ORDER = [
     # === Phase 2: Entity Processing ===
     # Link source entities to canonical PersonEntity records
     "link_slack",               # Link Slack users to people by email
-    "link_imessage",            # Link iMessage handles to people by phone
-    "imessage",                 # Create interactions from linked iMessage data
+    "imessage",                 # Create interactions from iMessage data (links its own unlinked messages internally)
+    "link_imessage",            # Retroactive: backfill phone-based links against latest CRM data (runs after imessage — see depends_on)
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
