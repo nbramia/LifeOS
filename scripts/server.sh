@@ -69,6 +69,30 @@ chromadb_healthy() {
     curl -s --max-time 2 "$CHROMADB_URL" > /dev/null 2>&1
 }
 
+# check_host_guard — refuse to start on a non-designated machine (#506).
+#
+# Mirrors check_server_host_guard() in api/main.py so a misconfigured second
+# server fails fast and legibly here, before Python (and the 30-60s model
+# load) even starts. LIFEOS_SERVER_HOSTNAME unset in .env (the default) never
+# blocks a start — safe for a fresh clone.
+check_host_guard() {
+    local expected=""
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        expected=$(grep -E "^LIFEOS_SERVER_HOSTNAME=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d ' "'"'" || true)
+    fi
+    if [ -z "$expected" ]; then
+        return 0
+    fi
+    local actual
+    actual="$(hostname)"
+    if [ "$actual" != "$expected" ]; then
+        log_error "Refusing to start: LIFEOS_SERVER_HOSTNAME=$expected but this machine's hostname is $actual."
+        log_error "The LifeOS API must run only on $expected. Point this machine at it via LIFEOS_API_URL instead of running a second server."
+        return 1
+    fi
+    return 0
+}
+
 # Get server PID
 get_server_pid() {
     lsof -ti :$PORT 2>/dev/null || true
@@ -170,6 +194,9 @@ rotate_log() {
 run_foreground() {
     log_info "Starting LifeOS server in foreground mode..."
 
+    # Guard: this machine must be the designated host, if one is configured.
+    check_host_guard || return 1
+
     # Check ChromaDB is running (required dependency)
     if ! chromadb_healthy; then
         log_error "ChromaDB server not running. Start it first."
@@ -195,6 +222,9 @@ uvicorn.run('api.main:app', host='$HOST', port=$PORT, log_level='info', timeout_
 # Start the server
 start_server() {
     log_info "Starting LifeOS server..."
+
+    # Guard: this machine must be the designated host, if one is configured.
+    check_host_guard || return 1
 
     # Rotate logs before starting
     rotate_log

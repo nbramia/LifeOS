@@ -168,6 +168,24 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
 
+    # Host guard (#506): the ONE machine allowed to run this API server. A
+    # second live server elsewhere writes to its own SQLite/Chroma copy that
+    # silently diverges from the real one, so clients pointed at the wrong
+    # host get stale answers with no signal anything is wrong. Empty
+    # (default) disables the guard entirely — a fresh clone must never be
+    # blocked from starting. Set it only once you've deliberately designated
+    # a host; api/main.py then refuses to start anywhere else.
+    server_hostname: str = Field(
+        default="",
+        alias="LIFEOS_SERVER_HOSTNAME",
+        description="Hostname (as returned by `socket.gethostname()`/`hostname`) "
+                    "of the one machine designated to run the LifeOS API server. "
+                    "Empty (default) disables the guard. When set, api/main.py "
+                    "and scripts/server.sh refuse to start on any other machine "
+                    "— point that machine's clients at LIFEOS_API_URL instead of "
+                    "running a second server."
+    )
+
     # The HTTPS front `tailscale serve` publishes (scripts/setup-tailscale.sh).
     # Also the one non-local origin CORS allows, so a browser loading the UI from
     # the tailnet hostname can call the API. Empty simply drops it from the list.
