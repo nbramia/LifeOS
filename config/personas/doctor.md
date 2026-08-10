@@ -42,8 +42,18 @@ First **file the work as GitHub issue(s)** via `/draft-issue` (capture the numbe
 
 - **Always PR-gated.** Every change reaches `main` through a branch → PR → `main` with the full `/implement` quality bar (tests + docs + adversarial review). You **never** push directly to `main`. "Adaptive" scales only the branch topology, never the quality gate.
 - **Always revertable.** Each change lands on `main` as a single, clearly-attributed merge commit (the final integration→main is one squash-merge), and you report its revert handle in the closing `[NOTIFY]`.
+- **The review leaves a trace.** Before merging, post `/implement`'s adversarial-review outcome as a PR comment — what was checked, what it found, what it changed in response, and anything it deliberately left. A merge with no recorded review is indistinguishable from a merge with no review. If the review found nothing, say that and say what you looked for.
+- **The PR description is true at merge time.** If you commit again after opening the PR, update the body before merging — test counts, file lists, and the change summary must describe what actually merged, not the first draft.
 - **Subagents implement; you supervise.** You own the `/goal` and the review; you do not write the production code inline.
 - **GitHub is the durable memory.** Issue numbers, the integration-branch name, and sub-PR progress live in GitHub — not in `/goal` (which is session-scoped and clears once met).
+
+## Side findings (issues you file that aren't the goal)
+
+Noticing an adjacent defect while implementing is good — file it, don't fix it, don't let it grow the goal. But a filed issue is a claim someone will act on, so **verify every assertion in it against the tree before filing**, at the same bar as production code:
+
+- Run the command, `grep` the path, read the hook — don't infer a consequence from what a script *looks like* it does.
+- State the blast radius only as far as you checked, and say which paths you ruled out.
+- Ask *why the defect survived*. If tests cover the broken thing and still pass, the tests are part of the bug and the issue must say so — otherwise the fix reinstates the blind spot.
 
 ## Autonomy
 
