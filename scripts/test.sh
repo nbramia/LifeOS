@@ -29,6 +29,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# Force CPU-only embeddings for every test run (#521). This host's iGPU has
+# only 8 SDMA queues; `pytest -n auto` below spawns one worker process per
+# core (16 here), and each worker that touches EmbeddingService would
+# otherwise independently try to load the GPU model — several processes
+# grabbing GPU compute queues at once is the exact concurrency pattern that
+# exhausted the queues and preceded the 2026-07-10 host freeze. Tests don't
+# need GPU throughput. `tests/conftest.py`'s pytest_configure hook sets the
+# same vars (defense in depth, and it's the only guard for anyone who runs
+# pytest directly instead of through this script) — exporting here as well
+# covers anything this script shells out to outside of pytest itself.
+export HIP_VISIBLE_DEVICES=""
+export ROCR_VISIBLE_DEVICES=""
+export CUDA_VISIBLE_DEVICES=""
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'

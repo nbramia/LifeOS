@@ -215,6 +215,36 @@ class Settings(BaseSettings):
                     "freezing the host (issue #483). Semantically neutral — "
                     "batching changes only peak memory, not the embedding values."
     )
+    embedding_gpu_lock_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_ENABLED",
+        description="Serialize GPU embedding across processes (API server, agent "
+                    "worker, nightly sync, ad-hoc scripts) via a cross-process file "
+                    "lock, so they can't all grab GPU compute queues at once and "
+                    "exhaust the iGPU's 8 SDMA queues (issue #521). Disable if the "
+                    "lock file ever causes more trouble than the contention it "
+                    "prevents."
+    )
+    embedding_gpu_lock_path: str = Field(
+        default="./data/gpu_embed.lock",
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_PATH",
+        description="flock() path used to serialize GPU embedding across "
+                    "processes (#521). Relative paths resolve against the process "
+                    "cwd; every LifeOS process (systemd services set "
+                    "WorkingDirectory to the project root, and scripts/docs "
+                    "instruct running from the project root) shares that cwd, so "
+                    "the default resolves to the same file everywhere without "
+                    "needing an absolute path. Set to empty to disable the lock."
+    )
+    embedding_gpu_lock_timeout_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT",
+        description="Max seconds to wait for the cross-process GPU embedding "
+                    "lock before giving up and falling back to CPU for the rest "
+                    "of this process's lifetime, rather than deadlocking or "
+                    "piling onto whichever process is already using the GPU "
+                    "(#521)."
+    )
 
     # Chunking
     chunk_size: int = 500  # tokens

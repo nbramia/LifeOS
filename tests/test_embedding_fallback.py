@@ -4,6 +4,7 @@ Unit tests for EmbeddingService GPU-to-CPU fallback logic.
 These tests mock SentenceTransformer to test fallback behavior without
 loading the actual ML model, so they run fast (no @pytest.mark.slow).
 """
+import errno
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -292,3 +293,174 @@ class TestBatchSizeCap:
         """Guard against a future edit restoring a dangerously large default."""
         from config.settings import settings
         assert 1 <= settings.embedding_batch_size <= 32
+
+
+class TestGpuLock:
+    """Cross-process lock serializing GPU embedding across processes (#521).
+
+    All tests mock ``fcntl.flock`` and/or ``SentenceTransformer`` rather than
+    touching a real GPU — this host's iGPU freezes the machine if multiple
+    embedders actually race for GPU queues, which is precisely the bug this
+    lock exists to prevent.
+    """
+
+    @staticmethod
+    def _fake_encode(data, **kwargs):
+        if isinstance(data, list):
+            return [MagicMock(tolist=lambda: [0.1, 0.2]) for _ in data]
+        return MagicMock(tolist=lambda: [0.1, 0.2])
+
+    @pytest.fixture(autouse=True)
+    def _lock_settings(self, monkeypatch, tmp_path):
+        """Point the lock at a scratch file with a short timeout so every
+        test in this class runs fast and isolated from other tests' locks."""
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "embedding_gpu_lock_enabled", True)
+        monkeypatch.setattr(
+            settings, "embedding_gpu_lock_path", str(tmp_path / "gpu_embed.lock")
+        )
+        monkeypatch.setattr(settings, "embedding_gpu_lock_timeout_seconds", 0.05)
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_lock_acquired_and_released_around_gpu_encode(self, mock_st_class):
+        """A successful acquisition wraps the encode call and is released
+        afterward (real flock on a scratch file — single process, so it
+        always succeeds immediately; this checks the acquire/release calls
+        actually happen around encode())."""
+        import fcntl as fcntl_mod
+
+        from api.services.embeddings import EmbeddingService
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        real_flock = fcntl_mod.flock
+        ops_seen = []
+
+        def spy_flock(fd, op):
+            ops_seen.append(op)
+            return real_flock(fd, op)
+
+        svc = EmbeddingService(model_name="test-model")
+        with patch("api.services.embeddings.fcntl.flock", side_effect=spy_flock):
+            svc.embed_texts(["a", "b"])
+
+        assert (fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB) in ops_seen
+        assert fcntl_mod.LOCK_UN in ops_seen
+        assert model.encode.call_count == 1
+        assert svc._force_cpu is False
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_lock_timeout_falls_back_to_cpu(self, mock_st_class, monkeypatch):
+        """If the lock can't be acquired before the timeout, encode on CPU
+        for this call (and stay on CPU going forward) instead of piling onto
+        whichever process is already using the GPU.
+
+        Exercises this after a GPU model is already loaded (via a first call
+        that acquires the lock normally), so the timeout path is shown to
+        discard the loaded GPU model and reload fresh on CPU — not just skip
+        loading because nothing had loaded yet.
+        """
+        from api.services.embeddings import EmbeddingService
+
+        # Avoid the real 0.25s retry sleep so the test is fast; the timeout
+        # deadline is still real wall-clock time (0.05s from _lock_settings).
+        monkeypatch.setattr("api.services.embeddings.time.sleep", lambda *_: None)
+
+        gpu_model = MagicMock()
+        gpu_model.encode.side_effect = self._fake_encode
+        cpu_model = MagicMock()
+        cpu_model.encode.side_effect = self._fake_encode
+        mock_st_class.side_effect = [gpu_model, cpu_model]
+
+        svc = EmbeddingService(model_name="test-model")
+
+        # First call: lock is free, loads + encodes on GPU normally.
+        svc.embed_texts(["a"])
+        assert mock_st_class.call_count == 1
+        assert svc._force_cpu is False
+
+        # Second call: lock is held by "another process" for the whole
+        # timeout window.
+        def always_locked(fd, op):
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        with patch("api.services.embeddings.fcntl.flock", side_effect=always_locked):
+            result = svc.embed_texts(["b"])
+
+        assert svc._force_cpu is True
+        assert mock_st_class.call_count == 2
+        _, cpu_kwargs = mock_st_class.call_args
+        assert cpu_kwargs["device"] == "cpu"
+        assert cpu_model.encode.call_count == 1
+        assert gpu_model.encode.call_count == 1  # only the first call touched GPU
+        assert result == [[0.1, 0.2]]
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_lock_skipped_when_already_cpu(self, mock_st_class):
+        """No lock is taken once the service is already on CPU — there's
+        nothing to serialize."""
+        from api.services.embeddings import EmbeddingService
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        svc = EmbeddingService(model_name="test-model")
+        svc._force_cpu = True
+        svc._model = model
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("flock must not be called when already on CPU")
+
+        with patch("api.services.embeddings.fcntl.flock", side_effect=fail_if_called):
+            svc.embed_text("hello")
+
+        assert model.encode.call_count == 1
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_lock_open_error_degrades_gracefully(self, mock_st_class, monkeypatch):
+        """If the lock file can't even be opened (permissions, disk full,
+        missing dir), proceed on GPU unserialized rather than failing the
+        embed or forcing CPU — an infra error is not evidence another
+        process holds the GPU."""
+        from api.services.embeddings import EmbeddingService
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        def broken_open(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("api.services.embeddings.os.open", broken_open)
+
+        svc = EmbeddingService(model_name="test-model")
+        result = svc.embed_text("hello")
+
+        assert result == [0.1, 0.2]
+        assert svc._force_cpu is False
+        assert mock_st_class.call_count == 1
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_lock_disabled_via_settings(self, mock_st_class, monkeypatch):
+        """embedding_gpu_lock_enabled=False skips the lock entirely."""
+        from config.settings import settings
+        from api.services.embeddings import EmbeddingService
+
+        monkeypatch.setattr(settings, "embedding_gpu_lock_enabled", False)
+
+        model = MagicMock()
+        model.encode.side_effect = self._fake_encode
+        mock_st_class.return_value = model
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("flock must not be called when the lock is disabled")
+
+        with patch("api.services.embeddings.fcntl.flock", side_effect=fail_if_called):
+            svc = EmbeddingService(model_name="test-model")
+            svc.embed_text("hello")
+
+        assert model.encode.call_count == 1

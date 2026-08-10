@@ -72,6 +72,15 @@ curl "http://localhost:8000/api/perf/traces?limit=10" | jq        # Recent trace
 curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 ```
 
+## GPU Watchdog
+
+`scripts/gpu-watchdog.sh` runs every 5 minutes (`lifeos-gpu-watchdog.timer`, Linux only) and watches for two independent GPU failure signals on the gfx1151 iGPU:
+
+- **VRAM saturation** — reads usage from AMDGPU sysfs and alerts above `LIFEOS_VRAM_ALERT_PCT` (default 80%). Guards against the 2026-05-28 incident where VRAM exhaustion during model load locked up the GPU.
+- **SDMA-queue exhaustion (#521)** — the iGPU has only 8 SDMA queues. Concurrent GPU embedders (e.g. the API server and a manual reindex both loading/encoding on GPU at once) can exhaust them with VRAM still healthy — VRAM% alone can't see this. Each tick scans the kernel log (`journalctl -k --since <last tick>`) for `No more SDMA queue to allocate`, the signature that preceded the 2026-07-10 host freeze, and alerts on it with its own cooldown (`LIFEOS_SDMA_ALERT_COOLDOWN_MIN`, defaults to the VRAM cooldown) so it can't spam independently of the VRAM alert.
+
+Both signals alert via Telegram and log to `logs/gpu-watchdog.log`. See `api/services/embeddings.py`'s cross-process `flock` (settings `embedding_gpu_lock_*`) for the mitigation that serializes GPU embedding across processes to prevent SDMA exhaustion in the first place.
+
 ## Alerting Severities
 
 | Severity | When Sent | Examples |
