@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-07-07
+> **Last Updated:** 2026-08-10
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -81,7 +81,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
 | Why was X chosen over Y? | `docs/adr/` (specific ADR) |
-| How do we review PRs? | `/review-pr`, `/pr-check`, `/implement` skills in `.claude/skills/` |
+| How do we review PRs? | `/implement <pr> just review`, `/pr-check`, `/merge-pr` — from the user-scope `implement-lifecycle` plugin |
 
 ---
 
@@ -264,9 +264,10 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 ./scripts/test.sh all          # Full test suite
 ```
 
-- **Most checkouts have no venv** — `./scripts/test.sh` only works on the server (nathan-linux). Get a green run on the server **before** committing; rsync the tree to an isolated temp dir there if the branch isn't pushed. Committing/pushing first "so tests can run" is not allowed.
+- **No local venv (the MacBook)** — `./scripts/test.sh` only runs where a venv exists (the server). From the Mac, run **`./scripts/remote-test.sh`**: it rsyncs your uncommitted working tree to an isolated branch-keyed dir on nathan-linux and runs the same `test.sh auto` scope there. Get a green run **before** committing — no push required, and committing/pushing "so tests can run" is neither necessary nor allowed.
 - **Parallelism:** unit tests run under pytest-xdist (`-n auto --dist loadscope`) — reproduce flakes in that mode, not sequentially.
-- **Browser tests:** the web SPA is served at `/chat` (not `/`); `test.sh browser` covers only `test_ui_browser.py` and `test_e2e_flow.py` — run new browser test files directly with pytest.
+- **Browser tests:** the web SPA is served at `/chat` (not `/`); `test.sh browser` covers only `test_ui_browser.py`, `test_e2e_flow.py`, and `test_voice_mic_block_ui_browser.py` — run new browser test files directly with pytest.
+- **Server-free browser tests:** most browser tests point at a running `lifeos-api` and carry `requires_server` on top of `browser`. A browser test that serves `web/` itself on an ephemeral port and stubs every `/api/` call (see `tests/test_voice_mic_block_ui_browser.py`) omits that marker, so `browser and not requires_server` selects it. The pre-push hook runs that set alongside `unit and not slow` — it's the only gate that catches a `web/` JS regression before it reaches main, so prefer the self-contained pattern for new frontend tests.
 
 ---
 

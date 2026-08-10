@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-09
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -57,55 +57,74 @@ How LifeOS ingests and stores data from multiple sources.
 
 ## Sync Schedule
 
-### Unified Daily Sync (6 Phases)
+### Unified Daily Sync (7 Phases)
 
-All data syncing is consolidated into a single daily sync with proper phase ordering. This ensures downstream processes always have access to fresh upstream data.
+All data syncing is consolidated into a single daily sync with proper phase ordering (`SYNC_ORDER` in `scripts/run_all_syncs.py`). This ensures downstream processes always have access to fresh upstream data.
 
 ```
+02:50          Apple Data Agent export (Mac Mini → Linux server via rsync)
+               └─ Exports contacts, phone calls, iMessage, photos, WhatsApp
+               └─ scripts/apple_data_agent.sh → scripts/apple_data_export.py (Mac Mini)
+               └─ scripts/apple_data_import.py (Linux server)
 02:30          Pre-sync health check (API server)
 03:00          Unified sync starts (via run_all_syncs.py)
 
                === PHASE 1: Data Collection ===
                Pull fresh data from all external sources
-03:00          └─ Gmail (sent + received + CC emails)
-03:01          └─ Calendar (Google Calendar events)
-03:02          └─ LinkedIn (connections CSV export)
-03:03          └─ Contacts (Apple Contacts, native API)
-03:04          └─ WhatsApp (wacli database)
-03:05          └─ Slack (users + DM and member-channel messages)
-
-02:50          Apple Data Agent export (Mac Mini → Linux server via rsync)
-               └─ Exports contacts, phone calls, iMessage, photos
-               └─ scripts/apple_data_agent.sh → scripts/apple_data_export.py (Mac Mini)
-               └─ scripts/apple_data_import.py (Linux server)
+               └─ Gmail (personal + work + work2: sent + received + CC)
+               └─ Calendar (personal + work + work2 Google Calendar events)
+               └─ LinkedIn (connections CSV export)
+               └─ Contacts (Apple Contacts; macOS-only — reports `skipped` on Linux)
+               └─ Apple import (contacts, phone, iMessage, photos, WhatsApp from
+                 the Mac Mini export; Linux only)
+               └─ Slack (users + DM and member-channel messages)
 
                === PHASE 2: Entity Processing ===
                Link source entities to canonical PersonEntity records
-03:07          └─ Link Slack (match by email)
-03:07          └─ Link iMessage (match by phone)
-03:08          └─ Link source entities (retroactive linking for all unlinked)
-03:09          └─ Photos (sync face recognition to people)
+               └─ Link Slack (match by email)
+               └─ iMessage (create interactions; links its own unlinked
+                 messages internally before filtering, so it doesn't need
+                 Link iMessage to have run first)
+               └─ Link iMessage (retroactive: backfill phone-based links
+                 against the latest CRM phone→person mapping)
+               └─ Link source entities (retroactive linking for all unlinked)
+               └─ Photos (sync face recognition to people; macOS-only —
+                 reports `skipped` on Linux)
+
+               === PHASE 2b: Stale ID Cleanup ===
+               Re-point interactions with stale merged person IDs before
+               relationship building
+               └─ Repoint stale IDs
 
                === PHASE 3: Relationship Building ===
                Build relationships using all collected interaction data
-               (Note: person stats are now refreshed inline by each sync script)
-03:09          └─ Relationship discovery (populate edge weights)
-03:10          └─ Strengths (calculate relationship scores)
-03:11          └─ Push birthdays (LifeOS → Apple Contacts)
+               └─ Person stats (full refresh of all PersonEntity counts +
+                 timestamps; each sync script also refreshes its own affected
+                 stats inline)
+               └─ Relationship discovery (populate edge weights)
+               └─ Strengths (calculate relationship scores)
+               └─ Push birthdays (LifeOS → Apple Contacts; macOS-only —
+                 reports `skipped` on Linux)
 
                === PHASE 4: Vector Store Indexing ===
                Index content with fresh people data available
-03:12          └─ Vault reindex (ChromaDB + BM25)
+               └─ Vault reindex (ChromaDB + BM25)
+               └─ CRM vectorstore (index CRM people for semantic search)
 
                === PHASE 5: Content Sync ===
                Pull external content into vault
-03:13          └─ Google Docs (configured docs → vault)
-03:14          └─ Google Sheets (form responses → vault)
-03:14          └─ Monarch Money (monthly, runs on 1st only)
+               └─ Google Docs (configured docs → vault)
+               └─ Google Sheets (form responses → vault)
+               └─ Monarch Money (monthly, runs on 1st only)
 
                === PHASE 6: Post-Sync Cleanup ===
                Auto-hide obvious non-human entities
-03:15          └─ Entity cleanup (auto-hide non-human entities)
+               └─ Entity cleanup (auto-hide non-human entities)
+
+               === PHASE 7: Consistency Verification ===
+               Verify cross-store data consistency after all syncs complete
+               └─ Consistency verify (check orphans, stale merged IDs, cached
+                 counts; auto-fixes below a threshold)
 
 ~03:16         Unified sync complete
 07:00          Post-sync health check (API server)
@@ -119,16 +138,18 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 
 ### Phase Dependencies
 
-The 6-phase structure ensures correct data flow:
+The 7-phase structure ensures correct data flow:
 
 1. **Data Collection** runs first so all external data is fresh
-2. **Entity Processing** links source entities after they exist
+2. **Entity Processing** links source entities and creates interactions after source data exists
+2b. **Stale ID Cleanup** re-points interactions with stale merged person IDs before relationship building consumes them
 3. **Relationship Building** computes metrics using linked entities
 4. **Vector Store Indexing** indexes content with fresh CRM data available for entity resolution
 5. **Content Sync** pulls external content (indexed on next run)
 6. **Post-Sync Cleanup** auto-hides obvious non-human entities after all other syncs
+7. **Consistency Verification** checks cross-store consistency after everything else has run
 
-**Note:** Apple data (contacts, phone calls, iMessage, photos) is exported from the Mac Mini via the Apple Data Agent (`scripts/apple_data_agent.sh`) at 2:50 AM, before the main pipeline. The export runs on the Mac Mini (which has FDA access) and syncs to the Linux server via rsync.
+**Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from the Mac Mini via the Apple Data Agent (`scripts/apple_data_agent.sh`) at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on the Mac Mini (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
 
 ### Process Summary
 
@@ -180,9 +201,9 @@ All sync scripts in `scripts/` follow the pattern:
 |--------|---------|-------------|
 | `sync_gmail_calendar_interactions.py` | Sync emails (sent+received+CC) and calendar | Gmail/Calendar API |
 | `sync_linkedin.py` | Sync LinkedIn connections | CSV export |
-| `sync_apple_contacts.py` | Sync Apple Contacts | Apple Data Agent export |
-| `sync_phone_calls.py` | Sync phone calls | Apple Data Agent export |
-| `sync_imessage_interactions.py` | Sync iMessage | Apple Data Agent export |
+| `sync_apple_contacts.py` | Sync Apple Contacts (macOS-only — `skipped` on Linux) | Apple Data Agent export |
+| `apple_data_import.py` | Import Apple ecosystem data (contacts, phone, iMessage, photos, WhatsApp) from the Mac Mini export | Apple Data Agent export (Linux only) |
+| `sync_phone_calls.py` | Sync phone calls (not in nightly `SYNC_ORDER` — runs via the separate FDA cron on macOS) | Apple Data Agent export |
 | `sync_slack.py` | Sync Slack users, DMs, and member channels | Slack API |
 
 ### Apple Data Agent
@@ -197,21 +218,30 @@ WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `
 
 ### Phase 2: Entity Processing
 
+Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below): `link_slack` → `imessage` → `link_imessage` → `link_source_entities` → `photos`.
+
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
 | `link_slack_entities.py` | Link Slack users to people by email | `data/crm.db` |
-| `link_imessage_entities.py` | Link iMessage handles to people by phone | `data/imessage.db` |
+| `sync_imessage_interactions.py` | Create interactions from iMessage DB; links its own unlinked messages internally before filtering | Apple Data Agent export |
+| `link_imessage_entities.py` | Retroactive: backfill phone-based links against the latest CRM phone→person mapping | `data/imessage.db` |
 | `link_source_entities.py` | Retroactive linking for all unlinked entities | `data/crm.db` |
-| `sync_photos.py` | Sync Photos face recognition to people | Apple Data Agent export |
+| `sync_photos.py` | Sync Photos face recognition to people (macOS-only — `skipped` on Linux) | Apple Data Agent export |
+
+### Phase 2b: Stale ID Cleanup
+
+| Script | Purpose | Data Source |
+|--------|---------|-------------|
+| `sync_repoint_stale_ids.py` | Re-point interactions with stale merged person IDs to canonical IDs, before relationship building | `data/interactions.db` |
 
 ### Phase 3: Relationship Building
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
+| `sync_person_stats.py` | Full refresh of all PersonEntity counts and timestamps | `data/interactions.db` |
 | `sync_relationship_discovery.py` | Discover relationships and populate edge weights | All interactions |
-| `sync_person_stats.py` | Verify/repair interaction counts (not in nightly sync) | `data/interactions.db` |
 | `sync_strengths.py` | Recalculate relationship strengths | `data/crm.db` |
-| `push_birthdays_to_contacts.py` | Push LifeOS birthdays to Apple Contacts | `data/crm.db` |
+| `push_birthdays_to_contacts.py` | Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux) | `data/crm.db` |
 
 ### Phase 4: Vector Store Indexing
 
@@ -234,6 +264,12 @@ WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `
 |--------|---------|-------------|
 | `sync_entity_cleanup.py` | Auto-hide obvious non-human entities (noreply@, newsletters) | `data/crm.db` |
 
+### Phase 7: Consistency Verification
+
+| Script | Purpose | Data Source |
+|--------|---------|-------------|
+| `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts) and auto-fix | `data/crm.db`, `data/interactions.db` |
+
 ### Unified Sync Runner
 
 ```bash
@@ -246,7 +282,7 @@ WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `
 # Run specific source only
 ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --source gmail --force
 
-# Execute full sync (all 6 phases)
+# Execute full sync (all 7 phases)
 ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --force
 ```
 
@@ -320,6 +356,30 @@ photos.
   typically already known via contacts or other sources, and we don't want to
   mint one-off PersonEntities for every LID in every group.
 
+### iMessage Sync Ordering
+
+Two Phase 2 sources touch iMessage data, and their order matters:
+
+1. **`imessage`** (`sync_imessage_interactions.py`) creates Interaction records
+   from `data/imessage.db`. It links its own unlinked messages internally
+   (`join_imessages_to_entities`, by phone/email against PersonEntity) as an
+   unconditional step immediately before filtering on
+   `person_entity_id IS NOT NULL` — it does not rely on any other source
+   having linked first.
+2. **`link_imessage`** (`link_imessage_entities.py`) is a separate, retroactive
+   backfill: it re-links any still-unlinked handles against the CRM's
+   phone→person mapping (`source_entities.observed_phone` /
+   `canonical_person_id`), catching partially-linked handles across nights.
+
+`link_imessage` runs after `imessage` (`depends_on: ["imessage"]` in
+`SYNC_SOURCES`) so its backfill operates on the night's freshly-created
+interactions rather than lagging a day behind. An earlier ordering (`link_imessage`
+before `imessage`) was intentional at the time it was introduced — `imessage`
+did not yet link unconditionally — but that root cause was fixed directly
+inside `sync_imessage_interactions.py` afterward, making the pre-linking step
+unnecessary and leaving the retroactive backfill running on stale CRM data
+each night.
+
 ### Slack Sync
 
 **Data Source:** Slack API via OAuth token
@@ -347,41 +407,48 @@ SLACK_TEAM_ID=T02XXXXXXXX      # Your workspace ID
 
 ### Daily Sync Order
 
-The unified sync runner (`run_all_syncs.py`) executes in this order:
+The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order:
 
 **Phase 1: Data Collection**
-1. `gmail` - Email sync (sent + received + CC)
-2. `calendar` - Calendar sync
+1. `gmail_personal` / `gmail_work` / `gmail_work2` - Email sync (sent + received + CC)
+2. `calendar_personal` / `calendar_work` / `calendar_work2` - Calendar sync
 3. `linkedin` - LinkedIn connections
-4. `contacts` - Apple Contacts (via Apple Data Agent export)
-5. `whatsapp` - WhatsApp contacts and messages
+4. `contacts` - Apple Contacts (macOS-only — `skipped` on Linux)
+5. `apple_import` - Import Apple ecosystem data + WhatsApp from the Mac Mini export (Linux only)
 6. `slack` - Slack users, DMs, and member channels
 
-**Note:** `phone` and `imessage` data is exported from the Mac Mini via the Apple Data Agent at 2:50 AM (before the main pipeline) and imported on the Linux server.
+**Note:** `phone` is defined as a source but is not in nightly `SYNC_ORDER` — it runs via the separate FDA cron on macOS (`scripts/run_sync_with_fda.sh`). Apple data (contacts, phone, iMessage, photos, WhatsApp) is exported from the Mac Mini via the Apple Data Agent at 2:50 AM (before the main pipeline) and imported on the Linux server by `apple_import`.
 
 **Phase 2: Entity Processing**
 7. `link_slack` - Link Slack entities by email
-8. `link_imessage` - Link iMessage handles by phone
-9. `link_source_entities` - Retroactive linking for all unlinked entities
-10. `photos` - Sync Photos face recognition to people
+8. `imessage` - Create interactions from iMessage DB (links its own unlinked messages internally)
+9. `link_imessage` - Retroactive: backfill phone-based links against the latest CRM data (see [iMessage Sync Ordering](#imessage-sync-ordering))
+10. `link_source_entities` - Retroactive linking for all unlinked entities
+11. `photos` - Sync Photos face recognition to people (macOS-only — `skipped` on Linux)
+
+**Phase 2b: Stale ID Cleanup**
+12. `repoint_stale_ids` - Re-point interactions with stale merged person IDs to canonical IDs
 
 **Phase 3: Relationship Building**
-11. `relationship_discovery` - Discover relationships, populate edge weights
-12. `strengths` - Recalculate relationship strengths
-13. `push_birthdays` - Push LifeOS birthdays to Apple Contacts
-(Note: person_stats refreshed inline by each data collection sync)
+13. `person_stats_full` - Full refresh of all PersonEntity counts and timestamps
+14. `relationship_discovery` - Discover relationships, populate edge weights
+15. `strengths` - Recalculate relationship strengths
+16. `push_birthdays` - Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux)
 
 **Phase 4: Vector Store Indexing**
-14. `vault_reindex` - Reindex vault to ChromaDB + BM25
-15. `crm_vectorstore` - Index CRM people for semantic search
+17. `vault_reindex` - Reindex vault to ChromaDB + BM25
+18. `crm_vectorstore` - Index CRM people for semantic search
 
 **Phase 5: Content Sync**
-16. `google_docs` - Sync Google Docs to vault
-17. `google_sheets` - Sync Google Sheets to vault
-18. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
+19. `google_docs` - Sync Google Docs to vault
+20. `google_sheets` - Sync Google Sheets to vault
+21. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
 
 **Phase 6: Post-Sync Cleanup**
-19. `entity_cleanup` - Auto-hide obvious non-human entities
+22. `entity_cleanup` - Auto-hide obvious non-human entities
+
+**Phase 7: Consistency Verification**
+23. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts) and auto-fix
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

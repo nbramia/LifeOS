@@ -7,7 +7,12 @@ phone numbers in the CRM source_entities table.
 """
 import sqlite3
 import logging
+import sys
 from pathlib import Path
+
+# Running `python scripts/foo.py` puts scripts/ on sys.path, not the project
+# root, so `import api` fails without this. Mirrors the sibling sync scripts.
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -93,16 +98,20 @@ def link_imessage_entities(dry_run: bool = True) -> dict:
         if not normalized:
             continue
 
-        # Check if already linked
+        # Skip only handles with NOTHING left to link. Testing for the
+        # presence of a linked message instead (the previous behaviour) meant a
+        # handle whose messages were partially linked — one linked row was
+        # enough — was skipped forever, so its remaining rows could never be
+        # backfilled (#497). The UPDATE below is already scoped to unlinked
+        # rows, so re-visiting a partially-linked handle is safe.
         cursor = conn.execute("""
-            SELECT person_entity_id FROM messages
+            SELECT 1 FROM messages
             WHERE handle_normalized = ?
-            AND person_entity_id IS NOT NULL
+            AND (person_entity_id IS NULL OR person_entity_id = '')
             LIMIT 1
         """, (handle,))
-        existing = cursor.fetchone()
 
-        if existing:
+        if cursor.fetchone() is None:
             stats['already_linked'] += 1
             continue
 
@@ -137,12 +146,22 @@ def link_imessage_entities(dry_run: bool = True) -> dict:
 
     conn.close()
 
-    logger.info(f"\n=== iMessage Entity Linking Summary ===")
+    logger.info("\n=== iMessage Entity Linking Summary ===")
     logger.info(f"Handles checked: {stats['handles_checked']}")
     logger.info(f"Already linked: {stats['already_linked']}")
     logger.info(f"Newly linked: {stats['newly_linked']}")
     logger.info(f"No match found: {stats['no_match']}")
     logger.info(f"Messages updated: {stats['messages_updated']}")
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output. "Newly
+    # linked" / "Messages updated" match none of the fallback regexes, so a
+    # night that linked thousands of rows still reported 0/0/0 (#497).
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(stats.get("handles_checked", 0) or 0),
+        "people_updated": int(stats.get("newly_linked", 0) or 0),
+        "updated": int(stats.get("messages_updated", 0) or 0),
+    })
 
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")

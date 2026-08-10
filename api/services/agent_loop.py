@@ -60,6 +60,32 @@ def _looks_like_giving_up(text: str) -> bool:
     return bool(_GIVE_UP_PATTERNS.search(text))
 
 
+# Phantom-write guard: a reply that opens with "Logged …" / "Updated …" claims a
+# state change. If the turn made ZERO tool calls, nothing was written — the model
+# pattern-matched earlier confirmation lines in the conversation history instead
+# of calling the tool (observed with the fitness bot on a weak model: "Logged …"
+# replies with tool_rounds=0 silently lost sets). Scope: only the zero-tool-call
+# turn is caught; a turn that makes a READ call and then claims a write still
+# passes — that variant hasn't been observed and distinguishing reads from
+# writes here isn't worth the tool-registry coupling yet.
+_WRITE_CLAIM_PATTERN = re.compile(r"(?i)^\s*(logged|updated|recorded|saved)\b")
+
+PHANTOM_WRITE_NUDGE = (
+    "Stop — you replied as if something was recorded, but you made NO tool call "
+    "this turn, so nothing was saved. If the user's CURRENT message contains new "
+    "data to record (a workout, a metric, a task…), call the appropriate tool NOW "
+    "to actually record it, then confirm. If it was already recorded in a "
+    "PREVIOUS turn, do NOT record it again — just answer the question. If "
+    "nothing needed recording, rephrase your answer without claiming anything "
+    "was logged or updated."
+)
+
+
+def _claims_write_without_tools(text: str) -> bool:
+    """Reply asserts a write ('Logged …') — only meaningful when no tools ran."""
+    return bool(_WRITE_CLAIM_PATTERN.match(text))
+
+
 # Cross-turn escalation (#303). A weak orchestrator sometimes declares something
 # impossible / unavailable / "not released" from stale training and won't budge.
 # When the PRIOR assistant turn refused like that AND the user's NEW message pushes
@@ -166,7 +192,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
     (comma-separated model ids / engine names), else derives a default from
     ``escalation_model``: [escalation_model, claude_code] — so the engine
     handoff lands on the 2nd pushback (1st → stronger model, 2nd → Claude Code).
-    Set the env var to e.g. 'claude-sonnet-4-6,claude-opus-4-8,claude_code' to
+    Set the env var to e.g. 'claude-sonnet-5,claude-opus-4-8,claude_code' to
     insert an opus rung in between. Empty when escalation isn't configured.
     Deduped, order preserved."""
     raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
@@ -189,7 +215,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
 # account is pinned to a different opus release.
 _MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-5",
     "opus": "claude-opus-4-8",
 }
 # A directive verb immediately followed by a tier word: "escalate to opus",
@@ -475,6 +501,7 @@ async def run_agent_loop(
     messages.append({"role": "user", "content": user_content})
 
     result = AgentResult(full_text="", model="local")
+    phantom_write_nudged = False  # phantom-write self-correction fires at most once per turn
 
     def _track_usage(usage: LLMUsage):
         result.total_input_tokens += usage.input_tokens
@@ -577,6 +604,19 @@ async def run_agent_loop(
                 result.full_text = ""
                 messages.append({"role": "assistant", "content": assistant_content})
                 messages.append({"role": "user", "content": SELF_CORRECTION_NUDGE})
+                continue
+            if (
+                not phantom_write_nudged
+                and not result.tool_calls_log
+                and text_this_round.strip()
+                and _claims_write_without_tools(text_this_round)
+            ):
+                phantom_write_nudged = True
+                print("[agent] Self-correction triggered: reply claims a write but no tool was called")
+                yield {"type": "self_correction"}
+                result.full_text = ""
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": PHANTOM_WRITE_NUDGE})
                 continue
             break
 

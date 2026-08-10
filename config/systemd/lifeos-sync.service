@@ -10,5 +10,13 @@ EnvironmentFile=__LIFEOS_DIR__/.env
 Environment=LIFEOS_HEADLESS=true
 ExecStart=__LIFEOS_DIR__/scripts/run_sync_wrapper.sh --execute --trigger scheduled
 TimeoutStartSec=21600
+# Contain the sync to its own cgroup so a runaway embedding/reindex phase can
+# never exhaust host RAM and OOM-freeze the desktop (see 2026-07-10 incident).
+# Percentages scale to any machine's physical RAM. MemoryHigh throttles via
+# reclaim; MemoryMax hard-kills the sync *within its cgroup* (nothing else dies);
+# MemorySwapMax bounds swap so the sync can't drive a swap-thrash freeze.
+MemoryHigh=60%
+MemoryMax=75%
+MemorySwapMax=2G
 StandardOutput=append:__LIFEOS_DIR__/logs/sync.log
 StandardError=append:__LIFEOS_DIR__/logs/sync.log

@@ -572,7 +572,10 @@ class AnthropicLLMClient:
         tool_calls = None
         for block in resp.content:
             if block.type == "text":
-                text = block.text
+                # Accumulate: a response may carry multiple text blocks (e.g. a
+                # native web-search answer split at citation boundaries). Keeping
+                # only the last would truncate the answer to its final fragment.
+                text += block.text
             elif block.type == "tool_use":
                 if tool_calls is None:
                     tool_calls = []
@@ -640,13 +643,16 @@ def get_anthropic_llm() -> AnthropicLLMClient:
     where frontier model quality provides clear value. These always use the Claude
     API regardless of the LIFEOS_LLM_BACKEND setting.
 
-    Pinned to Sonnet for quality — the orchestrator model (LIFEOS_ANTHROPIC_MODEL)
-    is independent of this.
+    Sonnet-tier for quality — resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL
+    (default claude-sonnet-5), independent of the orchestrator model
+    (LIFEOS_ANTHROPIC_MODEL). Was previously hardcoded to the dated snapshot
+    claude-sonnet-4-20250514, which retired and 404'd every caller (#470).
     """
     global _anthropic_client
     if _anthropic_client is None:
-        _anthropic_client = AnthropicLLMClient(model="claude-sonnet-4-20250514")
-        logger.info("Created Anthropic client for specialist calls (claude-sonnet-4-20250514)")
+        model = settings.anthropic_specialist_model
+        _anthropic_client = AnthropicLLMClient(model=model)
+        logger.info("Created Anthropic client for specialist calls (%s)", model)
     return _anthropic_client
 
 

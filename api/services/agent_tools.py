@@ -445,6 +445,8 @@ TOOL_DEFINITIONS = [
             "'investments' (Nathan's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
             "buckets, per-position holdings with cost basis, savings by year, wealth trend, taxable "
             "unrealized gains; aggregated nightly by the investments pipeline). "
+            "'movers' (which held positions moved most today — live day-change % for the snapshot's "
+            "tickers, past an optional 'threshold' percent, default 5). "
             "For historical monthly summaries, use search_vault with 'finance' or 'spending'."
         ),
         "input_schema": {
@@ -452,7 +454,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["accounts", "transactions", "cashflow", "budgets", "investments"],
+                    "enum": ["accounts", "transactions", "cashflow", "budgets", "investments", "movers"],
                     "description": "What financial data to retrieve.",
                 },
                 "start_date": {
@@ -470,6 +472,10 @@ TOOL_DEFINITIONS = [
                 "search": {
                     "type": "string",
                     "description": "Search transactions by merchant name.",
+                },
+                "threshold": {
+                    "type": "number",
+                    "description": "For action 'movers': only positions whose absolute day change exceeds this percent (default 5).",
                 },
             },
             "required": ["action"],
@@ -658,7 +664,11 @@ TOOL_DEFINITIONS = [
             "- 'log': record a session. Pass `sets` (one entry per distinct "
             "exercise/load); use `count` for repeated identical sets ('3x5 @185' = "
             "count 3, reps 5, weight 185; 'bench 135x8' = count 1, reps 8, weight "
-            "135). Omit `date` to log today; pass YYYY-MM-DD for an explicit day. "
+            "135). For timed/cardio work put the count (steps, meters, strokes) in "
+            "`reps` and the elapsed time in `duration_seconds` ('500 stairs in "
+            "7:01' = reps 500, duration_seconds 421; 'ran 4mi 32:10' = "
+            "duration_seconds 1930 with the distance in `notes`). Omit `date` to "
+            "log today; pass YYYY-MM-DD for an explicit day. "
             "After logging, tell the user what was recorded in normalized form.\n"
             "- 'update': correct a session. Defaults to the most recent session; "
             "to fix an OLDER one (e.g. the user threaded-replied to an earlier "
@@ -693,17 +703,18 @@ TOOL_DEFINITIONS = [
                 },
                 "sets": {
                     "type": "array",
-                    "description": "Exercises (for log/update). Each: {exercise, reps, weight, weight_unit, count, rpe, notes}. `count` = number of identical sets (default 1).",
+                    "description": "Exercises (for log/update). Each: {exercise, reps, weight, unit, count, rpe, duration_seconds, notes}. `count` = number of identical sets (default 1).",
                     "items": {
                         "type": "object",
                         "properties": {
                             "exercise": {"type": "string", "description": "Exercise name (normalized server-side)."},
-                            "reps": {"type": "integer", "description": "Reps per set."},
+                            "reps": {"type": "integer", "description": "Reps per set — also the count for timed work (steps climbed, meters rowed)."},
                             "weight": {"type": "number", "description": "Load."},
-                            "weight_unit": {"type": "string", "description": "'lb' or 'kg' (default lb)."},
+                            "unit": {"type": "string", "description": "'lb'/'kg' for weighted sets (defaults to lb when weight is set); for counted work, what reps counts ('steps', 'm'). Omit otherwise."},
                             "count": {"type": "integer", "description": "Number of identical sets (default 1)."},
                             "rpe": {"type": "number", "description": "Rate of perceived exertion (optional)."},
-                            "notes": {"type": "string", "description": "Per-exercise note, e.g. cardio distance/time."},
+                            "duration_seconds": {"type": "integer", "description": "Elapsed time in seconds for timed work (stairs, runs, planks, hangs) — '7:01' = 421."},
+                            "notes": {"type": "string", "description": "Per-exercise note, e.g. cardio distance ('4 mi')."},
                         },
                     },
                 },
@@ -1461,23 +1472,31 @@ def _fmt_num(n) -> str:
     return str(n)
 
 
+def _fmt_duration(seconds) -> str:
+    from api.services.fitness_store import format_duration
+    return format_duration(seconds)
+
+
 def _summarize_session(session) -> str:
     """Compact one-line summary, grouping consecutive identical sets."""
     groups: list[list] = []
     for s in session.sets:
-        key = (s.exercise, s.reps, s.weight, s.weight_unit)
+        key = (s.exercise, s.reps, s.weight, s.unit, s.duration_seconds)
         if groups and groups[-1][0] == key:
             groups[-1][1] += 1
         else:
             groups.append([key, 1])
     parts = []
-    for (exercise, reps, weight, unit), count in groups:
+    for (exercise, reps, weight, unit, duration), count in groups:
+        dur = f" in {_fmt_duration(duration)}" if duration else ""
         if reps is None and weight is None:
-            parts.append(exercise)
+            parts.append(f"{exercise}{dur}")
             continue
         rep_part = f"{count}×{reps}" if count > 1 else f"{_fmt_num(reps)}"
-        w = f" @{_fmt_num(weight)} {unit}" if weight else ""
-        parts.append(f"{exercise} {rep_part}{w}".strip())
+        if unit and weight is None:
+            rep_part += f" {unit}"   # counted work: "500 steps"
+        w = f" @{_fmt_num(weight)} {unit or 'lb'}" if weight else ""
+        parts.append(f"{exercise} {rep_part}{w}{dur}".strip())
     body = "; ".join(parts) if parts else "(no sets)"
     return f"{session.date}: {body}"
 
@@ -1545,10 +1564,11 @@ def _workout_history(inp: dict) -> str:
         return f"No history for {canonical}."
     lines = [f"{canonical} — recent sets:"]
     for r in rows:
-        w = f" @{_fmt_num(r['weight'])} {r['weight_unit']}" if r["weight"] else ""
+        w = f" @{_fmt_num(r['weight'])} {r['unit']}" if r["weight"] else ""
         rpe = f" RPE {_fmt_num(r['rpe'])}" if r["rpe"] else ""
+        dur = f" in {_fmt_duration(r.get('duration_seconds'))}" if r.get("duration_seconds") else ""
         sid = f" [{r['session_id']}]" if r.get("session_id") else ""
-        lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}{sid}")
+        lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}{dur}{sid}")
     return "\n".join(lines)
 
 
@@ -1781,10 +1801,17 @@ async def _tool_search_finances(inp: dict) -> str:
         for a in sorted(inv["accounts"], key=lambda x: -x["value"]):
             tag = " (external)" if a["external"] else ""
             lines.append(f"- {a['name']} [{a['key']}]{tag}: ${a['value']:,.0f}")
-        lines += ["", "Top positions:"]
-        for pos in inv["positions"][:15]:
+        lines += ["", f"Positions ({len(inv['positions'])}):"]
+        for pos in inv["positions"]:
             unrl = f", unrealized ${pos['unrealized']:+,.0f}" if pos.get("unrealized") is not None else ""
-            lines.append(f"- {pos['symbol']}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
+            # Include the security name alongside the ticker: the model's
+            # world knowledge can be stale (a recently-IPO'd company reads as
+            # "private, can't be in a portfolio"), so a bare ticker it doesn't
+            # recognize gets overridden by that prior. The desc makes
+            # "do I own <company>?" a literal text match.
+            desc = (pos.get("desc") or "").strip()
+            label = f"{pos['symbol']} — {desc}" if desc else pos["symbol"]
+            lines.append(f"- {label}: ${pos['value']:,.0f} ({pos['weight_pct']}%{unrl})")
         tu = inv["taxable_unrealized"]
         lines += [
             "",
@@ -1793,6 +1820,23 @@ async def _tool_search_finances(inp: dict) -> str:
             "Full detail: GET /api/investments/portfolio (positions incl. lots/flows, wealth history).",
         ]
         return "\n".join(lines)
+
+    if action == "movers":
+        # On-demand "which of my positions moved most today?" — reuses the noon
+        # big-mover check (live day-change via yfinance for the snapshot's tickers).
+        from api.routes.investments import MOVER_THRESHOLD_PCT, _held_tickers, investments_movers
+        threshold = inp.get("threshold")
+        if not isinstance(threshold, (int, float)) or threshold <= 0:
+            threshold = MOVER_THRESHOLD_PCT
+        if not _held_tickers():
+            # Distinguish "couldn't check" from a genuinely quiet day — on an
+            # on-demand ask, an empty count from a missing snapshot shouldn't read
+            # as "the market was flat."
+            return "Couldn't check movers right now — the investments snapshot isn't available."
+        result = await investments_movers(threshold=threshold)
+        if result.get("count"):
+            return result["scheduler_message"]
+        return f"No held position moved more than {threshold:g}% today."
 
     client = get_monarch_client()
 
@@ -1926,6 +1970,7 @@ TOOL_STATUS_MESSAGES = {
     "search_finances.transactions": "Searching transactions...",
     "search_finances.cashflow": "Loading cashflow summary...",
     "search_finances.budgets": "Checking budgets...",
+    "search_finances.movers": "Checking today's movers...",
     "create_email_draft": "Drafting email...",
     "send_email_draft": "Sending email...",
     "create_calendar_event": "Creating calendar event...",

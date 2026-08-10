@@ -526,6 +526,17 @@ def main():
     }
     print(f"CONSISTENCY_SUMMARY:{json.dumps(summary)}")
 
+    # Canonical line consumed by run_all_syncs._parse_sync_output. The
+    # CONSISTENCY_SUMMARY keys above have no columns in record_sync_complete,
+    # so they never reached sync_health and this phase always recorded 0/0/0
+    # (#496). Repairs are genuine record updates; issues found are what was
+    # examined, so they map onto `updated` and `processed` respectively.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": int(result.get("total_issues", 0) or 0),
+        "updated": int(result.get("total_fixed", 0) or 0),
+    })
+
     return 0
 
 

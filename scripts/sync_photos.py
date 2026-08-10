@@ -31,6 +31,18 @@ def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
             f"Photos library not available at {settings.photos_library_path}. "
             "Ensure the external drive is mounted."
         )
+        # Declare the skip so the parent records SKIPPED rather than a green
+        # "success" with zero records. Reading Photos.sqlite requires a macOS
+        # .photoslibrary bundle, so on Linux this is always the path taken —
+        # and it silently inflated the nightly healthy count for months (#495).
+        # Face data still reaches the vault via the Apple Data Agent, imported
+        # under `apple_import`, so nothing is actually lost here.
+        print(
+            "SYNC_SKIPPED: Photos library unavailable "
+            f"({settings.photos_library_path or 'LIFEOS_PHOTOS_PATH unset'}) "
+            "— macOS-only source; face data arrives via apple_import",
+            flush=True,
+        )
         return {
             "status": "skipped",
             "reason": "photos_not_available",
@@ -47,7 +59,7 @@ def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
             from api.services.apple_photos import get_apple_photos_reader
             reader = get_apple_photos_reader()
             stats = reader.get_stats()
-            logger.info(f"Photos library stats:")
+            logger.info("Photos library stats:")
             logger.info(f"  Named people: {stats['total_named_people']}")
             logger.info(f"  With contacts: {stats['people_with_contacts']}")
             logger.info(f"  Face detections: {stats['total_face_detections']}")
@@ -64,7 +76,7 @@ def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
         results = sync_apple_photos(since=since)
 
         # Log in format that run_all_syncs.py can parse
-        logger.info(f"\n=== Photos Sync Results ===")
+        logger.info("\n=== Photos Sync Results ===")
         logger.info(f"Photos people total: {results.get('photos_people_total', 0)}")
         logger.info(f"Photos people with contacts: {results.get('photos_people_with_contacts', 0)}")
         logger.info(f"Person matches: {results.get('person_matches', 0)}")

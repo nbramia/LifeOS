@@ -456,6 +456,44 @@ def test_investments_format_digest():
 
 
 @pytest.mark.unit
+def test_investments_format_lists_all_positions():
+    """The MCP digest must include a beyond-top-15 holding (regression for #452,
+    where SPCX at rank 44 was silently dropped by a [:15] cap). Mirrors the
+    search_finances 'investments' digest, so header/format stay consistent."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+    positions = [
+        {"symbol": f"FIL{i:02d}", "value": 100000 - i * 1000, "weight_pct": 5,
+         "unrealized": 1000}
+        for i in range(19)
+    ]
+    positions.append({"symbol": "SPCX", "desc": "SpaceX Class A (SPV)",
+                      "value": 3050, "weight_pct": 0.37})
+    data = {
+        "synced_at": "2026-07-09T03:26:00", "as_of": "2026-07-09",
+        "totals": {"all_investments": 1234567, "schwab": 1000000,
+                   "external_retirement": 234567,
+                   "tax_buckets": {"pretax": 500000, "roth": 300000, "taxable": 434567}},
+        "accounts": [{"key": "brokerage", "name": "Synthetic Brokerage",
+                      "value": 1000000, "external": False}],
+        "positions": positions,
+        "taxable_unrealized": {"long_term": 80000, "short_term": 5000,
+                               "harvestable_losses": -2000},
+    }
+    out = server._format_response("lifeos_investments", data)
+    assert "SPCX" in out                 # beyond-top-15 holding is present
+    assert "Positions (20):" in out      # header reflects the full count
+    assert "Top positions:" not in out   # old truncating header is gone
+    # Ticker + security name, so company-name questions are a text match
+    # (stale world knowledge otherwise overrides an unrecognized ticker).
+    assert "SPCX — SpaceX Class A (SPV)" in out
+    assert "FIL01:" in out               # desc-less positions keep bare ticker
+
+
+@pytest.mark.unit
 def test_investments_not_synced_is_graceful():
     """A missing snapshot yields a friendly message, not an 'Error:' string."""
     import importlib.util

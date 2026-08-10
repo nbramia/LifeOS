@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 660" width="1280" height="660" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+<defs>
+<linearGradient id="panelBg" x1="0" y1="0" x2="0" y2="1">
+  <stop offset="0" stop-color="#0d1226"/><stop offset="0.55" stop-color="#0a0e20"/><stop offset="1" stop-color="#080b18"/></linearGradient>
+<linearGradient id="panelStroke" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#38bdf8" stop-opacity="0.55"/><stop offset="0.5" stop-color="#a78bfa" stop-opacity="0.35"/><stop offset="1" stop-color="#fb7185" stop-opacity="0.45"/></linearGradient>
+<radialGradient id="vignette" cx="0.5" cy="0.42" r="0.75">
+  <stop offset="0" stop-color="#141b3a" stop-opacity="0.55"/><stop offset="0.6" stop-color="#0b1024" stop-opacity="0"/><stop offset="1" stop-color="#05070f" stop-opacity="0.5"/></radialGradient>
+<radialGradient id="brainGlow" cx="0.5" cy="0.5" r="0.5">
+  <stop offset="0" stop-color="#fbbf24" stop-opacity="0.26"/><stop offset="0.4" stop-color="#a855f7" stop-opacity="0.12"/><stop offset="1" stop-color="#a855f7" stop-opacity="0"/></radialGradient>
+<radialGradient id="coreDisc" cx="0.42" cy="0.35" r="0.85">
+  <stop offset="0" stop-color="#fde68a"/><stop offset="0.35" stop-color="#fbbf24"/><stop offset="0.7" stop-color="#b45309"/><stop offset="1" stop-color="#7c2d12"/></radialGradient>
+<radialGradient id="dot-src" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#22d3ee"/><stop offset="0.55" stop-color="#22d3ee" stop-opacity="0.85"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-src" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#22d3ee" stop-opacity="0.11"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-core" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#34d399"/><stop offset="0.55" stop-color="#34d399" stop-opacity="0.85"/><stop offset="1" stop-color="#34d399" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-core" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#34d399" stop-opacity="0.11"/><stop offset="1" stop-color="#34d399" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-brain" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.55" stop-color="#fbbf24" stop-opacity="0.85"/><stop offset="1" stop-color="#fbbf24" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-brain" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fbbf24" stop-opacity="0.11"/><stop offset="1" stop-color="#fbbf24" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-surf" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#a78bfa"/><stop offset="0.55" stop-color="#a78bfa" stop-opacity="0.85"/><stop offset="1" stop-color="#a78bfa" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-surf" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#a78bfa" stop-opacity="0.11"/><stop offset="1" stop-color="#a78bfa" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-auto" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fb7185"/><stop offset="0.55" stop-color="#fb7185" stop-opacity="0.85"/><stop offset="1" stop-color="#fb7185" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-auto" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fb7185" stop-opacity="0.11"/><stop offset="1" stop-color="#fb7185" stop-opacity="0"/></radialGradient>
+<radialGradient id="dot-web" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#38bdf8"/><stop offset="0.55" stop-color="#38bdf8" stop-opacity="0.85"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+<radialGradient id="zone-web" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#38bdf8" stop-opacity="0.11"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+</defs>
+<rect x="1.5" y="1.5" width="1277" height="657" rx="22" fill="url(#panelBg)" stroke="url(#panelStroke)" stroke-width="1.5"/><rect x="1.5" y="1.5" width="1277" height="657" rx="22" fill="url(#vignette)"/><circle cx="640.0" cy="330.0" r="460" fill="url(#brainGlow)"/>
+<defs><marker id="aFb" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#fbbf24"/></marker></defs>
+<rect x="40" y="75" width="1200" height="150" rx="18" fill="#f87171" fill-opacity="0.055" stroke="#f87171" stroke-opacity="0.28" stroke-width="1.3"/>
+<rect x="40" y="75" width="7" height="150" rx="3.5" fill="#f87171" fill-opacity="0.85"/>
+<text x="74" y="134" font-size="21" font-weight="800" fill="#f87171">Critical</text>
+<text x="74" y="156" font-size="12.5" fill="#8b96b5">local · no fallback</text>
+<rect x="74" y="168" width="209" height="24" rx="12" fill="#f87171" fill-opacity="0.12" stroke="#f87171" stroke-opacity="0.5" stroke-width="1"/>
+<circle cx="88" cy="180" r="4" fill="#f87171"/>
+<text x="98" y="184" font-size="11" font-weight="600" fill="#f87171" fill-opacity="0.95">CRITICAL · alerts immediately</text>
+<text x="1216" y="101" text-anchor="end" font-size="12.5" font-style="italic" fill="#8b96b5">if any fail → LifeOS is offline</text>
+<rect x="40" y="265" width="1200" height="150" rx="18" fill="#fbbf24" fill-opacity="0.055" stroke="#fbbf24" stroke-opacity="0.28" stroke-width="1.3"/>
+<rect x="40" y="265" width="7" height="150" rx="3.5" fill="#fbbf24" fill-opacity="0.85"/>
+<text x="74" y="324" font-size="21" font-weight="800" fill="#fbbf24">Graceful</text>
+<text x="74" y="346" font-size="12.5" fill="#8b96b5">degrades to a fallback</text>
+<rect x="74" y="358" width="184" height="24" rx="12" fill="#fbbf24" fill-opacity="0.12" stroke="#fbbf24" stroke-opacity="0.5" stroke-width="1"/>
+<circle cx="88" cy="370" r="4" fill="#fbbf24"/>
+<text x="98" y="374" font-size="11" font-weight="600" fill="#fbbf24" fill-opacity="0.95">WARNING · batched nightly</text>
+<text x="1216" y="291" text-anchor="end" font-size="12.5" font-style="italic" fill="#8b96b5">if it fails → auto-fallback, no outage</text>
+<rect x="40" y="455" width="1200" height="150" rx="18" fill="#34d399" fill-opacity="0.055" stroke="#34d399" stroke-opacity="0.28" stroke-width="1.3"/>
+<rect x="40" y="455" width="7" height="150" rx="3.5" fill="#34d399" fill-opacity="0.85"/>
+<text x="74" y="514" font-size="21" font-weight="800" fill="#34d399">External</text>
+<text x="74" y="536" font-size="12.5" fill="#8b96b5">third-party APIs</text>
+<rect x="74" y="548" width="114" height="24" rx="12" fill="#34d399" fill-opacity="0.12" stroke="#34d399" stroke-opacity="0.5" stroke-width="1"/>
+<circle cx="88" cy="560" r="4" fill="#34d399"/>
+<text x="98" y="564" font-size="11" font-weight="600" fill="#34d399" fill-opacity="0.95">WARNING / INFO</text>
+<text x="1216" y="481" text-anchor="end" font-size="12.5" font-style="italic" fill="#8b96b5">if it fails → that feature pauses</text>
+<rect x="380.0" y="128.0" width="114.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#f87171" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="399.0" cy="150.0" r="5.5" fill="#f87171" fill-opacity="0.95"/><text x="414.0" y="155.0" font-size="14.5" font-weight="600" fill="#e8ecf8">ChromaDB</text>
+<rect x="520.0" y="128.0" width="170.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#f87171" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="539.0" cy="150.0" r="5.5" fill="#f87171" fill-opacity="0.95"/><text x="554.0" y="155.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Embedding model</text>
+<rect x="716.0" y="128.0" width="178.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#f87171" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="735.0" cy="150.0" r="5.5" fill="#f87171" fill-opacity="0.95"/><text x="750.0" y="155.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Vault filesystem</text>
+<rect x="380.0" y="318.0" width="186.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#fbbf24" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="399.0" cy="340.0" r="5.5" fill="#fbbf24" fill-opacity="0.95"/><text x="414.0" y="345.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Intent classifier</text>
+<path d="M 574 340 L 628 340" fill="none" stroke="#fbbf24" stroke-opacity="0.6" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#aFb)"/>
+<text x="601" y="322" text-anchor="middle" font-size="9.5" fill="#8b96b5">falls back to</text>
+<rect x="636.0" y="318.0" width="162.0" height="44" rx="12" fill="#0b1022" fill-opacity="0.92" stroke="#fbbf24" stroke-opacity="0.34" stroke-width="1.3"/><circle cx="655.0" cy="340.0" r="5.5" fill="#fbbf24" fill-opacity="0.7"/><text x="670.0" y="345.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Regex patterns</text>
+<rect x="862.0" y="318.0" width="146.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#fbbf24" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="881.0" cy="340.0" r="5.5" fill="#fbbf24" fill-opacity="0.95"/><text x="896.0" y="345.0" font-size="14.5" font-weight="600" fill="#e8ecf8">BM25 keyword</text>
+<path d="M 1016 340 L 1070 340" fill="none" stroke="#fbbf24" stroke-opacity="0.6" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#aFb)"/>
+<text x="1043" y="322" text-anchor="middle" font-size="9.5" fill="#8b96b5">falls back to</text>
+<rect x="1078.0" y="318.0" width="138.0" height="44" rx="12" fill="#0b1022" fill-opacity="0.92" stroke="#fbbf24" stroke-opacity="0.34" stroke-width="1.3"/><circle cx="1097.0" cy="340.0" r="5.5" fill="#fbbf24" fill-opacity="0.7"/><text x="1112.0" y="345.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Vector-only</text>
+<rect x="380.0" y="508.0" width="138.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="399.0" cy="530.0" r="5.5" fill="#34d399" fill-opacity="0.95"/><text x="414.0" y="535.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Google APIs</text>
+<rect x="538.0" y="508.0" width="90.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="557.0" cy="530.0" r="5.5" fill="#34d399" fill-opacity="0.95"/><text x="572.0" y="535.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Slack</text>
+<rect x="648.0" y="508.0" width="106.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="667.0" cy="530.0" r="5.5" fill="#34d399" fill-opacity="0.95"/><text x="682.0" y="535.0" font-size="14.5" font-weight="600" fill="#e8ecf8">Monarch</text>
+<rect x="774.0" y="508.0" width="138.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="793.0" cy="530.0" r="5.5" fill="#34d399" fill-opacity="0.95"/><text x="808.0" y="535.0" font-size="14.5" font-weight="600" fill="#e8ecf8">LLM backend</text>
+<rect x="932.0" y="508.0" width="202.0" height="44" rx="12" fill="#0f1732" fill-opacity="0.92" stroke="#34d399" stroke-opacity="0.6" stroke-width="1.3"/><circle cx="951.0" cy="530.0" r="5.5" fill="#34d399" fill-opacity="0.95"/><text x="966.0" y="535.0" font-size="14.5" font-weight="600" fill="#e8ecf8">whisper-relay :9788</text>
+</svg>

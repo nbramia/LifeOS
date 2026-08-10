@@ -39,9 +39,18 @@ def sync_google_docs(dry_run: bool = True) -> dict:
 
     try:
         results = sync_gdocs()
-        logger.info(f"\n=== Google Docs Sync Results ===")
+        logger.info("\n=== Google Docs Sync Results ===")
         logger.info(f"  Docs synced: {results.get('synced', 0)}")
         logger.info(f"  Docs failed: {results.get('failed', 0)}")
+
+        # Canonical line consumed by run_all_syncs._parse_sync_output. "Docs
+        # synced" matches none of the fallback regexes, so this phase reported
+        # 0/0/0 nightly despite doing real work (#496).
+        from api.services.sync_health import emit_sync_stats
+        emit_sync_stats({
+            "processed": int(results.get("synced", 0) or 0),
+            "errors": int(results.get("failed", 0) or 0),
+        })
         return results
     except Exception as e:
         logger.error(f"Google Docs sync failed: {e}")

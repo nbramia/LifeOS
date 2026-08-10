@@ -48,7 +48,7 @@ OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 # local Gemma backend. None means "no override, use settings.agent_managed_model".
 MODEL_LOCAL = "local"
 MODEL_HAIKU = "claude-haiku-4-5"
-MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_SONNET = "claude-sonnet-5"
 ALLOWED_MODELS = (MODEL_LOCAL, MODEL_HAIKU, MODEL_SONNET)
 
 
@@ -307,7 +307,7 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
       `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
       `#codex`        → routing=codex  (Codex CLI, subscription-billed)
       `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5
-      `#cloud-sonnet` → routing=claude, model=claude-sonnet-4-6
+      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5
       `#cloud`        → routing=claude, model=(whatever preflight picked, else Sonnet)
 
     Returns a new PreflightResult so the caller can chain. Tag list is

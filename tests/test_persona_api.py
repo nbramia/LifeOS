@@ -8,6 +8,7 @@ on POST /api/ask/stream, and persona-scoped conversation storage/listing.
 import json
 import os
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -480,10 +481,35 @@ class TestPersonasEndpoint:
 
 class TestChatConfigEndpoint:
     def test_default_voice_reflects_setting(self, client, monkeypatch):
+        monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", False, raising=False)
-        assert client.get("/api/chat/config").json() == {"default_voice": False}
+        assert client.get("/api/chat/config").json() == {
+            "default_voice": False, "secure_url": ""}
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
-        assert client.get("/api/chat/config").json() == {"default_voice": True}
+        assert client.get("/api/chat/config").json() == {
+            "default_voice": True, "secure_url": ""}
+
+    # secure_url is the web client's one-tap escape from an insecure context to
+    # the HTTPS origin the mic needs (#516).
+    def test_secure_url_reflects_tailnet_setting(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "api.routes.chat.settings.tailnet_https_url",
+            "https://your-machine.your-tailnet.ts.net", raising=False)
+        assert (client.get("/api/chat/config").json()["secure_url"]
+                == "https://your-machine.your-tailnet.ts.net")
+
+    def test_secure_url_strips_trailing_slash(self, client, monkeypatch):
+        """Clients concatenate a path onto it, so it must not end in '/'."""
+        monkeypatch.setattr(
+            "api.routes.chat.settings.tailnet_https_url",
+            "https://your-machine.your-tailnet.ts.net/", raising=False)
+        assert (client.get("/api/chat/config").json()["secure_url"]
+                == "https://your-machine.your-tailnet.ts.net")
+
+    def test_secure_url_empty_when_unset(self, client, monkeypatch):
+        """A fresh clone with no Tailscale must degrade to no link, not break."""
+        monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
+        assert client.get("/api/chat/config").json()["secure_url"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -639,3 +665,51 @@ class TestConversationsListPersonaParam:
             resp = client.get("/api/conversations?persona_id=fitness")
         assert resp.status_code == 200
         assert mock_store.list_conversations.call_args.kwargs.get("persona_id") == "fitness"
+
+
+# ---------------------------------------------------------------------------
+# Finance persona (#458, renamed from "advisor") — validate the shipped config directly (the
+# live registry depends on the token being set, which a fresh clone won't have).
+# ---------------------------------------------------------------------------
+
+_FINANCE_FILE = Path(__file__).parent.parent / "config" / "personas" / "finance.md"
+_BOTS_FILE = Path(__file__).parent.parent / "config" / "telegram_bots.json"
+
+
+@pytest.mark.unit
+def test_finance_persona_parses_to_body_and_voice():
+    from config.settings import _parse_persona
+    body, voice, model = _parse_persona(_FINANCE_FILE.read_text(), "finance")
+    assert body.strip(), "finance persona has a non-empty preamble"
+    assert "id: finance" not in body, "frontmatter must be stripped from the preamble"
+    assert isinstance(voice, tuple) and voice, "voice rules parsed for spoken turns"
+
+
+@pytest.mark.unit
+def test_finance_persona_grounded_in_investments():
+    body = _FINANCE_FILE.read_text().lower()
+    assert "investments" in body and "portfolio" in body
+    assert "tax" in body           # tax buckets / harvesting
+    assert "monarch" in body       # the secondary source
+
+
+@pytest.mark.unit
+def test_finance_persona_no_leaked_financial_values():
+    """Open-source guard: the committed persona must not hardcode real balances,
+    account numbers, or the private dashboard URL — live numbers come from tools."""
+    import re
+    text = _FINANCE_FILE.read_text()
+    assert not re.search(r"\$\s?\d[\d,]{2,}", text), "no hardcoded dollar amounts"
+    assert "quickstage" not in text.lower(), "no private dashboard URL"
+    assert not re.search(r"\b\d{4}\b", text), "no account-number-like 4-digit fragments"
+
+
+@pytest.mark.unit
+def test_finance_registered_in_bot_registry():
+    entries = json.loads(_BOTS_FILE.read_text())
+    finance = next((e for e in entries if e.get("name") == "finance"), None)
+    assert finance is not None, "finance registered in telegram_bots.json"
+    assert finance["token_env"] == "TELEGRAM_FINANCE_BOT_TOKEN"
+    assert finance["persona_file"] == "config/personas/finance.md"
+    assert finance["label"] == "Finance", "finance displays as 'Finance' in the chat UI"
+    assert not finance.get("orchestrates"), "finance is pure-chat, not an orchestrator"

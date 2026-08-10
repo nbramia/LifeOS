@@ -38,7 +38,7 @@ Whether chat traffic leaves the machine depends on `LIFEOS_LLM_BACKEND`. The def
 |------|-------------|---------|-----------|
 | Query text (≤64 tokens of classification output) | Anthropic API (default) — Claude Haiku | Intent classification (`code` vs. ambiguous vs. agentic) | Per user query, unless `LIFEOS_LLM_BACKEND=local` |
 | Query text + retrieved tool results | Anthropic API (default) or local llama-server | Agentic orchestration & synthesis | Per user query and per tool round |
-| Email/note snippets for specialist tasks (web-search synthesis, fact extraction, relationship insights) | Anthropic API — pinned to `claude-sonnet-4-20250514` via `get_anthropic_llm()` | Quality-sensitive sub-calls | Per tool invocation, regardless of backend setting |
+| Email/note snippets for specialist tasks (web-search synthesis, fact extraction, relationship insights) | Anthropic API — Sonnet via `get_anthropic_llm()` (resolves from `LIFEOS_ANTHROPIC_SPECIALIST_MODEL`, default `claude-sonnet-5`) | Quality-sensitive sub-calls | Per tool invocation, regardless of backend setting |
 | OAuth authentication flows | Google, Slack | Token refresh | Periodic |
 | Reminder messages, sync summaries | Telegram Bot API | Notification delivery | Per reminder / nightly |
 

@@ -76,15 +76,36 @@ cat > "$APP_PATH/Contents/MacOS/LifeOS" << SCRIPT
 # All scripts that need FDA or access to ~/Documents/ should route through here.
 #
 # Usage:
-#   LifeOS                  - Start the API server (default, used by launchd)
+#   LifeOS                  - Prints this usage and exits 1 (no default action)
+#   LifeOS server           - Start the API server (must be explicit)
 #   LifeOS fda-sync         - Run FDA sync (phone/iMessage via Terminal.app)
 #   LifeOS watchdog         - ChromaDB health check and auto-restart
 #   LifeOS server-watchdog  - Server health check and auto-restart
 #   LifeOS exec <cmd>       - Run arbitrary command with FDA permissions
+#   LifeOS run <cmd>        - Run command as subprocess, keeping LifeOS.app as parent (preserves FDA)
+#
+# IMPORTANT: no-arg invocation must NEVER default to 'server'. This app is
+# often installed as a login item on machines that only run the export agent
+# (the API server lives on the Linux host per the architecture) — an
+# implicit 'server' default means every login silently launches a rogue
+# uvicorn on :8000 via Terminal.app. 'server' requires an explicit argument.
 
 LIFEOS_DIR="$PROJECT_DIR"
 
-case "\${1:-server}" in
+case "\${1:-}" in
+    "")
+        echo "Usage: LifeOS <command> [args]" >&2
+        echo "" >&2
+        echo "Commands:" >&2
+        echo "  server           - Start the API server (must be explicit)" >&2
+        echo "  fda-sync         - Run FDA sync (phone/iMessage via Terminal.app)" >&2
+        echo "  watchdog         - ChromaDB health check and auto-restart" >&2
+        echo "  server-watchdog  - Server health check and auto-restart" >&2
+        echo "  exec <cmd>       - Run arbitrary command with FDA permissions" >&2
+        echo "  run <cmd>        - Run command as subprocess, keeping LifeOS.app as parent" >&2
+        exit 1
+        ;;
+
     server)
         osascript <<'EOF'
 tell application "Terminal"
@@ -133,9 +154,17 @@ EOF
         exec "\$@"
         ;;
 
+    run)
+        # Run command as subprocess, keeping LifeOS.app as parent process.
+        # Unlike exec, this preserves FDA because macOS TCC checks the
+        # responsible process (LifeOS.app) rather than the child binary.
+        shift
+        "\$@"
+        ;;
+
     *)
         echo "Unknown command: \$1" >&2
-        echo "Usage: LifeOS [server|fda-sync|watchdog|server-watchdog|exec <cmd>]" >&2
+        echo "Usage: LifeOS [server|fda-sync|watchdog|server-watchdog|exec <cmd>|run <cmd>]" >&2
         exit 1
         ;;
 esac

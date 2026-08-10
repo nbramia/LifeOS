@@ -23,6 +23,7 @@ PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-8":   {"input": 15.0e-6, "output": 75.0e-6},
     "claude-opus-4-7":   {"input": 15.0e-6, "output": 75.0e-6},
     "claude-opus-4-6":   {"input": 15.0e-6, "output": 75.0e-6},
+    "claude-sonnet-5":   {"input":  3.0e-6, "output": 15.0e-6},
     "claude-sonnet-4-6": {"input":  3.0e-6, "output": 15.0e-6},
     "claude-sonnet-4-5": {"input":  3.0e-6, "output": 15.0e-6},
     "claude-haiku-4-5":  {"input":  0.8e-6, "output":  4.0e-6},

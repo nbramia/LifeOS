@@ -33,6 +33,13 @@ def get_apple_contacts_with_email():
         import Contacts
     except ImportError:
         logger.error("pyobjc-framework-Contacts not available")
+        # Declare the skip so the parent records SKIPPED instead of a green
+        # zero-record "success" — macOS-only source on a Linux host (#497).
+        print(
+            "SYNC_SKIPPED: Apple Contacts unavailable "
+            "(pyobjc-framework-Contacts is macOS-only)",
+            flush=True,
+        )
         return {}
 
     store = Contacts.CNContactStore.alloc().init()
@@ -63,7 +70,7 @@ def get_apple_contacts_with_email():
                         'birthday_month': birthday.month() if birthday else None,
                         'birthday_day': birthday.day() if birthday else None,
                     }
-        except Exception as e:
+        except Exception:
             pass  # Skip contacts that fail to parse
 
     store.enumerateContactsWithFetchRequest_error_usingBlock_(request, None, enumerate_contact)

@@ -4,7 +4,7 @@
 // follow-on surfaces (#359 persona, #361 Voice|Text) can reuse it.
 
 import { state, config, elements, endpoints, hooks } from './session.js';
-import { addMessage, updateMessage, setStatus } from './thread.js';
+import { addMessage, updateMessage, setStatus, buildSourcesHtml } from './thread.js';
 import { clearAttachments } from './attachments.js';
 import { loadConversations } from './conversations.js';
 import { personaSupportsHandoff, personaOrchestrates } from './persona.js';
@@ -207,50 +207,30 @@ export async function sendMessage() {
           if (msgEl) {
             let metaHtml = '';
 
-            // Show routing sources used
-            if (routingSources.length > 0) {
+            // Show routing sources used — but only genuine data sources. The
+            // `routing` event also carries internal plumbing labels (agent,
+            // claude_code, clarification, escalation model names, codex) that
+            // aren't "sources" to the user; those get filtered out here so an
+            // answer that pulled no data doesn't render a lone "agent" pill.
+            const sourceIcons = {
+              vault: '📚',
+              calendar: '📅',
+              gmail: '✉️',
+              drive: '📁',
+              attachment: '📎',
+              people: '👤',
+              actions: '✅'
+            };
+            const dataSources = routingSources.filter(src => sourceIcons[src]);
+            if (dataSources.length > 0) {
               metaHtml += '<div class="routing-sources">';
-              const sourceIcons = {
-                vault: '📚',
-                calendar: '📅',
-                gmail: '✉️',
-                drive: '📁',
-                attachment: '📎',
-                people: '👤',
-                actions: '✅'
-              };
-              routingSources.forEach(src => {
-                const icon = sourceIcons[src] || '📄';
-                metaHtml += `<span class="routing-source ${src}">${icon} ${src}</span>`;
+              dataSources.forEach(src => {
+                metaHtml += `<span class="routing-source ${src}">${sourceIcons[src]} ${src}</span>`;
               });
               metaHtml += '</div>';
             }
 
-            if (sources.length > 0) {
-              // Add collapsed class if more than 3 sources
-              const collapsedClass = sources.length > 3 ? ' collapsed' : '';
-              metaHtml += `<div class="sources${collapsedClass}">`;
-              sources.forEach(src => {
-                const fileName = src.file_name || src;
-                const sourceType = src.source_type || 'vault';
-
-                if (sourceType === 'calendar' && src.url) {
-                  // Calendar sources use Google Calendar URL
-                  metaHtml += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
-                } else {
-                  // Vault sources use Obsidian URL
-                  const obsidianPath = src.obsidian_path || fileName;
-                  const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-                  metaHtml += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
-                }
-              });
-              // Add toggle button if more than 3 sources
-              if (sources.length > 3) {
-                const hiddenCount = sources.length - 3;
-                metaHtml += `<button class="sources-toggle" onclick="toggleSources(this)">Show ${hiddenCount} more...</button>`;
-              }
-              metaHtml += '</div>';
-            }
+            metaHtml += buildSourcesHtml(sources);
 
             // Remove any existing meta
             const existingMeta = msgEl.querySelector('.message-meta');

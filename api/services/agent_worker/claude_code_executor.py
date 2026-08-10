@@ -318,6 +318,7 @@ class ClaudeCodeExecutor:
         session_store: SessionStore,
         transcript_store: TranscriptStore,
         notification_callback: Optional[NotificationCallback] = None,
+        operator_send: Optional[Callable[[object, str], None]] = None,
         conversation_mirror: Optional[Callable[[str, str], None]] = None,
         spawn_fn: Optional[SpawnFn] = None,
         binary_resolver: Optional[Callable[[], str]] = None,
@@ -327,6 +328,11 @@ class ClaudeCodeExecutor:
         self.session_store = session_store
         self.transcript_store = transcript_store
         self._notify = notification_callback or (lambda _msg: None)
+        # Preferred operator-facing sender: called with (session, body) so the
+        # worker can capture Telegram message ids and register them as reply
+        # anchors (threaded replies route back into the session). Falls back to
+        # the plain `notification_callback` when unset (tests, legacy wiring).
+        self._operator_send = operator_send
         # #311: optional (session_id, body) sink that mirrors each streamed
         # [NOTIFY]/[CLARIFY]/[GOAL] body into the web/voice conversation thread
         # that spawned the session. Additive — `notification_callback` (the
@@ -530,7 +536,7 @@ class ClaudeCodeExecutor:
         # cleanup is a single `stop_heartbeat.set()`.
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
-            args=(state, stop_heartbeat),
+            args=(session, state, stop_heartbeat),
             daemon=True,
             name=f"CodeHeartbeat-{sid[:8]}",
         )
@@ -728,10 +734,12 @@ class ClaudeCodeExecutor:
                         })
                         continue
                     state.pending_clarification = body
-                    try:
-                        self._notify(body)
-                    except Exception as exc:  # pragma: no cover — defensive
-                        logger.warning("notification callback raised: %s", exc)
+                    # NOT streamed to Telegram here: the worker sends ONE
+                    # anchored message — question + reply instructions — when
+                    # the session blocks, so the operator's threaded reply
+                    # lands on the message that shows the question itself
+                    # (same treatment [GOAL] gets). The web thread still gets
+                    # the body live via the mirror.
                     if self._conversation_mirror:  # #311: stream into the web thread
                         try:
                             self._conversation_mirror(session.session_id, body)
@@ -748,7 +756,10 @@ class ClaudeCodeExecutor:
                     # are folded into final_text for the parent instead (#349).
                     if not state.is_child:
                         try:
-                            self._notify(body)
+                            if self._operator_send is not None:
+                                self._operator_send(session, body)
+                            else:
+                                self._notify(body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
                         if self._conversation_mirror:  # #311: stream into the web thread
@@ -762,23 +773,25 @@ class ClaudeCodeExecutor:
                     if state.plan_mode and not state.awaiting_approval:
                         state.plan_text += body + "\n"
                 for body in scan.goal:
-                    # The agent proposed a success condition (#398). Stream it so
-                    # the operator can SEE what they're approving, then the result
-                    # event flips the session to BLOCKED awaiting their yes/no.
-                    # Child sessions stay silent to the operator like [NOTIFY].
+                    # The agent proposed a success condition (#398). NOT
+                    # streamed to Telegram here: the worker sends ONE anchored
+                    # message — goal body + reply instructions — when the
+                    # session blocks, so the operator's threaded reply lands on
+                    # the message that shows the goal itself (previously the
+                    # goal streamed as its own message and a separate
+                    # instruction message was the reply anchor, which made
+                    # "reply yes — but to which message?" ambiguous). The web
+                    # thread still gets the body live via the mirror. The
+                    # notify timestamps still advance so the heartbeat doesn't
+                    # race the blocked-prompt send with a "Still working".
                     state.pending_goal = body
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
-                    if not state.is_child:
-                        try:
-                            self._notify(body)
+                    if not state.is_child and self._conversation_mirror:
+                        try:  # #311: stream into the web thread
+                            self._conversation_mirror(session.session_id, body)
                         except Exception as exc:  # pragma: no cover — defensive
-                            logger.warning("notification callback raised: %s", exc)
-                        if self._conversation_mirror:  # #311: stream into the web thread
-                            try:
-                                self._conversation_mirror(session.session_id, body)
-                            except Exception as exc:  # pragma: no cover — defensive
-                                logger.warning("conversation mirror raised: %s", exc)
+                            logger.warning("conversation mirror raised: %s", exc)
                     self.transcript_store.append(sid, "claude_code_goal", {
                         "body": body, "body_chars": len(body),
                     })
@@ -857,7 +870,7 @@ class ClaudeCodeExecutor:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("watchdog terminate failed: %s", exc)
 
-    def _heartbeat_loop(self, state: _RunState, stop_event: threading.Event) -> None:
+    def _heartbeat_loop(self, session, state: _RunState, stop_event: threading.Event) -> None:
         # Recursive Timers (as used in the legacy orchestrator) are hard to
         # cancel cleanly from the calling thread because each fires the next.
         # An `Event.wait()` loop drops to zero overhead when stopped.
@@ -877,7 +890,11 @@ class ClaudeCodeExecutor:
             activity = f" — {state.last_activity}" if state.last_activity else ""
             cost = f" | ${state.cost_usd:.2f}" if state.cost_usd > 0 else ""
             try:
-                self._notify(f"Still working{activity} ({minutes}m elapsed{cost})")
+                body = f"Still working{activity} ({minutes}m elapsed{cost})"
+                if self._operator_send is not None:
+                    self._operator_send(session, body)
+                else:
+                    self._notify(body)
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("heartbeat callback raised: %s", exc)
             state.last_notify_at = now

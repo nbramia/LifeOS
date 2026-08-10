@@ -71,6 +71,14 @@ def sync_apple_contacts(dry_run: bool = True) -> dict:
     if not reader.is_available:
         logger.error("Apple Contacts not available. Install pyobjc-framework-Contacts.")
         stats['error'] = "Apple Contacts not available"
+        # Declare the skip so the parent records SKIPPED instead of a green
+        # zero-record "success". The pyobjc Contacts framework is macOS-only,
+        # so on Linux this is always the path taken (#497).
+        print(
+            "SYNC_SKIPPED: Apple Contacts unavailable "
+            "(pyobjc-framework-Contacts is macOS-only)",
+            flush=True,
+        )
         return stats
 
     auth_status = reader.check_authorization()

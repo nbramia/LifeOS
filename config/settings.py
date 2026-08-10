@@ -168,6 +168,29 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="LIFEOS_PORT")
     host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
 
+    # Host guard (#506): the ONE machine allowed to run this API server. A
+    # second live server elsewhere writes to its own SQLite/Chroma copy that
+    # silently diverges from the real one, so clients pointed at the wrong
+    # host get stale answers with no signal anything is wrong. Empty
+    # (default) disables the guard entirely — a fresh clone must never be
+    # blocked from starting. Set it only once you've deliberately designated
+    # a host; api/main.py then refuses to start anywhere else.
+    server_hostname: str = Field(
+        default="",
+        alias="LIFEOS_SERVER_HOSTNAME",
+        description="Hostname (as returned by `socket.gethostname()`/`hostname`) "
+                    "of the one machine designated to run the LifeOS API server. "
+                    "Empty (default) disables the guard. When set, api/main.py "
+                    "and scripts/server.sh refuse to start on any other machine "
+                    "— point that machine's clients at LIFEOS_API_URL instead of "
+                    "running a second server."
+    )
+
+    # The HTTPS front `tailscale serve` publishes (scripts/setup-tailscale.sh).
+    # Also the one non-local origin CORS allows, so a browser loading the UI from
+    # the tailnet hostname can call the API. Empty simply drops it from the list.
+    tailnet_https_url: str = Field(default="", alias="TAILNET_HTTPS_URL")
+
     # API Keys (no prefix - standard env var names)
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
@@ -183,6 +206,45 @@ class Settings(BaseSettings):
         alias="LIFEOS_EMBEDDING_CACHE",
         description="Directory for caching embedding model files (leave empty for HuggingFace default)"
     )
+    embedding_batch_size: int = Field(
+        default=8,
+        alias="LIFEOS_EMBEDDING_BATCH_SIZE",
+        description="Max texts per model.encode() batch. Bounds peak VRAM per "
+                    "embedding call so a large document's chunks can't spike GPU "
+                    "memory in one allocation and exhaust the iGPU's SDMA queues, "
+                    "freezing the host (issue #483). Semantically neutral — "
+                    "batching changes only peak memory, not the embedding values."
+    )
+    embedding_gpu_lock_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_ENABLED",
+        description="Serialize GPU embedding across processes (API server, agent "
+                    "worker, nightly sync, ad-hoc scripts) via a cross-process file "
+                    "lock, so they can't all grab GPU compute queues at once and "
+                    "exhaust the iGPU's 8 SDMA queues (issue #521). Disable if the "
+                    "lock file ever causes more trouble than the contention it "
+                    "prevents."
+    )
+    embedding_gpu_lock_path: str = Field(
+        default="./data/gpu_embed.lock",
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_PATH",
+        description="flock() path used to serialize GPU embedding across "
+                    "processes (#521). Relative paths resolve against the process "
+                    "cwd; every LifeOS process (systemd services set "
+                    "WorkingDirectory to the project root, and scripts/docs "
+                    "instruct running from the project root) shares that cwd, so "
+                    "the default resolves to the same file everywhere without "
+                    "needing an absolute path. Set to empty to disable the lock."
+    )
+    embedding_gpu_lock_timeout_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT",
+        description="Max seconds to wait for the cross-process GPU embedding "
+                    "lock before giving up and falling back to CPU for the rest "
+                    "of this process's lifetime, rather than deadlocking or "
+                    "piling onto whichever process is already using the GPU "
+                    "(#521)."
+    )
 
     # Chunking
     chunk_size: int = 500  # tokens
@@ -196,6 +258,15 @@ class Settings(BaseSettings):
 
     # Anthropic model for orchestration
     anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
+
+    # Anthropic model for specialist calls (relationship insights, fact
+    # extraction, tone analysis) — Sonnet-tier for quality, independent of the
+    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-5),
+    # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
+    # returning 404, silently breaking every specialist feature (#470).
+    anthropic_specialist_model: str = Field(
+        default="claude-sonnet-5", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+    )
 
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
     local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
@@ -281,7 +352,7 @@ class Settings(BaseSettings):
                     "classifies #agent tasks (budget, routing, ambiguity, sanity)."
     )
     agent_managed_model: str = Field(
-        default="claude-sonnet-4-6",
+        default="claude-sonnet-5",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
         description="Anthropic model the Managed Agents executor uses for "
                     "Claude-routed #agent tasks. Informational only — the "
@@ -306,7 +377,7 @@ class Settings(BaseSettings):
                     "pushing back ('do research', 'you're wrong'). Empty (default) "
                     "disables escalation — safe for fresh clones and the local "
                     "backend. Set to a stronger model than LIFEOS_ANTHROPIC_MODEL "
-                    "(e.g. claude-sonnet-4-6 or claude-opus-4-8) to enable. Only "
+                    "(e.g. claude-sonnet-5 or claude-opus-4-8) to enable. Only "
                     "applies to the Anthropic backend."
     )
     agent_escalation_ladder: str = Field(
@@ -319,7 +390,7 @@ class Settings(BaseSettings):
                     "from LIFEOS_AGENT_ESCALATION_MODEL: [that model, claude_code] "
                     "— so the Claude Code handoff lands on the 2nd pushback. "
                     "Override to insert rungs, e.g. "
-                    "'claude-sonnet-4-6,claude-opus-4-8,claude_code'."
+                    "'claude-sonnet-5,claude-opus-4-8,claude_code'."
     )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,
@@ -954,13 +1025,22 @@ class Settings(BaseSettings):
 
     @property
     def photos_db_path(self) -> str:
-        """Get path to Photos.sqlite database."""
-        return f"{self.photos_library_path}/database/Photos.sqlite"
+        """Get path to Photos.sqlite database.
+
+        Expands ``~`` so the tilde-prefixed default resolves — without this the
+        default configuration could never work, even on a Mac with a stock
+        library, because ``Path("~/...").exists()`` is always False.
+        """
+        from pathlib import Path
+        library = str(Path(self.photos_library_path).expanduser())
+        return f"{library}/database/Photos.sqlite"
 
     @property
     def photos_enabled(self) -> bool:
         """Check if Photos database is available."""
         from pathlib import Path
+        if not self.photos_library_path:
+            return False
         return Path(self.photos_db_path).exists()
 
 

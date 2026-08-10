@@ -1620,11 +1620,18 @@ class LifeOSMCPServer:
                     lines.append(f"- {a.get('name', '')} [{a.get('key', '')}]{tag}: ${(a.get('value') or 0):,.0f}")
             positions = data.get("positions", [])
             if positions:
-                lines += ["", "Top positions:"]
-                for pos in positions[:15]:
+                lines += ["", f"Positions ({len(positions)}):"]
+                for pos in positions:
                     unrl = (f", unrealized ${pos['unrealized']:+,.0f}"
                             if pos.get("unrealized") is not None else "")
-                    lines.append(f"- {pos.get('symbol', '')}: ${(pos.get('value') or 0):,.0f} "
+                    # Ticker + security name: stale world knowledge (e.g. a
+                    # recently-IPO'd company "can't be in a portfolio") beats
+                    # an unrecognized bare ticker; the desc makes company-name
+                    # questions a literal text match.
+                    desc = (pos.get("desc") or "").strip()
+                    symbol = pos.get("symbol", "")
+                    label = f"{symbol} — {desc}" if desc else symbol
+                    lines.append(f"- {label}: ${(pos.get('value') or 0):,.0f} "
                                  f"({pos.get('weight_pct') or 0}%{unrl})")
             tu = data.get("taxable_unrealized")
             if tu:

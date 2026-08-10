@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** Orchestrator
-**Last Updated:** 2026-06-25
+**Last Updated:** 2026-07-09
 
 LifeOS spawns a **Claude Code** subprocess from Telegram when the operator sends `/claude <task>` (or when a natural-language message is classified as requiring terminal / filesystem / browser access). The subprocess runs the task on the server, streams progress back as Telegram messages, and terminates. The operator can monitor (`/claude_status`) and cancel (`/claude_cancel`) the active session.
 
@@ -105,13 +105,13 @@ While a plan is pending, normal Telegram messages still reach the chat pipeline 
 
 ## Clarification questions
 
-If a task is vague or ambiguous, Claude asks a clarifying question instead of guessing. The question is relayed via Telegram and the session pauses until the operator answers.
+If a task is vague or ambiguous, Claude asks a clarifying question instead of guessing. The session pauses and the question is relayed via Telegram as **one message** carrying both the question and "Answer by replying to this message" — the operator's threaded reply lands on the message that shows the question itself.
 
 **Flow:**
 
 1. Operator: `/claude add this to the backlog`
-2. Claude: "The backlog has two sections (Work and Personal). Which one?"
-3. Operator: `Work`
+2. Claude (single message): "The backlog has two sections (Work and Personal). Which one? — Answer by replying to this message."
+3. Operator replies `Work` on that message.
 4. Claude resumes with the answer and completes the task.
 
 While a clarification is pending, all non-command Telegram messages route as the answer. The operator uses `/claude_cancel` if they want to chat normally instead.
@@ -122,16 +122,15 @@ While a clarification is pending, all non-command Telegram messages route as the
 
 ## Goal approval
 
-For longer or fuzzier objectives, Claude can propose a **success condition** with `[GOAL] <condition>` before it starts working. The proposed goal is relayed to the operator, the session pauses, and the operator either approves it or replies with changes.
+For longer or fuzzier objectives, Claude can propose a **success condition** with `[GOAL] <condition>` before it starts working. The session pauses and the goal is relayed to the operator as **one message** carrying both the proposed condition and how to answer it — the operator's threaded reply lands on the message that shows the goal itself.
 
 **Flow:**
 
-1. Claude: `[GOAL] All unit tests pass and the linter is clean.`
-2. LifeOS: "Reply 'yes' to lock this goal and start, or send changes to refine it."
-3. Operator: `yes` → the worker locks the goal (it arms Claude Code's native goal mode by injecting `/goal <condition>` on resume) and Claude begins.
-   Or: `make it also require the docs to build` → treated as a refinement; the raw reply goes back to Claude, which re-proposes an updated `[GOAL]`.
+1. LifeOS (single message): the proposed goal, followed by "Reply to this message with 'yes' to lock this goal and start, or with changes to refine it." The instruction spells out that only a **threaded reply** (Telegram's Reply on that message) reaches the session — a plain chat message doesn't.
+2. Operator replies `yes` on that message → LifeOS immediately acks ("✅ Goal locked — starting work now…"), then the worker locks the goal (it arms Claude Code's native goal mode by injecting `/goal <condition>` on resume) and Claude begins.
+   Or: `make it also require the docs to build` → acked as a rework; the raw reply goes back to Claude, which re-proposes an updated `[GOAL]`.
 
-Approval is recognized from short affirmatives (`yes`, `approve`, `go ahead`, `sounds good`, `lgtm`, …). A reply that also asks for changes (`yes, but make it stricter`) is treated as a refinement, not a lock.
+Approval is recognized from short affirmatives (`yes`, `approve`, `go ahead`, `sounds good`, `lgtm`, …). A reply that also asks for changes (`yes, but make it stricter`) is treated as a refinement, not a lock. A reply landing on a goal message that already has an answer is acknowledged ("already in motion") rather than treated as a new report.
 
 **Note:** `[GOAL]` is a first-class protocol tag with its own pending state (`REASON_AWAITING_GOAL_APPROVAL`). The doctor persona emits it as the gate of its goal-first pipeline (see [doctor-bot.md](../../guides/doctor-bot.md)).
 
@@ -145,10 +144,22 @@ Claude sends three kinds of messages via Telegram:
 |--------|------|---------|
 | `[NOTIFY] ...` | Progress checkpoint or completion summary | `[NOTIFY] Created backup script at ~/scripts/backup.sh and added daily cron job at 2am.` |
 | `[CLARIFY] ...` | Claude needs an answer | `[CLARIFY] Which backlog section — Work or Personal?` |
-| `[GOAL] ...` | Claude proposes a success condition to lock before starting | `[GOAL] All unit tests pass and the linter is clean.` |
+| `[GOAL] ...` | Claude proposes a success condition to lock before starting; delivered as one message with the reply instructions when the session blocks | `[GOAL] All unit tests pass and the linter is clean.` |
 | heartbeat | Every 5 minutes while running | `Still working... (5m elapsed)` |
 
 Only `[NOTIFY]`, `[CLARIFY]`, and `[GOAL]` lines are relayed. All other output (tool calls, file reads, intermediate steps) stays in the subprocess. The heartbeat is sent by the orchestrator (not Claude) so the operator always knows the session is alive even when Claude is busy without notifying.
+
+---
+
+## Threaded replies — every session message is an anchor
+
+Every operator-facing message a session sends — streamed `[NOTIFY]` updates, heartbeats, blocked prompts (clarify / plan / goal), completion and failure notices, and the acks LifeOS sends back — registers its Telegram message id against the session. A **threaded reply to any of them** routes back into that session:
+
+- Replies to a blocked prompt answer it (clarification answer, plan approve/reject, goal yes/refine).
+- Replies to a completion or failure notice reopen the session as a follow-up turn with full prior context.
+- Replies to anything else (a status update, a heartbeat, an ack) are queued as a **context note** — quoted with the message being replied to — and delivered at the session's next turn boundary. A mid-run reply gets an instant "Noted — I'll pass this to the session at its next checkpoint" ack; a reply to a finished session wakes it back up.
+
+Every message ends with a footer naming its affordance: **"↩️ reply in thread"** when a threaded reply reaches the session, or **"🚫 do not reply"** when it can't (e.g. a dead, unresumable session). A plain, non-threaded message never reaches a session — on an orchestration bot it starts a new one.
 
 ---
 

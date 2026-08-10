@@ -20,6 +20,18 @@ else
     PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
+# A commit in a linked worktree doesn't change the code the services run —
+# they execute from the primary checkout — so a restart would be pure
+# disruption. (Historically it also cascaded to lifeos-agent-worker via
+# `Requires=`, killing the committing agent session; the cascade is gone,
+# but a pointless api restart is still churn worth skipping.)
+# Detect BEFORE cd'ing away from the hook's starting cwd; GIT_DIR is exported
+# to hooks, and --absolute-git-dir resolves it either way.
+IN_WORKTREE=""
+case "$(git rev-parse --absolute-git-dir 2>/dev/null)" in
+    */.git/worktrees/*) IN_WORKTREE=1 ;;
+esac
+
 cd "$PROJECT_DIR"
 
 # Normalize commit timestamps to 12:00 UTC (privacy: hides work schedule)
@@ -37,11 +49,13 @@ if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
 fi
 
 # Restart the API server if api/ or config/ files changed. server.sh
-# restarts lifeos-api, which cascades to lifeos-agent-worker via
-# `Requires=lifeos-api.service` in its unit file.
+# restarts lifeos-api only — the agent worker deliberately does NOT follow
+# (see lifeos-agent-worker.service), so in-flight agent sessions survive.
 CHANGED_API=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
 
-if [ -n "$CHANGED_API" ]; then
+if [ -n "$IN_WORKTREE" ]; then
+    echo "Worktree commit — skipping service restarts (deploy happens on main)"
+elif [ -n "$CHANGED_API" ]; then
     if [ -x "./scripts/server.sh" ]; then
         nohup ./scripts/server.sh restart > /tmp/lifeos-server-restart.log 2>&1 &
         echo "Server restart triggered (log: /tmp/lifeos-server-restart.log)"
@@ -55,13 +69,13 @@ fi
 # installed by setup-systemd.sh permits passwordless restart.
 CHANGED_MCP=$(git diff-tree --no-commit-id --name-only -r HEAD -- mcp_server.py)
 
-if [ -n "$CHANGED_MCP" ]; then
+if [ -z "$IN_WORKTREE" ] && [ -n "$CHANGED_MCP" ]; then
     if systemctl list-unit-files lifeos-mcp-http.service &>/dev/null; then
         nohup sudo systemctl restart lifeos-mcp-http >> /tmp/lifeos-server-restart.log 2>&1 &
         echo "MCP HTTP service restart triggered (mcp_server.py changed)"
     fi
 fi
 
-if [ -z "$CHANGED_API" ] && [ -z "$CHANGED_MCP" ]; then
+if [ -z "$IN_WORKTREE" ] && [ -z "$CHANGED_API" ] && [ -z "$CHANGED_MCP" ]; then
     echo "No server restart needed"
 fi

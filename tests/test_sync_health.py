@@ -272,6 +272,40 @@ class TestSyncHealthSummary:
             assert is_healthy is True
             assert "healthy" in message.lower()
 
+    def test_check_sync_health_healthy_breakdown_when_disabled(self, temp_db):
+        """When some tracked sources are disabled, the healthy message must
+        break the total down (active vs disabled) so it doesn't read as
+        contradicting a nightly 'Total sources: N' line that only counts the
+        sources actually run (issue #494 follow-up)."""
+        summary = {
+            "all_healthy": True,
+            "total_sources": 28,
+            "enabled_sources": 27,
+            "disabled": 1,
+        }
+        with patch('api.services.sync_health.get_sync_summary', return_value=summary):
+            is_healthy, message = check_sync_health()
+
+        assert is_healthy is True
+        assert "28" in message
+        assert "27" in message
+        assert "1" in message
+        assert "healthy" in message.lower()
+
+    def test_check_sync_health_healthy_no_disabled_sources(self, temp_db):
+        """When nothing is disabled, keep the original simple message."""
+        summary = {
+            "all_healthy": True,
+            "total_sources": 28,
+            "enabled_sources": 28,
+            "disabled": 0,
+        }
+        with patch('api.services.sync_health.get_sync_summary', return_value=summary):
+            is_healthy, message = check_sync_health()
+
+        assert is_healthy is True
+        assert message == "All 28 sources are healthy"
+
     def test_check_sync_health_unhealthy(self, temp_db):
         """Test health check when there are issues."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):

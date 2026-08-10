@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
+import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -33,7 +34,18 @@ from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
+
+# Configure root logging here, explicitly, rather than leaving it to whatever
+# module happens to call `logging.basicConfig()` first. `scripts/merge_people`
+# (imported lazily on startup below) does exactly that with this same
+# level/format, so this is a no-op for existing log output — but doing it up
+# front, and pairing it with `configure_telegram_log_redaction()`, is what
+# keeps httpx's request logger (which logs full URLs, and the Telegram Bot
+# API embeds the bot token in the URL) from ever logging at INFO here (#519).
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+configure_telegram_log_redaction()
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +63,48 @@ _task_watcher = None
 # the alerts themselves.
 
 
+def check_server_host_guard() -> None:
+    """Refuse to start unless this machine is the designated LifeOS host (#506).
+
+    The LifeOS API is architecturally supposed to run on exactly one machine
+    — every other machine is a client or export agent. A second live server
+    writes to its own SQLite/Chroma copy that silently diverges from the
+    real one, and clients pointed at the wrong host get stale answers with
+    no indication anything is wrong.
+
+    ``LIFEOS_SERVER_HOSTNAME`` unset (the default) disables this guard
+    entirely — a fresh open-source clone must never be blocked from running
+    its own server. Only set it once you've deliberately designated a host.
+    """
+    expected = (settings.server_hostname or "").strip()
+    if not expected:
+        logger.info(
+            "LIFEOS_SERVER_HOSTNAME not set — host guard disabled "
+            "(this or any machine may run the LifeOS API server)."
+        )
+        return
+    actual = socket.gethostname()
+    if actual == expected:
+        return
+    raise RuntimeError(
+        f"Refusing to start: LIFEOS_SERVER_HOSTNAME designates {expected!r} as "
+        f"the only machine allowed to run the LifeOS API server, but this "
+        f"machine's hostname is {actual!r}. Running a second server here would "
+        f"write to its own SQLite/Chroma copy that silently diverges from the "
+        f"real one. Point this machine's clients at the designated host via "
+        f"LIFEOS_API_URL instead of running the server locally."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
     global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher
+
+    # Startup: refuse to run a second server on a non-designated machine (#506).
+    # Deliberately not wrapped in try/except — unlike the best-effort blocks
+    # below, this must actually stop startup on a mismatch.
+    check_server_host_guard()
 
     # Startup: Recover any incomplete merge operations
     try:
@@ -184,10 +234,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for local development
+# CORS: an explicit allowlist of the addresses this app answers on.
+#
+# The web UI does not depend on any of this — it is served by this app and
+# addresses it with root-relative paths, so its requests are same-origin and
+# never consult these rules. The list covers a page loaded at one of these
+# addresses that calls the API at another.
+#
+# A wildcard here was both ineffective and dangerous. Browsers reject `*` on
+# credentialed requests, so it never granted what it appeared to; and because
+# this app has no authentication of its own, `*` widened the security boundary
+# from "the tailnet" to "any page a tailnet device happens to have open".
+_cors_origins = [
+    f"http://localhost:{settings.port}",
+    f"http://127.0.0.1:{settings.port}",
+]
+if settings.tailnet_https_url:
+    _cors_origins.append(settings.tailnet_https_url.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -79,6 +79,10 @@ class SourceEntity:
     observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Re-matching bookkeeping (see get_unlinked_for_rematching / record_match_attempt)
+    match_attempted_at: Optional[datetime] = None
+    match_attempt_count: int = 0
+
     def __post_init__(self):
         """Validate source type."""
         if self.source_type and self.source_type not in SOURCE_TYPES:
@@ -94,6 +98,8 @@ class SourceEntity:
             data["created_at"] = self.created_at.isoformat()
         if self.linked_at:
             data["linked_at"] = self.linked_at.isoformat()
+        if self.match_attempted_at:
+            data["match_attempted_at"] = self.match_attempted_at.isoformat()
         return data
 
     @classmethod
@@ -106,6 +112,8 @@ class SourceEntity:
             data["created_at"] = _make_aware(datetime.fromisoformat(data["created_at"]))
         if data.get("linked_at") and isinstance(data["linked_at"], str):
             data["linked_at"] = _make_aware(datetime.fromisoformat(data["linked_at"]))
+        if data.get("match_attempted_at") and isinstance(data["match_attempted_at"], str):
+            data["match_attempted_at"] = _make_aware(datetime.fromisoformat(data["match_attempted_at"]))
         return cls(**data)
 
     @classmethod
@@ -119,6 +127,10 @@ class SourceEntity:
         observed_at = datetime.fromisoformat(row[11]) if row[11] else datetime.now(timezone.utc)
         created_at = datetime.fromisoformat(row[12]) if row[12] else datetime.now(timezone.utc)
         linked_at = datetime.fromisoformat(row[10]) if row[10] else None
+        match_attempted_at = (
+            datetime.fromisoformat(row[13]) if len(row) > 13 and row[13] else None
+        )
+        match_attempt_count = row[14] if len(row) > 14 and row[14] is not None else 0
         link_method = row[15] if len(row) > 15 else None
 
         return cls(
@@ -136,6 +148,8 @@ class SourceEntity:
             linked_at=_make_aware(linked_at),
             observed_at=_make_aware(observed_at),
             created_at=_make_aware(created_at),
+            match_attempted_at=_make_aware(match_attempted_at),
+            match_attempt_count=match_attempt_count,
         )
 
     @property
@@ -957,26 +971,61 @@ class SourceEntityStore:
         min_days_since_attempt: int = 30,
         max_attempts: int = 3,
         limit: int = 1000,
+        backoff_multiplier: int = 3,
+        max_capped_per_run: Optional[int] = 200,
     ) -> list[SourceEntity]:
         """
         Get unlinked entities eligible for re-matching.
 
-        Filters out:
-        - Entities that were attempted recently (within min_days_since_attempt)
-        - Entities with too many failed attempts (>= max_attempts)
+        Below ``max_attempts``, behavior is unchanged: eligible once
+        ``min_days_since_attempt`` has elapsed since the last attempt.
+
+        At or above ``max_attempts`` ("capped" entities), a hard stop would
+        permanently lock an entity out even as the CRM it failed to match
+        against keeps growing (#507 — 1,678 of 1,729 unlinked entities were
+        stuck this way, forever reporting 0 eligible). Instead we apply
+        exponential backoff: the wait before the next attempt grows as
+        ``min_days_since_attempt * backoff_multiplier ** (match_attempt_count
+        - max_attempts)``. With the defaults (30 days, multiplier 3) that's
+        attempt 4 at 30d, attempt 5 at 90d, attempt 6 at 270d, and so on —
+        no entity is locked out forever, but stale entities are retried
+        exponentially less often, bounding the amortized cost.
+
+        This is deliberately stateless: it reuses the existing
+        match_attempted_at/match_attempt_count columns instead of adding new
+        schema (e.g. a stored PersonEntity-count watermark) to react to CRM
+        growth directly. That's simpler and needs no migration, at the cost
+        of being a proxy — "CRM probably changed enough" — rather than a
+        precise trigger tied to actual PersonEntity growth.
+
+        Because many capped entities can cross their backoff threshold on
+        the same night (they tend to have been last attempted in clusters),
+        ``max_capped_per_run`` bounds how many capped entities are retried
+        per run so a large backlog drains over several nights instead of
+        spiking one night's fuzzy-match cost. Entities below max_attempts
+        are never subject to this per-run cap — that population is small
+        and behaves exactly as before.
 
         Args:
             source_type: Optional filter by source type
             min_days_since_attempt: Skip if attempted within this many days
-            max_attempts: Skip if attempted this many times or more
-            limit: Maximum entities to return
+            max_attempts: Attempts before backoff (instead of a hard stop) kicks in
+            limit: Maximum entities to return overall
+            backoff_multiplier: Growth factor applied per attempt past max_attempts
+            max_capped_per_run: Max capped (attempt_count >= max_attempts) entities
+                to include per call. None disables the cap.
 
         Returns:
             List of SourceEntity objects eligible for re-matching
         """
         conn = self._get_connection()
         try:
-            cutoff_date = (
+            # Most lenient possible cutoff — anything attempted more recently
+            # than this can't be eligible under any backoff tier, so it's
+            # safe (and keeps the query on the existing index) to filter it
+            # out in SQL. The precise per-row backoff check happens in Python
+            # below, since SQLite has no portable POWER() to express it in SQL.
+            base_cutoff = (
                 datetime.now(timezone.utc) - timedelta(days=min_days_since_attempt)
             ).isoformat()
 
@@ -986,62 +1035,122 @@ class SourceEntityStore:
                     WHERE canonical_person_id IS NULL
                       AND source_type = ?
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
-                      AND (match_attempt_count IS NULL OR match_attempt_count < ?)
                     ORDER BY observed_at DESC
-                    LIMIT ?
-                """, (source_type, cutoff_date, max_attempts, limit))
+                """, (source_type, base_cutoff))
             else:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
-                      AND (match_attempt_count IS NULL OR match_attempt_count < ?)
                     ORDER BY observed_at DESC
-                    LIMIT ?
-                """, (cutoff_date, max_attempts, limit))
+                """, (base_cutoff,))
 
-            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+            candidates = [SourceEntity.from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+        now = datetime.now(timezone.utc)
+        normal: list[SourceEntity] = []
+        capped_eligible: list[SourceEntity] = []
+
+        for entity in candidates:
+            count = entity.match_attempt_count or 0
+            if count < max_attempts:
+                normal.append(entity)
+                continue
+
+            if entity.match_attempted_at is None:
+                capped_eligible.append(entity)
+                continue
+
+            required_days = min_days_since_attempt * (
+                backoff_multiplier ** (count - max_attempts)
+            )
+            attempted_at = _make_aware(entity.match_attempted_at)
+            if (now - attempted_at).days >= required_days:
+                capped_eligible.append(entity)
+
+        if max_capped_per_run is not None and len(capped_eligible) > max_capped_per_run:
+            # Retry the longest-waiting capped entities first so the backlog
+            # rotates fairly across runs instead of starving the same tail.
+            capped_eligible.sort(
+                key=lambda e: e.match_attempted_at or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            capped_eligible = capped_eligible[:max_capped_per_run]
+
+        combined = normal + capped_eligible
+        combined.sort(key=lambda e: e.observed_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return combined[:limit]
 
     def count_unlinked_for_rematching(
         self,
         source_type: Optional[str] = None,
         min_days_since_attempt: int = 30,
         max_attempts: int = 3,
+        backoff_multiplier: int = 3,
+        max_capped_per_run: Optional[int] = 200,
     ) -> int:
         """
-        Count unlinked entities eligible for re-matching.
+        Count unlinked entities eligible for re-matching right now.
+
+        Mirrors the eligibility logic in ``get_unlinked_for_rematching``
+        (including the per-run cap on capped entities), see there for the
+        backoff rationale.
 
         Args:
             source_type: Optional filter by source type
             min_days_since_attempt: Skip if attempted within this many days
-            max_attempts: Skip if attempted this many times or more
+            max_attempts: Attempts before backoff kicks in
+            backoff_multiplier: Growth factor applied per attempt past max_attempts
+            max_capped_per_run: Max capped entities counted as eligible per run
 
         Returns:
             Count of eligible entities
         """
+        return len(self.get_unlinked_for_rematching(
+            source_type=source_type,
+            min_days_since_attempt=min_days_since_attempt,
+            max_attempts=max_attempts,
+            limit=1_000_000,
+            backoff_multiplier=backoff_multiplier,
+            max_capped_per_run=max_capped_per_run,
+        ))
+
+    def count_capped_backlog(
+        self,
+        source_type: Optional[str] = None,
+        max_attempts: int = 3,
+    ) -> int:
+        """
+        Count unlinked entities that have hit ``max_attempts`` or more.
+
+        This is the total capped population regardless of whether backoff
+        currently makes them eligible — used to surface the backlog size in
+        sync stats so a saturated backlog is visible (#507) instead of
+        looking identical to "nothing to do".
+
+        Args:
+            source_type: Optional filter by source type
+            max_attempts: Attempt count considered "capped"
+
+        Returns:
+            Count of unlinked entities with match_attempt_count >= max_attempts
+        """
         conn = self._get_connection()
         try:
-            cutoff_date = (
-                datetime.now(timezone.utc) - timedelta(days=min_days_since_attempt)
-            ).isoformat()
-
             if source_type:
                 cursor = conn.execute("""
                     SELECT COUNT(*) FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type = ?
-                      AND (match_attempted_at IS NULL OR match_attempted_at < ?)
-                      AND (match_attempt_count IS NULL OR match_attempt_count < ?)
-                """, (source_type, cutoff_date, max_attempts))
+                      AND match_attempt_count >= ?
+                """, (source_type, max_attempts))
             else:
                 cursor = conn.execute("""
                     SELECT COUNT(*) FROM source_entities
                     WHERE canonical_person_id IS NULL
-                      AND (match_attempted_at IS NULL OR match_attempted_at < ?)
-                      AND (match_attempt_count IS NULL OR match_attempt_count < ?)
-                """, (cutoff_date, max_attempts))
+                      AND match_attempt_count >= ?
+                """, (max_attempts,))
 
             return cursor.fetchone()[0]
         finally:

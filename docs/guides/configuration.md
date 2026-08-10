@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-09
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -20,11 +20,12 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 |---|---|---|---|
 | `LIFEOS_HOST` | str | `0.0.0.0` | API server bind address. Keep `0.0.0.0` for Tailscale access; `127.0.0.1` to restrict to localhost only. |
 | `LIFEOS_PORT` | int | `8000` | API server port. |
+| `LIFEOS_SERVER_HOSTNAME` | str | — | Hostname of the one machine designated to run the LifeOS API server (e.g. `<your-host>`, matching `hostname`/`socket.gethostname()` there). Empty (default) disables the guard so a fresh clone is never blocked. When set, `api/main.py` and `scripts/server.sh` refuse to start on any other machine — other machines should point at the designated host via `LIFEOS_API_URL` instead of running their own server (#506). |
 | `LIFEOS_CHROMA_URL` | str | `http://localhost:8001` | ChromaDB server endpoint the API connects to. |
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
 | `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/claude` orchestrator path resolution. |
 | `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
-| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
+| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output, and returned as `secure_url` by `GET /api/chat/config` so `/chat` can offer a one-tap link here when the mic is blocked by an insecure context. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
@@ -56,7 +57,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). Recorded in ADR-009. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
 | `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Stronger model a chat turn escalates to when the user pushes back on a refusal, or asks ("escalate to opus"). Empty disables escalation. Anthropic backend only. |
-| `LIFEOS_AGENT_ESCALATION_LADDER` | str | — (derived) | Comma-separated escalation rungs (models / engine names `codex`,`claude_code`). Empty derives `[escalation_model, claude_code]` — so a 2nd pushback hands off to Claude Code. Override e.g. `claude-sonnet-4-6,claude-opus-4-8,claude_code`. |
+| `LIFEOS_AGENT_ESCALATION_LADDER` | str | — (derived) | Comma-separated escalation rungs (models / engine names `codex`,`claude_code`). Empty derives `[escalation_model, claude_code]` — so a 2nd pushback hands off to Claude Code. Override e.g. `claude-sonnet-5,claude-opus-4-8,claude_code`. |
 | `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also used by specialized calls regardless of backend (relationship insights, fact extraction, web search). |
 | `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
@@ -119,7 +120,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
 | `LIFEOS_AGENT_OUTPUT_DIR` | path | `LifeOS/Tasks/Agent Output` | Vault-relative folder where the worker writes an Agent Output note on every successful task completion (one note per one-off task; one shared, prepended note per recurring cron schedule). |
 | `LIFEOS_AGENT_PREFLIGHT_MODEL` | str | `claude-haiku-4-5` | Model used for preflight (budget parsing, routing, ambiguity, sanity). |
-| `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-4-6` | Informational — actual model lives in the Anthropic Console preset. |
+| `LIFEOS_AGENT_MANAGED_MODEL` | str | `claude-sonnet-5` | Informational — actual model lives in the Anthropic Console preset. |
 | `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS` | str | — | Override for test runs. |
 | `LIFEOS_AGENT_MAX_SPAWN_DEPTH` | int | varies | Hard cap on nested spawn depth (parent → child → grandchild). |
 | `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT` | int | varies | Total descendants per root session. |
@@ -295,6 +296,7 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 | `TELEGRAM_FITNESS_BOT_TOKEN` / `TELEGRAM_FITNESS_CHAT_ID` | `fitness` | Pure chat — clinical training/nutrition logging surface. |
 | `TELEGRAM_THERAPIST_BOT_TOKEN` / `TELEGRAM_THERAPIST_CHAT_ID` | `therapist` | Pure chat — advice-oriented surface grounded in therapy notes. |
 | `TELEGRAM_DOCTOR_BOT_TOKEN` / `TELEGRAM_DOCTOR_CHAT_ID` | `doctor` | **Orchestration** — self-repair surface that files an issue and ships a fix. See [doctor-bot.md](doctor-bot.md). |
+| `TELEGRAM_FINANCE_BOT_TOKEN` / `TELEGRAM_FINANCE_CHAT_ID` | `finance` | Pure chat — financial-planning surface grounded in the investments snapshot + Monarch. |
 
 ### Monarch Money
 

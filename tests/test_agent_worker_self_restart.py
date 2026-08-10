@@ -309,6 +309,26 @@ exec "$@"
 
 
 @pytest.mark.unit
+def test_worker_unit_has_no_api_restart_cascade():
+    """Regression pin (2026-07-09): Requires=/BindsTo=/PartOf=lifeos-api on the
+    worker unit made EVERY api restart SIGTERM the worker — killing all
+    in-flight agent sessions, including the doctor session whose own commit or
+    deploy step triggered the restart. The worker must not follow api
+    restarts; it polls over HTTP and retries through outages, and is
+    restarted explicitly (auto-deploy per-unit, doctor via
+    restart-worker-detached) when its own code changes."""
+    unit = (Path(__file__).parent.parent
+            / "config" / "systemd" / "lifeos-agent-worker.service").read_text()
+    directives = [
+        line.strip() for line in unit.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for forbidden in ("Requires=lifeos-api", "BindsTo=lifeos-api", "PartOf=lifeos-api"):
+        assert not any(d.startswith(forbidden) for d in directives), forbidden
+    # Ordering (not binding) is still fine.
+    assert any(d.startswith("After=") and "lifeos-api" in d for d in directives)
+
+
 def test_classify_change_picks_worker_vs_api(tmp_path: Path):
     """classify-change prints 'worker' for an agent_worker diff, 'api' otherwise."""
     if not SERVER_SH.exists():

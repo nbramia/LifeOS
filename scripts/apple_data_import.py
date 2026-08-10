@@ -22,6 +22,7 @@ import re
 import shutil
 import logging
 import argparse
+import subprocess
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -44,6 +45,29 @@ IMPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 STALENESS_WARNING_HOURS = 48
 STALENESS_CRITICAL_HOURS = 168  # 7 days
+
+
+def _get_local_main_sha() -> str | None:
+    """Return this host's current `main` SHA, or None if it can't be determined.
+
+    Used only to flag a stale Mac Mini agent (issue #509) — best-effort and
+    non-fatal, since a detached HEAD, missing git binary, or any other
+    lookup failure here must never affect the import itself.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "main"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def check_manifest() -> dict | None:
@@ -106,6 +130,19 @@ def check_manifest() -> dict | None:
                     f"Check wacli/tooling on the Mac Mini."
                 )
 
+    # Flag a Mac Mini agent whose self-update (issue #509) has fallen behind.
+    # `agent_sha` is absent on manifests written before this change — that's
+    # expected and not a problem, so only compare when it's actually present.
+    agent_sha = manifest.get("agent_sha")
+    if agent_sha:
+        local_sha = _get_local_main_sha()
+        if local_sha and agent_sha != local_sha:
+            logger.warning(
+                f"Apple Data Agent exported from {agent_sha[:7]}, which differs from "
+                f"this host's main ({local_sha[:7]}) — its self-update may have failed. "
+                f"Check the agent log on the Mac Mini."
+            )
+
     return manifest
 
 
@@ -122,10 +159,24 @@ def _manifest_source_errored(manifest: dict | None, source: str) -> bool:
     return source_result.get("status") == "error"
 
 
-def import_contacts(dry_run: bool = False) -> dict:
-    """Import contacts from JSON export."""
+def import_contacts(dry_run: bool = False, manifest: dict | None = None) -> dict:
+    """Import contacts from JSON export.
+
+    Manifest-aware like import_whatsapp: if the Mac-side export marked
+    contacts as errored (e.g. the zero-count/empty-path pattern from
+    issue #505), propagate that as a failure here too instead of quietly
+    returning "skipped" — a manifest error must not look like a healthy
+    no-op.
+    """
     contacts_path = IMPORT_DIR / "contacts.json"
+    manifest_errored = _manifest_source_errored(manifest, "contacts")
+
     if not contacts_path.exists():
+        if manifest_errored:
+            return {
+                "status": "error",
+                "reason": "contacts.json not found and Mac export marked contacts as error",
+            }
         return {"status": "skipped", "reason": "contacts.json not found"}
 
     with open(contacts_path) as f:
@@ -135,7 +186,11 @@ def import_contacts(dry_run: bool = False) -> dict:
     logger.info(f"Found {len(contacts)} contacts to import (exported {data.get('exported_at', '?')})")
 
     if dry_run:
-        return {"status": "dry_run", "count": len(contacts)}
+        result = {"status": "dry_run", "count": len(contacts)}
+        if manifest_errored:
+            result["status"] = "error"
+            result["reason"] = "Mac export marked contacts as error (stale file used for dry-run counts)"
+        return result
 
     from api.services.source_entity import (
         get_source_entity_store, SourceEntity, LINK_STATUS_AUTO,
@@ -223,7 +278,11 @@ def import_contacts(dry_run: bool = False) -> dict:
             linked += 1
 
     logger.info(f"Contacts: {created} created, {updated} updated, {linked} linked")
-    return {"status": "ok", "created": created, "updated": updated, "linked": linked}
+    result = {"status": "ok", "created": created, "updated": updated, "linked": linked}
+    if manifest_errored:
+        result["status"] = "error"
+        result["reason"] = "Mac export marked contacts as error; imported stale contacts.json"
+    return result
 
 
 def import_imessage(dry_run: bool = False) -> dict:
@@ -675,12 +734,21 @@ def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict
         process_whatsapp_messages,
     )
 
-    contact_stats = process_whatsapp_contacts(contacts, dry_run=dry_run)
+    contact_stats = process_whatsapp_contacts(
+        contacts,
+        lid_contacts=lid_contacts,
+        lid_phones=lid_phones,
+        dry_run=dry_run,
+    )
     logger.info(
         f"WhatsApp contacts: {contact_stats['source_entities_created']} created, "
         f"{contact_stats['source_entities_updated']} updated, "
         f"{contact_stats['persons_linked']} linked, "
-        f"{contact_stats['skipped']} skipped"
+        f"{contact_stats['skipped']} skipped, "
+        f"{contact_stats['lid_contacts_read']} lid contacts read "
+        f"({contact_stats['lid_entities_created']} created, "
+        f"{contact_stats['lid_merged_into_classic']} merged into classic, "
+        f"{contact_stats['lid_skipped']} skipped)"
     )
 
     message_stats = process_whatsapp_messages(
@@ -768,11 +836,14 @@ def main():
     # Some sources need the manifest to distinguish "nothing exported" from
     # "export attempted and failed". Keep the uniform (dry_run,) signature for
     # the rest so the dispatch stays simple.
+    def _import_contacts_wrapper(dry_run: bool = False) -> dict:
+        return import_contacts(dry_run=dry_run, manifest=manifest)
+
     def _import_whatsapp_wrapper(dry_run: bool = False) -> dict:
         return import_whatsapp(dry_run=dry_run, manifest=manifest)
 
     sources = {
-        "contacts": import_contacts,
+        "contacts": _import_contacts_wrapper,
         "imessage": import_imessage,
         "phone": import_phone_calls,
         "photos": import_photos_faces,

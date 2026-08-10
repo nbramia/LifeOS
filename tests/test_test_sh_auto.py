@@ -63,10 +63,14 @@ _CASES = [
     # plain service/config code -> unit
     ("api/services/llm_client.py", "unit", "service_plain"),
     ("config/settings.py", "unit", "config"),
-    # frontend -> unit + critical browser test
+    # frontend -> unit + critical browser test. These paths must be ones that
+    # really exist: the mapping previously matched on `static/` and
+    # `/templates/`, neither of which is in this repo, and these cases asserted
+    # the same fiction — so a web/-only JS change silently skipped the browser
+    # scope while the suite stayed green (#518).
     ("api/routes/chat.py", "unit browser", "front_routes"),
-    ("static/app.js", "unit browser", "front_js"),
-    ("api/templates/index.html", "unit browser", "front_html"),
+    ("web/chat/voice.js", "unit browser", "front_js"),
+    ("web/index.html", "unit browser", "front_html"),
     # sync / index -> unit + slow
     ("scripts/run_all_syncs.py", "unit slow", "sync_script"),
     ("api/services/slack_sync.py", "unit slow", "sync_service"),
@@ -94,3 +98,15 @@ _CASES = [
 )
 def test_auto_scope_mapping(changed, expected):
     assert _plan(changed) == expected
+
+
+# The frontend cases are the ones that broke: they asserted `static/app.js` and
+# `api/templates/index.html`, paths this repo has never had, so the mapping and
+# its tests agreed on a layout that didn't exist. Pin them to real files so a
+# future move of web/ fails here instead of silently narrowing the scope.
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["api/routes/chat.py", "web/chat/voice.js", "web/index.html"])
+def test_frontend_fixture_paths_exist(path):
+    assert (REPO / path).exists(), (
+        f"{path} no longer exists — decide_plan's frontend pattern and this "
+        f"test's fixtures are out of sync with the repo layout")

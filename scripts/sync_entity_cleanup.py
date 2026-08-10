@@ -261,9 +261,19 @@ def main():
     try:
         stats = run_cleanup(dry_run=dry_run)
 
-        # Print summary for sync pipeline parsing
+        # Canonical line consumed by run_all_syncs._parse_sync_output. The
+        # bare "created:/updated:" prints below were written for the original
+        # parser; commit 1a753b1 (2026-02-11) removed those generic patterns
+        # and this script silently reported 0/0/0 from that night on, while
+        # still doing ~600s of real work for months (#497).
+        from api.services.sync_health import emit_sync_stats
+        emit_sync_stats({
+            "processed": int(stats.get("total_entities", 0) or 0),
+            "updated": int(stats.get("auto_hidden", 0) or 0),
+        })
+
+        # Human-readable summary (no longer load-bearing for stats).
         print(f"processed: {stats['total_entities']}")
-        print("created: 0")
         print(f"updated: {stats['auto_hidden']}")
 
         return 0

@@ -1011,6 +1011,61 @@ class SessionStore:
             )
         return cur.lastrowid
 
+    def add_reply_anchors(
+        self,
+        session_id: str,
+        task_id: str,
+        message_ids: list[int],
+        bot: str | None = None,
+    ) -> None:
+        """Register operator-facing message ids as reply anchors for a session.
+
+        Every message a session sends to Telegram (streamed [NOTIFY] bodies,
+        heartbeats, acks) registers here so a threaded reply to ANY of them can
+        be routed back into the session as a context note. One always-open
+        ``kind='status_anchor'`` row per session accumulates the ids in its
+        ``sent_message_ids`` JSON list — reusing the pending_questions matching
+        machinery without new schema. The row is excluded from deposit_answer,
+        the web open-question lookup, and the timeout sweep: it is a routing
+        index, not a question.
+        """
+        if not message_ids:
+            return
+        ids = [int(i) for i in message_ids]
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, sent_message_ids FROM pending_questions "
+                "WHERE session_id = ? AND kind = 'status_anchor' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO pending_questions (
+                        session_id, task_id, question, sent_message_id, sent_at,
+                        kind, sent_message_ids, bot
+                    ) VALUES (?, ?, ?, ?, ?, 'status_anchor', ?, ?)
+                    """,
+                    (session_id, task_id, "(session reply anchors)", ids[0],
+                     _now(), json.dumps(ids), bot),
+                )
+            else:
+                existing = json.loads(row["sent_message_ids"] or "[]")
+                merged = existing + [i for i in ids if i not in existing]
+                conn.execute(
+                    "UPDATE pending_questions SET sent_message_ids = ? WHERE id = ?",
+                    (json.dumps(merged), row["id"]),
+                )
+
+    def has_pending_messages(self, session_id: str) -> bool:
+        """True when undelivered pending messages exist for `session_id`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_messages WHERE session_id = ? AND delivered = 0 LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def register_completion_followup(
         self,
         session_id: str,
@@ -1065,6 +1120,7 @@ class SessionStore:
             row = conn.execute(
                 "SELECT id FROM pending_questions "
                 "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor' "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +
@@ -1095,6 +1151,7 @@ class SessionStore:
             row = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE session_id = ? AND answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor' "
                 "ORDER BY id ASC LIMIT 1",
                 (session_id,),
             ).fetchone()
@@ -1187,8 +1244,30 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_latest_open_question(
+        self, bot: str | None = None, kind: str | None = None
+    ) -> dict | None:
+        """The most recent open (unanswered, not-timed-out) question, optionally
+        filtered by owning bot and kind. Used to route a bare affirmative sent
+        as a plain message to the goal gate it almost certainly answers (#453)
+        instead of spawning a context-free session."""
+        bot_clause, bot_params = self._bot_scope_clause(bot)
+        kind_clause = " AND kind = ?" if kind else ""
+        params: list = [*bot_params, *([kind] if kind else [])]
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "AND kind != 'status_anchor'"
+                + bot_clause + kind_clause +
+                " ORDER BY id DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_open_question_by_message_id(
-        self, sent_message_id: int, bot: str | None = None
+        self, sent_message_id: int, bot: str | None = None,
+        include_answered: bool = False,
     ) -> dict | None:
         """Return the open (unanswered, not-timed-out) question a reply to
         `sent_message_id` matches — on any chunk — or None.
@@ -1196,13 +1275,18 @@ class SessionStore:
         Read-only sibling of `deposit_answer`: lets a caller inspect the matched
         row's `kind` before recording an answer (e.g. so the Telegram listener
         can recognize a ``routing='code'`` follow-up). When `bot` is given, the
-        match is scoped to that bot (see :meth:`_bot_scope_clause`).
+        match is scoped to that bot (see :meth:`_bot_scope_clause`). With
+        ``include_answered=True`` the answered_at filter is dropped, so a
+        caller can recognize a reply landing on an ALREADY-answered question
+        (check ``answered_at`` on the returned row) instead of treating it as
+        unrelated.
         """
         bot_clause, bot_params = self._bot_scope_clause(bot)
+        answered_clause = "" if include_answered else "answered_at IS NULL AND "
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM pending_questions "
-                "WHERE answered_at IS NULL AND timed_out = 0 "
+                "WHERE " + answered_clause + "timed_out = 0 "
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +
@@ -1232,7 +1316,8 @@ class SessionStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM pending_questions "
-                "WHERE answered_at IS NULL AND timed_out = 0 AND sent_at < ?",
+                "WHERE answered_at IS NULL AND timed_out = 0 AND sent_at < ? "
+                "AND kind != 'status_anchor'",
                 (int(before_ts),),
             ).fetchall()
         return [dict(r) for r in rows]

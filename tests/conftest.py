@@ -18,18 +18,61 @@ Run categories:
 - pytest -n auto              # Parallel execution (requires pytest-xdist)
 """
 import gc
+import os
 
 import pytest
+
+# git exports GIT_DIR (absolute when the invoker is a linked worktree) to hook
+# subprocesses — and the pre-push hook runs this suite. Tests that spawn `git`
+# in tmp fixture repos would inherit it and silently operate on the REAL repo:
+# committing fixture files onto real branches, flipping core.bare, rewriting
+# user identity. Scrub before any test runs so fixture git calls always
+# resolve via their own cwd.
+for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+    os.environ.pop(_var, None)
+
+
+# ---------------------------------------------------------------------------
+# Force CPU-only embeddings under pytest (#521).
+#
+# This host's iGPU has only 8 SDMA queues. `pytest -n auto` (see
+# scripts/test.sh) spawns one worker process per core (16 here), and any
+# worker that touches EmbeddingService would independently try to load the
+# GPU model — several processes grabbing GPU compute queues at once is
+# exactly the concurrency pattern that exhausted the queues and preceded the
+# 2026-07-10 host freeze. Tests don't need GPU throughput, so hide the GPU
+# unconditionally rather than relying on every future test to remember to.
+#
+# This MUST be a pytest_configure hook, not an autouse fixture. Fixtures run
+# per-test, after collection — by which point pytest has already imported
+# every test module (and conftest fixture module), and any of those imports
+# could have already pulled in torch/ROCm, which reads these env vars once
+# at process start and caches the visible-device list. pytest_configure runs
+# immediately after conftest.py itself is imported but *before* pytest
+# collects/imports any test module, so it's the latest point that's still
+# early enough to change what torch sees.
+#
+# `scripts/test.sh` also exports these (defense in depth) so anything that
+# runs outside pytest itself (e.g. a helper script test.sh shells out to)
+# still gets a CPU-only embedding model.
+def _force_cpu_embeddings_for_tests() -> None:
+    for _var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        os.environ.setdefault(_var, "")
 
 
 def pytest_configure(config):
     """Register custom markers."""
+    _force_cpu_embeddings_for_tests()
     config.addinivalue_line("markers", "unit: Fast unit tests")
     config.addinivalue_line("markers", "slow: Slow tests (ChromaDB, embeddings)")
     config.addinivalue_line("markers", "integration: Integration tests (server required)")
     config.addinivalue_line("markers", "browser: Browser tests using Playwright")
     config.addinivalue_line("markers", "requires_ollama: Requires Ollama running")
-    config.addinivalue_line("markers", "requires_server: Requires API server running")
+    config.addinivalue_line(
+        "markers",
+        "requires_server: Requires API server running. On a browser test this is "
+        "what excludes it from the server-free set the pre-push hook runs.",
+    )
     config.addinivalue_line("markers", "requires_db: Requires direct database access (may conflict with running server)")
     config.addinivalue_line(
         "markers",

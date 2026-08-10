@@ -2,9 +2,10 @@
 import json
 import logging
 import plistlib
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +238,552 @@ class TestContactsExport:
 
 
 # ---------------------------------------------------------------------------
+# Contacts .abcddb (SQLite AddressBook) parsing — issue #514
+# ---------------------------------------------------------------------------
+
+def _build_abcddb(
+    path: Path,
+    contacts: list[dict],
+    contact_ent: int = 22,
+    other_ent: int = 19,
+    other_ent_name: str = "ABCDGroup",
+):
+    """Build a synthetic AddressBook-v22.abcddb with the real table/column
+    shape (verified read-only against the real schema) but entirely
+    synthetic data. Each item in `contacts` is a dict with keys: pk, uid,
+    first, last, org, nickname, job_title, department, birthday (seconds
+    since Core Data epoch or None), phones (list of (label, value)),
+    emails (list of (label, value)).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER PRIMARY KEY, Z_NAME VARCHAR)")
+    conn.execute("INSERT INTO Z_PRIMARYKEY VALUES (?, 'ABCDContact')", (contact_ent,))
+    conn.execute("INSERT INTO Z_PRIMARYKEY VALUES (?, ?)", (other_ent, other_ent_name))
+    conn.execute(
+        """CREATE TABLE ZABCDRECORD (
+            Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, ZUNIQUEID VARCHAR,
+            ZFIRSTNAME VARCHAR, ZLASTNAME VARCHAR, ZORGANIZATION VARCHAR,
+            ZNICKNAME VARCHAR, ZJOBTITLE VARCHAR, ZDEPARTMENT VARCHAR,
+            ZBIRTHDAY TIMESTAMP
+        )"""
+    )
+    conn.execute(
+        "CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZLABEL VARCHAR, ZFULLNUMBER VARCHAR)"
+    )
+    conn.execute(
+        "CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZLABEL VARCHAR, ZADDRESS VARCHAR)"
+    )
+
+    for c in contacts:
+        conn.execute(
+            """INSERT INTO ZABCDRECORD
+               (Z_PK, Z_ENT, ZUNIQUEID, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION,
+                ZNICKNAME, ZJOBTITLE, ZDEPARTMENT, ZBIRTHDAY)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                c["pk"], c.get("ent", contact_ent), c["uid"],
+                c.get("first"), c.get("last"), c.get("org"),
+                c.get("nickname"), c.get("job_title"), c.get("department"),
+                c.get("birthday"),
+            ),
+        )
+        for label, value in c.get("phones", []):
+            conn.execute(
+                "INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZLABEL, ZFULLNUMBER) VALUES (?,?,?)",
+                (c["pk"], label, value),
+            )
+        for label, value in c.get("emails", []):
+            conn.execute(
+                "INSERT INTO ZABCDEMAILADDRESS (ZOWNER, ZLABEL, ZADDRESS) VALUES (?,?,?)",
+                (c["pk"], label, value),
+            )
+
+    # An unrelated group row (different Z_ENT) with no phone/email — must
+    # never surface as a contact.
+    conn.execute(
+        "INSERT INTO ZABCDRECORD (Z_PK, Z_ENT, ZUNIQUEID, ZFIRSTNAME) VALUES (999, ?, 'group-uid', 'Not A Person')",
+        (other_ent,),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestAbcddbContactsParsing:
+    """Test _fetch_abcddb_contacts against a synthetic AddressBook-v22.abcddb."""
+
+    def test_fetch_basic_contact_with_phone_and_email(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {
+                "pk": 1, "uid": "SYNTH-UID-1", "first": "Alex", "last": "Chen",
+                "org": "Example Corp", "job_title": "Engineer",
+                "phones": [("_$!<Mobile>!$_", "+15555550101")],
+                "emails": [("_$!<Work>!$_", "alex.chen@example.com")],
+            },
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        assert len(contacts) == 1
+        c = contacts[0]
+        assert c["full_name"] == "Alex Chen"
+        assert c["organization"] == "Example Corp"
+        assert c["job_title"] == "Engineer"
+        assert c["identifier"] == "abcddb:SYNTH-UID-1"
+        assert c["phones"] == [{"label": "Mobile", "value": "+15555550101"}]
+        assert c["emails"] == [{"label": "Work", "value": "alex.chen@example.com"}]
+
+    def test_fetch_excludes_non_contact_entity_rows(self, tmp_path):
+        """Rows in ZABCDRECORD whose Z_ENT isn't the looked-up ABCDContact
+        entity (groups, containers, ...) must not be treated as contacts."""
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-2", "first": "Priya", "last": "Kapoor"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        names = {c["full_name"] for c in contacts}
+        assert names == {"Priya Kapoor"}
+        assert "Not A Person" not in names
+
+    def test_fetch_org_only_contact(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-3", "org": "Fictional Widgets Inc"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+
+        assert len(contacts) == 1
+        assert contacts[0]["full_name"] == "Fictional Widgets Inc"
+        assert contacts[0]["given_name"] == ""
+
+    def test_fetch_no_name_or_org_skipped(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-4"},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+        assert contacts == []
+
+    def test_fetch_birthday_roundtrip(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        core_data_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+        birthday_seconds = 100_000_000  # ~3.17 years after the epoch
+        expected = (core_data_epoch + timedelta(seconds=birthday_seconds)).isoformat()
+
+        db_path = tmp_path / "AddressBook-v22.abcddb"
+        _build_abcddb(db_path, [
+            {"pk": 1, "uid": "SYNTH-UID-5", "first": "Sam", "birthday": birthday_seconds},
+        ])
+
+        contacts = _fetch_abcddb_contacts(db_path)
+        assert contacts[0]["birthday"] == expected
+
+    def test_fetch_missing_file_returns_empty(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        contacts = _fetch_abcddb_contacts(tmp_path / "does-not-exist.abcddb")
+        assert contacts == []
+
+    def test_fetch_corrupt_db_returns_empty(self, tmp_path):
+        from scripts.apple_data_export import _fetch_abcddb_contacts
+
+        bad_db = tmp_path / "corrupt.abcddb"
+        bad_db.write_bytes(b"not a sqlite file")
+
+        contacts = _fetch_abcddb_contacts(bad_db)
+        assert contacts == []
+
+
+class TestContactsDedup:
+    """Test _dedupe_contacts, the cross-source merge logic for #514."""
+
+    def _contact(self, full_name="", org="", emails=None, phones=None, **extra):
+        c = {
+            "identifier": extra.pop("identifier", "id"),
+            "given_name": extra.pop("given_name", ""),
+            "family_name": extra.pop("family_name", ""),
+            "full_name": full_name,
+            "nickname": extra.pop("nickname", ""),
+            "organization": org,
+            "job_title": extra.pop("job_title", ""),
+            "department": extra.pop("department", ""),
+            "emails": emails or [],
+            "phones": phones or [],
+            "addresses": [],
+            "social_profiles": [],
+            "note": "",
+            "image_available": False,
+            "birthday": extra.pop("birthday", None),
+        }
+        c.update(extra)
+        return c
+
+    def test_merges_same_name_across_sources(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        icloud = self._contact(
+            identifier="icloud-1", full_name="Jordan Lee",
+            phones=[{"label": "Mobile", "value": "+15555550111"}],
+        )
+        exchange = self._contact(
+            identifier="exchange-1", full_name="Jordan Lee",
+            emails=[{"label": "Work", "value": "jordan.lee@example.com"}],
+        )
+
+        result = _dedupe_contacts([icloud, exchange])
+
+        assert len(result) == 1
+        merged = result[0]
+        assert merged["phones"] == [{"label": "Mobile", "value": "+15555550111"}]
+        assert merged["emails"] == [{"label": "Work", "value": "jordan.lee@example.com"}]
+
+    def test_merge_is_case_and_whitespace_insensitive(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="  Taylor Morgan  ")
+        b = self._contact(identifier="b", full_name="taylor   morgan")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 1
+
+    def test_does_not_merge_different_names(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="Morgan Reed")
+        b = self._contact(identifier="b", full_name="Casey Reed")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 2
+
+    def test_dedup_by_organization_when_no_name(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", org="Fictional Widgets Inc")
+        b = self._contact(identifier="b", org="Fictional Widgets Inc")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 1
+
+    def test_no_name_or_org_passes_through_unmerged(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a")
+        b = self._contact(identifier="b")
+
+        result = _dedupe_contacts([a, b])
+        assert len(result) == 2
+
+    def test_dedup_backfills_empty_fields(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(identifier="a", full_name="Riley Park", job_title="")
+        b = self._contact(identifier="b", full_name="Riley Park", job_title="Analyst")
+
+        result = _dedupe_contacts([a, b])
+        assert result[0]["job_title"] == "Analyst"
+
+    def test_dedup_deduplicates_repeated_email_value(self):
+        from scripts.apple_data_export import _dedupe_contacts
+
+        a = self._contact(
+            identifier="a", full_name="Nina Okafor",
+            emails=[{"label": "Home", "value": "nina@example.com"}],
+        )
+        b = self._contact(
+            identifier="b", full_name="Nina Okafor",
+            emails=[{"label": "Work", "value": "NINA@EXAMPLE.COM"}],
+        )
+
+        result = _dedupe_contacts([a, b])
+        assert len(result[0]["emails"]) == 1
+
+
+class TestContactsExportAbcddbIntegration:
+    """End-to-end export_contacts() coverage for the .abcddb path, including
+    the .abcdp fallback and the both-empty error case (issue #514)."""
+
+    def _lib_ab(self, tmp_path: Path) -> Path:
+        return tmp_path / "Library" / "Application Support" / "AddressBook"
+
+    def test_export_reads_abcddb_when_present(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])  # empty root DB
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-1" / "AddressBook-v22.abcddb",
+            [
+                {
+                    "pk": 1, "uid": "SRC1-UID-1", "first": "Morgan", "last": "Diallo",
+                    "phones": [("_$!<Mobile>!$_", "+15555550199")],
+                    "emails": [("_$!<Home>!$_", "morgan.diallo@example.com")],
+                },
+            ],
+        )
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        contact = data["contacts"][0]
+        assert contact["full_name"] == "Morgan Diallo"
+        assert len(contact["phones"]) == 1
+        assert len(contact["emails"]) == 1
+
+    def test_export_dedupes_across_two_source_dbs(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        # Same real contact synced into two account sources (e.g. iCloud +
+        # Exchange), each with different contact info.
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-A" / "AddressBook-v22.abcddb",
+            [{
+                "pk": 1, "uid": "SRC-A-UID-1", "first": "Sasha", "last": "Ivanov",
+                "phones": [("_$!<Mobile>!$_", "+15555550177")],
+            }],
+        )
+        _build_abcddb(
+            lib_ab / "Sources" / "SRC-B" / "AddressBook-v22.abcddb",
+            [{
+                "pk": 1, "uid": "SRC-B-UID-1", "first": "Sasha", "last": "Ivanov",
+                "emails": [("_$!<Work>!$_", "sasha.ivanov@example.com")],
+            }],
+        )
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["count"] == 1
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        contact = data["contacts"][0]
+        assert len(contact["phones"]) == 1
+        assert len(contact["emails"]) == 1
+
+    def test_abcdp_fallback_used_when_abcddb_yields_nothing(self, tmp_path):
+        """If .abcddb files exist but contain no contact rows, .abcdp files
+        (if present) must still be read."""
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])  # no contacts
+
+        meta_dir = lib_ab / "Sources" / "LEGACY-SRC" / "Metadata"
+        meta_dir.mkdir(parents=True)
+        with open(meta_dir / "LEGACY-UID:ABPerson.abcdp", "wb") as f:
+            plistlib.dump({"First": "Dana", "Last": "Osei"}, f)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "ok"
+        assert result["count"] == 1
+        with open(export_dir / "contacts.json") as f:
+            data = json.load(f)
+        assert data["contacts"][0]["full_name"] == "Dana Osei"
+
+    def test_both_abcddb_and_abcdp_empty_returns_error(self, tmp_path):
+        from scripts.apple_data_export import export_contacts
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        lib_ab = self._lib_ab(tmp_path)
+        _build_abcddb(lib_ab / "AddressBook-v22.abcddb", [])
+        (lib_ab / "Sources" / "SRC-EMPTY" / "Metadata").mkdir(parents=True)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export_contacts(dry_run=False)
+
+        assert result["status"] == "error"
+        assert result["count"] == 0
+        assert result["path"] == ""
+        assert not (export_dir / "contacts.json").exists()
+
+
+class TestExportResultFinalization:
+    """_finalize_result guards against a source reporting "ok" with no
+    actual output. Issue #505's secondary finding: export_contacts returned
+    {"status": "ok", "count": 0, "path": ""} when no .abcdp files existed —
+    indistinguishable from a genuinely healthy empty result."""
+
+    def _finalize(self):
+        from scripts.apple_data_export import _finalize_result
+        return _finalize_result
+
+    def test_ok_zero_count_empty_path_becomes_error(self):
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 0, "path": ""})
+        assert result["status"] == "error"
+        assert "reason" in result
+
+    def test_ok_with_real_output_is_unaffected(self):
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 3, "path": "/tmp/contacts.json"})
+        assert result == {"status": "ok", "count": 3, "path": "/tmp/contacts.json"}
+
+    def test_ok_zero_count_but_written_path_is_unaffected(self):
+        """A genuinely empty but successfully-written export (e.g. 0 phone
+        calls, but phone_calls.json was still written) must not be flagged —
+        only the count-0-AND-path-empty combination means nothing happened."""
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "count": 0, "path": "/tmp/phone_calls.json"})
+        assert result["status"] == "ok"
+
+    def test_non_ok_status_is_unaffected(self):
+        finalize = self._finalize()
+        result = finalize({"status": "skipped", "reason": "AddressBook not found"})
+        assert result == {"status": "skipped", "reason": "AddressBook not found"}
+
+    def test_ok_without_count_or_path_keys_is_unaffected(self):
+        """Sources like imessage/photos/whatsapp use different result
+        shapes (size_mb, people/faces, contacts/messages) and must not be
+        caught by this contacts-shaped check."""
+        finalize = self._finalize()
+        result = finalize({"status": "ok", "size_mb": 12.3, "path": "/tmp/imessage.db"})
+        assert result["status"] == "ok"
+
+    def test_export_contacts_no_abcdp_files_gets_finalized_to_error(self, tmp_path):
+        """Full-loop check: export_contacts's own empty-result, run through
+        _finalize_result exactly as main() does, stays an error.
+
+        Historically (issue #505) export_contacts returned {"status": "ok",
+        "count": 0, "path": ""} here and _finalize_result had to catch it.
+        Issue #514 made export_contacts itself report "error" directly when
+        neither the .abcddb nor the .abcdp path yields any contacts, so this
+        is now a no-op pass-through rather than a state flip."""
+        from scripts.apple_data_export import export_contacts
+
+        lib_ab = tmp_path / "Library" / "Application Support" / "AddressBook"
+        (lib_ab / "Sources" / "SOURCE-1" / "Metadata").mkdir(parents=True)
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path):
+            raw = export_contacts(dry_run=False)
+
+        assert raw["status"] == "error"
+        assert raw["count"] == 0
+        assert raw["path"] == ""
+
+        finalized = self._finalize()(raw)
+        assert finalized["status"] == "error"
+
+
+class TestContactsImportManifestAware:
+    """import_contacts must not report success/skip when the Mac-side
+    export marked contacts as errored (issue #505 acceptance criteria:
+    "the Linux import surfaces it rather than reporting success")."""
+
+    def _write_contacts(self, import_dir: Path, contacts: list[dict]):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        with open(import_dir / "contacts.json", "w") as f:
+            json.dump({"contacts": contacts, "exported_at": "2026-01-01T00:00:00+00:00"}, f)
+
+    def _errored_manifest(self):
+        return {
+            "results": {
+                "contacts": {
+                    "status": "error",
+                    "reason": "reported ok with zero count and no output path",
+                }
+            }
+        }
+
+    def test_missing_file_no_manifest_error_is_still_skipped(self, tmp_path):
+        """Regression check: unrelated to #505, unchanged behavior."""
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=False, manifest=None)
+
+        assert result == {"status": "skipped", "reason": "contacts.json not found"}
+
+    def test_missing_file_with_manifest_error_is_error(self, tmp_path):
+        """The exact issue #505 scenario: export never wrote contacts.json
+        (zero .abcdp files found), the export-side fix now marks that as an
+        error in the manifest, and the import must surface an error instead
+        of a benign "skipped"."""
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=False, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert "contacts.json not found" in result["reason"]
+
+    def test_dry_run_with_manifest_error_is_error(self, tmp_path):
+        from scripts.apple_data_import import import_contacts
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_contacts(import_dir, [{"identifier": "u1", "full_name": "Jane Doe"}])
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            result = import_contacts(dry_run=True, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert result["count"] == 1
+
+    def test_execute_with_manifest_error_still_imports_but_flags_error(self, tmp_path):
+        """A stale contacts.json from a previous good run should still be
+        imported (data is better than nothing) but the run must be flagged
+        as errored so it doesn't look like a clean success — mirrors
+        import_whatsapp's existing manifest-aware behavior."""
+        from scripts.apple_data_import import import_contacts
+        from unittest.mock import MagicMock
+        from api.services.source_entity import SourceEntityStore
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_contacts(import_dir, [{"identifier": "u1", "full_name": "Jane Doe"}])
+
+        se_store = SourceEntityStore(db_path=str(tmp_path / "crm.db"))
+        mock_resolver = MagicMock()
+        mock_pe_store = MagicMock()
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+             patch("api.services.source_entity.get_source_entity_store", return_value=se_store), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=mock_resolver), \
+             patch("api.services.person_entity.get_person_entity_store", return_value=mock_pe_store):
+            result = import_contacts(dry_run=False, manifest=self._errored_manifest())
+
+        assert result["status"] == "error"
+        assert result["created"] == 1
+        assert "stale contacts.json" in result["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Staleness alerting
 # ---------------------------------------------------------------------------
 
@@ -330,6 +877,191 @@ class TestStalenessAlerting:
         assert result is not None
         assert "fresh" in caplog.text.lower()
         assert not any("Cannot parse" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Agent self-update SHA (issue #509) — export side
+# ---------------------------------------------------------------------------
+
+class TestAgentShaExport:
+    """_get_agent_sha and the manifest's agent_sha field from apple_data_export."""
+
+    def test_get_agent_sha_returns_stripped_sha(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=0, stdout="abc123def456\n")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() == "abc123def456"
+
+    def test_get_agent_sha_none_on_nonzero_exit(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=128, stdout="")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() is None
+
+    def test_get_agent_sha_none_on_empty_output(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        fake_result = MagicMock(returncode=0, stdout="\n")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert _get_agent_sha() is None
+
+    def test_get_agent_sha_none_when_git_missing(self):
+        from scripts.apple_data_export import _get_agent_sha
+
+        with patch("scripts.apple_data_export.subprocess.run", side_effect=FileNotFoundError()):
+            assert _get_agent_sha() is None
+
+    def test_main_writes_agent_sha_to_manifest(self, tmp_path, monkeypatch):
+        """main() records the checked-out SHA in manifest.json (issue #509) so the
+        Linux side can tell which revision produced an export without SSHing."""
+        import scripts.apple_data_export as export_mod
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: "deadbeef1234")
+        monkeypatch.setattr(export_mod.sys, "argv", ["apple_data_export.py", "--execute"])
+
+        def fake_source(dry_run=False):
+            return {"status": "ok", "count": 1, "path": "fake"}
+
+        for name in (
+            "export_contacts",
+            "export_imessage",
+            "export_phone_calls",
+            "export_photos_faces",
+            "export_whatsapp",
+        ):
+            monkeypatch.setattr(export_mod, name, fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["agent_sha"] == "deadbeef1234"
+
+    def test_main_writes_null_agent_sha_when_undeterminable(self, tmp_path, monkeypatch):
+        """A non-git checkout (or missing git binary) must not break the export —
+        agent_sha is simply null in that case."""
+        import scripts.apple_data_export as export_mod
+
+        monkeypatch.setattr(export_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(export_mod, "EXPORT_DIR", tmp_path)
+        monkeypatch.setattr(export_mod, "_get_agent_sha", lambda: None)
+        monkeypatch.setattr(export_mod.sys, "argv", ["apple_data_export.py", "--execute"])
+
+        def fake_source(dry_run=False):
+            return {"status": "ok", "count": 1, "path": "fake"}
+
+        for name in (
+            "export_contacts",
+            "export_imessage",
+            "export_phone_calls",
+            "export_photos_faces",
+            "export_whatsapp",
+        ):
+            monkeypatch.setattr(export_mod, name, fake_source)
+
+        export_mod.main()
+
+        manifest = json.loads((tmp_path / "manifest.json").read_text())
+        assert manifest["agent_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# Agent self-update SHA (issue #509) — import side
+# ---------------------------------------------------------------------------
+
+class TestAgentShaImport:
+    """check_manifest flags a Mac Mini export whose agent_sha differs from this
+    host's main — non-fatal, warning-level only, and silent when the field is
+    absent (older manifests) or the local SHA can't be determined."""
+
+    def _write_manifest(self, import_dir: Path, agent_sha=None):
+        import_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "hostname": "test-host",
+            "results": {},
+        }
+        if agent_sha is not None:
+            manifest["agent_sha"] = agent_sha
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+    def test_get_local_main_sha_returns_stripped_sha(self):
+        from scripts.apple_data_import import _get_local_main_sha
+
+        fake_result = MagicMock(returncode=0, stdout="def5678\n")
+        with patch("scripts.apple_data_import.subprocess.run", return_value=fake_result):
+            assert _get_local_main_sha() == "def5678"
+
+    def test_get_local_main_sha_none_on_failure(self):
+        from scripts.apple_data_import import _get_local_main_sha
+
+        with patch("scripts.apple_data_import.subprocess.run", side_effect=FileNotFoundError()):
+            assert _get_local_main_sha() is None
+
+    def test_matching_sha_no_warning(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="abc1234"):
+            with caplog.at_level(logging.WARNING):
+                check_manifest()
+
+        assert not any("differs from" in r.message for r in caplog.records)
+
+    def test_mismatched_sha_warns(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="def5678"):
+            with caplog.at_level(logging.WARNING):
+                check_manifest()
+
+        assert any(
+            r.levelno == logging.WARNING and "differs from" in r.message
+            for r in caplog.records
+        )
+
+    def test_missing_agent_sha_handled_silently(self, tmp_path, caplog):
+        """Manifests written before this change have no agent_sha — must not
+        warn or crash."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha=None)
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="def5678"):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert not any("differs from" in r.message for r in caplog.records)
+
+    def test_local_sha_lookup_failure_handled_silently(self, tmp_path, caplog):
+        """If the local main SHA can't be determined, skip the comparison
+        rather than crash or false-warn."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value=None):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert not any("differs from" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

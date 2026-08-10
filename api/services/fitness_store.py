@@ -61,8 +61,9 @@ class WorkoutSet:
     set_index: int
     reps: Optional[int] = None
     weight: Optional[float] = None
-    weight_unit: str = "lb"
+    unit: str = ""           # lb/kg for weighted sets; steps/m/… for counted work
     rpe: Optional[float] = None
+    duration_seconds: Optional[int] = None
     notes: str = ""
 
 
@@ -89,6 +90,17 @@ class HealthMetric:
     start_at: str = ""
     end_at: str = ""
     source: str = "manual"
+
+
+def format_duration(seconds) -> str:
+    """Render a set duration in seconds as M:SS (or H:MM:SS); '' for falsy.
+    Single source of truth for session summaries and the sheet mirror."""
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _load_aliases() -> dict:
@@ -134,12 +146,25 @@ class FitnessStore:
                     set_index INTEGER NOT NULL,
                     reps INTEGER,
                     weight REAL,
-                    weight_unit TEXT DEFAULT 'lb',
+                    unit TEXT DEFAULT '',
                     rpe REAL,
+                    duration_seconds INTEGER,
                     notes TEXT DEFAULT '',
                     FOREIGN KEY (session_id) REFERENCES workout_sessions(id) ON DELETE CASCADE
                 )
             """)
+            # Migrations for workout_sets created before these columns existed.
+            set_cols = {r[1] for r in conn.execute("PRAGMA table_info(workout_sets)")}
+            if "duration_seconds" not in set_cols:
+                conn.execute("ALTER TABLE workout_sets ADD COLUMN duration_seconds INTEGER")
+            if "weight_unit" in set_cols:
+                conn.execute("ALTER TABLE workout_sets RENAME COLUMN weight_unit TO unit")
+            # The old weight_unit column defaulted to 'lb' unconditionally; a
+            # lb/kg unit is meaningless without a weight, so clear it on
+            # weightless rows. Unconditional (not gated on the rename) so a
+            # crash between the RENAME (DDL, autocommits) and this commit
+            # can't strand rows — the UPDATE is idempotent.
+            conn.execute("UPDATE workout_sets SET unit = '' WHERE weight IS NULL AND unit IN ('lb', 'kg')")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS health_metrics (
                     id TEXT PRIMARY KEY,
@@ -217,14 +242,22 @@ class FitnessStore:
             exercise = self.normalize_exercise(s.get("exercise", ""))
             count = int(s.get("count", 1) or 1)
             count = max(1, count)
+            # lb/kg only make sense with a weight; counted work may carry its
+            # own unit ('steps', 'm'). Accept the legacy 'weight_unit' key.
+            unit = s.get("unit") or s.get("weight_unit") or ""
+            if s.get("weight") is None:
+                if unit in ("lb", "kg"):
+                    unit = ""  # models habitually send lb — enforce the invariant
+            elif not unit:
+                unit = "lb"
             for _ in range(count):
                 conn.execute(
-                    "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, weight_unit, rpe, notes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO workout_sets (id, session_id, exercise, set_index, reps, weight, unit, rpe, duration_seconds, notes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         uuid.uuid4().hex[:12], session_id, exercise, idx,
-                        s.get("reps"), s.get("weight"), s.get("weight_unit") or "lb",
-                        s.get("rpe"), s.get("notes", ""),
+                        s.get("reps"), s.get("weight"), unit,
+                        s.get("rpe"), s.get("duration_seconds"), s.get("notes", ""),
                     ),
                 )
                 idx += 1
@@ -248,12 +281,12 @@ class FitnessStore:
 
     def _fetch_sets(self, conn, session_id: str) -> list[WorkoutSet]:
         rows = conn.execute(
-            "SELECT exercise, set_index, reps, weight, weight_unit, rpe, notes "
+            "SELECT exercise, set_index, reps, weight, unit, rpe, duration_seconds, notes "
             "FROM workout_sets WHERE session_id = ? ORDER BY set_index", (session_id,)
         ).fetchall()
         return [
             WorkoutSet(exercise=r[0], set_index=r[1], reps=r[2], weight=r[3],
-                       weight_unit=r[4], rpe=r[5], notes=r[6] or "")
+                       unit=r[4] or "", rpe=r[5], duration_seconds=r[6], notes=r[7] or "")
             for r in rows
         ]
 
@@ -379,7 +412,7 @@ class FitnessStore:
         conn = sqlite3.connect(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT s.date, ws.reps, ws.weight, ws.weight_unit, ws.rpe, s.id "
+                "SELECT s.date, ws.reps, ws.weight, ws.unit, ws.rpe, ws.duration_seconds, s.id "
                 "FROM workout_sets ws JOIN workout_sessions s ON ws.session_id = s.id "
                 "WHERE ws.exercise = ? ORDER BY s.date DESC, ws.set_index ASC LIMIT ?",
                 (canonical, limit),
@@ -387,7 +420,8 @@ class FitnessStore:
         finally:
             conn.close()
         return [
-            {"date": r[0], "reps": r[1], "weight": r[2], "weight_unit": r[3], "rpe": r[4], "session_id": r[5]}
+            {"date": r[0], "reps": r[1], "weight": r[2], "unit": r[3] or "", "rpe": r[4],
+             "duration_seconds": r[5], "session_id": r[6]}
             for r in rows
         ]
 
@@ -529,6 +563,24 @@ class FitnessStore:
                 f"SELECT id, metric_type, value, unit, start_at, end_at, source FROM health_metrics "
                 f"WHERE {' AND '.join(clauses)} ORDER BY start_at DESC LIMIT ?",
                 (*params, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            HealthMetric(id=r[0], metric_type=r[1], value=r[2], unit=r[3] or "",
+                         start_at=r[4], end_at=r[5] or "", source=r[6])
+            for r in rows
+        ]
+
+    def list_manual_metrics(self, limit: int = 10000) -> list[HealthMetric]:
+        """Manually reported metrics (bot-logged; excludes device imports like
+        intraday Apple Health samples), newest first."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, metric_type, value, unit, start_at, end_at, source FROM health_metrics "
+                "WHERE source = 'manual' ORDER BY start_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         finally:
             conn.close()

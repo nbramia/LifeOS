@@ -17,5 +17,12 @@
     "chat_id_env": "TELEGRAM_DOCTOR_CHAT_ID",
     "persona_file": "config/personas/doctor.md",
     "orchestrates": true
+  },
+  {
+    "name": "finance",
+    "label": "Finance",
+    "token_env": "TELEGRAM_FINANCE_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_FINANCE_CHAT_ID",
+    "persona_file": "config/personas/finance.md"
   }
 ]

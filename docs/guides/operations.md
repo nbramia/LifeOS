@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-07-08
+> **Last Updated:** 2026-08-09
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -19,11 +19,35 @@ If you have a Mac with iMessage/phone data, it can export Apple ecosystem data a
 
 If adding new cron jobs or scripts on macOS that need to access protected directories, route them through `LifeOS exec`.
 
+### Self-update (issue #509)
+
+The Mac Mini runs `apple_data_agent.sh` from its own separate checkout, which nothing else ever pulls — a fix to the export pipeline on `main` would otherwise silently never reach it. Step 0 of the agent script self-updates that checkout before exporting, using the same guards as `auto-deploy.sh`: only on the `main` branch, only with a clean working tree, and only via `git pull --ff-only` (never force, never reset). If any guard trips or the pull fails, the agent logs a warning (and, on an actual pull failure, sends a Telegram alert) and **continues with the existing checkout** — a slightly stale export is better than a skipped one, as long as the staleness is visible.
+
+The before/after SHA is logged in the agent's own log, and the export's `manifest.json` records the SHA it ran from as `agent_sha`. On the Linux side, `apple_data_import.py`'s `check_manifest()` compares `agent_sha` against the host's own `main` SHA and logs a warning on mismatch — so a stuck self-update is diagnosable from the import log without SSHing to the Mac Mini. Manifests written before this change simply lack `agent_sha`, which is treated as "nothing to compare" rather than a warning.
+
 ## Monarch Money (Financial Data)
 
 Auth uses a cached session token at `data/monarch_session.pickle`. Monthly sync runs on the 1st via `run_all_syncs.py` (phase 5). Live queries at `/api/monarch/*`.
 
-Re-authenticate when token expires (401/525):
+Re-authenticate when the token expires (401/525), or when the nightly sync warns
+that the session is old. Run from the project root — the session path is relative.
+
+**Preferred (works in any shell, including agent/non-TTY sessions):** reads
+`MONARCH_EMAIL` / `MONARCH_PASSWORD` from `.env` and takes the MFA code as an
+argument. TOTP codes expire in ~30s, so read the code and run promptly.
+
+```bash
+~/.venvs/lifeos/bin/python scripts/monarch_reauth.py <6-digit-code>
+```
+
+It verifies the new session with a live authenticated call before reporting
+success — a saved pickle alone does not prove the session works. On success it
+prints how many accounts are reachable.
+
+**Interactive alternative (requires a real TTY):** prompts for email, password,
+and MFA code. This fails with `EOFError: EOF when reading a line` in any
+non-interactive shell, including Claude Code's `!` prefix.
+
 ```bash
 ~/.venvs/lifeos/bin/python -c "
 import asyncio
@@ -35,6 +59,9 @@ print('Session saved!')
 "
 ```
 
+The running API server picks up the refreshed session without a restart; verify
+with `curl -s localhost:8000/api/monarch/accounts | head -c 200`.
+
 ## Performance Tracing — Quick Commands
 
 Every chat request is traced with per-stage timing (SQLite, `data/perf_traces.db`). Full design in [Observability](../specs/technical/observability.md).
@@ -44,6 +71,15 @@ curl http://localhost:8000/api/perf/stats | jq                    # Aggregate st
 curl "http://localhost:8000/api/perf/traces?limit=10" | jq        # Recent traces
 curl http://localhost:8000/api/perf/traces/{trace_id} | jq        # Single trace
 ```
+
+## GPU Watchdog
+
+`scripts/gpu-watchdog.sh` runs every 5 minutes (`lifeos-gpu-watchdog.timer`, Linux only) and watches for two independent GPU failure signals on the gfx1151 iGPU:
+
+- **VRAM saturation** — reads usage from AMDGPU sysfs and alerts above `LIFEOS_VRAM_ALERT_PCT` (default 80%). Guards against the 2026-05-28 incident where VRAM exhaustion during model load locked up the GPU.
+- **SDMA-queue exhaustion (#521)** — the iGPU has only 8 SDMA queues. Concurrent GPU embedders (e.g. the API server and a manual reindex both loading/encoding on GPU at once) can exhaust them with VRAM still healthy — VRAM% alone can't see this. Each tick scans the kernel log (`journalctl -k --since <last tick>`) for `No more SDMA queue to allocate`, the signature that preceded the 2026-07-10 host freeze, and alerts on it with its own cooldown (`LIFEOS_SDMA_ALERT_COOLDOWN_MIN`, defaults to the VRAM cooldown) so it can't spam independently of the VRAM alert.
+
+Both signals alert via Telegram and log to `logs/gpu-watchdog.log`. See `api/services/embeddings.py`'s cross-process `flock` (settings `embedding_gpu_lock_*`) for the mitigation that serializes GPU embedding across processes to prevent SDMA exhaustion in the first place.
 
 ## Alerting Severities
 

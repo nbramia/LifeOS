@@ -85,6 +85,9 @@
     "flat abs": "Abs",
     "decline abs": "Decline abs",
     "plank": "Abs",
-    "abs": "Abs"
+    "abs": "Abs",
+    "stair climb": "Stairs",
+    "stair climbing": "Stairs",
+    "stair master": "Stairs"
   }
 }

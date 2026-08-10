@@ -29,6 +29,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# Force CPU-only embeddings for every test run (#521). This host's iGPU has
+# only 8 SDMA queues; `pytest -n auto` below spawns one worker process per
+# core (16 here), and each worker that touches EmbeddingService would
+# otherwise independently try to load the GPU model — several processes
+# grabbing GPU compute queues at once is the exact concurrency pattern that
+# exhausted the queues and preceded the 2026-07-10 host freeze. Tests don't
+# need GPU throughput. `tests/conftest.py`'s pytest_configure hook sets the
+# same vars (defense in depth, and it's the only guard for anyone who runs
+# pytest directly instead of through this script) — exporting here as well
+# covers anything this script shells out to outside of pytest itself.
+export HIP_VISIBLE_DEVICES=""
+export ROCR_VISIBLE_DEVICES=""
+export CUDA_VISIBLE_DEVICES=""
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -110,7 +124,12 @@ run_browser_tests() {
         exit 1
     fi
 
-    python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py -v \
+    # test_voice_mic_block_ui_browser.py serves web/ itself on an ephemeral port
+    # and stubs every /api/ call, so it needs no server and carries no
+    # `requires_server` marker — that's what lets pre-push run it. This scope
+    # deliberately runs the full `browser` set, server-dependent tests included.
+    python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py \
+        tests/test_voice_mic_block_ui_browser.py -v \
         --ignore=tests/archive \
         -m "browser" \
         --tb=short \
@@ -318,7 +337,9 @@ decide_plan() {
     # Code change: always run unit; additively widen for the touched areas so
     # a change spanning categories is fully covered.
     local plan="unit"
-    if printf '%s\n' "$files" | grep -qE '\.html$|^static/.*\.js$|^api/routes/|/templates/'; then
+    # Web assets live in web/ and are only *served* under the /static URL
+    # prefix — matching on a `static/` path never fires (#518).
+    if printf '%s\n' "$files" | grep -qE '\.html$|^web/.*\.js$|^api/routes/'; then
         plan="$plan browser"
     fi
     if printf '%s\n' "$files" | grep -qE '^scripts/run_all_syncs\.py$|^api/services/[^/]*sync[^/]*|indexer|embeddings|vectorstore|bm25_index'; then

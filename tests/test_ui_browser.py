@@ -8,7 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 # Mark all tests as requiring browser
-pytestmark = [pytest.mark.browser, pytest.mark.slow]
+pytestmark = [pytest.mark.browser, pytest.mark.slow, pytest.mark.requires_server]
 
 # Viewport sizes
 DESKTOP_VIEWPORT = {"width": 1280, "height": 800}

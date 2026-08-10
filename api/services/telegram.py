@@ -679,20 +679,66 @@ class TelegramBotListener:
         from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
         from api.services.agent_worker.session_store import SessionStore
 
+        # A short bare affirmative ("yes", "approved", "go ahead") is never a
+        # problem report — it's almost certainly a mis-threaded approval of a
+        # pending goal (#453: each such plain message used to spawn a fresh
+        # context-free session). Route it to the most recent open goal gate on
+        # this bot instead; only genuinely unmatched text falls through to a
+        # spawn. The length bound keeps real reports that merely START with
+        # "yes ..." ("yes the calendar tool is broken again") spawning normally.
+        stripped = text.strip()
+        if len(stripped) <= 25:
+            from api.services.agent_worker.worker import _is_affirmative
+            if _is_affirmative(stripped):
+                try:
+                    gate = SessionStore().get_latest_open_question(
+                        bot=self._bot.name, kind="goal_approval",
+                    )
+                except Exception as exc:
+                    logger.warning(f"goal-gate lookup failed: {exc}")
+                    gate = None
+                if gate and await self._maybe_handle_claude_code_reply(
+                    int(gate["sent_message_id"]), stripped, chat_id,
+                ):
+                    return
+                if not gate:
+                    await send_message_async(
+                        f'I got "{stripped}" but there\'s nothing here waiting '
+                        "for an approval — no session was started. If you meant "
+                        "to answer an earlier message, use Telegram's Reply on "
+                        "it; otherwise describe the problem you want me to fix.",
+                        chat_id=chat_id,
+                    )
+                    return
+
         working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
         prompt = (
             f"{self._persona}\n\n"
             f"---\n\n"
             f"The user just sent this report via the {self._bot.name} bot:\n\n{text}"
         )
-        await send_message_async(
-            "🩺 On it — taking a look now. I'll follow up here as I go.",
-            chat_id=chat_id,
-        )
+        # Send the ack with id capture so it can be registered as a reply
+        # anchor once the spawn returns a session id — replying to "On it"
+        # then routes into the session like any other thread message (#458).
+        from api.services.agent_worker.worker import _with_reply_footer
+        ack_ids = []
+        try:
+            ack_ids = send_message_capture_ids(
+                _with_reply_footer("🩺 On it — taking a look now. I'll follow up here as I go."),
+                chat_id,
+            ) or []
+        except Exception as exc:
+            logger.warning(f"orchestration ack send failed: {exc}")
+        if not ack_ids:
+            await send_message_async(
+                "🩺 On it — taking a look now. I'll follow up here as I go.",
+                chat_id=chat_id,
+            )
+        store = SessionStore()
         try:
             result = await asyncio.to_thread(
                 spawn_claude_code_session,
-                SessionStore(),
+                store,
                 prompt,
                 working_dir=working_dir,
                 plan_mode=False,
@@ -705,6 +751,14 @@ class TelegramBotListener:
                 f"Couldn't start the session: {str(exc)[:200]}", chat_id=chat_id,
             )
             return
+        if ack_ids and result.get("ok") and result.get("session_id"):
+            try:
+                store.add_reply_anchors(
+                    result["session_id"], result.get("task_id") or "",
+                    ack_ids, bot=self._bot.name,
+                )
+            except Exception as exc:
+                logger.warning(f"on-it anchor registration failed: {exc}")
         if not result.get("ok"):
             await send_message_async(
                 f"Couldn't start the session: {result.get('error')}", chat_id=chat_id,
@@ -753,7 +807,9 @@ class TelegramBotListener:
             # A reply to a /claude completion resumes that Claude Code session
             # (#237) — checked before the agent-worker deposit since both use
             # the shared follow-up table but resume different subsystems.
-            if await self._maybe_handle_claude_code_reply(reply_to_id, text, chat_id):
+            if await self._maybe_handle_claude_code_reply(
+                reply_to_id, text, chat_id, quoted_text=reply_to.get("text"),
+            ):
                 return
             if self._maybe_deposit_agent_answer(reply_to_id, text):
                 return
@@ -953,7 +1009,10 @@ class TelegramBotListener:
     _APPROVAL_KEYWORDS = {"approve", "approved", "yes", "go", "proceed", "ok"}
     _REJECTION_KEYWORDS = {"reject", "rejected", "no", "cancel", "stop"}
 
-    async def _maybe_handle_claude_code_reply(self, reply_to_message_id: int, text: str, chat_id: str) -> bool:
+    async def _maybe_handle_claude_code_reply(
+        self, reply_to_message_id: int, text: str, chat_id: str,
+        quoted_text: str | None = None,
+    ) -> bool:
         """If a reply targets a CLI (Claude Code or Codex) completion message,
         resume the linked agent-worker session.
 
@@ -962,7 +1021,20 @@ class TelegramBotListener:
         the answer is enough — the worker's ``_resume_as_followup`` picks it
         up on the next tick and routes through the right executor's resume().
 
-        Returns True if the reply was consumed as a CLI follow-up.
+        ``kind='goal_approval'`` replies are also consumed here, with an
+        immediate ack: the worker only drains the answer on its next tick (up
+        to poll_seconds later) and the agent may not emit anything for minutes
+        after that, so without a deposit-time ack the operator can't tell
+        whether their 'yes' landed at all.
+
+        ``kind='status_anchor'`` (#458): every operator-facing session message
+        (streamed [NOTIFY] bodies, heartbeats, acks) registers its Telegram
+        message id against the session. A threaded reply to ANY of them is
+        consumed here as a context note — queued (with ``quoted_text``, the
+        message being replied to, as context) and delivered at the session's
+        next turn boundary; a terminal session is reopened for it.
+
+        Returns True if the reply was consumed.
         """
         try:
             from api.services.agent_worker.session_store import SessionStore
@@ -971,7 +1043,49 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"cli reply lookup failed: {exc}")
             return False
-        if not q or q.get("kind") != "followup":
+        if not q:
+            # A reply landing on an ALREADY-answered goal message must not fall
+            # through — on an orchestration bot it would spawn a brand-new
+            # session with the bare reply as its "report" (the yes/yes/approved
+            # fan-out). Consume it with a pointer instead.
+            try:
+                done = store.get_open_question_by_message_id(
+                    reply_to_message_id, bot=self._bot.name, include_answered=True,
+                )
+            except Exception as exc:
+                logger.warning(f"answered-question lookup failed: {exc}")
+                done = None
+            if done and done.get("answered_at") and done.get("kind") == "goal_approval":
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            return False
+        if q.get("kind") == "status_anchor":
+            return await self._handle_status_anchor_reply(q, text, chat_id, quoted_text)
+        if q.get("kind") == "goal_approval":
+            # Same affirmative parser the worker's _resume_goal uses, so the
+            # ack never disagrees with what the worker will actually do.
+            from api.services.agent_worker.worker import _is_affirmative
+            if not store.deposit_answer(reply_to_message_id, text, bot=self._bot.name):
+                # Race: answered between the lookup above and this deposit.
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            if _is_affirmative(text):
+                ack = ("✅ Goal locked — starting work now. "
+                       "I'll post updates here as I go.")
+            else:
+                ack = ("✏️ Got it — reworking the goal with your changes. "
+                       "I'll propose an updated version shortly.")
+            self._send_anchored_ack(store, q.get("session_id"), q.get("task_id"), ack, chat_id)
+            return True
+        if q.get("kind") != "followup":
             return False
         session_id = q.get("session_id")
         if not session_id:
@@ -983,6 +1097,74 @@ class TelegramBotListener:
         label = "Codex" if session.routing == "codex" else "Claude Code"
         await send_message_async(f"Resuming {label} session...", chat_id=chat_id)
         return True
+
+    async def _handle_status_anchor_reply(
+        self, q: dict, text: str, chat_id: str, quoted_text: str | None,
+    ) -> bool:
+        """Route a threaded reply on a status/heartbeat/ack message back into
+        its session as a context note (#458).
+
+        The note is queued with the quoted message as context and rides the
+        session's next turn boundary: a RUNNING/CLAIMED/BLOCKED session picks
+        it up when its pending messages next drain; a terminal session with a
+        persisted CLI id is reopened (enqueue-then-CLAIM, mirroring
+        reopen-on-send #428) so the dispatch tick resumes it with the note.
+        """
+        from api.services.agent_worker.session_store import (
+            STATUS_BUDGET_EXCEEDED, STATUS_COMPLETED, STATUS_FAILED, SessionStore,
+        )
+        store = SessionStore()
+        session_id = q.get("session_id")
+        session = store.get_by_session_id(session_id) if session_id else None
+        if session is None:
+            return False
+        quoted = (quoted_text or "").strip()
+        if quoted:
+            if len(quoted) > MAX_QUOTED_REPLY_CHARS:
+                quoted = quoted[:MAX_QUOTED_REPLY_CHARS] + "…"
+            composed = f'[operator replied to your status update: "{quoted}"]\n{text}'
+        else:
+            composed = f"(operator note) {text}"
+        store.enqueue_message(session.session_id, "operator", composed)
+        terminal = session.status in (STATUS_COMPLETED, STATUS_FAILED, STATUS_BUDGET_EXCEEDED)
+        if terminal:
+            if session.routing in ("claude_code", "codex") and session.claude_code_session_id:
+                from api.services.agent_worker.session_store import STATUS_CLAIMED
+                store.update_status(session.task_id, STATUS_CLAIMED)
+                ack = "📨 Got it — waking the session with your note."
+            else:
+                ack = ("📨 Noted, but that session already ended and can't be "
+                       "resumed — send a fresh message to start a new one.")
+        else:
+            ack = "📨 Noted — I'll pass this to the session at its next checkpoint."
+        self._send_anchored_ack(store, session.session_id, session.task_id, ack, chat_id)
+        return True
+
+    def _send_anchored_ack(
+        self, store, session_id: str | None, task_id: str | None,
+        ack: str, chat_id: str,
+    ) -> None:
+        """Send a session-scoped ack with the reply-affordance footer and
+        register its message id as a reply anchor, so the ack itself is part
+        of the replyable work thread (#458). Falls back to a plain, footerless
+        send when id capture is unavailable.
+        """
+        from api.services.agent_worker.worker import _with_reply_footer
+        ids = []
+        try:
+            ids = send_message_capture_ids(_with_reply_footer(ack), chat_id) or []
+        except Exception as exc:
+            logger.warning(f"anchored ack send failed: {exc}")
+        if ids and session_id and task_id:
+            try:
+                store.add_reply_anchors(session_id, task_id, ids, bot=self._bot.name)
+            except Exception as exc:
+                logger.warning(f"ack anchor registration failed: {exc}")
+        elif not ids:
+            try:
+                send_message(ack, chat_id)  # plain, footerless fallback
+            except Exception as exc:
+                logger.warning(f"ack fallback send failed: {exc}")
 
     def _should_use_plan_mode(self, task: str) -> bool:
         """Conservative heuristic: plan mode only for complex-sounding tasks.

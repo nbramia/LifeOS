@@ -58,6 +58,7 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.conversation_store import ConversationStore
 from api.services.interaction_store import build_obsidian_link
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
 
@@ -175,6 +176,19 @@ def write_self_restart_marker(
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+# Telegram reply affordance markers. Every operator-facing session message
+# ends with exactly one of these so the operator can tell at a glance whether
+# a threaded reply will reach the session (see #458: any anchored message is
+# replyable; replies queue as context notes and ride the next turn boundary).
+REPLYABLE_FOOTER = "\u21a9\ufe0f reply in thread"
+NO_REPLY_FOOTER = "\U0001f6ab do not reply"
+
+
+def _with_reply_footer(text: str, replyable: bool = True) -> str:
+    """Append the reply-affordance footer as the message's final line."""
+    return f"{text}\n\n{REPLYABLE_FOOTER if replyable else NO_REPLY_FOOTER}"
 
 
 def _is_affirmative(text: str) -> bool:
@@ -515,6 +529,29 @@ class Worker:
                 )
                 recovered += 1
                 continue
+            # #198: a remote Managed Agents session survives a worker restart —
+            # it keeps running on Anthropic's infrastructure, making MCP tool
+            # calls with real side effects (task creation, vault writes, sends)
+            # long after this rollback tells the operator the task was rolled
+            # back. Kill it before finalizing. Best-effort: a kill failure
+            # (404, network) must not block the rollback.
+            if session.managed_agent_session_id:
+                managed = self._get_managed_executor()
+                if managed is not None and managed.driver is not None:
+                    try:
+                        managed.driver.kill_session(
+                            session.managed_agent_session_id,
+                            reason="worker_restart_rollback",
+                        )
+                        self.transcript_store.append(
+                            sid, "orphan_remote_session_killed", {
+                                "managed_agent_session_id": session.managed_agent_session_id,
+                            })
+                    except Exception as exc:
+                        logger.warning(
+                            "kill_session %s on restart rollback failed: %s",
+                            session.managed_agent_session_id, exc,
+                        )
             self.transcript_store.append(sid, "resume_failed", {"prior_status": session.status})
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             # Spawned children belong to a parent's lineage — they have no
@@ -1554,12 +1591,13 @@ class Worker:
                 "duplicate side effects")
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             try:
-                _send(
+                _send(_with_reply_footer(
                     "⚠️ A code session: a previous attempt may have already "
                     "started, so it wasn't retried automatically (to avoid "
                     "repeating side effects). It was marked failed — re-trigger "
-                    "it if you want to retry."
-                )
+                    "it if you want to retry.",
+                    replyable=False,
+                ))
             except Exception as exc:  # best-effort; the surface may be down
                 logger.warning("re-execute-averted notify failed: %s", exc)
             self._reconcile_vault_terminal(session, STATUS_FAILED)
@@ -1612,9 +1650,30 @@ class Worker:
             if outcome.reason == REASON_AWAITING_PLAN_APPROVAL:
                 prompt = "Plan ready — reply 'approve' to proceed, 'reject' to cancel, or send feedback to refine."
             elif outcome.reason == REASON_AWAITING_CLARIFICATION:
-                prompt = "Awaiting your reply — answer the question above to continue."
+                # ONE anchored message: the question itself (the executor
+                # defers its Telegram delivery to here, like [GOAL]) plus how
+                # to answer — the reply must be threaded to THIS message.
+                question_body = (outcome.final_text or "").strip()
+                instruction = "Answer by replying to this message."
+                prompt = (
+                    f"{question_body}\n\n{instruction}" if question_body
+                    else "Awaiting your reply — reply to this message to continue."
+                )
             elif outcome.reason == REASON_AWAITING_GOAL_APPROVAL:
-                prompt = "Reply 'yes' to lock this goal and start, or send changes to refine it."
+                # ONE anchored message: the goal body (the executor defers its
+                # Telegram delivery to here) plus how to answer it. Only a
+                # THREADED reply to this message reaches the session — on an
+                # orchestration bot a plain chat message spawns a fresh
+                # session instead — so the instruction names the mechanics
+                # and lives on the same message as the goal it gates.
+                goal_body = (outcome.final_text or "").strip()
+                instruction = (
+                    "Reply to this message with 'yes' to lock this goal and "
+                    "start, or with changes to refine it. (Use Telegram's "
+                    "Reply on this message — a plain chat message won't "
+                    "reach this session.)"
+                )
+                prompt = f"{goal_body}\n\n{instruction}" if goal_body else instruction
             else:
                 prompt = "Awaiting your reply to continue."
             # Goal-approval replies route through `_resume_goal` (which injects
@@ -1623,7 +1682,7 @@ class Worker:
             sent_ids: list = []
             for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
                 try:
-                    sent_ids = _send_with_id(prompt) or []
+                    sent_ids = _send_with_id(_with_reply_footer(prompt)) or []
                 except Exception as exc:
                     logger.warning(
                         "code blocked reply prompt send failed (attempt %d/%d): %s",
@@ -1664,10 +1723,11 @@ class Worker:
             })
             self.session_store.update_status(session.task_id, STATUS_FAILED)
             try:
-                _send(
+                _send(_with_reply_footer(
                     "⚠️ A session needs your input, but the question couldn't be "
-                    "delivered. It was marked failed — re-trigger it to retry."
-                )
+                    "delivered. It was marked failed — re-trigger it to retry.",
+                    replyable=False,
+                ))
             except Exception as exc:  # best-effort; the same surface may be down
                 logger.warning("blocked-session escalation send failed: %s", exc)
             self._reconcile_vault_terminal(session, STATUS_FAILED)
@@ -1685,7 +1745,7 @@ class Worker:
             body = outcome.final_text.strip() if outcome.final_text else ""
             if body and not session.parent_session_id:
                 try:
-                    sent_ids = _send_with_id(body) or []
+                    sent_ids = _send_with_id(_with_reply_footer(body)) or []
                 except Exception as exc:
                     logger.warning("code completion send failed: %s", exc)
                     sent_ids = []
@@ -1707,6 +1767,23 @@ class Worker:
                 "final_chars": len(body),
             })
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
+            # A reply that arrived MID-RUN (status-anchor route, #458) is
+            # queued in pending_messages with nothing to deliver it — the
+            # dispatch tick only drains CLAIMED sessions. Reopen now that the
+            # turn boundary is here, mirroring reopen-on-send (#428): resume
+            # needs the persisted CLI id (re-fetch the row — the executor sets
+            # it during this very run, so the claim-time snapshot may predate
+            # it), and children stay parent-driven.
+            if not session.parent_session_id and self.session_store.has_pending_messages(sid):
+                current = self.session_store.get_by_session_id(sid)
+                if current is not None and current.claude_code_session_id:
+                    if session.origin != "operator":
+                        for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+                            if self._swap_tag(session.task_id, terminal_tag, RUNNING_TAG):
+                                break
+                        self._set_task_status(session.task_id, "in_progress")
+                    self.session_store.update_status(session.task_id, STATUS_CLAIMED)
+                    self.transcript_store.append(sid, "code_reopened_for_pending_messages", {})
             return
 
         # FAILED / BUDGET_EXCEEDED — surface a brief operator notification.
@@ -1729,7 +1806,32 @@ class Worker:
         # [budget_exceeded] status header, so the notice would be duplicate
         # noise for a session the operator never directly started.
         if notice and not session.parent_session_id:
-            _send(notice)
+            # A failed/budget session with a persisted CLI id is resumable
+            # (`_resume_as_followup` swaps any terminal tag), so register the
+            # notice as a followup anchor and mark it replyable; without the
+            # CLI id there is nothing to resume — say so (#458).
+            current = self.session_store.get_by_session_id(sid)
+            resumable = bool(current is not None and current.claude_code_session_id)
+            sent_ids = []
+            if resumable:
+                try:
+                    sent_ids = _send_with_id(_with_reply_footer(notice)) or []
+                except Exception as exc:
+                    logger.warning("failure notice send (with id) failed: %s", exc)
+            if sent_ids:
+                self.session_store.create_pending_question(
+                    session_id=sid,
+                    task_id=session.task_id,
+                    question=notice[:200],
+                    sent_message_id=sent_ids[0],
+                    sent_message_ids=sent_ids,
+                    kind="followup",
+                    bot=bot,
+                )
+            else:
+                # No registered anchor (unresumable, or id capture failed) —
+                # a "reply in thread" footer would be a lie either way.
+                _send(_with_reply_footer(notice, replyable=False))
             # #311: mirror the same failure/budget notice into the web/voice
             # thread (no-op for Telegram-origin); a child is never
             # conversation-linked, so the child gate above also keeps this correct.
@@ -1747,6 +1849,43 @@ class Worker:
         # this is harmless for vault sessions the executor already finalized.
         self.session_store.update_status(session.task_id, outcome.status)
         self._reconcile_vault_terminal(session, outcome.status)
+
+    def _send_session_message(self, session, body: str) -> None:
+        """Send an operator-facing session message (streamed [NOTIFY] body,
+        heartbeat) with reply-anchor registration: the message ends with the
+        "reply in thread" footer, its Telegram message id(s) are captured and
+        registered against the session, and a threaded reply to it routes back
+        into the session as a context note (#458). Falls back to the plain
+        one-way sender (no footer — the affordance would be a lie) when id
+        capture is unavailable or fails.
+        """
+        bot = session.bot
+        text = _with_reply_footer(body)
+        try:
+            sent_ids = (
+                self._telegram_send_with_id(text, bot=bot) if bot
+                else self._telegram_send_with_id(text)
+            ) or []
+        except Exception as exc:
+            logger.warning("session message send (with id) failed for %s: %s",
+                           session.task_id, exc)
+            sent_ids = []
+        if not sent_ids:
+            try:
+                if bot:
+                    self._telegram_send(body, bot=bot)
+                else:
+                    self._telegram_send(body)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("session message fallback send failed: %s", exc)
+            return
+        try:
+            self.session_store.add_reply_anchors(
+                session.session_id, session.task_id, sent_ids, bot=bot,
+            )
+        except Exception as exc:  # best-effort — a lost anchor only loses
+            logger.warning("reply-anchor registration failed for %s: %s",
+                           session.task_id, exc)  # the reply route, not the message
 
     def _get_claude_code_executor(self, bot: str | None = None):
         """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
@@ -1772,6 +1911,11 @@ class Worker:
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=notify,
+            # Preferred operator sender (#458): captures Telegram ids and
+            # registers them as reply anchors so a threaded reply to ANY
+            # streamed message routes back into the session. The session's own
+            # `bot` picks the surface, so one binding serves every bot.
+            operator_send=self._send_session_message,
             # #311: mirror each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the
             # web/voice thread that spawned the session (no-op when unlinked).
             conversation_mirror=self._mirror_to_conversation,
@@ -2872,11 +3016,11 @@ class Worker:
         """
         sent_ids: list[int] = []
         try:
-            sent_ids = self._telegram_send_with_id(body) or []
+            sent_ids = self._telegram_send_with_id(_with_reply_footer(body)) or []
         except Exception as exc:
             logger.warning("terminal notify (with id) failed for %s: %s", session.task_id, exc)
         if not sent_ids:
-            self._notify(body)
+            self._notify(body)  # no registered anchor → no (false) footer
             return
         try:
             self.session_store.register_completion_followup(
@@ -2918,6 +3062,10 @@ def main() -> None:
         level=os.environ.get("LIFEOS_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # This worker sends progress/completion updates via Telegram. Without
+    # this, httpx's request logger (INFO by default, logs the full request
+    # URL — which embeds the bot token) would leak the token every send (#519).
+    configure_telegram_log_redaction()
     # Wire up real Telegram senders in production. Worker() defaults to
     # no-op senders so tests can't accidentally hit a real chat — see
     # comment in __init__. If telegram.py isn't importable or the bot

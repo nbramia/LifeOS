@@ -119,6 +119,7 @@ def _build_executor(
     spawn_fn,
     notifications: list[str] | None = None,
     mirror_calls: list[tuple[str, str]] | None = None,
+    operator_sends: list[tuple[str, str]] | None = None,
 ):
     db_path = tmp_path / "sessions.db"
     transcript_dir = tmp_path / "transcripts"
@@ -129,10 +130,17 @@ def _build_executor(
     # #311: a fake (session_id, body) sink so a test can assert the executor
     # mirrors each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the web thread.
     mirror = (lambda sid, body: mirror_calls.append((sid, body))) if mirror_calls is not None else None
+    # #458: preferred operator sender — receives (session, body) so the worker
+    # can register reply anchors. Tests capture (session_id, body).
+    op_send = (
+        (lambda session, body: operator_sends.append((session.session_id, body)))
+        if operator_sends is not None else None
+    )
     executor = ClaudeCodeExecutor(
         session_store=store,
         transcript_store=transcripts,
         notification_callback=notify,
+        operator_send=op_send,
         conversation_mirror=mirror,
         spawn_fn=spawn_fn,
         binary_resolver=lambda: "/usr/bin/true",
@@ -337,8 +345,10 @@ def test_child_clarify_folds_into_final_text_and_does_not_block(tmp_path: Path):
 
 def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
     """#311: when a conversation_mirror is wired, the executor calls it with
-    (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] — the same
-    bodies it relays to Telegram — so the web thread mirrors live progress."""
+    (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] so the web
+    thread mirrors live progress. Only [NOTIFY] also relays to Telegram here —
+    [CLARIFY] and [GOAL] deliver via the worker's single anchored
+    body + reply-instructions message at block time (#456, #458)."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -365,14 +375,15 @@ def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
 
     executor.execute(session, {"description": "do the thing"})
 
-    # Every streamed body is mirrored with the session id, in order, matching
-    # exactly what Telegram received.
+    # Every streamed body is mirrored with the session id, in order. Telegram
+    # received only the [NOTIFY] — clarify and goal deliver via the worker's
+    # anchored block-time messages instead.
     assert mirror_calls == [
         (session.session_id, "Reading the file."),
         (session.session_id, "Which repo?"),
         (session.session_id, "Tests pass."),
     ]
-    assert [b for _, b in mirror_calls] == notifications
+    assert notifications == ["Reading the file."]
 
 
 def test_child_session_does_not_mirror(tmp_path: Path):
@@ -564,8 +575,11 @@ def test_clarify_returns_blocked_with_question(tmp_path: Path):
 
     assert outcome.status == STATUS_BLOCKED
     assert outcome.reason == REASON_AWAITING_CLARIFICATION
+    # The question rides the outcome; the worker composes the single anchored
+    # question + reply-instructions message at block time (#458) — no separate
+    # streamed Telegram message.
     assert outcome.final_text == "Which file did you mean?"
-    assert notifications == ["Which file did you mean?"]
+    assert notifications == []
     assert store.get(session.task_id).status == STATUS_BLOCKED
 
 
@@ -828,6 +842,32 @@ def test_result_event_fenced_tag_preserved_in_final_text(tmp_path: Path):
     assert notifications == []  # result path never streams
 
 
+def test_operator_send_preferred_for_notify_bodies(tmp_path: Path):
+    """#458: when operator_send is wired, streamed [NOTIFY] bodies go through
+    it with the session (so the worker can register reply anchors) and the
+    legacy notification_callback is NOT used."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "[NOTIFY] Reading the file."}]},
+        },
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "done"},
+    ]
+    notifications: list[str] = []
+    operator_sends: list[tuple[str, str]] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events),
+        notifications=notifications, operator_sends=operator_sends,
+    )
+    session = _seed_session(store)
+
+    executor.execute(session, {"description": "read it"})
+
+    assert operator_sends == [(session.session_id, "Reading the file.")]
+    assert notifications == []  # legacy path bypassed when operator_send set
+
+
 # ---------------------------------------------------------------------------
 # [GOAL] tag (#398)
 # ---------------------------------------------------------------------------
@@ -878,10 +918,13 @@ def test_scan_ignores_empty_goal_body():
     assert scan.narrative.strip() == ""
 
 
-def test_goal_returns_blocked_streams_and_records(tmp_path: Path):
+def test_goal_returns_blocked_without_streaming_and_records(tmp_path: Path):
     """End-to-end: an assistant [GOAL] then a result event yields a BLOCKED
-    outcome awaiting approval, the body is streamed to the operator, and the
-    transcript records the proposed condition."""
+    outcome awaiting approval, carrying the condition as final_text, and the
+    transcript records it. The body is NOT streamed as its own Telegram
+    notification — the worker delivers goal + reply instructions as ONE
+    anchored message at block time, so the operator replies to the message
+    that shows the goal itself."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -900,9 +943,10 @@ def test_goal_returns_blocked_streams_and_records(tmp_path: Path):
 
     assert outcome.status == STATUS_BLOCKED
     assert outcome.reason == REASON_AWAITING_GOAL_APPROVAL
+    # The condition rides the outcome so the worker can compose the single
+    # goal + instructions message the operator replies to.
     assert outcome.final_text == "all tests pass"
-    # The operator must SEE the proposed goal to approve it.
-    assert notifications == ["all tests pass"]
+    assert notifications == []  # no separate streamed goal message
     assert store.get(session.task_id).status == STATUS_BLOCKED
     events_out = _read_transcript(transcripts, session.session_id)
     awaiting = [e for e in events_out if e["kind"] == "claude_code_awaiting_goal_approval"]

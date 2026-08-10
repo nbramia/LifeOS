@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-06-26
+**Last Updated:** 2026-08-10
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -10,7 +10,7 @@ Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orc
 
 ## Surfaces
 
-- **Telegram** (primary): a dedicated `@BotFather` bot. Full round-trip — reply to a `[CLARIFY]`/`[GOAL]` message (swipe-to-reply) to answer; a fresh, non-threaded message starts a **new** repair.
+- **Telegram** (primary): a dedicated `@BotFather` bot. Full round-trip — reply to a `[CLARIFY]`/`[GOAL]` message (swipe-to-reply) to answer, and reply to **any** other doctor message (status updates, heartbeats, acks, "On it") to drop a context note into that session's thread. Messages end with "↩️ reply in thread" or "🚫 do not reply" so the affordance is explicit. A fresh, non-threaded message starts a **new** repair.
 - **Web / voice**: selecting the `doctor` persona in web chat (or via whisper-relay) spawns the same orchestrating session. You can answer its `[CLARIFY]`/`[GOAL]` from the web conversation too (`POST /api/conversations/{id}/answer`); notices also surface on the doctor's Telegram thread and the `/agents` page.
 
 ## The flow
@@ -19,7 +19,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 
 1. **You report a problem**, e.g. _"the calendar tool returns last week's events when I ask for this week."_
 2. **Clarify the goal.** The doctor investigates the code and asks the minimum `[CLARIFY]` questions needed to pin down what "done" means. No work starts yet.
-3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** Reply **yes** to lock it (which arms the session's `/goal`), or send changes to refine it.
+3. **Propose + approve the goal.** It emits a `[GOAL]` — a crisp success condition (issue filed, tested PR merged to `main`, restarted, confirmed). **This is the single human gate.** The goal arrives as one message that ends with the reply instructions; use Telegram's **Reply on that message** with **yes** to lock it (which arms the session's `/goal`), or with changes to refine it. Your reply is acked immediately ("Goal locked — starting work now"). A plain, non-threaded message starts a **new** repair instead of answering.
 4. **Execute.** On approval it files the issue(s) via `/draft-issue`, then ships — adaptive to size:
    - **Small goal:** one branch → `/implement` → one PR → `main`.
    - **Multi-part goal:** an **integration branch** off `main`, each part landed as a sub-PR onto it (`/implement <issue> --base <integration-branch>`), then one PR integration→`main`, then cleanup.
@@ -44,6 +44,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 
 - **One gate.** Full-auto from your goal approval through merge; `/implement`'s built-in adversarial review is the quality bar.
 - **Always PR-gated, always revertable.** Even the smallest fix goes branch → PR → `main` with tests + docs + review; the doctor never pushes to `main`, and each change lands as a single revertable merge commit whose `gh pr revert` handle it reports.
+- **The review is on the record.** The adversarial-review outcome is posted as a comment on the PR before it merges — what was checked, what it found, what changed in response. So "reviewed" is something you can read afterwards, not something you take on faith. The PR description is also brought up to date before merge, so it describes what actually shipped.
 - **Escalation respected.** If `/implement` can't resolve its review findings after its rounds, the doctor leaves the PR open and reports the escalation instead of merging.
 - **Isolation.** Implementation happens in throwaway worktrees off `origin/main` (pre-flight-cleaned via `scripts/cleanup-worktrees.sh` so a prior crashed run can't block the `add`), so the canonical checkout other agents share is never left on a feature branch.
 - **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout, then runs `./scripts/server.sh verify-deployed` to confirm the checkout is a real work tree on the merged commit **before** restarting — so a silently-failed pull (e.g. a bare/misconfigured checkout) is reported as a deploy failure instead of a false "Shipped" (#419). Only on success does it restart, so the running server actually reflects the change.

@@ -38,7 +38,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Add project root to path
@@ -53,10 +53,15 @@ from api.services.sync_health import (
     get_sync_health,
     get_sync_summary,
     get_typical_duration_seconds,
+    get_typical_yield,
+    get_yield_history,
+    get_consecutive_zero_yield_runs,
+    get_recent_errors,
     check_sync_health,
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
 # =============================================================================
@@ -575,6 +580,11 @@ logging.basicConfig(
         logging.FileHandler(log_file),
     ]
 )
+# This sync sends a Telegram notification with a run summary. httpx's request
+# logger defaults to INFO and logs the full request URL — and the Telegram
+# Bot API embeds the bot token in that URL — so without this, every sync run
+# writes a live credential into logs/sync_*.log (#519).
+configure_telegram_log_redaction()
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -616,8 +626,8 @@ SYNC_ORDER = [
     # === Phase 2: Entity Processing ===
     # Link source entities to canonical PersonEntity records
     "link_slack",               # Link Slack users to people by email
-    "link_imessage",            # Link iMessage handles to people by phone
-    "imessage",                 # Create interactions from linked iMessage data
+    "imessage",                 # Create interactions from iMessage data (links its own unlinked messages internally)
+    "link_imessage",            # Retroactive: backfill phone-based links against latest CRM data (runs after imessage — see depends_on)
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
@@ -781,6 +791,118 @@ def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | Non
     return None
 
 
+# Yield-collapse detection (issue #494): duration collapse only catches sources
+# that *used* to be slow. A source that always finishes instantly and always
+# produces nothing is invisible to it — `entity_cleanup` silently stopped
+# producing records in Feb 2026 and nobody noticed for months. Yield measures
+# the thing we actually care about: did this run do anything.
+YIELD_COLLAPSE_MIN_TYPICAL = 1.0
+# A single empty run is normal (a quiet night with no new mail). Only a streak
+# from a source that normally produces records indicates a silent failure.
+YIELD_COLLAPSE_MIN_CONSECUTIVE = 3
+# A source must have completed at least this many runs, all with zero output,
+# before we call it dead — enough history that "nothing to do" is implausible.
+NEVER_YIELDED_MIN_RUNS = 20
+# Phases that legitimately do heavy work without reporting stats (entity
+# resolution, relationship discovery) must not be flagged. Their runtime proves
+# they are working; only near-instant sources are suspicious.
+NEVER_YIELDED_MAX_AVG_SECONDS = 5.0
+
+
+def _run_yield(stats: dict) -> int:
+    """Records this run produced. Mirrors sync_health._row_yield (max, not sum —
+    the stats keys overlap, so summing would double-count)."""
+    return max(
+        stats.get("created", 0) or 0,
+        stats.get("updated", 0) or 0,
+        stats.get("interactions_created", 0) or 0,
+        stats.get("processed", 0) or 0,
+    )
+
+
+def _detect_yield_collapse(source: str, stats: dict) -> dict | None:
+    """Return info if a source that normally produces records produced none.
+
+    Never raises — a sync_health DB hiccup must not fail the sync itself.
+    """
+    if _run_yield(stats) > 0:
+        return None
+    try:
+        typical = get_typical_yield(source)
+        # +1 for the run in flight: it isn't recorded yet, so the stored
+        # history is one short of the true streak.
+        streak = get_consecutive_zero_yield_runs(source) + 1
+    except Exception as e:
+        logger.warning(f"Yield-collapse check failed for {source}: {e}")
+        return None
+
+    if typical is None or typical < YIELD_COLLAPSE_MIN_TYPICAL:
+        return None
+    if streak < YIELD_COLLAPSE_MIN_CONSECUTIVE:
+        return None
+    return {"typical_yield": typical, "consecutive_zero_runs": streak}
+
+
+def _detect_never_yielded(source: str, stats: dict) -> dict | None:
+    """Return info if a source has never produced anything across many runs.
+
+    This is the blind spot duration-collapse cannot cover: every run looks
+    identical, so nothing stands out per-run. Long-running phases are exempt —
+    their runtime shows they are working even when they report no stats.
+    """
+    if _run_yield(stats) > 0:
+        return None
+    try:
+        history = get_yield_history(source)
+    except Exception as e:
+        logger.warning(f"Never-yielded check failed for {source}: {e}")
+        return None
+
+    if history["runs"] < NEVER_YIELDED_MIN_RUNS or history["best_yield"] > 0:
+        return None
+    if history["avg_duration_seconds"] > NEVER_YIELDED_MAX_AVG_SECONDS:
+        return None  # doing real work, just not reporting it
+    return {
+        "runs": history["runs"],
+        "avg_duration_seconds": history["avg_duration_seconds"],
+    }
+
+
+# A chronic never-yielded source (link_slack, repoint_stale_ids, google_sheets,
+# etc.) is a fixed, known-benign condition every night — issue #494's
+# acceptance criterion was "report once, not nightly", not "warn every night
+# forever". Re-warn periodically so a genuinely-fixed source's silence isn't
+# permanent, but damp the common case.
+NEVER_YIELDED_REWARN_DAYS = 7
+
+
+def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED_REWARN_DAYS) -> bool:
+    """True if a ``never_yielded`` warning was already recorded for ``source``
+    within the last ``within_days`` days.
+
+    Never raises — a sync_health DB hiccup must not fail the sync. On error we
+    fall through to "not recently warned", since a duplicate warning is
+    harmless while a silently-dropped one defeats the point of the check.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
+        for err in get_recent_errors(source=source, limit=20):
+            if err.get("error_type") != "never_yielded":
+                continue
+            ts = err.get("timestamp")
+            if not ts:
+                continue
+            err_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if err_dt.tzinfo is None:
+                err_dt = err_dt.replace(tzinfo=timezone.utc)
+            if err_dt >= cutoff:
+                return True
+    except Exception as e:
+        logger.warning(f"Never-yielded rewarn check failed for {source}: {e}")
+        return False
+    return False
+
+
 def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     """
     Run a single sync operation.
@@ -889,6 +1011,49 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             )
             logger.error(msg)
             record_sync_error(source, msg, error_type="duration_collapse")
+
+        # A source that exits early because it isn't configured must not count
+        # as a healthy success — that inflates the nightly "N/N green" summary.
+        skipped_reason = stats.pop("skipped_reason", None)
+
+        # Yield-based no-op detection (issue #494). Only meaningful when the
+        # source actually ran; a skipped source is expected to produce nothing.
+        if not skipped_reason:
+            yield_collapse = _detect_yield_collapse(source, stats)
+            if yield_collapse:
+                stats["yield_collapse"] = yield_collapse
+                msg = (
+                    f"Yield collapse for {source}: produced 0 records but "
+                    f"typically produces ~{yield_collapse['typical_yield']:.0f} "
+                    f"— possible silent no-op"
+                )
+                logger.error(msg)
+                record_sync_error(source, msg, error_type="yield_collapse")
+
+            never_yielded = _detect_never_yielded(source, stats)
+            if never_yielded:
+                stats["never_yielded"] = never_yielded
+                # Damped (#494 follow-up): only warn when the condition is
+                # newly true, or periodically — not every night for the same
+                # chronic sources.
+                if not _recently_warned_never_yielded(source):
+                    msg = (
+                        f"{source} has never produced records in "
+                        f"{never_yielded['runs']} runs (avg "
+                        f"{never_yielded['avg_duration_seconds']:.1f}s) — likely "
+                        f"dead or misconfigured"
+                    )
+                    logger.warning(msg)
+                    record_sync_error(source, msg, error_type="never_yielded")
+                    stats["never_yielded_warned"] = True
+
+        if skipped_reason:
+            stats["skipped"] = True
+            stats["skipped_reason"] = skipped_reason
+            logger.info(f"Sync skipped for {source}: {skipped_reason}")
+            record_sync_complete(run_id, SyncStatus.SKIPPED)
+            _active_run_id = None
+            return True, stats
 
         record_sync_complete(
             run_id,
@@ -1015,6 +1180,14 @@ def _parse_sync_output(output: str) -> dict:
         "source_entities_created": 0,
     }
 
+    # A script that cannot run because it isn't configured emits
+    # ``SYNC_SKIPPED:<reason>``. It still exits 0 — nothing is broken — but
+    # recording it as a healthy success inflates the nightly "N/N green"
+    # summary and hides dead sources (issue #494).
+    skipped_match = re.search(r"SYNC_SKIPPED:\s*([^\n]+)", output)
+    if skipped_match:
+        stats["skipped_reason"] = skipped_match.group(1).strip()
+
     # Authoritative path: a single SYNC_STATS:{json} line emitted by the
     # script. If present, treat it as ground truth and skip regex inference.
     # Last occurrence wins, so a top-level wrapper script (e.g.
@@ -1140,6 +1313,9 @@ def run_all_syncs(
     failed = []
     dep_skipped = set()  # Sources skipped because a dependency failed
     duration_collapsed = []  # Sources that "succeeded" suspiciously fast
+    yield_collapsed = []  # Normally produce records, produced none this run
+    never_yielded_sources = []  # Never produced anything across many runs
+    skipped_sources = []  # Exited early because they aren't configured
     start_time = datetime.now()
 
     # Check for disabled work integrations
@@ -1302,8 +1478,15 @@ def run_all_syncs(
 
             if not success:
                 failed.append(source)
-            elif stats.get("duration_collapse"):
-                duration_collapsed.append(source)
+            elif stats.get("skipped"):
+                skipped_sources.append(source)
+            else:
+                if stats.get("duration_collapse"):
+                    duration_collapsed.append(source)
+                if stats.get("yield_collapse"):
+                    yield_collapsed.append(source)
+                if stats.get("never_yielded_warned"):
+                    never_yielded_sources.append(source)
 
             # Restart LLM after last embedding phase completes (if we stopped it)
             if source in EMBEDDING_SOURCES and _llm_stopped_for_sync:
@@ -1325,12 +1508,20 @@ def run_all_syncs(
     logger.info("=" * 60)
     logger.info("SYNC RUN COMPLETE")
     logger.info(f"Total sources: {len(sources)}")
-    logger.info(f"Succeeded: {len(sources) - len(failed)}")
+    # Skipped sources aren't successes — counting them green is what let an
+    # unconfigured source sit in the "all healthy" total for months (#494).
+    logger.info(f"Succeeded: {len(sources) - len(failed) - len(skipped_sources)}")
     logger.info(f"Failed: {len(failed)}")
+    if skipped_sources:
+        logger.info(f"Skipped (not configured): {', '.join(sorted(skipped_sources))}")
     if failed:
         logger.error(f"Failed sources: {', '.join(failed)}")
     if dep_skipped:
         logger.warning(f"Dependency-skipped sources: {', '.join(sorted(dep_skipped))}")
+    if yield_collapsed:
+        logger.error(f"Yield collapse (produced nothing, normally do): {', '.join(yield_collapsed)}")
+    if never_yielded_sources:
+        logger.warning(f"Never produced records: {', '.join(never_yielded_sources)}")
     logger.info("=" * 60)
 
     # Check overall health
