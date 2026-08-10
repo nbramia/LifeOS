@@ -336,7 +336,9 @@ decide_plan() {
     # Code change: always run unit; additively widen for the touched areas so
     # a change spanning categories is fully covered.
     local plan="unit"
-    if printf '%s\n' "$files" | grep -qE '\.html$|^static/.*\.js$|^api/routes/|/templates/'; then
+    # Web assets live in web/ and are only *served* under the /static URL
+    # prefix — matching on a `static/` path never fires (#518).
+    if printf '%s\n' "$files" | grep -qE '\.html$|^web/.*\.js$|^api/routes/'; then
         plan="$plan browser"
     fi
     if printf '%s\n' "$files" | grep -qE '^scripts/run_all_syncs\.py$|^api/services/[^/]*sync[^/]*|indexer|embeddings|vectorstore|bm25_index'; then
