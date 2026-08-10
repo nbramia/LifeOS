@@ -5,6 +5,8 @@ Covers CRUD, cron computation, auto-disable, due detection, suppression,
 prompt execution, the markdown round-trip, markdown-as-source-of-truth, and
 the auto-generated dashboard.
 """
+import threading
+
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, AsyncMock, MagicMock
@@ -300,6 +302,93 @@ class TestDueChecking:
         entry.next_trigger_at = past
         entry.last_triggered_at = datetime.now(timezone.utc).isoformat()  # just fired
         assert store.get_due_reminders() == []
+
+
+class TestIndexSwapAtomicity:
+    """The index must never be observable half-rebuilt (issue #524).
+
+    ``get`` / ``list_all`` / ``get_due_reminders`` read without the lock, so
+    every write has to swap in a complete map rather than mutate the live one.
+    """
+
+    def test_reader_midway_through_reindex_sees_the_whole_index(self, store, monkeypatch):
+        """A read pinned to the middle of a reindex still sees every schedule."""
+        import api.services.scheduler_store as mod
+
+        ids = [
+            store.create(name=f"Job {n}", schedule_type="cron",
+                         schedule_value="0 9 * * *", message_type="static",
+                         message_content=f"body {n}").id
+            for n in range(3)
+        ]
+        # Make one schedule due. A reader that misses it mid-reindex loses the
+        # fire for good — the reindex recomputes next_trigger_at to the future.
+        store.get(ids[0]).next_trigger_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+
+        writer_inside = threading.Event()
+        reader_done = threading.Event()
+        observed = {}
+        real_merge_prior = mod.SchedulerStore._merge_prior
+
+        def hooked_merge_prior(entry, prior):
+            # Runs inside the reindex loop — the exact point at which the old
+            # code had already torn the index down and not yet refilled it.
+            if not writer_inside.is_set():
+                writer_inside.set()
+                reader_done.wait(timeout=10)
+            real_merge_prior(entry, prior)
+
+        monkeypatch.setattr(mod.SchedulerStore, "_merge_prior",
+                            staticmethod(hooked_merge_prior))
+
+        def read_midway():
+            try:
+                if not writer_inside.wait(timeout=10):
+                    return
+                observed["get"] = store.get(ids[1])
+                observed["list_all"] = store.list_all()
+                observed["due"] = store.get_due_reminders()
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(target=read_midway, name="scheduler-race-reader")
+        reader.start()
+        try:
+            store.reindex_file(str(store.inbox_path))
+        finally:
+            reader_done.set()
+            reader.join(timeout=10)
+
+        assert not reader.is_alive()
+        assert writer_inside.is_set(), "reindex never entered the merge loop"
+        assert observed["get"] is not None, "get() returned None for a live schedule"
+        assert len(observed["list_all"]) == 3, "list_all() saw a partial index"
+        assert [e.id for e in observed["due"]] == [ids[0]], "a due schedule was missed"
+
+    def test_create_and_delete_swap_the_index_instead_of_mutating_it(self, store):
+        """An in-flight scan of the index survives a concurrent create/delete.
+
+        Reaches into ``_entries`` because there is no public way to pause a
+        reader partway through its scan; the property under test is that the
+        dict a reader is iterating is never the one a writer touches.
+        """
+        keep = store.create(name="Keep", schedule_type="cron", schedule_value="0 9 * * *",
+                            message_type="static", message_content="a")
+        doomed = store.create(name="Doomed", schedule_type="cron", schedule_value="0 9 * * *",
+                              message_type="static", message_content="b")
+
+        scan = iter(store._entries.values())
+        assert next(scan).id == keep.id
+        added = store.create(name="Added", schedule_type="cron", schedule_value="0 9 * * *",
+                             message_type="static", message_content="c")
+        assert [e.id for e in scan] == [doomed.id]  # no "changed size during iteration"
+
+        scan = iter(store._entries.values())
+        assert next(scan).id == keep.id
+        store.delete(doomed.id)
+        assert [e.id for e in scan] == [doomed.id, added.id]
 
 
 class TestAutoDisable:
