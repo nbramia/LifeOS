@@ -61,6 +61,7 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
 # =============================================================================
@@ -579,6 +580,11 @@ logging.basicConfig(
         logging.FileHandler(log_file),
     ]
 )
+# This sync sends a Telegram notification with a run summary. httpx's request
+# logger defaults to INFO and logs the full request URL — and the Telegram
+# Bot API embeds the bot token in that URL — so without this, every sync run
+# writes a live credential into logs/sync_*.log (#519).
+configure_telegram_log_redaction()
 logger = logging.getLogger(__name__)
 
 # =============================================================================
