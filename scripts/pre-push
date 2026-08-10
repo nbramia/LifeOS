@@ -5,9 +5,10 @@
 # Runs unit tests before allowing pushes. Output is redirected to a log
 # file to avoid flooding the terminal — only a pass/fail summary is shown.
 #
-# Installation:
-#   cp scripts/pre-push .git/hooks/pre-push
-#   chmod +x .git/hooks/pre-push
+# Installation: none. This repo sets `core.hooksPath = scripts`, so git runs
+# THIS tracked file directly. Do not copy it into .git/hooks — a copy there is
+# never executed, and a stale one is actively misleading (one sat in
+# .git/hooks/pre-push from 2026-07-09 until it was removed).
 #
 
 set -e
@@ -26,10 +27,17 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 # git feeds pre-push hooks lines of "local_ref local_sha remote_ref remote_sha" on stdin.
 CHANGED_FILES=""
 ZERO_SHA="0000000000000000000000000000000000000000"
+# Did any ref in this push actually carry commits? A deletion-only push has
+# nothing to test, but it also yields an empty CHANGED_FILES — which the
+# classifier below (correctly) treats as "unknown, run everything". Tracking
+# this separately is what lets a pure deletion exit early instead of running
+# the whole suite just to delete a branch.
+HAVE_CONTENT=0
 while read local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
     # Deletion push (local_sha is zeros) — nothing to diff.
     [ "$local_sha" = "$ZERO_SHA" ] && continue
+    HAVE_CONTENT=1
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
         # New branch: diff against origin/main if available, else last 10 commits.
         MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "${local_sha}~10")
@@ -41,13 +49,55 @@ while read local_ref local_sha remote_ref remote_sha; do
 done
 CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
 
-# If we have a non-empty change list and every file is docs, skip the test suite.
-if [ -n "$CHANGED_FILES" ] && ! echo "$CHANGED_FILES" | grep -qvE '\.(md|txt|rst)$|^docs/'; then
-    echo "Pre-push: docs-only push, skipping unit tests"
+# Test overrides: stand in for the stdin ref lines so the decision below can be
+# exercised without a real push (mirrors test.sh's LIFEOS_TEST_CHANGED_FILES).
+if [ -n "${LIFEOS_PREPUSH_CHANGED_FILES+x}" ]; then
+    CHANGED_FILES=$(printf '%s\n' "$LIFEOS_PREPUSH_CHANGED_FILES" | grep -v '^$' || true)
+    HAVE_CONTENT="${LIFEOS_PREPUSH_HAVE_CONTENT:-1}"
+fi
+
+# Emit the decision and stop, without running anything.
+plan_only_exit() {
+    if [ -n "${LIFEOS_PREPUSH_PLAN_ONLY:-}" ]; then
+        echo "prepush-plan: $1"
+        exit 0
+    fi
+}
+
+# Is this push docs-only? Delegate to test.sh's decide_plan rather than keeping
+# a second copy of the classification here. The two had already drifted: this
+# hook's own regex matched `\.txt$`, so a requirements.txt / constraints.txt
+# bump counted as "docs" and skipped the entire suite, while decide_plan
+# deliberately excludes dependency manifests ("a dep bump must still run tests
+# rather than skipping"). One implementation, covered by tests/test_test_sh_auto.py
+# and tests/test_prepush_gate.py.
+docs_only() {
+    [ -n "$CHANGED_FILES" ] || return 1
+    [ -f "$PROJECT_ROOT/scripts/test.sh" ] || return 1
+    local plan
+    plan=$(LIFEOS_TEST_PLAN_ONLY=1 LIFEOS_TEST_CHANGED_FILES="$CHANGED_FILES" \
+        bash "$PROJECT_ROOT/scripts/test.sh" auto 2>/dev/null \
+        | sed -n 's/^auto-plan: //p')
+    [ "$plan" = "skip" ]
+}
+
+# Deletion-only push: no commits are being sent, so there is nothing to gate.
+if [ "$HAVE_CONTENT" = "0" ]; then
+    plan_only_exit "skip-deletion"
+    echo "Pre-push: ref deletion only, nothing to test"
     exit 0
 fi
 
+if docs_only; then
+    plan_only_exit "skip-docs"
+    echo "Pre-push: docs-only push, skipping tests"
+    exit 0
+fi
+
+plan_only_exit "run"
+
 LOG="/tmp/lifeos-prepush-tests.log"
+BROWSER_LOG="/tmp/lifeos-prepush-browser.log"
 
 # Activate virtual environment
 if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
@@ -62,17 +112,17 @@ fail() {
 
 echo -n "Running unit tests... "
 
-# Parallelize across all cores via pytest-xdist (-n auto).
-# --ff orders previously-failed tests first on full runs; --lf restricts
-# to only previously-failed tests when a failed-tests cache exists, so
-# fix-and-push iterations are fast. A fresh checkout (no cache) runs all.
-PYTEST_OPTS=(-n auto --ff)
-if [ -f ".pytest_cache/v/cache/lastfailed" ]; then
-    PYTEST_OPTS+=(--lf)
-fi
-
+# Parallelize across all cores via pytest-xdist (-n auto). --ff runs
+# previously-failed tests first, so a repeat failure surfaces in seconds
+# without narrowing what actually runs.
+#
+# Deliberately no last-failed-only flag. Restricting the run to previously
+# failed tests whenever a lastfailed cache existed collapsed the gate: fail
+# once, fix it, and the next push ran a handful of tests out of ~2400 and
+# passed — at exactly the moment the code had just changed. --ff keeps the
+# fast-feedback ordering; it just doesn't deselect anything.
 python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header \
-    "${PYTEST_OPTS[@]}" > "$LOG" 2>&1 || fail
+    -n auto --ff > "$LOG" 2>&1 || fail
 echo "passed ($(tail -1 "$LOG"))"
 
 # Browser tests that need no running server. Server-dependent ones carry
@@ -86,14 +136,20 @@ echo "passed ($(tail -1 "$LOG"))"
 # test that lands after a browser test in the same process is silently never
 # awaited. Under `-n auto` that ordering is nondeterministic.
 #
-# -p no:cacheprovider keeps this run out of .pytest_cache — otherwise a failure
-# here would seed `lastfailed` with tests the unit run's --lf can't select,
-# and the next push would run nothing at all.
+# -p no:cacheprovider keeps this run out of .pytest_cache so it can't disturb
+# the unit run's --ff ordering data.
 if python -c "import playwright" 2>/dev/null; then
     echo -n "Running server-free browser tests... "
+    # Its own log, so a browser failure doesn't clobber the unit-run output
+    # someone may still need to read.
+    LOG="$BROWSER_LOG"
     python -m pytest -m "browser and not requires_server" tests/ -q --tb=line \
         --no-header -p no:cacheprovider > "$LOG" 2>&1 || fail
     echo "passed ($(tail -1 "$LOG"))"
+else
+    # Say so rather than silently degrading — on a machine without Playwright
+    # this gate is simply absent, and that should be visible.
+    echo "Skipping browser tests (playwright not installed)"
 fi
 
 exit 0
