@@ -100,7 +100,12 @@ TOOL_DEFINITIONS = [
                 },
                 "days_range": {
                     "type": "integer",
-                    "description": "Number of days to search. With query: search ±N days (default 180). With date_ref: range from date (default 1).",
+                    "description": (
+                        "Number of days to search. With query: search ±N days — omit "
+                        "to auto-widen through ±180 → ±365 → ±1095 days, stopping at "
+                        "the first span with events; setting it disables widening. "
+                        "With date_ref: range from date (default 1)."
+                    ),
                 },
             },
             "required": [],
@@ -111,7 +116,8 @@ TOOL_DEFINITIONS = [
         "description": (
             "Search Gmail across personal and work accounts. "
             "Returns sender, recipient, subject, date, and body preview. "
-            "Use from_email/to_email for targeted searches (get email from person_info first)."
+            "Use from_email/to_email for targeted searches (get email from person_info first). "
+            "Scope by time with after/before; with neither, all of history is searched."
         ),
         "input_schema": {
             "type": "object",
@@ -128,9 +134,26 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Filter by recipient email address.",
                 },
+                "after": {
+                    "type": "string",
+                    "description": (
+                        "Only emails on or after this date (YYYY-MM-DD). Omit to "
+                        "search back to the beginning of the mailbox."
+                    ),
+                },
+                "before": {
+                    "type": "string",
+                    "description": (
+                        "Only emails on or before this date (YYYY-MM-DD). Omit for "
+                        "no upper bound."
+                    ),
+                },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max emails to return per account (default 5).",
+                    "description": (
+                        "Max emails to return per account (default 15). Raise it when "
+                        "the result says it was capped and you need the rest."
+                    ),
                 },
             },
             "required": [],
@@ -158,7 +181,11 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "search_slack",
-        "description": "Search Slack messages across DMs and channels.",
+        "description": (
+            "Search Slack messages across DMs and channels. Semantic search over "
+            "indexed messages only — an empty result means nothing indexed matches, "
+            "not a sign the search broke. Optionally scope by date with after/before."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -168,7 +195,18 @@ TOOL_DEFINITIONS = [
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Number of results (default 10).",
+                    "description": "Number of results (default 20).",
+                },
+                "after": {
+                    "type": "string",
+                    "description": (
+                        "Only messages on or after this date (YYYY-MM-DD). Applied "
+                        "after ranking, so a dated search can return fewer than top_k."
+                    ),
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only messages on or before this date (YYYY-MM-DD).",
                 },
             },
             "required": ["query"],
@@ -468,7 +506,12 @@ TOOL_DEFINITIONS = [
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD). Transactions default to 30 days ago, cashflow/budgets to 1st of current month.",
+                    "description": (
+                        "Start date (YYYY-MM-DD). For transactions, omit to auto-widen "
+                        "through 90 days → 1 year → all history, stopping at the first "
+                        "window with matches; setting it disables widening. "
+                        "cashflow/budgets default to the 1st of the current month."
+                    ),
                 },
                 "end_date": {
                     "type": "string",
@@ -822,32 +865,97 @@ def _tool_search_vault(inp: dict) -> str:
     return "\n\n---\n".join(lines)
 
 
+# Widening ladder for a calendar keyword search with no caller-supplied range.
+# ±180d covers "did we meet recently"; the wider rungs catch anniversaries and
+# one-off events from previous years that the old fixed ±180d silently hid.
+_CALENDAR_LADDER_DAYS = (180, 365, 1095)
+
+
 async def _tool_search_calendar(inp: dict) -> str:
     from api.services.calendar import CalendarService
 
     query = inp.get("query")
     date_ref = inp.get("date_ref")
-    days_range = inp.get("days_range")
-
-    all_events = []
-    for account in get_configured_accounts():
+    # A non-int or non-positive days_range would raise inside
+    # timedelta(days=...) per account, get swallowed by the handler below, and
+    # come back as "No calendar events found. Searched ±30d" — a scoped-looking
+    # empty for a search that never validly ran. Treat it as unstated (so the
+    # ladder applies) and say the value was dropped, rather than clamping it to
+    # some nearby number the caller never asked for.
+    raw_range = inp.get("days_range")
+    days_range = None
+    if raw_range is not None:
         try:
-            cal = CalendarService(account)
-            if query:
-                search_range = days_range or 180
-                events = cal.search_events(query=query, days_back=search_range, days_forward=search_range)
-            elif date_ref:
-                start = datetime.strptime(date_ref, "%Y-%m-%d")
-                end = start + timedelta(days=days_range or 1)
-                events = cal.get_events_in_range(start, end)
-            else:
-                events = cal.get_upcoming_events(days=7, max_results=15)
-            all_events.extend(events)
-        except Exception as e:
-            logger.warning(f"Calendar {account.value} error: {e}")
+            days_range = int(raw_range)
+        except (TypeError, ValueError):
+            days_range = None
+        if days_range is not None and days_range < 1:
+            days_range = None
+    bad_range = (
+        f" [Ignored days_range={raw_range!r} — must be a positive whole number "
+        "of days, so this result is NOT scoped to it.]"
+        if raw_range is not None and days_range is None
+        else ""
+    )
+
+    # Accounts that errored during the search. An expired token used to be
+    # logged and then reported as "no events" — a real fault dressed up as an
+    # empty result, which is the misdiagnosis this whole change exists to stop.
+    failed_accounts: list[str] = []
+
+    def _fetch(search_range: int | None) -> list:
+        """Collect events from every configured account for one window."""
+        events = []
+        failed_accounts.clear()
+        for account in get_configured_accounts():
+            try:
+                cal = CalendarService(account)
+                if query:
+                    events.extend(cal.search_events(query=query, days_back=search_range, days_forward=search_range))
+                elif date_ref:
+                    start = datetime.strptime(date_ref, "%Y-%m-%d")
+                    end = start + timedelta(days=days_range or 1)
+                    events.extend(cal.get_events_in_range(start, end))
+                else:
+                    events.extend(cal.get_upcoming_events(days=7, max_results=15))
+            except Exception as e:
+                logger.warning(f"Calendar {account.value} error: {e}")
+                failed_accounts.append(account.value)
+        return events
+
+    # An explicit days_range is an intentional constraint — answer exactly that
+    # span. Only a keyword search with no stated range walks the ladder.
+    windows_tried: list[str] = []
+    if query and days_range:
+        all_events = _fetch(days_range)
+        windows_tried.append(f"±{days_range}d")
+    elif query:
+        for days in _CALENDAR_LADDER_DAYS:
+            all_events = _fetch(days)
+            windows_tried.append(f"±{days}d")
+            if all_events:
+                break
+    else:
+        # date_ref / upcoming branches set their own range; search_range unused.
+        all_events = _fetch(None)
+
+    failed_note = ""
+    if failed_accounts:
+        failed_note = (
+            f" [Could not reach {', '.join(failed_accounts)} — that account "
+            "errored, so this is an incomplete answer, not necessarily an empty "
+            "calendar. It may need re-authorising.]"
+        )
 
     if not all_events:
-        return "No calendar events found."
+        if windows_tried:
+            hint = f"Nothing on the calendar matches {query!r} in that span."
+            return (
+                _exhausted_note("calendar events", windows_tried, hint)
+                + bad_range
+                + failed_note
+            )
+        return "No calendar events found." + bad_range + failed_note
 
     all_events.sort(key=lambda e: e.start_time or datetime.min)
     lines = []
@@ -857,14 +965,34 @@ async def _tool_search_calendar(inp: dict) -> str:
         attendees = f" with {', '.join(e.attendees[:5])}" if e.attendees else ""
         loc = f" @ {e.location}" if e.location else ""
         lines.append(f"- {e.title} ({start}) {acct}{attendees}{loc}")
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    note = _ladder_note(windows_tried) + bad_range + failed_note
+    return f"{len(all_events)} events{note}:\n{body}" if note else body
 
 
 async def _tool_search_email(inp: dict) -> str:
     from api.services.gmail import GmailService
 
-    max_results = inp.get("max_results", 5)
+    # Normalised, not passed through: max_results is also the yardstick for the
+    # truncation check below, so a None or 0 from the model would both confuse
+    # Gmail and silently disable that disclosure.
+    max_results = _positive_int(inp.get("max_results", 15), 15, 100)
+    after = _parse_ymd(inp.get("after"))
+    before = _parse_ymd(inp.get("before"))
+    ignored = [
+        f"{k}={inp[k]!r}"
+        for k, parsed in (("after", after), ("before", before))
+        if inp.get(k) and not parsed
+    ]
+    ignored_note = (
+        f"\n\n[Ignored unparseable {', '.join(ignored)} — dates must be YYYY-MM-DD, "
+        "so these results are NOT scoped to that range.]"
+        if ignored
+        else ""
+    )
+
     all_messages = []
+    truncated = False
     for account in get_configured_accounts():
         try:
             gmail = GmailService(account)
@@ -872,15 +1000,46 @@ async def _tool_search_email(inp: dict) -> str:
                 keywords=inp.get("keywords"),
                 from_email=inp.get("from_email"),
                 to_email=inp.get("to_email"),
+                after=after,
+                before=before,
                 max_results=max_results,
                 include_body=True,
             )
             all_messages.extend(messages)
+            # A full page back is the only signal Gmail gives that it had more.
+            if len(messages) == max_results:
+                truncated = True
         except Exception as e:
             logger.warning(f"Gmail {account.value} error: {e}")
 
     if not all_messages:
-        return "No emails found."
+        # Name the filters actually applied. A keyword that matches nothing
+        # matches nothing at any max_results, so there is no retry to make —
+        # but the model needs to see what was searched to pick a better filter.
+        applied = [
+            f"{label}={inp[key]!r}"
+            for key, label in (
+                ("keywords", "keywords"),
+                ("from_email", "from"),
+                ("to_email", "to"),
+            )
+            if inp.get(key)
+        ]
+        if after or before:
+            span = " to ".join(
+                d.strftime("%Y-%m-%d") for d in (after, before) if d
+            )
+            applied.append(f"dates {span}")
+        else:
+            applied.append("no date filter")
+        return f"No emails found. Searched with {', '.join(applied)}.{ignored_note}"
+
+    trunc_note = ""
+    if truncated:
+        trunc_note = (
+            f"\n\n[Capped at {max_results} per account — more may exist. Raise "
+            "max_results, or narrow with after/before, to see the rest.]"
+        )
 
     lines = []
     for m in all_messages:
@@ -899,7 +1058,7 @@ async def _tool_search_email(inp: dict) -> str:
             f"Date: {date_str}\n"
             f"{body_preview}"
         )
-    return "\n\n---\n".join(lines)
+    return "\n\n---\n".join(lines) + ignored_note + trunc_note
 
 
 async def _tool_search_drive(inp: dict) -> str:
@@ -936,10 +1095,99 @@ def _tool_search_slack(inp: dict) -> str:
         return "Slack is not configured."
 
     indexer = get_slack_indexer()
-    top_k = inp.get("top_k", 10)
-    results = indexer.search(query=inp["query"], top_k=top_k)
+    # Normalised for the same reason as email's max_results: it doubles as the
+    # truncation yardstick, so None/0 would quietly disable that disclosure.
+    top_k = _positive_int(inp.get("top_k", 20), 20, 200)
+    query = inp["query"]
+    results = indexer.search(query=query, top_k=top_k)
+
+    # A full page back means the ranking was cut off, not that Slack has no more.
+    truncated = len(results) == top_k
+
+    # after/before are post-filters: the indexed metadata carries an ISO
+    # `timestamp` per message, but the vector search itself can't range-filter,
+    # so dates are applied to the already-ranked page. A dated search can
+    # therefore return fewer than top_k even when more matches exist.
+    after = _parse_ymd(inp.get("after"))
+    before = _parse_ymd(inp.get("before"))
+    ignored = [
+        f"{k}={inp[k]!r}"
+        for k, parsed in (("after", after), ("before", before))
+        if inp.get(k) and not parsed
+    ]
+    if after:
+        after = after.replace(tzinfo=timezone.utc)
+    if before:
+        before = before.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+
+    ranked_count = len(results)
+    undateable = 0
+    if after or before:
+        dated = []
+        for msg in results:
+            try:
+                when = datetime.fromisoformat(msg.get("timestamp") or "")
+            except (ValueError, TypeError):
+                # Excluded because we can't place it in time, which is NOT the
+                # same as falling outside the range — counted separately so the
+                # empty-result text doesn't claim something it hasn't shown.
+                undateable += 1
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if after and when < after:
+                continue
+            if before and when > before:
+                continue
+            dated.append(msg)
+        results = dated
+
+    notes = ""
+    if ignored:
+        notes += (
+            f"\n\n[Ignored unparseable {', '.join(ignored)} — dates must be "
+            "YYYY-MM-DD, so these results are NOT date-scoped.]"
+        )
+    if truncated:
+        notes += (
+            f"\n\n[Ranked top {top_k} only — more may match. Raise top_k to see "
+            "further; note after/before filter this page after ranking, so a "
+            "dated search may return fewer than top_k.]"
+        )
+    if undateable:
+        notes += (
+            f"\n\n[{undateable} matching message(s) had no readable timestamp and "
+            "were excluded from the date filter — they may well be in range.]"
+        )
+
     if not results:
-        return "No Slack messages found."
+        span = " to ".join(d.strftime("%Y-%m-%d") for d in (after, before) if d)
+        if span and ranked_count:
+            # A bigger top_k genuinely helps here: the query did match, but no
+            # match on the ranked page could be shown for this range. Attribute
+            # the exclusions accurately — "outside the range" and "couldn't be
+            # dated" are different facts and only the first is established.
+            dated_out = ranked_count - undateable
+            reasons = []
+            if dated_out:
+                reasons.append(f"{dated_out} outside that range")
+            if undateable:
+                reasons.append(f"{undateable} with no readable timestamp")
+            return (
+                f"No Slack messages for {query!r} between {span} — of "
+                f"{ranked_count} top-ranked matches, {' and '.join(reasons)}. "
+                "Dates are applied after ranking, so raising top_k may surface "
+                "in-range matches." + notes
+            )
+        # Straight top-k nearest-neighbour with no score threshold: zero results
+        # means nothing indexed matches, and a larger top_k cannot change that.
+        return (
+            f"No Slack messages found for {query!r}"
+            + (f" between {span}" if span else "")
+            + ". Slack coverage is limited to the channels and DMs that have been "
+            "indexed, so this means nothing indexed matches — not a sign the "
+            "search broke." + notes
+        )
 
     lines = []
     for msg in results:
@@ -948,7 +1196,7 @@ def _tool_search_slack(inp: dict) -> str:
         ts = msg.get("timestamp", "")[:16]
         content = msg.get("content", "")[:500]
         lines.append(f"**{channel}** - {user} ({ts}):\n{content}")
-    return "\n\n".join(lines)
+    return "\n\n".join(lines) + notes
 
 
 async def _tool_search_web(inp: dict) -> str:
@@ -983,6 +1231,56 @@ def _format_whatsapp_interactions(interactions: list) -> str:
         lines.append(f"- **{time_str}** {direction}{text}")
 
     return "\n".join(lines)
+
+
+def _ladder_note(attempts: list[str]) -> str:
+    """Note which rungs of a widening ladder came up empty.
+
+    Lets the model see the search was already widened rather than assuming the
+    narrow window was the only one tried. Empty when the first rung hit.
+    """
+    if len(attempts) < 2:
+        return ""
+    return f" (nothing in {', '.join(attempts[:-1])}; widened to {attempts[-1]})"
+
+
+def _exhausted_note(noun: str, attempts: list[str], hint: str = "") -> str:
+    """Empty-result text that names every window searched.
+
+    A bare "No X found." reads as a broken backend; naming the windows makes the
+    emptiness a fact about the data instead.
+    """
+    searched = f" Searched {', then '.join(attempts)}." if attempts else ""
+    return f"No {noun} found.{searched}" + (f" {hint}" if hint else "")
+
+
+def _positive_int(raw, default: int, maximum: int) -> int:
+    """Coerce a model-supplied count to a usable bound.
+
+    The LLM fills these in, so None, "20", 0 and -5 all turn up. A bad value
+    must not reach the service layer: `timedelta(days="30")` raises, and a 0 or
+    None cap silently defeats the truncation checks that compare against it.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, maximum))
+
+
+def _parse_ymd(raw) -> datetime | None:
+    """Parse a 'YYYY-MM-DD' filter value. None if absent or unparseable.
+
+    Callers drop the filter on None rather than raising: a malformed date
+    shouldn't cost the model its whole search, but it must be told the filter
+    was ignored so it doesn't read the results as scoped.
+    """
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
 
 
 # Widening ladder for message history when the caller gave no date range.
@@ -1102,14 +1400,7 @@ def _tool_get_message_history(inp: dict) -> str:
             + ". Retry without start_date/end_date to search all history."
         )
 
-    # Note which rungs came up empty, so the model can see the search was already
-    # widened rather than assuming the narrow window was the only one tried.
-    widened_note = ""
-    if len(windows_tried) > 1:
-        widened_note = (
-            f" (nothing in {', '.join(windows_tried[:-1])}; "
-            f"widened to {windows_tried[-1]})"
-        )
+    widened_note = _ladder_note(windows_tried)
 
     # Build output. The budget is split across sources rather than applied to the
     # assembled string: the sections are grouped by source, not interleaved by
@@ -1901,6 +2192,18 @@ def _tool_read_vault_file(inp: dict) -> str:
         return f"Error reading {match.name}: {e}"
 
 
+# Widening ladder for transactions when the caller gave no start_date.
+# None = all history (the Monarch client omits start_date entirely).
+_TXN_LADDER_DAYS = (90, 365, None)
+
+# Row cap for a transactions fetch, passed explicitly so the number is known
+# here and can be disclosed. Monarch's own default is also 500, so before this
+# was passed a widened window silently topped out with no indication. Ordering
+# is newest-first (the client hardcodes orderBy="date", verified descending),
+# so hitting the cap drops the OLDEST rows, not the most recent.
+_TXN_ROW_CAP = 500
+
+
 async def _tool_search_finances(inp: dict) -> str:
     from api.services.monarch import get_monarch_client
 
@@ -1976,17 +2279,89 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "transactions":
-        start = inp.get("start_date")
-        end = inp.get("end_date")
-        if not start:
-            start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        txns = await client.get_transactions(
-            start_date=start, end_date=end,
-            search=inp.get("search", ""), category=inp.get("category"),
+        # Normalise before use: these come from the model, and an unparseable
+        # date passed through to Monarch would either error or be ignored
+        # server-side, leaving results that silently aren't scoped as asked.
+        raw_start, raw_end = inp.get("start_date"), inp.get("end_date")
+        start = raw_start if _parse_ymd(raw_start) else None
+        end = raw_end if _parse_ymd(raw_end) else None
+        dropped = [
+            f"{label}={raw!r}"
+            for raw, label in ((raw_start, "start_date"), (raw_end, "end_date"))
+            if raw and not _parse_ymd(raw)
+        ]
+        dropped_note = (
+            f" [Ignored unparseable {', '.join(dropped)} — dates must be "
+            "YYYY-MM-DD, so this result is NOT scoped to them.]"
+            if dropped
+            else ""
         )
+        search = inp.get("search", "")
+        category = inp.get("category")
+
+        async def _fetch(window_start: str | None) -> list:
+            # Monarch rejects a one-sided range ("You must specify both a
+            # startDate and endDate"), so fill in whichever half is missing.
+            # Unbounded is expressed as *neither* bound, not as a null start.
+            window_end = end
+            if window_start and not window_end:
+                window_end = datetime.now().strftime("%Y-%m-%d")
+            elif window_end and not window_start:
+                window_start = "1900-01-01"
+            return await client.get_transactions(
+                start_date=window_start, end_date=window_end,
+                search=search, category=category, limit=_TXN_ROW_CAP,
+            )
+
+        # An explicit start_date is an intentional constraint — answer exactly
+        # that window. With none, walk the ladder rather than silently clamping
+        # to 30 days: a merchant last charged 8 months ago is not "no data".
+        #
+        # The ladder counts back from end_date when one was given, not from
+        # today. Counting from today would build an inverted start>end window
+        # for any past end_date — a range that can only return zero, which the
+        # ladder note would then misreport as "nothing in the last 90d".
+        anchor = _parse_ymd(end) or datetime.now()
+        anchored = " before " + anchor.strftime("%Y-%m-%d") if _parse_ymd(end) else ""
+        windows_tried: list[str] = []
+        if start:
+            txns = await _fetch(start)
+        else:
+            for days in _TXN_LADDER_DAYS:
+                window_start = (
+                    (anchor - timedelta(days=days)).strftime("%Y-%m-%d")
+                    if days
+                    else None
+                )
+                txns = await _fetch(window_start)
+                windows_tried.append(
+                    f"last {days}d{anchored}" if days else f"all history{anchored}"
+                )
+                if txns:
+                    break
+
         if not txns:
-            return "No transactions found."
-        lines = [f"{len(txns)} transactions:"]
+            if search:
+                hint = f"Nothing matched {search!r} — retry without the search term."
+            elif start:
+                hint = "Retry without start_date to search all history."
+            else:
+                hint = "There are no transactions on record" + (
+                    f" in category {category!r}." if category else "."
+                )
+            return _exhausted_note("transactions", windows_tried, hint) + dropped_note
+
+        capped_note = ""
+        if len(txns) >= _TXN_ROW_CAP:
+            capped_note = (
+                f" [Capped at {_TXN_ROW_CAP} rows — older matches in this window "
+                "were dropped. Narrow with start_date/end_date or a search term "
+                "to see them.]"
+            )
+        lines = [
+            f"{len(txns)} transactions{_ladder_note(windows_tried)}:"
+            f"{dropped_note}{capped_note}"
+        ]
         for t in sorted(txns, key=lambda x: x["date"], reverse=True)[:50]:
             sign = "" if t["amount"] >= 0 else "-"
             lines.append(f"- {t['date']} | {t['merchant']} | {t['category']} | {sign}${abs(t['amount']):,.2f}")
