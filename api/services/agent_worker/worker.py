@@ -58,6 +58,7 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.conversation_store import ConversationStore
 from api.services.interaction_store import build_obsidian_link
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
 
@@ -3061,6 +3062,10 @@ def main() -> None:
         level=os.environ.get("LIFEOS_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # This worker sends progress/completion updates via Telegram. Without
+    # this, httpx's request logger (INFO by default, logs the full request
+    # URL — which embeds the bot token) would leak the token every send (#519).
+    configure_telegram_log_redaction()
     # Wire up real Telegram senders in production. Worker() defaults to
     # no-op senders so tests can't accidentally hit a real chat — see
     # comment in __init__. If telegram.py isn't importable or the bot

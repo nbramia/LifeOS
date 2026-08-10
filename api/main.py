@@ -34,7 +34,18 @@ from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy
+from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
+
+# Configure root logging here, explicitly, rather than leaving it to whatever
+# module happens to call `logging.basicConfig()` first. `scripts/merge_people`
+# (imported lazily on startup below) does exactly that with this same
+# level/format, so this is a no-op for existing log output — but doing it up
+# front, and pairing it with `configure_telegram_log_redaction()`, is what
+# keeps httpx's request logger (which logs full URLs, and the Telegram Bot
+# API embeds the bot token in the URL) from ever logging at INFO here (#519).
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+configure_telegram_log_redaction()
 
 logger = logging.getLogger(__name__)
 
