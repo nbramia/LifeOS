@@ -246,7 +246,18 @@ class EmbeddingService:
             yield _LOCK_DISABLED
             return
 
+        # Resolve a relative lock path against the PROJECT ROOT, not the
+        # process cwd. Every LifeOS service pins cwd via systemd
+        # WorkingDirectory, but an ad-hoc `python scripts/...` run from
+        # elsewhere would otherwise open a *different* lock file and serialize
+        # against nobody — the exact kind of silent no-op this lock exists to
+        # prevent. An absolute setting is honoured as-is.
         lock_path = settings.embedding_gpu_lock_path
+        if not os.path.isabs(lock_path):
+            project_root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            lock_path = os.path.join(project_root, lock_path)
         fd = None
         try:
             lock_dir = os.path.dirname(lock_path)

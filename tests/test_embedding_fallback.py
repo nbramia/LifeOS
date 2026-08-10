@@ -464,3 +464,58 @@ class TestGpuLock:
             svc.embed_text("hello")
 
         assert model.encode.call_count == 1
+
+
+class TestGpuLockPathResolution:
+    """A relative lock path must resolve against the project root, not cwd (#521).
+
+    Every LifeOS service pins cwd via systemd WorkingDirectory, but an ad-hoc
+    `python scripts/...` run from another directory would otherwise open a
+    *different* lock file and serialize against nobody — a silent no-op in the
+    exact mechanism meant to prevent GPU-queue exhaustion.
+    """
+
+    def test_relative_path_resolves_to_project_root_from_foreign_cwd(self, tmp_path, monkeypatch):
+        import os
+        from api.services import embeddings as emb
+
+        monkeypatch.chdir(tmp_path)  # a cwd that is NOT the project root
+        svc = emb.EmbeddingService(model_name="test-model")
+        svc._force_cpu = False
+
+        opened: list[str] = []
+        real_open = os.open
+
+        def spy_open(path, *a, **kw):
+            opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(emb.os, "open", spy_open)
+        monkeypatch.setattr(emb.fcntl, "flock", lambda *a, **kw: None)
+
+        with svc._acquire_gpu_lock():
+            pass
+
+        assert opened, "lock file was never opened"
+        lock_path = opened[0]
+        assert os.path.isabs(lock_path), f"lock path not absolute: {lock_path}"
+        # It must NOT have been created under the foreign cwd.
+        assert str(tmp_path) not in lock_path
+        # The project root is the parent of the `api/` package.
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(emb.__file__))))
+        assert lock_path.startswith(project_root)
+
+    def test_absolute_path_is_honoured_as_is(self, tmp_path, monkeypatch):
+        from api.services import embeddings as emb
+        from config.settings import settings
+
+        target = tmp_path / "custom" / "gpu.lock"
+        monkeypatch.setattr(settings, "embedding_gpu_lock_path", str(target))
+        svc = emb.EmbeddingService(model_name="test-model")
+        svc._force_cpu = False
+
+        monkeypatch.setattr(emb.fcntl, "flock", lambda *a, **kw: None)
+        with svc._acquire_gpu_lock():
+            pass
+
+        assert target.exists(), "explicit absolute lock path was not used"
