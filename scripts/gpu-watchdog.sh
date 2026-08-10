@@ -17,6 +17,15 @@
 #   - When rocm-smi is present, includes top per-PID VRAM consumers in the alert
 #   - Posts a recovery message when usage drops back below the threshold
 #
+# SDMA-queue exhaustion detection (#521): the gfx1151 iGPU has only 8 SDMA
+# queues. Concurrent GPU embedders (e.g. the API server and a manual reindex
+# both loading/encoding on GPU at once) can exhaust them with VRAM still
+# perfectly healthy — the kernel logs "No more SDMA queue to allocate", the
+# same signature that preceded the 2026-07-10 host freeze. VRAM% alone can't
+# see this, so each tick also scans the kernel log (via `journalctl -k`) for
+# that signature since the previous tick and alerts on it, with its own
+# cooldown so it can't spam independently of the VRAM alert.
+#
 # Linux: triggered by lifeos-gpu-watchdog.timer (installed by setup-systemd.sh).
 # macOS: not applicable (Metal manages VRAM via OS-level limits).
 
@@ -26,11 +35,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="$PROJECT_DIR/logs/gpu-watchdog.log"
 ALERT_STAMP_FILE="$PROJECT_DIR/logs/gpu-watchdog-alert.stamp"
+SDMA_STAMP_FILE="$PROJECT_DIR/logs/gpu-watchdog-sdma.stamp"
+SDMA_ALERT_STAMP_FILE="$PROJECT_DIR/logs/gpu-watchdog-sdma-alert.stamp"
 # Overridable for testing; defaults to the project .env in production.
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
+# Overridable for testing (a stub `journalctl` on $PATH, or a plain command
+# name if journald isn't present).
+JOURNALCTL_CMD="${JOURNALCTL_CMD:-journalctl}"
 
 THRESHOLD_PCT="${LIFEOS_VRAM_ALERT_PCT:-80}"
 COOLDOWN_MIN="${LIFEOS_VRAM_ALERT_COOLDOWN_MIN:-60}"
+SDMA_COOLDOWN_MIN="${LIFEOS_SDMA_ALERT_COOLDOWN_MIN:-$COOLDOWN_MIN}"
+SDMA_PATTERN="No more SDMA queue to allocate"
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -60,6 +76,76 @@ send_telegram() {
         --data-urlencode "text=${message}" \
         --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1
 }
+
+# Scan the kernel log for SDMA-queue exhaustion since the previous tick, and
+# alert if any occurred (#521).
+#
+# VRAM% (the check below) can't see this failure mode: the gfx1151 iGPU has
+# only 8 SDMA queues, and concurrent GPU embedders can exhaust those queues
+# — "No more SDMA queue to allocate" — with VRAM usage still low. That
+# signature preceded the 2026-07-10 host freeze.
+#
+# Approach: track only a timestamp (not a running count) in $SDMA_STAMP_FILE,
+# and re-query the kernel log each tick with `journalctl -k --since <that
+# timestamp>`. This was chosen over diffing a persisted occurrence count
+# because a count survives reboots awkwardly (dmesg's ring buffer resets, so
+# a stored count would either have to be reset on every boot or drift out of
+# sync with what's actually still in the buffer) and because `--since` lets
+# journald do the filtering instead of this script re-parsing the entire log
+# every tick. The timestamp is written *before* the query so a slow or
+# failed journalctl call can't cause the same window to be re-scanned (and
+# double-counted) on the next tick.
+check_sdma_exhaustion() {
+    local since_arg
+    if [ -f "$SDMA_STAMP_FILE" ]; then
+        since_arg=$(date -d "@$(cat "$SDMA_STAMP_FILE")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "10 minutes ago")
+    else
+        since_arg="10 minutes ago"
+    fi
+
+    date +%s > "$SDMA_STAMP_FILE"
+
+    if ! command -v "$JOURNALCTL_CMD" > /dev/null 2>&1; then
+        # No journald (e.g. non-systemd host) — nothing to scan.
+        return 0
+    fi
+
+    local count
+    count=$("$JOURNALCTL_CMD" -k --since "$since_arg" 2>/dev/null | grep -c "$SDMA_PATTERN" || true)
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+    if [ "$count" -eq 0 ]; then
+        return 0
+    fi
+
+    log "SDMA queue exhaustion detected: ${count} occurrence(s) of '${SDMA_PATTERN}' since ${since_arg}"
+
+    # Separate cooldown/stamp from the VRAM alert so the two signals can't
+    # suppress each other.
+    local now last
+    now=$(date +%s)
+    if [ -f "$SDMA_ALERT_STAMP_FILE" ]; then
+        last=$(cat "$SDMA_ALERT_STAMP_FILE")
+        if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < SDMA_COOLDOWN_MIN * 60 )); then
+            log "SDMA alert suppressed (cooldown)"
+            return 0
+        fi
+    fi
+
+    local msg
+    msg=$(printf '🔥 *LifeOS GPU SDMA Queues Exhausted*\n\n%d occurrence(s) of "%s" in the kernel log — the same signature that preceded the 2026-07-10 host freeze. VRAM may look healthy; this is a different failure mode (concurrent GPU embedders exhausting the 8 SDMA queues, not memory pressure). Check for overlapping GPU embed jobs (API server, agent worker, sync, ad-hoc scripts).' \
+        "$count" "$SDMA_PATTERN")
+    if send_telegram "$msg"; then
+        echo "$now" > "$SDMA_ALERT_STAMP_FILE"
+    else
+        log "Telegram POST failed for SDMA alert; will retry on next tick"
+    fi
+}
+
+# Run the SDMA check every tick, independent of the VRAM logic below (which
+# has several early exits) — this failure mode can occur regardless of VRAM
+# level.
+check_sdma_exhaustion
 
 # Locate the first AMDGPU card sysfs node that exposes VRAM stats. Multi-GPU
 # systems are not in scope — this picks the first card with sysfs stats.
