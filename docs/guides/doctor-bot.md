@@ -1,7 +1,7 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-10
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
@@ -44,6 +44,7 @@ This is the operator's-eye summary; the exact contract the session runs lives in
 
 - **One gate.** Full-auto from your goal approval through merge; `/implement`'s built-in adversarial review is the quality bar.
 - **Always PR-gated, always revertable.** Even the smallest fix goes branch → PR → `main` with tests + docs + review; the doctor never pushes to `main`, and each change lands as a single revertable merge commit whose `gh pr revert` handle it reports.
+- **The review is on the record.** The adversarial-review outcome is posted as a comment on the PR before it merges — what was checked, what it found, what changed in response. So "reviewed" is something you can read afterwards, not something you take on faith. The PR description is also brought up to date before merge, so it describes what actually shipped.
 - **Escalation respected.** If `/implement` can't resolve its review findings after its rounds, the doctor leaves the PR open and reports the escalation instead of merging.
 - **Isolation.** Implementation happens in throwaway worktrees off `origin/main` (pre-flight-cleaned via `scripts/cleanup-worktrees.sh` so a prior crashed run can't block the `add`), so the canonical checkout other agents share is never left on a feature branch.
 - **Pick-up after merge.** The doctor pulls merged `main` into the canonical checkout, then runs `./scripts/server.sh verify-deployed` to confirm the checkout is a real work tree on the merged commit **before** restarting — so a silently-failed pull (e.g. a bare/misconfigured checkout) is reported as a deploy failure instead of a false "Shipped" (#419). Only on success does it restart, so the running server actually reflects the change.
