@@ -25,7 +25,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
 | `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/claude` orchestrator path resolution. |
 | `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
-| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
+| `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output, and returned as `secure_url` by `GET /api/chat/config` so `/chat` can offer a one-tap link here when the mic is blocked by an insecure context. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:

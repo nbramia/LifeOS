@@ -110,7 +110,11 @@ run_browser_tests() {
         exit 1
     fi
 
-    python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py -v \
+    # test_voice_mic_block_ui_browser.py serves web/ itself on an ephemeral port
+    # and stubs every /api/ call, so it needs no server — but it is a Playwright
+    # test, so `browser` is the only scope that can reach it.
+    python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py \
+        tests/test_voice_mic_block_ui_browser.py -v \
         --ignore=tests/archive \
         -m "browser" \
         --tb=short \
