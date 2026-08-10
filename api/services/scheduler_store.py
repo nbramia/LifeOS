@@ -330,6 +330,17 @@ class SchedulerStore:
     rebuildable query cache holding the full entry (including payload fields
     and computed ``next_trigger_at``). Thread-safe.
 
+    Concurrency invariant — ``self._entries`` is **never mutated in place**.
+    Writers hold ``self._lock``, build a new dict, and rebind the attribute;
+    the rebind is atomic, so a lock-free reader (``get``, ``list_all``,
+    ``get_due_reminders``) always sees a complete map — either wholly before or
+    wholly after the write. Readers therefore take no lock: the scheduler tick
+    and the API read this on hot paths, and a reader-side lock would only add
+    contention. Mutating in place instead would let a reader observe a
+    half-rebuilt index (a schedule that momentarily doesn't exist, so a due
+    notification is silently skipped) or raise "dictionary changed size during
+    iteration" mid-scan.
+
     For backward compatibility a ``file_path=`` argument (the old JSON path)
     is accepted: it becomes the index path and its parent directory becomes an
     isolated vault root, so existing callers and tests keep working.
@@ -369,9 +380,11 @@ class SchedulerStore:
         if self.index_path.exists():
             try:
                 data = json.loads(self.index_path.read_text(encoding="utf-8"))
+                loaded: dict[str, ScheduleEntry] = {}
                 for item in data.get("schedules", data.get("reminders", [])):
                     entry = ScheduleEntry.from_dict(item)
-                    self._entries[entry.id] = entry
+                    loaded[entry.id] = entry
+                self._entries = loaded
                 logger.info(f"Loaded {len(self._entries)} schedules from index")
                 return
             except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -456,7 +469,7 @@ class SchedulerStore:
             )
             entry.next_trigger_at = compute_next_trigger(entry)
             self._insert_block_at_top(_format_entry_block(entry))
-            self._entries[entry.id] = entry
+            self._entries = {**self._entries, entry.id: entry}
             self._save()
             logger.info(f"Created schedule: {entry.id} - {entry.name}")
             return entry
@@ -488,7 +501,7 @@ class SchedulerStore:
     def delete(self, entry_id: str) -> bool:
         with self._lock:
             if entry_id in self._entries:
-                del self._entries[entry_id]
+                self._entries = {k: v for k, v in self._entries.items() if k != entry_id}
                 self._remove_block(entry_id)
                 self._save()
                 return True
@@ -572,35 +585,41 @@ class SchedulerStore:
         if not path.exists():
             with self._lock:
                 if self._entries:
-                    self._entries.clear()
+                    self._entries = {}
                     self._save()
             return
 
         with self._lock:
-            # Preserve payload + history from the current cache, merged by ID.
-            prior = {eid: e for eid, e in self._entries.items()}
-            self._entries.clear()
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
             except Exception as e:
                 logger.warning(f"Could not read {file_path}: {e}")
                 return
-            for _start, _end, entry in _iter_entry_blocks(lines):
-                self._merge_prior(entry, prior.get(entry.id))
-                entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
-                self._entries[entry.id] = entry
+            self._entries = self._parse_into_index(lines)
             self._save()
 
     def rebuild_index(self):
         """Full re-parse of Inbox.md into the cache."""
-        prior = {eid: e for eid, e in self._entries.items()}
-        self._entries.clear()
-        for _start, _end, entry in _iter_entry_blocks(self._read_inbox_lines()):
+        with self._lock:
+            self._entries = self._parse_into_index(self._read_inbox_lines())
+            self._save()
+        logger.info(f"Rebuilt scheduler index: {len(self._entries)} schedules")
+
+    def _parse_into_index(self, lines: list[str]) -> dict[str, ScheduleEntry]:
+        """Parse markdown ``lines`` into a fresh index dict.
+
+        Returns a new dict rather than filling ``self._entries``, so the caller
+        can swap it in atomically (see the class docstring's concurrency
+        invariant). Payload + history are merged forward from the current cache
+        by ID. Must be called with ``self._lock`` held.
+        """
+        prior = self._entries
+        entries: dict[str, ScheduleEntry] = {}
+        for _start, _end, entry in _iter_entry_blocks(lines):
             self._merge_prior(entry, prior.get(entry.id))
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
-            self._entries[entry.id] = entry
-        self._save()
-        logger.info(f"Rebuilt scheduler index: {len(self._entries)} schedules")
+            entries[entry.id] = entry
+        return entries
 
     @staticmethod
     def _merge_prior(entry: ScheduleEntry, prior: Optional[ScheduleEntry]):
