@@ -68,7 +68,11 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "integration: Integration tests (server required)")
     config.addinivalue_line("markers", "browser: Browser tests using Playwright")
     config.addinivalue_line("markers", "requires_ollama: Requires Ollama running")
-    config.addinivalue_line("markers", "requires_server: Requires API server running")
+    config.addinivalue_line(
+        "markers",
+        "requires_server: Requires API server running. On a browser test this is "
+        "what excludes it from the server-free set the pre-push hook runs.",
+    )
     config.addinivalue_line("markers", "requires_db: Requires direct database access (may conflict with running server)")
     config.addinivalue_line(
         "markers",

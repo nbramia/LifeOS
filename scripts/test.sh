@@ -125,8 +125,9 @@ run_browser_tests() {
     fi
 
     # test_voice_mic_block_ui_browser.py serves web/ itself on an ephemeral port
-    # and stubs every /api/ call, so it needs no server — but it is a Playwright
-    # test, so `browser` is the only scope that can reach it.
+    # and stubs every /api/ call, so it needs no server and carries no
+    # `requires_server` marker — that's what lets pre-push run it. This scope
+    # deliberately runs the full `browser` set, server-dependent tests included.
     python -m pytest tests/test_ui_browser.py tests/test_e2e_flow.py \
         tests/test_voice_mic_block_ui_browser.py -v \
         --ignore=tests/archive \

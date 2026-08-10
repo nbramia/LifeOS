@@ -54,6 +54,12 @@ if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
     source "$HOME/.venvs/lifeos/bin/activate"
 fi
 
+fail() {
+    echo "FAILED ($(tail -1 "$LOG"))"
+    echo "  Full output: $LOG"
+    exit 1
+}
+
 echo -n "Running unit tests... "
 
 # Parallelize across all cores via pytest-xdist (-n auto).
@@ -65,13 +71,29 @@ if [ -f ".pytest_cache/v/cache/lastfailed" ]; then
     PYTEST_OPTS+=(--lf)
 fi
 
-if python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header "${PYTEST_OPTS[@]}" > "$LOG" 2>&1; then
-    SUMMARY=$(tail -1 "$LOG")
-    echo "passed ($SUMMARY)"
-    exit 0
-else
-    SUMMARY=$(tail -1 "$LOG")
-    echo "FAILED ($SUMMARY)"
-    echo "  Full output: $LOG"
-    exit 1
+python -m pytest -m "unit and not slow" tests/ -q --tb=line --no-header \
+    "${PYTEST_OPTS[@]}" > "$LOG" 2>&1 || fail
+echo "passed ($(tail -1 "$LOG"))"
+
+# Browser tests that need no running server. Server-dependent ones carry
+# `requires_server`; including those would tie every push to the health of a
+# shared lifeos-api that other agents bounce constantly. The rest serve web/
+# themselves and stub every /api/ call, and are the only gate that catches a
+# regression in the chat SPA's JS before it reaches main.
+#
+# Deliberately a second pytest process, not another marker in the run above:
+# pytest-playwright's sync API leaves its own event loop current, so any async
+# test that lands after a browser test in the same process is silently never
+# awaited. Under `-n auto` that ordering is nondeterministic.
+#
+# -p no:cacheprovider keeps this run out of .pytest_cache — otherwise a failure
+# here would seed `lastfailed` with tests the unit run's --lf can't select,
+# and the next push would run nothing at all.
+if python -c "import playwright" 2>/dev/null; then
+    echo -n "Running server-free browser tests... "
+    python -m pytest -m "browser and not requires_server" tests/ -q --tb=line \
+        --no-header -p no:cacheprovider > "$LOG" 2>&1 || fail
+    echo "passed ($(tail -1 "$LOG"))"
 fi
+
+exit 0
