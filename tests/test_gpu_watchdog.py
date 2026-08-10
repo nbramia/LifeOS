@@ -16,6 +16,12 @@ from pathlib import Path
 
 import pytest
 
+# Without this the whole module is deselected by the `unit and not slow` scope
+# the pre-push hook runs, so the reclaim state machine would never be exercised
+# automatically. These shell out to bash with stubbed binaries — no GPU, no
+# network, ~1s for the module — so `unit` is the right home for them.
+pytestmark = pytest.mark.unit
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "gpu-watchdog.sh"
 
