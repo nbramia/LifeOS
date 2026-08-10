@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-06-18
+> **Last Updated:** 2026-08-10
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -80,6 +80,14 @@ Custom markers are registered in `conftest.py`:
 | `@pytest.mark.requires_db` | Tests needing direct database access |
 
 Apply `pytestmark = pytest.mark.unit` at the module level for unit test files.
+
+### Browser tests and `requires_server`
+
+`browser` and `requires_server` are independent. A browser test that points at a running `lifeos-api` carries both; one that serves `web/` itself on an ephemeral port and intercepts every `/api/` call carries only `browser`.
+
+That distinction is load-bearing: `browser and not requires_server` is the set the pre-push hook runs, so it is the only gate that catches a `web/` JS regression before it reaches `main`. Pushes must not depend on a shared server that other agents restart, so a browser test that needs one is excluded there and runs under `./scripts/test.sh browser` instead.
+
+Prefer the self-contained pattern for new frontend tests — it also means the test exercises the checkout under test rather than whatever a running server has deployed.
 
 ## Fixture Patterns
 

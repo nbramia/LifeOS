@@ -21,7 +21,7 @@ import re
 import pytest
 from playwright.sync_api import Page, expect
 
-pytestmark = [pytest.mark.browser, pytest.mark.slow]
+pytestmark = [pytest.mark.browser, pytest.mark.slow, pytest.mark.requires_server]
 
 DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 # The production server owns :8000; a worktree run can point at its own instance

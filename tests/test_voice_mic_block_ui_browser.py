@@ -9,6 +9,9 @@ context offers a tappable link to the configured HTTPS origin.
 Unlike the rest of the browser suite this serves `web/` itself from an ephemeral
 port rather than pointing at a running API, because the assertions are about the
 JS in *this* checkout and every API call the page makes is intercepted anyway.
+That is why it carries no `requires_server` marker, and so runs at pre-push
+(`browser and not requires_server`). Keep it that way — reaching for a live
+server here would silently drop `web/chat/` from the push gate.
 """
 import http.server
 import json

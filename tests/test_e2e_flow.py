@@ -10,12 +10,11 @@ These tests verify the complete request flow works, including:
 Run with server: pytest tests/test_e2e_flow.py -v
 """
 import pytest
-import asyncio
 import httpx
 from unittest.mock import patch, MagicMock
 
 # Mark as integration tests (require server or mocking)
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.requires_server]
 
 
 class TestConfigurationValidation:
@@ -86,7 +85,6 @@ class TestUIErrorDisplay:
     @pytest.mark.browser
     def test_api_error_shown_to_user(self, page):
         """API errors or success should be displayed to the user, not silently fail."""
-        from playwright.sync_api import expect
 
         page.set_viewport_size({"width": 1280, "height": 800})
         page.goto("http://localhost:8000")
@@ -115,7 +113,6 @@ class TestUIErrorDisplay:
     @pytest.mark.browser
     def test_loading_indicator_clears_on_completion(self, page):
         """Loading indicator should clear when response completes."""
-        from playwright.sync_api import expect
 
         page.set_viewport_size({"width": 1280, "height": 800})
         page.goto("http://localhost:8000")
@@ -128,7 +125,7 @@ class TestUIErrorDisplay:
         # Wait for typing indicator to appear (may not appear for fast responses)
         try:
             page.wait_for_selector(".typing", timeout=5000)
-        except:
+        except Exception:
             pass  # Fast response, no typing indicator
 
         # Wait for response to complete - use longer timeout for streaming
@@ -154,7 +151,7 @@ class TestRequestTimeouts:
         """Requests should have timeouts to prevent indefinite hangs."""
         # Test that httpx client has reasonable timeout (using sync client)
         try:
-            response = httpx.post(
+            httpx.post(
                 "http://localhost:8000/api/ask/stream",
                 json={"question": "test"},
                 timeout=5.0  # 5 second timeout for test
@@ -214,7 +211,7 @@ class TestHealthCheck:
             response = client.get("/health")
             data = response.json()
             assert data['status'] == 'degraded'
-            assert data['checks']['api_key_configured'] == False
+            assert not data['checks']['api_key_configured']
 
 
 class TestRealUserFlow:
@@ -311,7 +308,6 @@ class TestRealUserFlow:
     @pytest.mark.browser
     def test_user_clicks_suggestion(self, page):
         """User can click a suggestion to send it as a query."""
-        from playwright.sync_api import expect
 
         page.set_viewport_size({"width": 1280, "height": 800})
         page.goto("http://localhost:8000")
@@ -321,7 +317,6 @@ class TestRealUserFlow:
         suggestions = page.locator(".suggestion")
         if suggestions.count() > 0:
             first_suggestion = suggestions.first
-            suggestion_text = first_suggestion.text_content()
 
             first_suggestion.click()
 
@@ -334,7 +329,6 @@ class TestRealUserFlow:
     @pytest.mark.browser
     def test_mobile_user_flow(self, page):
         """Test the full user flow on mobile viewport."""
-        from playwright.sync_api import expect
 
         # Mobile viewport (iPhone X)
         page.set_viewport_size({"width": 375, "height": 812})
