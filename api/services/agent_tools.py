@@ -198,7 +198,12 @@ TOOL_DEFINITIONS = [
         "description": (
             "Get iMessage and WhatsApp chat logs with a specific person. "
             "Returns actual message content with timestamps — shows what was said and when. "
-            "Requires entity_id from person_info. Can filter by date range or search term."
+            "Requires entity_id from person_info. Can filter by date range or search term. "
+            "With no date range it searches the last 90 days, then the last year, then all "
+            "history, stopping at the first window with matches — so omit dates when you "
+            "don't know when something was said. A 'no messages found' result from this "
+            "tool means the history genuinely does not contain them, not that retrieval "
+            "failed; do not report it as a sync or permissions problem."
         ),
         "input_schema": {
             "type": "object",
@@ -213,7 +218,11 @@ TOOL_DEFINITIONS = [
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD). Defaults to last 30 days.",
+                    "description": (
+                        "Start date (YYYY-MM-DD). Omit to auto-widen through "
+                        "90 days → 1 year → all history. Set it only to pin a "
+                        "specific period; doing so disables auto-widening."
+                    ),
                 },
                 "end_date": {
                     "type": "string",
@@ -976,6 +985,18 @@ def _format_whatsapp_interactions(interactions: list) -> str:
     return "\n".join(lines)
 
 
+# Widening ladder for message history when the caller gave no date range.
+# Each step is tried in order and the first one with any hits wins. Widening is
+# cheap by construction: it only happens on threads too sparse to fill the
+# narrow window, so the wider queries scan very little.
+_MSG_HISTORY_LADDER_DAYS = (90, 365, None)  # None = all history
+
+# Payload ceiling for message history, in characters. Message *count* is a poor
+# cost proxy — a year of a quiet thread is ~250 tokens while 1000 messages of a
+# busy one is ~28k — so the budget is applied to formatted output instead.
+_MSG_HISTORY_CHAR_BUDGET = 24000
+
+
 def _tool_get_message_history(inp: dict) -> str:
     from api.services.imessage import query_person_messages, resolve_entity_id
     from api.services.interaction_store import get_interaction_store
@@ -988,84 +1009,189 @@ def _tool_get_message_history(inp: dict) -> str:
     start_date = inp.get("start_date")
     end_date = inp.get("end_date")
     search_term = inp.get("search_term")
-    limit = inp.get("limit", 100)
-    if not start_date and not end_date:
-        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    limit = inp.get("limit", 1000)
 
-    # 1. iMessage/SMS
-    imessage_result = query_person_messages(
-        entity_id=resolved_id,
-        search_term=search_term,
-        start_date=start_date,
-        end_date=end_date,
-        limit=limit,
-    )
+    # An explicit date range is an intentional constraint — answer exactly that
+    # window. Only auto-widen when the caller expressed no preference.
+    caller_set_dates = bool(start_date or end_date)
 
-    # 2. WhatsApp from interaction store
     store = get_interaction_store()
-    days_back = 30
-    if start_date:
-        try:
-            delta = datetime.now() - datetime.strptime(start_date, "%Y-%m-%d")
-            days_back = max(delta.days, 1)
-        except (ValueError, TypeError):
-            pass
 
-    whatsapp_interactions = store.get_for_person(
-        person_id=resolved_id,
-        days_back=days_back,
-        source_type="whatsapp",
-        limit=limit,
-    )
+    def _fetch(window_start: str | None) -> tuple[dict, list]:
+        """Fetch both sources for one window. Returns (imessage_result, whatsapp)."""
+        imsg = query_person_messages(
+            entity_id=resolved_id,
+            search_term=search_term,
+            start_date=window_start,
+            end_date=end_date,
+            limit=limit,
+        )
 
-    # Filter WhatsApp by search_term
-    if search_term and whatsapp_interactions:
-        term_lower = search_term.lower()
-        whatsapp_interactions = [
-            i for i in whatsapp_interactions
-            if i.snippet and term_lower in i.snippet.lower()
-        ]
+        # The interaction store takes a lookback in days rather than a date.
+        days_back = 36500  # ~all history
+        if window_start:
+            try:
+                delta = datetime.now() - datetime.strptime(window_start, "%Y-%m-%d")
+                days_back = max(delta.days, 1)
+            except (ValueError, TypeError):
+                pass
 
-    # Filter WhatsApp by end_date
-    if end_date and whatsapp_interactions:
-        try:
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
-                hour=23, minute=59, second=59, tzinfo=timezone.utc
+        wa = store.get_for_person(
+            person_id=resolved_id,
+            days_back=days_back,
+            source_type="whatsapp",
+            limit=limit,
+        )
+
+        if search_term and wa:
+            term_lower = search_term.lower()
+            wa = [i for i in wa if i.snippet and term_lower in i.snippet.lower()]
+
+        if end_date and wa:
+            try:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=timezone.utc
+                )
+                wa = [i for i in wa if i.timestamp <= end_dt]
+            except (ValueError, TypeError):
+                pass
+
+        # Store returns most recent first; present chronologically.
+        wa.sort(key=lambda i: i.timestamp)
+        return imsg, wa
+
+    # Walk the widening ladder until either source has hits. Breaking on either
+    # (not just iMessage) keeps a recent iMessage from hiding an older WhatsApp
+    # thread, and vice versa.
+    windows_tried: list[str] = []
+    if caller_set_dates:
+        imessage_result, whatsapp_interactions = _fetch(start_date)
+    else:
+        for days in _MSG_HISTORY_LADDER_DAYS:
+            window_start = (
+                (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                if days
+                else None
             )
-            whatsapp_interactions = [
-                i for i in whatsapp_interactions if i.timestamp <= end_dt
-            ]
-        except (ValueError, TypeError):
-            pass
-
-    # Sort WhatsApp chronologically (store returns most recent first)
-    whatsapp_interactions.sort(key=lambda i: i.timestamp)
+            imessage_result, whatsapp_interactions = _fetch(window_start)
+            windows_tried.append(f"last {days}d" if days else "all history")
+            if imessage_result["count"] > 0 or whatsapp_interactions:
+                break
 
     imessage_count = imessage_result["count"]
     whatsapp_count = len(whatsapp_interactions)
 
     if imessage_count == 0 and whatsapp_count == 0:
-        return "No messages found."
+        if windows_tried:
+            return (
+                "No messages found. Searched "
+                + ", then ".join(windows_tried)
+                + (f" for {search_term!r}" if search_term else "")
+                + ". There is no iMessage or WhatsApp history on record for this "
+                "person"
+                + (
+                    " matching that term — try again without search_term."
+                    if search_term
+                    else "."
+                )
+            )
+        window_desc = " to ".join(x for x in (start_date, end_date) if x)
+        return (
+            f"No messages found in the requested window ({window_desc})"
+            + (f" for {search_term!r}" if search_term else "")
+            + ". Retry without start_date/end_date to search all history."
+        )
 
-    # Build output
-    parts = []
+    # Note which rungs came up empty, so the model can see the search was already
+    # widened rather than assuming the narrow window was the only one tried.
+    widened_note = ""
+    if len(windows_tried) > 1:
+        widened_note = (
+            f" (nothing in {', '.join(windows_tried[:-1])}; "
+            f"widened to {windows_tried[-1]})"
+        )
+
+    # Build output. The budget is split across sources rather than applied to the
+    # assembled string: the sections are grouped by source, not interleaved by
+    # time, so trimming the tail of the whole document would drop all of iMessage
+    # before touching WhatsApp regardless of recency.
+    imsg_text = imessage_result["formatted"]
+    wa_text = _format_whatsapp_interactions(whatsapp_interactions) if whatsapp_count else ""
+    imsg_text, wa_text, trimmed = _split_to_budget(imsg_text, wa_text)
+
+    trim_note = ""
+    if trimmed:
+        trim_note = (
+            "\n\n[Oldest messages trimmed to fit context — the most recent are "
+            "shown. Narrow with search_term or start_date/end_date for a "
+            "specific period.]"
+        )
 
     if imessage_count > 0 and whatsapp_count > 0:
         # Both sources — label each section
         dr = imessage_result.get("date_range")
         date_info = f" ({dr['start'][:10]} to {dr['end'][:10]})" if dr else ""
-        parts.append(f"## iMessage ({imessage_count} messages{date_info})\n\n{imessage_result['formatted']}")
-        parts.append(f"## WhatsApp ({whatsapp_count} messages)\n\n{_format_whatsapp_interactions(whatsapp_interactions)}")
+        parts = [
+            f"## iMessage ({imessage_count} messages{date_info})\n\n{imsg_text}",
+            f"## WhatsApp ({whatsapp_count} messages)\n\n{wa_text}",
+        ]
         total = imessage_count + whatsapp_count
-        return f"{total} messages from iMessage and WhatsApp:\n\n" + "\n\n".join(parts)
+        return (
+            f"{total} messages from iMessage and WhatsApp{widened_note}{trim_note}:\n\n"
+            + "\n\n".join(parts)
+        )
     elif imessage_count > 0:
         date_info = ""
         if imessage_result.get("date_range"):
             dr = imessage_result["date_range"]
             date_info = f" ({dr['start'][:10]} to {dr['end'][:10]})"
-        return f"{imessage_count} messages{date_info}:\n\n{imessage_result['formatted']}"
+        return f"{imessage_count} messages{date_info}{widened_note}{trim_note}:\n\n{imsg_text}"
     else:
-        return f"{whatsapp_count} WhatsApp messages:\n\n{_format_whatsapp_interactions(whatsapp_interactions)}"
+        return f"{whatsapp_count} WhatsApp messages{widened_note}{trim_note}:\n\n{wa_text}"
+
+
+def _trim_section(formatted: str, budget: int) -> str:
+    """Trim one formatted message block to budget, keeping the most recent.
+
+    Blocks are chronological (oldest first), so the tail is kept. The cut is
+    aligned to a `### date` header so no message is left without the date it
+    belongs under — a shown message with a wrong or missing date is worse than
+    a dropped one.
+    """
+    if len(formatted) <= budget:
+        return formatted
+    kept = formatted[-budget:]
+    idx = kept.find("\n### ")
+    if idx != -1:
+        return kept[idx + 1:]
+    # No header in range — fall back to a clean line boundary.
+    return kept.split("\n", 1)[1] if "\n" in kept else kept
+
+
+def _split_to_budget(imsg_text: str, wa_text: str) -> tuple[str, str, bool]:
+    """Fit both source blocks into the payload budget, keeping recent messages.
+
+    Each source gets an equal share, but a block smaller than its share donates
+    the unused remainder to the other — so one quiet source never wastes budget
+    a busy one could use.
+    """
+    budget = _MSG_HISTORY_CHAR_BUDGET
+    if len(imsg_text) + len(wa_text) <= budget:
+        return imsg_text, wa_text, False
+
+    if not wa_text:
+        return _trim_section(imsg_text, budget), "", True
+    if not imsg_text:
+        return "", _trim_section(wa_text, budget), True
+
+    share = budget // 2
+    imsg_share = share + max(0, share - len(wa_text))
+    wa_share = share + max(0, share - len(imsg_text))
+    return (
+        _trim_section(imsg_text, imsg_share),
+        _trim_section(wa_text, wa_share),
+        True,
+    )
 
 
 # -- People helpers --
