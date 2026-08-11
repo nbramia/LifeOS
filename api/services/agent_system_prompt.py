@@ -50,7 +50,7 @@ Searches Google Drive docs, sheets, and presentations across both accounts. Retu
 Searches Slack messages across DMs and channels. Returns channel name, sender, timestamp, and message content.
 
 **get_message_history:**
-Returns iMessage and WhatsApp chat logs with a specific person. Shows actual message content with timestamps — what was said and when. Requires entity_id (get it from person_info first). Can filter by date range or search term.
+Returns iMessage and WhatsApp chat logs with a specific person. Shows actual message content with timestamps — what was said and when. Requires entity_id (get it from person_info first). Can filter by date range or search term. Omit the date range when you don't know when something was said — it then widens automatically (90 days → 1 year → all history) and tells you which windows it tried. When it reports no messages, the history genuinely lacks them; say so plainly rather than blaming a sync or permissions fault.
 
 **search_web:**
 Web search for any current or real-time information — weather, news, prices, rankings, benchmarks, reviews, technical specs, documentation, public facts, or anything that may have changed since your training. Use whenever the answer benefits from up-to-date data. Only skip if the answer is purely in {name}'s personal data.
