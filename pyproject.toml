@@ -38,7 +38,6 @@ markers = [
     "slow: Tests that require ChromaDB, sentence-transformers, or heavy processing",
     "integration: Tests that require running server or external APIs",
     "browser: Browser-based UI tests using Playwright",
-    "requires_ollama: Tests that require Ollama to be running",
     "requires_server: Tests that require the API server to be running. On a browser test this is what separates it from the server-free set (`browser and not requires_server`) that the pre-push hook runs.",
 ]
 

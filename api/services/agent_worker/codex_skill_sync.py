@@ -8,10 +8,9 @@ and installed into `$CODEX_HOME/skills` (or `~/.codex/skills`) for local Codex
 sessions and the LifeOS Codex worker.
 
 This module converts the portable subset (no Claude subagent orchestration)
-to Codex's format and installs them. It also installs native Codex skills
-checked into `.agents/skills/` without conversion. It is import-safe and
-side-effect-free until an install function is called, so transforms can be
-unit-tested without touching the filesystem.
+to Codex's format and installs them. It is import-safe and side-effect-free
+until an install function is called, so transforms can be unit-tested
+without touching the filesystem.
 
 Only engine-agnostic skills are ported. `mine-for-ideas` drives Claude's
 `Task`/`Skill` subagent loop and is deliberately left Claude-only; `tune` edits
@@ -21,14 +20,12 @@ The implementation lifecycle (planning, issue drafting, PR checks, review,
 merge) is not synced from here at all: it comes from the
 `benjamcalvin/bootstraps` marketplace, which ships a Codex-compatible plugin
 (`implement-lifecycle`, `issue-management`) installed through Codex's own
-plugin browser. `implement` additionally has a native Codex rewrite under
-`.agents/skills/implement`.
+plugin browser.
 """
 from __future__ import annotations
 
 import os
 import re
-import shutil
 from pathlib import Path
 
 import yaml
@@ -44,12 +41,6 @@ PORTABLE_SKILLS = (
     "stale",
     "sync-health",
     "remove-worktree",
-)
-
-# Native Codex skills authored directly in Codex's SKILL.md format under
-# `.agents/skills`. They are copied as-is so bundled resources/metadata survive.
-NATIVE_CODEX_SKILLS = (
-    "implement",
 )
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
@@ -131,33 +122,5 @@ def install_skills(
         dest_dir = codex_dir / name
         dest_dir.mkdir(parents=True, exist_ok=True)
         (dest_dir / "SKILL.md").write_text(converted, encoding="utf-8")
-        installed.append(name)
-    return installed
-
-
-def install_native_codex_skills(
-    native_skills_dir: Path | str,
-    codex_skills_dir: Path | str | None = None,
-    skills: tuple[str, ...] = NATIVE_CODEX_SKILLS,
-) -> list[str]:
-    """Copy native Codex skills into Codex's local skill directory.
-
-    Returns the list of skill names installed. Missing allowlisted sources are
-    skipped so older checkouts can still install the converted portable set.
-    Existing destination directories for these allowlisted skills are replaced
-    to avoid stale resources after a source-side edit removes files.
-    """
-    native_dir = Path(native_skills_dir)
-    codex_dir = Path(codex_skills_dir) if codex_skills_dir is not None else _codex_skills_dir()
-
-    installed: list[str] = []
-    for name in skills:
-        src_dir = native_dir / name
-        if not (src_dir / "SKILL.md").is_file():
-            continue
-        dest_dir = codex_dir / name
-        if dest_dir.exists():
-            shutil.rmtree(dest_dir)
-        shutil.copytree(src_dir, dest_dir)
         installed.append(name)
     return installed

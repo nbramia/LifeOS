@@ -3,7 +3,6 @@ Service Health Registry for LifeOS.
 
 Tracks availability and degradation of external services:
 - ChromaDB (vector store)
-- Ollama (local LLM)
 - Google APIs (Calendar, Gmail)
 - Telegram (notifications)
 - Embedding model (sentence-transformers)
@@ -20,7 +19,7 @@ Usage:
     from api.services.service_health import get_service_health, record_degradation
 
     # Record when a fallback is used
-    record_degradation("ollama", "intent_classification", "haiku_llm", "Connection refused")
+    record_degradation("google_calendar", "event_lookup", "cached_events", "Connection refused")
 
     # Mark service state changes
     mark_service_healthy("chromadb")
@@ -58,7 +57,6 @@ class Severity(str, Enum):
 # Service configuration: name -> (default severity, description)
 SERVICE_CONFIG = {
     "chromadb": (Severity.CRITICAL, "Vector store (ChromaDB)"),
-    "ollama": (Severity.WARNING, "Local LLM for query routing"),
     "google_calendar": (Severity.WARNING, "Google Calendar API"),
     "google_gmail": (Severity.WARNING, "Gmail API"),
     "telegram": (Severity.INFO, "Telegram bot notifications"),

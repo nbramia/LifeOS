@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-11
 
 Performance tracing and alerting for LifeOS.
 
@@ -105,7 +105,6 @@ Set in `.env`:
 | `chromadb` | CRITICAL | None (core functionality) |
 | `embedding_model` | CRITICAL | None (core functionality) |
 | `vault_filesystem` | CRITICAL | None (core functionality) |
-| `ollama` | WARNING | Local LLM fallback → pattern matching |
 | `bm25_index` | WARNING | Vector-only search |
 | `google_calendar` | WARNING | Cached data |
 | `google_gmail` | WARNING | Cached data |

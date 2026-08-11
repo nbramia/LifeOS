@@ -1,4 +1,0 @@
-interface:
-  display_name: "Implement"
-  short_description: "Issue-to-PR implementation loop"
-  default_prompt: "Use $implement to implement this issue end to end."

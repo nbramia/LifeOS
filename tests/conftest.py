@@ -6,7 +6,6 @@ Test Categories:
 - slow: Tests requiring ChromaDB, sentence-transformers, or file watchers
 - integration: Tests requiring running server or external APIs
 - browser: Playwright browser tests
-- requires_ollama: Tests requiring Ollama LLM to be running
 - requires_server: Tests requiring API server to be running
 
 Run categories:
@@ -67,7 +66,6 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: Slow tests (ChromaDB, embeddings)")
     config.addinivalue_line("markers", "integration: Integration tests (server required)")
     config.addinivalue_line("markers", "browser: Browser tests using Playwright")
-    config.addinivalue_line("markers", "requires_ollama: Requires Ollama running")
     config.addinivalue_line(
         "markers",
         "requires_server: Requires API server running. On a browser test this is "
@@ -147,17 +145,6 @@ def _install_anthropic_request_guard() -> None:
 def pytest_runtest_setup(item):
     """Hand the active test item to the guard so it can check markers."""
     _install_anthropic_request_guard._current_node = item
-
-
-@pytest.fixture(scope="session")
-def ollama_available():
-    """Check if Ollama is available for tests."""
-    try:
-        import httpx
-        response = httpx.get("http://localhost:11434", timeout=2.0)
-        return response.status_code == 200
-    except Exception:
-        return False
 
 
 @pytest.fixture(scope="session")

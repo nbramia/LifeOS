@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-10
+> **Last Updated:** 2026-08-11
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -75,7 +75,6 @@ Custom markers are registered in `conftest.py`:
 | `@pytest.mark.slow` | Tests needing ChromaDB, embeddings, or file watchers |
 | `@pytest.mark.integration` | Tests requiring a running server |
 | `@pytest.mark.browser` | Playwright browser tests |
-| `@pytest.mark.requires_ollama` | Tests requiring Ollama LLM |
 | `@pytest.mark.requires_server` | Tests requiring the API server |
 | `@pytest.mark.requires_db` | Tests needing direct database access |
 
@@ -99,7 +98,6 @@ Shared fixtures are in `tests/conftest.py`. Key fixtures:
 | `test_data_path` | session | Temporary data directory for ChromaDB/SQLite |
 | `mock_settings` | function | Patched `config.settings.settings` with temp paths |
 | `server_available` | session | Checks if API server is running |
-| `ollama_available` | session | Checks if Ollama is available |
 | `reset_singletons_after_test` | function (autouse) | Resets service singletons to prevent test pollution |
 
 Test-specific fixtures use `tmp_path` for isolated file system state:

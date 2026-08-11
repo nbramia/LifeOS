@@ -10,13 +10,12 @@ Tests:
 """
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from api.services.service_health import (
     ServiceHealthRegistry,
     ServiceStatus,
     Severity,
-    ServiceState,
     DegradationEvent,
     get_service_health,
     record_degradation,
@@ -149,7 +148,7 @@ class TestServiceHealthRegistry:
     def test_get_summary(self, fresh_registry):
         """get_summary should return complete status info."""
         fresh_registry.mark_healthy("chromadb")
-        fresh_registry.mark_failed("ollama", "Not running")
+        fresh_registry.mark_failed("google_calendar", "Not running")
         fresh_registry.record_degradation("bm25_index", "search", "vector_only", None)
 
         summary = fresh_registry.get_summary()
@@ -163,7 +162,7 @@ class TestServiceHealthRegistry:
 
         # Check service statuses
         assert summary["services"]["chromadb"]["status"] == "healthy"
-        assert summary["services"]["ollama"]["status"] == "unavailable"
+        assert summary["services"]["google_calendar"]["status"] == "unavailable"
         assert summary["services"]["bm25_index"]["status"] == "degraded"
 
         # Overall status should be degraded (has unavailable service)

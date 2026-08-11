@@ -5,10 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from api.services.agent_worker import codex_skill_sync
 from api.services.agent_worker.codex_skill_sync import (
-    NATIVE_CODEX_SKILLS,
     PORTABLE_SKILLS,
-    install_native_codex_skills,
     install_skills,
     transform_skill,
 )
@@ -146,28 +145,6 @@ def test_install_skips_missing_sources(tmp_path: Path):
     assert installed == ["standup"]
 
 
-def test_install_native_codex_skills_copies_skill_directory(tmp_path: Path):
-    native_dir = tmp_path / "native_skills"
-    codex_dir = tmp_path / "codex_skills"
-    skill_dir = native_dir / "implement"
-    agents_dir = skill_dir / "agents"
-    agents_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        "---\nname: implement\ndescription: Native Codex lifecycle.\n---\nBody.\n",
-        encoding="utf-8",
-    )
-    (agents_dir / "openai.yaml").write_text(
-        'interface:\n  display_name: "Implement"\n',
-        encoding="utf-8",
-    )
-
-    installed = install_native_codex_skills(native_dir, codex_dir)
-
-    assert installed == ["implement"]
-    assert (codex_dir / "implement" / "SKILL.md").read_text(encoding="utf-8").endswith("Body.\n")
-    assert (codex_dir / "implement" / "agents" / "openai.yaml").is_file()
-
-
 def test_orchestration_skills_excluded_from_allowlist():
     for excluded in ("implement", "review-pr", "address-review", "tune", "mine-for-ideas"):
         assert excluded not in PORTABLE_SKILLS
@@ -190,5 +167,17 @@ def test_every_portable_skill_has_a_source_in_the_repo():
     assert not missing, f"allowlisted skills with no source: {missing}"
 
 
-def test_native_codex_skills_include_implement_only():
-    assert NATIVE_CODEX_SKILLS == ("implement",)
+def test_native_codex_skill_path_removed():
+    """The native-skill install path (NATIVE_CODEX_SKILLS +
+    install_native_codex_skills) was retired along with the six lifecycle
+    directories it copied from `.agents/skills/` — Codex now gets the
+    lifecycle from the `benjamcalvin/bootstraps` marketplace instead (#491).
+    Guard against either resurfacing without a source in the repo.
+    """
+    assert not hasattr(codex_skill_sync, "NATIVE_CODEX_SKILLS")
+    assert not hasattr(codex_skill_sync, "install_native_codex_skills")
+
+    agents_skills = Path(__file__).resolve().parent.parent / ".agents" / "skills"
+    retired = {"implement", "draft-issue", "pr-check", "merge-pr", "review-pr", "address-review"}
+    existing = {p.name for p in agents_skills.iterdir() if p.is_dir()}
+    assert not (existing & retired), f"retired lifecycle skills still present: {existing & retired}"

@@ -183,7 +183,7 @@ Example:
 | `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
 | `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
 | `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
-| `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format (and copy native Codex skills) into `~/.codex/skills/`. Re-run after editing source skills. |
+| `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
