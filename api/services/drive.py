@@ -6,7 +6,7 @@ Supports Google Docs, Sheets, and other file types.
 """
 import logging
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from googleapiclient.discovery import build
@@ -115,6 +115,7 @@ class DriveService:
         mime_type: Optional[str] = None,
         folder_id: Optional[str] = None,
         max_results: int = 20,
+        order_by: str = "modifiedTime desc",
     ) -> list[DriveFile]:
         """
         Search Drive files.
@@ -125,6 +126,10 @@ class DriveService:
             mime_type: Filter by MIME type
             folder_id: Search within specific folder
             max_results: Maximum files to return
+            order_by: Drive `orderBy` sort key. Must be one of Drive's documented
+                keys (e.g. "modifiedTime desc", "modifiedTime", "name"). Drive has
+                no relevance key and omitting orderBy returns an arbitrary order,
+                so callers get an explicit sort rather than an unordered page.
 
         Returns:
             List of DriveFile objects
@@ -153,12 +158,18 @@ class DriveService:
 
         query = " and ".join(query_parts)
 
+        # Resolved before the handler below: an expired token raises here, and a
+        # caller must be able to tell "this account is unreachable" from "this
+        # account has no matching files". Swallowing an auth fault into an empty
+        # list makes a broken connection look like absent data.
+        service = self.service
+
         try:
-            result = self.service.files().list(
+            result = service.files().list(
                 q=query,
                 pageSize=max_results,
                 fields="files(id, name, mimeType, modifiedTime, webViewLink, size, parents)",
-                orderBy="modifiedTime desc",
+                orderBy=order_by,
             ).execute()
 
             files = result.get("files", [])
