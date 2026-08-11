@@ -162,18 +162,34 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_drive",
         "description": (
-            "Search Google Drive files (docs, sheets, presentations) across personal and work accounts."
+            "Search Google Drive files (docs, sheets, presentations) across personal "
+            "and work accounts. Drive offers no relevance ranking, so results are "
+            "ordered by modification time and the result says so whenever the "
+            "per-account cap binds — an empty result means no file in the searched "
+            "accounts contains those terms, not a sign the search broke."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (matches file names and content).",
+                    "description": "Search query (matches file content).",
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max files to return per account (default 5).",
+                    "description": (
+                        "Max files to return per account (default 20, max 100). "
+                        "The result discloses when this cap binds."
+                    ),
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["recent", "oldest"],
+                    "description": (
+                        "Modification-time order: 'recent' (default, newest first) "
+                        "or 'oldest'. Use 'oldest' to reach an old document that "
+                        "newer matches would otherwise push past the cap."
+                    ),
                 },
             },
             "required": ["query"],
@@ -1073,30 +1089,139 @@ async def _tool_search_email(inp: dict) -> str:
     return "\n\n---\n".join(lines) + ignored_note + trunc_note
 
 
+# Per-account page size for a Drive search. 20 matches the DriveService default;
+# the old 5 meant any query whose terms also appeared in five newer files could
+# never surface an older one, with nothing in the output to hint at the cut.
+_DRIVE_DEFAULT_RESULTS = 20
+_DRIVE_MAX_RESULTS = 100
+
+# Drive cannot sort by relevance. files.list only accepts the documented sort
+# keys (modifiedTime, name, recency, ...) and, per Google's own search guide,
+# "if you omit the orderBy query parameter, there's no default sort order and
+# the items are returned arbitrarily". So an old document hidden behind newer
+# matches is reached by a bigger page plus an explicit oldest-first option —
+# not by pretending an unordered page is relevance-ranked.
+_DRIVE_ORDERINGS = {
+    "recent": ("modifiedTime desc", "newest-modified first"),
+    "oldest": ("modifiedTime", "oldest-modified first"),
+}
+
+
+def _drive_modified_key(f) -> datetime:
+    """Sort key over DriveFile.modified_time that can't raise mid-merge.
+
+    Files come from several accounts, so a missing or naive timestamp on one of
+    them would otherwise blow up the merge sort — outside the per-account
+    handler, taking the whole search with it.
+    """
+    ts = getattr(f, "modified_time", None)
+    if ts is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
 async def _tool_search_drive(inp: dict) -> str:
     from api.services.drive import DriveService
 
-    max_results = inp.get("max_results", 5)
+    # Read before the loop: this used to be inp["query"] inside the per-account
+    # try, so a missing query raised KeyError once per account and came back as
+    # "Could not reach personal, work" — a malformed argument reported as
+    # expired credentials.
+    query = str(inp.get("query") or "").strip()
+    if not query:
+        return "No Drive search ran: search_drive needs a non-empty query."
+
+    # Normalised, not passed through: max_results is also the yardstick for the
+    # truncation check below, so a None or 0 from the model would both confuse
+    # Drive's pageSize and silently disable that disclosure.
+    max_results = _positive_int(
+        inp.get("max_results", _DRIVE_DEFAULT_RESULTS),
+        _DRIVE_DEFAULT_RESULTS,
+        _DRIVE_MAX_RESULTS,
+    )
+    raw_order = inp.get("order_by")
+    order_key = raw_order if raw_order in _DRIVE_ORDERINGS else "recent"
+    order_by, order_desc = _DRIVE_ORDERINGS[order_key]
+    bad_order = (
+        f"\n\n[Ignored order_by={raw_order!r} — must be one of "
+        f"{', '.join(sorted(_DRIVE_ORDERINGS))}; ordered {order_desc} instead.]"
+        if raw_order is not None and raw_order not in _DRIVE_ORDERINGS
+        else ""
+    )
+
+    # Accounts that raised during the search. An expired token used to be logged
+    # and the tool still said "No drive files found." — a broken connection
+    # rendered as absent data, which is the misdiagnosis this change exists to
+    # stop.
+    failed_accounts: list[str] = []
     all_files = []
+    truncated = False
     for account in get_configured_accounts():
         try:
             drive = DriveService(account)
-            files = drive.search(full_text=inp["query"], max_results=max_results)
+            files = drive.search(
+                full_text=query, max_results=max_results, order_by=order_by
+            )
             all_files.extend(files)
+            # A full page back is the only signal Drive gives that it had more.
+            if len(files) == max_results:
+                truncated = True
         except Exception as e:
             logger.warning(f"Drive {account.value} error: {e}")
+            failed_accounts.append(account.value)
+
+    failed_note = ""
+    if failed_accounts:
+        failed_note = (
+            f"\n\n[Could not reach {', '.join(failed_accounts)} — that account "
+            "errored, so this is an incomplete answer, not necessarily an empty "
+            "Drive. It may need re-authorising.]"
+        )
 
     if not all_files:
-        return "No drive files found."
+        if failed_accounts:
+            return (
+                "No Drive files came back from the accounts that responded."
+                + bad_order
+                + failed_note
+            )
+        # Name what was actually searched. A term that matches nothing matches
+        # nothing at any page size, so there is no retry to make — but the model
+        # needs to see the scope to pick a better query.
+        return (
+            f"No Drive files found. Searched file contents for {query!r} in every "
+            f"configured account, ordered {order_desc}, up to {max_results} files "
+            "per account." + bad_order
+        )
+
+    # Concatenating per-account pages would contradict the ordering the note
+    # claims, so the merged list is re-sorted the same way.
+    all_files.sort(key=_drive_modified_key, reverse=(order_key == "recent"))
+
+    trunc_note = ""
+    if truncated:
+        trunc_note = (
+            f"\n\n[Capped at {max_results} files per account and ordered "
+            f"{order_desc} — more may exist. Drive has no relevance ranking, so "
+            "the cut is by modification time, not match quality: raise "
+            "max_results, narrow the query, or pass order_by='oldest' to reach "
+            "older matches.]"
+        )
 
     lines = []
     for f in all_files:
         acct = f"[{f.source_account}]" if f.source_account else ""
+        modified = ""
+        ts = getattr(f, "modified_time", None)
+        if ts:
+            modified = f" modified {ts.strftime('%Y-%m-%d')}"
         content_preview = ""
         if f.content:
             content_preview = f"\n{f.content[:800]}"
-        lines.append(f"**{f.name}** {acct} ({f.mime_type}){content_preview}")
-    return "\n\n---\n".join(lines)
+        lines.append(
+            f"**{f.name}** {acct} ({f.mime_type}){modified}{content_preview}"
+        )
+    return "\n\n---\n".join(lines) + bad_order + trunc_note + failed_note
 
 
 def _tool_search_slack(inp: dict) -> str:
