@@ -15,6 +15,7 @@ the scope it searched instead of implying a fault.
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -64,6 +65,33 @@ def _counts_outside_range(text: str, n: int) -> bool:
 def _account(value: str = "personal"):
     """Stand-in for a GoogleAccount enum member; only `.value` is read."""
     return SimpleNamespace(value=value)
+
+
+def _http_error(status: int, reason_code: str = "", message: str = "Synthetic failure"):
+    """Build a real googleapiclient HttpError with the shape Google returns.
+
+    Not a stand-in: the classifier reads `resp.status` and the machine reason out
+    of `error_details`, and both are derived by HttpError itself from the raw
+    body — so a hand-rolled double would prove nothing about the real thing.
+    `HttpError.reason` is the human *message*, not `reason_code`; that asymmetry
+    is exactly what the classifier has to cope with.
+    """
+    import json
+
+    import httplib2
+    from googleapiclient.errors import HttpError
+
+    error: dict = {"code": status, "message": message}
+    if reason_code:
+        error["errors"] = [
+            {"domain": "usageLimits", "reason": reason_code, "message": message}
+        ]
+    resp = httplib2.Response({"status": status, "reason": message})
+    return HttpError(
+        resp,
+        json.dumps({"error": error}).encode(),
+        uri="https://www.googleapis.com/calendar/v3/calendars/primary/events",
+    )
 
 
 @pytest.fixture
@@ -370,11 +398,14 @@ def _event(days_ago: int, title: str, **extra):
 @pytest.fixture
 def fake_calendar(monkeypatch, accounts):
     """Stub CalendarService, recording the days_back of every search attempt."""
-    state = SimpleNamespace(events=[], searches=[], range_calls=[], upcoming_calls=[])
+    state = SimpleNamespace(
+        events=[], searches=[], range_calls=[], upcoming_calls=[], strict_flags=[]
+    )
 
     class FakeCalendarService:
-        def __init__(self, account):
+        def __init__(self, account, *, raise_on_api_error=False):
             self.account = account
+            state.strict_flags.append(raise_on_api_error)
 
         def search_events(self, query=None, attendee=None, days_back=30,
                           days_forward=30, calendar_id="primary"):
@@ -1080,13 +1111,29 @@ class TestCalendarAccountFailureDisclosure:
 
     @pytest.fixture
     def broken_calendar(self, monkeypatch, accounts):
-        state = SimpleNamespace(events_by_account={}, raising=set())
+        """Per-account failures.
+
+        `raising` names accounts that fail with a plain credentials error;
+        `errors` maps an account to a specific exception instance (an HttpError,
+        say) so the failure *category* can be exercised. `calls` records every
+        attempt so a rung that should have been skipped is observable.
+        """
+        state = SimpleNamespace(
+            events_by_account={}, raising=set(), errors={}, calls=[], strict_flags=[]
+        )
 
         class FlakyCalendarService:
-            def __init__(self, account):
+            def __init__(self, account, *, raise_on_api_error=False):
                 self.account = account
+                state.strict_flags.append(raise_on_api_error)
 
             def search_events(self, query=None, days_back=30, days_forward=30, **kw):
+                state.calls.append(
+                    {"account": self.account.value, "days_back": days_back}
+                )
+                specific = state.errors.get(self.account.value)
+                if specific is not None:
+                    raise specific
                 if self.account.value in state.raising:
                     raise RuntimeError("credentials expired")
                 return list(state.events_by_account.get(self.account.value, []))
@@ -1155,8 +1202,283 @@ class TestCalendarAccountFailureDisclosure:
         """
         broken_calendar.raising = {"personal"}
         out = await _tool_search_calendar({"query": "standup"})
-        assert "errored" in out
+        assert "returned an error" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
+
+    # -- API failures, not just credential failures (issue #536) -------------
+    # The credential path was fixed first, so an expired token surfaced. A 403, a
+    # 429, a 500 or a quota event still died in
+    # `CalendarService._fetch_events`'s `except Exception: return []` and came
+    # back as "nothing on your calendar".
+
+    async def test_the_tool_asks_the_service_to_propagate_failures(
+        self, broken_calendar, accounts
+    ):
+        """Without the opt-in flag the service swallows the fault and none of
+        the disclosure below can ever fire."""
+        await _tool_search_calendar({"query": "standup"})
+        assert broken_calendar.strict_flags
+        assert all(broken_calendar.strict_flags)
+
+    async def test_api_error_is_reported_as_a_failure_to_search(
+        self, broken_calendar, accounts
+    ):
+        broken_calendar.errors = {"personal": _http_error(500, "backendError")}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert out.startswith("Could not search the calendar")
+        assert "NOT an empty calendar" in out
+        assert "Nothing on the calendar matches" not in out
+
+    async def test_api_error_says_the_search_could_not_complete(
+        self, broken_calendar, accounts
+    ):
+        broken_calendar.errors = {"personal": _http_error(500, "backendError")}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "could not complete" in out
+        assert "rate-limit" not in out.lower()
+
+    @pytest.mark.parametrize(
+        "exc_args",
+        [
+            (429, "", "Quota exceeded for quota metric 'Queries'"),
+            (403, "rateLimitExceeded", "Rate Limit Exceeded"),
+            (403, "userRateLimitExceeded", "User Rate Limit Exceeded"),
+        ],
+    )
+    async def test_rate_limit_is_reported_distinctly(
+        self, broken_calendar, accounts, exc_args
+    ):
+        """A rate limit means the data is almost certainly there.
+
+        Google returns it two ways: a 429 under the newer error format, and a 403
+        whose machine reason — in error_details, not in `.reason` — is
+        rateLimitExceeded or userRateLimitExceeded.
+        """
+        broken_calendar.errors = {"personal": _http_error(*exc_args)}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "rate-limiting" in out
+        assert "trying again shortly" in out
+        assert "likely there" in out
+        assert "may need re-authorising" not in out
+
+    async def test_a_plain_403_is_not_mistaken_for_a_rate_limit(
+        self, broken_calendar, accounts
+    ):
+        """Insufficient permission is a 403 too, and it will not clear by waiting."""
+        broken_calendar.errors = {
+            "personal": _http_error(403, "forbidden", "Insufficient Permission")
+        }
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "rate-limiting" not in out
+        assert "re-authorising" in out
+
+    async def test_failure_note_does_not_quote_the_exception(
+        self, broken_calendar, accounts
+    ):
+        """Exception text can carry event titles, attendees, or the query."""
+        broken_calendar.errors = {
+            "personal": _http_error(500, "backendError", "Milo Placeholder therapy")
+        }
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Milo Placeholder" not in out
+        assert "HttpError" not in out
+        assert "personal" in out
+
+    async def test_a_failed_account_is_not_retried_on_wider_rungs(
+        self, broken_calendar, accounts
+    ):
+        """The ladder triples call volume on a miss, and rate limits are burst-driven.
+
+        A 429 on the ±180d rung must not be answered by two more calls to the
+        same account. The healthy account still walks the whole ladder.
+        """
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(429)}
+        await _tool_search_calendar({"query": "standup"})
+        work_calls = [c for c in broken_calendar.calls if c["account"] == "work"]
+        personal_calls = [
+            c for c in broken_calendar.calls if c["account"] == "personal"
+        ]
+        assert len(work_calls) == 1
+        assert work_calls[0]["days_back"] == _CALENDAR_LADDER_DAYS[0]
+        assert [c["days_back"] for c in personal_calls] == list(_CALENDAR_LADDER_DAYS)
+
+    async def test_a_dropped_account_is_still_disclosed_on_the_last_rung(
+        self, broken_calendar, accounts
+    ):
+        """Dropping it from later rungs must not drop it from the answer."""
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(429)}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Could not reach work" in out
+        assert "It was not retried on the wider windows." in out
+
+    async def test_a_partial_failure_withholds_the_nothing_matches_claim(
+        self, broken_calendar, accounts
+    ):
+        """One account never answered, so the absence was never established.
+
+        The windows are still named — the account that did answer really searched
+        them — but "nothing on the calendar matches" is an assertion the search
+        did not earn.
+        """
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(429)}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Nothing on the calendar matches" not in out
+        assert "Searched ±180d, then ±365d, then ±1095d." in out
+        assert "incomplete answer" in out
+
+    async def test_a_clean_empty_still_makes_the_claim(self, broken_calendar, accounts):
+        """The complement: with every account answering, the absence is real."""
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Nothing on the calendar matches 'standup' in that span." in out
+        assert not any(word in out.lower() for word in FAULT_WORDS)
+
+    async def test_the_drop_is_not_claimed_when_no_wider_rung_ran(
+        self, broken_calendar, accounts
+    ):
+        """First rung hit, so there were no wider windows to skip."""
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(429)}
+        broken_calendar.events_by_account["personal"] = [
+            _event(20, "Synthetic standup")
+        ]
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "wider windows" not in out
+        assert "Could not reach work" in out
+
+    async def test_partial_failure_returns_the_healthy_results_and_discloses(
+        self, broken_calendar, accounts
+    ):
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(429)}
+        broken_calendar.events_by_account["personal"] = [
+            _event(20, "Synthetic standup")
+        ]
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Synthetic standup" in out
+        assert "Could not reach work" in out
+        assert "rate-limiting" in out
+
+    async def test_one_account_failing_is_not_a_total_failure(
+        self, broken_calendar, accounts
+    ):
+        """The other account searched every window and found nothing.
+
+        That empty is real, so the output must not claim nothing was searched —
+        but it must still say the answer is incomplete.
+        """
+        accounts.append(_account("work"))
+        broken_calendar.errors = {"work": _http_error(500, "backendError")}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert not out.startswith("Could not search the calendar")
+        assert "nothing was actually searched" not in out
+        assert "incomplete answer" in out
+
+    async def test_every_account_failing_is_a_total_failure(
+        self, broken_calendar, accounts
+    ):
+        accounts.append(_account("work"))
+        broken_calendar.errors = {
+            "personal": _http_error(429),
+            "work": _http_error(500, "backendError"),
+        }
+        out = await _tool_search_calendar({"query": "standup"})
+        assert out.startswith("Could not search the calendar")
+        assert "personal" in out and "work" in out
+        # Both categories named, neither collapsed into the other.
+        assert "rate-limiting personal" in out
+        assert "work returned an error" in out
+
+    async def test_the_ladder_stops_once_every_account_has_failed(
+        self, broken_calendar, accounts
+    ):
+        accounts.append(_account("work"))
+        broken_calendar.errors = {
+            "personal": _http_error(429),
+            "work": _http_error(500, "backendError"),
+        }
+        await _tool_search_calendar({"query": "standup"})
+        assert len(broken_calendar.calls) == 2
+
+
+class TestCalendarServiceApiErrorContract:
+    """The disclosure above depends on API faults reaching the tool.
+
+    `CalendarService._fetch_events` wraps its request in
+    `try/except Exception: return []`. That is the contract every api/routes/
+    caller depends on, so propagation is opt-in per instance rather than removed.
+    """
+
+    @pytest.fixture
+    def service(self):
+        """A real CalendarService with a stubbed Google client."""
+        from api.services.calendar import CalendarService
+        from api.services.google_auth import GoogleAccount
+
+        def _build(**kwargs):
+            svc = CalendarService(account_type=GoogleAccount.PERSONAL, **kwargs)
+            svc._service = MagicMock()
+            return svc
+
+        return _build
+
+    def test_api_error_is_swallowed_to_an_empty_list_by_default(self, service):
+        svc = service()
+        svc._service.events().list().execute.side_effect = _http_error(429)
+        assert svc.get_upcoming_events(days=7) == []
+
+    def test_api_error_propagates_when_the_caller_opts_in(self, service):
+        from googleapiclient.errors import HttpError
+
+        svc = service(raise_on_api_error=True)
+        svc._service.events().list().execute.side_effect = _http_error(429)
+        with pytest.raises(HttpError):
+            svc.get_upcoming_events(days=7)
+
+    def test_every_entry_point_honours_the_flag(self, service):
+        """One constructor flag has to cover all three public read paths."""
+        from googleapiclient.errors import HttpError
+
+        svc = service(raise_on_api_error=True)
+        svc._service.events().list().execute.side_effect = _http_error(500)
+        with pytest.raises(HttpError):
+            svc.search_events(query="standup")
+        with pytest.raises(HttpError):
+            svc.get_events_in_range(_days_ago(5), _days_ago(1))
+        with pytest.raises(HttpError):
+            svc.get_upcoming_events(days=7)
+
+    def test_the_singleton_factory_never_hands_out_a_strict_service(self):
+        """Routes share these instances; none of them may start raising."""
+        from api.services.calendar import get_calendar_service
+        from api.services.google_auth import GoogleAccount
+
+        svc = get_calendar_service(GoogleAccount.PERSONAL)
+        assert svc.raise_on_api_error is False
+
+    async def test_the_route_still_returns_an_empty_list_on_api_error(self, service):
+        """The long-standing HTTP contract: 200 with zero events, not a 500."""
+        from api.routes import calendar as calendar_route
+
+        svc = service()
+        svc._service.events().list().execute.side_effect = _http_error(429)
+        with patch.object(
+            calendar_route, "get_calendar_service", return_value=svc
+        ):
+            upcoming = await calendar_route.get_upcoming_events(
+                days=7, account="personal", max_results=50
+            )
+            searched = await calendar_route.search_events(
+                q="standup",
+                attendee=None,
+                account="personal",
+                days_back=30,
+                days_forward=30,
+            )
+        assert (upcoming.events, upcoming.count) == ([], 0)
+        assert (searched.events, searched.count) == ([], 0)
 
 
 class TestCapNormalization:
@@ -1362,7 +1684,7 @@ class TestCalendarTotalAccountFailure:
         state = SimpleNamespace(raising=set(), events={}, attempts=0)
 
         class FlakyCalendarService:
-            def __init__(self, account):
+            def __init__(self, account, *, raise_on_api_error=False):
                 self.name = account.value
 
             def search_events(self, query=None, days_back=30, days_forward=30, **kw):
@@ -1409,3 +1731,88 @@ class TestCalendarTotalAccountFailure:
         await _tool_search_calendar({"query": "standup"})
         assert flaky_calendar.attempts == 1
 
+
+
+class TestFailureAttribution:
+    """The remedy named must be the one the status actually establishes.
+
+    An earlier version grouped every non-rate-limit failure together and always
+    suggested re-authorising. For a 500 or 503 that is a wrong remedy — the fault
+    is on Google's side and clears on its own — so it sent the reader to repair
+    credentials that were working. Same defect class as the rest of this file: a
+    cause asserted that the code had not established.
+    """
+
+    @pytest.fixture
+    def failing_calendar(self, monkeypatch, accounts):
+        state = SimpleNamespace(error=None)
+
+        class FailingCalendarService:
+            def __init__(self, account, *, raise_on_api_error=False):
+                self.strict = raise_on_api_error
+
+            def search_events(self, query=None, days_back=30, days_forward=30, **kw):
+                if self.strict and state.error is not None:
+                    raise state.error
+                return []
+
+            def get_events_in_range(self, start, end):
+                return []
+
+            def get_upcoming_events(self, days=7, max_results=15):
+                return []
+
+        monkeypatch.setattr(
+            "api.services.calendar.CalendarService", FailingCalendarService
+        )
+        return state
+
+    async def _out(self, state, error):
+        state.error = error
+        return await _tool_search_calendar({"query": "standup"})
+
+    @pytest.mark.parametrize("status,reason", [(429, ""), (403, "rateLimitExceeded")])
+    async def test_rate_limit_says_the_data_is_probably_there(
+        self, failing_calendar, status, reason
+    ):
+        out = await self._out(failing_calendar, _http_error(status, reason))
+        assert "rate-limiting" in out
+        assert "re-authorising" not in out
+
+    @pytest.mark.parametrize("status,reason", [(403, "forbidden"), (401, "")])
+    async def test_credential_failure_names_re_authorising(
+        self, failing_calendar, status, reason
+    ):
+        out = await self._out(failing_calendar, _http_error(status, reason))
+        assert "re-authorising" in out
+        assert "rate-limiting" not in out
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_server_error_is_not_blamed_on_credentials(
+        self, failing_calendar, status
+    ):
+        """The specific wrong remedy this class exists to prevent."""
+        out = await self._out(failing_calendar, _http_error(status))
+        assert "re-authorising" not in out
+        assert "Google's side" in out
+
+    async def test_server_error_still_reports_a_failure_not_an_absence(
+        self, failing_calendar
+    ):
+        out = await self._out(failing_calendar, _http_error(503))
+        assert "Nothing on the calendar matches" not in out
+        assert "could not" in out.lower()
+
+    async def test_daily_quota_is_not_promised_to_clear_shortly(
+        self, failing_calendar
+    ):
+        """A daily cap will not clear 'shortly', so it must not read as a rate limit."""
+        out = await self._out(failing_calendar, _http_error(403, "dailyLimitExceeded"))
+        assert "trying again shortly" not in out
+
+    async def test_the_exception_payload_never_reaches_the_output(
+        self, failing_calendar
+    ):
+        secret = "SYNTHETIC-sensitive-payload-do-not-echo"
+        out = await self._out(failing_calendar, _http_error(500, message=secret))
+        assert secret not in out

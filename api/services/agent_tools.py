@@ -74,7 +74,7 @@ TOOL_DEFINITIONS = [
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Number of results to return (default 10)",
+                    "description": "Number of results to return (default 40). A capped result says so — raise this to reach past it.",
                 },
             },
             "required": ["query"],
@@ -817,13 +817,13 @@ TOOL_DEFINITIONS = [
                 "notes": {"type": "string", "description": "Session notes (optional)."},
                 "session_id": {"type": "string", "description": "Target session for 'update' (defaults to most recent)."},
                 "exercise": {"type": "string", "description": "Exercise name for 'history' / 'summary'."},
-                "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for summary/metrics)."},
-                "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for summary/metrics)."},
+                "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for list/summary/metrics)."},
+                "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for list/summary/metrics)."},
                 "metric_type": {"type": "string", "description": "Metric name for log_metric/metrics, e.g. 'body_weight'."},
                 "value": {"type": "string", "description": "Value: numeric for 'log_metric' (e.g. '178.4'), free text for 'set_profile'."},
                 "unit": {"type": "string", "description": "Metric unit for 'log_metric', e.g. 'lb'."},
                 "key": {"type": "string", "description": "Training-profile key for 'set_profile'."},
-                "limit": {"type": "integer", "description": "Max rows for history/metrics (default 20/100)."},
+                "limit": {"type": "integer", "description": "Max rows for list/history/metrics (default 50/100/365). A capped result says so — raise this to reach past it."},
             },
             "required": ["action"],
         },
@@ -890,31 +890,214 @@ async def execute_tool_parallel(name: str, tool_input: dict) -> str:
 # Individual tool handlers
 # ---------------------------------------------------------------------------
 
-# Matches HybridSearch.search's own default. The old default of 10 halved the
-# service default for no stated reason, so a chunk the vault ranked 12th came
-# back as "no vault results" — an empty that described the cap, not the vault.
-_VAULT_TOP_K_DEFAULT = 20
+# Result cap for a vault search. Measured against a real index rather than
+# guessed: ordinary single-word queries return well over 20 matches, and the
+# extra ones are free, because the pipeline fetches `rerank_candidates` (50)
+# candidates whatever top_k says. A cap of 20 was discarding ranked,
+# already-retrieved chunks and presenting the remainder as the answer.
+#
+# 40 rather than 50 because HybridSearch.search only runs the cross-encoder when
+# more candidates survive than top_k asks for (`len(final_results) > top_k`). A
+# default at or above `rerank_candidates` would silently switch reranking off,
+# and the char budget below would then drop the tail by RRF order rather than by
+# relevance. _VAULT_TOP_K_MAX is likewise held below that ceiling so a caller
+# cannot cross it either — and so a request can always actually be served.
+_VAULT_TOP_K_DEFAULT = 40
+_VAULT_TOP_K_MAX = 49
+
+# Payload ceiling for the rendered results, in characters, following
+# _MSG_HISTORY_CHAR_BUDGET. Result *count* is a poor cost proxy here: measured
+# over a real index, the same number of results varied by roughly 2.3x in bytes
+# depending on how long the matched chunks happened to be. A character budget
+# lets a query with short chunks keep the full set, while one with long chunks
+# stays near the worst case the old count-based cap allowed.
+_VAULT_CHAR_BUDGET = 24000
 
 
 def _tool_search_vault(inp: dict) -> str:
     from api.services.hybrid_search import HybridSearch
     hs = HybridSearch()
     # Normalised like Slack's top_k: the model fills this in, and a 0 or None
-    # would return nothing and read as an empty vault.
-    top_k = _positive_int(inp.get("top_k", _VAULT_TOP_K_DEFAULT), _VAULT_TOP_K_DEFAULT, 200)
+    # would return nothing and read as an empty vault — and it doubles as the
+    # yardstick for the truncation disclosure below.
+    # Bounded by what the pipeline can actually return, not by an arbitrary
+    # ceiling. A request above `rerank_candidates` could never be served — it
+    # came back at the candidate limit instead, and since the truncation check
+    # compares against the number asked for, a short return read as complete
+    # when it was really ceiling-bound.
+    raw_top_k = inp.get("top_k", _VAULT_TOP_K_DEFAULT)
+    top_k = _positive_int(raw_top_k, _VAULT_TOP_K_DEFAULT, _VAULT_TOP_K_MAX)
+    reduced_note = ""
+    if isinstance(raw_top_k, (int, float, str)):
+        try:
+            if int(raw_top_k) > _VAULT_TOP_K_MAX:
+                reduced_note = (
+                    f" [Asked for top_k={int(raw_top_k)}, reduced to "
+                    f"{_VAULT_TOP_K_MAX} — the search pipeline cannot return more "
+                    "than that for one query, so a larger number would have gone "
+                    "unserved rather than fetched more.]"
+                )
+        except (TypeError, ValueError):
+            pass
     query = inp["query"]
     results = hs.search(query, top_k=top_k)
     if not results:
         # Echo the query: an empty here is a fact about this wording, and the
         # model needs to see what was asked to try a different one.
-        return f"No vault results found for query {query!r}."
+        return f"No vault results found for query {query!r}.{reduced_note}"
     lines = []
+    used = 0
     for i, r in enumerate(results, 1):
         fn = r.get("file_name", "unknown")
         content = r.get("content", "")[:800]
         score = r.get("hybrid_score", 0)
-        lines.append(f"[{i}] {fn} (score={score:.2f})\n{content}")
-    return "\n\n---\n".join(lines)
+        block = f"[{i}] {fn} (score={score:.2f})\n{content}"
+        # Whole chunks only, and always at least one: half a chunk sitting under
+        # the next chunk's header would be attributed to the wrong note, which is
+        # worse than dropping it.
+        if lines and used + len(block) > _VAULT_CHAR_BUDGET:
+            break
+        lines.append(block)
+        used += len(block)
+
+    notes = []
+    if len(lines) < len(results):
+        # Raising top_k cannot help here — the budget, not the count, bound.
+        # The figure names the budget applied to chunk text; separators and this
+        # note itself sit outside it, so the rendered payload is slightly larger.
+        notes.append(
+            f"Chunk text capped at {_VAULT_CHAR_BUDGET} characters — showing the "
+            f"{len(lines)} highest-ranked of {len(results)} chunks returned. "
+            "Narrow the query to spend the budget on fewer, closer notes."
+        )
+    if len(results) == top_k:
+        # A full page is the only signal the search gives that it had more. Say
+        # so: a truncated set read as complete is worse than an empty one,
+        # because nothing cues the reader to doubt it.
+        notes.append(
+            f"Capped at top_k={top_k} — more matching chunks may exist. Raise "
+            "top_k, or narrow the query, to reach them."
+        )
+    body = "\n\n---\n".join(lines)
+    if not notes:
+        return body + reduced_note
+    return body + "\n\n[" + " ".join(notes) + "]" + reduced_note
+
+
+# ---------------------------------------------------------------------------
+# Google API failure classification (calendar + Drive)
+# ---------------------------------------------------------------------------
+# "Google is rate-limiting these requests, try again shortly" tells the reader
+# their data is almost certainly there. "The search could not complete" does
+# not. Both beat "nothing found", but the difference between them is the
+# difference between waiting and giving up, so the two are reported separately.
+_FAIL_RATE_LIMIT = "rate_limit"
+_FAIL_AUTH = "auth"
+_FAIL_ERROR = "error"
+
+# Statuses that mean "this account's credentials are the problem". Anything else
+# — a 500, a 503, a transport error — is Google's side or the network, and
+# telling the reader to re-authorise for one of those sends them to fix
+# something that isn't broken.
+_AUTH_FAIL_STATUSES = frozenset({401, 403})
+
+# Google's machine reason codes for "too many calls", as returned under the
+# classic 403 error format. Verified against the installed googleapiclient
+# rather than assumed — see _google_failure_kind for the exact field shapes.
+# Deliberately excludes dailyLimitExceeded and quotaExceeded: a daily cap will
+# not clear "shortly", so promising that would be worse than saying the search
+# could not complete.
+_RATE_LIMIT_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
+
+
+def _google_failure_kind(exc: Exception) -> str:
+    """Classify a Google API exception as a rate limit or a generic failure.
+
+    Returns only a category, never anything derived from the exception: the
+    payload can quote event titles, file names, or the caller's own query, and
+    none of that belongs in tool output.
+
+    The field shapes below were checked against the installed
+    googleapiclient, not inferred from the attribute names:
+
+    - `HttpError.resp` is an `httplib2.Response` and `.status` is an int. A
+      rate limit under Google's newer error format arrives as 429.
+    - `HttpError.reason` is the human-readable *message* ("Rate Limit
+      Exceeded"), NOT the machine reason code. Testing `.reason` against
+      "rateLimitExceeded" never matches — that trap is why this reads
+      `error_details` instead.
+    - `HttpError.error_details` holds the first present of
+      `error.detail`/`error.details`/`error.errors`/`error.message`. For the
+      classic 403 that is the `errors` list, whose entries carry the machine
+      code: `[{"domain": "usageLimits", "reason": "rateLimitExceeded", ...}]`.
+      It can also be a bare string when the body is not JSON, hence the
+      isinstance guards.
+    """
+    from googleapiclient.errors import HttpError
+
+    if not isinstance(exc, HttpError):
+        return _FAIL_ERROR
+
+    raw_status = getattr(getattr(exc, "resp", None), "status", None)
+    try:
+        status = int(raw_status)
+    except (TypeError, ValueError):
+        status = None
+
+    if status == 429:
+        return _FAIL_RATE_LIMIT
+
+    if status == 403:
+        details = getattr(exc, "error_details", None)
+        entries = details if isinstance(details, (list, tuple)) else []
+        for entry in entries:
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if isinstance(reason, str) and reason.lower() in _RATE_LIMIT_REASONS:
+                return _FAIL_RATE_LIMIT
+
+    # A credentials problem is the only failure that re-authorising fixes. A 500
+    # or 503 is Google's side and clears on its own, so naming it an auth
+    # problem sends the reader to repair something that is not broken.
+    if status in _AUTH_FAIL_STATUSES:
+        return _FAIL_AUTH
+
+    return _FAIL_ERROR
+
+
+def _failure_causes(failures: dict[str, str]) -> str:
+    """Name the failing accounts and the failure category — never the payload.
+
+    `failures` maps account name to a _FAIL_* category. Each category gets its
+    own clause, because the remedy differs and naming the wrong one sends the
+    reader to fix something that is not broken: a rate limit clears by waiting,
+    a credentials failure needs re-authorising, and a server-side error needs
+    neither. Only what the status actually establishes is claimed.
+    """
+    limited = [a for a, kind in failures.items() if kind == _FAIL_RATE_LIMIT]
+    auth = [a for a, kind in failures.items() if kind == _FAIL_AUTH]
+    errored = [
+        a for a, kind in failures.items()
+        if kind not in (_FAIL_RATE_LIMIT, _FAIL_AUTH)
+    ]
+    parts = []
+    if limited:
+        parts.append(
+            f"Google is rate-limiting {', '.join(limited)}, so the data is very "
+            "likely there and trying again shortly should reach it"
+        )
+    if auth:
+        subject = "those accounts" if len(auth) > 1 else "that account"
+        parts.append(
+            f"{', '.join(auth)} rejected the credentials, so {subject} likely "
+            "needs re-authorising"
+        )
+    if errored:
+        parts.append(
+            f"{', '.join(errored)} returned an error, so the search could not "
+            "complete there — the cause is on Google's side or the network "
+            "rather than anything to fix here, and it may clear on a retry"
+        )
+    return "; ".join(parts)
 
 
 # Widening ladder for a calendar keyword search with no caller-supplied range.
@@ -962,22 +1145,49 @@ async def _tool_search_calendar(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that errored during the search. An expired token used to be
-    # logged and then reported as "no events" — a real fault dressed up as an
-    # empty result, which is the misdiagnosis this whole change exists to stop.
-    failed_accounts: list[str] = []
+    # Accounts that errored during the search, mapped to a failure category. An
+    # expired token used to be logged and then reported as "no events" — a real
+    # fault dressed up as an empty result, which is the misdiagnosis this whole
+    # change exists to stop. Failures accumulate across rungs rather than being
+    # reset per rung: an account that dropped out on the first window is still
+    # missing from the answer, so it still has to be disclosed.
+    failures: dict[str, str] = {}
+    # Accounts that completed at least one window without error. "Nothing was
+    # searched" is only true if this stays empty — an account that answered the
+    # ±180d rung and then failed at ±365d did establish something.
+    searched: set[str] = set()
     account_count = 0
+    # Whether any account completed the window most recently attempted, as
+    # opposed to any window at all.
+    rung_responded = False
 
     def _fetch(search_range: int | None) -> list:
-        """Collect events from every configured account for one window."""
-        nonlocal account_count
+        """Collect events from every configured account for one window.
+
+        Sets `rung_responded` for the window just attempted. That is distinct
+        from the cumulative `searched` set: an earlier rung can have succeeded
+        while this one reached nobody, and claiming this window was searched on
+        the strength of an earlier one is exactly the kind of unearned assertion
+        this module exists to avoid.
+        """
+        nonlocal account_count, rung_responded
         events = []
-        failed_accounts.clear()
         account_count = 0
+        rung_responded = False
         for account in get_configured_accounts():
             account_count += 1
+            if account.value in failures:
+                # Do not retry a failed account on a wider rung. The ladder
+                # already triples the call volume of a miss (3 rungs × each
+                # configured account), and rate limits are driven by burst
+                # volume: an account that just 429'd will very likely 429 again
+                # and each retry deepens the hole. The existing break below
+                # covers the all-accounts-down case; this covers the partial one,
+                # where another account is still answering and the ladder walks
+                # on without this one.
+                continue
             try:
-                cal = CalendarService(account)
+                cal = CalendarService(account, raise_on_api_error=True)
                 if query:
                     events.extend(cal.search_events(query=query, days_back=search_range, days_forward=search_range))
                 elif date_ref:
@@ -986,9 +1196,11 @@ async def _tool_search_calendar(inp: dict) -> str:
                     events.extend(cal.get_events_in_range(start, end))
                 else:
                     events.extend(cal.get_upcoming_events(days=7, max_results=15))
+                searched.add(account.value)
+                rung_responded = True
             except Exception as e:
                 logger.warning(f"Calendar {account.value} error: {e}")
-                failed_accounts.append(account.value)
+                failures[account.value] = _google_failure_kind(e)
         return events
 
     # An explicit days_range is an intentional constraint — answer exactly that
@@ -996,31 +1208,45 @@ async def _tool_search_calendar(inp: dict) -> str:
     windows_tried: list[str] = []
     if query and days_range:
         all_events = _fetch(days_range)
-        windows_tried.append(f"±{days_range}d")
+        if rung_responded:
+            windows_tried.append(f"±{days_range}d")
     elif query:
         for days in _CALENDAR_LADDER_DAYS:
             all_events = _fetch(days)
-            windows_tried.append(f"±{days}d")
+            # Only a window some account actually completed goes on the list.
+            # Otherwise the empty-result note names a span nobody looked at.
+            if rung_responded:
+                windows_tried.append(f"±{days}d")
             if all_events:
                 break
-            # Every account errored, so this rung searched nothing. Widening
-            # cannot help a broken connection, and continuing would let the
-            # note claim three windows were searched when none were.
-            if account_count and len(failed_accounts) == account_count:
+            # Every account has now errored, so there is nobody left to ask.
+            # Widening cannot help a broken connection, and continuing would let
+            # the note claim three windows were searched when none were.
+            if account_count and len(failures) == account_count:
                 break
     else:
         # date_ref / upcoming branches set their own range; search_range unused.
         all_events = _fetch(None)
 
     failed_note = ""
-    if failed_accounts:
+    if failures:
+        # Say the account was dropped, but only when a wider rung actually ran:
+        # otherwise "Searched ±180d, then ±365d" reads as if every account was
+        # asked in every window.
+        dropped = ""
+        if len(windows_tried) > 1:
+            subject = "They were" if len(failures) > 1 else "It was"
+            dropped = f" {subject} not retried on the wider windows."
         failed_note = (
-            f" [Could not reach {', '.join(failed_accounts)} — that account "
-            "errored, so this is an incomplete answer, not necessarily an empty "
-            "calendar. It may need re-authorising.]"
+            f" [Could not reach {', '.join(failures)}: {_failure_causes(failures)}."
+            f"{dropped} This is an incomplete answer, not necessarily an empty "
+            "calendar.]"
         )
 
-    total_failure = bool(failed_accounts) and len(failed_accounts) == account_count
+    # Not "every account failed" but "no account ever answered": with two
+    # accounts where one returned an empty ±180d window before the other broke,
+    # something *was* searched, and claiming otherwise is its own false report.
+    total_failure = bool(failures) and not searched
 
     if not all_events:
         # With every account down, nothing was searched, so an absence was never
@@ -1028,13 +1254,21 @@ async def _tool_search_calendar(inp: dict) -> str:
         # "nothing matches" followed by a footnote still reads as an answer.
         if total_failure:
             return (
-                f"Could not search the calendar: {', '.join(failed_accounts)} "
-                "errored, and no other account was reachable. This is NOT an "
-                "empty calendar — nothing was actually searched. The account may "
-                "need re-authorising." + bad_range
+                f"Could not search the calendar: {_failure_causes(failures)}. No "
+                "other account was reachable. This is NOT an empty calendar — "
+                "nothing was actually searched." + bad_range
             )
         if windows_tried:
-            hint = f"Nothing on the calendar matches {query!r} in that span."
+            # An account that never answered leaves the absence unestablished, so
+            # the "nothing matches" hint is withheld — the same distinction Drive
+            # draws with its "accounts that responded" branch. The windows are
+            # still named, because the accounts that did answer really searched
+            # them.
+            hint = (
+                ""
+                if failures
+                else f"Nothing on the calendar matches {query!r} in that span."
+            )
             return (
                 _exhausted_note("calendar events", windows_tried, hint)
                 + bad_range
@@ -1210,18 +1444,18 @@ async def _tool_search_drive(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that raised during the search. An expired token used to be logged
-    # and the tool still said "No drive files found." — a broken connection
-    # rendered as absent data, which is the misdiagnosis this change exists to
-    # stop.
-    failed_accounts: list[str] = []
+    # Accounts that raised during the search, mapped to a failure category. An
+    # expired token used to be logged and the tool still said "No drive files
+    # found." — a broken connection rendered as absent data, which is the
+    # misdiagnosis this change exists to stop.
+    failures: dict[str, str] = {}
     all_files = []
     truncated = False
     account_count = 0
     for account in get_configured_accounts():
         account_count += 1
         try:
-            drive = DriveService(account)
+            drive = DriveService(account, raise_on_api_error=True)
             files = drive.search(
                 full_text=query, max_results=max_results, order_by=order_by
             )
@@ -1231,14 +1465,14 @@ async def _tool_search_drive(inp: dict) -> str:
                 truncated = True
         except Exception as e:
             logger.warning(f"Drive {account.value} error: {e}")
-            failed_accounts.append(account.value)
+            failures[account.value] = _google_failure_kind(e)
 
     failed_note = ""
-    if failed_accounts:
+    if failures:
         failed_note = (
-            f"\n\n[Could not reach {', '.join(failed_accounts)} — that account "
-            "errored, so this is an incomplete answer, not necessarily an empty "
-            "Drive. It may need re-authorising.]"
+            f"\n\n[Could not reach {', '.join(failures)}: "
+            f"{_failure_causes(failures)}. This is an incomplete answer, not "
+            "necessarily an empty Drive.]"
         )
 
     if not all_files:
@@ -1246,14 +1480,13 @@ async def _tool_search_drive(inp: dict) -> str:
         # established. Lead with the fault instead of appending it to a denial —
         # "nothing came back" followed by a footnote still reads as an answer,
         # and "the accounts that responded" was none of them.
-        if len(failed_accounts) == account_count and failed_accounts:
+        if len(failures) == account_count and failures:
             return (
-                f"Could not search Drive: {', '.join(failed_accounts)} errored, and "
-                "no other account was reachable. This is NOT an empty Drive — "
-                "nothing was actually searched. The account may need "
-                "re-authorising." + bad_order
+                f"Could not search Drive: {_failure_causes(failures)}. No other "
+                "account was reachable. This is NOT an empty Drive — nothing was "
+                "actually searched." + bad_order
             )
-        if failed_accounts:
+        if failures:
             return (
                 "No Drive files came back from the accounts that responded."
                 + bad_order
@@ -2344,14 +2577,36 @@ def _workout_update(inp: dict) -> str:
     return f"Updated — {_summarize_session(session)} (session id: {session.id})"
 
 
+# Session cap for `list`, and the ceiling on a caller-supplied one.
+#
+# 10 was set the day the workout store was written, before it held a month of
+# real training, and it undercounts an ordinary month: a measured log held more
+# than 10 sessions in a single month, so "how did that month go" was answered
+# from part of the record with nothing saying so. 50 is the store's own
+# list_sessions default, covers the densest measured month several times over,
+# and covers a full quarter at the measured rate — the widest span worth
+# enumerating session by session.
+#
+# A count is an honest cost proxy at this shape, unlike the vault chunks above:
+# one line per session, measured at roughly 100 characters and under 200 at
+# worst, so 50 sessions is ~5 KB. The 200 ceiling bounds a caller-supplied
+# request to ~34 KB and still spans the whole 125-session log.
+_WORKOUT_LIST_LIMIT = 50
+_WORKOUT_LIST_MAX = 200
+
+
 def _workout_list(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     store = get_fitness_store()
+    # Normalised, not coerced with int(): the model writes this, and a 0, None or
+    # "twenty" would either raise inside the store or silently disable the
+    # truncation check below, which compares against this same number.
+    limit = _positive_int(inp.get("limit", _WORKOUT_LIST_LIMIT), _WORKOUT_LIST_LIMIT, _WORKOUT_LIST_MAX)
     sessions = store.list_sessions(
         date_start=inp.get("date_start"),
         date_end=inp.get("date_end"),
         kind=inp.get("kind"),
-        limit=int(inp.get("limit", 10) or 10),
+        limit=limit,
     )
     if not sessions:
         applied = _applied_filters(
@@ -2369,7 +2624,24 @@ def _workout_list(inp: dict) -> str:
     lines = ["Recent sessions (newest first):"]
     for s in sessions:
         lines.append(f"  [{s.id}] {_summarize_session(s)}")
+    if len(sessions) == limit:
+        # A full page is the only signal the store gives that it had more. Newest
+        # first, so what is missing is the older end of the span asked about —
+        # exactly what a "how did that month go" question is counting.
+        lines.append(
+            f"[Capped at {limit} sessions, newest first — older sessions may "
+            "also match. Raise limit, or set date_start/date_end, to reach them.]"
+        )
     return "\n".join(lines)
+
+
+# Set cap for `history`. One row is one set of one lift, so 20 was under a month
+# of a twice-weekly lift at the measured 2.3 sets per session (4 at worst) —
+# the wrong unit for "how has this moved", which is asked over months. 100 rows
+# is roughly a year at that rate and ~5 KB (one date, reps and load per line).
+# The 500 ceiling bounds a caller-supplied request to ~27 KB.
+_WORKOUT_HISTORY_LIMIT = 100
+_WORKOUT_HISTORY_MAX = 500
 
 
 def _workout_history(inp: dict) -> str:
@@ -2378,7 +2650,12 @@ def _workout_history(inp: dict) -> str:
     if not exercise:
         return "Error: 'history' needs an 'exercise'."
     store = get_fitness_store()
-    rows = store.exercise_history(exercise, limit=int(inp.get("limit", 20) or 20))
+    # Normalised for the same reason as `list` above — it is also the yardstick
+    # for the truncation check.
+    limit = _positive_int(
+        inp.get("limit", _WORKOUT_HISTORY_LIMIT), _WORKOUT_HISTORY_LIMIT, _WORKOUT_HISTORY_MAX
+    )
+    rows = store.exercise_history(exercise, limit=limit)
     canonical = store.normalize_exercise(exercise)
     if not rows:
         # normalize_exercise title-cases anything it has no alias for, so the
@@ -2397,6 +2674,11 @@ def _workout_history(inp: dict) -> str:
         dur = f" in {_fmt_duration(r.get('duration_seconds'))}" if r.get("duration_seconds") else ""
         sid = f" [{r['session_id']}]" if r.get("session_id") else ""
         lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}{dur}{sid}")
+    if len(rows) == limit:
+        lines.append(
+            f"[Capped at {limit} sets, newest first — earlier sets of "
+            f"{canonical!r} may also be logged. Raise limit to reach them.]"
+        )
     return "\n".join(lines)
 
 
@@ -2428,6 +2710,17 @@ def _workout_log_metric(inp: dict) -> str:
     return f"Logged {metric_type.replace('_', ' ')}: {_fmt_num(m.value)}{unit}."
 
 
+# Sample cap for `metrics`. A metric question is a trend question, and its
+# natural span is a year: 365 covers a year of the cumulative path (one row per
+# day) and over a year of the densest measured metric, where the old 100 was
+# under four months of either. The metrics that arrive at most daily fit a year
+# with room to spare. One row is a date and a number, ~30 characters, so 365
+# rows is ~11 KB and the 1000 ceiling bounds a caller-supplied request to
+# ~30 KB.
+_WORKOUT_METRICS_LIMIT = 365
+_WORKOUT_METRICS_MAX = 1000
+
+
 def _workout_metrics(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     metric_type = inp.get("metric_type")
@@ -2435,7 +2728,11 @@ def _workout_metrics(inp: dict) -> str:
         return "Error: 'metrics' needs a 'metric_type'."
     store = get_fitness_store()
     label = metric_type.replace("_", " ")
-    limit = int(inp.get("limit", 100) or 100)
+    # Normalised for the same reason as `list` above — it is also the yardstick
+    # for the truncation checks.
+    limit = _positive_int(
+        inp.get("limit", _WORKOUT_METRICS_LIMIT), _WORKOUT_METRICS_LIMIT, _WORKOUT_METRICS_MAX
+    )
 
     # Both query paths below share one empty result. With a window in effect it
     # must name the window: "No body weight recorded." for a dated query implies
@@ -2460,6 +2757,14 @@ def _workout_metrics(inp: dict) -> str:
         for d in days:
             unit = f" {d['unit']}" if d["unit"] else ""
             lines.append(f"  {d['date']}: {_fmt_num(d['value'])}{unit}")
+        if len(days) == limit:
+            # Newest first, so the oldest days of the trend are the ones missing —
+            # and a trend read off a silently clipped series is simply wrong.
+            lines.append(
+                f"[Capped at {limit} days, newest first — earlier {label} may "
+                "also be recorded. Raise limit, or set date_start/date_end, to "
+                "reach it.]"
+            )
         return "\n".join(lines)
 
     rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit)
@@ -2469,6 +2774,11 @@ def _workout_metrics(inp: dict) -> str:
     for m in rows:
         unit = f" {m.unit}" if m.unit else ""
         lines.append(f"  {m.start_at[:10]}: {_fmt_num(m.value)}{unit}")
+    if len(rows) == limit:
+        lines.append(
+            f"[Capped at {limit} samples, newest first — earlier {label} may "
+            "also be recorded. Raise limit, or set date_start/date_end, to reach it.]"
+        )
     return "\n".join(lines)
 
 

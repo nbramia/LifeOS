@@ -48,6 +48,33 @@ def _account(value: str = "personal"):
     return SimpleNamespace(value=value)
 
 
+def _http_error(status: int, reason_code: str = "", message: str = "Synthetic failure"):
+    """Build a real googleapiclient HttpError with the shape Google returns.
+
+    Not a stand-in: the classifier reads `resp.status` and the machine reason out
+    of `error_details`, and both are derived by HttpError itself from the raw
+    body — so a hand-rolled double would prove nothing about the real thing.
+    `HttpError.reason` is the human *message*, not `reason_code`; that asymmetry
+    is exactly what the classifier has to cope with.
+    """
+    import json
+
+    import httplib2
+    from googleapiclient.errors import HttpError
+
+    error: dict = {"code": status, "message": message}
+    if reason_code:
+        error["errors"] = [
+            {"domain": "usageLimits", "reason": reason_code, "message": message}
+        ]
+    resp = httplib2.Response({"status": status, "reason": message})
+    return HttpError(
+        resp,
+        json.dumps({"error": error}).encode(),
+        uri="https://www.googleapis.com/drive/v3/files",
+    )
+
+
 @pytest.fixture
 def accounts(monkeypatch):
     """One configured Google account. Tests may append more in place."""
@@ -75,11 +102,14 @@ def fake_drive(monkeypatch, accounts):
     a single page) so both the ordering and the truncation signal are real rather
     than assumed.
     """
-    state = SimpleNamespace(files=[], per_account={}, broken=set(), calls=[])
+    state = SimpleNamespace(
+        files=[], per_account={}, broken=set(), errors={}, calls=[], strict_flags=[]
+    )
 
     class FakeDriveService:
-        def __init__(self, account):
+        def __init__(self, account, *, raise_on_api_error=False):
             self.account = account
+            state.strict_flags.append(raise_on_api_error)
 
         def search(
             self,
@@ -95,6 +125,12 @@ def fake_drive(monkeypatch, accounts):
                 "full_text": full_text, "max_results": max_results,
                 "order_by": order_by,
             })
+            # `errors` maps an account to a specific exception instance (an
+            # HttpError, say) so the failure *category* can be exercised;
+            # `broken` is the plain credentials-expired case.
+            specific = state.errors.get(self.account.value)
+            if specific is not None:
+                raise specific
             if self.account.value in state.broken:
                 raise RuntimeError("synthetic credentials expired")
             files = list(state.per_account.get(self.account.value, state.files))
@@ -315,7 +351,7 @@ class TestDriveOrdering:
         fake_drive.per_account["personal"].sort(key=lambda f: f.name)
 
         class NoSortDrive:
-            def __init__(self, account):
+            def __init__(self, account, *, raise_on_api_error=False):
                 self.account = account
 
             def search(self, **kw):
@@ -436,7 +472,7 @@ class TestDriveAccountFailureDisclosure:
         """
         fake_drive.broken = {"personal"}
         out = await _tool_search_drive({"query": "synthetic"})
-        assert "errored" in out
+        assert "returned an error" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
 
     async def test_partial_failure_still_calls_the_answer_incomplete(
@@ -462,6 +498,115 @@ class TestDriveAccountFailureDisclosure:
         assert partial != healthy
         assert "accounts that responded" in partial
         assert "accounts that responded" not in healthy
+
+    # -- API failures, not just credential failures (issue #536) -------------
+    # The credential path was fixed first, so an expired token surfaced. A 403, a
+    # 429, a 500 or a quota event still died in `DriveService.search`'s
+    # `except Exception: return []` and came back as "no Drive files".
+
+    async def test_the_tool_asks_the_service_to_propagate_failures(
+        self, fake_drive, accounts
+    ):
+        """Without the opt-in flag the service swallows the fault and none of
+        the disclosure below can ever fire."""
+        await _tool_search_drive({"query": "synthetic"})
+        assert fake_drive.strict_flags
+        assert all(fake_drive.strict_flags)
+
+    async def test_api_error_is_reported_as_a_failure_to_search(
+        self, fake_drive, accounts
+    ):
+        fake_drive.errors = {"personal": _http_error(500, "backendError")}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert out.startswith("Could not search Drive")
+        assert "NOT an empty Drive" in out
+        assert "No Drive files" not in out
+
+    async def test_api_error_says_the_search_could_not_complete(
+        self, fake_drive, accounts
+    ):
+        fake_drive.errors = {"personal": _http_error(500, "backendError")}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert "could not complete" in out
+        assert "rate-limit" not in out.lower()
+
+    @pytest.mark.parametrize(
+        "exc_args",
+        [
+            (429, "", "Quota exceeded for quota metric 'Queries'"),
+            (403, "rateLimitExceeded", "Rate Limit Exceeded"),
+            (403, "userRateLimitExceeded", "User Rate Limit Exceeded"),
+        ],
+    )
+    async def test_rate_limit_is_reported_distinctly(
+        self, fake_drive, accounts, exc_args
+    ):
+        """A rate limit means the files are almost certainly there.
+
+        Google returns it two ways: a 429 under the newer error format, and a 403
+        whose machine reason — in error_details, not in `.reason` — is
+        rateLimitExceeded or userRateLimitExceeded.
+        """
+        fake_drive.errors = {"personal": _http_error(*exc_args)}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert "rate-limiting" in out
+        assert "trying again shortly" in out
+        assert "likely there" in out
+        assert "may need re-authorising" not in out
+
+    async def test_a_plain_403_is_not_mistaken_for_a_rate_limit(
+        self, fake_drive, accounts
+    ):
+        """Insufficient permission is a 403 too, and it will not clear by waiting."""
+        fake_drive.errors = {
+            "personal": _http_error(403, "forbidden", "Insufficient Permission")
+        }
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert "rate-limiting" not in out
+        assert "re-authorising" in out
+
+    async def test_failure_note_does_not_quote_the_exception(
+        self, fake_drive, accounts
+    ):
+        """Exception text can carry file names or the caller's own query."""
+        fake_drive.errors = {
+            "personal": _http_error(500, "backendError", "Milo Placeholder therapy")
+        }
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert "Milo Placeholder" not in out
+        assert "HttpError" not in out
+        assert "personal" in out
+
+    async def test_partial_failure_returns_the_healthy_results_and_discloses(
+        self, fake_drive, accounts
+    ):
+        accounts.append(_account("work"))
+        fake_drive.errors = {"work": _http_error(429)}
+        fake_drive.per_account = {"personal": [_file(1, "Synthetic personal doc")]}
+        out = await _tool_search_drive({"query": "synthetic"})
+        assert "Synthetic personal doc" in out
+        assert "Could not reach work" in out
+        assert "rate-limiting" in out
+
+    async def test_a_failed_account_is_asked_exactly_once(self, fake_drive, accounts):
+        """Rate limits are burst-driven; a failure must not be re-attempted."""
+        accounts.append(_account("work"))
+        fake_drive.errors = {"work": _http_error(429)}
+        await _tool_search_drive({"query": "synthetic"})
+        assert [c["account"] for c in fake_drive.calls] == ["personal", "work"]
+
+    async def test_both_failure_categories_are_named_separately(
+        self, fake_drive, accounts
+    ):
+        accounts.append(_account("work"))
+        fake_drive.errors = {
+            "personal": _http_error(429),
+            "work": _http_error(500, "backendError"),
+        }
+        out = await _tool_search_drive({"query": "synthetic"})
+        assert out.startswith("Could not search Drive")
+        assert "rate-limiting personal" in out
+        assert "work returned an error" in out
 
 
 # ---------------------------------------------------------------------------
@@ -691,3 +836,61 @@ class TestDriveServiceContract:
 
         kwargs = service._service.files().list.call_args.kwargs
         assert kwargs["orderBy"] == "modifiedTime desc"
+
+    # -- Opt-in API-failure propagation (issue #536) --------------------------
+
+    @pytest.fixture
+    def service(self):
+        """A real DriveService with a stubbed Google client."""
+        from api.services.drive import DriveService, GoogleAccount
+
+        def _build(**kwargs):
+            svc = DriveService(account_type=GoogleAccount.PERSONAL, **kwargs)
+            svc._service = MagicMock()
+            return svc
+
+        return _build
+
+    def test_api_error_is_swallowed_to_an_empty_list_by_default(self, service):
+        svc = service()
+        svc._service.files().list().execute.side_effect = _http_error(429)
+        assert svc.search(full_text="comp planning") == []
+
+    def test_api_error_propagates_when_the_caller_opts_in(self, service):
+        from googleapiclient.errors import HttpError
+
+        svc = service(raise_on_api_error=True)
+        svc._service.files().list().execute.side_effect = _http_error(429)
+        with pytest.raises(HttpError):
+            svc.search(full_text="comp planning")
+
+    def test_the_flag_does_not_leak_into_the_other_read_paths(self, service):
+        """Only search() is opted in; get_file/get_file_content keep their own
+        contract, which this change is not in scope to touch."""
+        svc = service(raise_on_api_error=True)
+        svc._service.files().get().execute.side_effect = _http_error(500)
+        assert svc.get_file("synthetic-id") is None
+
+    def test_the_singleton_factory_never_hands_out_a_strict_service(self):
+        """Routes share these instances; none of them may start raising."""
+        from api.services.drive import get_drive_service, GoogleAccount
+
+        svc = get_drive_service(GoogleAccount.PERSONAL)
+        assert svc.raise_on_api_error is False
+
+    async def test_the_route_still_returns_an_empty_list_on_api_error(self, service):
+        """The long-standing HTTP contract: 200 with zero files, not a 500."""
+        from api.routes import drive as drive_route
+
+        svc = service()
+        svc._service.files().list().execute.side_effect = _http_error(429)
+        with patch.object(drive_route, "get_drive_service", return_value=svc):
+            result = await drive_route.search_files(
+                q="comp planning",
+                name=None,
+                content=None,
+                account="personal",
+                max_results=20,
+            )
+        assert (result.files, result.count) == ([], 0)
+        assert result.query == "comp planning"
