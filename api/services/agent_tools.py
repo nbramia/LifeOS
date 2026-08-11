@@ -962,6 +962,97 @@ def _tool_search_vault(inp: dict) -> str:
     return body + "\n\n[" + " ".join(notes) + "]"
 
 
+# ---------------------------------------------------------------------------
+# Google API failure classification (calendar + Drive)
+# ---------------------------------------------------------------------------
+# "Google is rate-limiting these requests, try again shortly" tells the reader
+# their data is almost certainly there. "The search could not complete" does
+# not. Both beat "nothing found", but the difference between them is the
+# difference between waiting and giving up, so the two are reported separately.
+_FAIL_RATE_LIMIT = "rate_limit"
+_FAIL_ERROR = "error"
+
+# Google's machine reason codes for "too many calls", as returned under the
+# classic 403 error format. Verified against the installed googleapiclient
+# rather than assumed — see _google_failure_kind for the exact field shapes.
+# Deliberately excludes dailyLimitExceeded and quotaExceeded: a daily cap will
+# not clear "shortly", so promising that would be worse than saying the search
+# could not complete.
+_RATE_LIMIT_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
+
+
+def _google_failure_kind(exc: Exception) -> str:
+    """Classify a Google API exception as a rate limit or a generic failure.
+
+    Returns only a category, never anything derived from the exception: the
+    payload can quote event titles, file names, or the caller's own query, and
+    none of that belongs in tool output.
+
+    The field shapes below were checked against the installed
+    googleapiclient, not inferred from the attribute names:
+
+    - `HttpError.resp` is an `httplib2.Response` and `.status` is an int. A
+      rate limit under Google's newer error format arrives as 429.
+    - `HttpError.reason` is the human-readable *message* ("Rate Limit
+      Exceeded"), NOT the machine reason code. Testing `.reason` against
+      "rateLimitExceeded" never matches — that trap is why this reads
+      `error_details` instead.
+    - `HttpError.error_details` holds the first present of
+      `error.detail`/`error.details`/`error.errors`/`error.message`. For the
+      classic 403 that is the `errors` list, whose entries carry the machine
+      code: `[{"domain": "usageLimits", "reason": "rateLimitExceeded", ...}]`.
+      It can also be a bare string when the body is not JSON, hence the
+      isinstance guards.
+    """
+    from googleapiclient.errors import HttpError
+
+    if not isinstance(exc, HttpError):
+        return _FAIL_ERROR
+
+    raw_status = getattr(getattr(exc, "resp", None), "status", None)
+    try:
+        status = int(raw_status)
+    except (TypeError, ValueError):
+        status = None
+
+    if status == 429:
+        return _FAIL_RATE_LIMIT
+
+    if status == 403:
+        details = getattr(exc, "error_details", None)
+        entries = details if isinstance(details, (list, tuple)) else []
+        for entry in entries:
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if isinstance(reason, str) and reason.lower() in _RATE_LIMIT_REASONS:
+                return _FAIL_RATE_LIMIT
+
+    return _FAIL_ERROR
+
+
+def _failure_causes(failures: dict[str, str]) -> str:
+    """Name the failing accounts and the failure category — never the payload.
+
+    `failures` maps account name to a _FAIL_* category. Rate-limited accounts
+    are grouped separately from the rest so the reader learns the data is
+    probably there and the retry is worth making.
+    """
+    limited = [a for a, kind in failures.items() if kind == _FAIL_RATE_LIMIT]
+    errored = [a for a, kind in failures.items() if kind != _FAIL_RATE_LIMIT]
+    parts = []
+    if limited:
+        parts.append(
+            f"Google is rate-limiting {', '.join(limited)}, so the data is very "
+            "likely there and trying again shortly should reach it"
+        )
+    if errored:
+        subject = "those accounts" if len(errored) > 1 else "that account"
+        parts.append(
+            f"{', '.join(errored)} errored, so the search could not complete "
+            f"there and {subject} may need re-authorising"
+        )
+    return "; ".join(parts)
+
+
 # Widening ladder for a calendar keyword search with no caller-supplied range.
 # ±180d covers "did we meet recently"; the wider rungs catch anniversaries and
 # one-off events from previous years that the old fixed ±180d silently hid.
@@ -1007,22 +1098,38 @@ async def _tool_search_calendar(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that errored during the search. An expired token used to be
-    # logged and then reported as "no events" — a real fault dressed up as an
-    # empty result, which is the misdiagnosis this whole change exists to stop.
-    failed_accounts: list[str] = []
+    # Accounts that errored during the search, mapped to a failure category. An
+    # expired token used to be logged and then reported as "no events" — a real
+    # fault dressed up as an empty result, which is the misdiagnosis this whole
+    # change exists to stop. Failures accumulate across rungs rather than being
+    # reset per rung: an account that dropped out on the first window is still
+    # missing from the answer, so it still has to be disclosed.
+    failures: dict[str, str] = {}
+    # Accounts that completed at least one window without error. "Nothing was
+    # searched" is only true if this stays empty — an account that answered the
+    # ±180d rung and then failed at ±365d did establish something.
+    searched: set[str] = set()
     account_count = 0
 
     def _fetch(search_range: int | None) -> list:
         """Collect events from every configured account for one window."""
         nonlocal account_count
         events = []
-        failed_accounts.clear()
         account_count = 0
         for account in get_configured_accounts():
             account_count += 1
+            if account.value in failures:
+                # Do not retry a failed account on a wider rung. The ladder
+                # already triples the call volume of a miss (3 rungs × each
+                # configured account), and rate limits are driven by burst
+                # volume: an account that just 429'd will very likely 429 again
+                # and each retry deepens the hole. The existing break below
+                # covers the all-accounts-down case; this covers the partial one,
+                # where another account is still answering and the ladder walks
+                # on without this one.
+                continue
             try:
-                cal = CalendarService(account)
+                cal = CalendarService(account, raise_on_api_error=True)
                 if query:
                     events.extend(cal.search_events(query=query, days_back=search_range, days_forward=search_range))
                 elif date_ref:
@@ -1031,9 +1138,10 @@ async def _tool_search_calendar(inp: dict) -> str:
                     events.extend(cal.get_events_in_range(start, end))
                 else:
                     events.extend(cal.get_upcoming_events(days=7, max_results=15))
+                searched.add(account.value)
             except Exception as e:
                 logger.warning(f"Calendar {account.value} error: {e}")
-                failed_accounts.append(account.value)
+                failures[account.value] = _google_failure_kind(e)
         return events
 
     # An explicit days_range is an intentional constraint — answer exactly that
@@ -1048,24 +1156,34 @@ async def _tool_search_calendar(inp: dict) -> str:
             windows_tried.append(f"±{days}d")
             if all_events:
                 break
-            # Every account errored, so this rung searched nothing. Widening
-            # cannot help a broken connection, and continuing would let the
-            # note claim three windows were searched when none were.
-            if account_count and len(failed_accounts) == account_count:
+            # Every account has now errored, so there is nobody left to ask.
+            # Widening cannot help a broken connection, and continuing would let
+            # the note claim three windows were searched when none were.
+            if account_count and len(failures) == account_count:
                 break
     else:
         # date_ref / upcoming branches set their own range; search_range unused.
         all_events = _fetch(None)
 
     failed_note = ""
-    if failed_accounts:
+    if failures:
+        # Say the account was dropped, but only when a wider rung actually ran:
+        # otherwise "Searched ±180d, then ±365d" reads as if every account was
+        # asked in every window.
+        dropped = ""
+        if len(windows_tried) > 1:
+            subject = "They were" if len(failures) > 1 else "It was"
+            dropped = f" {subject} not retried on the wider windows."
         failed_note = (
-            f" [Could not reach {', '.join(failed_accounts)} — that account "
-            "errored, so this is an incomplete answer, not necessarily an empty "
-            "calendar. It may need re-authorising.]"
+            f" [Could not reach {', '.join(failures)}: {_failure_causes(failures)}."
+            f"{dropped} This is an incomplete answer, not necessarily an empty "
+            "calendar.]"
         )
 
-    total_failure = bool(failed_accounts) and len(failed_accounts) == account_count
+    # Not "every account failed" but "no account ever answered": with two
+    # accounts where one returned an empty ±180d window before the other broke,
+    # something *was* searched, and claiming otherwise is its own false report.
+    total_failure = bool(failures) and not searched
 
     if not all_events:
         # With every account down, nothing was searched, so an absence was never
@@ -1073,13 +1191,21 @@ async def _tool_search_calendar(inp: dict) -> str:
         # "nothing matches" followed by a footnote still reads as an answer.
         if total_failure:
             return (
-                f"Could not search the calendar: {', '.join(failed_accounts)} "
-                "errored, and no other account was reachable. This is NOT an "
-                "empty calendar — nothing was actually searched. The account may "
-                "need re-authorising." + bad_range
+                f"Could not search the calendar: {_failure_causes(failures)}. No "
+                "other account was reachable. This is NOT an empty calendar — "
+                "nothing was actually searched." + bad_range
             )
         if windows_tried:
-            hint = f"Nothing on the calendar matches {query!r} in that span."
+            # An account that never answered leaves the absence unestablished, so
+            # the "nothing matches" hint is withheld — the same distinction Drive
+            # draws with its "accounts that responded" branch. The windows are
+            # still named, because the accounts that did answer really searched
+            # them.
+            hint = (
+                ""
+                if failures
+                else f"Nothing on the calendar matches {query!r} in that span."
+            )
             return (
                 _exhausted_note("calendar events", windows_tried, hint)
                 + bad_range
@@ -1255,18 +1381,18 @@ async def _tool_search_drive(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that raised during the search. An expired token used to be logged
-    # and the tool still said "No drive files found." — a broken connection
-    # rendered as absent data, which is the misdiagnosis this change exists to
-    # stop.
-    failed_accounts: list[str] = []
+    # Accounts that raised during the search, mapped to a failure category. An
+    # expired token used to be logged and the tool still said "No drive files
+    # found." — a broken connection rendered as absent data, which is the
+    # misdiagnosis this change exists to stop.
+    failures: dict[str, str] = {}
     all_files = []
     truncated = False
     account_count = 0
     for account in get_configured_accounts():
         account_count += 1
         try:
-            drive = DriveService(account)
+            drive = DriveService(account, raise_on_api_error=True)
             files = drive.search(
                 full_text=query, max_results=max_results, order_by=order_by
             )
@@ -1276,14 +1402,14 @@ async def _tool_search_drive(inp: dict) -> str:
                 truncated = True
         except Exception as e:
             logger.warning(f"Drive {account.value} error: {e}")
-            failed_accounts.append(account.value)
+            failures[account.value] = _google_failure_kind(e)
 
     failed_note = ""
-    if failed_accounts:
+    if failures:
         failed_note = (
-            f"\n\n[Could not reach {', '.join(failed_accounts)} — that account "
-            "errored, so this is an incomplete answer, not necessarily an empty "
-            "Drive. It may need re-authorising.]"
+            f"\n\n[Could not reach {', '.join(failures)}: "
+            f"{_failure_causes(failures)}. This is an incomplete answer, not "
+            "necessarily an empty Drive.]"
         )
 
     if not all_files:
@@ -1291,14 +1417,13 @@ async def _tool_search_drive(inp: dict) -> str:
         # established. Lead with the fault instead of appending it to a denial —
         # "nothing came back" followed by a footnote still reads as an answer,
         # and "the accounts that responded" was none of them.
-        if len(failed_accounts) == account_count and failed_accounts:
+        if len(failures) == account_count and failures:
             return (
-                f"Could not search Drive: {', '.join(failed_accounts)} errored, and "
-                "no other account was reachable. This is NOT an empty Drive — "
-                "nothing was actually searched. The account may need "
-                "re-authorising." + bad_order
+                f"Could not search Drive: {_failure_causes(failures)}. No other "
+                "account was reachable. This is NOT an empty Drive — nothing was "
+                "actually searched." + bad_order
             )
-        if failed_accounts:
+        if failures:
             return (
                 "No Drive files came back from the accounts that responded."
                 + bad_order
