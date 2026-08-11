@@ -194,13 +194,19 @@ class TestCashflowBreakdownTruncation:
         fake_monarch.categories = _categories(_CASHFLOW_CATEGORY_CAP + 3)
         out = await _cashflow()
         assert "and 3 more categories" in out
-        assert "truncated" in out
+        assert f"largest {_CASHFLOW_CATEGORY_CAP} of {_CASHFLOW_CATEGORY_CAP + 3}" in out
 
-    async def test_truncated_note_denies_the_zero_reading(self, fake_monarch):
-        """A category just outside the cut otherwise reads as zero spend."""
+    async def test_truncated_note_discloses_without_claiming_amounts(self, fake_monarch):
+        """A category outside the cut must not read as zero spend.
+
+        An earlier version said "the rest are not zero", which the code cannot
+        establish — an omitted category may legitimately be 0. The note now
+        discloses the omission by count and asserts nothing about the amounts.
+        """
         fake_monarch.categories = _categories(_CASHFLOW_CATEGORY_CAP + 1)
         out = await _cashflow()
-        assert "not zero" in out
+        assert "1 more categories not shown" in out
+        assert "not zero" not in out
 
     async def test_no_note_when_exactly_at_the_cap(self, fake_monarch):
         """At the cap nothing was cut, so there is nothing to disclose."""
@@ -225,8 +231,18 @@ class TestCashflowBreakdownTruncation:
 class TestCashflowHonestEmpty:
     async def test_empty_breakdown_names_the_period(self, fake_monarch):
         out = await _cashflow()
-        assert "No categorized spending in this period." in out
+        assert "No spending in this period." in out
         assert f"{_first_of_this_month()} to {_today()}" in out
+
+    async def test_unclassified_expenses_are_not_called_no_spending(self, fake_monarch):
+        """Saying "no spending" here would contradict the Expenses line above it."""
+        fake_monarch.summary = {
+            "total_income": 5000.0, "total_expenses": 1200.0, "savings_rate": 0.76,
+        }
+        fake_monarch.categories = []
+        out = await _cashflow()
+        assert "No spending in this period." not in out
+        assert "unavailable, not" in out
 
     async def test_empty_breakdown_does_not_suggest_a_backend_fault(self, fake_monarch):
         out = (await _cashflow()).lower()
@@ -369,3 +385,85 @@ class TestSummaryDefaultBoundary:
             call["start"], "%Y-%m-%d"
         )
         assert timedelta(0) <= span < timedelta(days=31)
+
+
+class TestImpossibleWindowIsRefused:
+    """A start after the end cannot contain anything, so it must not be queried.
+
+    Anchoring a defaulted start to end_date fixes the defaulted case, but a
+    caller-supplied future start_date — or bounds passed the wrong way round —
+    still describes an impossible window. Querying it returns zeros that print as
+    a real $0.00 period at 0%, which is the confidently-wrong-number failure this
+    whole change exists to remove.
+    """
+
+    async def test_future_start_date_is_refused(self, fake_monarch):
+        future = (datetime.now() + timedelta(days=9)).strftime("%Y-%m-%d")
+        out = await _cashflow(start_date=future)
+        assert "start is after the end" in out
+        assert not fake_monarch.calls, "an impossible window must not be queried"
+
+    async def test_reversed_bounds_are_refused(self, fake_monarch):
+        out = await _cashflow(start_date="2026-09-01", end_date="2026-08-01")
+        assert "start is after the end" in out
+        assert not fake_monarch.calls
+
+    async def test_budgets_refuses_the_same_window(self, fake_monarch):
+        out = await _budgets(start_date="2026-09-01", end_date="2026-08-01")
+        assert "start is after the end" in out
+        assert not fake_monarch.calls
+
+    async def test_refusal_is_named_as_a_bad_range_not_an_empty_period(self, fake_monarch):
+        out = await _cashflow(start_date="2026-09-01", end_date="2026-08-01")
+        assert "NOT an empty period" in out
+        assert "$0.00" not in out
+
+    async def test_refusal_carries_no_fault_language(self, fake_monarch):
+        out = (await _cashflow(start_date="2026-09-01", end_date="2026-08-01")).lower()
+        for word in FAULT_WORDS:
+            assert word not in out, f"bad-range refusal implies a fault: {word!r}"
+
+    async def test_a_valid_window_is_still_queried(self, fake_monarch):
+        out = await _cashflow(start_date="2026-08-01", end_date="2026-08-11")
+        assert "start is after the end" not in out
+        assert fake_monarch.calls
+
+
+class TestSavingsRate:
+    """An undefined rate must not be printed as a number.
+
+    The rate is derived from the two figures printed above it rather than taken
+    from the upstream field: with no income it is undefined, and the upstream
+    value's unit is ambiguous (a bare -25 could mean -25% or -2500%), so a
+    magnitude heuristic guesses wrong on negative rates.
+    """
+
+    async def test_zero_income_reports_not_applicable(self, fake_monarch):
+        fake_monarch.summary = {
+            "total_income": 0.0, "total_expenses": 0.0, "savings_rate": 0,
+        }
+        out = await _cashflow()
+        assert "**Savings Rate**: n/a (no income in this period)" in out
+        assert "0.0%" not in out
+
+    async def test_zero_income_with_spending_reports_not_applicable(self, fake_monarch):
+        fake_monarch.summary = {
+            "total_income": 0.0, "total_expenses": 200.0, "savings_rate": 0,
+        }
+        out = await _cashflow()
+        assert "n/a (no income in this period)" in out
+
+    async def test_rate_is_derived_from_the_printed_figures(self, fake_monarch):
+        fake_monarch.summary = {
+            "total_income": 5000.0, "total_expenses": 1000.0, "savings_rate": 0.99,
+        }
+        out = await _cashflow()
+        # 4000/5000 = 80%, regardless of the upstream field's 0.99.
+        assert "**Savings Rate**: 80.0%" in out
+
+    async def test_overspending_reports_a_negative_rate(self, fake_monarch):
+        fake_monarch.summary = {
+            "total_income": 1000.0, "total_expenses": 1500.0, "savings_rate": -0.5,
+        }
+        out = await _cashflow()
+        assert "**Savings Rate**: -50.0%" in out

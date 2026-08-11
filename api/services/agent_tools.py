@@ -2261,12 +2261,25 @@ def _summary_period(inp: dict) -> tuple[str, str, str, str]:
     start = (start_dt or anchor.replace(day=1)).strftime("%Y-%m-%d")
     end = (end_dt or now).strftime("%Y-%m-%d")
 
+    # Anchoring fixes the defaulted case but not a caller-supplied one: a future
+    # start_date, or bounds passed the wrong way round, still describe a window
+    # that cannot contain anything. Querying it returns zeros that print as a
+    # real $0.00 period at 0% — the confidently-wrong-number failure this whole
+    # change exists to remove. Refuse it instead of reporting it.
+    if start > end:
+        error = (
+            f"Cannot summarise {start} to {end} — the start is after the end, so "
+            "that period cannot contain anything. This is a bad date range, NOT "
+            "an empty period. Check the order of start_date and end_date."
+        )
+        return start, end, f"{start} to {end}", dropped_note, error
+
     label = f"{start} to {end}"
     if start_dt is None and end_dt is None:
         label += " (month-to-date by default, so it may cover only part of the month)"
     elif start_dt is None:
         label += " (start defaulted to the 1st of that month)"
-    return start, end, label, dropped_note
+    return start, end, label, dropped_note, None
 
 
 async def _tool_search_finances(inp: dict) -> str:
@@ -2470,35 +2483,58 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "cashflow":
-        start, end, period, dropped_note = _summary_period(inp)
+        start, end, period, dropped_note, error = _summary_period(inp)
+        if error:
+            return error
         cf = await client.get_cashflow_summary(start_date=start, end_date=end)
         cats = await client.get_cashflow_by_category(start_date=start, end_date=end)
+        income = cf["total_income"]
+        expenses = cf["total_expenses"]
         # Period first: every figure below is only true of that window, and a
         # savings rate reads as a settled fact unless the scope precedes it.
         lines = [
             f"**Period**: {period}{dropped_note}",
-            f"**Income**: ${cf['total_income']:,.2f}",
-            f"**Expenses**: ${cf['total_expenses']:,.2f}",
-            f"**Net Savings**: ${cf['total_income'] - cf['total_expenses']:,.2f}",
-            f"**Savings Rate**: {cf['savings_rate'] * 100:.1f}%" if cf['savings_rate'] <= 1 else f"**Savings Rate**: {cf['savings_rate']:.1f}%",
+            f"**Income**: ${income:,.2f}",
+            f"**Expenses**: ${expenses:,.2f}",
+            f"**Net Savings**: ${income - expenses:,.2f}",
         ]
+        # Derived from the two figures printed above rather than taken from the
+        # upstream field. With no income the rate is undefined, and printing
+        # "0.0%" for it states something untrue; the upstream value's unit is
+        # also ambiguous (a bare -25 could mean -25% or -2500%), and a
+        # magnitude heuristic guesses wrong on negative rates.
+        if income > 0:
+            lines.append(f"**Savings Rate**: {(income - expenses) / income * 100:.1f}%")
+        else:
+            lines.append("**Savings Rate**: n/a (no income in this period)")
+
         if cats:
+            shown = cats[:_CASHFLOW_CATEGORY_CAP]
             lines.append("\nTop categories:")
-            for c in cats[:_CASHFLOW_CATEGORY_CAP]:
+            for c in shown:
                 lines.append(f"- {c['category']}: ${c['amount']:,.2f}")
             # Without this, a category just outside the cut reads as zero spend.
-            if len(cats) > _CASHFLOW_CATEGORY_CAP:
+            if len(cats) > len(shown):
                 lines.append(
-                    f"... and {len(cats) - _CASHFLOW_CATEGORY_CAP} more categories "
-                    "(breakdown truncated to the largest "
-                    f"{_CASHFLOW_CATEGORY_CAP} — the rest are not zero)"
+                    f"... and {len(cats) - len(shown)} more categories not shown "
+                    f"(largest {_CASHFLOW_CATEGORY_CAP} of {len(cats)} listed)"
                 )
+        elif expenses:
+            # Expenses exist but arrived unclassified. Saying "no spending" here
+            # would contradict the Expenses line printed directly above it.
+            lines.append(
+                "\nNo category breakdown came back for this period, though the "
+                "expenses above are non-zero — the breakdown is unavailable, not "
+                "empty."
+            )
         else:
-            lines.append("\nNo categorized spending in this period.")
+            lines.append("\nNo spending in this period.")
         return "\n".join(lines)
 
     elif action == "budgets":
-        start, end, period, dropped_note = _summary_period(inp)
+        start, end, period, dropped_note, error = _summary_period(inp)
+        if error:
+            return error
         budgets = await client.get_budgets(start_date=start, end_date=end)
         if not budgets:
             # The period is always bounded (month-to-date at the widest), so
