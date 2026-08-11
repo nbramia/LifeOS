@@ -171,6 +171,17 @@ class TestDriveCapAndTruncation:
         assert "no relevance ranking" in out
         assert "order_by='oldest'" in out
 
+    async def test_capped_result_suggests_the_ordering_not_already_used(
+        self, fake_drive
+    ):
+        """Advising order_by='oldest' to a caller already on 'oldest' is noise."""
+        fake_drive.files = [_file(i + 1, f"Synthetic doc {i}") for i in range(5)]
+        out = await _tool_search_drive(
+            {"query": "synthetic", "max_results": 5, "order_by": "oldest"}
+        )
+        assert "order_by='recent'" in out
+        assert "order_by='oldest'" not in out
+
 
 # ---------------------------------------------------------------------------
 # Ordering — Drive has no relevance sort, so ordering is explicit

@@ -1200,12 +1200,17 @@ async def _tool_search_drive(inp: dict) -> str:
 
     trunc_note = ""
     if truncated:
+        # Point at the other end of the ordering, never the one already used.
+        flip = (
+            "order_by='oldest' to reach older matches"
+            if order_key == "recent"
+            else "order_by='recent' to reach newer matches"
+        )
         trunc_note = (
             f"\n\n[Capped at {max_results} files per account and ordered "
             f"{order_desc} — more may exist. Drive has no relevance ranking, so "
             "the cut is by modification time, not match quality: raise "
-            "max_results, narrow the query, or pass order_by='oldest' to reach "
-            "older matches.]"
+            f"max_results, narrow the query, or pass {flip}.]"
         )
 
     lines = []
