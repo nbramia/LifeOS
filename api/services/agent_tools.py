@@ -1763,13 +1763,23 @@ _MSG_HISTORY_CHAR_BUDGET = 24000
 
 
 def _tool_get_message_history(inp: dict) -> str:
-    from api.services.imessage import query_person_messages, resolve_entity_id
+    from api.services.imessage import query_person_messages, resolve_entity_id_confidence
     from api.services.interaction_store import get_interaction_store
 
     entity_id = inp["entity_id"]
-    resolved_id = resolve_entity_id(entity_id)
+    resolved_id, ambiguous_match = resolve_entity_id_confidence(entity_id)
     if not resolved_id:
         return f"Could not resolve person '{entity_id}'. Use person_info first."
+
+    # A fuzzy_ambiguous resolution means two+ candidates scored close enough
+    # together that the top pick isn't reliably the right person — flag it
+    # rather than returning someone else's messages as a confident match.
+    ambiguous_note = (
+        f" ('{entity_id}' matched more than one person about equally well — "
+        "this may be the wrong person; confirm with person_info)"
+        if ambiguous_match
+        else ""
+    )
 
     start_date = inp.get("start_date")
     end_date = inp.get("end_date")
@@ -1859,15 +1869,17 @@ def _tool_get_message_history(inp: dict) -> str:
                     if search_term
                     else "."
                 )
+                + ambiguous_note
             )
         window_desc = " to ".join(x for x in (start_date, end_date) if x)
         return (
             f"No messages found in the requested window ({window_desc})"
             + (f" for {search_term!r}" if search_term else "")
             + ". Retry without start_date/end_date to search all history."
+            + ambiguous_note
         )
 
-    widened_note = _ladder_note(windows_tried)
+    widened_note = _ladder_note(windows_tried) + ambiguous_note
 
     # Build output. The budget is split across sources rather than applied to the
     # assembled string: the sections are grouped by source, not interleaved by

@@ -5,6 +5,7 @@ import pytest
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from api.services.imessage import (
     IMessageStore,
@@ -12,6 +13,8 @@ from api.services.imessage import (
     apple_timestamp_to_datetime,
     datetime_to_apple_timestamp,
     extract_text_from_attributed_body,
+    resolve_entity_id,
+    resolve_entity_id_confidence,
 )
 
 
@@ -255,6 +258,105 @@ class TestQueryMessagesDateFilters:
             entity_id="entity-date", start_date="not-a-date"
         )
         assert len(msgs) == 4
+
+
+class TestResolveEntityId:
+    """resolve_entity_id / resolve_entity_id_confidence (#346).
+
+    imessage.py used to define resolve_entity_id twice: a people_aggregator-
+    based version and an entity_resolver-based version that silently shadowed
+    it (the second definition wins in Python). These tests pin the surviving,
+    entity_resolver-based behavior, and the confidence signal it now surfaces
+    separately — a bare id can't tell a confident match from an ambiguous one.
+    """
+
+    ENTITY_ID = "11111111-2222-3333-4444-555555555555"
+
+    def test_valid_uuid_passes_through_without_resolving(self, monkeypatch):
+        """A UUID never needs the resolver — hitting it would be wasted work
+        and, if the resolver were ever wrong, could substitute an unrelated
+        person for an id that was already correct."""
+        calls = []
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: calls.append(True),
+        )
+        assert resolve_entity_id(self.ENTITY_ID) == self.ENTITY_ID
+        assert calls == []
+
+    def test_valid_uuid_confidence_is_never_ambiguous(self):
+        resolved_id, ambiguous = resolve_entity_id_confidence(self.ENTITY_ID)
+        assert resolved_id == self.ENTITY_ID
+        assert ambiguous is False
+
+    def test_name_slug_resolves_via_entity_resolver(self, monkeypatch):
+        result = SimpleNamespace(
+            entity=SimpleNamespace(id=self.ENTITY_ID), match_type="name_exact"
+        )
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: SimpleNamespace(resolve=lambda **kw: result),
+        )
+        assert resolve_entity_id("robin-doe") == self.ENTITY_ID
+
+    def test_name_slug_converts_hyphens_to_spaces(self, monkeypatch):
+        seen = {}
+
+        def fake_resolve(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                entity=SimpleNamespace(id=self.ENTITY_ID), match_type="name_exact"
+            )
+
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: SimpleNamespace(resolve=fake_resolve),
+        )
+        resolve_entity_id("robin-alex-doe")
+        assert seen["name"] == "robin alex doe"
+
+    def test_no_match_returns_none(self, monkeypatch):
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: SimpleNamespace(resolve=lambda **kw: None),
+        )
+        assert resolve_entity_id("nobody-here") is None
+        assert resolve_entity_id_confidence("nobody-here") == (None, False)
+
+    def test_confident_exact_match_is_not_ambiguous(self, monkeypatch):
+        result = SimpleNamespace(
+            entity=SimpleNamespace(id=self.ENTITY_ID), match_type="name_exact"
+        )
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: SimpleNamespace(resolve=lambda **kw: result),
+        )
+        resolved_id, ambiguous = resolve_entity_id_confidence("robin-doe")
+        assert resolved_id == self.ENTITY_ID
+        assert ambiguous is False
+
+    def test_fuzzy_ambiguous_match_is_flagged(self, monkeypatch):
+        """entity_resolver.resolve() can return match_type='fuzzy_ambiguous'
+        (confidence reduced to 0.7) when two candidates scored too close to
+        call. resolve_entity_id() discards this entirely — making an uncertain
+        match indistinguishable from an exact one — so callers whose output
+        can expose the wrong person's data must use the confidence variant."""
+        result = SimpleNamespace(
+            entity=SimpleNamespace(id=self.ENTITY_ID),
+            match_type="fuzzy_ambiguous",
+            confidence=0.7,
+            disambiguation_applied=True,
+        )
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: SimpleNamespace(resolve=lambda **kw: result),
+        )
+        resolved_id, ambiguous = resolve_entity_id_confidence("robin-doe")
+        assert resolved_id == self.ENTITY_ID
+        assert ambiguous is True
+        # resolve_entity_id() still returns just the id for callers that don't
+        # need the confidence signal.
+        assert resolve_entity_id("robin-doe") == self.ENTITY_ID
 
 
 class TestIMessageRecord:
