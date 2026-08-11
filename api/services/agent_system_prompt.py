@@ -83,7 +83,7 @@ Deletes a calendar event. Requires event_id from search_calendar. ALWAYS confirm
 Saves a persistent memory that will be surfaced in future conversations. Use when the user says "remember that...", "don't forget...", or asks you to remember something. Memories are automatically retrieved when relevant to future queries.
 
 **search_memories:**
-Searches saved memories by keyword. Use to recall previously saved information or check if a memory already exists.
+Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates came close but cleared no threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
 
 ## When NOT to use tools
 

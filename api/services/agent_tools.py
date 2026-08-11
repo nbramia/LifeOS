@@ -693,8 +693,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_memories",
         "description": (
-            "Search saved memories by keyword. Use to recall previously saved information, "
-            "check if a memory already exists, or find specific remembered facts/preferences."
+            "Search saved memories by wording and meaning. Use to recall previously saved "
+            "information, check if a memory already exists, or find specific remembered "
+            "facts/preferences. A relevance threshold applies, so an empty result can mean "
+            "the query wording missed rather than nothing being saved — the result says "
+            "which. When it says candidates came close, retry with different wording or a "
+            "higher limit before telling the user nothing is saved."
         ),
         "input_schema": {
             "type": "object",
@@ -702,6 +706,13 @@ TOOL_DEFINITIONS = [
                 "query": {
                     "type": "string",
                     "description": "Search query for memories.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max memories to return (default 10). Raise it when the result "
+                        "says it was capped, or when widening a search that came up short."
+                    ),
                 },
             },
             "required": ["query"],
@@ -1878,17 +1889,87 @@ async def _tool_save_memory(inp: dict) -> str:
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
+# Result cap for memory search. Exposed to the caller so a memory that missed on
+# wording can be reached by widening; also the truncation yardstick, so it has to
+# be a usable positive int however the model fills it in.
+_MEMORY_LIMIT_DEFAULT = 10
+_MEMORY_LIMIT_MAX = 200
+
+
 def _tool_search_memories(inp: dict) -> str:
     from api.services.memory_store import get_memory_store
 
+    query = (inp.get("query") or "").strip()
+    if not query:
+        return "search_memories needs a non-empty query."
+
     store = get_memory_store()
-    memories = store.search_memories(inp["query"], limit=10)
+    limit = _positive_int(inp.get("limit", _MEMORY_LIMIT_DEFAULT), _MEMORY_LIMIT_DEFAULT, _MEMORY_LIMIT_MAX)
+    memories, stats = store.search_memories_detailed(query, limit=limit)
+
+    notes = ""
+    # The corpus bound is a fact about what was checked, never about what exists:
+    # a memory saved before the newest N was not scored at all.
+    if stats.total_saved > stats.searched:
+        notes += (
+            f"\n\n[Scored the {stats.searched} most recently saved memories of "
+            f"{stats.total_saved} saved in total — anything older was not checked, "
+            "so this is not a complete look at everything saved.]"
+        )
+    # stats.matched counts matches before the cap, so this fires only when the
+    # cap actually hid something.
+    if stats.matched > limit:
+        notes += (
+            f"\n\n[Showing {limit} of {stats.matched} matching memories — raise "
+            "`limit` to see the rest.]"
+        )
+    if not stats.semantic_available:
+        notes += (
+            "\n\n[Meaning-based recall is offline for this search, so only word "
+            "overlap was scored — a memory phrased differently from the query may "
+            "have been missed. Retrying in the memory's likely wording helps.]"
+        )
+
     if not memories:
-        return "No matching memories found."
+        if stats.near_misses:
+            # Candidates existed and were scored; only the relevance floors kept
+            # them out. Rewording is the fix, not concluding the memory is gone.
+            return (
+                f"No saved memory cleared the relevance threshold for {query!r}, but "
+                f"{stats.near_misses} came close. Something relevant is likely saved: "
+                "retry with the wording the memory itself probably uses, or with "
+                "fewer, more specific terms." + notes
+            )
+        if stats.total_saved > stats.searched:
+            # The corpus bound cut the search short, so absence was never established.
+            return (
+                f"No match for {query!r} among the {stats.searched} most recently "
+                f"saved memories, of {stats.total_saved} saved in total. Older "
+                "memories were not scored, so this does not establish that the "
+                "thing was never saved." + notes
+            )
+        if stats.total_saved == 0:
+            return (
+                f"Nothing saved matches {query!r} — no memories have been saved yet, "
+                "so there was nothing to search."
+            )
+        if stats.semantic_available:
+            return (
+                f"Nothing saved matches {query!r}. All {stats.total_saved} saved "
+                "memories were scored on both wording and meaning, and none "
+                "matched." + notes
+            )
+        # Meaning was never scored, so only a wording miss was established.
+        return (
+            f"No saved memory matches the wording of {query!r}. All "
+            f"{stats.total_saved} saved memories were checked for word overlap."
+            + notes
+        )
+
     lines = []
     for m in memories:
         lines.append(f"- [{m.category}] {m.content}")
-    return "\n".join(lines)
+    return "\n".join(lines) + notes
 
 
 # -- Workout helpers (fitness bot backend) --
