@@ -74,7 +74,7 @@ TOOL_DEFINITIONS = [
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Number of results to return (default 10)",
+                    "description": "Number of results to return (default 40). A capped result says so — raise this to reach past it.",
                 },
             },
             "required": ["query"],
@@ -817,13 +817,13 @@ TOOL_DEFINITIONS = [
                 "notes": {"type": "string", "description": "Session notes (optional)."},
                 "session_id": {"type": "string", "description": "Target session for 'update' (defaults to most recent)."},
                 "exercise": {"type": "string", "description": "Exercise name for 'history' / 'summary'."},
-                "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for summary/metrics)."},
-                "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for summary/metrics)."},
+                "date_start": {"type": "string", "description": "Window start YYYY-MM-DD (for list/summary/metrics)."},
+                "date_end": {"type": "string", "description": "Window end YYYY-MM-DD (for list/summary/metrics)."},
                 "metric_type": {"type": "string", "description": "Metric name for log_metric/metrics, e.g. 'body_weight'."},
                 "value": {"type": "string", "description": "Value: numeric for 'log_metric' (e.g. '178.4'), free text for 'set_profile'."},
                 "unit": {"type": "string", "description": "Metric unit for 'log_metric', e.g. 'lb'."},
                 "key": {"type": "string", "description": "Training-profile key for 'set_profile'."},
-                "limit": {"type": "integer", "description": "Max rows for history/metrics (default 20/100)."},
+                "limit": {"type": "integer", "description": "Max rows for list/history/metrics (default 50/100/365). A capped result says so — raise this to reach past it."},
             },
             "required": ["action"],
         },
@@ -890,17 +890,34 @@ async def execute_tool_parallel(name: str, tool_input: dict) -> str:
 # Individual tool handlers
 # ---------------------------------------------------------------------------
 
-# Matches HybridSearch.search's own default. The old default of 10 halved the
-# service default for no stated reason, so a chunk the vault ranked 12th came
-# back as "no vault results" — an empty that described the cap, not the vault.
-_VAULT_TOP_K_DEFAULT = 20
+# Result cap for a vault search. Chosen against the live index, not guessed:
+# ordinary queries have far more than 20 matches ("meeting notes" 50, "project"
+# 48, "kayak trip" 42, "workout" 29), and the extra ones are free — the pipeline
+# fetches `rerank_candidates` (50) candidates whatever top_k says, so top_k=80
+# was measured to return exactly what top_k=50 does. 20 was throwing away
+# ranked, already-retrieved chunks and calling the remainder the answer.
+#
+# 40 rather than 50 because HybridSearch.search only runs the cross-encoder when
+# more candidates survive than top_k asks for (`len(final_results) > top_k`). A
+# default of 50 would silently switch reranking off, and the char budget below
+# would then drop the tail by RRF order rather than by relevance.
+_VAULT_TOP_K_DEFAULT = 40
+
+# Payload ceiling for the rendered results, in characters, following
+# _MSG_HISTORY_CHAR_BUDGET. Result *count* is a poor cost proxy here: measured
+# over the live index, 50 results cost 15 KB for "therapy" (avg 270 chars of
+# chunk) and 36 KB for "Nathan" (avg 693) — same count, 2.3x the payload. A
+# character budget lets a query with short chunks keep all 40 while a query with
+# full 800-char chunks stays near the ~17 KB worst case the old cap of 20 had.
+_VAULT_CHAR_BUDGET = 24000
 
 
 def _tool_search_vault(inp: dict) -> str:
     from api.services.hybrid_search import HybridSearch
     hs = HybridSearch()
     # Normalised like Slack's top_k: the model fills this in, and a 0 or None
-    # would return nothing and read as an empty vault.
+    # would return nothing and read as an empty vault — and it doubles as the
+    # yardstick for the truncation disclosure below.
     top_k = _positive_int(inp.get("top_k", _VAULT_TOP_K_DEFAULT), _VAULT_TOP_K_DEFAULT, 200)
     query = inp["query"]
     results = hs.search(query, top_k=top_k)
@@ -909,12 +926,40 @@ def _tool_search_vault(inp: dict) -> str:
         # model needs to see what was asked to try a different one.
         return f"No vault results found for query {query!r}."
     lines = []
+    used = 0
     for i, r in enumerate(results, 1):
         fn = r.get("file_name", "unknown")
         content = r.get("content", "")[:800]
         score = r.get("hybrid_score", 0)
-        lines.append(f"[{i}] {fn} (score={score:.2f})\n{content}")
-    return "\n\n---\n".join(lines)
+        block = f"[{i}] {fn} (score={score:.2f})\n{content}"
+        # Whole chunks only, and always at least one: half a chunk sitting under
+        # the next chunk's header would be attributed to the wrong note, which is
+        # worse than dropping it.
+        if lines and used + len(block) > _VAULT_CHAR_BUDGET:
+            break
+        lines.append(block)
+        used += len(block)
+
+    notes = []
+    if len(lines) < len(results):
+        # Raising top_k cannot help here — the budget, not the count, bound.
+        notes.append(
+            f"Payload capped at {_VAULT_CHAR_BUDGET} characters — showing the "
+            f"{len(lines)} highest-ranked of {len(results)} chunks returned. "
+            "Narrow the query to spend the budget on fewer, closer notes."
+        )
+    if len(results) == top_k:
+        # A full page is the only signal the search gives that it had more. Say
+        # so: a truncated set read as complete is worse than an empty one,
+        # because nothing cues the reader to doubt it.
+        notes.append(
+            f"Capped at top_k={top_k} — more matching chunks may exist. Raise "
+            "top_k, or narrow the query, to reach them."
+        )
+    body = "\n\n---\n".join(lines)
+    if not notes:
+        return body
+    return body + "\n\n[" + " ".join(notes) + "]"
 
 
 # Widening ladder for a calendar keyword search with no caller-supplied range.
@@ -2344,14 +2389,36 @@ def _workout_update(inp: dict) -> str:
     return f"Updated — {_summarize_session(session)} (session id: {session.id})"
 
 
+# Session cap for `list`, and the ceiling on a caller-supplied one.
+#
+# 10 was set the day the workout store was written, before it held a month of
+# real training, and it undercounts an ordinary month: the log holds 16 sessions
+# in June 2026 and 18 in its densest 30-day window, so "how did June go" was
+# answered from 10 of 16 with nothing saying so. 50 is the store's own
+# list_sessions default, covers the densest measured month nearly 3x, and covers
+# a full quarter at the June 2026 rate (~16/month) — the widest span worth
+# enumerating session by session.
+#
+# A count is an honest cost proxy at this shape, unlike the vault chunks above:
+# one line per session, measured at ~96 characters over the real log and 172 at
+# worst, so 50 sessions is ~5 KB. The 200 ceiling bounds a caller-supplied
+# request to ~34 KB and still spans the whole 125-session log.
+_WORKOUT_LIST_LIMIT = 50
+_WORKOUT_LIST_MAX = 200
+
+
 def _workout_list(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     store = get_fitness_store()
+    # Normalised, not coerced with int(): the model writes this, and a 0, None or
+    # "twenty" would either raise inside the store or silently disable the
+    # truncation check below, which compares against this same number.
+    limit = _positive_int(inp.get("limit", _WORKOUT_LIST_LIMIT), _WORKOUT_LIST_LIMIT, _WORKOUT_LIST_MAX)
     sessions = store.list_sessions(
         date_start=inp.get("date_start"),
         date_end=inp.get("date_end"),
         kind=inp.get("kind"),
-        limit=int(inp.get("limit", 10) or 10),
+        limit=limit,
     )
     if not sessions:
         applied = _applied_filters(
@@ -2369,7 +2436,24 @@ def _workout_list(inp: dict) -> str:
     lines = ["Recent sessions (newest first):"]
     for s in sessions:
         lines.append(f"  [{s.id}] {_summarize_session(s)}")
+    if len(sessions) == limit:
+        # A full page is the only signal the store gives that it had more. Newest
+        # first, so what is missing is the older end of the span asked about —
+        # exactly what a "how did that month go" question is counting.
+        lines.append(
+            f"[Capped at {limit} sessions, newest first — older sessions may "
+            "also match. Raise limit, or set date_start/date_end, to reach them.]"
+        )
     return "\n".join(lines)
+
+
+# Set cap for `history`. One row is one set of one lift, so 20 was under a month
+# of a twice-weekly lift at the measured 2.3 sets per session (4 at worst) —
+# the wrong unit for "how has this moved", which is asked over months. 100 rows
+# is roughly a year at that rate and ~5 KB (one date, reps and load per line).
+# The 500 ceiling bounds a caller-supplied request to ~27 KB.
+_WORKOUT_HISTORY_LIMIT = 100
+_WORKOUT_HISTORY_MAX = 500
 
 
 def _workout_history(inp: dict) -> str:
@@ -2378,7 +2462,12 @@ def _workout_history(inp: dict) -> str:
     if not exercise:
         return "Error: 'history' needs an 'exercise'."
     store = get_fitness_store()
-    rows = store.exercise_history(exercise, limit=int(inp.get("limit", 20) or 20))
+    # Normalised for the same reason as `list` above — it is also the yardstick
+    # for the truncation check.
+    limit = _positive_int(
+        inp.get("limit", _WORKOUT_HISTORY_LIMIT), _WORKOUT_HISTORY_LIMIT, _WORKOUT_HISTORY_MAX
+    )
+    rows = store.exercise_history(exercise, limit=limit)
     canonical = store.normalize_exercise(exercise)
     if not rows:
         # normalize_exercise title-cases anything it has no alias for, so the
@@ -2397,6 +2486,11 @@ def _workout_history(inp: dict) -> str:
         dur = f" in {_fmt_duration(r.get('duration_seconds'))}" if r.get("duration_seconds") else ""
         sid = f" [{r['session_id']}]" if r.get("session_id") else ""
         lines.append(f"  {r['date']}: {_fmt_num(r['reps'])} reps{w}{rpe}{dur}{sid}")
+    if len(rows) == limit:
+        lines.append(
+            f"[Capped at {limit} sets, newest first — earlier sets of "
+            f"{canonical!r} may also be logged. Raise limit to reach them.]"
+        )
     return "\n".join(lines)
 
 
@@ -2428,6 +2522,17 @@ def _workout_log_metric(inp: dict) -> str:
     return f"Logged {metric_type.replace('_', ' ')}: {_fmt_num(m.value)}{unit}."
 
 
+# Sample cap for `metrics`. A metric question is a trend question, and its
+# natural span is a year: 365 is a year of the cumulative path (one row per day)
+# and about sixteen months of HRV at the measured 275 samples a year, where the
+# old 100 was under four months of either. Body weight, sleep and resting HR
+# arrive at most daily in the real record, so a year of those fits with room.
+# One row is a date and a number, ~30 characters, so 365 rows is ~11 KB and the
+# 1000 ceiling bounds a caller-supplied request to ~30 KB.
+_WORKOUT_METRICS_LIMIT = 365
+_WORKOUT_METRICS_MAX = 1000
+
+
 def _workout_metrics(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     metric_type = inp.get("metric_type")
@@ -2435,7 +2540,11 @@ def _workout_metrics(inp: dict) -> str:
         return "Error: 'metrics' needs a 'metric_type'."
     store = get_fitness_store()
     label = metric_type.replace("_", " ")
-    limit = int(inp.get("limit", 100) or 100)
+    # Normalised for the same reason as `list` above — it is also the yardstick
+    # for the truncation checks.
+    limit = _positive_int(
+        inp.get("limit", _WORKOUT_METRICS_LIMIT), _WORKOUT_METRICS_LIMIT, _WORKOUT_METRICS_MAX
+    )
 
     # Both query paths below share one empty result. With a window in effect it
     # must name the window: "No body weight recorded." for a dated query implies
@@ -2460,6 +2569,14 @@ def _workout_metrics(inp: dict) -> str:
         for d in days:
             unit = f" {d['unit']}" if d["unit"] else ""
             lines.append(f"  {d['date']}: {_fmt_num(d['value'])}{unit}")
+        if len(days) == limit:
+            # Newest first, so the oldest days of the trend are the ones missing —
+            # and a trend read off a silently clipped series is simply wrong.
+            lines.append(
+                f"[Capped at {limit} days, newest first — earlier {label} may "
+                "also be recorded. Raise limit, or set date_start/date_end, to "
+                "reach it.]"
+            )
         return "\n".join(lines)
 
     rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit)
@@ -2469,6 +2586,11 @@ def _workout_metrics(inp: dict) -> str:
     for m in rows:
         unit = f" {m.unit}" if m.unit else ""
         lines.append(f"  {m.start_at[:10]}: {_fmt_num(m.value)}{unit}")
+    if len(rows) == limit:
+        lines.append(
+            f"[Capped at {limit} samples, newest first — earlier {label} may "
+            "also be recorded. Raise limit, or set date_start/date_end, to reach it.]"
+        )
     return "\n".join(lines)
 
 
