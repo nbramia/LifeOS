@@ -119,6 +119,36 @@ class PersonFact:
         )
 
 
+def effective_confidence(fact: "PersonFact") -> float:
+    """How much a fact is trusted: extraction confidence, or 1.0 if confirmed.
+
+    A user-confirmed fact counts as full confidence — the user asserted it, which
+    outranks any extraction score. Shared by ranking and by confidence floors so
+    the two cannot disagree: they did, and a fact the user had personally
+    confirmed was ranked first, dropped by the briefing's floor, and then
+    reported as withheld for low extraction confidence.
+    """
+    if fact.confirmed_by_user:
+        return 1.0
+    return fact.confidence or 0.0
+
+
+def rank_facts(facts: list["PersonFact"]) -> list["PersonFact"]:
+    """Order facts most-trustworthy-first, for surfaces that show only some.
+
+    The store returns facts sorted by category then key, which is right for a UI
+    that groups them but wrong for anything that truncates: an alphabetical cut
+    drops "family: spouse" for "work: …" purely on spelling, and the reader is
+    told nothing about what fell off.
+
+    Does not change the store's own ordering; callers opt in.
+    """
+    return sorted(
+        facts,
+        key=lambda f: (-effective_confidence(f), f.category, f.key),
+    )
+
+
 class PersonFactStore:
     """
     SQLite-backed storage for person facts.

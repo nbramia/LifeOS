@@ -29,6 +29,18 @@ DEFAULT_MEMORIES_PATH = Path.home() / ".lifeos" / "memories.json"
 # keeps vague/unrelated queries from pulling in low-relevance memories. Tunable.
 MEMORY_SEMANTIC_FLOOR = 0.35
 
+# How close to MEMORY_SEMANTIC_FLOOR a score has to be to be reported as a near
+# miss. Reporting only — it never changes which memories are returned. A
+# paraphrase of a saved memory typically lands just under the floor, and the
+# difference between "nothing is saved about this" and "something nearly matched"
+# is what stops an empty search being read as a lost memory.
+MEMORY_SEMANTIC_NEAR_MISS_MARGIN = 0.05
+
+# Search scores the most recently saved memories only. Bounded because semantic
+# recall embeds every memory it scores; when the bound binds it is reported in
+# MemorySearchStats so a miss beyond it is never presented as absence.
+MEMORY_SEARCH_CORPUS_LIMIT = 1000
+
 # Memory categories and their trigger patterns
 CATEGORY_PATTERNS = {
     "people": [
@@ -152,6 +164,27 @@ class Memory:
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "is_active": self.is_active,
         }
+
+
+@dataclass
+class MemorySearchStats:
+    """What bounded a memory search, so the caller can disclose it.
+
+    Returned alongside results rather than logged: a bare empty list can't tell
+    "nothing is saved about this" from "something nearly matched but no floor was
+    cleared", and only the first justifies telling the user the memory is gone.
+    """
+    total_saved: int      # active memories in the store, before the corpus bound
+    searched: int         # memories actually scored
+    corpus_limit: int     # the bound applied to the corpus
+    matched: int          # matches found, before the `limit` slice
+    # Scored memories that cleared neither floor: keyword overlap under
+    # min_relevance, or a semantic score inside MEMORY_SEMANTIC_NEAR_MISS_MARGIN
+    # of the floor. The keyword half is a weak signal — a single common word in a
+    # long query counts — so a caller may report that candidates were scored and
+    # rejected, but not that a relevant memory is likely saved.
+    near_misses: int
+    semantic_available: bool  # False when scoring fell back to keyword-only
 
 
 class MemoryStore:
@@ -479,12 +512,40 @@ class MemoryStore:
         Returns:
             List of matching Memory objects
         """
-        if not query.strip():
-            return []
+        memories, _stats = self.search_memories_detailed(
+            query, limit=limit, min_relevance=min_relevance
+        )
+        return memories
 
-        memories = self.list_memories(limit=1000)
+    def search_memories_detailed(
+        self, query: str, limit: int = 10, min_relevance: float = 0.15
+    ) -> tuple[list[Memory], MemorySearchStats]:
+        """search_memories, plus the bounds that shaped the result.
+
+        Same ranking and same results as search_memories; the second element
+        reports what was scored, how many matched before `limit` was applied, and
+        how many were scored and rejected by a floor. Callers that render an
+        empty result to a user need that to avoid reporting a relevance miss as a
+        memory the system lost. See MemorySearchStats.
+        """
+        total_saved = sum(1 for m in self._memories.values() if m.is_active)
+
+        def _stats(searched=0, matched=0, near_misses=0, semantic_available=True):
+            return MemorySearchStats(
+                total_saved=total_saved,
+                searched=searched,
+                corpus_limit=MEMORY_SEARCH_CORPUS_LIMIT,
+                matched=matched,
+                near_misses=near_misses,
+                semantic_available=semantic_available,
+            )
+
+        if not query.strip():
+            return [], _stats()
+
+        memories = self.list_memories(limit=MEMORY_SEARCH_CORPUS_LIMIT)
         if not memories:
-            return []
+            return [], _stats()
 
         by_id = {m.id: m for m in memories}
 
@@ -495,14 +556,21 @@ class MemoryStore:
         term_count = max(len(search_terms), 1)
 
         keyword_scores: dict[str, int] = {}
+        # Memories that overlapped the query but not by enough to clear a floor.
+        # Tracked as ids so a memory caught by both floors is only counted once.
+        near_miss_ids: set[str] = set()
         for memory in memories:
             memory_keywords = set(kw.lower() for kw in memory.keywords)
             content_words = set(memory.content.lower().split())
             all_terms = memory_keywords | content_words
 
             overlap = len(search_terms & all_terms)
-            if overlap > 0 and overlap / term_count >= min_relevance:
+            if overlap == 0:
+                continue
+            if overlap / term_count >= min_relevance:
                 keyword_scores[memory.id] = overlap
+            else:
+                near_miss_ids.add(memory.id)
 
         keyword_ranked = [mid for mid, _ in sorted(keyword_scores.items(), key=lambda x: -x[1])]
 
@@ -510,19 +578,37 @@ class MemoryStore:
 
         # Embedding service unavailable — preserve the original keyword behavior.
         if semantic_scores is None:
-            return [by_id[mid] for mid in keyword_ranked[:limit]]
+            results = [by_id[mid] for mid in keyword_ranked[:limit]]
+            near_miss_ids -= {m.id for m in results}
+            return results, _stats(
+                searched=len(memories),
+                matched=len(keyword_ranked),
+                near_misses=len(near_miss_ids),
+                semantic_available=False,
+            )
 
         semantic_ranked = [
             mid for mid, score in sorted(semantic_scores.items(), key=lambda x: -x[1])
             if score >= MEMORY_SEMANTIC_FLOOR
         ]
+        near_miss_ids.update(
+            mid for mid, score in semantic_scores.items()
+            if MEMORY_SEMANTIC_FLOOR - MEMORY_SEMANTIC_NEAR_MISS_MARGIN <= score < MEMORY_SEMANTIC_FLOOR
+        )
 
         if not semantic_ranked and not keyword_ranked:
-            return []
+            return [], _stats(searched=len(memories), near_misses=len(near_miss_ids))
 
         from api.services.hybrid_search import reciprocal_rank_fusion
         fused = reciprocal_rank_fusion(semantic_ranked, keyword_ranked)
-        return [by_id[mid] for mid, _ in fused[:limit] if mid in by_id]
+        matched = [by_id[mid] for mid, _ in fused if mid in by_id]
+        results = matched[:limit]
+        near_miss_ids -= {m.id for m in results}
+        return results, _stats(
+            searched=len(memories),
+            matched=len(matched),
+            near_misses=len(near_miss_ids),
+        )
 
     def get_relevant_memories(self, query: str, limit: int = 5) -> list[Memory]:
         """

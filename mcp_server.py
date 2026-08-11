@@ -1303,10 +1303,18 @@ class LifeOSMCPServer:
                 text += "\n"
                 # Show relationship context for routing decisions
                 strength = p.get("relationship_strength", 0)
+                # 999 is the API's never-contacted sentinel, not a measurement.
+                # Printed as a number it reads as a real gap of about 2.7 years,
+                # so fall back to the date the API actually reports.
                 days = p.get("days_since_contact", 999)
                 active = p.get("active_channels", [])
                 entity_id = p.get("entity_id", "")
-                text += f"  Strength: {strength:.0f}/100 | Last contact: {days} days ago\n"
+                last_contact = (
+                    f"{days} days ago"
+                    if days != 999 or p.get("last_seen")
+                    else "no contact on record"
+                )
+                text += f"  Strength: {strength:.0f}/100 | Last contact: {last_contact}\n"
                 if active:
                     text += f"  Active channels: {', '.join(active)}\n"
                 else:
@@ -1497,17 +1505,33 @@ class LifeOSMCPServer:
             text = "## Communication Gap Analysis\n\n"
             # Show person summaries first
             text += "### Overview\n"
+            # Report the fields the endpoint actually returns. All three names
+            # read here before were absent from the response, so every .get()
+            # fell through to its default: each person was rendered as "999 days
+            # since contact" — a fabricated interval, not a real one — the real
+            # average gap was dropped because it read as 0, and the alert could
+            # never fire. There is no days-since-contact in this response, so
+            # none is invented.
             for s in summaries:
                 name = s.get("person_name", "Unknown")
-                days = s.get("days_since_last_contact", 999)
-                avg = s.get("average_gap_days", 0)
-                current = s.get("current_gap_days", 0)
-                # Flag if current gap is significantly longer than average
-                alert = "⚠️ " if current > avg * 1.5 and current > 14 else ""
-                text += f"- **{name}**: {alert}{days} days since contact"
-                if avg:
-                    text += f" (avg gap: {avg:.0f} days)"
-                text += "\n"
+                avg = s.get("avg_gap_days")
+                longest = s.get("max_gap_days")
+                over = s.get("total_gaps_over_threshold")
+                parts = []
+                if avg is not None:
+                    parts.append(f"avg gap {avg:.0f}d")
+                if longest is not None:
+                    parts.append(f"longest {longest}d")
+                if over:
+                    parts.append(f"{over} over threshold")
+                # Flag someone whose worst gap is far above their own average.
+                alert = (
+                    "⚠️ "
+                    if avg and longest and longest > avg * 1.5 and longest > 14
+                    else ""
+                )
+                detail = " · ".join(parts) if parts else "no gap data"
+                text += f"- **{name}**: {alert}{detail}\n"
             # Show significant gaps
             if gaps:
                 text += "\n### Significant Gaps\n"

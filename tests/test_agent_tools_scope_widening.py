@@ -1107,8 +1107,8 @@ class TestCalendarAccountFailureDisclosure:
     ):
         broken_calendar.raising = {"personal"}
         out = await _tool_search_calendar({"query": "standup"})
-        assert "Could not reach personal" in out
-        assert "not necessarily an empty calendar" in out
+        assert "personal" in out
+        assert "NOT an empty calendar" in out
 
     async def test_partial_failure_still_discloses_alongside_results(
         self, broken_calendar, accounts
@@ -1155,7 +1155,7 @@ class TestCalendarAccountFailureDisclosure:
         """
         broken_calendar.raising = {"personal"}
         out = await _tool_search_calendar({"query": "standup"})
-        assert "incomplete" in out
+        assert "errored" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
 
 
@@ -1344,3 +1344,68 @@ class TestCalendarDaysRangeUpperBound:
     async def test_bound_does_not_overflow_timedelta(self):
         """The ceiling must be safely below where timedelta gives out."""
         assert datetime.now(timezone.utc) - timedelta(days=_CALENDAR_MAX_DAYS)
+
+
+class TestCalendarTotalAccountFailure:
+    """With every account down, nothing was searched — so nothing was established.
+
+    `CalendarService._fetch_events` used to resolve its lazy `service` property
+    inside its own `try/except Exception -> return []`, so an expired token came
+    back as an empty list. The per-account disclosure could never fire for the
+    case it exists for, and the widening ladder then reported "Searched ±180d,
+    then ±365d, then ±1095d. Nothing on the calendar matches ..." over a broken
+    connection — three windows it claimed to search and never did.
+    """
+
+    @pytest.fixture
+    def flaky_calendar(self, monkeypatch, accounts):
+        state = SimpleNamespace(raising=set(), events={}, attempts=0)
+
+        class FlakyCalendarService:
+            def __init__(self, account):
+                self.name = account.value
+
+            def search_events(self, query=None, days_back=30, days_forward=30, **kw):
+                state.attempts += 1
+                if self.name in state.raising:
+                    raise RuntimeError("invalid_grant: token expired")
+                return list(state.events.get(self.name, []))
+
+            def get_events_in_range(self, start, end):
+                return []
+
+            def get_upcoming_events(self, days=7, max_results=15):
+                return []
+
+        monkeypatch.setattr(
+            "api.services.calendar.CalendarService", FlakyCalendarService
+        )
+        return state
+
+    def _event(self, title="Synthetic standup"):
+        return SimpleNamespace(
+            title=title,
+            start_time=datetime.now(timezone.utc),
+            attendees=[],
+            location="",
+            source_account="personal",
+        )
+
+    async def test_total_failure_leads_with_the_fault(self, flaky_calendar):
+        flaky_calendar.raising = {"personal"}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert out.startswith("Could not search the calendar")
+
+    async def test_total_failure_does_not_claim_an_absence(self, flaky_calendar):
+        """A denial with a footnote still reads as an answer."""
+        flaky_calendar.raising = {"personal"}
+        out = await _tool_search_calendar({"query": "standup"})
+        assert "Nothing on the calendar matches" not in out
+        assert "NOT an empty calendar" in out
+
+    async def test_total_failure_stops_the_ladder(self, flaky_calendar):
+        """Widening cannot help a broken connection, and claiming it lies."""
+        flaky_calendar.raising = {"personal"}
+        await _tool_search_calendar({"query": "standup"})
+        assert flaky_calendar.attempts == 1
+

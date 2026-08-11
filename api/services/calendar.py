@@ -285,7 +285,21 @@ class CalendarService:
 
         Returns:
             List of CalendarEvent objects
+
+        Raises:
+            Exception: if credentials cannot be resolved. API-level errors are
+                still swallowed to an empty list (the long-standing contract for
+                the other callers), but an auth failure must reach the caller —
+                see the note below.
         """
+        # Resolved before the try. `service` is a lazy property, so building it
+        # inside the block meant an expired token was caught here and returned as
+        # an empty list — indistinguishable from a genuinely empty calendar. The
+        # per-account failure disclosure in agent_tools could therefore never
+        # fire for the case it exists for, and a broken Google connection was
+        # reported as "nothing on your calendar" after apparently searching
+        # three widening windows.
+        service = self.service
         try:
             request_params = {
                 "calendarId": calendar_id,
@@ -299,7 +313,7 @@ class CalendarService:
             if query:
                 request_params["q"] = query
 
-            result = self.service.events().list(**request_params).execute()
+            result = service.events().list(**request_params).execute()
             items = result.get("items", [])
 
             events = []

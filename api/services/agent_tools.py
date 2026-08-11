@@ -162,18 +162,34 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_drive",
         "description": (
-            "Search Google Drive files (docs, sheets, presentations) across personal and work accounts."
+            "Search Google Drive files (docs, sheets, presentations) across personal "
+            "and work accounts. Drive offers no relevance ranking, so results are "
+            "ordered by modification time and the result says so whenever the "
+            "per-account cap binds — an empty result means no file in the searched "
+            "accounts contains those terms, not a sign the search broke."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (matches file names and content).",
+                    "description": "Search query (matches file content).",
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max files to return per account (default 5).",
+                    "description": (
+                        "Max files to return per account (default 20, max 100). "
+                        "The result discloses when this cap binds."
+                    ),
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["recent", "oldest"],
+                    "description": (
+                        "Modification-time order: 'recent' (default, newest first) "
+                        "or 'oldest'. Use 'oldest' to reach an old document that "
+                        "newer matches would otherwise push past the cap."
+                    ),
                 },
             },
             "required": ["query"],
@@ -281,7 +297,10 @@ TOOL_DEFINITIONS = [
             "Look up a person or generate a comprehensive briefing. "
             "Use 'lookup' for any query mentioning a person — returns entity_id, emails, phones, "
             "relationship strength, days since last contact, interaction counts per channel (90 days), "
-            "and known facts. Use 'briefing' for meeting prep or deep dives."
+            "and known facts (highest-confidence first; the output says so when it truncates). "
+            "Use 'briefing' for meeting prep or deep dives — it searches the last 90 days of "
+            "interactions and widens automatically if that window is empty; pass interaction_days "
+            "to pin a specific window instead."
         ),
         "input_schema": {
             "type": "object",
@@ -298,6 +317,15 @@ TOOL_DEFINITIONS = [
                 "email": {
                     "type": "string",
                     "description": "Person's email (optional, improves briefing accuracy).",
+                },
+                "interaction_days": {
+                    "type": "integer",
+                    "description": (
+                        "Briefing only: interaction lookback in days (1-3650). Omit "
+                        "unless the user named a period — omitted means 90 days, "
+                        "widening to a year then all history if that is empty. A "
+                        "value here is honoured exactly, with no widening."
+                    ),
                 },
             },
             "required": ["action", "name"],
@@ -510,7 +538,9 @@ TOOL_DEFINITIONS = [
                         "Start date (YYYY-MM-DD). For transactions, omit to auto-widen "
                         "through 90 days → 1 year → all history, stopping at the first "
                         "window with matches; setting it disables widening. "
-                        "cashflow/budgets default to the 1st of the current month."
+                        "cashflow/budgets default to the 1st of the month end_date "
+                        "falls in (the current month when end_date is omitted) and "
+                        "state the period they cover."
                     ),
                 },
                 "end_date": {
@@ -693,8 +723,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "search_memories",
         "description": (
-            "Search saved memories by keyword. Use to recall previously saved information, "
-            "check if a memory already exists, or find specific remembered facts/preferences."
+            "Search saved memories by wording and meaning. Use to recall previously saved "
+            "information, check if a memory already exists, or find specific remembered "
+            "facts/preferences. A relevance threshold applies, so an empty result can mean "
+            "the query wording missed rather than nothing being saved — the result says "
+            "which. When it says candidates scored below the threshold, retry with "
+            "different wording or a higher limit before telling the user nothing is saved."
         ),
         "input_schema": {
             "type": "object",
@@ -702,6 +736,13 @@ TOOL_DEFINITIONS = [
                 "query": {
                     "type": "string",
                     "description": "Search query for memories.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max memories to return (default 10). Raise it when the result "
+                        "says it was capped, or when widening a search that came up short."
+                    ),
                 },
             },
             "required": ["query"],
@@ -849,13 +890,24 @@ async def execute_tool_parallel(name: str, tool_input: dict) -> str:
 # Individual tool handlers
 # ---------------------------------------------------------------------------
 
+# Matches HybridSearch.search's own default. The old default of 10 halved the
+# service default for no stated reason, so a chunk the vault ranked 12th came
+# back as "no vault results" — an empty that described the cap, not the vault.
+_VAULT_TOP_K_DEFAULT = 20
+
+
 def _tool_search_vault(inp: dict) -> str:
     from api.services.hybrid_search import HybridSearch
     hs = HybridSearch()
-    top_k = inp.get("top_k", 10)
-    results = hs.search(inp["query"], top_k=top_k)
+    # Normalised like Slack's top_k: the model fills this in, and a 0 or None
+    # would return nothing and read as an empty vault.
+    top_k = _positive_int(inp.get("top_k", _VAULT_TOP_K_DEFAULT), _VAULT_TOP_K_DEFAULT, 200)
+    query = inp["query"]
+    results = hs.search(query, top_k=top_k)
     if not results:
-        return "No vault results found."
+        # Echo the query: an empty here is a fact about this wording, and the
+        # model needs to see what was asked to try a different one.
+        return f"No vault results found for query {query!r}."
     lines = []
     for i, r in enumerate(results, 1):
         fn = r.get("file_name", "unknown")
@@ -914,12 +966,16 @@ async def _tool_search_calendar(inp: dict) -> str:
     # logged and then reported as "no events" — a real fault dressed up as an
     # empty result, which is the misdiagnosis this whole change exists to stop.
     failed_accounts: list[str] = []
+    account_count = 0
 
     def _fetch(search_range: int | None) -> list:
         """Collect events from every configured account for one window."""
+        nonlocal account_count
         events = []
         failed_accounts.clear()
+        account_count = 0
         for account in get_configured_accounts():
+            account_count += 1
             try:
                 cal = CalendarService(account)
                 if query:
@@ -947,6 +1003,11 @@ async def _tool_search_calendar(inp: dict) -> str:
             windows_tried.append(f"±{days}d")
             if all_events:
                 break
+            # Every account errored, so this rung searched nothing. Widening
+            # cannot help a broken connection, and continuing would let the
+            # note claim three windows were searched when none were.
+            if account_count and len(failed_accounts) == account_count:
+                break
     else:
         # date_ref / upcoming branches set their own range; search_range unused.
         all_events = _fetch(None)
@@ -959,7 +1020,19 @@ async def _tool_search_calendar(inp: dict) -> str:
             "calendar. It may need re-authorising.]"
         )
 
+    total_failure = bool(failed_accounts) and len(failed_accounts) == account_count
+
     if not all_events:
+        # With every account down, nothing was searched, so an absence was never
+        # established. Lead with the fault instead of appending it to a denial —
+        # "nothing matches" followed by a footnote still reads as an answer.
+        if total_failure:
+            return (
+                f"Could not search the calendar: {', '.join(failed_accounts)} "
+                "errored, and no other account was reachable. This is NOT an "
+                "empty calendar — nothing was actually searched. The account may "
+                "need re-authorising." + bad_range
+            )
         if windows_tried:
             hint = f"Nothing on the calendar matches {query!r} in that span."
             return (
@@ -1073,30 +1146,161 @@ async def _tool_search_email(inp: dict) -> str:
     return "\n\n---\n".join(lines) + ignored_note + trunc_note
 
 
+# Per-account page size for a Drive search. 20 matches the DriveService default;
+# the old 5 meant any query whose terms also appeared in five newer files could
+# never surface an older one, with nothing in the output to hint at the cut.
+_DRIVE_DEFAULT_RESULTS = 20
+_DRIVE_MAX_RESULTS = 100
+
+# Drive cannot sort by relevance. files.list only accepts the documented sort
+# keys (modifiedTime, name, recency, ...) and, per Google's own search guide,
+# "if you omit the orderBy query parameter, there's no default sort order and
+# the items are returned arbitrarily". So an old document hidden behind newer
+# matches is reached by a bigger page plus an explicit oldest-first option —
+# not by pretending an unordered page is relevance-ranked.
+_DRIVE_ORDERINGS = {
+    "recent": ("modifiedTime desc", "newest-modified first"),
+    "oldest": ("modifiedTime", "oldest-modified first"),
+}
+
+
+def _drive_modified_key(f) -> datetime:
+    """Sort key over DriveFile.modified_time that can't raise mid-merge.
+
+    Files come from several accounts, so a missing or naive timestamp on one of
+    them would otherwise blow up the merge sort — outside the per-account
+    handler, taking the whole search with it.
+    """
+    ts = getattr(f, "modified_time", None)
+    if ts is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
 async def _tool_search_drive(inp: dict) -> str:
     from api.services.drive import DriveService
 
-    max_results = inp.get("max_results", 5)
+    # Read before the loop: this used to be inp["query"] inside the per-account
+    # try, so a missing query raised KeyError once per account and came back as
+    # "Could not reach personal, work" — a malformed argument reported as
+    # expired credentials.
+    query = str(inp.get("query") or "").strip()
+    if not query:
+        return "No Drive search ran: search_drive needs a non-empty query."
+
+    # Normalised, not passed through: max_results is also the yardstick for the
+    # truncation check below, so a None or 0 from the model would both confuse
+    # Drive's pageSize and silently disable that disclosure.
+    max_results = _positive_int(
+        inp.get("max_results", _DRIVE_DEFAULT_RESULTS),
+        _DRIVE_DEFAULT_RESULTS,
+        _DRIVE_MAX_RESULTS,
+    )
+    # The membership test is guarded: the model writes this argument, and an
+    # order_by=[] would raise TypeError: unhashable type on a bare `in` check —
+    # a malformed argument taken down as a tool crash rather than disclosed.
+    raw_order = inp.get("order_by")
+    valid_order = isinstance(raw_order, str) and raw_order in _DRIVE_ORDERINGS
+    order_key = raw_order if valid_order else "recent"
+    order_by, order_desc = _DRIVE_ORDERINGS[order_key]
+    bad_order = (
+        f"\n\n[Ignored order_by={raw_order!r} — must be one of "
+        f"{', '.join(sorted(_DRIVE_ORDERINGS))}; ordered {order_desc} instead.]"
+        if raw_order is not None and not valid_order
+        else ""
+    )
+
+    # Accounts that raised during the search. An expired token used to be logged
+    # and the tool still said "No drive files found." — a broken connection
+    # rendered as absent data, which is the misdiagnosis this change exists to
+    # stop.
+    failed_accounts: list[str] = []
     all_files = []
+    truncated = False
+    account_count = 0
     for account in get_configured_accounts():
+        account_count += 1
         try:
             drive = DriveService(account)
-            files = drive.search(full_text=inp["query"], max_results=max_results)
+            files = drive.search(
+                full_text=query, max_results=max_results, order_by=order_by
+            )
             all_files.extend(files)
+            # A full page back is the only signal Drive gives that it had more.
+            if len(files) == max_results:
+                truncated = True
         except Exception as e:
             logger.warning(f"Drive {account.value} error: {e}")
+            failed_accounts.append(account.value)
+
+    failed_note = ""
+    if failed_accounts:
+        failed_note = (
+            f"\n\n[Could not reach {', '.join(failed_accounts)} — that account "
+            "errored, so this is an incomplete answer, not necessarily an empty "
+            "Drive. It may need re-authorising.]"
+        )
 
     if not all_files:
-        return "No drive files found."
+        # With every account down, nothing was searched, so an absence was never
+        # established. Lead with the fault instead of appending it to a denial —
+        # "nothing came back" followed by a footnote still reads as an answer,
+        # and "the accounts that responded" was none of them.
+        if len(failed_accounts) == account_count and failed_accounts:
+            return (
+                f"Could not search Drive: {', '.join(failed_accounts)} errored, and "
+                "no other account was reachable. This is NOT an empty Drive — "
+                "nothing was actually searched. The account may need "
+                "re-authorising." + bad_order
+            )
+        if failed_accounts:
+            return (
+                "No Drive files came back from the accounts that responded."
+                + bad_order
+                + failed_note
+            )
+        # Name what was actually searched. A term that matches nothing matches
+        # nothing at any page size, so there is no retry to make — but the model
+        # needs to see the scope to pick a better query.
+        return (
+            f"No Drive files found. Searched file contents for {query!r} in every "
+            f"configured account, ordered {order_desc}, up to {max_results} files "
+            "per account." + bad_order
+        )
+
+    # Concatenating per-account pages would contradict the ordering the note
+    # claims, so the merged list is re-sorted the same way.
+    all_files.sort(key=_drive_modified_key, reverse=(order_key == "recent"))
+
+    trunc_note = ""
+    if truncated:
+        # Point at the other end of the ordering, never the one already used.
+        flip = (
+            "order_by='oldest' to reach older matches"
+            if order_key == "recent"
+            else "order_by='recent' to reach newer matches"
+        )
+        trunc_note = (
+            f"\n\n[Capped at {max_results} files per account and ordered "
+            f"{order_desc} — more may exist. Drive has no relevance ranking, so "
+            "the cut is by modification time, not match quality: raise "
+            f"max_results, narrow the query, or pass {flip}.]"
+        )
 
     lines = []
     for f in all_files:
         acct = f"[{f.source_account}]" if f.source_account else ""
+        modified = ""
+        ts = getattr(f, "modified_time", None)
+        if ts:
+            modified = f" modified {ts.strftime('%Y-%m-%d')}"
         content_preview = ""
         if f.content:
             content_preview = f"\n{f.content[:800]}"
-        lines.append(f"**{f.name}** {acct} ({f.mime_type}){content_preview}")
-    return "\n\n---\n".join(lines)
+        lines.append(
+            f"**{f.name}** {acct} ({f.mime_type}){modified}{content_preview}"
+        )
+    return "\n\n---\n".join(lines) + bad_order + trunc_note + failed_note
 
 
 def _tool_search_slack(inp: dict) -> str:
@@ -1264,6 +1468,24 @@ def _exhausted_note(noun: str, attempts: list[str], hint: str = "") -> str:
     """
     searched = f" Searched {', then '.join(attempts)}." if attempts else ""
     return f"No {noun} found.{searched}" + (f" {hint}" if hint else "")
+
+
+def _applied_filters(date_start=None, date_end=None, **named) -> list[str]:
+    """The filters actually in effect, for naming in an empty result.
+
+    Mirrors the construction in `_tool_search_email`: a filtered search that
+    found nothing establishes only that the slice is empty, so the reply must
+    describe the slice rather than the whole record. An empty list means nothing
+    was filtered — the one case where "there are none" is a fair thing to say.
+    """
+    applied = [f"{label}={value!r}" for label, value in named.items() if value]
+    if date_start and date_end:
+        applied.append(f"dates {date_start} to {date_end}")
+    elif date_start:
+        applied.append(f"dates from {date_start}")
+    elif date_end:
+        applied.append(f"dates through {date_end}")
+    return applied
 
 
 def _positive_int(raw, default: int, maximum: int) -> int:
@@ -1499,15 +1721,33 @@ def _split_to_budget(imsg_text: str, wa_text: str) -> tuple[str, str, bool]:
 
 # -- People helpers --
 
+# Facts shown by person_info(lookup). Doubles as the yardstick for the truncation
+# disclosure below, so it must be a real number rather than a bare slice.
+_PERSON_FACT_LIMIT = 15
+
+# Upper bound on a caller-supplied briefing window. The interaction index spans
+# about ten years, so anything past this is not a window the data can honour.
+_BRIEFING_MAX_DAYS = 3650
+
+
 def _lookup_person(inp: dict) -> str:
     from api.services.entity_resolver import get_entity_resolver
     from api.services.relationship_summary import get_relationship_summary, format_relationship_context
-    from api.services.person_facts import get_person_fact_store
+    from api.services.person_facts import get_person_fact_store, rank_facts
 
     resolver = get_entity_resolver()
-    result = resolver.resolve(name=inp["name"])
+    name = inp["name"]
+    result = resolver.resolve(name=name)
     if not result or not result.entity:
-        return f"No person found matching '{inp['name']}'."
+        # Name the term searched: the model needs to tell "that spelling didn't
+        # match" from "this person isn't in the index" before it decides whether
+        # to retry, and downstream tools depend on the entity_id this returns.
+        return (
+            f"No person found matching '{name}'. That exact term was searched "
+            "against the people index and nothing matched it closely enough to be "
+            "treated as the same person. Try a fuller name, a different spelling, "
+            "or pass the person's email address."
+        )
 
     entity = result.entity
     parts = [f"**{entity.canonical_name}** (entity_id: {entity.id})"]
@@ -1527,22 +1767,71 @@ def _lookup_person(inp: dict) -> str:
     if rel:
         parts.append(format_relationship_context(rel))
 
-    # Person facts
+    # Person facts. Ranked by confidence rather than the store's category/key
+    # order: an alphabetical cut can drop "family: spouse" for a work fact purely
+    # on spelling, and the model then answers that it doesn't know.
     fact_store = get_person_fact_store()
-    facts = fact_store.get_for_person(entity.id)
+    facts = rank_facts(fact_store.get_for_person(entity.id))
     if facts:
-        fact_lines = [f"- {f.category}: {f.key} = {f.value}" for f in facts[:15]]
-        parts.append("Known facts:\n" + "\n".join(fact_lines))
+        shown = facts[:_PERSON_FACT_LIMIT]
+        header = "Known facts:"
+        if len(facts) > len(shown):
+            header = (
+                f"Known facts ({len(shown)} of {len(facts)} shown, "
+                "highest-confidence first; the rest were truncated for length — "
+                "ask for a specific category to see more):"
+            )
+        parts.append(header + "\n" + "\n".join(
+            f"- {f.category}: {f.key} = {f.value}" for f in shown
+        ))
 
     return "\n\n".join(parts)
 
 
 async def _briefing_person(inp: dict) -> str:
     from api.services.briefings import get_briefings_service
+
+    # A window is a scope, not a cap, so clamping is out — but unlike
+    # search_calendar's days_range, an unusable window here is refused outright
+    # rather than treated as unstated. Falling back to the ladder would widen the
+    # briefing past the caller's scope, and this window bounds how much of a
+    # person's history the briefing reads: emails, messages, meetings. Widening
+    # on a malformed argument exposes more personal history than was asked for,
+    # which AGENTS.md §6 says to treat as a privacy concern, and no briefing is
+    # cheaper to correct than the wrong one.
+    raw_days = inp.get("interaction_days")
+    interaction_days: int | None = None
+    if raw_days is not None:
+        try:
+            interaction_days = int(raw_days)
+        except (TypeError, ValueError):
+            interaction_days = None
+        if interaction_days is not None and not 1 <= interaction_days <= _BRIEFING_MAX_DAYS:
+            interaction_days = None
+        if interaction_days is None:
+            return (
+                f"No briefing generated: interaction_days={raw_days!r} is not a "
+                f"whole number of days between 1 and {_BRIEFING_MAX_DAYS}. This is "
+                "a bad argument, NOT a thin record — nothing was looked up. "
+                "Widening to the default window would cover more of this person's "
+                "history than was asked for, so re-send a valid window instead."
+            )
+
     svc = get_briefings_service()
-    result = await svc.generate_briefing(inp["name"], email=inp.get("email"))
-    if result.get("status") == "success":
+    result = await svc.generate_briefing(
+        inp["name"], email=inp.get("email"), interaction_days=interaction_days
+    )
+    status = result.get("status")
+    if status == "success":
         return result.get("briefing", "Briefing generated but empty.")
+    if status in ("not_found", "limited"):
+        # Thin or absent data is an absence, not a fault. Reporting it as a failed
+        # briefing invites the model to blame the backend for a quiet record. When
+        # a source did fail, that message says so itself (see generate_briefing).
+        return (
+            result.get("message")
+            or f"Nothing on record under '{inp['name']}' to brief from."
+        )
     return f"Briefing failed: {result.get('message', 'unknown error')}"
 
 
@@ -1579,6 +1868,20 @@ def _task_list(inp: dict) -> str:
         query=inp.get("query"),
     )
     if not tasks:
+        applied = _applied_filters(
+            status=inp.get("status"), context=inp.get("context"), query=inp.get("query"),
+        )
+        if applied:
+            # Filtered: say which slice was empty. A context spelled differently
+            # from the stored one matches nothing, and reporting that as "no
+            # tasks found" reads as an empty task list.
+            hint = (
+                " The context filter is compared exactly (case-insensitively), so a "
+                "different spelling of it matches nothing."
+                if inp.get("context")
+                else ""
+            )
+            return f"No tasks matched. Filtered on {', '.join(applied)}.{hint}"
         return "No tasks found."
     lines = []
     for t in tasks:
@@ -1878,17 +2181,94 @@ async def _tool_save_memory(inp: dict) -> str:
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
+# Result cap for memory search. Exposed to the caller so a memory that missed on
+# wording can be reached by widening; also the truncation yardstick, so it has to
+# be a usable positive int however the model fills it in.
+_MEMORY_LIMIT_DEFAULT = 10
+_MEMORY_LIMIT_MAX = 200
+
+
 def _tool_search_memories(inp: dict) -> str:
     from api.services.memory_store import get_memory_store
 
+    query = (inp.get("query") or "").strip()
+    if not query:
+        return "search_memories needs a non-empty query."
+
     store = get_memory_store()
-    memories = store.search_memories(inp["query"], limit=10)
+    limit = _positive_int(inp.get("limit", _MEMORY_LIMIT_DEFAULT), _MEMORY_LIMIT_DEFAULT, _MEMORY_LIMIT_MAX)
+    memories, stats = store.search_memories_detailed(query, limit=limit)
+
+    notes = ""
+    # The corpus bound is a fact about what was checked, never about what exists:
+    # a memory saved before the newest N was not scored at all.
+    if stats.total_saved > stats.searched:
+        notes += (
+            f"\n\n[Scored the {stats.searched} most recently saved memories of "
+            f"{stats.total_saved} saved in total — anything older was not checked, "
+            "so this is not a complete look at everything saved.]"
+        )
+    # stats.matched counts matches before the cap, so this fires only when the
+    # cap actually hid something.
+    if stats.matched > limit:
+        notes += (
+            f"\n\n[Showing {limit} of {stats.matched} matching memories — raise "
+            "`limit` to see the rest.]"
+        )
+    if not stats.semantic_available:
+        notes += (
+            "\n\n[Meaning-based recall is offline for this search, so only word "
+            "overlap was scored — a memory phrased differently from the query may "
+            "have been missed. Retrying in the memory's likely wording helps.]"
+        )
+
     if not memories:
-        return "No matching memories found."
+        if stats.near_misses:
+            # Candidates existed and were scored; only the relevance floors kept
+            # them out. Rewording is the fix, not concluding the memory is gone.
+            #
+            # The claim is deliberately narrow. This count includes any keyword
+            # overlap under min_relevance — one common word shared with a long
+            # query qualifies — so it cannot support "something relevant is
+            # likely saved". It states the two things the count does establish:
+            # candidates were scored, and none cleared a floor.
+            return (
+                f"No saved memory cleared the relevance threshold for {query!r}. "
+                f"{stats.near_misses} shared some wording with it, or scored near "
+                "the meaning floor, without clearing either — a threshold miss, "
+                "not an established absence. Retry with the wording the memory "
+                "itself probably uses, or with fewer, more specific terms." + notes
+            )
+        if stats.total_saved > stats.searched:
+            # The corpus bound cut the search short, so absence was never established.
+            return (
+                f"No match for {query!r} among the {stats.searched} most recently "
+                f"saved memories, of {stats.total_saved} saved in total. Older "
+                "memories were not scored, so this does not establish that the "
+                "thing was never saved." + notes
+            )
+        if stats.total_saved == 0:
+            return (
+                f"Nothing saved matches {query!r} — no memories have been saved yet, "
+                "so there was nothing to search."
+            )
+        if stats.semantic_available:
+            return (
+                f"Nothing saved matches {query!r}. All {stats.total_saved} saved "
+                "memories were scored on both wording and meaning, and none "
+                "matched." + notes
+            )
+        # Meaning was never scored, so only a wording miss was established.
+        return (
+            f"No saved memory matches the wording of {query!r}. All "
+            f"{stats.total_saved} saved memories were checked for word overlap."
+            + notes
+        )
+
     lines = []
     for m in memories:
         lines.append(f"- [{m.category}] {m.content}")
-    return "\n".join(lines)
+    return "\n".join(lines) + notes
 
 
 # -- Workout helpers (fitness bot backend) --
@@ -1974,6 +2354,17 @@ def _workout_list(inp: dict) -> str:
         limit=int(inp.get("limit", 10) or 10),
     )
     if not sessions:
+        applied = _applied_filters(
+            date_start=inp.get("date_start"), date_end=inp.get("date_end"), kind=inp.get("kind"),
+        )
+        if applied:
+            # A filtered miss says nothing about the rest of the log. Asked
+            # "did I train in June", "No sessions logged." reads as "you have no
+            # training history".
+            return (
+                f"No sessions matched. Filtered on {', '.join(applied)} — "
+                "sessions outside those filters may still be logged."
+            )
         return "No sessions logged."
     lines = ["Recent sessions (newest first):"]
     for s in sessions:
@@ -1990,7 +2381,15 @@ def _workout_history(inp: dict) -> str:
     rows = store.exercise_history(exercise, limit=int(inp.get("limit", 20) or 20))
     canonical = store.normalize_exercise(exercise)
     if not rows:
-        return f"No history for {canonical}."
+        # normalize_exercise title-cases anything it has no alias for, so the
+        # name looked up can differ from the name asked about. Say which name was
+        # queried — otherwise a lift logged under another spelling reads as
+        # never performed.
+        normalised = f" (normalised from {exercise.strip()!r})" if canonical != exercise.strip() else ""
+        return (
+            f"No history for exercise {canonical!r}{normalised} — that exact name was "
+            "looked up, so the same work logged under a different name would not appear here."
+        )
     lines = [f"{canonical} — recent sets:"]
     for r in rows:
         w = f" @{_fmt_num(r['weight'])} {r['unit']}" if r["weight"] else ""
@@ -2038,6 +2437,17 @@ def _workout_metrics(inp: dict) -> str:
     label = metric_type.replace("_", " ")
     limit = int(inp.get("limit", 100) or 100)
 
+    # Both query paths below share one empty result. With a window in effect it
+    # must name the window: "No body weight recorded." for a dated query implies
+    # the metric was never recorded at all.
+    dated = _applied_filters(date_start=inp.get("date_start"), date_end=inp.get("date_end"))
+    empty = (
+        f"No {label} matched. Filtered on {', '.join(dated)} — that window only, "
+        f"so {label} may be recorded outside it."
+        if dated
+        else f"No {label} recorded."
+    )
+
     # Cumulative metrics (steps, active energy) arrive from Apple Health as many
     # intraday buckets — sum them to one daily total so the trend is readable.
     if metric_type in _CUMULATIVE_METRICS:
@@ -2045,7 +2455,7 @@ def _workout_metrics(inp: dict) -> str:
             metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit,
         )
         if not days:
-            return f"No {label} recorded."
+            return empty
         lines = [f"{label} (daily total):"]
         for d in days:
             unit = f" {d['unit']}" if d["unit"] else ""
@@ -2054,7 +2464,7 @@ def _workout_metrics(inp: dict) -> str:
 
     rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit)
     if not rows:
-        return f"No {label} recorded."
+        return empty
     lines = [f"{label}:"]
     for m in rows:
         unit = f" {m.unit}" if m.unit else ""
@@ -2214,6 +2624,77 @@ _TXN_LADDER_DAYS = (90, 365, None)
 # is newest-first (the client hardcodes orderBy="date", verified descending),
 # so hitting the cap drops the OLDEST rows, not the most recent.
 _TXN_ROW_CAP = 500
+
+# Spending categories shown in a cashflow breakdown, highest amount first.
+# Named so the truncation disclosure can quote it instead of hardcoding 10.
+_CASHFLOW_CATEGORY_CAP = 10
+
+
+def _summary_period(inp: dict) -> tuple[str, str, str, str | None]:
+    """Resolve the window a cashflow/budget summary covers.
+
+    Returns ``(start, end, label, error)``: the two bounds to send, a human label
+    for them, and a refusal message when the request cannot be honestly answered
+    at all. The label exists because these summaries default to month-to-date,
+    and an unlabelled month-to-date total is worse than an empty result — asked
+    on the 2nd, it is a two-day figure with a savings rate beside it and nothing
+    to cue the reader that the period is partial.
+
+    Both bounds are always filled in. Monarch rejects a one-sided range ("You
+    must specify both a startDate and endDate, not just one of them"), and a
+    period whose end the caller can't see isn't a stated period at all.
+    """
+    raw_start, raw_end = inp.get("start_date"), inp.get("end_date")
+    start_dt, end_dt = _parse_ymd(raw_start), _parse_ymd(raw_end)
+
+    now = datetime.now()
+    # A defaulted start counts back from end_date when one was given, not from
+    # today: pairing this month's 1st with a past end_date builds an inverted
+    # window that can only report zeros, which then reads as a real $0 month.
+    anchor = end_dt or now
+    start = (start_dt or anchor.replace(day=1)).strftime("%Y-%m-%d")
+    end = (end_dt or now).strftime("%Y-%m-%d")
+
+    # An explicitly supplied date that can't be read is refused rather than
+    # dropped. The transactions branch drops one and says so, which is safe there
+    # because every row it prints carries its own date, so a wrong period shows
+    # up in the output. An aggregate has no such cue: the number IS the whole
+    # answer, and a note beside a real total is easily reported without it.
+    unparseable = [
+        f"{label}={raw!r}"
+        for raw, parsed, label in (
+            (raw_start, start_dt, "start_date"),
+            (raw_end, end_dt, "end_date"),
+        )
+        if raw and not parsed
+    ]
+    if unparseable:
+        return start, end, f"{start} to {end}", (
+            f"Cannot summarise this period: could not read "
+            f"{', '.join(unparseable)} — dates must be YYYY-MM-DD. No figures "
+            "were fetched, because a total for some other window reads exactly "
+            "like the one that was asked for. This is a bad date argument, NOT "
+            "an empty period. Re-send the date as YYYY-MM-DD."
+        )
+
+    # Anchoring fixes the defaulted case but not a caller-supplied one: a future
+    # start_date, or bounds passed the wrong way round, still describe a window
+    # that cannot contain anything. Querying it returns zeros that print as a
+    # real $0.00 period at 0% — the confidently-wrong-number failure this whole
+    # change exists to remove. Refuse it instead of reporting it.
+    if start > end:
+        return start, end, f"{start} to {end}", (
+            f"Cannot summarise {start} to {end} — the start is after the end, so "
+            "that period cannot contain anything. This is a bad date range, NOT "
+            "an empty period. Check the order of start_date and end_date."
+        )
+
+    label = f"{start} to {end}"
+    if start_dt is None and end_dt is None:
+        label += " (month-to-date by default, so it may cover only part of the month)"
+    elif start_dt is None:
+        label += " (start defaulted to the 1st of that month)"
+    return start, end, label, None
 
 
 async def _tool_search_finances(inp: dict) -> str:
@@ -2417,35 +2898,76 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "cashflow":
-        start = inp.get("start_date")
-        end = inp.get("end_date")
-        if not start:
-            now = datetime.now()
-            start = now.replace(day=1).strftime("%Y-%m-%d")
+        start, end, period, error = _summary_period(inp)
+        if error:
+            return error
         cf = await client.get_cashflow_summary(start_date=start, end_date=end)
         cats = await client.get_cashflow_by_category(start_date=start, end_date=end)
+        income = cf["total_income"]
+        expenses = cf["total_expenses"]
+        # Period first: every figure below is only true of that window, and a
+        # savings rate reads as a settled fact unless the scope precedes it.
         lines = [
-            f"**Income**: ${cf['total_income']:,.2f}",
-            f"**Expenses**: ${cf['total_expenses']:,.2f}",
-            f"**Net Savings**: ${cf['total_income'] - cf['total_expenses']:,.2f}",
-            f"**Savings Rate**: {cf['savings_rate'] * 100:.1f}%" if cf['savings_rate'] <= 1 else f"**Savings Rate**: {cf['savings_rate']:.1f}%",
+            f"**Period**: {period}",
+            f"**Income**: ${income:,.2f}",
+            f"**Expenses**: ${expenses:,.2f}",
+            f"**Net Savings**: ${income - expenses:,.2f}",
         ]
+        # Derived from the two figures printed above rather than taken from the
+        # upstream field. With no income the rate is undefined, and printing
+        # "0.0%" for it states something untrue; the upstream value's unit is
+        # also ambiguous (a bare -25 could mean -25% or -2500%), and a
+        # magnitude heuristic guesses wrong on negative rates.
+        if income > 0:
+            lines.append(f"**Savings Rate**: {(income - expenses) / income * 100:.1f}%")
+        else:
+            lines.append("**Savings Rate**: n/a (no income in this period)")
+
         if cats:
+            shown = cats[:_CASHFLOW_CATEGORY_CAP]
             lines.append("\nTop categories:")
-            for c in cats[:10]:
+            for c in shown:
                 lines.append(f"- {c['category']}: ${c['amount']:,.2f}")
+            # Without this, a category just outside the cut reads as zero spend.
+            if len(cats) > len(shown):
+                lines.append(
+                    f"... and {len(cats) - len(shown)} more categories not shown "
+                    f"(largest {_CASHFLOW_CATEGORY_CAP} of {len(cats)} listed)"
+                )
+        elif expenses:
+            # Expenses exist but arrived unclassified. Saying "no spending" here
+            # would contradict the Expenses line printed directly above it.
+            lines.append(
+                "\nNo category breakdown came back for this period, though the "
+                "expenses above are non-zero — the breakdown is unavailable, not "
+                "empty."
+            )
+        else:
+            lines.append("\nNo spending in this period.")
         return "\n".join(lines)
 
     elif action == "budgets":
-        start = inp.get("start_date")
-        end = inp.get("end_date")
-        if not start:
-            now = datetime.now()
-            start = now.replace(day=1).strftime("%Y-%m-%d")
+        start, end, period, error = _summary_period(inp)
+        if error:
+            return error
         budgets = await client.get_budgets(start_date=start, end_date=end)
         if not budgets:
-            return "No budgets found."
-        lines = ["| Category | Budgeted | Actual | Remaining |", "|----------|----------|--------|-----------|"]
+            # The period is always bounded (month-to-date at the widest), so
+            # nothing here establishes that no budgets exist — a month whose
+            # figures haven't populated yet looks identical to an account with
+            # none configured. Say only what was checked.
+            return (
+                _exhausted_note("budgets", [period])
+                + " That is a statement about this period, not about whether "
+                "budgets are set up — a period that hasn't populated yet looks "
+                "the same as one with none. Try a different start_date/end_date "
+                "to check another period."
+            )
+        lines = [
+            f"Budgets for {period}:",
+            "| Category | Budgeted | Actual | Remaining |",
+            "|----------|----------|--------|-----------|",
+        ]
         for b in budgets:
             lines.append(f"| {b['category']} | ${b['budgeted']:,.2f} | ${b['actual']:,.2f} | ${b['remaining']:,.2f} |")
         return "\n".join(lines)
