@@ -500,27 +500,43 @@ def record_sync_complete(
     interactions_created: int = 0,
     source_entities_created: int = 0,
     attempt_count: int = 1,
+    duration_seconds: Optional[float] = None,
 ):
     """Record completion of a sync operation.
 
     ``attempt_count`` is the total number of attempts the orchestrator made
     before reaching this final status (1 = no retry needed; >1 = one or more
     transient-failure retries happened first — see issue #541). One row per
-    logical run still gets one update: ``started_at`` is set once at the
-    first attempt, so ``duration_seconds`` naturally covers the whole retry
-    campaign (backoff sleeps included), not just the final attempt.
+    logical run still gets one update, keeping the row *count* history
+    detectors see unchanged by retries.
+
+    ``duration_seconds``, when given, is used verbatim instead of being
+    derived from ``started_at``. The retry loop passes the elapsed time of
+    only the attempt that produced this final outcome — not the earlier
+    failed attempts or the backoff sleeps between them — because
+    ``get_typical_duration_seconds``/``_detect_duration_collapse`` assume
+    this column means "how long a normal run takes". Deriving it from
+    ``started_at`` (set once, at the first attempt) would let a retried
+    run's failed-attempt-plus-backoff time inflate that baseline upward
+    every time a retry happens, making the collapse detector progressively
+    less sensitive given how often retries are expected to fire (issue #541
+    adversarial review). When omitted (e.g. a caller outside the retry
+    loop), duration still falls back to the ``started_at``-derived value.
     """
     conn = get_sync_health_db()
 
-    # Get start time to calculate duration
-    row = conn.execute(
-        "SELECT started_at FROM sync_runs WHERE id = ?", (run_id,)
-    ).fetchone()
+    if duration_seconds is not None:
+        duration = duration_seconds
+    else:
+        # Get start time to calculate duration
+        row = conn.execute(
+            "SELECT started_at FROM sync_runs WHERE id = ?", (run_id,)
+        ).fetchone()
 
-    duration = None
-    if row:
-        started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
-        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        duration = None
+        if row:
+            started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+            duration = (datetime.now(timezone.utc) - started).total_seconds()
 
     conn.execute(
         """

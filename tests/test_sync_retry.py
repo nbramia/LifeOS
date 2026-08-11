@@ -116,6 +116,68 @@ class TestTransientFailureClassifier:
         assert _is_transient_failure(None) is False
         assert _is_transient_failure("") is False
 
+    @pytest.mark.parametrize(
+        "error_text",
+        [
+            # A bare "429" with no status-code context — could be a line
+            # number, byte count, or message id in an unrelated traceback,
+            # not a rate-limit response (issue #541 adversarial review
+            # finding #2).
+            "IndexError: list index out of range at line 429",
+            "AssertionError: expected 429 rows, got 12",
+            "ValueError: message id 429 already processed",
+        ],
+    )
+    def test_bare_429_without_status_context_is_not_transient(self, error_text):
+        assert _is_transient_failure(error_text) is False
+
+    @pytest.mark.parametrize(
+        "error_text",
+        [
+            "googleapiclient.errors.HttpError: <HttpError 429 when requesting ...>",
+            "HTTP status 429 returned",
+            "response code 429: too many requests",
+            "429 Too Many Requests",
+            "429 rate limit exceeded",
+        ],
+    )
+    def test_429_with_status_context_is_transient(self, error_text):
+        assert _is_transient_failure(error_text) is True
+
+    def test_incidental_rate_limiter_class_name_is_not_transient(self):
+        """'RateLimiter' is a common HTTP-client helper class name. A bug in
+        that class (e.g. an AttributeError) is not a rate-limit response and
+        must not be misread as one just because the class name contains
+        'rate' + 'limit' as a substring (issue #541 adversarial review,
+        found while auditing pattern shapes similar to the bare-429 issue)."""
+        assert _is_transient_failure(
+            "AttributeError: 'RateLimiter' object has no attribute 'wait'"
+        ) is False
+
+    def test_real_rate_limit_wording_still_transient(self):
+        """The tightened rate-limit pattern must still catch the real thing."""
+        assert _is_transient_failure("Rate limit exceeded, please retry later") is True
+        assert _is_transient_failure("slack_sdk.errors.SlackApiError: ratelimited") is True
+
+    def test_entity_resolution_wording_is_not_transient(self):
+        """This codebase's own domain vocabulary uses "resolve" for
+        merging/linking person entities. A bug there ("Failed to resolve
+        duplicate entity...") is not a DNS failure and must not match just
+        because both contain the words "Failed to resolve" (issue #541
+        adversarial review, found while auditing pattern shapes similar to
+        the bare-429 issue)."""
+        assert _is_transient_failure(
+            "RuntimeError: Failed to resolve duplicate entity for source_id=abc123"
+        ) is False
+
+    def test_real_dns_failed_to_resolve_still_transient(self):
+        """The tightened pattern must still catch urllib3's actual wording,
+        which always quotes the hostname immediately after this phrase."""
+        assert _is_transient_failure(
+            "NameResolutionError: Failed to resolve 'gmail.googleapis.com' "
+            "([Errno -3] Temporary failure in name resolution)"
+        ) is True
+
 
 class TestRetryLoop:
     """run_sync's within-run retry behavior."""
@@ -208,6 +270,51 @@ class TestRetryLoop:
 
         kwargs = mocks["complete"].call_args.kwargs
         assert kwargs["attempt_count"] == 1
+
+    def test_retried_run_records_only_final_attempt_duration_not_backoff(self):
+        """A retried run's recorded duration_seconds must reflect only the
+        attempt that produced the final outcome — not the failed attempt's
+        time plus the backoff sleep between attempts.
+
+        Regression: duration_seconds used to be derived from the row's
+        started_at (set once, at the first attempt), so a retried run
+        recorded failed-attempt-time + backoff on top of the successful
+        attempt's real execution time. That value feeds
+        get_typical_duration_seconds, which _detect_duration_collapse
+        compares against to catch silent no-op syncs — inflating it on
+        every retry would make that detector progressively less sensitive
+        (issue #541 adversarial review finding #1).
+        """
+        dns_failure = _completed(1, stderr="Temporary failure in name resolution")
+        ok = _completed(0)
+
+        # Two time.monotonic() calls per attempt (start, then elapsed-from-
+        # start) — fully controlled so backoff/failed-attempt time can't
+        # leak into the measurement by accident.
+        # Attempt 1: 100.0 -> 100.1 (0.1s, fast failure).
+        # Attempt 2: 250.0 -> 250.05 ("150s later" including backoff, but a
+        # fast 0.05s successful attempt).
+        monotonic_values = [100.0, 100.1, 250.0, 250.05]
+
+        with (
+            patch("scripts.run_all_syncs.subprocess.run", side_effect=[dns_failure, ok]),
+            patch("scripts.run_all_syncs.record_sync_start", return_value=999),
+            patch("scripts.run_all_syncs.record_sync_complete") as complete_mock,
+            patch("scripts.run_all_syncs.record_sync_error"),
+            patch("scripts.run_all_syncs.log_error_to_markdown"),
+            patch("scripts.run_all_syncs.time.sleep"),
+            patch("scripts.run_all_syncs.time.monotonic", side_effect=monotonic_values),
+            patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
+            patch("scripts.run_all_syncs._detect_never_yielded", return_value=None),
+        ):
+            success, stats = run_sync(_SOURCE, dry_run=False)
+
+        assert success is True
+        kwargs = complete_mock.call_args.kwargs
+        # Only the successful attempt's ~0.05s — not the failed attempt plus
+        # the ~150s gap, and not the two summed together.
+        assert kwargs["duration_seconds"] == pytest.approx(0.05, abs=1e-6)
 
     def test_retry_attempts_are_logged_to_sync_errors_for_visibility(self):
         """Each failed attempt (including retried ones) is recorded via

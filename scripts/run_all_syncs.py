@@ -930,6 +930,45 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
 # though it had failed), and lets one attempt campaign share a single
 # sync_runs row — so the retry doesn't skew the duration/yield history that
 # other detectors (#438, #494) rely on by counting one logical run twice.
+#
+# Idempotence: a retry re-runs a source's script from scratch, so a script
+# that fails partway through (after writing some data) and then retries must
+# not duplicate what it already wrote. This is not a new risk introduced
+# here — the nightly sync already re-runs every script over overlapping
+# windows every night, so a genuinely non-idempotent source would already be
+# duplicating data on every ordinary night. A retry just does the same thing
+# sooner. Verified per write path (not assumed):
+#   - Sources writing through InteractionStore (most Phase 1/2 sources):
+#     `UNIQUE INDEX idx_interactions_source_unique ON interactions(source_type,
+#     source_id)` plus `INSERT OR IGNORE`/`ON CONFLICT ... DO UPDATE` in
+#     interaction_store.py make a repeat write a no-op or a plain overwrite,
+#     never a duplicate row.
+#   - photos (sync_photos.py -> ApplePhotosSync): explicitly checks
+#     `source_store.get_by_source(...)` before creating a SourceEntity, on
+#     top of the InteractionStore guarantee above.
+#   - monarch_money: `write_monthly_report` does a single `file_path
+#     .write_text(content, ...)` — a full overwrite of a fixed-name file, not
+#     an append. Re-running regenerates and overwrites the same file.
+#   - google_docs / google_sheets: same full-overwrite `write_text` pattern
+#     (gdoc_sync.py) as monarch_money.
+#   - vault_reindex (IndexerService.index_all): explicitly designed to
+#     survive a crash mid-run — progress is saved to a state file every 10
+#     files, and both writes it makes per file are delete-then-add, not
+#     append: `VectorStore.update_document` deletes existing chunks for that
+#     file_path before adding new ones, and `BM25Index.delete_by_path` runs
+#     before re-adding. Re-indexing the same file twice (which already
+#     happens on ordinary incremental runs) is a no-op in effect.
+#   - crm_vectorstore (person_indexer.index_person_to_vectorstore): same
+#     delete-then-add pattern, keyed by `person:{person.id}`.
+#   - push_birthdays_to_contacts: sets a single Apple Contacts field
+#     (`setBirthday_`) to an exact value — setting it twice is the same as
+#     setting it once, not an append.
+# No source examined writes by unconditional append or by an external side
+# effect (e.g. sending a message, charging something) that would make a
+# repeat attempt unsafe. Per-source retry-eligibility metadata is therefore
+# not needed — if a genuinely non-idempotent source turns up later, exclude
+# it explicitly rather than adding a configuration surface for a
+# hypothetical.
 MAX_SYNC_RETRIES = 2  # up to 3 attempts total per source
 RETRY_BACKOFF_SECONDS = [30, 120]  # wait before attempt 2, then before attempt 3
 
@@ -953,7 +992,12 @@ _TRANSIENT_ERROR_PATTERNS = [
     r"nodename nor servname provided",
     r"NameResolutionError",
     r"gaierror",
-    r"Failed to resolve",
+    # Requires the quote urllib3 always emits right after this phrase
+    # ("Failed to resolve 'host.name' (...)") — bare "Failed to resolve"
+    # would also match this codebase's *entity*-resolution vocabulary
+    # (e.g. "Failed to resolve duplicate entity for source_id=..."), which
+    # is a real bug, not a network blip.
+    r"Failed to resolve ['\"]",
     r"Failed to establish a new connection",
     r"Connection refused",
     r"Connection reset by peer",
@@ -965,10 +1009,16 @@ _TRANSIENT_ERROR_PATTERNS = [
     r"\bECONNRESET\b",
     r"ConnectTimeout",
     r"ReadTimeout",
-    r"rate.?limit",
+    # Negative lookahead excludes "RateLimiter" (a class name several HTTP
+    # clients use) so an unrelated bug like "'RateLimiter' object has no
+    # attribute 'foo'" doesn't get misread as an actual rate-limit response.
+    r"rate.?limit(?!er)",
     r"ratelimited",
     r"Too Many Requests",
-    r"\b429\b",
+    # Bare "429" collides with line numbers, byte counts, and message ids in
+    # an unrelated traceback — require status-code context on one side.
+    r"(?:HTTP|status|response|code)[^\n]{0,40}\b429\b",
+    r"\b429\b[^\n]{0,40}(?:Too Many Requests|rate.?limit)",
     r"503 Service Unavailable",
 ]
 _TRANSIENT_ERROR_RE = re.compile("|".join(_TRANSIENT_ERROR_PATTERNS), re.IGNORECASE)
@@ -1151,8 +1201,17 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         logger.info(f"Starting sync for {source}...")
 
         for attempt in range(1, max_attempts + 1):
-            sync_started_monotonic = time.monotonic()
+            # Per-attempt clock, not per-campaign: `duration_seconds` passed
+            # to record_sync_complete below must reflect only the attempt
+            # that produced the final outcome. If it instead spanned from
+            # the very first attempt (started_at), a retried run would record
+            # failed-attempt time + backoff on top of the real execution
+            # time — inflating get_typical_duration_seconds's baseline and
+            # making _detect_duration_collapse progressively less sensitive
+            # every time a retry fires (issue #541 adversarial review).
+            attempt_started_monotonic = time.monotonic()
             outcome = _execute_sync_once(source, script_path, args, full_path)
+            attempt_elapsed_seconds = time.monotonic() - attempt_started_monotonic
 
             if outcome["success"]:
                 stats = outcome["stats"]
@@ -1160,7 +1219,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 # Check for duration collapse BEFORE recording completion, so
                 # the current run (still status=running) can't contaminate
                 # the history.
-                elapsed_seconds = time.monotonic() - sync_started_monotonic
+                elapsed_seconds = attempt_elapsed_seconds
                 collapse = _detect_duration_collapse(source, elapsed_seconds)
                 if collapse:
                     stats["duration_collapse"] = collapse
@@ -1214,7 +1273,12 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                     stats["skipped"] = True
                     stats["skipped_reason"] = skipped_reason
                     logger.info(f"Sync skipped for {source}: {skipped_reason}")
-                    record_sync_complete(run_id, SyncStatus.SKIPPED, attempt_count=attempt)
+                    record_sync_complete(
+                        run_id,
+                        SyncStatus.SKIPPED,
+                        attempt_count=attempt,
+                        duration_seconds=attempt_elapsed_seconds,
+                    )
                     _active_run_id = None
                     return True, stats
 
@@ -1233,6 +1297,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                     interactions_created=stats.get("interactions_created", 0),
                     source_entities_created=stats.get("source_entities_created", 0),
                     attempt_count=attempt,
+                    duration_seconds=attempt_elapsed_seconds,
                 )
                 _active_run_id = None
                 return True, stats
@@ -1278,6 +1343,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 interactions_created=stats.get("interactions_created", 0),
                 source_entities_created=stats.get("source_entities_created", 0),
                 attempt_count=attempt,
+                duration_seconds=attempt_elapsed_seconds,
             )
             _active_run_id = None
 
