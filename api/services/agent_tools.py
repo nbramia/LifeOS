@@ -510,7 +510,9 @@ TOOL_DEFINITIONS = [
                         "Start date (YYYY-MM-DD). For transactions, omit to auto-widen "
                         "through 90 days → 1 year → all history, stopping at the first "
                         "window with matches; setting it disables widening. "
-                        "cashflow/budgets default to the 1st of the current month."
+                        "cashflow/budgets default to the 1st of the month end_date "
+                        "falls in (the current month when end_date is omitted) and "
+                        "state the period they cover."
                     ),
                 },
                 "end_date": {
@@ -2215,6 +2217,57 @@ _TXN_LADDER_DAYS = (90, 365, None)
 # so hitting the cap drops the OLDEST rows, not the most recent.
 _TXN_ROW_CAP = 500
 
+# Spending categories shown in a cashflow breakdown, highest amount first.
+# Named so the truncation disclosure can quote it instead of hardcoding 10.
+_CASHFLOW_CATEGORY_CAP = 10
+
+
+def _summary_period(inp: dict) -> tuple[str, str, str, str]:
+    """Resolve the window a cashflow/budget summary covers.
+
+    Returns ``(start, end, label, dropped_note)``: the two bounds to send, a
+    human label for them, and a disclosure for any unparseable date dropped on
+    the way. The label exists because these summaries default to month-to-date,
+    and an unlabelled month-to-date total is worse than an empty result — asked
+    on the 2nd, it is a two-day figure with a savings rate beside it and nothing
+    to cue the reader that the period is partial.
+
+    Both bounds are always filled in. Monarch rejects a one-sided range ("You
+    must specify both a startDate and endDate, not just one of them"), and a
+    period whose end the caller can't see isn't a stated period at all.
+    """
+    raw_start, raw_end = inp.get("start_date"), inp.get("end_date")
+    start_dt, end_dt = _parse_ymd(raw_start), _parse_ymd(raw_end)
+    dropped = [
+        f"{label}={raw!r}"
+        for raw, parsed, label in (
+            (raw_start, start_dt, "start_date"),
+            (raw_end, end_dt, "end_date"),
+        )
+        if raw and not parsed
+    ]
+    dropped_note = (
+        f" [Ignored unparseable {', '.join(dropped)} — dates must be "
+        "YYYY-MM-DD, so this period is NOT the one that was asked for.]"
+        if dropped
+        else ""
+    )
+
+    now = datetime.now()
+    # A defaulted start counts back from end_date when one was given, not from
+    # today: pairing this month's 1st with a past end_date builds an inverted
+    # window that can only report zeros, which then reads as a real $0 month.
+    anchor = end_dt or now
+    start = (start_dt or anchor.replace(day=1)).strftime("%Y-%m-%d")
+    end = (end_dt or now).strftime("%Y-%m-%d")
+
+    label = f"{start} to {end}"
+    if start_dt is None and end_dt is None:
+        label += " (month-to-date by default, so it may cover only part of the month)"
+    elif start_dt is None:
+        label += " (start defaulted to the 1st of that month)"
+    return start, end, label, dropped_note
+
 
 async def _tool_search_finances(inp: dict) -> str:
     from api.services.monarch import get_monarch_client
@@ -2417,14 +2470,13 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "cashflow":
-        start = inp.get("start_date")
-        end = inp.get("end_date")
-        if not start:
-            now = datetime.now()
-            start = now.replace(day=1).strftime("%Y-%m-%d")
+        start, end, period, dropped_note = _summary_period(inp)
         cf = await client.get_cashflow_summary(start_date=start, end_date=end)
         cats = await client.get_cashflow_by_category(start_date=start, end_date=end)
+        # Period first: every figure below is only true of that window, and a
+        # savings rate reads as a settled fact unless the scope precedes it.
         lines = [
+            f"**Period**: {period}{dropped_note}",
             f"**Income**: ${cf['total_income']:,.2f}",
             f"**Expenses**: ${cf['total_expenses']:,.2f}",
             f"**Net Savings**: ${cf['total_income'] - cf['total_expenses']:,.2f}",
@@ -2432,20 +2484,39 @@ async def _tool_search_finances(inp: dict) -> str:
         ]
         if cats:
             lines.append("\nTop categories:")
-            for c in cats[:10]:
+            for c in cats[:_CASHFLOW_CATEGORY_CAP]:
                 lines.append(f"- {c['category']}: ${c['amount']:,.2f}")
+            # Without this, a category just outside the cut reads as zero spend.
+            if len(cats) > _CASHFLOW_CATEGORY_CAP:
+                lines.append(
+                    f"... and {len(cats) - _CASHFLOW_CATEGORY_CAP} more categories "
+                    "(breakdown truncated to the largest "
+                    f"{_CASHFLOW_CATEGORY_CAP} — the rest are not zero)"
+                )
+        else:
+            lines.append("\nNo categorized spending in this period.")
         return "\n".join(lines)
 
     elif action == "budgets":
-        start = inp.get("start_date")
-        end = inp.get("end_date")
-        if not start:
-            now = datetime.now()
-            start = now.replace(day=1).strftime("%Y-%m-%d")
+        start, end, period, dropped_note = _summary_period(inp)
         budgets = await client.get_budgets(start_date=start, end_date=end)
         if not budgets:
-            return "No budgets found."
-        lines = ["| Category | Budgeted | Actual | Remaining |", "|----------|----------|--------|-----------|"]
+            # The period is always bounded (month-to-date at the widest), so
+            # nothing here establishes that no budgets exist — a month whose
+            # figures haven't populated yet looks identical to an account with
+            # none configured. Say only what was checked.
+            return (
+                _exhausted_note("budgets", [period])
+                + " That is a statement about this period, not about whether "
+                "budgets are set up — a period that hasn't populated yet looks "
+                "the same as one with none. Try a different start_date/end_date "
+                "to check another period." + dropped_note
+            )
+        lines = [
+            f"Budgets for {period}:{dropped_note}",
+            "| Category | Budgeted | Actual | Remaining |",
+            "|----------|----------|--------|-----------|",
+        ]
         for b in budgets:
             lines.append(f"| {b['category']} | ${b['budgeted']:,.2f} | ${b['actual']:,.2f} | ${b['remaining']:,.2f} |")
         return "\n".join(lines)
