@@ -890,13 +890,24 @@ async def execute_tool_parallel(name: str, tool_input: dict) -> str:
 # Individual tool handlers
 # ---------------------------------------------------------------------------
 
+# Matches HybridSearch.search's own default. The old default of 10 halved the
+# service default for no stated reason, so a chunk the vault ranked 12th came
+# back as "no vault results" — an empty that described the cap, not the vault.
+_VAULT_TOP_K_DEFAULT = 20
+
+
 def _tool_search_vault(inp: dict) -> str:
     from api.services.hybrid_search import HybridSearch
     hs = HybridSearch()
-    top_k = inp.get("top_k", 10)
-    results = hs.search(inp["query"], top_k=top_k)
+    # Normalised like Slack's top_k: the model fills this in, and a 0 or None
+    # would return nothing and read as an empty vault.
+    top_k = _positive_int(inp.get("top_k", _VAULT_TOP_K_DEFAULT), _VAULT_TOP_K_DEFAULT, 200)
+    query = inp["query"]
+    results = hs.search(query, top_k=top_k)
     if not results:
-        return "No vault results found."
+        # Echo the query: an empty here is a fact about this wording, and the
+        # model needs to see what was asked to try a different one.
+        return f"No vault results found for query {query!r}."
     lines = []
     for i, r in enumerate(results, 1):
         fn = r.get("file_name", "unknown")
@@ -1421,6 +1432,24 @@ def _exhausted_note(noun: str, attempts: list[str], hint: str = "") -> str:
     return f"No {noun} found.{searched}" + (f" {hint}" if hint else "")
 
 
+def _applied_filters(date_start=None, date_end=None, **named) -> list[str]:
+    """The filters actually in effect, for naming in an empty result.
+
+    Mirrors the construction in `_tool_search_email`: a filtered search that
+    found nothing establishes only that the slice is empty, so the reply must
+    describe the slice rather than the whole record. An empty list means nothing
+    was filtered — the one case where "there are none" is a fair thing to say.
+    """
+    applied = [f"{label}={value!r}" for label, value in named.items() if value]
+    if date_start and date_end:
+        applied.append(f"dates {date_start} to {date_end}")
+    elif date_start:
+        applied.append(f"dates from {date_start}")
+    elif date_end:
+        applied.append(f"dates through {date_end}")
+    return applied
+
+
 def _positive_int(raw, default: int, maximum: int) -> int:
     """Coerce a model-supplied count to a usable bound.
 
@@ -1794,6 +1823,20 @@ def _task_list(inp: dict) -> str:
         query=inp.get("query"),
     )
     if not tasks:
+        applied = _applied_filters(
+            status=inp.get("status"), context=inp.get("context"), query=inp.get("query"),
+        )
+        if applied:
+            # Filtered: say which slice was empty. A context spelled differently
+            # from the stored one matches nothing, and reporting that as "no
+            # tasks found" reads as an empty task list.
+            hint = (
+                " The context filter is compared exactly (case-insensitively), so a "
+                "different spelling of it matches nothing."
+                if inp.get("context")
+                else ""
+            )
+            return f"No tasks matched. Filtered on {', '.join(applied)}.{hint}"
         return "No tasks found."
     lines = []
     for t in tasks:
@@ -2259,6 +2302,17 @@ def _workout_list(inp: dict) -> str:
         limit=int(inp.get("limit", 10) or 10),
     )
     if not sessions:
+        applied = _applied_filters(
+            date_start=inp.get("date_start"), date_end=inp.get("date_end"), kind=inp.get("kind"),
+        )
+        if applied:
+            # A filtered miss says nothing about the rest of the log. Asked
+            # "did I train in June", "No sessions logged." reads as "you have no
+            # training history".
+            return (
+                f"No sessions matched. Filtered on {', '.join(applied)} — "
+                "sessions outside those filters may still be logged."
+            )
         return "No sessions logged."
     lines = ["Recent sessions (newest first):"]
     for s in sessions:
@@ -2275,7 +2329,15 @@ def _workout_history(inp: dict) -> str:
     rows = store.exercise_history(exercise, limit=int(inp.get("limit", 20) or 20))
     canonical = store.normalize_exercise(exercise)
     if not rows:
-        return f"No history for {canonical}."
+        # normalize_exercise title-cases anything it has no alias for, so the
+        # name looked up can differ from the name asked about. Say which name was
+        # queried — otherwise a lift logged under another spelling reads as
+        # never performed.
+        normalised = f" (normalised from {exercise.strip()!r})" if canonical != exercise.strip() else ""
+        return (
+            f"No history for exercise {canonical!r}{normalised} — that exact name was "
+            "looked up, so the same work logged under a different name would not appear here."
+        )
     lines = [f"{canonical} — recent sets:"]
     for r in rows:
         w = f" @{_fmt_num(r['weight'])} {r['unit']}" if r["weight"] else ""
@@ -2323,6 +2385,17 @@ def _workout_metrics(inp: dict) -> str:
     label = metric_type.replace("_", " ")
     limit = int(inp.get("limit", 100) or 100)
 
+    # Both query paths below share one empty result. With a window in effect it
+    # must name the window: "No body weight recorded." for a dated query implies
+    # the metric was never recorded at all.
+    dated = _applied_filters(date_start=inp.get("date_start"), date_end=inp.get("date_end"))
+    empty = (
+        f"No {label} matched. Filtered on {', '.join(dated)} — that window only, "
+        f"so {label} may be recorded outside it."
+        if dated
+        else f"No {label} recorded."
+    )
+
     # Cumulative metrics (steps, active energy) arrive from Apple Health as many
     # intraday buckets — sum them to one daily total so the trend is readable.
     if metric_type in _CUMULATIVE_METRICS:
@@ -2330,7 +2403,7 @@ def _workout_metrics(inp: dict) -> str:
             metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit,
         )
         if not days:
-            return f"No {label} recorded."
+            return empty
         lines = [f"{label} (daily total):"]
         for d in days:
             unit = f" {d['unit']}" if d["unit"] else ""
@@ -2339,7 +2412,7 @@ def _workout_metrics(inp: dict) -> str:
 
     rows = store.list_metrics(metric_type, start=inp.get("date_start"), end=inp.get("date_end"), limit=limit)
     if not rows:
-        return f"No {label} recorded."
+        return empty
     lines = [f"{label}:"]
     for m in rows:
         unit = f" {m.unit}" if m.unit else ""
