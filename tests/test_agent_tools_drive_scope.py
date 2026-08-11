@@ -251,6 +251,27 @@ class TestDriveOrdering:
         out = await _tool_search_drive({"query": "synthetic", "order_by": "recent"})
         assert "Ignored order_by" not in out
 
+    @pytest.mark.parametrize("raw", [[], ["recent"], {}, {"order": "recent"}, 3, 1.5, True])
+    async def test_wrong_typed_ordering_is_disclosed_not_raised(self, fake_drive, raw):
+        """The model writes this argument, so a list or dict arrives.
+
+        `raw_order in _DRIVE_ORDERINGS` raised TypeError: unhashable type on those
+        — a malformed argument taken down as a tool crash instead of being
+        reported. It is now handled exactly like an unknown sort key.
+        """
+        fake_drive.files = [_file(1, "Synthetic doc")]
+        out = await _tool_search_drive({"query": "synthetic", "order_by": raw})
+        assert f"Ignored order_by={raw!r}" in out
+        assert fake_drive.calls[0]["order_by"] == "modifiedTime desc"
+        assert "Synthetic doc" in out
+
+    async def test_wrong_typed_ordering_is_disclosed_on_an_empty_result_too(
+        self, fake_drive
+    ):
+        out = await _tool_search_drive({"query": "nothing", "order_by": []})
+        assert "Ignored order_by=[]" in out
+        assert not any(word in out.lower() for word in FAULT_WORDS)
+
     async def test_merged_accounts_are_sorted_not_concatenated(
         self, fake_drive, accounts
     ):
@@ -331,8 +352,41 @@ class TestDriveAccountFailureDisclosure:
     ):
         fake_drive.broken = {"personal"}
         out = await _tool_search_drive({"query": "comp planning"})
-        assert "Could not reach personal" in out
-        assert "not necessarily an empty Drive" in out
+        assert "personal" in out
+        assert "NOT an empty Drive" in out
+
+    async def test_total_failure_leads_with_the_fault(self, fake_drive, accounts):
+        """A denial with a footnote still reads as an answer."""
+        fake_drive.broken = {"personal"}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert out.startswith("Could not search Drive")
+
+    async def test_total_failure_does_not_claim_an_absence(self, fake_drive, accounts):
+        """Nothing responded, so "the accounts that responded" was none of them."""
+        fake_drive.broken = {"personal"}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert "No Drive files" not in out
+        assert "accounts that responded" not in out
+
+    async def test_every_account_failing_is_a_total_failure(
+        self, fake_drive, accounts
+    ):
+        """Two accounts, both down — still nothing searched."""
+        accounts.append(_account("work"))
+        fake_drive.broken = {"personal", "work"}
+        out = await _tool_search_drive({"query": "comp planning"})
+        assert out.startswith("Could not search Drive")
+        assert "personal" in out and "work" in out
+
+    async def test_total_failure_still_discloses_a_bad_ordering(
+        self, fake_drive, accounts
+    ):
+        """A bad argument does not stop being wrong because an account broke."""
+        fake_drive.broken = {"personal"}
+        out = await _tool_search_drive(
+            {"query": "comp planning", "order_by": "relevance"}
+        )
+        assert "Ignored order_by='relevance'" in out
 
     async def test_partial_failure_still_discloses_alongside_results(
         self, fake_drive, accounts
@@ -382,8 +436,19 @@ class TestDriveAccountFailureDisclosure:
         """
         fake_drive.broken = {"personal"}
         out = await _tool_search_drive({"query": "synthetic"})
-        assert "incomplete" in out
+        assert "errored" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
+
+    async def test_partial_failure_still_calls_the_answer_incomplete(
+        self, fake_drive, accounts
+    ):
+        """The partial branch keeps its own wording: results, minus one account."""
+        accounts.append(_account("work"))
+        fake_drive.broken = {"work"}
+        fake_drive.per_account = {"personal": [_file(1, "Synthetic personal doc")]}
+        out = await _tool_search_drive({"query": "synthetic"})
+        assert "incomplete" in out
+        assert "not necessarily an empty Drive" in out
 
     async def test_empty_after_a_failure_is_a_distinct_branch(
         self, fake_drive, accounts
@@ -425,6 +490,7 @@ class TestDriveHonestEmpty:
             {"query": "comp planning"},
             {"query": "comp planning", "max_results": 0},
             {"query": "comp planning", "order_by": "relevance"},
+            {"query": "comp planning", "order_by": []},
             {},
             {"query": "   "},
         ],

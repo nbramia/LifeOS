@@ -292,59 +292,113 @@ class TestBudgetsPopulated:
         assert "| Groceries | $600.00 | $120.00 | $480.00 |" in out
 
 
-class TestSummaryUnparseableDates:
-    async def test_unparseable_start_never_reaches_monarch(self, fake_monarch):
-        await _cashflow(start_date="last month")
-        assert fake_monarch.calls
-        for call in fake_monarch.calls:
-            assert call["start"] == _first_of_this_month()
+class TestSummaryUnparseableDatesAreRefused:
+    """An unreadable date on an aggregate is refused, not dropped.
 
-    async def test_unparseable_start_is_disclosed(self, fake_monarch):
+    The transactions branch drops one and says so, which is survivable there
+    because every row it prints carries its own date — a wrong period shows up in
+    the output. An aggregate has no such cue: the number IS the whole answer, and
+    a note beside a real total is easily reported without it. So cashflow and
+    budgets make no API call at all when an explicitly supplied date can't be
+    read.
+    """
+
+    async def test_unparseable_start_is_refused(self, fake_monarch):
         out = await _cashflow(start_date="last month")
-        assert "Ignored unparseable start_date='last month'" in out
+        assert "could not read start_date='last month'" in out
+        assert not fake_monarch.calls, "no figures may be fetched for a guessed period"
 
-    async def test_unparseable_end_never_reaches_monarch(self, fake_monarch):
-        await _cashflow(start_date="2026-03-01", end_date="soon")
-        for call in fake_monarch.calls:
-            assert call["end"] == _today()
+    async def test_unparseable_end_is_refused(self, fake_monarch):
+        out = await _cashflow(start_date="2026-03-01", end_date="soon")
+        assert "could not read end_date='soon'" in out
+        assert not fake_monarch.calls
 
     async def test_both_unparseable_dates_are_named(self, fake_monarch):
         out = await _cashflow(start_date="q1", end_date="q2")
         assert "start_date='q1'" in out
         assert "end_date='q2'" in out
 
-    async def test_disclosure_says_the_period_is_not_the_one_asked_for(self, fake_monarch):
+    async def test_refusal_is_named_as_a_bad_argument_not_an_empty_period(
+        self, fake_monarch
+    ):
         out = await _cashflow(start_date="last month")
-        assert "NOT the one that was asked for" in out
+        assert "bad date argument" in out
+        assert "NOT an empty period" in out
 
-    async def test_no_note_when_dates_are_valid(self, fake_monarch):
+    async def test_refusal_says_why_a_note_would_not_have_been_enough(
+        self, fake_monarch
+    ):
+        """The reason this differs from transactions: an aggregate has no cue."""
+        out = await _cashflow(start_date="last month")
+        assert "reads exactly like the one that was asked for" in out
+
+    async def test_refusal_prints_no_figures(self, fake_monarch):
+        fake_monarch.summary = {
+            "total_income": 5000.0, "total_expenses": 3200.0, "savings_rate": 0.36,
+        }
+        out = await _cashflow(start_date="last month")
+        assert "$" not in out
+        assert "Savings Rate" not in out
+
+    async def test_refusal_asks_for_the_expected_format(self, fake_monarch):
+        out = await _cashflow(start_date="last month")
+        assert "YYYY-MM-DD" in out
+
+    async def test_no_refusal_when_dates_are_valid(self, fake_monarch):
         out = await _cashflow(start_date="2026-03-01", end_date="2026-03-31")
-        assert "Ignored unparseable" not in out
+        assert "could not read" not in out
+        assert fake_monarch.calls
 
-    async def test_no_note_when_dates_are_absent(self, fake_monarch):
+    async def test_no_refusal_when_dates_are_absent(self, fake_monarch):
         out = await _cashflow()
-        assert "Ignored unparseable" not in out
+        assert "could not read" not in out
+        assert fake_monarch.calls
 
-    async def test_budgets_disclose_on_a_populated_result(self, fake_monarch):
+    async def test_budgets_refuse_the_same_way(self, fake_monarch):
         fake_monarch.budgets = [_budget("Groceries", 600.0, 120.0)]
         out = await _budgets(start_date="whenever")
-        assert "Ignored unparseable start_date='whenever'" in out
+        assert "could not read start_date='whenever'" in out
+        assert not fake_monarch.calls
+        assert "| Groceries |" not in out
 
-    async def test_budgets_disclose_on_an_empty_result(self, fake_monarch):
+    async def test_budgets_refuse_an_unparseable_end(self, fake_monarch):
         out = await _budgets(end_date="soon")
-        assert "Ignored unparseable end_date='soon'" in out
+        assert "could not read end_date='soon'" in out
+        assert not fake_monarch.calls
 
-    async def test_budgets_empty_with_bad_dates_has_no_fault_language(self, fake_monarch):
-        out = (await _budgets(start_date="q1", end_date="q2")).lower()
-        for word in FAULT_WORDS:
-            assert word not in out
+    async def test_refusal_carries_no_backend_fault_language(self, fake_monarch):
+        """A malformed argument is not a broken backend."""
+        for out in (
+            await _cashflow(start_date="q1", end_date="q2"),
+            await _budgets(start_date="q1", end_date="q2"),
+        ):
+            lowered = out.lower()
+            for word in FAULT_WORDS:
+                assert word not in lowered, f"bad-date refusal implies a fault: {word!r}"
 
-    async def test_a_dropped_date_still_leaves_a_valid_window(self, fake_monarch):
-        """Dropping half a range must not produce an inverted or one-sided one."""
-        await _cashflow(start_date="2026-03-01", end_date="nope")
-        for call in fake_monarch.calls:
-            assert call["start"] is not None and call["end"] is not None
-            assert call["start"] <= call["end"], call
+    async def test_transactions_still_drop_and_disclose(self, fake_monarch, monkeypatch):
+        """The deliberate asymmetry: rows carry their own dates, so a note works.
+
+        Refusing there would remove a working answer; the period is visible on
+        every line printed.
+        """
+        async def _get_transactions(start_date=None, end_date=None, search="", limit=None):
+            return [{
+                "date": "2026-03-04", "merchant": "Synthetic Grocer",
+                "category": "Groceries", "amount": -42.0,
+            }]
+
+        class FakeClient:
+            get_transactions = staticmethod(_get_transactions)
+
+        monkeypatch.setattr(
+            "api.services.monarch.get_monarch_client", lambda: FakeClient()
+        )
+        out = await _tool_search_finances(
+            {"action": "transactions", "start_date": "last month"}
+        )
+        assert "Ignored unparseable start_date='last month'" in out
+        assert "Synthetic Grocer" in out
 
 
 class TestSummaryFigures:

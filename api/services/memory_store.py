@@ -178,7 +178,12 @@ class MemorySearchStats:
     searched: int         # memories actually scored
     corpus_limit: int     # the bound applied to the corpus
     matched: int          # matches found, before the `limit` slice
-    near_misses: int      # scored memories that cleared neither floor but came close
+    # Scored memories that cleared neither floor: keyword overlap under
+    # min_relevance, or a semantic score inside MEMORY_SEMANTIC_NEAR_MISS_MARGIN
+    # of the floor. The keyword half is a weak signal — a single common word in a
+    # long query counts — so a caller may report that candidates were scored and
+    # rejected, but not that a relevant memory is likely saved.
+    near_misses: int
     semantic_available: bool  # False when scoring fell back to keyword-only
 
 
@@ -519,7 +524,7 @@ class MemoryStore:
 
         Same ranking and same results as search_memories; the second element
         reports what was scored, how many matched before `limit` was applied, and
-        how many came close without clearing a floor. Callers that render an
+        how many were scored and rejected by a floor. Callers that render an
         empty result to a user need that to avoid reporting a relevance miss as a
         memory the system lost. See MemorySearchStats.
         """

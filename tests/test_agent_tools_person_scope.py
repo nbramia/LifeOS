@@ -47,7 +47,7 @@ from api.services.interaction_store import (
     NO_INTERACTIONS_PREFIX,
     format_window_label,
 )
-from api.services.person_facts import PersonFact, rank_facts
+from api.services.person_facts import PersonFact, effective_confidence, rank_facts
 from api.services.relationship_summary import (
     NEVER_CONTACTED_DAYS,
     ChannelActivity,
@@ -294,6 +294,28 @@ class TestFactRanking:
         fact = _fact("topics", "x", "no score", 0.5)
         fact.confidence = None
         assert rank_facts([fact])[0] is fact
+
+    def test_effective_confidence_is_the_shared_rule(self):
+        """Ranking and the briefing's floor read the same number.
+
+        They did not: ranking treated a confirmed fact as 1.0 while the floor read
+        the raw score, so a fact the user had personally confirmed was ranked
+        first and then withheld as low extraction confidence.
+        """
+        assert effective_confidence(_fact("z", "a", "extracted", 0.42)) == 0.42
+        assert effective_confidence(
+            _fact("z", "a", "user said so", 0.10, confirmed=True)
+        ) == 1.0
+
+    def test_effective_confidence_treats_a_missing_score_as_zero(self):
+        fact = _fact("topics", "x", "no score", 0.5)
+        fact.confidence = None
+        assert effective_confidence(fact) == 0.0
+
+    def test_effective_confidence_of_a_confirmed_fact_ignores_a_missing_score(self):
+        fact = _fact("topics", "x", "user said so", 0.5, confirmed=True)
+        fact.confidence = None
+        assert effective_confidence(fact) == 1.0
 
     def test_input_list_is_not_mutated(self):
         facts = [_fact("a", "one", "low", 0.2), _fact("z", "two", "high", 0.9)]
@@ -621,10 +643,14 @@ def fake_briefing_service(monkeypatch):
 
 
 class TestBriefingToolWindowArgument:
-    """A window is a scope, so a bad one is dropped rather than clamped.
+    """A window is a scope, so a bad one is neither clamped nor widened.
 
-    Clamping would brief on a period nobody asked for; treating it as unstated
-    falls back to the ladder, and the drop is disclosed either way.
+    Clamping would brief on a period nobody asked for. Treating it as unstated —
+    which is what search_calendar does with a bad days_range, harmlessly — is
+    wrong here: the ladder would widen to a year and then to the full history,
+    reading more of this person's emails, messages, and meetings than the caller
+    scoped. Per AGENTS.md §6 that uncertainty is a privacy concern, so an
+    unusable window produces no briefing at all.
     """
 
     async def test_omitted_window_reaches_the_service_as_unstated(
@@ -642,20 +668,43 @@ class TestBriefingToolWindowArgument:
         assert fake_briefing_service.calls[0]["interaction_days"] == 45
 
     @pytest.mark.parametrize(
-        "bad", [0, -30, "soon", 10**9, _BRIEFING_MAX_DAYS + 1, None.__class__]
+        "bad", [0, -30, "soon", 10**9, _BRIEFING_MAX_DAYS + 1, None.__class__, []]
     )
-    async def test_bad_window_is_treated_as_unstated(self, fake_briefing_service, bad):
+    async def test_bad_window_generates_no_briefing(self, fake_briefing_service, bad):
+        """No service call at all — the widening ladder must not run."""
         await _briefing_person({"name": "Marigold Quill", "interaction_days": bad})
-        assert fake_briefing_service.calls[0]["interaction_days"] is None
+        assert fake_briefing_service.calls == []
 
-    async def test_dropped_window_is_disclosed(self, fake_briefing_service):
+    async def test_refusal_names_the_value_and_the_bound(self, fake_briefing_service):
         out = await _briefing_person({"name": "Marigold Quill", "interaction_days": -30})
-        assert "Ignored interaction_days" in out
-        assert "NOT scoped to it" in out
+        assert "interaction_days=-30" in out
+        assert f"between 1 and {_BRIEFING_MAX_DAYS}" in out
+
+    async def test_refusal_names_the_problem_as_a_bad_argument(
+        self, fake_briefing_service
+    ):
+        """The opposite case to an honest empty: this one must not read as one."""
+        out = await _briefing_person({"name": "Marigold Quill", "interaction_days": -30})
+        assert "No briefing generated" in out
+        assert "NOT a thin record" in out
+
+    async def test_refusal_says_why_widening_was_not_the_answer(
+        self, fake_briefing_service
+    ):
+        """The privacy reason, so the model doesn't just retry without a window."""
+        out = await _briefing_person({"name": "Marigold Quill", "interaction_days": -30})
+        assert "more of this person's history than was asked for" in out
+
+    async def test_refusal_carries_no_backend_fault_language(
+        self, fake_briefing_service
+    ):
+        """A malformed argument is not a broken backend."""
+        out = await _briefing_person({"name": "Marigold Quill", "interaction_days": -30})
+        _assert_no_fault_language(out, "bad-window refusal")
 
     async def test_valid_window_is_not_reported_as_ignored(self, fake_briefing_service):
         out = await _briefing_person({"name": "Marigold Quill", "interaction_days": 45})
-        assert "Ignored interaction_days" not in out
+        assert "No briefing generated" not in out
 
     async def test_the_bound_itself_is_accepted(self, fake_briefing_service):
         await _briefing_person(
@@ -798,6 +847,153 @@ class TestBriefingFactConfidenceFloor:
         context = briefing_env.service.gather_context("Marigold Quill")
         section = briefing_env.service._format_facts_section(context)
         _assert_no_fault_language(section, "withheld-facts disclosure")
+
+    def test_a_user_confirmed_fact_clears_the_floor(self, briefing_env):
+        """The floor is about extraction confidence, and the user is not an
+        extractor. Withholding what they personally confirmed, then attributing it
+        to a low extraction score, is a wrong claim about their own assertion."""
+        briefing_env.facts = [
+            _fact("family", "spouse_name", "Spouse is Rowan Quill", 0.1, confirmed=True),
+        ]
+        context = briefing_env.service.gather_context("Marigold Quill")
+        assert context.facts_withheld_low_confidence == 0
+        assert [f["value"] for f in context.person_facts] == ["Spouse is Rowan Quill"]
+
+    def test_a_confirmed_fact_with_no_score_clears_the_floor(self, briefing_env):
+        fact = _fact("family", "spouse_name", "Spouse is Rowan Quill", 0.5, confirmed=True)
+        fact.confidence = None
+        briefing_env.facts = [fact]
+        context = briefing_env.service.gather_context("Marigold Quill")
+        assert context.facts_withheld_low_confidence == 0
+        assert len(context.person_facts) == 1
+
+    async def test_a_confirmed_fact_reaches_the_prompt(self, briefing_env):
+        briefing_env.facts = [
+            _fact("family", "spouse_name", "Spouse is Rowan Quill", 0.1, confirmed=True),
+        ]
+        await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "Spouse is Rowan Quill" in briefing_env.prompt
+        assert "further fact(s)" not in briefing_env.prompt
+
+    def test_an_unconfirmed_low_score_is_still_withheld(self, briefing_env):
+        """The floor still does its job — only the confirmed case is exempt."""
+        briefing_env.facts = [_fact("topics", "rumour", "Maybe moved to Lowmarsh", 0.2)]
+        context = briefing_env.service.gather_context("Marigold Quill")
+        assert context.facts_withheld_low_confidence == 1
+        assert context.person_facts == []
+
+    def test_ranking_and_the_floor_agree_on_every_fact(self, briefing_env):
+        """The two sites drifted apart once; nothing kept them together.
+
+        Anything the ranking puts at full confidence must clear the floor, or the
+        briefing ranks a fact first and then drops it.
+        """
+        briefing_env.facts = [
+            _fact("family", "spouse_name", "Spouse is Rowan Quill", 0.05, confirmed=True),
+            _fact("work", "role", "Runs the poetry imprint", 0.9),
+            _fact("topics", "rumour", "Maybe moved to Lowmarsh", 0.2),
+        ]
+        context = briefing_env.service.gather_context("Marigold Quill")
+        ranked = rank_facts(briefing_env.facts)
+        kept = [f["value"] for f in context.person_facts]
+        assert kept == [
+            f.value for f in ranked if effective_confidence(f) >= FACT_CONFIDENCE_FLOOR
+        ]
+        assert kept == ["Spouse is Rowan Quill", "Runs the poetry imprint"]
+
+
+class TestBriefingLimitedStatusDisclosesCaveats:
+    """The early "limited information" return happens before the section
+    formatters run, so it has to carry their caveats itself.
+
+    Without that, a briefing whose interaction lookup actually raised reported
+    "limited information … I don't have detailed notes" — a fault rendered as an
+    absence, which is the whole bug class.
+    """
+
+    async def test_a_lookup_fault_is_stated_not_called_thin_data(self, briefing_env):
+        briefing_env.entity_email = None
+        briefing_env.raise_on_history = True
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert result["status"] == "limited"
+        assert "could not be read" in result["message"]
+        assert "NOT because there is nothing on record" in result["message"]
+
+    async def test_a_lookup_fault_names_the_fault_plainly(self, briefing_env):
+        """The opposite case to an honest empty — it must say a source broke."""
+        briefing_env.entity_email = None
+        briefing_env.raise_on_history = True
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "errored" in result["message"]
+        assert any(w in result["message"].lower() for w in FAULT_WORDS)
+
+    async def test_the_fault_message_reaches_the_tool_output_verbatim(
+        self, monkeypatch, briefing_env
+    ):
+        """A "limited" message is passed through as-is, so this is what the
+        orchestrator actually reads."""
+        briefing_env.entity_email = None
+        briefing_env.raise_on_history = True
+        monkeypatch.setattr(
+            briefings, "get_briefings_service", lambda: briefing_env.service
+        )
+        out = await _briefing_person({"name": "Marigold Quill"})
+        assert "could not be read" in out
+
+    async def test_the_fault_message_differs_from_the_thin_record_one(
+        self, briefing_env
+    ):
+        briefing_env.entity_email = None
+        briefing_env.oldest_days = None
+        thin = await briefing_env.service.generate_briefing("Marigold Quill")
+        briefing_env.raise_on_history = True
+        faulted = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert thin["message"] != faulted["message"]
+        assert "limited information" not in faulted["message"]
+
+    async def test_a_thin_record_still_reads_as_an_absence(self, briefing_env):
+        """The complement: with no fault, nothing may imply one."""
+        briefing_env.entity_email = None
+        briefing_env.oldest_days = None
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "limited information" in result["message"]
+        _assert_no_fault_language(result["message"], "thin-record briefing")
+
+    async def test_withheld_facts_are_disclosed_in_the_limited_message(
+        self, briefing_env
+    ):
+        """All facts under the floor looks identical to no facts at all."""
+        briefing_env.entity_email = None
+        briefing_env.oldest_days = None
+        briefing_env.facts = [
+            _fact("topics", "rumour", "Maybe moved to Lowmarsh", 0.2),
+            _fact("topics", "rumour2", "Maybe changed jobs", 0.1),
+        ]
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert result["status"] == "limited"
+        assert "2 lower-confidence fact(s)" in result["message"]
+        assert str(FACT_CONFIDENCE_FLOOR) in result["message"]
+
+    async def test_withheld_facts_never_leak_their_content(self, briefing_env):
+        briefing_env.entity_email = None
+        briefing_env.oldest_days = None
+        briefing_env.facts = [_fact("topics", "rumour", "Maybe moved to Lowmarsh", 0.2)]
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "Maybe moved to Lowmarsh" not in result["message"]
+
+    async def test_both_caveats_are_carried_together(self, briefing_env):
+        briefing_env.entity_email = None
+        briefing_env.raise_on_history = True
+        briefing_env.facts = [_fact("topics", "rumour", "Maybe moved to Lowmarsh", 0.2)]
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "could not be read" in result["message"]
+        assert "1 lower-confidence fact(s)" in result["message"]
+
+    async def test_no_withheld_note_when_the_floor_dropped_nothing(self, briefing_env):
+        briefing_env.entity_email = None
+        briefing_env.oldest_days = None
+        result = await briefing_env.service.generate_briefing("Marigold Quill")
+        assert "lower-confidence fact(s)" not in result["message"]
 
 
 class TestInteractionStoreEmptyMessage:

@@ -258,7 +258,7 @@ class TestMemoriesHonestEmpty:
     def test_below_threshold_names_the_threshold(self, fake_store):
         out = _below_threshold(fake_store)
         assert "relevance threshold" in out
-        assert "2 came close" in out
+        assert "2 shared some wording" in out
 
     def test_below_threshold_suggests_rewording(self, fake_store):
         out = _below_threshold(fake_store)
@@ -268,7 +268,27 @@ class TestMemoriesHonestEmpty:
         """The whole point: candidates existed, so absence was never established."""
         out = _below_threshold(fake_store)
         assert "nothing saved" not in out.lower()
-        assert "likely saved" in out.lower()
+        assert "not an established absence" in out.lower()
+
+    def test_below_threshold_does_not_claim_a_relevant_memory_exists(self, fake_store):
+        """The count cannot support that claim, so the text must not make it.
+
+        A near miss is counted for ANY keyword overlap under min_relevance — one
+        common word shared with a long query qualifies — so "something relevant is
+        likely saved" asserted more than the number establishes. The floors
+        themselves are unchanged; only the claim is.
+        """
+        out = _below_threshold(fake_store, near=1)
+        assert "likely saved" not in out.lower()
+        assert "likely" not in out.lower()
+
+    def test_below_threshold_describes_what_was_actually_counted(self, fake_store):
+        """Both counting rules, stated as the disjunction they are: keyword
+        overlap under the floor, or a semantic score inside the near-miss margin.
+        """
+        out = _below_threshold(fake_store)
+        assert "shared some wording with it, or scored near the meaning floor" in out
+        assert "without clearing either" in out
 
     def test_nothing_saved_says_so(self, fake_store):
         out = _nothing_saved(fake_store)

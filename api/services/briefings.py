@@ -289,10 +289,17 @@ class BriefingsService:
         # v3: Get PersonFacts (extracted facts about this person)
         if context.entity_id:
             try:
-                from api.services.person_facts import get_person_fact_store, rank_facts
+                from api.services.person_facts import (
+                    effective_confidence,
+                    get_person_fact_store,
+                    rank_facts,
+                )
                 fact_store = get_person_fact_store()
                 facts = rank_facts(fact_store.get_for_person(context.entity_id))
-                kept = [f for f in facts if (f.confidence or 0.0) >= FACT_CONFIDENCE_FLOOR]
+                # Same effective confidence the ranking uses, so a fact the user
+                # confirmed is never dropped here and then attributed to low
+                # extraction confidence — a claim about something they asserted.
+                kept = [f for f in facts if effective_confidence(f) >= FACT_CONFIDENCE_FLOOR]
                 context.facts_withheld_low_confidence = len(facts) - len(kept)
                 context.person_facts = [
                     {
@@ -517,12 +524,39 @@ class BriefingsService:
                 if context.interaction_windows_tried
                 else ""
             )
-            return {
-                "status": "limited",
-                "message": (
+            # This return happens before _format_facts_section can disclose the
+            # confidence floor, so it carries that caveat itself. Without it a
+            # person whose only facts sit under the floor is reported as having
+            # nothing on record.
+            withheld = (
+                f" {context.facts_withheld_low_confidence} lower-confidence "
+                f"fact(s) are on record, below the {FACT_CONFIDENCE_FLOOR} "
+                "confidence floor, and are not included here."
+                if context.facts_withheld_low_confidence
+                else ""
+            )
+            # Same reason, and the one caveat that must never be summarised as
+            # thin data: the interaction lookup raised, so the history is missing
+            # because that source could not be read. _format_interaction_section
+            # states this on the normal path, which this return never reaches.
+            if context.interaction_lookup_failed:
+                message = (
+                    f"The interaction index could not be read for "
+                    f"{context.resolved_name}, and no notes, tasks, or facts turned "
+                    "up either. The interaction history is absent because that "
+                    "source errored, NOT because there is nothing on record — this "
+                    "is a genuine fault on that source and must be stated as one."
+                    + withheld
+                )
+            else:
+                message = (
                     f"I have limited information about {context.resolved_name}. They "
                     f"appear in my records but I don't have detailed notes.{searched}"
-                ),
+                    + withheld
+                )
+            return {
+                "status": "limited",
+                "message": message,
                 "person_name": context.resolved_name,
                 "sources": context.sources,
             }

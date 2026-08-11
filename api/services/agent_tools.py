@@ -727,8 +727,8 @@ TOOL_DEFINITIONS = [
             "information, check if a memory already exists, or find specific remembered "
             "facts/preferences. A relevance threshold applies, so an empty result can mean "
             "the query wording missed rather than nothing being saved — the result says "
-            "which. When it says candidates came close, retry with different wording or a "
-            "higher limit before telling the user nothing is saved."
+            "which. When it says candidates scored below the threshold, retry with "
+            "different wording or a higher limit before telling the user nothing is saved."
         ),
         "input_schema": {
             "type": "object",
@@ -1196,13 +1196,17 @@ async def _tool_search_drive(inp: dict) -> str:
         _DRIVE_DEFAULT_RESULTS,
         _DRIVE_MAX_RESULTS,
     )
+    # The membership test is guarded: the model writes this argument, and an
+    # order_by=[] would raise TypeError: unhashable type on a bare `in` check —
+    # a malformed argument taken down as a tool crash rather than disclosed.
     raw_order = inp.get("order_by")
-    order_key = raw_order if raw_order in _DRIVE_ORDERINGS else "recent"
+    valid_order = isinstance(raw_order, str) and raw_order in _DRIVE_ORDERINGS
+    order_key = raw_order if valid_order else "recent"
     order_by, order_desc = _DRIVE_ORDERINGS[order_key]
     bad_order = (
         f"\n\n[Ignored order_by={raw_order!r} — must be one of "
         f"{', '.join(sorted(_DRIVE_ORDERINGS))}; ordered {order_desc} instead.]"
-        if raw_order is not None and raw_order not in _DRIVE_ORDERINGS
+        if raw_order is not None and not valid_order
         else ""
     )
 
@@ -1213,7 +1217,9 @@ async def _tool_search_drive(inp: dict) -> str:
     failed_accounts: list[str] = []
     all_files = []
     truncated = False
+    account_count = 0
     for account in get_configured_accounts():
+        account_count += 1
         try:
             drive = DriveService(account)
             files = drive.search(
@@ -1236,6 +1242,17 @@ async def _tool_search_drive(inp: dict) -> str:
         )
 
     if not all_files:
+        # With every account down, nothing was searched, so an absence was never
+        # established. Lead with the fault instead of appending it to a denial —
+        # "nothing came back" followed by a footnote still reads as an answer,
+        # and "the accounts that responded" was none of them.
+        if len(failed_accounts) == account_count and failed_accounts:
+            return (
+                f"Could not search Drive: {', '.join(failed_accounts)} errored, and "
+                "no other account was reachable. This is NOT an empty Drive — "
+                "nothing was actually searched. The account may need "
+                "re-authorising." + bad_order
+            )
         if failed_accounts:
             return (
                 "No Drive files came back from the accounts that responded."
@@ -1774,9 +1791,14 @@ def _lookup_person(inp: dict) -> str:
 async def _briefing_person(inp: dict) -> str:
     from api.services.briefings import get_briefings_service
 
-    # A window is a scope, not a cap: clamping a nonsense value would brief on a
-    # period nobody asked for, so a bad one is treated as unstated (the widening
-    # ladder then applies) and the drop is disclosed.
+    # A window is a scope, not a cap, so clamping is out — but unlike
+    # search_calendar's days_range, an unusable window here is refused outright
+    # rather than treated as unstated. Falling back to the ladder would widen the
+    # briefing past the caller's scope, and this window bounds how much of a
+    # person's history the briefing reads: emails, messages, meetings. Widening
+    # on a malformed argument exposes more personal history than was asked for,
+    # which AGENTS.md §6 says to treat as a privacy concern, and no briefing is
+    # cheaper to correct than the wrong one.
     raw_days = inp.get("interaction_days")
     interaction_days: int | None = None
     if raw_days is not None:
@@ -1786,13 +1808,14 @@ async def _briefing_person(inp: dict) -> str:
             interaction_days = None
         if interaction_days is not None and not 1 <= interaction_days <= _BRIEFING_MAX_DAYS:
             interaction_days = None
-    bad_days = (
-        f"\n\n[Ignored interaction_days={raw_days!r} — must be a whole number of "
-        f"days between 1 and {_BRIEFING_MAX_DAYS}, so this briefing is NOT scoped "
-        "to it.]"
-        if raw_days is not None and interaction_days is None
-        else ""
-    )
+        if interaction_days is None:
+            return (
+                f"No briefing generated: interaction_days={raw_days!r} is not a "
+                f"whole number of days between 1 and {_BRIEFING_MAX_DAYS}. This is "
+                "a bad argument, NOT a thin record — nothing was looked up. "
+                "Widening to the default window would cover more of this person's "
+                "history than was asked for, so re-send a valid window instead."
+            )
 
     svc = get_briefings_service()
     result = await svc.generate_briefing(
@@ -1800,15 +1823,16 @@ async def _briefing_person(inp: dict) -> str:
     )
     status = result.get("status")
     if status == "success":
-        return result.get("briefing", "Briefing generated but empty.") + bad_days
+        return result.get("briefing", "Briefing generated but empty.")
     if status in ("not_found", "limited"):
         # Thin or absent data is an absence, not a fault. Reporting it as a failed
-        # briefing invites the model to blame the backend for a quiet record.
+        # briefing invites the model to blame the backend for a quiet record. When
+        # a source did fail, that message says so itself (see generate_briefing).
         return (
             result.get("message")
             or f"Nothing on record under '{inp['name']}' to brief from."
-        ) + bad_days
-    return f"Briefing failed: {result.get('message', 'unknown error')}" + bad_days
+        )
+    return f"Briefing failed: {result.get('message', 'unknown error')}"
 
 
 def _tool_person_info(inp: dict):
@@ -2202,11 +2226,18 @@ def _tool_search_memories(inp: dict) -> str:
         if stats.near_misses:
             # Candidates existed and were scored; only the relevance floors kept
             # them out. Rewording is the fix, not concluding the memory is gone.
+            #
+            # The claim is deliberately narrow. This count includes any keyword
+            # overlap under min_relevance — one common word shared with a long
+            # query qualifies — so it cannot support "something relevant is
+            # likely saved". It states the two things the count does establish:
+            # candidates were scored, and none cleared a floor.
             return (
-                f"No saved memory cleared the relevance threshold for {query!r}, but "
-                f"{stats.near_misses} came close. Something relevant is likely saved: "
-                "retry with the wording the memory itself probably uses, or with "
-                "fewer, more specific terms." + notes
+                f"No saved memory cleared the relevance threshold for {query!r}. "
+                f"{stats.near_misses} shared some wording with it, or scored near "
+                "the meaning floor, without clearing either — a threshold miss, "
+                "not an established absence. Retry with the wording the memory "
+                "itself probably uses, or with fewer, more specific terms." + notes
             )
         if stats.total_saved > stats.searched:
             # The corpus bound cut the search short, so absence was never established.
@@ -2599,12 +2630,12 @@ _TXN_ROW_CAP = 500
 _CASHFLOW_CATEGORY_CAP = 10
 
 
-def _summary_period(inp: dict) -> tuple[str, str, str, str]:
+def _summary_period(inp: dict) -> tuple[str, str, str, str | None]:
     """Resolve the window a cashflow/budget summary covers.
 
-    Returns ``(start, end, label, dropped_note)``: the two bounds to send, a
-    human label for them, and a disclosure for any unparseable date dropped on
-    the way. The label exists because these summaries default to month-to-date,
+    Returns ``(start, end, label, error)``: the two bounds to send, a human label
+    for them, and a refusal message when the request cannot be honestly answered
+    at all. The label exists because these summaries default to month-to-date,
     and an unlabelled month-to-date total is worse than an empty result — asked
     on the 2nd, it is a two-day figure with a savings rate beside it and nothing
     to cue the reader that the period is partial.
@@ -2615,20 +2646,6 @@ def _summary_period(inp: dict) -> tuple[str, str, str, str]:
     """
     raw_start, raw_end = inp.get("start_date"), inp.get("end_date")
     start_dt, end_dt = _parse_ymd(raw_start), _parse_ymd(raw_end)
-    dropped = [
-        f"{label}={raw!r}"
-        for raw, parsed, label in (
-            (raw_start, start_dt, "start_date"),
-            (raw_end, end_dt, "end_date"),
-        )
-        if raw and not parsed
-    ]
-    dropped_note = (
-        f" [Ignored unparseable {', '.join(dropped)} — dates must be "
-        "YYYY-MM-DD, so this period is NOT the one that was asked for.]"
-        if dropped
-        else ""
-    )
 
     now = datetime.now()
     # A defaulted start counts back from end_date when one was given, not from
@@ -2638,25 +2655,46 @@ def _summary_period(inp: dict) -> tuple[str, str, str, str]:
     start = (start_dt or anchor.replace(day=1)).strftime("%Y-%m-%d")
     end = (end_dt or now).strftime("%Y-%m-%d")
 
+    # An explicitly supplied date that can't be read is refused rather than
+    # dropped. The transactions branch drops one and says so, which is safe there
+    # because every row it prints carries its own date, so a wrong period shows
+    # up in the output. An aggregate has no such cue: the number IS the whole
+    # answer, and a note beside a real total is easily reported without it.
+    unparseable = [
+        f"{label}={raw!r}"
+        for raw, parsed, label in (
+            (raw_start, start_dt, "start_date"),
+            (raw_end, end_dt, "end_date"),
+        )
+        if raw and not parsed
+    ]
+    if unparseable:
+        return start, end, f"{start} to {end}", (
+            f"Cannot summarise this period: could not read "
+            f"{', '.join(unparseable)} — dates must be YYYY-MM-DD. No figures "
+            "were fetched, because a total for some other window reads exactly "
+            "like the one that was asked for. This is a bad date argument, NOT "
+            "an empty period. Re-send the date as YYYY-MM-DD."
+        )
+
     # Anchoring fixes the defaulted case but not a caller-supplied one: a future
     # start_date, or bounds passed the wrong way round, still describe a window
     # that cannot contain anything. Querying it returns zeros that print as a
     # real $0.00 period at 0% — the confidently-wrong-number failure this whole
     # change exists to remove. Refuse it instead of reporting it.
     if start > end:
-        error = (
+        return start, end, f"{start} to {end}", (
             f"Cannot summarise {start} to {end} — the start is after the end, so "
             "that period cannot contain anything. This is a bad date range, NOT "
             "an empty period. Check the order of start_date and end_date."
         )
-        return start, end, f"{start} to {end}", dropped_note, error
 
     label = f"{start} to {end}"
     if start_dt is None and end_dt is None:
         label += " (month-to-date by default, so it may cover only part of the month)"
     elif start_dt is None:
         label += " (start defaulted to the 1st of that month)"
-    return start, end, label, dropped_note, None
+    return start, end, label, None
 
 
 async def _tool_search_finances(inp: dict) -> str:
@@ -2860,7 +2898,7 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "cashflow":
-        start, end, period, dropped_note, error = _summary_period(inp)
+        start, end, period, error = _summary_period(inp)
         if error:
             return error
         cf = await client.get_cashflow_summary(start_date=start, end_date=end)
@@ -2870,7 +2908,7 @@ async def _tool_search_finances(inp: dict) -> str:
         # Period first: every figure below is only true of that window, and a
         # savings rate reads as a settled fact unless the scope precedes it.
         lines = [
-            f"**Period**: {period}{dropped_note}",
+            f"**Period**: {period}",
             f"**Income**: ${income:,.2f}",
             f"**Expenses**: ${expenses:,.2f}",
             f"**Net Savings**: ${income - expenses:,.2f}",
@@ -2909,7 +2947,7 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     elif action == "budgets":
-        start, end, period, dropped_note, error = _summary_period(inp)
+        start, end, period, error = _summary_period(inp)
         if error:
             return error
         budgets = await client.get_budgets(start_date=start, end_date=end)
@@ -2923,10 +2961,10 @@ async def _tool_search_finances(inp: dict) -> str:
                 + " That is a statement about this period, not about whether "
                 "budgets are set up — a period that hasn't populated yet looks "
                 "the same as one with none. Try a different start_date/end_date "
-                "to check another period." + dropped_note
+                "to check another period."
             )
         lines = [
-            f"Budgets for {period}:{dropped_note}",
+            f"Budgets for {period}:",
             "| Category | Budgeted | Actual | Remaining |",
             "|----------|----------|--------|-----------|",
         ]
