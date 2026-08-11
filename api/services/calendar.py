@@ -128,14 +128,26 @@ class CalendarService:
     Provides methods to fetch and search calendar events.
     """
 
-    def __init__(self, account_type: GoogleAccount = GoogleAccount.PERSONAL):
+    def __init__(
+        self,
+        account_type: GoogleAccount = GoogleAccount.PERSONAL,
+        *,
+        raise_on_api_error: bool = False,
+    ):
         """
         Initialize calendar service.
 
         Args:
             account_type: Which Google account to use
+            raise_on_api_error: Opt-in failure propagation. False (the default)
+                keeps the long-standing empty-list-on-error contract that every
+                api/routes/ caller depends on; True lets a caller that can report
+                a fault — the chat tools — tell "this account is unreachable"
+                from "this calendar is empty". See the note in _fetch_events for
+                why this is a constructor flag rather than a per-call one.
         """
         self.account_type = account_type
+        self.raise_on_api_error = raise_on_api_error
         self._service = None
 
     @property
@@ -287,10 +299,11 @@ class CalendarService:
             List of CalendarEvent objects
 
         Raises:
-            Exception: if credentials cannot be resolved. API-level errors are
-                still swallowed to an empty list (the long-standing contract for
-                the other callers), but an auth failure must reach the caller —
-                see the note below.
+            Exception: if credentials cannot be resolved (always), or if the
+                Calendar API itself fails and this service was built with
+                raise_on_api_error=True. Without that flag an API failure is
+                still swallowed to an empty list — the long-standing contract
+                for the other callers.
         """
         # Resolved before the try. `service` is a lazy property, so building it
         # inside the block meant an expired token was caught here and returned as
@@ -325,6 +338,19 @@ class CalendarService:
             return events
 
         except Exception as e:
+            # A 403, a 429, a 500 or a quota event is a failure to look, not a
+            # confirmed empty calendar. Propagation is opt-in per instance
+            # because the alternatives all cost more: a strict twin of each
+            # public method would need three of them (get_upcoming_events,
+            # get_events_in_range, search_events), a per-call keyword would need
+            # threading through all three, and a result wrapper would change the
+            # return type every existing caller reads. One constructor flag
+            # covers all three entry points and leaves every caller that does not
+            # ask for it byte-identical. get_calendar_service() deliberately does
+            # not expose the flag, so the instances the routes share through that
+            # cache can never become strict behind a route's back.
+            if self.raise_on_api_error:
+                raise
             logger.error(f"Failed to fetch calendar events: {e}")
             return []
 
