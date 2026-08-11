@@ -380,6 +380,20 @@ def _init_schema(conn: sqlite3.Connection):
         migrations.append("ALTER TABLE sync_runs ADD COLUMN source_entities_created INTEGER DEFAULT 0")
     if "trigger_source" not in columns:
         migrations.append("ALTER TABLE sync_runs ADD COLUMN trigger_source TEXT DEFAULT 'unknown'")
+    if "attempt_count" not in columns:
+        # Issue #541: within-run retry for transient (connectivity/rate-limit)
+        # failures. 1 = succeeded or failed on the first try (no retry
+        # attempted); >1 = a retry was needed before the final status. This
+        # single column is enough to derive all three states the health
+        # record must distinguish: first-time success (status=success,
+        # attempt_count=1), success-after-retry (status=success,
+        # attempt_count>1), and gave-up (status=failed, attempt_count>1 means
+        # retries were exhausted; attempt_count=1 means the failure was
+        # classified non-transient and never retried).
+        # DEFAULT 1 makes every pre-existing row (from before this column
+        # existed) read as "no retry" rather than NULL, so historical rows
+        # stay queryable without special-casing NULL everywhere.
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN attempt_count INTEGER DEFAULT 1")
 
     for sql in migrations:
         conn.execute(sql)
@@ -485,8 +499,17 @@ def record_sync_complete(
     people_updated: int = 0,
     interactions_created: int = 0,
     source_entities_created: int = 0,
+    attempt_count: int = 1,
 ):
-    """Record completion of a sync operation."""
+    """Record completion of a sync operation.
+
+    ``attempt_count`` is the total number of attempts the orchestrator made
+    before reaching this final status (1 = no retry needed; >1 = one or more
+    transient-failure retries happened first — see issue #541). One row per
+    logical run still gets one update: ``started_at`` is set once at the
+    first attempt, so ``duration_seconds`` naturally covers the whole retry
+    campaign (backoff sleeps included), not just the final attempt.
+    """
     conn = get_sync_health_db()
 
     # Get start time to calculate duration
@@ -513,7 +536,8 @@ def record_sync_complete(
             people_created = ?,
             people_updated = ?,
             interactions_created = ?,
-            source_entities_created = ?
+            source_entities_created = ?,
+            attempt_count = ?
         WHERE id = ?
         """,
         (
@@ -529,6 +553,7 @@ def record_sync_complete(
             people_updated,
             interactions_created,
             source_entities_created,
+            attempt_count,
             run_id,
         )
     )
