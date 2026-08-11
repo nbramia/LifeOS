@@ -96,6 +96,21 @@ def _classify_refresh_failure(exc: Exception) -> str:
       the identity provider (e.g. a revoked or expired refresh token).
     - Anything else is unrecognised; say the refresh failed without
       asserting which of the above happened.
+
+    This does not check `exc.__cause__`/`__context__` for a chained
+    TransportError under a RefreshError, and that is deliberate, not an
+    oversight: verified against the installed google-auth (2.48.0) that no
+    such chain exists. `google.oauth2._client._token_endpoint_request_no_throw`
+    calls `request(...)` (the transport call that raises TransportError) with
+    no try/except around it at all, so a transport failure there propagates
+    as a bare TransportError straight out of `Credentials.refresh()`. Every
+    `raise exceptions.RefreshError(...)` in that module (`_handle_error_response`,
+    `_handle_refresh_grant_response`, and the id-token variants) instead
+    originates from parsing or validating the token endpoint's *response body*
+    — a non-200 status, or a missing/malformed field in an otherwise-received
+    response — never from catching a transport exception. So a network
+    failure cannot surface here disguised as a RefreshError; if a future
+    google-auth release changes that, this classifier would need revisiting.
     """
     if isinstance(exc, google_auth_exceptions.TransportError):
         return _REFRESH_FAIL_CONNECTIVITY
@@ -217,19 +232,27 @@ class GoogleAuthService:
                     return self._credentials
                 except Exception as e:
                     refresh_failure_kind = _classify_refresh_failure(e)
+                    # Log the classification and the exception's type only —
+                    # never str(e) and no exc_info. An OAuth refresh exception
+                    # is precisely where a token or response payload can show
+                    # up, and log_redaction.py only filters `bot\d+:...`
+                    # patterns, not this. The classification is the useful
+                    # signal; the payload was never what made this diagnostic.
                     if refresh_failure_kind == _REFRESH_FAIL_CONNECTIVITY:
                         logger.warning(
                             f"Token refresh for {self.account_type.value} account could not "
-                            f"reach Google (connectivity failure, token not evaluated): {e}"
+                            f"reach Google (connectivity failure, token not evaluated); "
+                            f"exception type: {type(e).__name__}"
                         )
                     elif refresh_failure_kind == _REFRESH_FAIL_REJECTED:
                         logger.warning(
                             f"Token refresh for {self.account_type.value} account was rejected "
-                            f"by Google: {e}"
+                            f"by Google; exception type: {type(e).__name__}"
                         )
                     else:
                         logger.warning(
-                            f"Token refresh for {self.account_type.value} account failed: {e}"
+                            f"Token refresh for {self.account_type.value} account failed; "
+                            f"exception type: {type(e).__name__}"
                         )
                     # Fall through to re-authenticate
 

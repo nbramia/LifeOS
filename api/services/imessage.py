@@ -1001,7 +1001,16 @@ def resolve_entity_id_confidence(entity_id: str) -> tuple[Optional[str], bool]:
     in response to a request about another — e.g. get_message_history, which
     this resolution feeds on every call — should use this function directly
     and disclose the uncertainty instead of presenting the match as certain.
+
+    `entity_id` is filled in by an LLM tool call, so None, non-string types,
+    and empty/whitespace strings all arrive in practice. `uuid.UUID(...)`
+    raises TypeError on None and AttributeError on a non-string (no
+    `.replace()`) rather than the ValueError this function otherwise expects
+    for "not a UUID" — so those are rejected up front as simply unresolved,
+    the same outcome a caller gets for any other name that doesn't match.
     """
+    if not isinstance(entity_id, str) or not entity_id.strip():
+        return None, False
     try:
         uuid_mod.UUID(entity_id)
         return entity_id, False

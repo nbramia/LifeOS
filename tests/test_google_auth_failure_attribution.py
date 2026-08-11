@@ -121,6 +121,25 @@ class TestClassifyRefreshFailure:
             == _REFRESH_FAIL_UNKNOWN
         )
 
+    def test_refresh_error_with_a_chained_transport_cause_is_still_rejected(self):
+        """Documents, rather than guards against, a scenario verified not to
+        occur in the installed google-auth (2.48.0): every RefreshError raise
+        site in google.oauth2._client originates from parsing the token
+        endpoint's response body, never from catching a transport exception,
+        so a network failure cannot surface disguised as a RefreshError. This
+        pins what the classifier does today if that ever changed upstream —
+        isinstance(TransportError) is checked first, but a RefreshError is not
+        a TransportError subclass, so a __cause__ chain is never consulted and
+        the exception classifies by its own type regardless of what caused
+        it."""
+        exc = google_auth_exceptions.RefreshError("invalid_grant")
+        try:
+            raise google_auth_exceptions.TransportError("synthetic transport failure")
+        except google_auth_exceptions.TransportError as transport_exc:
+            exc.__cause__ = transport_exc
+
+        assert _classify_refresh_failure(exc) == _REFRESH_FAIL_REJECTED
+
 
 class TestHeadlessFailureMessage:
     """The raised message names a cause and a remedy per category, never raw
@@ -236,6 +255,59 @@ class TestGetCredentialsHeadlessAttribution:
 
         assert "personal" in personal_msg and "work account" not in personal_msg
         assert "work account" in work_msg
+
+
+class TestLogLinesDoNotLeakExceptionText:
+    """The refresh-failure log lines must never interpolate str(e) — an OAuth
+    refresh exception is precisely where a token or response payload can
+    appear, and log_redaction.py only filters `bot\\d+:...` patterns (the
+    Telegram-token leak it was built for), not an arbitrary OAuth payload.
+    The classification and the exception's type name are the diagnostic
+    signal; the payload never was.
+    """
+
+    def _run_and_capture(self, credentials_file, temp_config_dir, refresh_exc, caplog, monkeypatch):
+        service = _service(credentials_file, temp_config_dir)
+        monkeypatch.setenv("LIFEOS_HEADLESS", "true")
+        with patch("api.services.google_auth.Credentials") as mock_creds_class:
+            mock_creds_class.from_authorized_user_file.return_value = _expired_creds(refresh_exc)
+            with caplog.at_level("WARNING", logger="api.services.google_auth"):
+                with pytest.raises(RuntimeError):
+                    service.get_credentials()
+        return caplog.records
+
+    def test_connectivity_failure_log_omits_exception_text(
+        self, credentials_file, temp_config_dir, monkeypatch, caplog
+    ):
+        exc = google_auth_exceptions.TransportError(_SYNTHETIC_SECRET)
+        records = self._run_and_capture(credentials_file, temp_config_dir, exc, caplog, monkeypatch)
+        joined = "\n".join(r.getMessage() for r in records)
+
+        assert _SYNTHETIC_SECRET not in joined
+        assert "TransportError" in joined
+        assert all(r.exc_info is None for r in records)
+
+    def test_rejected_failure_log_omits_exception_text(
+        self, credentials_file, temp_config_dir, monkeypatch, caplog
+    ):
+        exc = google_auth_exceptions.RefreshError(_SYNTHETIC_SECRET)
+        records = self._run_and_capture(credentials_file, temp_config_dir, exc, caplog, monkeypatch)
+        joined = "\n".join(r.getMessage() for r in records)
+
+        assert _SYNTHETIC_SECRET not in joined
+        assert "RefreshError" in joined
+        assert all(r.exc_info is None for r in records)
+
+    def test_unknown_failure_log_omits_exception_text(
+        self, credentials_file, temp_config_dir, monkeypatch, caplog
+    ):
+        exc = ValueError(_SYNTHETIC_SECRET)
+        records = self._run_and_capture(credentials_file, temp_config_dir, exc, caplog, monkeypatch)
+        joined = "\n".join(r.getMessage() for r in records)
+
+        assert _SYNTHETIC_SECRET not in joined
+        assert "ValueError" in joined
+        assert all(r.exc_info is None for r in records)
 
 
 class TestValidCredentialPathUnchanged:

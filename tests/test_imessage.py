@@ -359,6 +359,31 @@ class TestResolveEntityId:
         assert resolve_entity_id("robin-doe") == self.ENTITY_ID
 
 
+class TestResolveEntityIdMalformedInput:
+    """entity_id is filled in by an LLM tool call, so None, non-string types,
+    and empty/whitespace strings all arrive in practice. Before the guard,
+    `uuid.UUID(None)` raised TypeError and `uuid.UUID(123)`/`uuid.UUID([])`/
+    `uuid.UUID({})` raised AttributeError (no `.replace()`) — neither is the
+    ValueError this function otherwise treats as "not a UUID, try the
+    resolver" — so the tool crashed instead of returning its normal
+    could-not-resolve response.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_entity_id", [None, 123, [], {}, "", "   "],
+    )
+    def test_malformed_entity_id_does_not_raise(self, bad_entity_id, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "api.services.entity_resolver.get_entity_resolver",
+            lambda: calls.append(True),
+        )
+        assert resolve_entity_id_confidence(bad_entity_id) == (None, False)
+        assert resolve_entity_id(bad_entity_id) is None
+        # None of these should even reach the resolver.
+        assert calls == []
+
+
 class TestIMessageRecord:
     """Tests for IMessageRecord dataclass."""
 

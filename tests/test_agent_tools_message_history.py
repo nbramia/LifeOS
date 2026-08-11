@@ -173,29 +173,42 @@ class TestHonestEmpty:
 class TestAmbiguousResolution:
     """resolve_entity_id_confidence's second element (#346): when
     entity_resolver reports `fuzzy_ambiguous` (two-plus candidates scored close
-    enough together that the top pick isn't reliably right), the tool must say
-    so rather than silently returning what may be the wrong person's messages.
+    enough together that the top pick isn't reliably right), the tool must
+    refuse the query outright rather than returning what may be the wrong
+    person's private messages with a warning attached — a warning read after
+    the fact doesn't undo content already in the model's context.
     """
 
-    def test_ambiguous_match_is_disclosed_alongside_results(self, fake_sources):
+    def test_ambiguous_match_is_refused_not_disclosed(self, fake_sources):
         fake_sources.ambiguous = True
         fake_sources.imessages = [(_days_ago(3), "hello")]
         out = _tool_get_message_history({"entity_id": ENTITY})
         assert "matched more than one person" in out
+        assert "hello" not in out
 
-    def test_confident_match_carries_no_ambiguity_note(self, fake_sources):
+    def test_ambiguous_match_never_queries_either_source(self, fake_sources):
+        """No message content may reach the tool's output at all — assert the
+        underlying sources were never even queried, not just that the reply
+        omits them."""
+        fake_sources.ambiguous = True
+        fake_sources.imessages = [(_days_ago(3), "hello")]
+        fake_sources.whatsapp = [(_days_ago(3), "wa hello")]
+        _tool_get_message_history({"entity_id": ENTITY})
+        assert fake_sources.attempts == []
+
+    def test_ambiguous_match_names_the_term_and_the_remedy(self, fake_sources):
+        fake_sources.ambiguous = True
+        out = _tool_get_message_history({"entity_id": ENTITY})
+        assert ENTITY in out
+        assert "person_info" in out
+        assert "UUID" in out
+
+    def test_confident_match_is_not_refused(self, fake_sources):
         fake_sources.ambiguous = False
         fake_sources.imessages = [(_days_ago(3), "hello")]
         out = _tool_get_message_history({"entity_id": ENTITY})
         assert "matched more than one person" not in out
-
-    def test_ambiguous_match_is_disclosed_even_on_empty_result(self, fake_sources):
-        """An ambiguous resolution with zero messages is still worth flagging —
-        the wrong person may simply have no history, which reads as innocuous
-        without the note."""
-        fake_sources.ambiguous = True
-        out = _tool_get_message_history({"entity_id": ENTITY})
-        assert "matched more than one person" in out
+        assert "hello" in out
 
 
 class TestBudget:
