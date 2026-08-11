@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # Threshold for considering a channel "recently active"
 RECENT_ACTIVITY_DAYS = 7
 
+# Sentinel stored in days_since_contact when there is no last-contact date at
+# all. It is a marker, not a measurement: rendered as a number it reads as a gap
+# of about 2.7 years, so formatters must ask `contact_on_record` first.
+NEVER_CONTACTED_DAYS = 999
+
 
 @dataclass
 class ChannelActivity:
@@ -62,11 +67,22 @@ class RelationshipSummary:
     # Quick stats
     total_interactions_90d: int = 0
     last_interaction: Optional[datetime] = None
-    days_since_contact: int = 999  # 999 = never contacted
+    days_since_contact: int = NEVER_CONTACTED_DAYS  # sentinel = never contacted
 
     # Optional extras
     facts_count: int = 0
     has_facts: bool = False
+
+    @property
+    def contact_on_record(self) -> bool:
+        """Whether days_since_contact is a real gap rather than the sentinel.
+
+        The date is the authority, not the number: a genuine gap can exceed
+        NEVER_CONTACTED_DAYS, so a large value alone proves nothing either way.
+        """
+        if self.last_interaction is not None:
+            return True
+        return self.days_since_contact != NEVER_CONTACTED_DAYS
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
@@ -162,7 +178,7 @@ def get_relationship_summary(person_id: str) -> Optional[RelationshipSummary]:
     primary = channels[0].source_type if channels else None
 
     # Calculate days since contact
-    days_since = 999
+    days_since = NEVER_CONTACTED_DAYS
     if person.last_seen:
         last_seen = person.last_seen
         if last_seen.tzinfo is None:
@@ -209,8 +225,15 @@ def format_relationship_context(summary: RelationshipSummary) -> str:
     lines = [
         f"## Relationship Context: {summary.person_name}",
         f"- **Strength**: {summary.relationship_strength}/100",
-        f"- **Days since contact**: {summary.days_since_contact}",
     ]
+
+    # Never print the sentinel. A reader (human or model) has no way to tell it
+    # from a real 999-day gap, and stating a fabricated interval is worse than
+    # stating that nothing is on record.
+    if summary.contact_on_record:
+        lines.append(f"- **Days since contact**: {summary.days_since_contact}")
+    else:
+        lines.append("- **Days since contact**: no contact on record")
 
     if summary.active_channels:
         lines.append(f"- **Active channels** (last 7 days): {', '.join(summary.active_channels)}")

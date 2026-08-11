@@ -119,6 +119,27 @@ class PersonFact:
         )
 
 
+def rank_facts(facts: list["PersonFact"]) -> list["PersonFact"]:
+    """Order facts most-trustworthy-first, for surfaces that show only some.
+
+    The store returns facts sorted by category then key, which is right for a UI
+    that groups them but wrong for anything that truncates: an alphabetical cut
+    drops "family: spouse" for "work: …" purely on spelling, and the reader is
+    told nothing about what fell off. A user-confirmed fact counts as full
+    confidence — the user asserted it, which outranks any extraction score.
+
+    Does not change the store's own ordering; callers opt in.
+    """
+    return sorted(
+        facts,
+        key=lambda f: (
+            -(1.0 if f.confirmed_by_user else (f.confidence or 0.0)),
+            f.category,
+            f.key,
+        ),
+    )
+
+
 class PersonFactStore:
     """
     SQLite-backed storage for person facts.

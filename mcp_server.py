@@ -1303,10 +1303,18 @@ class LifeOSMCPServer:
                 text += "\n"
                 # Show relationship context for routing decisions
                 strength = p.get("relationship_strength", 0)
+                # 999 is the API's never-contacted sentinel, not a measurement.
+                # Printed as a number it reads as a real gap of about 2.7 years,
+                # so fall back to the date the API actually reports.
                 days = p.get("days_since_contact", 999)
                 active = p.get("active_channels", [])
                 entity_id = p.get("entity_id", "")
-                text += f"  Strength: {strength:.0f}/100 | Last contact: {days} days ago\n"
+                last_contact = (
+                    f"{days} days ago"
+                    if days != 999 or p.get("last_seen")
+                    else "no contact on record"
+                )
+                text += f"  Strength: {strength:.0f}/100 | Last contact: {last_contact}\n"
                 if active:
                     text += f"  Active channels: {', '.join(active)}\n"
                 else:

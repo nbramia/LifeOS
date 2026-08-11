@@ -38,6 +38,22 @@ VALID_SOURCE_TYPES = frozenset({
 _MIN_TIMESTAMP = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _MAX_FUTURE_DAYS = 90  # Calendar events can be up to ~30 days out; allow margin
 
+# Opening of the empty-history message. Callers detect emptiness by this prefix
+# rather than by an exact string, so the window named after it can vary.
+NO_INTERACTIONS_PREFIX = "_No interactions found"
+
+
+def format_window_label(days_back: Optional[int]) -> str:
+    """Human phrasing for a lookback window, for messages that must name it.
+
+    None means the store's default window (InteractionConfig.DEFAULT_WINDOW_DAYS,
+    which spans the whole indexed period), so it is described as such rather than
+    as "the specified time period" — a phrase that tells a reader nothing.
+    """
+    if days_back is None:
+        return "the full history on record"
+    return f"the last {days_back} days"
+
 
 def get_interaction_db_path() -> str:
     """Get the path to the interactions database."""
@@ -1394,14 +1410,16 @@ class InteractionStore:
             limit: Maximum interactions
 
         Returns:
-            Formatted markdown string
+            Formatted markdown string. An empty result names the window it
+            searched (see NO_INTERACTIONS_PREFIX) — callers must not restate it
+            as "no history", which claims more than the window established.
         """
         interactions = self.get_for_person(person_id, days_back, limit)
         counts = self.get_interaction_counts(person_id, days_back)
         last = self.get_last_interaction(person_id)
 
         if not interactions:
-            return "_No interactions found in the specified time period._"
+            return f"{NO_INTERACTIONS_PREFIX} in {format_window_label(days_back)}._"
 
         # Build summary line
         total = sum(counts.values())
