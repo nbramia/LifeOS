@@ -344,6 +344,27 @@ class TestNeverContactedSentinel:
         assert _summary(NEVER_CONTACTED_DAYS, _days_ago(999)).contact_on_record is True
         assert _summary(3, None).contact_on_record is True
 
+    def test_indexed_profile_does_not_invent_a_recency_bucket(self):
+        """The sentinel used to bucket into "over a year ago" — a fabricated
+        interval written into the searchable corpus, where a later retrieval
+        reads it as an established fact.
+        """
+        from api.services.person_entity import PersonEntity
+        from api.services.person_indexer import generate_person_document
+
+        person = PersonEntity(id="person-quill", canonical_name="Marigold Quill")
+        doc = generate_person_document(person, _summary(NEVER_CONTACTED_DAYS, None))
+        assert "over a year ago" not in doc
+        assert "Last contact: none on record" in doc
+
+    def test_indexed_profile_still_buckets_a_real_gap(self):
+        from api.services.person_entity import PersonEntity
+        from api.services.person_indexer import generate_person_document
+
+        person = PersonEntity(id="person-quill", canonical_name="Marigold Quill")
+        doc = generate_person_document(person, _summary(400, _days_ago(400)))
+        assert "over a year ago" in doc
+
 
 # ---------------------------------------------------------------------------
 # person_info action="briefing"
