@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from google.auth import exceptions as google_auth_exceptions
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -61,6 +62,80 @@ def get_configured_accounts() -> list[GoogleAccount]:
         if (config_dir / f"credentials-{account.value}.json").exists():
             accounts.append(account)
     return accounts
+
+
+# Refresh-failure categories, mirroring _google_failure_kind/_failure_causes in
+# agent_tools.py: classify what actually happened before naming a remedy,
+# because a connectivity failure and a genuine rejection call for opposite
+# actions — retry vs. re-authenticate — and naming the wrong one sends the
+# operator to fix something that isn't broken (and costs an interactive
+# browser session on a headless box for nothing).
+_REFRESH_FAIL_CONNECTIVITY = "connectivity"
+_REFRESH_FAIL_REJECTED = "rejected"
+_REFRESH_FAIL_UNKNOWN = "unknown"
+
+_AUTHENTICATE_SCRIPT = "~/.venvs/lifeos/bin/python scripts/authenticate_google.py"
+
+
+def _classify_refresh_failure(exc: Exception) -> str:
+    """Classify a `Credentials.refresh()` exception before naming a remedy.
+
+    Never derives anything from the exception's text — it can carry tokens —
+    only its type is inspected.
+
+    - `google.auth.exceptions.TransportError` is what
+      `google.auth.transport.requests.Request.__call__` raises for *any*
+      `requests.exceptions.RequestException` it catches — connection refused,
+      timeout, and DNS/name-resolution failure alike (`requests`/`urllib3`
+      raise a `ConnectionError` wrapping a `NameResolutionError` for the
+      latter; none of these are HTTP-level distinctions). None of those cases
+      ever reached Google, so the credentials were never evaluated.
+    - `google.auth.exceptions.RefreshError` is what
+      `google.oauth2._client._handle_error_response` raises when the token
+      endpoint itself returns a non-200 response — a genuine rejection by
+      the identity provider (e.g. a revoked or expired refresh token).
+    - Anything else is unrecognised; say the refresh failed without
+      asserting which of the above happened.
+    """
+    if isinstance(exc, google_auth_exceptions.TransportError):
+        return _REFRESH_FAIL_CONNECTIVITY
+    if isinstance(exc, google_auth_exceptions.RefreshError):
+        return _REFRESH_FAIL_REJECTED
+    return _REFRESH_FAIL_UNKNOWN
+
+
+def _headless_auth_failure_message(account: str, refresh_failure_kind: Optional[str]) -> str:
+    """Name the failing account and the remedy the failure actually establishes.
+
+    `refresh_failure_kind` is None when no refresh was attempted (no stored
+    token, or an expired token with no refresh_token) — that case keeps its
+    original wording since it isn't the misattribution this classifies.
+    """
+    if refresh_failure_kind == _REFRESH_FAIL_CONNECTIVITY:
+        return (
+            f"Could not reach Google to refresh the OAuth token for the "
+            f"{account} account — this looks like a network or DNS problem, "
+            f"not a credentials problem. The token itself is untested, not "
+            f"known to be invalid. Re-authenticating will not help; retry "
+            f"once connectivity is restored."
+        )
+    if refresh_failure_kind == _REFRESH_FAIL_REJECTED:
+        return (
+            f"Google rejected the OAuth token refresh for the {account} "
+            f"account and it cannot be refreshed in a headless environment. "
+            f"Run interactively: {_AUTHENTICATE_SCRIPT}"
+        )
+    if refresh_failure_kind == _REFRESH_FAIL_UNKNOWN:
+        return (
+            f"Token refresh for the {account} account failed and cannot be "
+            f"retried in a headless environment. The cause is not "
+            f"established — this may or may not be a credentials problem."
+        )
+    return (
+        f"Google OAuth token for {account} account is expired/revoked "
+        f"and cannot be refreshed in a headless environment. "
+        f"Run interactively: {_AUTHENTICATE_SCRIPT}"
+    )
 
 
 class GoogleAuthService:
@@ -129,6 +204,7 @@ class GoogleAuthService:
                 self._credentials = None
 
         # Check if we need to refresh or re-authenticate
+        refresh_failure_kind: Optional[str] = None
         if self._credentials:
             if self._credentials.valid:
                 return self._credentials
@@ -140,15 +216,27 @@ class GoogleAuthService:
                     self._save_token(self._credentials)
                     return self._credentials
                 except Exception as e:
-                    logger.warning(f"Token refresh failed (may be revoked): {e}")
+                    refresh_failure_kind = _classify_refresh_failure(e)
+                    if refresh_failure_kind == _REFRESH_FAIL_CONNECTIVITY:
+                        logger.warning(
+                            f"Token refresh for {self.account_type.value} account could not "
+                            f"reach Google (connectivity failure, token not evaluated): {e}"
+                        )
+                    elif refresh_failure_kind == _REFRESH_FAIL_REJECTED:
+                        logger.warning(
+                            f"Token refresh for {self.account_type.value} account was rejected "
+                            f"by Google: {e}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Token refresh for {self.account_type.value} account failed: {e}"
+                        )
                     # Fall through to re-authenticate
 
         # Need to authenticate via browser — fail fast if headless
         if os.environ.get("LIFEOS_HEADLESS", "").lower() in ("1", "true", "yes") or not sys.stdin.isatty():
             raise RuntimeError(
-                f"Google OAuth token for {self.account_type.value} account is expired/revoked "
-                f"and cannot be refreshed in a headless environment. "
-                f"Run interactively: ~/.venvs/lifeos/bin/python scripts/authenticate_google.py"
+                _headless_auth_failure_message(self.account_type.value, refresh_failure_kind)
             )
 
         logger.info(f"Initiating OAuth flow for {self.account_type.value} account")
