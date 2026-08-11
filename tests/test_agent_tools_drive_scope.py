@@ -472,7 +472,7 @@ class TestDriveAccountFailureDisclosure:
         """
         fake_drive.broken = {"personal"}
         out = await _tool_search_drive({"query": "synthetic"})
-        assert "errored" in out
+        assert "returned an error" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
 
     async def test_partial_failure_still_calls_the_answer_incomplete(
@@ -563,7 +563,7 @@ class TestDriveAccountFailureDisclosure:
         }
         out = await _tool_search_drive({"query": "comp planning"})
         assert "rate-limiting" not in out
-        assert "could not complete" in out
+        assert "re-authorising" in out
 
     async def test_failure_note_does_not_quote_the_exception(
         self, fake_drive, accounts
@@ -606,7 +606,7 @@ class TestDriveAccountFailureDisclosure:
         out = await _tool_search_drive({"query": "synthetic"})
         assert out.startswith("Could not search Drive")
         assert "rate-limiting personal" in out
-        assert "work errored" in out
+        assert "work returned an error" in out
 
 
 # ---------------------------------------------------------------------------

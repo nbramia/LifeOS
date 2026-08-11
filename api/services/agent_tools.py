@@ -890,25 +890,27 @@ async def execute_tool_parallel(name: str, tool_input: dict) -> str:
 # Individual tool handlers
 # ---------------------------------------------------------------------------
 
-# Result cap for a vault search. Chosen against the live index, not guessed:
-# ordinary queries have far more than 20 matches ("meeting notes" 50, "project"
-# 48, "kayak trip" 42, "workout" 29), and the extra ones are free — the pipeline
-# fetches `rerank_candidates` (50) candidates whatever top_k says, so top_k=80
-# was measured to return exactly what top_k=50 does. 20 was throwing away
-# ranked, already-retrieved chunks and calling the remainder the answer.
+# Result cap for a vault search. Measured against a real index rather than
+# guessed: ordinary single-word queries return well over 20 matches, and the
+# extra ones are free, because the pipeline fetches `rerank_candidates` (50)
+# candidates whatever top_k says. A cap of 20 was discarding ranked,
+# already-retrieved chunks and presenting the remainder as the answer.
 #
 # 40 rather than 50 because HybridSearch.search only runs the cross-encoder when
 # more candidates survive than top_k asks for (`len(final_results) > top_k`). A
-# default of 50 would silently switch reranking off, and the char budget below
-# would then drop the tail by RRF order rather than by relevance.
+# default at or above `rerank_candidates` would silently switch reranking off,
+# and the char budget below would then drop the tail by RRF order rather than by
+# relevance. _VAULT_TOP_K_MAX is likewise held below that ceiling so a caller
+# cannot cross it either — and so a request can always actually be served.
 _VAULT_TOP_K_DEFAULT = 40
+_VAULT_TOP_K_MAX = 49
 
 # Payload ceiling for the rendered results, in characters, following
 # _MSG_HISTORY_CHAR_BUDGET. Result *count* is a poor cost proxy here: measured
-# over the live index, 50 results cost 15 KB for "therapy" (avg 270 chars of
-# chunk) and 36 KB for "Nathan" (avg 693) — same count, 2.3x the payload. A
-# character budget lets a query with short chunks keep all 40 while a query with
-# full 800-char chunks stays near the ~17 KB worst case the old cap of 20 had.
+# over a real index, the same number of results varied by roughly 2.3x in bytes
+# depending on how long the matched chunks happened to be. A character budget
+# lets a query with short chunks keep the full set, while one with long chunks
+# stays near the worst case the old count-based cap allowed.
 _VAULT_CHAR_BUDGET = 24000
 
 
@@ -918,13 +920,31 @@ def _tool_search_vault(inp: dict) -> str:
     # Normalised like Slack's top_k: the model fills this in, and a 0 or None
     # would return nothing and read as an empty vault — and it doubles as the
     # yardstick for the truncation disclosure below.
-    top_k = _positive_int(inp.get("top_k", _VAULT_TOP_K_DEFAULT), _VAULT_TOP_K_DEFAULT, 200)
+    # Bounded by what the pipeline can actually return, not by an arbitrary
+    # ceiling. A request above `rerank_candidates` could never be served — it
+    # came back at the candidate limit instead, and since the truncation check
+    # compares against the number asked for, a short return read as complete
+    # when it was really ceiling-bound.
+    raw_top_k = inp.get("top_k", _VAULT_TOP_K_DEFAULT)
+    top_k = _positive_int(raw_top_k, _VAULT_TOP_K_DEFAULT, _VAULT_TOP_K_MAX)
+    reduced_note = ""
+    if isinstance(raw_top_k, (int, float, str)):
+        try:
+            if int(raw_top_k) > _VAULT_TOP_K_MAX:
+                reduced_note = (
+                    f" [Asked for top_k={int(raw_top_k)}, reduced to "
+                    f"{_VAULT_TOP_K_MAX} — the search pipeline cannot return more "
+                    "than that for one query, so a larger number would have gone "
+                    "unserved rather than fetched more.]"
+                )
+        except (TypeError, ValueError):
+            pass
     query = inp["query"]
     results = hs.search(query, top_k=top_k)
     if not results:
         # Echo the query: an empty here is a fact about this wording, and the
         # model needs to see what was asked to try a different one.
-        return f"No vault results found for query {query!r}."
+        return f"No vault results found for query {query!r}.{reduced_note}"
     lines = []
     used = 0
     for i, r in enumerate(results, 1):
@@ -943,8 +963,10 @@ def _tool_search_vault(inp: dict) -> str:
     notes = []
     if len(lines) < len(results):
         # Raising top_k cannot help here — the budget, not the count, bound.
+        # The figure names the budget applied to chunk text; separators and this
+        # note itself sit outside it, so the rendered payload is slightly larger.
         notes.append(
-            f"Payload capped at {_VAULT_CHAR_BUDGET} characters — showing the "
+            f"Chunk text capped at {_VAULT_CHAR_BUDGET} characters — showing the "
             f"{len(lines)} highest-ranked of {len(results)} chunks returned. "
             "Narrow the query to spend the budget on fewer, closer notes."
         )
@@ -958,8 +980,8 @@ def _tool_search_vault(inp: dict) -> str:
         )
     body = "\n\n---\n".join(lines)
     if not notes:
-        return body
-    return body + "\n\n[" + " ".join(notes) + "]"
+        return body + reduced_note
+    return body + "\n\n[" + " ".join(notes) + "]" + reduced_note
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +992,14 @@ def _tool_search_vault(inp: dict) -> str:
 # not. Both beat "nothing found", but the difference between them is the
 # difference between waiting and giving up, so the two are reported separately.
 _FAIL_RATE_LIMIT = "rate_limit"
+_FAIL_AUTH = "auth"
 _FAIL_ERROR = "error"
+
+# Statuses that mean "this account's credentials are the problem". Anything else
+# — a 500, a 503, a transport error — is Google's side or the network, and
+# telling the reader to re-authorise for one of those sends them to fix
+# something that isn't broken.
+_AUTH_FAIL_STATUSES = frozenset({401, 403})
 
 # Google's machine reason codes for "too many calls", as returned under the
 # classic 403 error format. Verified against the installed googleapiclient
@@ -1026,29 +1055,47 @@ def _google_failure_kind(exc: Exception) -> str:
             if isinstance(reason, str) and reason.lower() in _RATE_LIMIT_REASONS:
                 return _FAIL_RATE_LIMIT
 
+    # A credentials problem is the only failure that re-authorising fixes. A 500
+    # or 503 is Google's side and clears on its own, so naming it an auth
+    # problem sends the reader to repair something that is not broken.
+    if status in _AUTH_FAIL_STATUSES:
+        return _FAIL_AUTH
+
     return _FAIL_ERROR
 
 
 def _failure_causes(failures: dict[str, str]) -> str:
     """Name the failing accounts and the failure category — never the payload.
 
-    `failures` maps account name to a _FAIL_* category. Rate-limited accounts
-    are grouped separately from the rest so the reader learns the data is
-    probably there and the retry is worth making.
+    `failures` maps account name to a _FAIL_* category. Each category gets its
+    own clause, because the remedy differs and naming the wrong one sends the
+    reader to fix something that is not broken: a rate limit clears by waiting,
+    a credentials failure needs re-authorising, and a server-side error needs
+    neither. Only what the status actually establishes is claimed.
     """
     limited = [a for a, kind in failures.items() if kind == _FAIL_RATE_LIMIT]
-    errored = [a for a, kind in failures.items() if kind != _FAIL_RATE_LIMIT]
+    auth = [a for a, kind in failures.items() if kind == _FAIL_AUTH]
+    errored = [
+        a for a, kind in failures.items()
+        if kind not in (_FAIL_RATE_LIMIT, _FAIL_AUTH)
+    ]
     parts = []
     if limited:
         parts.append(
             f"Google is rate-limiting {', '.join(limited)}, so the data is very "
             "likely there and trying again shortly should reach it"
         )
-    if errored:
-        subject = "those accounts" if len(errored) > 1 else "that account"
+    if auth:
+        subject = "those accounts" if len(auth) > 1 else "that account"
         parts.append(
-            f"{', '.join(errored)} errored, so the search could not complete "
-            f"there and {subject} may need re-authorising"
+            f"{', '.join(auth)} rejected the credentials, so {subject} likely "
+            "needs re-authorising"
+        )
+    if errored:
+        parts.append(
+            f"{', '.join(errored)} returned an error, so the search could not "
+            "complete there — the cause is on Google's side or the network "
+            "rather than anything to fix here, and it may clear on a retry"
         )
     return "; ".join(parts)
 
@@ -1110,12 +1157,23 @@ async def _tool_search_calendar(inp: dict) -> str:
     # ±180d rung and then failed at ±365d did establish something.
     searched: set[str] = set()
     account_count = 0
+    # Whether any account completed the window most recently attempted, as
+    # opposed to any window at all.
+    rung_responded = False
 
     def _fetch(search_range: int | None) -> list:
-        """Collect events from every configured account for one window."""
-        nonlocal account_count
+        """Collect events from every configured account for one window.
+
+        Sets `rung_responded` for the window just attempted. That is distinct
+        from the cumulative `searched` set: an earlier rung can have succeeded
+        while this one reached nobody, and claiming this window was searched on
+        the strength of an earlier one is exactly the kind of unearned assertion
+        this module exists to avoid.
+        """
+        nonlocal account_count, rung_responded
         events = []
         account_count = 0
+        rung_responded = False
         for account in get_configured_accounts():
             account_count += 1
             if account.value in failures:
@@ -1139,6 +1197,7 @@ async def _tool_search_calendar(inp: dict) -> str:
                 else:
                     events.extend(cal.get_upcoming_events(days=7, max_results=15))
                 searched.add(account.value)
+                rung_responded = True
             except Exception as e:
                 logger.warning(f"Calendar {account.value} error: {e}")
                 failures[account.value] = _google_failure_kind(e)
@@ -1149,11 +1208,15 @@ async def _tool_search_calendar(inp: dict) -> str:
     windows_tried: list[str] = []
     if query and days_range:
         all_events = _fetch(days_range)
-        windows_tried.append(f"±{days_range}d")
+        if rung_responded:
+            windows_tried.append(f"±{days_range}d")
     elif query:
         for days in _CALENDAR_LADDER_DAYS:
             all_events = _fetch(days)
-            windows_tried.append(f"±{days}d")
+            # Only a window some account actually completed goes on the list.
+            # Otherwise the empty-result note names a span nobody looked at.
+            if rung_responded:
+                windows_tried.append(f"±{days}d")
             if all_events:
                 break
             # Every account has now errored, so there is nobody left to ask.
@@ -2517,15 +2580,15 @@ def _workout_update(inp: dict) -> str:
 # Session cap for `list`, and the ceiling on a caller-supplied one.
 #
 # 10 was set the day the workout store was written, before it held a month of
-# real training, and it undercounts an ordinary month: the log holds 16 sessions
-# in June 2026 and 18 in its densest 30-day window, so "how did June go" was
-# answered from 10 of 16 with nothing saying so. 50 is the store's own
-# list_sessions default, covers the densest measured month nearly 3x, and covers
-# a full quarter at the June 2026 rate (~16/month) — the widest span worth
+# real training, and it undercounts an ordinary month: a measured log held more
+# than 10 sessions in a single month, so "how did that month go" was answered
+# from part of the record with nothing saying so. 50 is the store's own
+# list_sessions default, covers the densest measured month several times over,
+# and covers a full quarter at the measured rate — the widest span worth
 # enumerating session by session.
 #
 # A count is an honest cost proxy at this shape, unlike the vault chunks above:
-# one line per session, measured at ~96 characters over the real log and 172 at
+# one line per session, measured at roughly 100 characters and under 200 at
 # worst, so 50 sessions is ~5 KB. The 200 ceiling bounds a caller-supplied
 # request to ~34 KB and still spans the whole 125-session log.
 _WORKOUT_LIST_LIMIT = 50
@@ -2648,12 +2711,12 @@ def _workout_log_metric(inp: dict) -> str:
 
 
 # Sample cap for `metrics`. A metric question is a trend question, and its
-# natural span is a year: 365 is a year of the cumulative path (one row per day)
-# and about sixteen months of HRV at the measured 275 samples a year, where the
-# old 100 was under four months of either. Body weight, sleep and resting HR
-# arrive at most daily in the real record, so a year of those fits with room.
-# One row is a date and a number, ~30 characters, so 365 rows is ~11 KB and the
-# 1000 ceiling bounds a caller-supplied request to ~30 KB.
+# natural span is a year: 365 covers a year of the cumulative path (one row per
+# day) and over a year of the densest measured metric, where the old 100 was
+# under four months of either. The metrics that arrive at most daily fit a year
+# with room to spare. One row is a date and a number, ~30 characters, so 365
+# rows is ~11 KB and the 1000 ceiling bounds a caller-supplied request to
+# ~30 KB.
 _WORKOUT_METRICS_LIMIT = 365
 _WORKOUT_METRICS_MAX = 1000
 

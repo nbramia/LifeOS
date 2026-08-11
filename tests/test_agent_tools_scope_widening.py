@@ -1202,7 +1202,7 @@ class TestCalendarAccountFailureDisclosure:
         """
         broken_calendar.raising = {"personal"}
         out = await _tool_search_calendar({"query": "standup"})
-        assert "errored" in out
+        assert "returned an error" in out
         assert any(word in out.lower() for word in FAULT_WORDS)
 
     # -- API failures, not just credential failures (issue #536) -------------
@@ -1270,7 +1270,7 @@ class TestCalendarAccountFailureDisclosure:
         }
         out = await _tool_search_calendar({"query": "standup"})
         assert "rate-limiting" not in out
-        assert "could not complete" in out
+        assert "re-authorising" in out
 
     async def test_failure_note_does_not_quote_the_exception(
         self, broken_calendar, accounts
@@ -1389,7 +1389,7 @@ class TestCalendarAccountFailureDisclosure:
         assert "personal" in out and "work" in out
         # Both categories named, neither collapsed into the other.
         assert "rate-limiting personal" in out
-        assert "work errored" in out
+        assert "work returned an error" in out
 
     async def test_the_ladder_stops_once_every_account_has_failed(
         self, broken_calendar, accounts
@@ -1731,3 +1731,88 @@ class TestCalendarTotalAccountFailure:
         await _tool_search_calendar({"query": "standup"})
         assert flaky_calendar.attempts == 1
 
+
+
+class TestFailureAttribution:
+    """The remedy named must be the one the status actually establishes.
+
+    An earlier version grouped every non-rate-limit failure together and always
+    suggested re-authorising. For a 500 or 503 that is a wrong remedy — the fault
+    is on Google's side and clears on its own — so it sent the reader to repair
+    credentials that were working. Same defect class as the rest of this file: a
+    cause asserted that the code had not established.
+    """
+
+    @pytest.fixture
+    def failing_calendar(self, monkeypatch, accounts):
+        state = SimpleNamespace(error=None)
+
+        class FailingCalendarService:
+            def __init__(self, account, *, raise_on_api_error=False):
+                self.strict = raise_on_api_error
+
+            def search_events(self, query=None, days_back=30, days_forward=30, **kw):
+                if self.strict and state.error is not None:
+                    raise state.error
+                return []
+
+            def get_events_in_range(self, start, end):
+                return []
+
+            def get_upcoming_events(self, days=7, max_results=15):
+                return []
+
+        monkeypatch.setattr(
+            "api.services.calendar.CalendarService", FailingCalendarService
+        )
+        return state
+
+    async def _out(self, state, error):
+        state.error = error
+        return await _tool_search_calendar({"query": "standup"})
+
+    @pytest.mark.parametrize("status,reason", [(429, ""), (403, "rateLimitExceeded")])
+    async def test_rate_limit_says_the_data_is_probably_there(
+        self, failing_calendar, status, reason
+    ):
+        out = await self._out(failing_calendar, _http_error(status, reason))
+        assert "rate-limiting" in out
+        assert "re-authorising" not in out
+
+    @pytest.mark.parametrize("status,reason", [(403, "forbidden"), (401, "")])
+    async def test_credential_failure_names_re_authorising(
+        self, failing_calendar, status, reason
+    ):
+        out = await self._out(failing_calendar, _http_error(status, reason))
+        assert "re-authorising" in out
+        assert "rate-limiting" not in out
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_server_error_is_not_blamed_on_credentials(
+        self, failing_calendar, status
+    ):
+        """The specific wrong remedy this class exists to prevent."""
+        out = await self._out(failing_calendar, _http_error(status))
+        assert "re-authorising" not in out
+        assert "Google's side" in out
+
+    async def test_server_error_still_reports_a_failure_not_an_absence(
+        self, failing_calendar
+    ):
+        out = await self._out(failing_calendar, _http_error(503))
+        assert "Nothing on the calendar matches" not in out
+        assert "could not" in out.lower()
+
+    async def test_daily_quota_is_not_promised_to_clear_shortly(
+        self, failing_calendar
+    ):
+        """A daily cap will not clear 'shortly', so it must not read as a rate limit."""
+        out = await self._out(failing_calendar, _http_error(403, "dailyLimitExceeded"))
+        assert "trying again shortly" not in out
+
+    async def test_the_exception_payload_never_reaches_the_output(
+        self, failing_calendar
+    ):
+        secret = "SYNTHETIC-sensitive-payload-do-not-echo"
+        out = await self._out(failing_calendar, _http_error(500, message=secret))
+        assert secret not in out

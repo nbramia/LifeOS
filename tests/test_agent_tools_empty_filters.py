@@ -37,6 +37,7 @@ from api.services import agent_tools
 from api.services.agent_tools import (
     _VAULT_CHAR_BUDGET,
     _VAULT_TOP_K_DEFAULT,
+    _VAULT_TOP_K_MAX,
     _WORKOUT_HISTORY_LIMIT,
     _WORKOUT_LIST_LIMIT,
     _WORKOUT_METRICS_LIMIT,
@@ -510,7 +511,7 @@ class TestSearchVaultCap:
         # another, which is why the ceiling is characters and not count.
         fake_vault.results = [vault_chunk(i, content_len=800) for i in range(_VAULT_TOP_K_DEFAULT)]
         out = _tool_search_vault({"query": "kayak portage checklist"})
-        assert f"Payload capped at {_VAULT_CHAR_BUDGET} characters" in out
+        assert f"Chunk text capped at {_VAULT_CHAR_BUDGET} characters" in out
         assert f"of {_VAULT_TOP_K_DEFAULT} chunks returned" in out
         # Both bounds bound here, and both are facts the model needs: the count
         # cap means more exist beyond these 40, the budget means fewer than 40 are
@@ -525,7 +526,7 @@ class TestSearchVaultCap:
         monkeypatch.setattr(agent_tools, "_VAULT_CHAR_BUDGET", 700)
         fake_vault.results = [vault_chunk(i, content_len=300) for i in range(5)]
         out = _tool_search_vault({"query": "kayak portage checklist"})
-        assert "Payload capped at 700 characters" in out
+        assert "Chunk text capped at 700 characters" in out
         assert "of 5 chunks returned" in out
         kept = [i for i in range(5) if f"chunk-{i:03d}" in out]
         # Highest-ranked first, contiguous from the top, and each kept chunk whole.
@@ -565,3 +566,46 @@ class TestAppliedFilters:
         assert _applied_filters(date_start="2026-06-01", date_end="2026-06-30") == [
             "dates 2026-06-01 to 2026-06-30",
         ]
+
+
+class TestVaultUnreachableTopK:
+    """A request the pipeline cannot serve must not read as a complete answer.
+
+    `HybridSearch` fetches `rerank_candidates` candidates regardless of `top_k`,
+    so a larger `top_k` was never served — it came back at the candidate limit.
+    Because the truncation check compares against the number *asked for*, a short
+    return then read as complete when it was really ceiling-bound. The accepted
+    value is now held below that ceiling, which also keeps the cross-encoder on.
+    """
+
+    def test_the_max_stays_below_the_rerank_candidate_ceiling(self):
+        """At or above it, HybridSearch silently stops reranking."""
+        import inspect
+        from api.services.hybrid_search import HybridSearch
+
+        candidates = inspect.signature(HybridSearch.search).parameters[
+            "rerank_candidates"
+        ].default
+        assert _VAULT_TOP_K_MAX < candidates
+        assert _VAULT_TOP_K_DEFAULT < candidates
+
+    def test_an_unreachable_request_is_reduced_and_disclosed(self, fake_vault):
+        out = _tool_search_vault({"query": "kayak", "top_k": 500})
+        assert fake_vault.calls[-1]["top_k"] == _VAULT_TOP_K_MAX
+        assert "reduced to" in out
+        assert "would have gone unserved" in out
+
+    def test_a_reachable_request_is_passed_through_unreduced(self, fake_vault):
+        out = _tool_search_vault({"query": "kayak", "top_k": 12})
+        assert fake_vault.calls[-1]["top_k"] == 12
+        assert "reduced to" not in out
+
+    def test_the_default_is_not_reported_as_reduced(self, fake_vault):
+        out = _tool_search_vault({"query": "kayak"})
+        assert "reduced to" not in out
+
+    def test_a_garbled_top_k_is_not_reported_as_reduced(self, fake_vault):
+        """Absent or unusable is not the same as "you asked for too much"."""
+        for bad in (None, "lots", [], 0):
+            out = _tool_search_vault({"query": "kayak", "top_k": bad})
+            assert "reduced to" not in out, f"{bad!r} reported as a reduction"
