@@ -1034,6 +1034,38 @@ def _is_transient_failure(error_text: str | None) -> bool:
     return bool(_TRANSIENT_ERROR_RE.search(error_text))
 
 
+# Counter fields that get merged across a retry campaign (see
+# `_merge_campaign_stats` and its call sites in run_sync). If attempt 1 does
+# real work and then fails partway with a transient error, the sources are
+# idempotent (see the idempotence note above MAX_SYNC_RETRIES) so attempt 2
+# legitimately re-processes the same window and reports near-zero new
+# counters for rows attempt 1 already wrote. Recording only the final
+# attempt's numbers would under-report — or even zero out — a run that
+# actually did work, and `_detect_yield_collapse`/the consecutive-zero-run
+# streak read exactly these fields. Taking the max observed for each field
+# across every attempt in the campaign guarantees a success-after-retry
+# never reports less than the most any single attempt already achieved.
+# (Mirrors `_run_yield`'s own reasoning: these fields overlap by
+# construction, so max is the right merge — summing would double-count.)
+_MERGEABLE_STAT_FIELDS = (
+    "processed", "created", "updated", "errors",
+    "people_created", "people_updated",
+    "interactions_created", "source_entities_created",
+)
+
+
+def _merge_campaign_stats(campaign_stats: dict, attempt_stats: dict) -> None:
+    """Update ``campaign_stats`` in place with the elementwise max of each
+    mergeable field against ``attempt_stats``. Non-numeric/attempt-specific
+    keys (e.g. ``skipped_reason``, ``duration_collapse``) are untouched —
+    those describe the attempt that produced the final outcome, not the
+    campaign as a whole.
+    """
+    for field in _MERGEABLE_STAT_FIELDS:
+        if field in attempt_stats:
+            campaign_stats[field] = max(campaign_stats.get(field, 0), attempt_stats.get(field, 0) or 0)
+
+
 def _execute_sync_once(source: str, script_path: str, args: list, full_path: Path) -> dict:
     """Run exactly one subprocess attempt for ``source``.
 
@@ -1196,6 +1228,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
     max_attempts = MAX_SYNC_RETRIES + 1
+    # Running max of each counter field across every attempt in this
+    # campaign — see `_merge_campaign_stats` for why this can't just be the
+    # last attempt's numbers.
+    campaign_stats: dict = {}
 
     try:
         logger.info(f"Starting sync for {source}...")
@@ -1213,8 +1249,13 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             outcome = _execute_sync_once(source, script_path, args, full_path)
             attempt_elapsed_seconds = time.monotonic() - attempt_started_monotonic
 
+            _merge_campaign_stats(campaign_stats, outcome["stats"])
+
             if outcome["success"]:
                 stats = outcome["stats"]
+                # Counter fields reflect the whole campaign's max, not just
+                # this attempt — see _merge_campaign_stats.
+                stats.update(campaign_stats)
 
                 # Check for duration collapse BEFORE recording completion, so
                 # the current run (still status=running) can't contaminate
@@ -1330,6 +1371,10 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 logger.error(f"{source}: giving up after {attempt} attempts")
 
             stats = outcome["stats"]
+            # Even on a terminal failure, an earlier attempt may have done
+            # real (idempotent) work before this one failed — don't let the
+            # last attempt's numbers erase that from the record.
+            stats.update(campaign_stats)
             record_sync_complete(
                 run_id,
                 SyncStatus.FAILED,
@@ -1357,6 +1402,52 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             log_error_to_markdown(source, outcome["markdown_message"], outcome["error_type"])
 
             return False, {"error": outcome["health_message"], **stats}
+
+    except Exception as e:
+        # `_execute_sync_once` already catches everything the subprocess
+        # attempt itself can raise (adversarial review finding #1: that
+        # helper's own try/except covers TimeoutExpired and Exception). This
+        # guards the orchestration *around* it instead — duration/yield
+        # detection, and the record_sync_error/record_sync_complete calls —
+        # since a locked sync_health.db (this host runs many agents against
+        # it concurrently) is a realistic way for one of those to raise.
+        # Before the retry refactor, `run_sync` had exactly this guard
+        # around its single subprocess call; losing it here would mean one
+        # source's DB hiccup takes down the entire nightly pipeline instead
+        # of just that source, since run_all_syncs has no exception guard of
+        # its own around each run_sync call.
+        error_msg = str(e)
+        tb = traceback.format_exc()
+        logger.error(f"Sync orchestration exception for {source}: {error_msg}")
+        logger.error(tb)
+
+        # Best-effort — the DB write is exactly what may be failing right
+        # now (mirrors the same pattern already used in _handle_sigterm).
+        try:
+            record_sync_complete(
+                run_id,
+                SyncStatus.FAILED,
+                errors=1,
+                error_message=error_msg[:500],
+            )
+        except Exception:
+            pass
+        _active_run_id = None
+        try:
+            record_sync_error(
+                source,
+                error_msg,
+                error_type=type(e).__name__,
+                stack_trace=tb,
+            )
+        except Exception:
+            pass
+        try:
+            log_error_to_markdown(source, f"{error_msg}\n\n{tb}", type(e).__name__)
+        except Exception:
+            pass
+
+        return False, {"error": error_msg}
 
     finally:
         _active_run_id = None
