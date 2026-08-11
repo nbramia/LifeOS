@@ -179,5 +179,8 @@ def test_native_codex_skill_path_removed():
 
     agents_skills = Path(__file__).resolve().parent.parent / ".agents" / "skills"
     retired = {"implement", "draft-issue", "pr-check", "merge-pr", "review-pr", "address-review"}
-    existing = {p.name for p in agents_skills.iterdir() if p.is_dir()}
+    # A missing `.agents/skills/` (e.g. a future cleanup removes the directory
+    # entirely) satisfies "these six are absent" just as well as an existing
+    # directory that lacks them — don't let iterdir() on a gone path fail the test.
+    existing = {p.name for p in agents_skills.iterdir() if p.is_dir()} if agents_skills.is_dir() else set()
     assert not (existing & retired), f"retired lifecycle skills still present: {existing & retired}"
