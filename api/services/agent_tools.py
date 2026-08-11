@@ -870,6 +870,11 @@ def _tool_search_vault(inp: dict) -> str:
 # one-off events from previous years that the old fixed ±180d silently hid.
 _CALENDAR_LADDER_DAYS = (180, 365, 1095)
 
+# Ceiling for a caller-supplied days_range — a century either side of today,
+# far beyond any real calendar and well short of the OverflowError that
+# timedelta(days=...) raises on absurd values.
+_CALENDAR_MAX_DAYS = 36500
+
 
 async def _tool_search_calendar(inp: dict) -> str:
     from api.services.calendar import CalendarService
@@ -882,6 +887,12 @@ async def _tool_search_calendar(inp: dict) -> str:
     # empty for a search that never validly ran. Treat it as unstated (so the
     # ladder applies) and say the value was dropped, rather than clamping it to
     # some nearby number the caller never asked for.
+    # The upper bound matters as much as the lower one: search_events does
+    # `now - timedelta(days=days_back)`, which raises OverflowError past a few
+    # million days. That would land in the per-account handler below and get
+    # reported as an unreachable account needing re-authorisation — a bad
+    # argument blamed on expired credentials, which is this same misdiagnosis
+    # in a new costume.
     raw_range = inp.get("days_range")
     days_range = None
     if raw_range is not None:
@@ -889,11 +900,12 @@ async def _tool_search_calendar(inp: dict) -> str:
             days_range = int(raw_range)
         except (TypeError, ValueError):
             days_range = None
-        if days_range is not None and days_range < 1:
+        if days_range is not None and not 1 <= days_range <= _CALENDAR_MAX_DAYS:
             days_range = None
     bad_range = (
-        f" [Ignored days_range={raw_range!r} — must be a positive whole number "
-        "of days, so this result is NOT scoped to it.]"
+        f" [Ignored days_range={raw_range!r} — must be a whole number of days "
+        f"between 1 and {_CALENDAR_MAX_DAYS}, so this result is NOT scoped to "
+        "it.]"
         if raw_range is not None and days_range is None
         else ""
     )
@@ -2308,10 +2320,21 @@ async def _tool_search_finances(inp: dict) -> str:
                 window_end = datetime.now().strftime("%Y-%m-%d")
             elif window_end and not window_start:
                 window_start = "1900-01-01"
+            # `category` is deliberately NOT passed down. The client applies it
+            # client-side *after* the row cap (monarch.py), so a capped fetch
+            # would hand back a filtered handful and hide the fact that the cap
+            # bound at all. Filtering here keeps the cap and the filter on the
+            # same side, so the pre-filter row count stays knowable.
             return await client.get_transactions(
                 start_date=window_start, end_date=window_end,
-                search=search, category=category, limit=_TXN_ROW_CAP,
+                search=search, limit=_TXN_ROW_CAP,
             )
+
+        def _by_category(rows: list) -> list:
+            if not category:
+                return rows
+            wanted = category.lower()
+            return [r for r in rows if (r.get("category") or "").lower() == wanted]
 
         # An explicit start_date is an intentional constraint — answer exactly
         # that window. With none, walk the ladder rather than silently clamping
@@ -2324,8 +2347,11 @@ async def _tool_search_finances(inp: dict) -> str:
         anchor = _parse_ymd(end) or datetime.now()
         anchored = " before " + anchor.strftime("%Y-%m-%d") if _parse_ymd(end) else ""
         windows_tried: list[str] = []
+        capped = False
         if start:
-            txns = await _fetch(start)
+            fetched = await _fetch(start)
+            capped = len(fetched) >= _TXN_ROW_CAP
+            txns = _by_category(fetched)
         else:
             for days in _TXN_LADDER_DAYS:
                 window_start = (
@@ -2333,14 +2359,35 @@ async def _tool_search_finances(inp: dict) -> str:
                     if days
                     else None
                 )
-                txns = await _fetch(window_start)
+                fetched = await _fetch(window_start)
+                capped = len(fetched) >= _TXN_ROW_CAP
+                txns = _by_category(fetched)
                 windows_tried.append(
                     f"last {days}d{anchored}" if days else f"all history{anchored}"
                 )
                 if txns:
                     break
+                # Rows come back newest-first, so once a window fills the cap the
+                # wider rungs return that same newest page — they can only add
+                # older rows the cap already excluded. Continuing would burn API
+                # calls and, worse, let the note claim "all history" was searched
+                # when it never got past the cap.
+                if capped:
+                    break
 
         if not txns:
+            # A capped fetch means absence was never established: the filter ran
+            # over one page, not the window. Claiming "no transactions on record"
+            # here is the original misdiagnosis wearing a different hat.
+            if capped:
+                scope = f" in category {category!r}" if category else ""
+                return (
+                    _exhausted_note("transactions", windows_tried)
+                    + f" Nothing{scope} in the {_TXN_ROW_CAP} most recent rows of "
+                    "that window, but the window holds more than that — this is "
+                    "NOT a confirmed absence. Narrow with start_date/end_date, or "
+                    "use a search term, to look past the cap." + dropped_note
+                )
             if search:
                 hint = f"Nothing matched {search!r} — retry without the search term."
             elif start:
@@ -2352,11 +2399,11 @@ async def _tool_search_finances(inp: dict) -> str:
             return _exhausted_note("transactions", windows_tried, hint) + dropped_note
 
         capped_note = ""
-        if len(txns) >= _TXN_ROW_CAP:
+        if capped:
             capped_note = (
-                f" [Capped at {_TXN_ROW_CAP} rows — older matches in this window "
-                "were dropped. Narrow with start_date/end_date or a search term "
-                "to see them.]"
+                f" [Fetched the {_TXN_ROW_CAP} most recent rows in this window and "
+                "older ones were dropped, so this may be incomplete. Narrow with "
+                "start_date/end_date or a search term to see past the cap.]"
             )
         lines = [
             f"{len(txns)} transactions{_ladder_note(windows_tried)}:"

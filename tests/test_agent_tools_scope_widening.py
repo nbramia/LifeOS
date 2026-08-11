@@ -21,6 +21,7 @@ import pytest
 import api.services.agent_tools as at
 from api.services.agent_tools import (
     _CALENDAR_LADDER_DAYS,
+    _CALENDAR_MAX_DAYS,
     _positive_int,
     _TXN_LADDER_DAYS,
     _TXN_ROW_CAP,
@@ -260,13 +261,14 @@ class TestFinancesRowCap:
     async def test_cap_is_disclosed_when_hit(self, fake_monarch):
         fake_monarch.txns = self._overflowing_window()
         out = await _transactions()
-        assert f"Capped at {_TXN_ROW_CAP} rows" in out
-        assert "older matches" in out
+        assert f"Fetched the {_TXN_ROW_CAP} most recent rows" in out
+        assert "may be incomplete" in out
+        assert "older ones were dropped" in out
 
     async def test_no_cap_note_below_the_cap(self, fake_monarch):
         fake_monarch.txns = [_txn(i + 1, f"Merchant {i:04d}", -1.00) for i in range(5)]
         out = await _transactions()
-        assert "Capped at" not in out
+        assert "most recent rows" not in out
 
     async def test_cap_drops_the_oldest_rows_not_the_newest(self, fake_monarch):
         """The note claims the oldest go first, which only holds if rows arrive newest-first."""
@@ -276,7 +278,8 @@ class TestFinancesRowCap:
         ]
         out = await _transactions()
         assert "Newest Marker Shop" in out
-        assert f"Capped at {_TXN_ROW_CAP} rows" in out
+        assert f"Fetched the {_TXN_ROW_CAP} most recent rows" in out
+        assert "may be incomplete" in out
 
 
 class TestFinancesExplicitScope:
@@ -1230,3 +1233,114 @@ class TestPositiveIntHelper:
 
     def test_value_inside_bounds_is_unchanged(self):
         assert _positive_int(50, 15, 100) == 50
+
+
+class TestFinancesCategoryRowCapInteraction:
+    """`category` is filtered client-side, downstream of the row cap.
+
+    api/services/monarch.py sends limit/search/dates to the API but applies the
+    category filter to the returned page. So a window dense enough to fill the
+    cap yields a filtered handful drawn from only the newest N rows — and every
+    wider ladder rung re-fetches that same newest page, since wider windows can
+    only add older rows the cap already excluded. Before this was handled, a
+    category with no recent activity produced "There are no transactions on
+    record in category 'X'" over data that was present: the original
+    misdiagnosis, reintroduced through the cap.
+    """
+
+    def _dense_recent(self, n: int = _TXN_ROW_CAP + 100) -> list:
+        """More rows than the cap, all inside the first ladder rung."""
+        return [_txn(i % 80 + 1, f"Merchant {i:04d}", -1.00) for i in range(n)]
+
+    async def test_category_is_not_pushed_down_to_the_client(self, fake_monarch):
+        """Filtering must happen where the cap is visible, or it can't be disclosed."""
+        fake_monarch.txns = self._dense_recent()
+        await _transactions(category="Veterinary")
+        assert fake_monarch.calls
+        assert all(call["category"] is None for call in fake_monarch.calls)
+
+    async def test_capped_miss_is_not_reported_as_confirmed_absence(self, fake_monarch):
+        fake_monarch.txns = self._dense_recent() + [
+            _txn(800, "Cedar Veterinary Clinic", -240.00, category="Veterinary")
+        ]
+        out = await _transactions(category="Veterinary")
+        assert "There are no transactions on record" not in out
+        assert "NOT a confirmed absence" in out
+
+    async def test_capped_miss_names_the_cap_and_the_category(self, fake_monarch):
+        fake_monarch.txns = self._dense_recent()
+        out = await _transactions(category="Veterinary")
+        assert f"{_TXN_ROW_CAP} most recent rows" in out
+        assert "'Veterinary'" in out
+
+    async def test_capped_miss_does_not_claim_windows_it_never_reached(self, fake_monarch):
+        """Once a rung fills the cap, wider rungs are pointless — and claiming
+        them would say all history was searched when it never got past one page.
+        """
+        fake_monarch.txns = self._dense_recent()
+        out = await _transactions(category="Veterinary")
+        assert len(fake_monarch.calls) == 1
+        assert "all history" not in out
+
+    async def test_capped_miss_avoids_fault_language(self, fake_monarch):
+        fake_monarch.txns = self._dense_recent()
+        out = (await _transactions(category="Veterinary")).lower()
+        for word in FAULT_WORDS:
+            assert word not in out, f"capped miss implies a fault: {word!r}"
+
+    async def test_uncapped_absence_is_still_stated_confidently(self, fake_monarch):
+        """The honest-absence path must survive: a sparse window proves absence."""
+        fake_monarch.txns = [_txn(5, "Nimbus Cleaners", -18.00)]
+        out = await _transactions(category="Veterinary")
+        assert "There are no transactions on record" in out
+        assert "NOT a confirmed absence" not in out
+
+    async def test_category_hit_inside_the_cap_is_returned(self, fake_monarch):
+        fake_monarch.txns = [
+            _txn(5, "Cedar Veterinary Clinic", -240.00, category="Veterinary"),
+            _txn(6, "Nimbus Cleaners", -18.00),
+        ]
+        out = await _transactions(category="Veterinary")
+        assert "Cedar Veterinary Clinic" in out
+        assert "Nimbus Cleaners" not in out
+
+    async def test_category_match_is_case_insensitive(self, fake_monarch):
+        fake_monarch.txns = [
+            _txn(5, "Cedar Veterinary Clinic", -240.00, category="Veterinary")
+        ]
+        out = await _transactions(category="veterinary")
+        assert "Cedar Veterinary Clinic" in out
+
+
+class TestCalendarDaysRangeUpperBound:
+    """A huge days_range must not be blamed on the account.
+
+    search_events does `now - timedelta(days=days_back)`, which raises
+    OverflowError past a few million days. That lands in the per-account handler
+    and — now that the handler speaks up instead of staying silent — was reported
+    as an account needing re-authorisation. A bad argument dressed as expired
+    credentials is this same misdiagnosis in a new costume.
+    """
+
+    @pytest.mark.parametrize("huge", [_CALENDAR_MAX_DAYS + 1, 10**9, 4 * 10**8])
+    async def test_absurd_range_is_rejected_not_sent(self, fake_calendar, huge):
+        out = await _tool_search_calendar({"query": "standup", "days_range": huge})
+        assert [s["days_back"] for s in fake_calendar.searches] == list(
+            _CALENDAR_LADDER_DAYS
+        )
+        assert "Ignored days_range" in out
+
+    async def test_absurd_range_is_not_blamed_on_the_account(self, fake_calendar):
+        out = await _tool_search_calendar({"query": "standup", "days_range": 10**9})
+        assert "Could not reach" not in out
+        assert "re-authorising" not in out
+
+    async def test_the_bound_itself_is_still_accepted(self, fake_calendar):
+        await _tool_search_calendar(
+            {"query": "standup", "days_range": _CALENDAR_MAX_DAYS}
+        )
+        assert [s["days_back"] for s in fake_calendar.searches] == [_CALENDAR_MAX_DAYS]
+
+    async def test_bound_does_not_overflow_timedelta(self):
+        """The ceiling must be safely below where timedelta gives out."""
+        assert datetime.now(timezone.utc) - timedelta(days=_CALENDAR_MAX_DAYS)
