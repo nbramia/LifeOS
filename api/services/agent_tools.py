@@ -281,7 +281,10 @@ TOOL_DEFINITIONS = [
             "Look up a person or generate a comprehensive briefing. "
             "Use 'lookup' for any query mentioning a person — returns entity_id, emails, phones, "
             "relationship strength, days since last contact, interaction counts per channel (90 days), "
-            "and known facts. Use 'briefing' for meeting prep or deep dives."
+            "and known facts (highest-confidence first; the output says so when it truncates). "
+            "Use 'briefing' for meeting prep or deep dives — it searches the last 90 days of "
+            "interactions and widens automatically if that window is empty; pass interaction_days "
+            "to pin a specific window instead."
         ),
         "input_schema": {
             "type": "object",
@@ -298,6 +301,15 @@ TOOL_DEFINITIONS = [
                 "email": {
                     "type": "string",
                     "description": "Person's email (optional, improves briefing accuracy).",
+                },
+                "interaction_days": {
+                    "type": "integer",
+                    "description": (
+                        "Briefing only: interaction lookback in days (1-3650). Omit "
+                        "unless the user named a period — omitted means 90 days, "
+                        "widening to a year then all history if that is empty. A "
+                        "value here is honoured exactly, with no widening."
+                    ),
                 },
             },
             "required": ["action", "name"],
@@ -1510,15 +1522,33 @@ def _split_to_budget(imsg_text: str, wa_text: str) -> tuple[str, str, bool]:
 
 # -- People helpers --
 
+# Facts shown by person_info(lookup). Doubles as the yardstick for the truncation
+# disclosure below, so it must be a real number rather than a bare slice.
+_PERSON_FACT_LIMIT = 15
+
+# Upper bound on a caller-supplied briefing window. The interaction index spans
+# about ten years, so anything past this is not a window the data can honour.
+_BRIEFING_MAX_DAYS = 3650
+
+
 def _lookup_person(inp: dict) -> str:
     from api.services.entity_resolver import get_entity_resolver
     from api.services.relationship_summary import get_relationship_summary, format_relationship_context
-    from api.services.person_facts import get_person_fact_store
+    from api.services.person_facts import get_person_fact_store, rank_facts
 
     resolver = get_entity_resolver()
-    result = resolver.resolve(name=inp["name"])
+    name = inp["name"]
+    result = resolver.resolve(name=name)
     if not result or not result.entity:
-        return f"No person found matching '{inp['name']}'."
+        # Name the term searched: the model needs to tell "that spelling didn't
+        # match" from "this person isn't in the index" before it decides whether
+        # to retry, and downstream tools depend on the entity_id this returns.
+        return (
+            f"No person found matching '{name}'. That exact term was searched "
+            "against the people index and nothing matched it closely enough to be "
+            "treated as the same person. Try a fuller name, a different spelling, "
+            "or pass the person's email address."
+        )
 
     entity = result.entity
     parts = [f"**{entity.canonical_name}** (entity_id: {entity.id})"]
@@ -1538,23 +1568,65 @@ def _lookup_person(inp: dict) -> str:
     if rel:
         parts.append(format_relationship_context(rel))
 
-    # Person facts
+    # Person facts. Ranked by confidence rather than the store's category/key
+    # order: an alphabetical cut can drop "family: spouse" for a work fact purely
+    # on spelling, and the model then answers that it doesn't know.
     fact_store = get_person_fact_store()
-    facts = fact_store.get_for_person(entity.id)
+    facts = rank_facts(fact_store.get_for_person(entity.id))
     if facts:
-        fact_lines = [f"- {f.category}: {f.key} = {f.value}" for f in facts[:15]]
-        parts.append("Known facts:\n" + "\n".join(fact_lines))
+        shown = facts[:_PERSON_FACT_LIMIT]
+        header = "Known facts:"
+        if len(facts) > len(shown):
+            header = (
+                f"Known facts ({len(shown)} of {len(facts)} shown, "
+                "highest-confidence first; the rest were truncated for length — "
+                "ask for a specific category to see more):"
+            )
+        parts.append(header + "\n" + "\n".join(
+            f"- {f.category}: {f.key} = {f.value}" for f in shown
+        ))
 
     return "\n\n".join(parts)
 
 
 async def _briefing_person(inp: dict) -> str:
     from api.services.briefings import get_briefings_service
+
+    # A window is a scope, not a cap: clamping a nonsense value would brief on a
+    # period nobody asked for, so a bad one is treated as unstated (the widening
+    # ladder then applies) and the drop is disclosed.
+    raw_days = inp.get("interaction_days")
+    interaction_days: int | None = None
+    if raw_days is not None:
+        try:
+            interaction_days = int(raw_days)
+        except (TypeError, ValueError):
+            interaction_days = None
+        if interaction_days is not None and not 1 <= interaction_days <= _BRIEFING_MAX_DAYS:
+            interaction_days = None
+    bad_days = (
+        f"\n\n[Ignored interaction_days={raw_days!r} — must be a whole number of "
+        f"days between 1 and {_BRIEFING_MAX_DAYS}, so this briefing is NOT scoped "
+        "to it.]"
+        if raw_days is not None and interaction_days is None
+        else ""
+    )
+
     svc = get_briefings_service()
-    result = await svc.generate_briefing(inp["name"], email=inp.get("email"))
-    if result.get("status") == "success":
-        return result.get("briefing", "Briefing generated but empty.")
-    return f"Briefing failed: {result.get('message', 'unknown error')}"
+    result = await svc.generate_briefing(
+        inp["name"], email=inp.get("email"), interaction_days=interaction_days
+    )
+    status = result.get("status")
+    if status == "success":
+        return result.get("briefing", "Briefing generated but empty.") + bad_days
+    if status in ("not_found", "limited"):
+        # Thin or absent data is an absence, not a fault. Reporting it as a failed
+        # briefing invites the model to blame the backend for a quiet record.
+        return (
+            result.get("message")
+            or f"Nothing on record under '{inp['name']}' to brief from."
+        ) + bad_days
+    return f"Briefing failed: {result.get('message', 'unknown error')}" + bad_days
 
 
 def _tool_person_info(inp: dict):

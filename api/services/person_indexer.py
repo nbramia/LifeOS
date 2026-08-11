@@ -83,17 +83,22 @@ def generate_person_document(person: PersonEntity, summary: RelationshipSummary)
         if summary.primary_channel:
             parts.append(f"\nPrimary communication channel: {summary.primary_channel}")
 
-    # Contact recency
-    if summary.days_since_contact < 7:
-        parts.append(f"\nLast contact: within the last week")
+    # Contact recency. The never-contacted sentinel is a marker, not a
+    # measurement: bucketing it lands in the final branch, which would index
+    # "over a year ago" as a searchable claim about someone who was never
+    # contacted at all.
+    if not summary.contact_on_record:
+        parts.append("\nLast contact: none on record")
+    elif summary.days_since_contact < 7:
+        parts.append("\nLast contact: within the last week")
     elif summary.days_since_contact < 30:
-        parts.append(f"\nLast contact: within the last month")
+        parts.append("\nLast contact: within the last month")
     elif summary.days_since_contact < 90:
-        parts.append(f"\nLast contact: within the last 3 months")
+        parts.append("\nLast contact: within the last 3 months")
     elif summary.days_since_contact < 365:
-        parts.append(f"\nLast contact: within the last year")
+        parts.append("\nLast contact: within the last year")
     else:
-        parts.append(f"\nLast contact: over a year ago")
+        parts.append("\nLast contact: over a year ago")
 
     # Aliases (for search matching)
     if person.aliases:
