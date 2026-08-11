@@ -966,12 +966,16 @@ async def _tool_search_calendar(inp: dict) -> str:
     # logged and then reported as "no events" — a real fault dressed up as an
     # empty result, which is the misdiagnosis this whole change exists to stop.
     failed_accounts: list[str] = []
+    account_count = 0
 
     def _fetch(search_range: int | None) -> list:
         """Collect events from every configured account for one window."""
+        nonlocal account_count
         events = []
         failed_accounts.clear()
+        account_count = 0
         for account in get_configured_accounts():
+            account_count += 1
             try:
                 cal = CalendarService(account)
                 if query:
@@ -999,6 +1003,11 @@ async def _tool_search_calendar(inp: dict) -> str:
             windows_tried.append(f"±{days}d")
             if all_events:
                 break
+            # Every account errored, so this rung searched nothing. Widening
+            # cannot help a broken connection, and continuing would let the
+            # note claim three windows were searched when none were.
+            if account_count and len(failed_accounts) == account_count:
+                break
     else:
         # date_ref / upcoming branches set their own range; search_range unused.
         all_events = _fetch(None)
@@ -1011,7 +1020,19 @@ async def _tool_search_calendar(inp: dict) -> str:
             "calendar. It may need re-authorising.]"
         )
 
+    total_failure = bool(failed_accounts) and len(failed_accounts) == account_count
+
     if not all_events:
+        # With every account down, nothing was searched, so an absence was never
+        # established. Lead with the fault instead of appending it to a denial —
+        # "nothing matches" followed by a footnote still reads as an answer.
+        if total_failure:
+            return (
+                f"Could not search the calendar: {', '.join(failed_accounts)} "
+                "errored, and no other account was reachable. This is NOT an "
+                "empty calendar — nothing was actually searched. The account may "
+                "need re-authorising." + bad_range
+            )
         if windows_tried:
             hint = f"Nothing on the calendar matches {query!r} in that span."
             return (
