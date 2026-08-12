@@ -19,9 +19,12 @@ from fastapi.testclient import TestClient
 
 from api.routes import journal_trends
 from api.routes.journal_trends import (
+    _PUBLISHED_TAXONOMY_MAP,
     _derive_branch_groups,
     _derive_taxonomy_labels,
+    _find_grouping_conflicts,
     _grid_span,
+    _group_for_label,
     _numeric,
 )
 
@@ -83,29 +86,37 @@ class TestGridSpan:
 # ---------------------------------------------------------------------------
 
 class TestStripEndpoint:
-    def test_empty_vault_all_time_has_no_days(self, client_and_vault):
+    """The strip always spans full history — earliest valid entry through
+    today — and takes no `window` parameter at all. See CHANGE 1 (squares)
+    and the follow-up operator feedback (auto-scale to full history,
+    independent of the window selector) this module was revised for."""
+
+    def test_empty_vault_has_no_days(self, client_and_vault):
         client, _, _ = client_and_vault
-        resp = client.get("/api/journal/strip?window=all-time")
+        resp = client.get("/api/journal/strip")
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_entries"] == 0
         assert body["emotion_entries"] == 0
         assert body["days"] == []
         assert body["start_date"] is None
+        assert "window" not in body  # no window concept applies to this view at all
 
-    def test_short_window_with_zero_entries_still_renders_gap_grid(self, client_and_vault):
-        # "week" has fixed bounds regardless of data, so the grid still
-        # exists — it's just all gaps.
-        client, _, _ = client_and_vault
-        resp = client.get("/api/journal/strip?window=week")
-        body = resp.json()
-        assert len(body["days"]) == 7
-        assert all(not d["has_entry"] for d in body["days"])
+    def test_a_window_query_param_has_no_effect(self, client_and_vault):
+        # The endpoint takes no `window` parameter; passing one anyway
+        # (e.g. a stale bookmark, or a caller assuming this view works
+        # like the other three) must not silently change the answer —
+        # confirming there's no half-wired parameter left behind.
+        client, vault, _ = client_and_vault
+        _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "feeling": "Sad"})
+        without = client.get("/api/journal/strip").json()
+        with_window = client.get("/api/journal/strip?window=day").json()
+        assert without == with_window
 
     def test_single_entry_n1(self, client_and_vault):
         client, vault, _ = client_and_vault
         _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Happy"})
-        resp = client.get("/api/journal/strip?window=day")
+        resp = client.get("/api/journal/strip")
         body = resp.json()
         assert len(body["days"]) == 1
         assert body["days"][0] == {"date": "2026-06-30", "has_entry": True, "primary_emotion": "Happy"}
@@ -114,20 +125,26 @@ class TestStripEndpoint:
     def test_entry_with_no_feeling_is_a_distinct_state(self, client_and_vault):
         client, vault, _ = client_and_vault
         _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "mood": 5})
-        resp = client.get("/api/journal/strip?window=day")
+        resp = client.get("/api/journal/strip")
         body = resp.json()
         assert body["days"][0]["has_entry"] is True
         assert body["days"][0]["primary_emotion"] is None
         assert body["emotion_entries"] == 0
 
-    def test_gap_spanning_weeks_renders_every_day_between(self, client_and_vault):
+    def test_leftmost_is_earliest_entry_rightmost_is_today(self, client_and_vault):
+        # The exact contract from operator feedback: furthest left is the
+        # earliest recorded observation, furthest right is today — fixed
+        # in this fixture at 2026-06-30 — regardless of the gap between
+        # them.
         client, vault, _ = client_and_vault
         _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "feeling": "Sad"})
         _write_entry(vault, "2026-06-22", {"date": "2026-06-22", "feeling": "Happy"})
-        resp = client.get("/api/journal/strip?window=all-time")
+        resp = client.get("/api/journal/strip")
         body = resp.json()
         assert body["start_date"] == "2026-01-27"
         assert body["end_date"] == "2026-06-30"  # "today", not the last entry
+        assert body["days"][0]["date"] == "2026-01-27"
+        assert body["days"][-1]["date"] == "2026-06-30"
         by_date = {d["date"]: d for d in body["days"]}
         assert by_date["2026-01-27"]["primary_emotion"] == "Sad"
         assert by_date["2026-06-22"]["primary_emotion"] == "Happy"
@@ -137,6 +154,22 @@ class TestStripEndpoint:
         assert body["emotion_entries"] == 2
         # Every calendar day from 2026-01-27 through 2026-06-30 is present.
         assert len(body["days"]) == (date(2026, 6, 30) - date(2026, 1, 27)).days + 1
+
+    def test_malformed_earlier_file_does_not_move_the_left_edge(self, client_and_vault):
+        # A file that doesn't parse as a trustworthy journal entry (here:
+        # frontmatter `date:` disagreeing with the filename) must not set
+        # the left edge to a date with no real data behind it, even though
+        # it's the earliest file on disk.
+        client, vault, _ = client_and_vault
+        journal_dir = vault / "Personal" / "Journal"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        (journal_dir / "2020-01-01.md").write_text(
+            "---\ndate: 2019-01-01\nfeeling: Bad\n---\nMismatched date.", encoding="utf-8"
+        )
+        _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "feeling": "Sad"})
+        resp = client.get("/api/journal/strip")
+        body = resp.json()
+        assert body["start_date"] == "2026-01-27"
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +394,90 @@ class TestDeriveBranchGroups:
         _write_entry(vault, "2020-01-01", {"date": "2020-01-01", "feeling": "Happy", "happy_feelings": "Cozy"})
         groups = _derive_branch_groups(vault, date(2026, 6, 30))
         assert groups["cozy"] == "Happy"
+
+
+class TestPublishedTaxonomyFallback:
+    """Grouping by observed evidence alone is self-defeating for this
+    specific view: a branch is only ever observed if it was selected, but
+    the unexplored wheel exists to show branches that were *never*
+    selected. Verified against one real vault: leaving grouping purely
+    evidence-based left 25 of 47 branches (53%) unplaced. This fallback
+    (`_PUBLISHED_TAXONOMY_MAP`) is what closes that gap — see its
+    module-level comment and `_group_for_label`'s docstring for the full
+    precedence order."""
+
+    @pytest.mark.parametrize("label,expected_primary", [
+        # The exact branches a real vault left unplaced before this
+        # fallback existed (a representative subset of the reported 25).
+        ("Accepted", "Happy"),
+        ("Aggressive", "Angry"),
+        ("Anxious", "Fearful"),
+        ("Awful", "Disgusted"),
+        ("Bitter", "Angry"),
+        ("Confused", "Surprised"),
+        ("Critical", "Angry"),
+        ("Depressed", "Sad"),
+        ("Despairing", "Sad"),
+        ("Distant", "Angry"),
+        ("Excited", "Surprised"),
+        ("Humiliated", "Angry"),
+        ("Hurt", "Sad"),
+        ("Insecure", "Fearful"),
+        ("Interested", "Happy"),
+        # "Playful" specifically: the branch whose form-order position
+        # (index 29, immediately before "Happy" at 30) is what disproved
+        # the original column-order-encodes-depth assumption.
+        ("Playful", "Happy"),
+    ])
+    def test_known_unplaced_branches_now_resolve_via_the_published_map(self, label, expected_primary):
+        # No observed evidence at all (empty branch_groups) — purely
+        # exercising the published-map fallback.
+        assert _group_for_label(label, {}) == expected_primary
+
+    def test_a_branch_the_map_does_not_cover_still_lands_unplaced(self):
+        # The map is a fallback, not a guarantee of full coverage — an
+        # honest gap beats a wrong guess here too.
+        assert _group_for_label("SomeBrandNewFormWord", {}) == "Unplaced"
+
+    def test_derived_evidence_still_wins_over_the_published_map(self):
+        # If this vault's real chains ever contradict the published map
+        # for some branch, the observed evidence takes precedence — the
+        # map is only consulted for branches with zero observed evidence.
+        branch_groups = {"accepted": "Sad"}  # hypothetical contradicting real evidence
+        assert _group_for_label("Accepted", branch_groups) == "Sad"
+
+    def test_known_primaries_are_never_shadowed_by_the_map(self):
+        # A branch that is itself a known primary groups under itself,
+        # checked before either the derived votes or the published map —
+        # confirms the map has no entries that could override this.
+        for primary in journal_trends._KNOWN_PRIMARIES:
+            assert _group_for_label(primary, {}) == primary
+
+
+class TestGroupingConflictDetection:
+    """`_find_grouping_conflicts` is the safety net that keeps the
+    published map from silently overriding — or being silently
+    contradicted by — real observed evidence without anyone noticing."""
+
+    def test_no_conflict_when_derived_agrees_with_published(self):
+        branch_groups = {"accepted": "Happy"}  # matches _PUBLISHED_TAXONOMY_MAP
+        assert _find_grouping_conflicts(branch_groups) == []
+
+    def test_flags_a_real_disagreement(self):
+        branch_groups = {"accepted": "Sad"}  # published map says "Happy"
+        conflicts = _find_grouping_conflicts(branch_groups)
+        assert conflicts == [("accepted", "Sad", "Happy")]
+
+    def test_a_label_the_published_map_does_not_cover_is_never_a_conflict(self):
+        branch_groups = {"some_unmapped_word": "Bad"}
+        assert _find_grouping_conflicts(branch_groups) == []
+
+    def test_the_published_map_itself_has_no_internal_contradictions(self):
+        # Sanity check on the map's own construction: every key maps to
+        # exactly one of the seven known primaries, never something else.
+        primaries = set(journal_trends._KNOWN_PRIMARIES)
+        for label, primary in _PUBLISHED_TAXONOMY_MAP.items():
+            assert primary in primaries, f"{label!r} maps to unknown primary {primary!r}"
 
 
 # ---------------------------------------------------------------------------

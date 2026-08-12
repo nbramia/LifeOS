@@ -57,6 +57,23 @@
             margin-bottom: 0.5rem;
         }
 
+        /* Flags a view that deliberately does not respond to the window
+           selector, so a reader never mistakes "didn't move" for "broken". */
+        .section-badge {
+            display: inline-block;
+            font-size: 0.68rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: var(--text-secondary);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 0.15rem 0.55rem;
+            margin-left: 0.5rem;
+            vertical-align: middle;
+        }
+
         .back-link {
             color: var(--text-secondary);
             text-decoration: none;
@@ -155,10 +172,15 @@
             min-width: 2em;
         }
 
+        /* --cell is set by JS after measuring available width against the
+           full-history span — see MAX_CELL_PX/MIN_CELL_PX in renderStrip.
+           Defaults to the max size so a pre-JS/no-JS render still looks
+           right for a short history. */
         .strip-grid {
             display: flex;
             gap: 2px;
             width: max-content;
+            --cell: 11px;
         }
 
         .strip-week {
@@ -168,8 +190,8 @@
         }
 
         .strip-day {
-            width: 11px;
-            height: 11px;
+            width: var(--cell);
+            height: var(--cell);
             border-radius: 2px;
             flex-shrink: 0;
         }
@@ -377,7 +399,7 @@
         </div>
 
         <section class="view" id="stripSection">
-            <h2>The Strip</h2>
+            <h2>The Strip <span class="section-badge">Full history &mdash; ignores the window selector above</span></h2>
             <div class="sample-note" id="stripNote">Loading…</div>
             <div id="stripBody"></div>
         </section>
@@ -466,25 +488,43 @@
             return `<div class="${cls}" style="${style}" title="${escapeHtml(title)}"></div>`;
         }
 
+        // Cell size floor/ceiling for the strip's auto-scaling. MAX matches
+        // the size this view shipped with (comfortable at today's real span
+        // of ~198 days); MIN is the smallest a square can shrink to before
+        // this view stops shrinking and lets `.strip-scroll` take over with
+        // horizontal scrolling instead of rendering an unreadable grey
+        // smear. 4px is still an individually distinguishable, hoverable
+        // square at typical screen DPI — smaller than that stops reading as
+        // "a square" at all.
+        const STRIP_MAX_CELL_PX = 11;
+        const STRIP_MIN_CELL_PX = 4;
+
         // Renders the strip as GitHub-contribution-style squares: weeks as
         // flex columns (Sunday-aligned, matching the CRM heatmap in
         // web/crm.html), with month labels running along the top. Unlike
         // the CRM heatmap, color encodes *which* emotion (a flat hue per
         // primary emotion), never an intensity ramp — a day either has an
         // entry (its primary's color) or it doesn't (the gap background).
+        //
+        // Always spans the full history the API returns (earliest valid
+        // entry through today) — this view takes no `window` parameter and
+        // ignores the page's window selector entirely, labeled explicitly
+        // via the "Full history" badge next to its heading so that doesn't
+        // read as a bug.
         function renderStrip(data) {
             const note = document.getElementById('stripNote');
             const body = document.getElementById('stripBody');
             const { total_entries, emotion_entries, start_date, end_date, days } = data;
-            const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
             if (!days.length) {
-                note.innerHTML = `No journal entries in this window (${rangeText}).`;
+                note.innerHTML = 'No journal entries recorded yet.';
                 body.innerHTML = '';
                 return;
             }
             note.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
-                `entries logged a feeling, across <strong>${days.length}</strong> calendar days ` +
-                `(${rangeText}). Every day in the span gets a square — gaps are shown, not skipped.`;
+                `entries logged a feeling, across every day from your earliest entry ` +
+                `(<strong>${start_date}</strong>) through today (<strong>${end_date}</strong>) — ` +
+                `<strong>${days.length}</strong> calendar days total, always full history regardless of ` +
+                `the window selector above. Every day in the span gets a square — gaps are shown, not skipped.`;
 
             const byDate = new Map(days.map((d) => [d.date, d]));
             const rangeStart = new Date(days[0].date + 'T00:00:00Z');
@@ -523,13 +563,30 @@
                 return `<div class="strip-month-label" style="flex:${span}">${m.label}</div>`;
             }).join('');
 
-            body.innerHTML = `<div class="strip-scroll"><div class="strip-months">${monthsHtml}</div>` +
-                `<div class="strip-grid">${weeks.join('')}</div></div>` +
+            body.innerHTML = `<div class="strip-scroll" id="stripScroll"><div class="strip-months">${monthsHtml}</div>` +
+                `<div class="strip-grid" id="stripGrid">${weeks.join('')}</div></div>` +
                 `<div class="strip-legend">` +
                 `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>no entry that day (gap)</span>` +
                 `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>entry, no feeling logged</span>` +
                 `<span><span class="strip-legend-swatch" style="background:${colorFor('Happy')}"></span>colored by primary emotion (hue is deterministic per value, hover for the exact label) — flat color, never shaded by intensity</span>` +
                 `</div>`;
+
+            // Auto-scale cells to fit the full span in the available width.
+            // Rendered above at STRIP_MAX_CELL_PX; if that overflows the
+            // scroll container, shrink toward STRIP_MIN_CELL_PX. If even the
+            // floor doesn't fit, keep the floor size and let the container
+            // scroll horizontally (`.strip-scroll` already has
+            // `overflow-x: auto`) rather than shrinking into illegibility.
+            const scrollEl = document.getElementById('stripScroll');
+            const gridEl = document.getElementById('stripGrid');
+            const available = scrollEl.clientWidth;
+            const natural = gridEl.scrollWidth;
+            if (natural > available && totalCols > 0) {
+                const gapPx = 2;
+                const idealCell = (available - (totalCols - 1) * gapPx) / totalCols;
+                const cell = Math.max(STRIP_MIN_CELL_PX, Math.floor(idealCell));
+                gridEl.style.setProperty('--cell', `${cell}px`);
+            }
         }
 
         // ---- View D: scalar stack ----
@@ -777,6 +834,18 @@
 
         // ---- orchestration ----
 
+        // The strip takes no `window` — it always shows full history (see
+        // renderStrip above) — so it's fetched once, independent of the
+        // window selector, rather than re-fetched on every pill click for
+        // data that can never change as a result.
+        async function loadStrip() {
+            try {
+                renderStrip(await fetchJson('/api/journal/strip'));
+            } catch (err) {
+                document.getElementById('stripNote').textContent = `Failed to load: ${err.message}`;
+            }
+        }
+
         async function loadAll(win) {
             currentWindow = win;
             document.querySelectorAll('.window-pill').forEach((p) => {
@@ -785,16 +854,14 @@
 
             const q = `window=${encodeURIComponent(win)}`;
             try {
-                const [strip, scalars, taxonomy] = await Promise.all([
-                    fetchJson(`/api/journal/strip?${q}`),
+                const [scalars, taxonomy] = await Promise.all([
                     fetchJson(`/api/journal/scalars?${q}`),
                     fetchJson(`/api/journal/taxonomy?${q}`),
                 ]);
-                renderStrip(strip);
                 renderScalars(scalars);
                 renderTaxonomy(taxonomy);
             } catch (err) {
-                document.getElementById('stripNote').textContent = `Failed to load: ${err.message}`;
+                document.getElementById('scalarNote').textContent = `Failed to load: ${err.message}`;
             }
         }
 
@@ -803,6 +870,7 @@
             if (pill) loadAll(pill.dataset.window);
         });
 
+        loadStrip();
         loadAll(currentWindow);
     </script>
 </body>

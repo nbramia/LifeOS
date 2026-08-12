@@ -132,6 +132,157 @@ _UNPLACED_GROUP = "Unplaced"
 # stable across requests regardless of which groups happen to be biggest.
 _GROUP_ORDER = (*_KNOWN_PRIMARIES, _UNPLACED_GROUP)
 
+# Fallback grouping for a branch with zero observed evidence, sourced from
+# the widely-published feelings wheel (the Gloria Willcox "Feeling Wheel"
+# and its many circulated derivatives) this operator's Google Form is
+# itself derived from — NOT measured from this operator's private data,
+# and strictly separable from `_derive_branch_groups`'s vote-counting
+# below. `_group_for_label` only consults this map when a branch is
+# neither a known primary itself nor covered by any real observed chain;
+# derived evidence always wins when both have an opinion (see
+# `_group_for_label`), and `_find_grouping_conflicts` exists specifically
+# to catch — and log loudly, never silently swallow — the case where they
+# disagree.
+#
+# This map exists because grouping-by-observed-evidence-alone is
+# self-defeating for exactly the view it's meant to serve: a branch is
+# only ever observed if it was selected, but the unexplored wheel exists
+# to show branches that were *never* selected. On one real vault's data,
+# leaving grouping purely evidence-based left 25 of 47 branches (53%)
+# unplaced — the branches the view is about are precisely the ones with
+# no evidence, so no amount of vote-counting over real chains was ever
+# going to place them. This map is what actually closes that gap.
+#
+# Necessarily incomplete and not authoritative for every rendition of the
+# wheel in circulation — some words appear more than once across
+# different published versions of it (e.g. "Overwhelmed" under both
+# Fearful and Bad's branches in different renderings); where that
+# happened during construction, one primary was picked and is noted
+# inline. A branch this map doesn't cover, and that also has no observed
+# evidence, still lands in `_UNPLACED_GROUP` — this is a fallback, not a
+# guarantee of full coverage, and an honest gap beats a wrong guess here
+# just as much as it does for the evidence-based path.
+_PUBLISHED_TAXONOMY_MAP: dict[str, str] = {
+    # --- Happy ---
+    "playful": "Happy",  # the exact branch that broke the column-order assumption (index 29, before Happy at 30)
+    "content": "Happy",
+    "interested": "Happy",
+    "proud": "Happy",
+    "accepted": "Happy",
+    "powerful": "Happy",
+    "peaceful": "Happy",
+    "trusting": "Happy",
+    "optimistic": "Happy",
+    "aroused": "Happy", "cheeky": "Happy",
+    "free": "Happy", "joyful": "Happy",
+    "curious": "Happy", "inquisitive": "Happy",
+    "successful": "Happy", "confident": "Happy",
+    "respected": "Happy", "valued": "Happy",
+    "courageous": "Happy", "creative": "Happy",
+    "loving": "Happy", "thankful": "Happy",
+    "sensitive": "Happy", "intimate": "Happy",
+    "inspired": "Happy", "hopeful": "Happy",
+    # --- Sad ---
+    "lonely": "Sad",
+    "vulnerable": "Sad",
+    "despair": "Sad", "despairing": "Sad",  # form uses the "-ing" spelling; classic wheel uses "Despair"
+    "guilty": "Sad",
+    "depressed": "Sad",
+    "hurt": "Sad",
+    "isolated": "Sad", "abandoned": "Sad",
+    "victimized": "Sad", "fragile": "Sad",
+    "grief": "Sad", "powerless": "Sad",
+    "ashamed": "Sad", "remorseful": "Sad",
+    "empty": "Sad", "inferior": "Sad",
+    "disappointed": "Disgusted",  # ambiguous in the published wheel: also appears as a Hurt/Sad leaf; the
+    # level-2 Disgusted branch position was picked since a leaf is unlikely to have its own follow-up column
+    "embarrassed": "Sad",
+    # --- Disgusted ---
+    "disapproving": "Disgusted",
+    "awful": "Disgusted",
+    "repelled": "Disgusted",
+    "judgmental": "Disgusted",
+    "appalled": "Disgusted", "revolted": "Disgusted",
+    "nauseated": "Disgusted", "detestable": "Disgusted",
+    "horrified": "Disgusted", "hesitant": "Disgusted",
+    # --- Angry ---
+    "let down": "Angry",
+    "humiliated": "Angry",
+    "bitter": "Angry",
+    "mad": "Angry",
+    "aggressive": "Angry",
+    "frustrated": "Angry",
+    "distant": "Angry",
+    "critical": "Angry",
+    "betrayed": "Angry", "resentful": "Angry",
+    "disrespected": "Angry", "ridiculed": "Angry",
+    "indignant": "Angry", "violated": "Angry",
+    "furious": "Angry", "jealous": "Angry",
+    "provoked": "Angry", "hostile": "Angry",
+    "infuriated": "Angry", "annoyed": "Angry",
+    "withdrawn": "Angry", "numb": "Angry",
+    "skeptical": "Angry", "dismissive": "Angry",
+    # --- Fearful ---
+    "scared": "Fearful",
+    "anxious": "Fearful",
+    "insecure": "Fearful",
+    "weak": "Fearful",
+    "rejected": "Fearful",
+    "threatened": "Fearful",
+    "helpless": "Fearful", "frightened": "Fearful",
+    "overwhelmed": "Fearful",  # also appears under Bad/Stressed in some renderings; Fearful chosen here
+    "worried": "Fearful",
+    "inadequate": "Fearful",
+    "worthless": "Fearful", "insignificant": "Fearful",
+    "excluded": "Fearful", "persecuted": "Fearful",
+    "nervous": "Fearful", "exposed": "Fearful",
+    # --- Bad ---
+    "bored": "Bad",
+    "busy": "Bad",
+    "stressed": "Bad",
+    "tired": "Bad",
+    "indifferent": "Bad", "apathetic": "Bad",
+    "pressured": "Bad", "rushed": "Bad",
+    "out of control": "Bad",
+    "sleepy": "Bad", "unfocused": "Bad",
+    # --- Surprised ---
+    "startled": "Surprised",
+    "confused": "Surprised",
+    "amazed": "Surprised",
+    "excited": "Surprised",
+    "shocked": "Surprised", "dismayed": "Surprised",
+    "disillusioned": "Surprised", "perplexed": "Surprised",
+    "astonished": "Surprised", "awe": "Surprised",
+    "eager": "Surprised", "energetic": "Surprised",
+}
+
+
+def _find_grouping_conflicts(
+    branch_groups: dict[str, str], published: dict[str, str] = _PUBLISHED_TAXONOMY_MAP
+) -> list[tuple[str, str, str]]:
+    """Labels where the derived votes (`_derive_branch_groups` — real
+    evidence from this vault) and the published fallback map
+    (`_PUBLISHED_TAXONOMY_MAP` — a widely-circulated feelings-wheel
+    taxonomy, not this operator's data) disagree about which primary a
+    branch belongs to.
+
+    Precedence in `_group_for_label` always resolves the *output* in
+    derived evidence's favor — but a disagreement here means either the
+    operator's form has genuinely diverged from the published wheel for
+    that word, or an entry in `_PUBLISHED_TAXONOMY_MAP` is simply wrong.
+    Either way it should be looked at, not silently absorbed by
+    precedence and never seen again. Returns `(label, derived_primary,
+    published_primary)` tuples; callers (`get_journal_taxonomy`) log
+    these rather than raising, since a taxonomy disagreement must never
+    take the whole page down.
+    """
+    conflicts = []
+    for label, derived_primary in branch_groups.items():
+        published_primary = published.get(label)
+        if published_primary is not None and published_primary != derived_primary:
+            conflicts.append((label, derived_primary, published_primary))
+    return conflicts
+
 
 # ---------------------------------------------------------------------------
 # Shared window/grid helpers
@@ -171,7 +322,6 @@ class StripDay(BaseModel):
 
 
 class JournalStripResponse(BaseModel):
-    window: str
     start_date: str | None = None
     end_date: str
     total_entries: int
@@ -180,19 +330,48 @@ class JournalStripResponse(BaseModel):
 
 
 @router.get("/strip", response_model=JournalStripResponse)
-async def get_journal_strip(
-    window: str = Query(default=_DEFAULT_WINDOW, description="day, week, month, quarter, or all-time"),
-) -> JournalStripResponse:
-    """One cell per calendar day across the window, colored by that day's
-    primary (level-1) emotion. Days with no journal file at all render as
-    `has_entry=False` — an explicit gap, never skipped or interpolated —
-    and days with a file but no parseable `feeling:` render as
-    `has_entry=True, primary_emotion=None`, a third, distinct state from
-    either "no journal that day" or "logged a feeling"."""
-    window = _canonical_window(window)
+async def get_journal_strip() -> JournalStripResponse:
+    """One cell per calendar day, from the earliest *valid* journal entry
+    ever written through today — always, regardless of the window selector
+    the other trend views respond to.
+
+    **Deliberately takes no `window` parameter.** Operator feedback was
+    explicit: the strip should auto-scale to the full history available —
+    leftmost cell is the earliest recorded observation, rightmost is today
+    — not whatever window happens to be selected elsewhere on the page.
+    An earlier version took `window` and used the wheel's day/week/month/
+    quarter/all-time bounds like every other view here; that parameter is
+    gone rather than kept-but-ignored, because a query parameter a caller
+    can set with no effect on the response is exactly the silent-defect
+    shape this codebase has spent real effort removing elsewhere (see
+    docs/specs/product/journal-analytics.md's note on this view). The
+    frontend (`web/journal-trends.html`) labels this view "full history"
+    explicitly and never sends `?window=` to this endpoint, so a reader
+    changing the window pill and watching this section not move reads as
+    intentional, not broken.
+
+    "Earliest recorded observation" means the earliest entry
+    `_iter_valid_journal_files` actually admits — canonical `YYYY-MM-DD.md`
+    filename, not a symlink, UTF-8, parseable frontmatter, and (if present)
+    a `date:` field that agrees with the filename — never the earliest
+    file on disk regardless of whether it parses. A malformed or
+    non-conforming file must not silently set the left edge to a date with
+    no real data behind it.
+
+    Every day gets a cell in one of three distinct states — never just two:
+
+    - **Gap** (`has_entry: false`) — no journal file that day at all.
+    - **Entry, no feeling** (`has_entry: true, primary_emotion: null`) — a
+      file exists but had no parseable `feeling:`.
+    - **Entry with a feeling** (`has_entry: true, primary_emotion: "<value>"`).
+
+    With zero valid entries anywhere in the vault, `start_date` is `None`
+    and `days` is empty — the frontend renders a plain "no journal entries
+    recorded yet" message rather than a zero-width or single-cell grid.
+    """
     today = date.today()
-    entries = _collect_entries(settings.vault_path, window, today)
-    start, end = _grid_span(window, today, entries)
+    entries = _collect_entries(settings.vault_path, "all-time", today)
+    start, end = _grid_span("all-time", today, entries)
     by_date = dict(entries)
 
     days: list[StripDay] = []
@@ -211,7 +390,6 @@ async def get_journal_strip(
             cur += timedelta(days=1)
 
     return JournalStripResponse(
-        window=window,
         start_date=start.isoformat() if start else None,
         end_date=end.isoformat(),
         total_entries=len(entries),
@@ -346,13 +524,14 @@ def _derive_branch_groups(vault_path, today: date) -> dict[str, str]:
 
     Returns only entries this function found votes for. A branch with no
     votes at all — never observed as a non-root value in any real chain —
-    is absent from the returned dict; the caller (`get_journal_taxonomy`)
-    treats that as `_UNPLACED_GROUP` rather than guessing. A branch that is
-    itself one of `_KNOWN_PRIMARIES` doesn't need a vote to find its group
-    at all — the caller checks that case first — but if one somehow
-    received contrary votes anyway (real data quirk, not expected), those
-    votes are still returned here; the caller's primary-name check takes
-    precedence over anything in this dict.
+    is absent from the returned dict; the caller (`_group_for_label`) then
+    falls back to `_PUBLISHED_TAXONOMY_MAP` before finally landing on
+    `_UNPLACED_GROUP`. A branch that is itself one of `_KNOWN_PRIMARIES`
+    doesn't need a vote to find its group at all — the caller checks that
+    case first — but if one somehow received contrary votes anyway (real
+    data quirk, not expected), those votes are still returned here; the
+    caller's primary-name check takes precedence over anything in this
+    dict.
     """
     primary_lower = {p.lower() for p in _KNOWN_PRIMARIES}
     votes: dict[str, Counter[str]] = {}
@@ -376,14 +555,28 @@ def _derive_branch_groups(vault_path, today: date) -> dict[str, str]:
 
 
 def _group_for_label(label: str, branch_groups: dict[str, str]) -> str:
-    """A branch's group: itself, if it's one of the known primaries;
-    otherwise whatever `_derive_branch_groups` voted for it; otherwise the
-    honest "don't know" bucket rather than a guessed parent."""
+    """A branch's group, checked in this order:
+
+    1. Itself, if it's one of the known primaries.
+    2. Whatever `_derive_branch_groups` voted for it from real observed
+       chains in this vault — always wins over the published map below
+       when both have an opinion (see `_find_grouping_conflicts` for how
+       a disagreement between them is surfaced instead of silently lost).
+    3. `_PUBLISHED_TAXONOMY_MAP`, the widely-published feelings-wheel
+       fallback — only consulted for a branch with zero observed
+       evidence, which is exactly the branches this view exists to show
+       (see that map's module-level comment for why evidence alone isn't
+       enough for this particular view).
+    4. The honest "don't know" bucket, rather than a guessed parent, for
+       a branch neither source has an opinion on.
+    """
     lower = label.lower()
     for primary in _KNOWN_PRIMARIES:
         if lower == primary.lower():
             return primary
-    return branch_groups.get(lower, _UNPLACED_GROUP)
+    if lower in branch_groups:
+        return branch_groups[lower]
+    return _PUBLISHED_TAXONOMY_MAP.get(lower, _UNPLACED_GROUP)
 
 
 @router.get("/taxonomy", response_model=JournalTaxonomyResponse)
@@ -429,6 +622,21 @@ async def get_journal_taxonomy(
     taxonomy_source = "form" if taxonomy_labels else "used-only"
     matched_lower: set[str] = set()
     branch_groups = _derive_branch_groups(settings.vault_path, today)
+    conflicts = _find_grouping_conflicts(branch_groups)
+    if conflicts:
+        # Loud, not silent: derived evidence still wins in `_group_for_label`
+        # (see its docstring), but a real disagreement between this vault's
+        # observed chains and the published fallback map means either the
+        # form has diverged from the published wheel, or the map has a
+        # wrong entry — either way, it should get looked at rather than
+        # quietly resolved by precedence and never seen again.
+        logger.warning(
+            "Unexplored wheel grouping conflict — observed evidence and the "
+            "published fallback map disagree for %d branch(es): %s. Derived "
+            "evidence wins in the response; investigate whether the form "
+            "changed or _PUBLISHED_TAXONOMY_MAP has a wrong entry.",
+            len(conflicts), conflicts,
+        )
     group_rank = {g: i for i, g in enumerate(_GROUP_ORDER)}
 
     branches: list[TaxonomyBranch] = []
