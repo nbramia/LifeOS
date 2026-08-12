@@ -872,28 +872,6 @@ def get_imessage_store(storage_path: str = "./data/imessage.db") -> IMessageStor
     return _imessage_store
 
 
-def resolve_entity_id(entity_id: str) -> Optional[str]:
-    """Resolve an entity_id that may be a UUID or a name slug (e.g. 'john-doe') to a UUID."""
-    import uuid
-    # If it's already a valid UUID, pass through
-    try:
-        uuid.UUID(entity_id)
-        return entity_id
-    except ValueError:
-        pass
-    # Treat as a name slug: "john-doe" -> "john doe", then search
-    try:
-        from api.services.people_aggregator import get_people_aggregator
-        agg = get_people_aggregator()
-        name_query = entity_id.replace("-", " ")
-        results = agg.search(name_query)
-        if results:
-            return results[0].id
-    except Exception:
-        pass
-    return None
-
-
 def sync_imessages() -> dict:
     """
     Convenience function for nightly sync.
@@ -1009,11 +987,33 @@ def sync_and_join_imessages() -> dict:
     }
 
 
-def resolve_entity_id(entity_id: str) -> Optional[str]:  # noqa: F811 - pre-existing duplicate of the definition above; this entity_resolver-based one wins. Flagged as follow-up.
-    """If entity_id isn't a UUID, try resolving it as a person name."""
+def resolve_entity_id_confidence(entity_id: str) -> tuple[Optional[str], bool]:
+    """Resolve a UUID or name slug (e.g. 'john-doe') to a person's UUID.
+
+    Returns `(resolved_id, ambiguous)`. `ambiguous` is True when
+    `entity_resolver.resolve()` reported `match_type="fuzzy_ambiguous"` — two
+    or more candidates scored close enough together that the top pick isn't
+    reliably the right person (confidence is reduced accordingly, but the
+    bare id alone can't carry that).
+
+    `resolve_entity_id()` below discards this flag for callers that only ever
+    need the id. A caller whose output could expose one person's private data
+    in response to a request about another — e.g. get_message_history, which
+    this resolution feeds on every call — should use this function directly
+    and disclose the uncertainty instead of presenting the match as certain.
+
+    `entity_id` is filled in by an LLM tool call, so None, non-string types,
+    and empty/whitespace strings all arrive in practice. `uuid.UUID(...)`
+    raises TypeError on None and AttributeError on a non-string (no
+    `.replace()`) rather than the ValueError this function otherwise expects
+    for "not a UUID" — so those are rejected up front as simply unresolved,
+    the same outcome a caller gets for any other name that doesn't match.
+    """
+    if not isinstance(entity_id, str) or not entity_id.strip():
+        return None, False
     try:
         uuid_mod.UUID(entity_id)
-        return entity_id
+        return entity_id, False
     except ValueError:
         from api.services.entity_resolver import get_entity_resolver
         resolver = get_entity_resolver()
@@ -1021,8 +1021,19 @@ def resolve_entity_id(entity_id: str) -> Optional[str]:  # noqa: F811 - pre-exis
         name = entity_id.replace("-", " ")
         result = resolver.resolve(name=name)
         if result and result.entity:
-            return result.entity.id
-        return None
+            return result.entity.id, result.match_type == "fuzzy_ambiguous"
+        return None, False
+
+
+def resolve_entity_id(entity_id: str) -> Optional[str]:
+    """If entity_id isn't a UUID, try resolving it as a person name.
+
+    Thin wrapper over `resolve_entity_id_confidence()` — see that function's
+    docstring if the caller's output could expose the wrong person's data on
+    an ambiguous match.
+    """
+    resolved_id, _ambiguous = resolve_entity_id_confidence(entity_id)
+    return resolved_id
 
 
 def query_person_messages(

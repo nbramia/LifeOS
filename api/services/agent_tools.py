@@ -1763,13 +1763,29 @@ _MSG_HISTORY_CHAR_BUDGET = 24000
 
 
 def _tool_get_message_history(inp: dict) -> str:
-    from api.services.imessage import query_person_messages, resolve_entity_id
+    from api.services.imessage import query_person_messages, resolve_entity_id_confidence
     from api.services.interaction_store import get_interaction_store
 
     entity_id = inp["entity_id"]
-    resolved_id = resolve_entity_id(entity_id)
+    resolved_id, ambiguous_match = resolve_entity_id_confidence(entity_id)
     if not resolved_id:
         return f"Could not resolve person '{entity_id}'. Use person_info first."
+
+    # A fuzzy_ambiguous resolution means two+ candidates scored close enough
+    # together that the top pick isn't reliably the right person. Disclosure
+    # alone isn't a fix here — a warning appended after the fact doesn't stop
+    # someone's private messages from already being in the model's context,
+    # attributable to whichever person the caller actually meant. Refuse the
+    # query outright: entity_id is documented to come from person_info, which
+    # returns a UUID, so a slug is a fallback and refusing an uncertain one
+    # only costs the caller one extra call.
+    if ambiguous_match:
+        return (
+            f"'{entity_id}' matched more than one person about equally well — "
+            "not resolving to avoid returning the wrong person's messages. "
+            "Use person_info to find the exact person, then pass their UUID "
+            "as entity_id."
+        )
 
     start_date = inp.get("start_date")
     end_date = inp.get("end_date")
