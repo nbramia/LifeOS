@@ -1,20 +1,27 @@
 """
-Journal trend views: the strip, the unexplored wheel, felt-vs-recorded
-connection, and the scalar stack (issue follow-up to #212).
+Journal trend views: the strip, the unexplored wheel, and the scalar stack
+(issue follow-up to #212).
 
 The original emotion wheel (`api/routes/journal.py`) answers "what did I
 feel most often" for a single window. Operator feedback on that view was
 that it says nothing about *trajectory* — and with 32 entries spanning
 2026-01-27 to 2026-06-22 in three bursts (Jan-Feb, April, June) rather than
 a steady cadence, "trajectory" mostly means "how sparse and clustered is
-this, actually" before anything else. These four views are the response;
-see docs/specs/product/journal-analytics.md for the full writeup, including
+this, actually" before anything else. These views are the response; see
+docs/specs/product/journal-analytics.md for the full writeup, including
 options considered and rejected.
 
+A fourth view — felt-vs-recorded connection, which cross-referenced
+`connection_<name>` self-reports against `data/interactions.db` via
+`api.services.entity_resolver` — was removed after operator feedback that
+it wasn't useful (see the spec's Removed section). Removing it also
+dropped this module's only reason to import the entity resolver or touch
+the interactions database, which shrinks this module's privacy surface —
+a real gain, not just a line-count one.
+
 This is a separate module from `journal.py` rather than an extension of it
-because each view pulls in a data source the wheel never needed —
-`data/gsheet_sync.db` (view B), `data/interactions.db` plus
-`api.services.entity_resolver` (view C) — and `journal.py` at 372 lines
+because the unexplored wheel pulls in a data source the original wheel
+never needed — `data/gsheet_sync.db` — and `journal.py` at 372 lines
 before this file existed was already a full unit on its own. Splitting
 keeps the wheel's import surface untouched.
 
@@ -29,6 +36,9 @@ instruction:
   extracted from the Google Sheet's column names (view B) as a defense-in
   depth measure, even though that source is form structure rather than
   journal free text.
+- `api.routes.journal.parse_emotion_chain` — reused a second time in this
+  module (beyond the strip) to derive the unexplored wheel's primary-emotion
+  grouping from real observed chains; see `_derive_branch_groups`.
 
 None of these are re-exported as a public API of this module; the imports
 below are intentionally of the underscore-prefixed originals, because
@@ -47,10 +57,11 @@ import sqlite3
 import statistics
 from collections import Counter
 from datetime import date, timedelta
+from itertools import combinations
 from pathlib import Path
 
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from api.routes.journal import (
     _DEFAULT_WINDOW,
@@ -61,9 +72,7 @@ from api.routes.journal import (
     parse_emotion_chain,
     window_bounds,
 )
-from api.services.entity_resolver import get_entity_resolver
 from api.services.gsheet_sync import get_gsheet_sync_db_path
-from api.services.interaction_store import get_interaction_db_path
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -77,11 +86,10 @@ router = APIRouter(prefix="/api/journal", tags=["journal"])
 # fifth scalar" concern driving this toward a derived list.
 _SCALAR_FIELDS = ("mood", "stress", "sleep", "body")
 
-# Below this confidence, a name resolution is disclosed as low-confidence
-# rather than presented as a plain match — same spirit as the emotion
-# wheel's value-disclosure policy, applied to person resolution instead of
-# free text.
-_LOW_CONFIDENCE_THRESHOLD = 0.5
+# Every distinct unordered pair of scalar fields — 4 choose 2 = 6. Order
+# within each pair matches `_SCALAR_FIELDS`'s order, so "mood vs. stress"
+# is always `["mood", "stress"]`, never `["stress", "mood"]`.
+_SCALAR_PAIRS = list(combinations(_SCALAR_FIELDS, 2))
 
 # Column names in the Google Sheet backing the journal that hold a
 # follow-up emotion branch look like "<Branch> feelings" or, for a couple
@@ -91,8 +99,38 @@ _LOW_CONFIDENCE_THRESHOLD = 0.5
 # captures everything before the suffix as the branch name.
 _FEELINGS_SUFFIX_RE = re.compile(r"\s+feelings?\s*\??\s*$", re.IGNORECASE)
 
-_TRUTHY = {"yes", "y", "true", "1"}
-_FALSY = {"no", "n", "false", "0"}
+# "Not sure" is excluded entirely from the unexplored wheel — from the
+# derived branch list, the legend, the wheel's wedges, and every count —
+# per explicit operator feedback: it's a non-answer to "what did you
+# feel", not an emotion, so grouping it under some primary family (or
+# giving it one of its own) would misrepresent it either way. It can
+# appear both as a root `feeling:` value and as a leaf several steps into
+# an otherwise-real chain (e.g. Sad -> ... -> "Not sure"); both positions
+# are filtered, case-insensitively, everywhere this module touches it.
+_EXCLUDED_VALUE = "not sure"
+
+# The primary emotions the unexplored wheel groups every other branch
+# under. Sourced from operator-supplied ground truth, not derived, because
+# it can't be derived from anything in the data: `Angry`, `Bad`,
+# `Disgusted`, `Happy`, and `Sad` are the root `feeling:` values actually
+# observed across the real vault's entries; `Fearful` and `Surprised` never
+# appear as a root but do have their own "<Primary> feelings" follow-up
+# column in the form, so they're primaries the operator has simply never
+# selected as a top-level feeling yet. "Not sure" is deliberately excluded
+# (see `_EXCLUDED_VALUE`) even though it's also an observed root value.
+_KNOWN_PRIMARIES = ("Angry", "Bad", "Disgusted", "Fearful", "Happy", "Sad", "Surprised")
+
+# Bucket for a taxonomy branch that is neither a known primary itself nor
+# reachable from one via any chain actually observed in the journal. A
+# branch lands here rather than under a guessed primary — see
+# `_derive_branch_groups`'s docstring for why a visible "don't know" bucket
+# beats a silently wrong parent.
+_UNPLACED_GROUP = "Unplaced"
+
+# Wheel/legend group ordering: primaries in the fixed order above, then
+# Unplaced last — never sorted by size or alphabetically, so the layout is
+# stable across requests regardless of which groups happen to be biggest.
+_GROUP_ORDER = (*_KNOWN_PRIMARIES, _UNPLACED_GROUP)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +228,7 @@ class TaxonomyBranch(BaseModel):
     label: str
     used: bool
     count: int
+    group: str  # one of _KNOWN_PRIMARIES, or _UNPLACED_GROUP
 
 
 class JournalTaxonomyResponse(BaseModel):
@@ -199,6 +238,7 @@ class JournalTaxonomyResponse(BaseModel):
     total_entries: int
     emotion_entries: int
     taxonomy_source: str  # "form" or "used-only"
+    group_order: list[str]
     branches: list[TaxonomyBranch]
     extra_used: list[TaxonomyBranch]
 
@@ -270,18 +310,101 @@ def _derive_taxonomy_labels(db_path: str) -> list[str]:
     return sorted(labels.values())
 
 
+def _derive_branch_groups(vault_path, today: date) -> dict[str, str]:
+    """Map each branch label (lowercased) to the primary emotion it belongs
+    to, derived from real parent -> child links actually observed in the
+    journal — never from the form's column order.
+
+    An earlier pass at this grouping assumed the form's `"<Node> feelings"`
+    columns are laid out depth-first, so column order alone would reveal
+    the tree. That assumption is false: in form order, `Playful` (index 29)
+    comes immediately before `Happy` (index 30), even though `Playful` is
+    one of `Happy`'s children in the standard wheel this form derives
+    from. Order reflects however the form's author arranged the questions,
+    not the tree structure, so it is never used here.
+
+    What *is* reliable: every parsed emotion chain (`parse_emotion_chain`)
+    is a real parent -> child path an entry actually recorded, e.g.
+    `["Sad", "Muted", "Not sure"]` means "Muted" followed "Sad" and
+    "Not sure" followed "Muted" in that one entry. This function walks
+    every chain from every journal entry ever written — deliberately not
+    window-scoped, since which primary a branch belongs to is a structural
+    property of the form, not something that should shift depending on
+    which time window happens to be selected — and, for every non-root
+    value in a chain, casts a vote for the chain's root (`chain[0]`) as
+    that value's primary. A branch's group is whichever root has the most
+    votes; ties break alphabetically for determinism.
+
+    "Not sure" chains are never used as evidence in either direction: a
+    chain rooted at "Not sure" casts no votes (skipped outright), and
+    "Not sure" appearing anywhere inside another chain is never itself
+    recorded as a branch to be grouped (see `_EXCLUDED_VALUE` — it is
+    excluded from the wheel entirely, so it needs no group). A root that
+    isn't one of `_KNOWN_PRIMARIES` at all (which should not happen with a
+    trustworthy chain, but a hand-edited entry could produce one) also
+    casts no votes, rather than inventing an eighth primary on the fly.
+
+    Returns only entries this function found votes for. A branch with no
+    votes at all — never observed as a non-root value in any real chain —
+    is absent from the returned dict; the caller (`get_journal_taxonomy`)
+    treats that as `_UNPLACED_GROUP` rather than guessing. A branch that is
+    itself one of `_KNOWN_PRIMARIES` doesn't need a vote to find its group
+    at all — the caller checks that case first — but if one somehow
+    received contrary votes anyway (real data quirk, not expected), those
+    votes are still returned here; the caller's primary-name check takes
+    precedence over anything in this dict.
+    """
+    primary_lower = {p.lower() for p in _KNOWN_PRIMARIES}
+    votes: dict[str, Counter[str]] = {}
+    for _, fm in _iter_valid_journal_files(vault_path, "all-time", today):
+        chain = parse_emotion_chain(fm)
+        if not chain:
+            continue
+        root = chain[0]
+        if root.lower() == _EXCLUDED_VALUE or root.lower() not in primary_lower:
+            continue  # "Not sure" root, or a root that isn't a known primary: no evidence to cast
+        for value in chain[1:]:
+            if value.lower() == _EXCLUDED_VALUE:
+                continue
+            votes.setdefault(value.lower(), Counter())[root] += 1
+
+    groups: dict[str, str] = {}
+    for label_lower, counter in votes.items():
+        best_root, _count = min(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        groups[label_lower] = best_root
+    return groups
+
+
+def _group_for_label(label: str, branch_groups: dict[str, str]) -> str:
+    """A branch's group: itself, if it's one of the known primaries;
+    otherwise whatever `_derive_branch_groups` voted for it; otherwise the
+    honest "don't know" bucket rather than a guessed parent."""
+    lower = label.lower()
+    for primary in _KNOWN_PRIMARIES:
+        if lower == primary.lower():
+            return primary
+    return branch_groups.get(lower, _UNPLACED_GROUP)
+
+
 @router.get("/taxonomy", response_model=JournalTaxonomyResponse)
 async def get_journal_taxonomy(
     window: str = Query(default=_DEFAULT_WINDOW, description="day, week, month, quarter, or all-time"),
 ) -> JournalTaxonomyResponse:
     """The full form taxonomy (derived, not hardcoded — see
     `_derive_taxonomy_labels`), each branch marked used/unused with a
-    frequency count over the window. `extra_used` holds values that were
-    actually logged but don't match any derived branch (a stray value like
-    "Not sure" that isn't itself a branch name, the "Unrecognized" bucket
+    frequency count over the window and grouped by primary emotion (see
+    `_derive_branch_groups`). `extra_used` holds values that were actually
+    logged but don't match any derived branch (the "Unrecognized" bucket
     from the disclosure policy, or taxonomy drift if the form changed since
     the sheet was last synced) — these are never dropped, just not folded
     into the known-branch list.
+
+    "Not sure" is excluded entirely — from `branches`, from `extra_used`,
+    and from every count — per explicit operator feedback that it's a
+    non-answer, not an emotion. It is filtered case-insensitively wherever
+    it could appear: as a derived taxonomy label, as a raw logged value,
+    and (for grouping purposes) as either a chain's root or one of its
+    non-root values.
 
     When the sheet database is absent, empty, or has no matching columns,
     `taxonomy_source` is `"used-only"` and `branches` is empty; every
@@ -294,11 +417,19 @@ async def get_journal_taxonomy(
 
     value_counts: Counter[str] = Counter()
     for chain in chains:
-        value_counts.update(chain)
+        for value in chain:
+            if value.lower() == _EXCLUDED_VALUE:
+                continue
+            value_counts[value] += 1
 
-    taxonomy_labels = _derive_taxonomy_labels(get_gsheet_sync_db_path())
+    taxonomy_labels = [
+        label for label in _derive_taxonomy_labels(get_gsheet_sync_db_path())
+        if label.lower() != _EXCLUDED_VALUE
+    ]
     taxonomy_source = "form" if taxonomy_labels else "used-only"
     matched_lower: set[str] = set()
+    branch_groups = _derive_branch_groups(settings.vault_path, today)
+    group_rank = {g: i for i, g in enumerate(_GROUP_ORDER)}
 
     branches: list[TaxonomyBranch] = []
     for label in taxonomy_labels:
@@ -306,15 +437,15 @@ async def get_journal_taxonomy(
         count = sum(c for v, c in value_counts.items() if v.lower() == key)
         if count > 0:
             matched_lower.add(key)
-        branches.append(TaxonomyBranch(label=label, used=count > 0, count=count))
-    branches.sort(key=lambda b: (-b.count, b.label))
+        branches.append(TaxonomyBranch(label=label, used=count > 0, count=count, group=_group_for_label(label, branch_groups)))
+    branches.sort(key=lambda b: (group_rank.get(b.group, len(_GROUP_ORDER)), -b.count, b.label))
 
     extra_used = [
-        TaxonomyBranch(label=value, used=True, count=count)
+        TaxonomyBranch(label=value, used=True, count=count, group=_group_for_label(value, branch_groups))
         for value, count in value_counts.items()
         if value.lower() not in matched_lower and value.lower() not in {lbl.lower() for lbl in taxonomy_labels}
     ]
-    extra_used.sort(key=lambda b: (-b.count, b.label))
+    extra_used.sort(key=lambda b: (group_rank.get(b.group, len(_GROUP_ORDER)), -b.count, b.label))
 
     start, end = window_bounds(window, today)
     return JournalTaxonomyResponse(
@@ -324,242 +455,9 @@ async def get_journal_taxonomy(
         total_entries=total_entries,
         emotion_entries=emotion_entries,
         taxonomy_source=taxonomy_source,
+        group_order=list(_GROUP_ORDER),
         branches=branches,
         extra_used=extra_used,
-    )
-
-
-# ---------------------------------------------------------------------------
-# View C: felt vs. recorded connection
-# ---------------------------------------------------------------------------
-
-class ConnectionResolution(BaseModel):
-    status: str  # "resolved" | "low_confidence" | "ambiguous" | "unresolved"
-    canonical_name: str | None = None
-    confidence: float | None = None
-    note: str
-
-
-class ConnectionDay(BaseModel):
-    date: str
-    self_reported: bool
-    interaction_count: int | None = None  # None only when resolution failed
-
-
-class ConnectionField(BaseModel):
-    field: str  # raw frontmatter key, e.g. "connection_taylor"
-    queried_name: str  # what was handed to the entity resolver
-    resolution: ConnectionResolution
-    field_entries: int
-    unparseable_entries: int
-    days: list[ConnectionDay]
-
-
-class JournalConnectionsResponse(BaseModel):
-    window: str
-    start_date: str | None = None
-    end_date: str
-    total_entries: int
-    fields: list[ConnectionField]
-
-
-def _parse_bool_field(value) -> bool | None:
-    """Best-effort boolean parse for a `connection_<name>` value. Accepts a
-    real YAML boolean (the expected case — PyYAML/`frontmatter` already
-    parses `true`/`false`/`yes`/`no` literals as Python `bool`), a small
-    set of common string/int spellings, and nothing else. Returns `None`
-    for anything unparseable so the caller can skip that day rather than
-    guess.
-
-    No real journal data was available while building this (the project's
-    own rule is to never read the real journal in code or tests), so this
-    intentionally covers more than just the one form-emitted shape rather
-    than assuming a single exact type.
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        if value == 1:
-            return True
-        if value == 0:
-            return False
-        return None
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in _TRUTHY:
-            return True
-        if v in _FALSY:
-            return False
-    return None
-
-
-def _interaction_counts_by_day(person_id: str, start: date, end: date, db_path: str) -> dict[str, int]:
-    """Count-only lookup of interactions for one person, grouped by
-    calendar day, over `[start, end]`. Never reads title/snippet/source
-    content — the query itself only ever selects `timestamp`, so there is
-    nothing to leak even in memory, matching the "counts only, never
-    content" privacy constraint for this view.
-
-    Uses substring comparison on the ISO timestamp text for both the date
-    grouping and the range filter, matching the existing convention in
-    `InteractionStore.get_all_in_range`'s `specific_date` branch — accepted
-    imprecision near a timezone-offset midnight boundary, not something
-    this view introduces.
-
-    Returns `{}` without connecting if the database file doesn't exist —
-    same "never create data/interactions.db as a side effect of a read"
-    posture as `_derive_taxonomy_labels`.
-    """
-    path = Path(db_path)
-    if not path.exists():
-        return {}
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return {}
-    try:
-        try:
-            cursor = conn.execute(
-                "SELECT substr(timestamp, 1, 10) AS day, COUNT(*) FROM interactions "
-                "WHERE person_id = ? AND substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ? "
-                "GROUP BY day",
-                (person_id, start.isoformat(), end.isoformat()),
-            )
-        except sqlite3.OperationalError:
-            return {}
-        return {row[0]: row[1] for row in cursor.fetchall()}
-    finally:
-        conn.close()
-
-
-def _resolve_connection_name(name: str) -> tuple[ConnectionResolution, str | None]:
-    """Resolve a `connection_<name>` slug to a person, disclosing
-    ambiguity and low confidence rather than silently picking a match.
-
-    Returns the disclosure-facing `ConnectionResolution` alongside the
-    resolved person's id (or `None`), so the caller can fetch interaction
-    counts without re-running resolution a second time.
-
-    `resolve_by_name` collapses two different ambiguity outcomes into the
-    same `None` return (fully ambiguous with no dominant candidate vs.
-    genuinely no match) — both are reported here as "unresolved" since the
-    caller can't tell them apart from the return value alone, and neither
-    can safely be attached to a specific person's interaction history.
-    """
-    resolver = get_entity_resolver()
-    result = resolver.resolve_by_name(name, create_if_missing=False)
-    if result is None:
-        return (
-            ConnectionResolution(
-                status="unresolved",
-                note=f"No confident match for '{name}' — interaction counts are not available for this field.",
-            ),
-            None,
-        )
-    if result.disambiguation_applied:
-        return (
-            ConnectionResolution(
-                status="ambiguous",
-                canonical_name=result.entity.canonical_name,
-                confidence=result.confidence,
-                note=(
-                    f"'{name}' matched multiple similarly-scored people; showing counts for the closest "
-                    f"guess ({result.entity.canonical_name}). Treat this comparison cautiously."
-                ),
-            ),
-            result.entity.id,
-        )
-    if result.confidence < _LOW_CONFIDENCE_THRESHOLD:
-        return (
-            ConnectionResolution(
-                status="low_confidence",
-                canonical_name=result.entity.canonical_name,
-                confidence=result.confidence,
-                note=f"Low-confidence match for '{name}' ({result.entity.canonical_name}); treat counts cautiously.",
-            ),
-            result.entity.id,
-        )
-    return (
-        ConnectionResolution(
-            status="resolved",
-            canonical_name=result.entity.canonical_name,
-            confidence=result.confidence,
-            note=f"'{name}' resolved to {result.entity.canonical_name}.",
-        ),
-        result.entity.id,
-    )
-
-
-@router.get("/connections", response_model=JournalConnectionsResponse)
-async def get_journal_connections(
-    window: str = Query(default=_DEFAULT_WINDOW, description="day, week, month, quarter, or all-time"),
-) -> JournalConnectionsResponse:
-    """For every `connection_<name>` field seen in the window, the
-    self-reported boolean per day alongside the actual interaction count
-    with that person from `data/interactions.db`.
-
-    In-person connection leaves no digital trace, so a day marked
-    "connected" with zero recorded interactions is not an error in either
-    direction — it's information about *channel*, not about accuracy. This
-    view (and the page that renders it) must never label a divergence as
-    wrong. The more actionable direction is the reverse: a day *not*
-    marked as connecting that has a nonzero interaction count, meaning a
-    real exchange happened through a channel the self-report didn't
-    credit.
-    """
-    window = _canonical_window(window)
-    today = date.today()
-    entries = _collect_entries(settings.vault_path, window, today)
-    start, end = window_bounds(window, today)
-
-    slugs: set[str] = set()
-    for _, fm in entries:
-        for key in fm:
-            if isinstance(key, str) and key.startswith("connection_"):
-                slugs.add(key)
-
-    fields: list[ConnectionField] = []
-    for field_key in sorted(slugs):
-        name_slug = field_key[len("connection_"):]
-        queried_name = name_slug.replace("_", " ").strip().title() or name_slug
-        resolution, person_id = _resolve_connection_name(queried_name)
-
-        counts_by_day: dict[str, int] = {}
-        if person_id is not None:
-            grid_start, _ = _grid_span(window, today, entries)
-            counts_by_day = _interaction_counts_by_day(
-                person_id, grid_start or today, end, get_interaction_db_path()
-            )
-
-        days: list[ConnectionDay] = []
-        unparseable = 0
-        for entry_date, fm in entries:
-            if field_key not in fm:
-                continue
-            parsed = _parse_bool_field(fm.get(field_key))
-            if parsed is None:
-                unparseable += 1
-                continue
-            count = None if resolution.status == "unresolved" else counts_by_day.get(entry_date.isoformat(), 0)
-            days.append(ConnectionDay(date=entry_date.isoformat(), self_reported=parsed, interaction_count=count))
-
-        fields.append(
-            ConnectionField(
-                field=field_key,
-                queried_name=queried_name,
-                resolution=resolution,
-                field_entries=len(days),
-                unparseable_entries=unparseable,
-                days=days,
-            )
-        )
-
-    return JournalConnectionsResponse(
-        window=window,
-        start_date=start.isoformat() if start else None,
-        end_date=end.isoformat(),
-        total_entries=len(entries),
-        fields=fields,
     )
 
 
@@ -578,7 +476,7 @@ class ScalarSeries(BaseModel):
 
 
 class ScalarCorrelation(BaseModel):
-    pair: list[str] = Field(default_factory=lambda: ["mood", "stress"])
+    pair: list[str]
     n: int
     r: float | None = None
     caveat: str
@@ -590,7 +488,7 @@ class JournalScalarsResponse(BaseModel):
     end_date: str
     total_entries: int
     series: list[ScalarSeries]
-    correlation: ScalarCorrelation
+    correlations: list[ScalarCorrelation]
 
 
 def _numeric(value) -> float | None:
@@ -604,16 +502,58 @@ def _numeric(value) -> float | None:
     return None
 
 
+def _pair_correlation(a: str, b: str, values_by_field: dict[str, dict[date, float]]) -> ScalarCorrelation:
+    """The Pearson `r` (stdlib `statistics.correlation`) for one scalar
+    pair over every entry-day where both fields are present and numeric,
+    alongside `n` and a caveat. `r` is `None` (never a misleadingly-precise
+    number) whenever it can't honestly be computed:
+
+    - `n < 2`: not enough paired data at all.
+    - `n >= 2` but zero variance in either field: `statistics.correlation`
+      raises `StatisticsError`, and the caveat says so specifically rather
+      than reusing the generic "not enough data" message — those are two
+      different reasons a reader needs to distinguish.
+
+    Deliberately does *not* embed the "the form doesn't label which
+    direction is better" disclaimer here — that caveat is identical for
+    every one of the six pairs (every self-reported scalar field has the
+    same scale-direction ambiguity), so the frontend states it once, above
+    the whole grid, rather than repeating it verbatim in all six footnotes.
+    This function's `caveat` field is reserved for the pair-specific
+    "not enough data" / "zero variance" cases, which *do* differ per pair.
+    """
+    paired_dates = sorted(set(values_by_field[a]) & set(values_by_field[b]))
+    n = len(paired_dates)
+    if n < 2:
+        return ScalarCorrelation(
+            pair=[a, b], n=n, r=None,
+            caveat=f"Not enough paired {a}/{b} entries in this window (n={n}) to compute a correlation.",
+        )
+    a_vals = [values_by_field[a][d] for d in paired_dates]
+    b_vals = [values_by_field[b][d] for d in paired_dates]
+    try:
+        r = statistics.correlation(a_vals, b_vals)
+    except statistics.StatisticsError:
+        return ScalarCorrelation(
+            pair=[a, b], n=n, r=None,
+            caveat=f"Correlation is undefined for this window (n={n}) — {a} or {b} had no variance across these entries.",
+        )
+    return ScalarCorrelation(pair=[a, b], n=n, r=r, caveat=f"co-movement only, over {n} paired entries.")
+
+
 @router.get("/scalars", response_model=JournalScalarsResponse)
 async def get_journal_scalars(
     window: str = Query(default=_DEFAULT_WINDOW, description="day, week, month, quarter, or all-time"),
 ) -> JournalScalarsResponse:
     """`mood`, `stress`, `sleep`, `body` as one point per entry-day, on the
     same calendar grid as the strip (`_grid_span`) so the two views line up
-    visually. The mood/stress correlation is computed and returned
-    directly rather than only implied by a rendered trend line — see the
-    module docstring and docs/specs/product/journal-analytics.md for why a
-    fitted line is deliberately not part of this feature at all.
+    visually, plus a `ScalarCorrelation` for every one of the six distinct
+    pairs among those four fields (`_SCALAR_PAIRS`). Each is computed and
+    returned directly rather than only implied by a rendered trend line —
+    see the module docstring and docs/specs/product/journal-analytics.md
+    for why a fitted line is deliberately not part of this feature at all,
+    and for why the frontend draws every pair as a scatter rather than
+    leading on the `r` values alone.
     """
     window = _canonical_window(window)
     today = date.today()
@@ -621,8 +561,7 @@ async def get_journal_scalars(
     start, end = _grid_span(window, today, entries)
 
     series: list[ScalarSeries] = []
-    mood_by_date: dict[date, float] = {}
-    stress_by_date: dict[date, float] = {}
+    values_by_field: dict[str, dict[date, float]] = {field: {} for field in _SCALAR_FIELDS}
     for field_name in _SCALAR_FIELDS:
         points: list[ScalarPoint] = []
         for entry_date, fm in entries:
@@ -630,34 +569,10 @@ async def get_journal_scalars(
             if value is None:
                 continue
             points.append(ScalarPoint(date=entry_date.isoformat(), value=value))
-            if field_name == "mood":
-                mood_by_date[entry_date] = value
-            elif field_name == "stress":
-                stress_by_date[entry_date] = value
+            values_by_field[field_name][entry_date] = value
         series.append(ScalarSeries(field=field_name, points=points))
 
-    paired_dates = sorted(set(mood_by_date) & set(stress_by_date))
-    n = len(paired_dates)
-    caveat = (
-        "The journal form does not label which direction of the mood or stress scale is "
-        "‘better’ — a positive correlation may mean mood holds up (or improves) under "
-        "load, or it may mean one of the two fields is effectively reverse-coded relative to the "
-        "other. This number describes co-movement only, not which interpretation is correct."
-    )
-    r: float | None = None
-    if n < 2:
-        caveat = f"Not enough paired mood/stress entries in this window (n={n}) to compute a correlation."
-    else:
-        moods = [mood_by_date[d] for d in paired_dates]
-        stresses = [stress_by_date[d] for d in paired_dates]
-        try:
-            r = statistics.correlation(moods, stresses)
-        except statistics.StatisticsError:
-            r = None
-            caveat = (
-                f"Correlation is undefined for this window (n={n}) — mood or stress had no "
-                "variance across these entries."
-            )
+    correlations = [_pair_correlation(a, b, values_by_field) for a, b in _SCALAR_PAIRS]
 
     return JournalScalarsResponse(
         window=window,
@@ -665,5 +580,5 @@ async def get_journal_scalars(
         end_date=end.isoformat(),
         total_entries=len(entries),
         series=series,
-        correlation=ScalarCorrelation(n=n, r=r, caveat=caveat),
+        correlations=correlations,
     )

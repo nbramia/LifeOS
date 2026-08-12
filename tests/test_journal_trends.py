@@ -1,15 +1,17 @@
 """
-Tests for the journal trend views: the strip, the unexplored wheel,
-felt-vs-recorded connection, and the scalar stack.
+Tests for the journal trend views: the strip, the unexplored wheel, and
+the scalar stack.
 
 All fixtures use invented dates, names, and values — never the real
-journal, the real CRM, or the real interactions database. View C's tests
-build a temp interactions database and a fake entity resolver instead of
-touching `data/`.
+journal, the real CRM, or the real interactions database. A fourth view
+(felt-vs-recorded connection) was removed after operator feedback that it
+wasn't useful — see docs/specs/product/journal-analytics.md's Removed
+section — which is why there's no longer a fake entity resolver or temp
+interactions database here.
 """
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date
 
 import pytest
 from fastapi import FastAPI
@@ -17,16 +19,11 @@ from fastapi.testclient import TestClient
 
 from api.routes import journal_trends
 from api.routes.journal_trends import (
-    ConnectionResolution,
+    _derive_branch_groups,
     _derive_taxonomy_labels,
     _grid_span,
-    _interaction_counts_by_day,
     _numeric,
-    _parse_bool_field,
 )
-from api.services.entity_resolver import ResolutionResult
-from api.services.interaction_store import Interaction, InteractionStore
-from api.services.person_entity import PersonEntity
 
 pytestmark = pytest.mark.unit
 
@@ -53,7 +50,6 @@ def client_and_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     monkeypatch.setattr(journal_trends.settings, "vault_path", vault)
     monkeypatch.setattr(journal_trends, "get_gsheet_sync_db_path", lambda: str(tmp_path / "no-such-gsheet.db"))
-    monkeypatch.setattr(journal_trends, "get_interaction_db_path", lambda: str(tmp_path / "no-such-interactions.db"))
     app = FastAPI()
     app.include_router(journal_trends.router)
     return TestClient(app), vault, tmp_path
@@ -220,7 +216,9 @@ class TestTaxonomyEndpoint:
         body = resp.json()
         assert body["taxonomy_source"] == "used-only"
         assert body["branches"] == []
-        assert body["extra_used"] == [{"label": "Happy", "used": True, "count": 1}]
+        # "Happy" is a known primary, so it groups under itself even with
+        # no form taxonomy available to derive anything from.
+        assert body["extra_used"] == [{"label": "Happy", "used": True, "count": 1, "group": "Happy"}]
 
     def test_form_source_marks_used_and_unused_branches(self, client_and_vault, tmp_path, monkeypatch):
         client, vault, _ = client_and_vault
@@ -235,8 +233,10 @@ class TestTaxonomyEndpoint:
         by_label = {b["label"]: b for b in body["branches"]}
         assert by_label["Angry"]["used"] is True
         assert by_label["Angry"]["count"] == 1
+        assert by_label["Angry"]["group"] == "Angry"  # primaries group under themselves
         assert by_label["Sad"]["used"] is False
         assert by_label["Sad"]["count"] == 0
+        assert by_label["Sad"]["group"] == "Sad"
         assert body["extra_used"] == []
 
     def test_value_not_matching_any_branch_lands_in_extra_used(self, client_and_vault, tmp_path, monkeypatch):
@@ -245,11 +245,13 @@ class TestTaxonomyEndpoint:
         _make_gsheet_db(gsheet_path, [{"Angry feelings": "Frustrated"}])
         monkeypatch.setattr(journal_trends, "get_gsheet_sync_db_path", lambda: str(gsheet_path))
 
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Not sure"})
+        # "Meh" is a stray value that doesn't match any derived branch and
+        # isn't a known primary, so it lands in extra_used, unplaced.
+        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Meh"})
         resp = client.get("/api/journal/taxonomy?window=day")
         body = resp.json()
-        assert body["branches"] == [{"label": "Angry", "used": False, "count": 0}]
-        assert body["extra_used"] == [{"label": "Not sure", "used": True, "count": 1}]
+        assert body["branches"] == [{"label": "Angry", "used": False, "count": 0, "group": "Angry"}]
+        assert body["extra_used"] == [{"label": "Meh", "used": True, "count": 1, "group": "Unplaced"}]
 
     def test_empty_window_reports_zero_entries(self, client_and_vault):
         client, _, _ = client_and_vault
@@ -258,166 +260,107 @@ class TestTaxonomyEndpoint:
         assert body["total_entries"] == 0
         assert body["emotion_entries"] == 0
 
-
-# ---------------------------------------------------------------------------
-# View C: felt vs. recorded connection
-# ---------------------------------------------------------------------------
-
-class _FakeResolver:
-    """Resolves exactly the names it's told to, nothing else — a stand-in
-    for `EntityResolver` so these tests never touch the real person store."""
-
-    def __init__(self, mapping: dict):
-        self._mapping = mapping
-
-    def resolve_by_name(self, name, create_if_missing=False):
-        return self._mapping.get(name)
-
-
-def _make_interactions_db(path, rows: list[tuple]) -> str:
-    """rows: list of (person_id, iso_timestamp)."""
-    store = InteractionStore(db_path=str(path), strict=False)
-    for i, (person_id, ts) in enumerate(rows):
-        store.add(
-            Interaction(
-                id=f"int-{i}",
-                person_id=person_id,
-                timestamp=datetime.fromisoformat(ts),
-                source_type="imessage",
-                title="synthetic",
-            )
-        )
-    return str(path)
-
-
-class TestParseBoolField:
-    @pytest.mark.parametrize("value", [True, "yes", "Yes", "true", "TRUE", 1])
-    def test_truthy_values(self, value):
-        assert _parse_bool_field(value) is True
-
-    @pytest.mark.parametrize("value", [False, "no", "No", "false", 0])
-    def test_falsy_values(self, value):
-        assert _parse_bool_field(value) is False
-
-    @pytest.mark.parametrize("value", ["maybe", "sort of", 2, None, 3.5, [], {}])
-    def test_unparseable_values_return_none(self, value):
-        assert _parse_bool_field(value) is None
-
-
-class TestInteractionCountsByDay:
-    def test_missing_db_returns_empty(self, tmp_path):
-        counts = _interaction_counts_by_day("person-1", date(2026, 1, 1), date(2026, 1, 31), str(tmp_path / "nope.db"))
-        assert counts == {}
-
-    def test_counts_grouped_by_day_for_one_person(self, tmp_path):
-        db_path = _make_interactions_db(tmp_path / "interactions.db", [
-            ("person-1", "2026-01-27T09:00:00+00:00"),
-            ("person-1", "2026-01-27T15:00:00+00:00"),
-            ("person-1", "2026-01-28T09:00:00+00:00"),
-            ("person-2", "2026-01-27T09:00:00+00:00"),  # different person, excluded
-        ])
-        counts = _interaction_counts_by_day("person-1", date(2026, 1, 1), date(2026, 1, 31), db_path)
-        assert counts == {"2026-01-27": 2, "2026-01-28": 1}
-
-
-class TestConnectionsEndpoint:
-    def test_no_connection_fields_in_window(self, client_and_vault):
-        client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Happy"})
-        resp = client.get("/api/journal/connections?window=day")
+    def test_group_order_is_primaries_then_unplaced(self, client_and_vault):
+        client, _, _ = client_and_vault
+        resp = client.get("/api/journal/taxonomy?window=day")
         body = resp.json()
-        assert body["fields"] == []
-        assert body["total_entries"] == 1
+        assert body["group_order"] == ["Angry", "Bad", "Disgusted", "Fearful", "Happy", "Sad", "Surprised", "Unplaced"]
 
-    def test_unresolvable_name_reports_unresolved_with_no_counts(self, client_and_vault, monkeypatch):
+
+class TestNotSureExcludedFromTaxonomy:
+    """"Not sure" must disappear entirely — from branches, extra_used, and
+    every count — whether it appears as a root `feeling:` value or as a
+    leaf deep in another branch's chain. See CHANGE 3 of the operator
+    feedback this module was revised for."""
+
+    def test_not_sure_as_root_produces_no_branch_or_extra_used_entry(self, client_and_vault):
         client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "connection_ghost": True})
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({}))
-
-        resp = client.get("/api/journal/connections?window=day")
+        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Not sure"})
+        resp = client.get("/api/journal/taxonomy?window=day")
         body = resp.json()
-        field = body["fields"][0]
-        assert field["field"] == "connection_ghost"
-        assert field["resolution"]["status"] == "unresolved"
-        assert field["resolution"]["canonical_name"] is None
-        assert field["days"] == [{"date": "2026-06-30", "self_reported": True, "interaction_count": None}]
+        assert body["branches"] == []
+        assert body["extra_used"] == []
+        # The entry itself still counts as emotion-bearing — "Not sure" is
+        # a real answer to "did you log a feeling", just not a taxonomy
+        # branch this view groups or displays.
+        assert body["emotion_entries"] == 1
 
-    def test_ambiguous_resolution_is_disclosed_and_still_counted(self, client_and_vault, tmp_path, monkeypatch):
+    def test_not_sure_as_leaf_is_never_counted(self, client_and_vault, tmp_path, monkeypatch):
         client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "connection_sam": True})
+        gsheet_path = tmp_path / "gsheet.db"
+        _make_gsheet_db(gsheet_path, [{"Sad feelings": "Muted"}])
+        monkeypatch.setattr(journal_trends, "get_gsheet_sync_db_path", lambda: str(gsheet_path))
+        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Sad", "sad_feelings": "Not sure"})
+        resp = client.get("/api/journal/taxonomy?window=day")
+        body = resp.json()
+        by_label = {b["label"]: b for b in body["branches"]}
+        assert by_label["Sad"]["used"] is True
+        assert by_label["Sad"]["count"] == 1
+        assert body["extra_used"] == []  # the "Not sure" leaf is dropped, not surfaced anywhere
 
-        person = PersonEntity(id="person-amb", canonical_name="Sam Ambiguous")
-        result = ResolutionResult(entity=person, is_new=False, confidence=0.42, match_type="fuzzy_ambiguous", disambiguation_applied=True)
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({"Sam": result}))
-
-        db_path = _make_interactions_db(tmp_path / "interactions.db", [("person-amb", "2026-06-30T09:00:00+00:00")])
-        monkeypatch.setattr(journal_trends, "get_interaction_db_path", lambda: db_path)
-
-        resp = client.get("/api/journal/connections?window=day")
-        field = resp.json()["fields"][0]
-        assert field["resolution"]["status"] == "ambiguous"
-        assert field["resolution"]["canonical_name"] == "Sam Ambiguous"
-        assert "cautiously" in field["resolution"]["note"]
-        assert field["days"][0]["interaction_count"] == 1
-
-    def test_low_confidence_resolution_is_disclosed(self, client_and_vault, monkeypatch):
+    def test_not_sure_as_a_derived_form_column_is_filtered(self, client_and_vault, tmp_path, monkeypatch):
+        # Defensive: even if the sheet somehow had a "Not sure feelings"
+        # column, it must never become a displayable taxonomy branch.
         client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "connection_pat": False})
+        gsheet_path = tmp_path / "gsheet.db"
+        _make_gsheet_db(gsheet_path, [{"Not sure feelings": "Whatever", "Sad feelings": "Muted"}])
+        monkeypatch.setattr(journal_trends, "get_gsheet_sync_db_path", lambda: str(gsheet_path))
+        resp = client.get("/api/journal/taxonomy?window=day")
+        body = resp.json()
+        labels = {b["label"] for b in body["branches"]}
+        assert "Not sure" not in labels
+        assert "Sad" in labels
 
-        person = PersonEntity(id="person-low", canonical_name="Pat Uncertain")
-        result = ResolutionResult(entity=person, is_new=False, confidence=0.3, match_type="structured", disambiguation_applied=False)
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({"Pat": result}))
 
-        resp = client.get("/api/journal/connections?window=day")
-        field = resp.json()["fields"][0]
-        assert field["resolution"]["status"] == "low_confidence"
+class TestDeriveBranchGroups:
+    """Unit coverage for the grouping logic itself, independent of the
+    taxonomy endpoint's use of it."""
 
-    def test_resolved_field_matches_self_report_against_interaction_counts(self, client_and_vault, tmp_path, monkeypatch):
-        client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "connection_rowan": True})
-        _write_entry(vault, "2026-01-28", {"date": "2026-01-28", "connection_rowan": False})
+    def test_majority_vote_assigns_the_more_frequent_root(self, tmp_path):
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2026-01-01", {"date": "2026-01-01", "feeling": "Sad", "sad_feelings": "Muted"})
+        _write_entry(vault, "2026-01-02", {"date": "2026-01-02", "feeling": "Sad", "sad_feelings": "Muted"})
+        _write_entry(vault, "2026-01-03", {"date": "2026-01-03", "feeling": "Bad", "bad_feeling": "Muted"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert groups["muted"] == "Sad"  # 2 votes for Sad outweigh 1 for Bad
 
-        person = PersonEntity(id="person-rowan", canonical_name="Rowan Placeholder")
-        result = ResolutionResult(entity=person, is_new=False, confidence=0.95, match_type="name_exact")
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({"Rowan": result}))
+    def test_tie_breaks_alphabetically(self, tmp_path):
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2026-01-01", {"date": "2026-01-01", "feeling": "Bad", "bad_feeling": "Foggy"})
+        _write_entry(vault, "2026-01-02", {"date": "2026-01-02", "feeling": "Angry", "angry_feelings": "Foggy"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert groups["foggy"] == "Angry"  # one vote each; "Angry" < "Bad" alphabetically
 
-        db_path = _make_interactions_db(tmp_path / "interactions.db", [
-            ("person-rowan", "2026-01-27T09:00:00+00:00"),
-            # The "reverse direction" case: not self-reported as connecting,
-            # but a real interaction happened that day.
-            ("person-rowan", "2026-01-28T09:00:00+00:00"),
-        ])
-        monkeypatch.setattr(journal_trends, "get_interaction_db_path", lambda: db_path)
+    def test_not_sure_root_casts_no_votes(self, tmp_path):
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2026-01-01", {"date": "2026-01-01", "feeling": "Not sure", "not_sure_feelings": "Adrift"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert "adrift" not in groups
 
-        resp = client.get("/api/journal/connections?window=all-time")
-        field = resp.json()["fields"][0]
-        assert field["resolution"]["status"] == "resolved"
-        by_date = {d["date"]: d for d in field["days"]}
-        assert by_date["2026-01-27"] == {"date": "2026-01-27", "self_reported": True, "interaction_count": 1}
-        assert by_date["2026-01-28"] == {"date": "2026-01-28", "self_reported": False, "interaction_count": 1}
+    def test_not_sure_as_a_chain_value_is_never_recorded(self, tmp_path):
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2026-01-01", {"date": "2026-01-01", "feeling": "Sad", "sad_feelings": "Not sure"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert "not sure" not in groups
 
-    def test_unparseable_self_report_is_skipped_and_counted(self, client_and_vault, monkeypatch):
-        client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "connection_avery": "maybe"})
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({}))
+    def test_root_outside_known_primaries_casts_no_votes(self, tmp_path):
+        # A hand-edited entry whose root isn't one of the seven known
+        # primaries at all — must not become an eighth, invented primary.
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2026-01-01", {"date": "2026-01-01", "feeling": "Weird", "weird_feelings": "Odd"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert "odd" not in groups
 
-        resp = client.get("/api/journal/connections?window=day")
-        field = resp.json()["fields"][0]
-        assert field["days"] == []
-        assert field["unparseable_entries"] == 1
-
-    def test_multiple_connection_fields_discovered_dynamically(self, client_and_vault, monkeypatch):
-        client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-06-30", {
-            "date": "2026-06-30",
-            "connection_river": True,
-            "connection_sage": False,
-        })
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({}))
-
-        resp = client.get("/api/journal/connections?window=day")
-        field_names = {f["field"] for f in resp.json()["fields"]}
-        assert field_names == {"connection_river", "connection_sage"}
+    def test_not_window_scoped(self, tmp_path):
+        # Grouping is a structural property of the form, derived from
+        # every entry ever written — not something that should change
+        # depending on which window the taxonomy endpoint happens to be
+        # showing. Passing a `today` far enough in the future to be
+        # "all-time"-inclusive of an old entry must still find its votes.
+        vault = tmp_path / "vault"
+        _write_entry(vault, "2020-01-01", {"date": "2020-01-01", "feeling": "Happy", "happy_feelings": "Cozy"})
+        groups = _derive_branch_groups(vault, date(2026, 6, 30))
+        assert groups["cozy"] == "Happy"
 
 
 # ---------------------------------------------------------------------------
@@ -438,24 +381,39 @@ class TestNumeric:
         assert _numeric(None) is None
 
 
+def _corr(body, a, b):
+    """Pull one pair's ScalarCorrelation dict out of a scalars response."""
+    return next(c for c in body["correlations"] if c["pair"] == [a, b])
+
+
 class TestScalarsEndpoint:
+    def test_returns_all_six_pairs(self, client_and_vault):
+        client, _, _ = client_and_vault
+        resp = client.get("/api/journal/scalars?window=day")
+        body = resp.json()
+        pairs = {tuple(c["pair"]) for c in body["correlations"]}
+        assert pairs == {
+            ("mood", "stress"), ("mood", "sleep"), ("mood", "body"),
+            ("stress", "sleep"), ("stress", "body"), ("sleep", "body"),
+        }
+
     def test_empty_window(self, client_and_vault):
         client, _, _ = client_and_vault
         resp = client.get("/api/journal/scalars?window=day")
         body = resp.json()
         assert body["total_entries"] == 0
         assert all(s["points"] == [] for s in body["series"])
-        assert body["correlation"]["n"] == 0
-        assert body["correlation"]["r"] is None
+        assert all(c["n"] == 0 and c["r"] is None for c in body["correlations"])
 
     def test_single_entry_n1_correlation_is_undefined(self, client_and_vault):
         client, vault, _ = client_and_vault
         _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "mood": 6, "stress": 4, "sleep": 7, "body": 5})
         resp = client.get("/api/journal/scalars?window=day")
         body = resp.json()
-        assert body["correlation"]["n"] == 1
-        assert body["correlation"]["r"] is None
-        assert "n=1" in body["correlation"]["caveat"]
+        mood_stress = _corr(body, "mood", "stress")
+        assert mood_stress["n"] == 1
+        assert mood_stress["r"] is None
+        assert "n=1" in mood_stress["caveat"]
         mood_series = next(s for s in body["series"] if s["field"] == "mood")
         assert mood_series["points"] == [{"date": "2026-06-30", "value": 6.0}]
 
@@ -465,10 +423,15 @@ class TestScalarsEndpoint:
         _write_entry(vault, "2026-01-28", {"date": "2026-01-28", "mood": 7, "stress": 8})
         resp = client.get("/api/journal/scalars?window=all-time")
         body = resp.json()
-        assert body["correlation"]["n"] == 2
-        assert body["correlation"]["r"] == pytest.approx(1.0)
-        assert "caveat" in body["correlation"]
-        assert "scale" in body["correlation"]["caveat"] or "reverse-coded" in body["correlation"]["caveat"]
+        mood_stress = _corr(body, "mood", "stress")
+        assert mood_stress["n"] == 2
+        assert mood_stress["r"] == pytest.approx(1.0)
+        # The pair-specific caveat is now just the "co-movement" note — the
+        # scale-direction disclaimer moved to the frontend's single shared
+        # banner above the whole grid (see journal-trends.html), since
+        # it's identical for all six pairs and repeating it verbatim six
+        # times in the API response would be redundant, not informative.
+        assert "co-movement" in mood_stress["caveat"]
 
     def test_zero_variance_makes_correlation_undefined(self, client_and_vault):
         client, vault, _ = client_and_vault
@@ -477,8 +440,9 @@ class TestScalarsEndpoint:
         _write_entry(vault, "2026-01-29", {"date": "2026-01-29", "mood": 5, "stress": 7})
         resp = client.get("/api/journal/scalars?window=all-time")
         body = resp.json()
-        assert body["correlation"]["r"] is None
-        assert "variance" in body["correlation"]["caveat"]
+        mood_stress = _corr(body, "mood", "stress")
+        assert mood_stress["r"] is None
+        assert "variance" in mood_stress["caveat"]
 
     def test_missing_field_on_some_entries_is_excluded_not_zeroed(self, client_and_vault):
         client, vault, _ = client_and_vault
@@ -490,7 +454,7 @@ class TestScalarsEndpoint:
         stress_series = next(s for s in body["series"] if s["field"] == "stress")
         assert len(mood_series["points"]) == 2
         assert len(stress_series["points"]) == 1
-        assert body["correlation"]["n"] == 1  # only one day has both
+        assert _corr(body, "mood", "stress")["n"] == 1  # only one day has both
 
     def test_grid_aligned_with_strip_for_all_time(self, client_and_vault):
         client, vault, _ = client_and_vault
@@ -525,11 +489,5 @@ class TestDisclosurePolicyStillApplies:
         })
         resp = client.get("/api/journal/taxonomy?window=day")
         body = resp.json()
-        assert body["extra_used"] == [{"label": "Unrecognized", "used": True, "count": 1}]
+        assert body["extra_used"] == [{"label": "Unrecognized", "used": True, "count": 1, "group": "Unplaced"}]
         assert "private" not in resp.text
-
-
-def test_connection_resolution_model_defaults():
-    r = ConnectionResolution(status="unresolved", note="x")
-    assert r.canonical_name is None
-    assert r.confidence is None

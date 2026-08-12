@@ -130,33 +130,62 @@
             font-size: 0.9rem;
         }
 
-        /* -- View A: the strip -- */
+        /* -- View A: the strip (GitHub-contribution-style squares; same
+           structure/metrics as the CRM heatmap in web/crm.html — weeks as
+           flex columns, ~11px square cells, 2px radius/gap — but flat
+           discrete emotion colors instead of an intensity ramp: a day
+           either has an entry (its primary emotion's color) or it doesn't
+           (the empty-cell background). No opacity steps. -- */
         .strip-scroll {
             overflow-x: auto;
             padding-bottom: 0.5rem;
         }
 
-        .strip-row {
+        .strip-months {
             display: flex;
-            gap: 1px;
-            height: 34px;
+            margin-bottom: 4px;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+        }
+
+        .strip-month-label {
+            text-align: left;
+            white-space: nowrap;
+            flex: 1;
+            min-width: 2em;
+        }
+
+        .strip-grid {
+            display: flex;
+            gap: 2px;
             width: max-content;
         }
 
-        .day-cell {
-            width: 7px;
-            height: 34px;
-            flex-shrink: 0;
-            border-radius: 1px;
+        .strip-week {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
         }
 
-        .day-cell.gap {
+        .strip-day {
+            width: 11px;
+            height: 11px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+
+        .strip-day.hidden-cell {
+            visibility: hidden;
+        }
+
+        .strip-day.gap {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
         }
 
-        .day-cell.no-feeling {
-            background: repeating-linear-gradient(45deg, var(--border), var(--border) 2px, var(--bg-secondary) 2px, var(--bg-secondary) 4px);
+        .strip-day.no-feeling {
+            background: var(--bg-secondary);
+            border: 1px dashed var(--text-secondary);
         }
 
         .strip-legend {
@@ -199,6 +228,74 @@
             height: 40px;
         }
 
+        /* -- View D: pairwise scatter grid -- */
+        .scatter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-top: 0.9rem;
+        }
+
+        .scatter-cell {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.7rem 0.8rem;
+        }
+
+        .scatter-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+        }
+
+        .scatter-sentence {
+            font-size: 0.8rem;
+            color: var(--text-primary);
+            margin-bottom: 0.5rem;
+            min-height: 2.4em;
+        }
+
+        .scatter-chart-row {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .scatter-y-label {
+            writing-mode: vertical-rl;
+            transform: rotate(180deg);
+            font-size: 0.68rem;
+            color: var(--text-secondary);
+            text-transform: capitalize;
+        }
+
+        .scatter-svg {
+            flex: 1;
+            width: 100%;
+            aspect-ratio: 1;
+        }
+
+        .scatter-x-label {
+            text-align: center;
+            font-size: 0.68rem;
+            color: var(--text-secondary);
+            text-transform: capitalize;
+            margin-top: 0.15rem;
+        }
+
+        .scatter-footnote {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            margin-top: 0.4rem;
+        }
+
+        .scatter-empty {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            padding: 1.5rem 0;
+            text-align: center;
+        }
+
         /* -- View B: unexplored wheel -- */
         .wheel-flex {
             display: flex;
@@ -208,24 +305,37 @@
         }
 
         #taxonomySvg {
-            width: 260px;
-            height: 260px;
+            width: 280px;
+            height: 280px;
             flex-shrink: 0;
         }
 
         .taxonomy-legend {
             flex: 1;
             min-width: 220px;
-            max-height: 280px;
+            max-height: 320px;
             overflow-y: auto;
             font-size: 0.82rem;
+        }
+
+        .taxonomy-group {
+            margin-bottom: 0.6rem;
+        }
+
+        .taxonomy-group-header {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            padding: 0.15rem 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0.15rem;
         }
 
         .taxonomy-row {
             display: flex;
             align-items: center;
             gap: 0.5rem;
-            padding: 0.2rem 0;
+            padding: 0.2rem 0 0.2rem 0.5rem;
         }
 
         .taxonomy-row.unused {
@@ -244,65 +354,6 @@
             margin-left: auto;
             color: var(--text-secondary);
             font-size: 0.78rem;
-        }
-
-        /* -- View C: connections -- */
-        .connection-field {
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 0.9rem 1rem;
-            margin-bottom: 1rem;
-        }
-
-        .connection-field:last-child {
-            margin-bottom: 0;
-        }
-
-        .connection-status {
-            font-size: 0.8rem;
-            padding: 0.2rem 0.6rem;
-            border-radius: 999px;
-            display: inline-block;
-            margin-bottom: 0.5rem;
-        }
-
-        .status-resolved { background: rgba(34,197,94,0.15); color: #4ade80; }
-        .status-low_confidence { background: rgba(234,179,8,0.15); color: #facc15; }
-        .status-ambiguous { background: rgba(234,179,8,0.15); color: #facc15; }
-        .status-unresolved { background: rgba(148,163,184,0.15); color: var(--text-secondary); }
-
-        .connection-note {
-            font-size: 0.82rem;
-            color: var(--text-secondary);
-            margin-bottom: 0.6rem;
-        }
-
-        table.connection-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.82rem;
-        }
-
-        table.connection-table th, table.connection-table td {
-            text-align: left;
-            padding: 0.3rem 0.5rem;
-            border-bottom: 1px solid var(--border);
-        }
-
-        table.connection-table th {
-            color: var(--text-secondary);
-            font-weight: 500;
-        }
-
-        .flag-recorded-not-felt {
-            color: var(--accent-hover);
-            font-weight: 600;
-        }
-
-        .reverse-summary {
-            font-size: 0.82rem;
-            color: var(--accent-hover);
-            margin-top: 0.5rem;
         }
     </style>
 </head>
@@ -342,20 +393,6 @@
             <h2>The Unexplored Wheel</h2>
             <div class="sample-note" id="taxonomyNote">Loading…</div>
             <div id="taxonomyBody"></div>
-        </section>
-
-        <section class="view" id="connectionSection">
-            <h2>Felt vs. Recorded Connection</h2>
-            <div class="sample-note" id="connectionNote">Loading…</div>
-            <div class="caveat">
-                In-person connection leaves no digital trace, so a day marked "connected" with zero
-                recorded interactions is not an error — it's information about <em>channel</em>, not
-                accuracy. The more useful signal runs the other way: a day <em>not</em> marked as
-                connecting that has recorded messages, meaning a real exchange happened through a
-                channel the self-report didn't credit. Rows like that are flagged below rather than
-                treated as agreement/disagreement.
-            </div>
-            <div id="connectionBody"></div>
         </section>
     </div>
 
@@ -410,6 +447,31 @@
 
         // ---- View A: the strip ----
 
+        // Builds one <div class="strip-day"> for a single UTC calendar day,
+        // reused by both in-range and out-of-range (hidden) cells so the
+        // week/grid loop below stays uncluttered.
+        function stripDayCell(d) {
+            if (!d) return '<div class="strip-day hidden-cell"></div>';
+            let cls = 'strip-day gap';
+            let style = '';
+            let title = d.date + ': no journal entry';
+            if (d.has_entry && d.primary_emotion) {
+                cls = 'strip-day';
+                style = `background:${colorFor(d.primary_emotion)}`;
+                title = `${d.date}: ${d.primary_emotion}`;
+            } else if (d.has_entry) {
+                cls = 'strip-day no-feeling';
+                title = `${d.date}: entry logged, no feeling recorded`;
+            }
+            return `<div class="${cls}" style="${style}" title="${escapeHtml(title)}"></div>`;
+        }
+
+        // Renders the strip as GitHub-contribution-style squares: weeks as
+        // flex columns (Sunday-aligned, matching the CRM heatmap in
+        // web/crm.html), with month labels running along the top. Unlike
+        // the CRM heatmap, color encodes *which* emotion (a flat hue per
+        // primary emotion), never an intensity ramp — a day either has an
+        // entry (its primary's color) or it doesn't (the gap background).
         function renderStrip(data) {
             const note = document.getElementById('stripNote');
             const body = document.getElementById('stripBody');
@@ -422,27 +484,51 @@
             }
             note.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
                 `entries logged a feeling, across <strong>${days.length}</strong> calendar days ` +
-                `(${rangeText}). Every day in the span gets a cell — gaps are shown, not skipped.`;
+                `(${rangeText}). Every day in the span gets a square — gaps are shown, not skipped.`;
 
-            const cells = days.map((d) => {
-                let cls = 'day-cell gap';
-                let style = '';
-                let title = d.date + ': no journal entry';
-                if (d.has_entry && d.primary_emotion) {
-                    cls = 'day-cell';
-                    style = `background:${colorFor(d.primary_emotion)}`;
-                    title = `${d.date}: ${d.primary_emotion}`;
-                } else if (d.has_entry) {
-                    cls = 'day-cell no-feeling';
-                    title = `${d.date}: entry logged, no feeling recorded`;
+            const byDate = new Map(days.map((d) => [d.date, d]));
+            const rangeStart = new Date(days[0].date + 'T00:00:00Z');
+            const rangeEnd = new Date(days[days.length - 1].date + 'T00:00:00Z');
+            const gridStart = new Date(rangeStart);
+            gridStart.setUTCDate(gridStart.getUTCDate() - gridStart.getUTCDay());
+            const gridEnd = new Date(rangeEnd);
+            gridEnd.setUTCDate(gridEnd.getUTCDate() + (6 - gridEnd.getUTCDay()));
+
+            const weeks = [];
+            const monthLabels = [];
+            let lastMonth = -1;
+            let colIndex = 0;
+            for (let cur = new Date(gridStart); cur <= gridEnd; cur.setUTCDate(cur.getUTCDate() + 7)) {
+                const cells = [];
+                for (let i = 0; i < 7; i++) {
+                    const day = new Date(cur);
+                    day.setUTCDate(day.getUTCDate() + i);
+                    const inRange = day >= rangeStart && day <= rangeEnd;
+                    if (i === 0 && inRange) {
+                        const month = day.getUTCMonth();
+                        if (month !== lastMonth) {
+                            monthLabels.push({ colIndex, label: day.toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' }) });
+                            lastMonth = month;
+                        }
+                    }
+                    cells.push(inRange ? stripDayCell(byDate.get(day.toISOString().slice(0, 10))) : stripDayCell(null));
                 }
-                return `<div class="${cls}" style="${style}" title="${escapeHtml(title)}"></div>`;
-            });
-            body.innerHTML = `<div class="strip-scroll"><div class="strip-row">${cells.join('')}</div></div>` +
+                weeks.push(`<div class="strip-week">${cells.join('')}</div>`);
+                colIndex++;
+            }
+
+            const totalCols = colIndex;
+            const monthsHtml = monthLabels.map((m, i) => {
+                const span = (monthLabels[i + 1] ? monthLabels[i + 1].colIndex : totalCols) - m.colIndex;
+                return `<div class="strip-month-label" style="flex:${span}">${m.label}</div>`;
+            }).join('');
+
+            body.innerHTML = `<div class="strip-scroll"><div class="strip-months">${monthsHtml}</div>` +
+                `<div class="strip-grid">${weeks.join('')}</div></div>` +
                 `<div class="strip-legend">` +
                 `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>no entry that day (gap)</span>` +
-                `<span><span class="strip-legend-swatch" style="background:repeating-linear-gradient(45deg, var(--border), var(--border) 2px, var(--bg-secondary) 2px, var(--bg-secondary) 4px)"></span>entry, no feeling logged</span>` +
-                `<span><span class="strip-legend-swatch" style="background:${colorFor('Happy')}"></span>colored by primary emotion (hue is deterministic per value, hover for the exact label)</span>` +
+                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>entry, no feeling logged</span>` +
+                `<span><span class="strip-legend-swatch" style="background:${colorFor('Happy')}"></span>colored by primary emotion (hue is deterministic per value, hover for the exact label) — flat color, never shaded by intensity</span>` +
                 `</div>`;
         }
 
@@ -482,11 +568,69 @@
             return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${parts.join('')}</svg>`;
         }
 
+        // Plain-language reading of one pair's correlation. Deliberately
+        // symmetric in wording ("also tends to be higher/lower") rather than
+        // asserting cause in either direction — the same "co-movement, not
+        // causation" boundary the demoted r-footnote states numerically.
+        function pairSentence(a, b, n, r) {
+            if (r === null || r === undefined) {
+                return `Not enough paired ${a}/${b} entries in this window (n=${n}) to see a pattern.`;
+            }
+            if (Math.abs(r) < 0.1) {
+                return `${a[0].toUpperCase()}${a.slice(1)} and ${b} show no clear pattern together in this window.`;
+            }
+            const direction = r > 0 ? 'also tends to be higher' : 'tends to be lower';
+            return `On days rated higher for ${a}, ${b} ${direction}.`;
+        }
+
+        // The paired (x, y) points for one field pair, matched by date —
+        // computed client-side from the already-fetched per-field series
+        // rather than the backend re-shipping the same points twice.
+        function pairedPoints(seriesByField, a, b) {
+            const A = new Map(seriesByField[a].points.map((p) => [p.date, p.value]));
+            const B = new Map(seriesByField[b].points.map((p) => [p.date, p.value]));
+            const dates = [...A.keys()].filter((d) => B.has(d));
+            return dates.map((d) => ({ date: d, x: A.get(d), y: B.get(d) }));
+        }
+
+        // One small, individually-labeled scatter: no fitted line (a
+        // regression at n as low as 2-5 would imply confidence the sample
+        // can't support — the same principle the sparklines' "never bridge
+        // a gap" rule follows), axis ticks at the observed min/max so the
+        // plot is readable without a shared external scale.
+        function renderScatterSvg(points) {
+            if (!points.length) {
+                return '<div class="scatter-empty">No paired data in this window.</div>';
+            }
+            const size = 160;
+            const pad = 20;
+            const xs = points.map((p) => p.x);
+            const ys = points.map((p) => p.y);
+            const minX = Math.min(...xs), maxX = Math.max(...xs);
+            const minY = Math.min(...ys), maxY = Math.max(...ys);
+            const spanX = (maxX - minX) || 1;
+            const spanY = (maxY - minY) || 1;
+            const toX = (v) => pad + ((v - minX) / spanX) * (size - 2 * pad);
+            const toY = (v) => (size - pad) - ((v - minY) / spanY) * (size - 2 * pad);
+            const dots = points.map((p) =>
+                `<circle cx="${toX(p.x)}" cy="${toY(p.y)}" r="3" fill="${colorFor('scatter')}" opacity="0.75">` +
+                `<title>${escapeHtml(p.date)}: ${p.x} / ${p.y}</title></circle>`
+            ).join('');
+            return `<svg viewBox="0 0 ${size} ${size}" class="scatter-svg" preserveAspectRatio="xMidYMid meet">` +
+                `<line x1="${pad}" y1="${size - pad}" x2="${size - pad}" y2="${size - pad}" stroke="var(--border)" />` +
+                `<line x1="${pad}" y1="${pad}" x2="${pad}" y2="${size - pad}" stroke="var(--border)" />` +
+                `<text x="${pad}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${minX}</text>` +
+                `<text x="${size - pad - 12}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${maxX}</text>` +
+                `<text x="2" y="${size - pad}" font-size="8" fill="var(--text-secondary)">${minY}</text>` +
+                `<text x="2" y="${pad + 6}" font-size="8" fill="var(--text-secondary)">${maxY}</text>` +
+                dots + `</svg>`;
+        }
+
         function renderScalars(data) {
             const note = document.getElementById('scalarNote');
             const corr = document.getElementById('correlationNote');
             const body = document.getElementById('scalarBody');
-            const { total_entries, series, start_date, end_date, correlation } = data;
+            const { total_entries, series, start_date, end_date, correlations } = data;
             const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
             const anyPoints = series.some((s) => s.points.length);
             if (!anyPoints) {
@@ -498,28 +642,75 @@
             note.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
                 `in this window (${rangeText}). Dots mark entries; a line is drawn only between entries on ` +
                 `consecutive calendar days — everything else is a gap, on purpose.`;
-            const rText = correlation.r === null || correlation.r === undefined
-                ? 'n/a'
-                : (correlation.r >= 0 ? '+' : '') + correlation.r.toFixed(2);
-            corr.innerHTML = `<strong>mood vs. stress: r = ${rText}</strong> (n=${correlation.n}). ${escapeHtml(correlation.caveat)}`;
+
+            // Stated once, above every pair — identical for all six because
+            // every self-reported scalar field shares the same ambiguity,
+            // not something worth repeating six times over.
+            corr.innerHTML = `The journal form does not label which direction of any of these four scales is ` +
+                `"better" — a relationship below may mean the two genuinely move together, or that one field ` +
+                `is effectively reverse-coded relative to the other. Each chart plots one dot per entry with ` +
+                `both values logged; no line is fitted, since a sample this small can't support one.`;
+
+            const seriesByField = {};
+            series.forEach((s) => { seriesByField[s.field] = s; });
 
             const gridStart = start_date || (series.find((s) => s.points.length)?.points[0]?.date);
             const gridEnd = end_date;
-            body.innerHTML = series.map((s) => {
+            const sparklines = series.map((s) => {
                 return `<div class="scalar-row"><span class="scalar-label">${escapeHtml(s.field)}</span>` +
                     renderSparkline(s.field, s.points, gridStart, gridEnd) + `</div>`;
             }).join('');
+
+            const scatterCells = correlations.map((c) => {
+                const [a, b] = c.pair;
+                const points = pairedPoints(seriesByField, a, b);
+                const sentence = pairSentence(a, b, c.n, c.r);
+                const rText = c.r === null || c.r === undefined ? 'n/a' : (c.r >= 0 ? '+' : '') + c.r.toFixed(2);
+                return `<div class="scatter-cell">` +
+                    `<div class="scatter-title">${escapeHtml(a)} vs. ${escapeHtml(b)}</div>` +
+                    `<div class="scatter-sentence">${escapeHtml(sentence)}</div>` +
+                    `<div class="scatter-chart-row"><span class="scatter-y-label">${escapeHtml(b)}</span>${renderScatterSvg(points)}</div>` +
+                    `<div class="scatter-x-label">${escapeHtml(a)}</div>` +
+                    `<div class="scatter-footnote">r = ${rText} (n=${c.n})</div>` +
+                    `</div>`;
+            }).join('');
+
+            body.innerHTML = sparklines +
+                `<h3 style="font-size:0.95rem;margin:1rem 0 0.2rem;">How the four measures relate</h3>` +
+                `<div class="scatter-grid">${scatterCells}</div>`;
         }
 
         // ---- View B: the unexplored wheel ----
 
+        // A colour *family* per primary-emotion group: one hue per group
+        // (hashed from the group name, so it's stable across reloads),
+        // varying only lightness/saturation per branch within that family
+        // — so a glance at the wheel or legend shows which family a branch
+        // belongs to. "Unplaced" gets a neutral (zero-saturation) family
+        // instead of a hue, since it isn't a real emotion family — it's an
+        // honest "don't know yet" bucket. This is the one place on this
+        // page intensity-style shading *is* wanted (feedback item 1's "no
+        // variable shading" applies to the strip only).
+        function familyColor(group, label) {
+            const h2 = fnv1aHue(label);
+            if (group === 'Unplaced') {
+                const light = 30 + (h2 % 30);
+                return `hsl(0, 0%, ${light}%)`;
+            }
+            const hue = fnv1aHue(group);
+            const sat = 50 + (h2 % 30);
+            const light = 40 + ((h2 >> 4) % 30);
+            return `hsl(${hue}, ${sat}%, ${light}%)`;
+        }
+
         function renderTaxonomy(data) {
             const note = document.getElementById('taxonomyNote');
             const body = document.getElementById('taxonomyBody');
-            const { total_entries, emotion_entries, taxonomy_source, branches, extra_used } = data;
+            const { total_entries, emotion_entries, taxonomy_source, branches, extra_used, group_order } = data;
 
             const sourceText = taxonomy_source === 'form'
-                ? `${branches.length} branches derived from the journal form's own questions.`
+                ? `${branches.length} branches derived from the journal form's own questions, grouped by ` +
+                  `primary emotion. "Not sure" is excluded entirely — it's a non-answer, not an emotion.`
                 : `Form taxonomy unavailable (no gsheet_sync.db, or no matching columns) — showing only ` +
                   `values actually used, same as the emotion wheel's flat legend. This is a real degraded ` +
                   `mode, not an error.`;
@@ -531,78 +722,57 @@
                 body.innerHTML = '<div class="empty-state">No emotion vocabulary observed or available in this window.</div>';
                 return;
             }
+
+            const byGroup = new Map();
+            all.forEach((b) => {
+                if (!byGroup.has(b.group)) byGroup.set(b.group, []);
+                byGroup.get(b.group).push(b);
+            });
+            byGroup.forEach((items) => items.sort((x, y) => (y.count - x.count) || x.label.localeCompare(y.label)));
+            const groupsPresent = group_order.filter((g) => byGroup.has(g));
+
+            // Slots interleave real items with `null` gap markers between
+            // groups, so every group's wedges land contiguously on the
+            // wheel with a small visible break before the next family.
+            const slots = [];
+            groupsPresent.forEach((g, gi) => {
+                byGroup.get(g).forEach((b) => slots.push(b));
+                if (gi < groupsPresent.length - 1) slots.push(null);
+            });
+
             const maxCount = Math.max(1, ...all.map((b) => b.count));
             const rInner = 26;
-            const rOuter = 118;
-            const n = all.length;
+            const rOuter = 128;
+            const n = slots.length;
             const angle = (2 * Math.PI) / n;
             const parts = [];
-            all.forEach((b, i) => {
+            slots.forEach((b, i) => {
+                if (!b) return; // gap between groups — nothing drawn
                 const a0 = -Math.PI / 2 + i * angle;
-                const a1 = a0 + angle * 0.85; // small gap between wedges
+                const a1 = a0 + angle * 0.85; // small gap between wedges within a group
+                const color = familyColor(b.group, b.label);
                 if (b.used) {
                     const len = rInner + (b.count / maxCount) * (rOuter - rInner);
-                    parts.push(`<path d="${arcPath(130, 130, rInner, len, a0, a1)}" fill="${colorFor(b.label)}" opacity="0.9"><title>${escapeHtml(b.label)}: ${b.count}</title></path>`);
+                    parts.push(`<path d="${arcPath(140, 140, rInner, len, a0, a1)}" fill="${color}" opacity="0.9"><title>${escapeHtml(b.group)} → ${escapeHtml(b.label)}: ${b.count}</title></path>`);
                 } else {
-                    parts.push(`<path d="${arcPath(130, 130, rInner, rInner + 18, a0, a1)}" fill="none" stroke="var(--text-secondary)" stroke-width="1" opacity="0.5"><title>${escapeHtml(b.label)}: not used in this window</title></path>`);
+                    parts.push(`<path d="${arcPath(140, 140, rInner, rInner + 18, a0, a1)}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.6"><title>${escapeHtml(b.group)} → ${escapeHtml(b.label)}: not used in this window</title></path>`);
                 }
             });
-            const svg = `<svg id="taxonomySvg" viewBox="0 0 260 260">${parts.join('')}</svg>`;
+            const svg = `<svg id="taxonomySvg" viewBox="0 0 280 280">${parts.join('')}</svg>`;
 
-            const sorted = all.slice().sort((a, b2) => (b2.count - a.count) || a.label.localeCompare(b2.label));
-            const legend = sorted.map((b) => {
-                const cls = b.used ? 'taxonomy-row' : 'taxonomy-row unused';
-                const swatchStyle = b.used ? `background:${colorFor(b.label)}` : `border:1px solid var(--text-secondary);background:none`;
-                return `<div class="${cls}"><span class="taxonomy-swatch" style="${swatchStyle}"></span>` +
-                    `<span>${escapeHtml(b.label)}</span>` +
-                    `<span class="taxonomy-count">${b.used ? b.count : 'unused'}</span></div>`;
+            const legend = groupsPresent.map((g) => {
+                const rows = byGroup.get(g).map((b) => {
+                    const cls = b.used ? 'taxonomy-row' : 'taxonomy-row unused';
+                    const color = familyColor(b.group, b.label);
+                    const swatchStyle = b.used ? `background:${color}` : `border:1px solid ${color};background:none`;
+                    return `<div class="${cls}"><span class="taxonomy-swatch" style="${swatchStyle}"></span>` +
+                        `<span>${escapeHtml(b.label)}</span>` +
+                        `<span class="taxonomy-count">${b.used ? b.count : 'unused'}</span></div>`;
+                }).join('');
+                return `<div class="taxonomy-group"><div class="taxonomy-group-header">${escapeHtml(g)}</div>${rows}</div>`;
             }).join('');
 
             body.innerHTML = `<div class="wheel-flex">${svg}<div class="taxonomy-legend">${legend}</div></div>`;
-        }
-
-        // ---- View C: connections ----
-
-        function renderConnections(data) {
-            const note = document.getElementById('connectionNote');
-            const body = document.getElementById('connectionBody');
-            const { total_entries, fields, start_date, end_date } = data;
-            const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
-            note.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
-                `in this window (${rangeText}), across <strong>${fields.length}</strong> connection field${fields.length === 1 ? '' : 's'}.`;
-
-            if (!fields.length) {
-                body.innerHTML = '<div class="empty-state">No connection_&lt;name&gt; fields found in this window.</div>';
-                return;
-            }
-
-            body.innerHTML = fields.map((f) => {
-                const r = f.resolution;
-                const reverseCount = f.days.filter((d) => !d.self_reported && d.interaction_count > 0).length;
-                const rows = f.days.map((d) => {
-                    const flagged = !d.self_reported && d.interaction_count > 0;
-                    const countText = d.interaction_count === null ? 'n/a' : d.interaction_count;
-                    return `<tr>` +
-                        `<td>${escapeHtml(d.date)}</td>` +
-                        `<td>${d.self_reported ? 'Yes' : 'No'}</td>` +
-                        `<td class="${flagged ? 'flag-recorded-not-felt' : ''}">${countText}${flagged ? ' ← recorded, not marked felt' : ''}</td>` +
-                        `</tr>`;
-                }).join('');
-                const unparseableNote = f.unparseable_entries
-                    ? `<div class="connection-note">${f.unparseable_entries} entr${f.unparseable_entries === 1 ? 'y' : 'ies'} had an unparseable value for this field and were skipped.</div>`
-                    : '';
-                const reverseNote = reverseCount
-                    ? `<div class="reverse-summary">${reverseCount} day${reverseCount === 1 ? '' : 's'} had recorded messages that weren't marked as "felt connected" — the more actionable direction.</div>`
-                    : '';
-                return `<div class="connection-field">` +
-                    `<h3 style="font-size:0.95rem;margin-bottom:0.4rem;">${escapeHtml(f.field)}</h3>` +
-                    `<div><span class="connection-status status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></div>` +
-                    `<div class="connection-note">${escapeHtml(r.note)}</div>` +
-                    unparseableNote +
-                    (f.days.length ? `<table class="connection-table"><thead><tr><th>Date</th><th>Self-reported</th><th>Interactions</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty-state">No parseable days for this field in this window.</div>') +
-                    reverseNote +
-                    `</div>`;
-            }).join('');
         }
 
         // ---- orchestration ----
@@ -615,16 +785,14 @@
 
             const q = `window=${encodeURIComponent(win)}`;
             try {
-                const [strip, scalars, taxonomy, connections] = await Promise.all([
+                const [strip, scalars, taxonomy] = await Promise.all([
                     fetchJson(`/api/journal/strip?${q}`),
                     fetchJson(`/api/journal/scalars?${q}`),
                     fetchJson(`/api/journal/taxonomy?${q}`),
-                    fetchJson(`/api/journal/connections?${q}`),
                 ]);
                 renderStrip(strip);
                 renderScalars(scalars);
                 renderTaxonomy(taxonomy);
-                renderConnections(connections);
             } catch (err) {
                 document.getElementById('stripNote').textContent = `Failed to load: ${err.message}`;
             }
