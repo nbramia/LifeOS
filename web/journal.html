@@ -60,6 +60,24 @@
             color: var(--accent-hover);
         }
 
+        /* This is the only route to the trend views now that they no longer
+           have a home-page card, so it can't read as muted as the back link
+           sitting beside it. */
+        .forward-link {
+            color: var(--accent-hover);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 600;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 0.3rem 0.8rem;
+        }
+
+        .forward-link:hover {
+            border-color: var(--accent-hover);
+            background: var(--bg-secondary);
+        }
+
         .window-selector {
             display: flex;
             gap: 0.5rem;
@@ -193,8 +211,8 @@
         <header>
             <h1>Journal Emotion Wheel</h1>
             <span>
-                <a class="back-link" href="/journal/trends">Trend views &rarr;</a>
-                &nbsp;·&nbsp;
+                <a class="forward-link" href="/journal/trends">Trend views &rarr;</a>
+                &nbsp;&nbsp;
                 <a class="back-link" href="/">&larr; Home</a>
             </span>
         </header>

@@ -89,6 +89,12 @@
             gap: 0.5rem;
             margin-bottom: 1.5rem;
             flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .window-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
         }
 
         .window-pill {
@@ -212,11 +218,16 @@
 
         .strip-legend {
             display: flex;
-            gap: 1.25rem;
+            gap: 0.4rem 1rem;
             flex-wrap: wrap;
             font-size: 0.78rem;
             color: var(--text-secondary);
             margin-top: 0.6rem;
+        }
+
+        .strip-legend-count {
+            color: var(--text-secondary);
+            opacity: 0.7;
         }
 
         .strip-legend-swatch {
@@ -237,11 +248,11 @@
         }
 
         .scalar-label {
-            width: 60px;
+            width: 112px;
             flex-shrink: 0;
-            font-size: 0.8rem;
+            font-size: 0.78rem;
+            line-height: 1.25;
             color: var(--text-secondary);
-            text-transform: capitalize;
         }
 
         .scalar-row svg {
@@ -275,6 +286,13 @@
             color: var(--text-primary);
             margin-bottom: 0.5rem;
             min-height: 2.4em;
+        }
+
+        .scatter-summary {
+            font-size: 0.88rem;
+            line-height: 1.5;
+            color: var(--text-primary);
+            margin: 0 0 0.9rem;
         }
 
         .scatter-chart-row {
@@ -321,61 +339,149 @@
         /* -- View B: unexplored wheel -- */
         .wheel-flex {
             display: flex;
-            gap: 1.5rem;
+            gap: 1.75rem;
             flex-wrap: wrap;
             align-items: flex-start;
         }
 
-        #taxonomySvg {
-            width: 280px;
-            height: 280px;
-            flex-shrink: 0;
+        .wheel-figure {
+            flex: 0 0 auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
         }
 
+        #taxonomySvg {
+            width: 340px;
+            height: 340px;
+            max-width: 100%;
+        }
+
+        .wheel-caption {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-align: center;
+            max-width: 300px;
+        }
+
+        .wheel-finding {
+            font-size: 0.82rem;
+            color: var(--text-primary);
+            text-align: center;
+            max-width: 300px;
+            padding: 0.4rem 0.7rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .taxonomy-extra {
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+            margin-left: 0.25rem;
+            vertical-align: super;
+        }
+
+        .wheel-group-label {
+            font-size: 9.5px;
+            font-weight: 600;
+            fill: var(--text-secondary);
+            letter-spacing: 0.02em;
+        }
+
+        .wheel-center-num {
+            font-size: 30px;
+            font-weight: 650;
+            fill: var(--text-primary);
+        }
+
+        .wheel-center-of {
+            font-size: 17px;
+            font-weight: 500;
+            fill: var(--text-secondary);
+        }
+
+        .wheel-center-cap {
+            font-size: 9px;
+            fill: var(--text-secondary);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        /* Columns rather than one tall scroller: 47 rows in a single
+           320px-tall overflow box meant the list was mostly hidden, and the
+           groups the operator asked to see were below the fold. */
         .taxonomy-legend {
-            flex: 1;
-            min-width: 220px;
-            max-height: 320px;
-            overflow-y: auto;
+            flex: 1 1 320px;
+            min-width: 260px;
+            columns: 2;
+            column-gap: 1.5rem;
             font-size: 0.82rem;
         }
 
         .taxonomy-group {
-            margin-bottom: 0.6rem;
+            break-inside: avoid;
+            margin-bottom: 0.85rem;
         }
 
         .taxonomy-group-header {
-            font-size: 0.8rem;
-            font-weight: 600;
-            color: var(--text-primary);
-            padding: 0.15rem 0;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 0.15rem;
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 0.5rem;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--family, var(--text-primary));
+            padding-bottom: 0.2rem;
+            border-bottom: 1px solid var(--family, var(--border));
+            margin-bottom: 0.25rem;
+        }
+
+        .taxonomy-group-count {
+            font-weight: 500;
+            letter-spacing: 0;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
         }
 
         .taxonomy-row {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
-            padding: 0.2rem 0 0.2rem 0.5rem;
+            gap: 0.45rem;
+            padding: 0.12rem 0;
         }
 
-        .taxonomy-row.unused {
+        .taxonomy-row.unused .taxonomy-name {
             color: var(--text-secondary);
-            opacity: 0.6;
+            opacity: 0.75;
         }
 
         .taxonomy-swatch {
-            width: 9px;
-            height: 9px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
             flex-shrink: 0;
+        }
+
+        .taxonomy-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .taxonomy-count {
             margin-left: auto;
             color: var(--text-secondary);
-            font-size: 0.78rem;
+            font-size: 0.76rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        @media (max-width: 720px) {
+            .taxonomy-legend { columns: 1; }
+            #taxonomySvg { width: 300px; height: 300px; }
         }
     </style>
 </head>
@@ -391,6 +497,7 @@
         </header>
 
         <div class="window-selector" id="windowSelector">
+            <span class="window-label">Window &mdash; sets the range for the two lower sections:</span>
             <button class="window-pill" data-window="day">Day</button>
             <button class="window-pill" data-window="week">Week</button>
             <button class="window-pill" data-window="month">Month</button>
@@ -399,7 +506,7 @@
         </div>
 
         <section class="view" id="stripSection">
-            <h2>The Strip <span class="section-badge">Full history &mdash; ignores the window selector above</span></h2>
+            <h2>The Strip <span class="section-badge">Always full history</span></h2>
             <div class="sample-note" id="stripNote">Loading…</div>
             <div id="stripBody"></div>
         </section>
@@ -436,8 +543,44 @@
             return Math.abs(h) % 360;
         }
 
+        // Emotion families get conventional hues, not hashed ones. Hashing a
+        // hue from the group name is deterministic but arbitrary, and
+        // arbitrary is actively wrong here: it rendered "Angry" green and
+        // "Sad" green-adjacent, so the colour argued against the label it sat
+        // beside. Colour is doing semantic work in this view, so it's
+        // assigned, not derived. Any primary not listed falls back to a
+        // hashed hue rather than a shared default, so a new one stays
+        // distinguishable until it's given a considered colour here.
+        const EMOTION_HUE = {
+            happy: 44,      // gold
+            sad: 212,       // blue
+            angry: 4,       // red
+            fearful: 274,   // violet
+            disgusted: 128, // green
+            surprised: 186, // cyan
+            bad: 22,        // muted umber — see EMOTION_SAT
+        };
+
+        // "Bad" is the form's vague catch-all ("bad" as distinct from angry,
+        // sad, or disgusted), and at full saturation its umber sat 18° from
+        // Happy's gold — close enough that the two families read as one on
+        // the ring. Desaturating it both separates them and suits what the
+        // word actually means: the unspecific one.
+        const EMOTION_SAT = { bad: 22 };
+        const emotionHue = (name) => {
+            const key = String(name).toLowerCase();
+            return key in EMOTION_HUE ? EMOTION_HUE[key] : fnv1aHue(key);
+        };
+        const emotionSatBase = (name) => EMOTION_SAT[String(name).toLowerCase()] ?? 52;
+
+        // The four self-reported scalars are a different domain from
+        // emotions — assigned distinct hues so a sparkline and its scatter
+        // dots always read as the same measure.
+        const FIELD_HUE = { mood: 330, stress: 32, sleep: 200, body: 158 };
+        const fieldColor = (f) => `hsl(${f in FIELD_HUE ? FIELD_HUE[f] : fnv1aHue(f)}, 62%, 58%)`;
+
         function colorFor(value) {
-            return `hsl(${fnv1aHue(value)}, 55%, 55%)`;
+            return `hsl(${emotionHue(value)}, ${emotionSatBase(value) + 6}%, 55%)`;
         }
 
         function dayOffset(dateStr, startStr) {
@@ -488,6 +631,32 @@
             return `<div class="${cls}" style="${style}" title="${escapeHtml(title)}"></div>`;
         }
 
+        // The strip's key: one swatch per primary emotion actually present,
+        // most-used first, then the two non-emotion cell states. Built from
+        // the data rather than a fixed list, so it can't advertise a colour
+        // that never appears or omit one that does.
+        //
+        // The hues match the wheel's colour families below by construction —
+        // `colorFor(x)` and `familyColor(x, …)` both take their hue from
+        // `fnv1aHue(x)` — so a primary reads as the same colour in both
+        // views without the two needing to be kept in sync by hand.
+        function stripKey(days) {
+            const counts = new Map();
+            days.forEach((d) => {
+                if (d.has_entry && d.primary_emotion) {
+                    counts.set(d.primary_emotion, (counts.get(d.primary_emotion) || 0) + 1);
+                }
+            });
+            const ordered = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+            const emotions = ordered.map(([label, count]) =>
+                `<span><span class="strip-legend-swatch" style="background:${colorFor(label)}"></span>` +
+                `${escapeHtml(label)} <span class="strip-legend-count">${count}</span></span>`
+            ).join('');
+            return emotions +
+                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>entry, no feeling</span>` +
+                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>no entry</span>`;
+        }
+
         // Cell size floor/ceiling for the strip's auto-scaling. MAX matches
         // the size this view shipped with (comfortable at today's real span
         // of ~198 days); MIN is the smallest a square can shrink to before
@@ -520,11 +689,10 @@
                 body.innerHTML = '';
                 return;
             }
-            note.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
-                `entries logged a feeling, across every day from your earliest entry ` +
-                `(<strong>${start_date}</strong>) through today (<strong>${end_date}</strong>) — ` +
-                `<strong>${days.length}</strong> calendar days total, always full history regardless of ` +
-                `the window selector above. Every day in the span gets a square — gaps are shown, not skipped.`;
+            note.innerHTML = `One square per day from your first entry (<strong>${start_date}</strong>) to today ` +
+                `(<strong>${end_date}</strong>): <strong>${days.length}</strong> days, ` +
+                `<strong>${total_entries}</strong> with an entry, <strong>${emotion_entries}</strong> with a ` +
+                `feeling recorded. Colour is that day's primary emotion; hover any square for its date and label.`;
 
             const byDate = new Map(days.map((d) => [d.date, d]));
             const rangeStart = new Date(days[0].date + 'T00:00:00Z');
@@ -565,11 +733,7 @@
 
             body.innerHTML = `<div class="strip-scroll" id="stripScroll"><div class="strip-months">${monthsHtml}</div>` +
                 `<div class="strip-grid" id="stripGrid">${weeks.join('')}</div></div>` +
-                `<div class="strip-legend">` +
-                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>no entry that day (gap)</span>` +
-                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>entry, no feeling logged</span>` +
-                `<span><span class="strip-legend-swatch" style="background:${colorFor('Happy')}"></span>colored by primary emotion (hue is deterministic per value, hover for the exact label) — flat color, never shaded by intensity</span>` +
-                `</div>`;
+                `<div class="strip-legend">${stripKey(days)}</div>`;
 
             // Auto-scale cells to fit the full span in the available width.
             // Rendered above at STRIP_MAX_CELL_PX; if that overflows the
@@ -616,28 +780,128 @@
                 // line between entries weeks apart would imply a trend the
                 // sample doesn't support.
                 if (gap <= 1) {
-                    parts.push(`<line x1="${xy[i - 1].x}" y1="${xy[i - 1].y}" x2="${xy[i].x}" y2="${xy[i].y}" stroke="${colorFor(field)}" stroke-width="1.5" />`);
+                    parts.push(`<line x1="${xy[i - 1].x}" y1="${xy[i - 1].y}" x2="${xy[i].x}" y2="${xy[i].y}" stroke="${fieldColor(field)}" stroke-width="1.5" />`);
                 }
             }
             for (const p of xy) {
-                parts.push(`<circle cx="${p.x}" cy="${p.y}" r="2.5" fill="${colorFor(field)}"><title>${escapeHtml(p.date)}: ${p.value}</title></circle>`);
+                parts.push(`<circle cx="${p.x}" cy="${p.y}" r="2.5" fill="${fieldColor(field)}"><title>${escapeHtml(p.date)}: ${p.value}</title></circle>`);
             }
             return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${parts.join('')}</svg>`;
         }
 
-        // Plain-language reading of one pair's correlation. Deliberately
-        // symmetric in wording ("also tends to be higher/lower") rather than
-        // asserting cause in either direction — the same "co-movement, not
-        // causation" boundary the demoted r-footnote states numerically.
+        // Shared |r| tier cuts. Both the per-pair sentences and the prose
+        // summary above the grid read these same two numbers, so the two can
+        // never disagree about whether a pair counts as "no clear
+        // relationship" — a summary contradicting the cell right below it
+        // would be worse than having no summary at all.
+        const R_NONE = 0.1;      // below this: no clear relationship
+        const R_MODERATE = 0.3;  // at or above this: the clearer tier
+
+        // Which fields describe the night *before* the day being rated. The
+        // journal form's own column names settle this: "Sleep yesterday"
+        // versus "Mood today" / "Stress today" / "Body today". So sleep is
+        // not simultaneous with the other three — it precedes them, and a
+        // sentence that reads symmetrically ("on days rated higher for
+        // stress, sleep also tends to be higher") hides that ordering and is
+        // genuinely ambiguous about which came first.
+        const PRIOR_NIGHT = new Set(['sleep']);
+
+        // Display names carrying the timing, so a reader never has to guess
+        // whether a value describes the day or the night before it.
+        // Only sleep carries its timing in the name. Tagging all four ("mood
+        // (that day)" …) put "(that day)" in the summary paragraph eight
+        // times and buried the numbers in scaffolding; the caveat above the
+        // grid already establishes that the other three are same-day, so
+        // saying it once there beats repeating it in every label.
+        const FIELD_TITLE = {
+            sleep: 'prior-night sleep',
+            mood: 'mood',
+            stress: 'stress',
+            body: 'body',
+        };
+        const fieldTitle = (f) => FIELD_TITLE[f] || f;
+        const sentenceCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+        // Plain-language reading of one pair's correlation.
+        //
+        // For a pair where exactly one side is the prior night, the sentence
+        // is ordered in time — sleep first, then what it preceded. Temporal
+        // order is real here and worth stating; it still isn't causation, so
+        // the wording stays "tends to be rated", never "leads to".
+        //
+        // For two same-day fields there is no ordering to claim, so the
+        // wording stays deliberately symmetric.
         function pairSentence(a, b, n, r) {
             if (r === null || r === undefined) {
-                return `Not enough paired ${a}/${b} entries in this window (n=${n}) to see a pattern.`;
+                return `Not enough entries recording both ${fieldTitle(a)} and ${fieldTitle(b)} (n=${n}) to compare.`;
             }
-            if (Math.abs(r) < 0.1) {
-                return `${a[0].toUpperCase()}${a.slice(1)} and ${b} show no clear pattern together in this window.`;
+            const aPrior = PRIOR_NIGHT.has(a);
+            const bPrior = PRIOR_NIGHT.has(b);
+            if (aPrior !== bPrior) {
+                const [first, second] = aPrior ? [a, b] : [b, a];
+                if (Math.abs(r) < R_NONE) {
+                    return `How much ${first} you got shows no clear relationship with ${second} the next day.`;
+                }
+                const direction = r > 0 ? 'higher' : 'lower';
+                return `After more ${first}, ${second} that day tends to be rated ${direction}.`;
             }
-            const direction = r > 0 ? 'also tends to be higher' : 'tends to be lower';
+            if (Math.abs(r) < R_NONE) {
+                return `${a[0].toUpperCase()}${a.slice(1)} and ${b} show no clear relationship on the same day.`;
+            }
+            const direction = r > 0 ? 'also tends to be rated higher' : 'tends to be rated lower';
             return `On days rated higher for ${a}, ${b} ${direction}.`;
+        }
+
+        // Summary of all six pairs at once, so the grid can be read without
+        // decoding six scatters one at a time.
+        //
+        // Grouped under short labels rather than written as one long
+        // sentence, for two reasons beyond brevity: a compound subject like
+        // "sleep and body" forces an awkward verb-number choice ("leans" vs
+        // "lean") that is wrong either way, and joining pair names with "and"
+        // when each name already contains "and" produces genuine ambiguity
+        // ("mood and body and stress and body"). Pairs are written "x vs. y",
+        // matching the scatter titles below.
+        //
+        // Pairs with no clear relationship are named explicitly rather than
+        // omitted. "These two don't track each other" is a real finding, and
+        // dropping the null results would leave a reader assuming every pair
+        // shown is meaningful and the rest simply weren't measured.
+        // Returns HTML; only the field names are interpolated, escaped here.
+        function correlationSummary(correlations) {
+            const usable = correlations.filter((c) => c.r !== null && c.r !== undefined);
+            const short = correlations.filter((c) => c.r === null || c.r === undefined);
+            if (!usable.length) {
+                return 'Not enough paired entries in this window to compare any of these measures.';
+            }
+
+            const pairName = (c) => `${escapeHtml(fieldTitle(c.pair[0]))} vs. ${escapeHtml(fieldTitle(c.pair[1]))}`;
+            const label = (c) => `${pairName(c)} (${(c.r >= 0 ? '+' : '') + c.r.toFixed(2)})`;
+            const ranked = [...usable].sort((x, y) => Math.abs(y.r) - Math.abs(x.r));
+            const tier = (lo, hi, sign) => ranked.filter((c) =>
+                Math.abs(c.r) >= lo && Math.abs(c.r) < hi && (sign > 0 ? c.r > 0 : c.r < 0));
+
+            const groups = [
+                ['Move together', tier(R_MODERATE, Infinity, 1)],
+                ['Move in opposite directions', tier(R_MODERATE, Infinity, -1)],
+                ['Move together slightly', tier(R_NONE, R_MODERATE, 1)],
+                ['Slightly opposite', tier(R_NONE, R_MODERATE, -1)],
+                ['No clear relationship', ranked.filter((c) => Math.abs(c.r) < R_NONE)],
+                ['Too few paired entries to compare', short],
+            ];
+
+            const sentences = groups
+                .filter(([, items]) => items.length)
+                .map(([heading, items]) => {
+                    const body = items.map((c) => (items === short ? pairName(c) : label(c))).join(', ');
+                    return `<strong>${heading}:</strong> ${body}.`;
+                })
+                .join(' ');
+
+            const maxN = Math.max(...usable.map((c) => c.n));
+            return `Across up to ${maxN} entr${maxN === 1 ? 'y' : 'ies'} with both values recorded. ` +
+                `${sentences} None of these is strong enough to predict a single day — they describe ` +
+                `tendencies over the window, not rules.`;
         }
 
         // The paired (x, y) points for one field pair, matched by date —
@@ -655,7 +919,7 @@
         // can't support — the same principle the sparklines' "never bridge
         // a gap" rule follows), axis ticks at the observed min/max so the
         // plot is readable without a shared external scale.
-        function renderScatterSvg(points) {
+        function renderScatterSvg(points, yField) {
             if (!points.length) {
                 return '<div class="scatter-empty">No paired data in this window.</div>';
             }
@@ -670,7 +934,7 @@
             const toX = (v) => pad + ((v - minX) / spanX) * (size - 2 * pad);
             const toY = (v) => (size - pad) - ((v - minY) / spanY) * (size - 2 * pad);
             const dots = points.map((p) =>
-                `<circle cx="${toX(p.x)}" cy="${toY(p.y)}" r="3" fill="${colorFor('scatter')}" opacity="0.75">` +
+                `<circle cx="${toX(p.x)}" cy="${toY(p.y)}" r="3" fill="${fieldColor(yField)}" opacity="0.8">` +
                 `<title>${escapeHtml(p.date)}: ${p.x} / ${p.y}</title></circle>`
             ).join('');
             return `<svg viewBox="0 0 ${size} ${size}" class="scatter-svg" preserveAspectRatio="xMidYMid meet">` +
@@ -697,16 +961,16 @@
                 return;
             }
             note.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
-                `in this window (${rangeText}). Dots mark entries; a line is drawn only between entries on ` +
-                `consecutive calendar days — everything else is a gap, on purpose.`;
+                `in this window (${rangeText}). Each dot is one entry; lines join consecutive days only, so ` +
+                `a break in the line is a day you didn't log.`;
 
             // Stated once, above every pair — identical for all six because
             // every self-reported scalar field shares the same ambiguity,
             // not something worth repeating six times over.
-            corr.innerHTML = `The journal form does not label which direction of any of these four scales is ` +
-                `"better" — a relationship below may mean the two genuinely move together, or that one field ` +
-                `is effectively reverse-coded relative to the other. Each chart plots one dot per entry with ` +
-                `both values logged; no line is fitted, since a sample this small can't support one.`;
+            corr.innerHTML = `The form asks for sleep <em>yesterday</em> and mood, stress and body <em>today</em>, ` +
+                `so sleep describes the night before the day it sits on. It doesn't record units or say which ` +
+                `end of any scale is "better", so "higher" could mean more hours or a better-rated night. ` +
+                `No trend line is fitted.`;
 
             const seriesByField = {};
             series.forEach((s) => { seriesByField[s.field] = s; });
@@ -714,7 +978,7 @@
             const gridStart = start_date || (series.find((s) => s.points.length)?.points[0]?.date);
             const gridEnd = end_date;
             const sparklines = series.map((s) => {
-                return `<div class="scalar-row"><span class="scalar-label">${escapeHtml(s.field)}</span>` +
+                return `<div class="scalar-row"><span class="scalar-label">${escapeHtml(sentenceCase(fieldTitle(s.field)))}</span>` +
                     renderSparkline(s.field, s.points, gridStart, gridEnd) + `</div>`;
             }).join('');
 
@@ -724,9 +988,9 @@
                 const sentence = pairSentence(a, b, c.n, c.r);
                 const rText = c.r === null || c.r === undefined ? 'n/a' : (c.r >= 0 ? '+' : '') + c.r.toFixed(2);
                 return `<div class="scatter-cell">` +
-                    `<div class="scatter-title">${escapeHtml(a)} vs. ${escapeHtml(b)}</div>` +
+                    `<div class="scatter-title">${escapeHtml(sentenceCase(fieldTitle(a)))} vs. ${escapeHtml(fieldTitle(b))}</div>` +
                     `<div class="scatter-sentence">${escapeHtml(sentence)}</div>` +
-                    `<div class="scatter-chart-row"><span class="scatter-y-label">${escapeHtml(b)}</span>${renderScatterSvg(points)}</div>` +
+                    `<div class="scatter-chart-row"><span class="scatter-y-label">${escapeHtml(b)}</span>${renderScatterSvg(points, b)}</div>` +
                     `<div class="scatter-x-label">${escapeHtml(a)}</div>` +
                     `<div class="scatter-footnote">r = ${rText} (n=${c.n})</div>` +
                     `</div>`;
@@ -734,30 +998,30 @@
 
             body.innerHTML = sparklines +
                 `<h3 style="font-size:0.95rem;margin:1rem 0 0.2rem;">How the four measures relate</h3>` +
+                `<p class="scatter-summary">${correlationSummary(correlations)}</p>` +
                 `<div class="scatter-grid">${scatterCells}</div>`;
         }
 
         // ---- View B: the unexplored wheel ----
 
-        // A colour *family* per primary-emotion group: one hue per group
-        // (hashed from the group name, so it's stable across reloads),
-        // varying only lightness/saturation per branch within that family
-        // — so a glance at the wheel or legend shows which family a branch
-        // belongs to. "Unplaced" gets a neutral (zero-saturation) family
-        // instead of a hue, since it isn't a real emotion family — it's an
-        // honest "don't know yet" bucket. This is the one place on this
-        // page intensity-style shading *is* wanted (feedback item 1's "no
-        // variable shading" applies to the strip only).
+        // A colour *family* per primary-emotion group: the group's assigned
+        // hue (see EMOTION_HUE), varying only lightness within it, so a
+        // glance at the wheel or legend shows which family a branch belongs
+        // to while each branch stays individually distinguishable.
+        // "Unplaced" gets a neutral, zero-saturation family instead of a hue,
+        // since it isn't a real emotion family — it's an honest "don't know
+        // yet" bucket, and giving it a colour would imply otherwise.
+        //
+        // Lightness varies over a deliberately narrow band. Wider looked
+        // livelier but broke the family read: the palest member of one family
+        // sat closer to a neighbouring hue than to its own siblings, which is
+        // the exact grouping the operator asked for.
         function familyColor(group, label) {
             const h2 = fnv1aHue(label);
             if (group === 'Unplaced') {
-                const light = 30 + (h2 % 30);
-                return `hsl(0, 0%, ${light}%)`;
+                return `hsl(0, 0%, ${42 + (h2 % 14)}%)`;
             }
-            const hue = fnv1aHue(group);
-            const sat = 50 + (h2 % 30);
-            const light = 40 + ((h2 >> 4) % 30);
-            return `hsl(${hue}, ${sat}%, ${light}%)`;
+            return `hsl(${emotionHue(group)}, ${emotionSatBase(group) + (h2 % 16)}%, ${46 + ((h2 >> 4) % 16)}%)`;
         }
 
         function renderTaxonomy(data) {
@@ -766,17 +1030,26 @@
             const { total_entries, emotion_entries, taxonomy_source, branches, extra_used, group_order } = data;
 
             const sourceText = taxonomy_source === 'form'
-                ? `${branches.length} branches derived from the journal form's own questions, grouped by ` +
-                  `primary emotion. "Not sure" is excluded entirely — it's a non-answer, not an emotion.`
-                : `Form taxonomy unavailable (no gsheet_sync.db, or no matching columns) — showing only ` +
-                  `values actually used, same as the emotion wheel's flat legend. This is a real degraded ` +
-                  `mode, not an error.`;
+                ? `Every wedge is one of the <strong>${branches.length}</strong> feelings the form offers, ` +
+                  `grouped into a colour family per primary emotion. Hover any wedge for its name and count.`
+                : `The form's question list isn't available, so this shows only feelings you've actually ` +
+                  `used — no unexplored branches.`;
             note.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> entries ` +
-                `logged a feeling in this window. ${sourceText}`;
+                `recorded a feeling in this window. ${sourceText}`;
 
-            const all = branches.concat(extra_used);
+            // `extra_used` holds values that were logged but match no form
+            // branch. They belong on the wheel — they're real feelings that
+            // were recorded — but they must never enter the "how much of the
+            // vocabulary have I reached for" denominator, because every one
+            // of them is used by definition. Counting them made the centre
+            // read 37/64 when the form offers 47, a fraction whose
+            // denominator partly consisted of things that could not be
+            // unused. Tagged here so the ring can show them while the
+            // counts stay honest.
+            const all = branches.map((b) => ({ ...b, extra: false }))
+                .concat(extra_used.map((b) => ({ ...b, extra: true })));
             if (!all.length) {
-                body.innerHTML = '<div class="empty-state">No emotion vocabulary observed or available in this window.</div>';
+                body.innerHTML = '<div class="empty-state">No feelings recorded in this window.</div>';
                 return;
             }
 
@@ -797,39 +1070,116 @@
                 if (gi < groupsPresent.length - 1) slots.push(null);
             });
 
+            // Every branch gets the same angular width and the same radial
+            // extent, so the ring is a complete circle standing for the whole
+            // vocabulary the form offers. What varies is only used vs unused:
+            // solid versus a faint outline.
+            //
+            // The previous version scaled each wedge's *length* by how often
+            // it was used, which inverted the view's purpose. A handful of
+            // frequent feelings became long spikes, every unused branch
+            // collapsed into a stub near the centre, and the result read as a
+            // broken asterisk rather than a wheel — with the unexplored
+            // branches, the entire point, rendered nearly invisible. Frequency
+            // is a secondary detail here; it lives in the legend and the
+            // hover, and only tints fill opacity. What the ring answers at a
+            // glance is "how much of this vocabulary have I ever reached for",
+            // and the pale arc is the answer.
+            const cx = 170;
+            const cy = 170;
+            const rInner = 86;
+            const rOuter = 132;
             const maxCount = Math.max(1, ...all.map((b) => b.count));
-            const rInner = 26;
-            const rOuter = 128;
             const n = slots.length;
             const angle = (2 * Math.PI) / n;
             const parts = [];
+            const groupSpans = new Map();
             slots.forEach((b, i) => {
-                if (!b) return; // gap between groups — nothing drawn
                 const a0 = -Math.PI / 2 + i * angle;
-                const a1 = a0 + angle * 0.85; // small gap between wedges within a group
+                const a1 = a0 + angle * 0.82; // hairline gap between neighbouring wedges
+                if (!b) return; // group separator — nothing drawn
+                const span = groupSpans.get(b.group) || { first: a0, last: a1 };
+                span.last = a1;
+                groupSpans.set(b.group, span);
                 const color = familyColor(b.group, b.label);
+                const d = arcPath(cx, cy, rInner, rOuter, a0, a1);
                 if (b.used) {
-                    const len = rInner + (b.count / maxCount) * (rOuter - rInner);
-                    parts.push(`<path d="${arcPath(140, 140, rInner, len, a0, a1)}" fill="${color}" opacity="0.9"><title>${escapeHtml(b.group)} → ${escapeHtml(b.label)}: ${b.count}</title></path>`);
+                    // Floor at 0.55 so "used once" still reads as solid; the
+                    // ramp above it is a nicety, not the encoding.
+                    const strength = 0.55 + 0.45 * (b.count / maxCount);
+                    parts.push(`<path d="${d}" fill="${color}" fill-opacity="${strength.toFixed(2)}">` +
+                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — used ${b.count}×</title></path>`);
                 } else {
-                    parts.push(`<path d="${arcPath(140, 140, rInner, rInner + 18, a0, a1)}" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.6"><title>${escapeHtml(b.group)} → ${escapeHtml(b.label)}: not used in this window</title></path>`);
+                    parts.push(`<path d="${d}" fill="${color}" fill-opacity="0.1" stroke="${color}" ` +
+                        `stroke-opacity="0.4" stroke-width="0.75">` +
+                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — never used</title></path>`);
                 }
             });
-            const svg = `<svg id="taxonomySvg" viewBox="0 0 280 280">${parts.join('')}</svg>`;
+
+            // Group names sit outside the ring at each family's mid-angle,
+            // so the wheel is readable without cross-referencing the legend.
+            groupSpans.forEach((span, g) => {
+                const mid = (span.first + span.last) / 2;
+                const lx = cx + Math.cos(mid) * (rOuter + 19);
+                const ly = cy + Math.sin(mid) * (rOuter + 19);
+                const onLeft = Math.cos(mid) < -0.2;
+                const onRight = Math.cos(mid) > 0.2;
+                const anchor = onRight ? 'start' : onLeft ? 'end' : 'middle';
+                parts.push(`<text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" class="wheel-group-label" ` +
+                    `text-anchor="${anchor}" dominant-baseline="middle">${escapeHtml(g)}</text>`);
+            });
+
+            const formUsed = branches.filter((b) => b.used).length;
+            parts.push(
+                `<text x="${cx}" y="${cy - 6}" class="wheel-center-num" text-anchor="middle">${formUsed}<tspan class="wheel-center-of">/${branches.length}</tspan></text>` +
+                `<text x="${cx}" y="${cy + 14}" class="wheel-center-cap" text-anchor="middle">of the form&#39;s feelings</text>`
+            );
+
+            const svg = `<svg id="taxonomySvg" viewBox="0 0 340 340" role="img" ` +
+                `aria-label="${formUsed} of ${branches.length} of the form's feelings used at least once">${parts.join('')}</svg>`;
 
             const legend = groupsPresent.map((g) => {
-                const rows = byGroup.get(g).map((b) => {
+                const items = byGroup.get(g);
+                const fromForm = items.filter((b) => !b.extra);
+                const usedFromForm = fromForm.filter((b) => b.used).length;
+                const rows = items.map((b) => {
                     const cls = b.used ? 'taxonomy-row' : 'taxonomy-row unused';
                     const color = familyColor(b.group, b.label);
                     const swatchStyle = b.used ? `background:${color}` : `border:1px solid ${color};background:none`;
+                    const mark = b.extra ? `<span class="taxonomy-extra" title="Logged, but not one of the form&#39;s options">+</span>` : '';
                     return `<div class="${cls}"><span class="taxonomy-swatch" style="${swatchStyle}"></span>` +
-                        `<span>${escapeHtml(b.label)}</span>` +
-                        `<span class="taxonomy-count">${b.used ? b.count : 'unused'}</span></div>`;
+                        `<span class="taxonomy-name">${escapeHtml(b.label)}${mark}</span>` +
+                        `<span class="taxonomy-count">${b.used ? b.count : '—'}</span></div>`;
                 }).join('');
-                return `<div class="taxonomy-group"><div class="taxonomy-group-header">${escapeHtml(g)}</div>${rows}</div>`;
+                const hue = g === 'Unplaced' ? null : emotionHue(g);
+                const accent = hue === null ? 'var(--text-secondary)' : `hsl(${hue}, ${emotionSatBase(g) + 6}%, 60%)`;
+                // Denominator counts only the form's own options, matching the
+                // centre readout. Extras are listed but not counted.
+                const tally = fromForm.length ? `${usedFromForm}/${fromForm.length}` : `${items.length} logged`;
+                return `<div class="taxonomy-group" style="--family:${accent}">` +
+                    `<div class="taxonomy-group-header"><span>${escapeHtml(g)}</span>` +
+                    `<span class="taxonomy-group-count">${tally}</span></div>${rows}</div>`;
             }).join('');
 
-            body.innerHTML = `<div class="wheel-flex">${svg}<div class="taxonomy-legend">${legend}</div></div>`;
+            // Families where nothing at all has been recorded are the view's
+            // sharpest finding, and a reader shouldn't have to scan seven
+            // group headers for a row of zeros to notice them.
+            const untouched = groupsPresent.filter((g) => byGroup.get(g).every((b) => !b.used));
+            const extraCount = all.filter((b) => b.extra).length;
+            const asides = [];
+            if (untouched.length) {
+                asides.push(`<div class="wheel-finding">Nothing recorded yet under ` +
+                    `<strong>${untouched.map(escapeHtml).join('</strong>, <strong>')}</strong>.</div>`);
+            }
+            if (extraCount) {
+                asides.push(`<div class="wheel-caption"><span class="taxonomy-extra">+</span> ${extraCount} ` +
+                    `feeling${extraCount === 1 ? '' : 's'} logged that aren't among the form's options — shown, not counted.</div>`);
+            }
+
+            body.innerHTML = `<div class="wheel-flex"><div class="wheel-figure">${svg}` +
+                `<div class="wheel-caption">Solid = used at least once · faint = never picked</div>` +
+                `${asides.join('')}</div>` +
+                `<div class="taxonomy-legend">${legend}</div></div>`;
         }
 
         // ---- orchestration ----

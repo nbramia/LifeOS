@@ -131,6 +131,26 @@ class TestStripEndpoint:
         assert body["days"][0]["primary_emotion"] is None
         assert body["emotion_entries"] == 0
 
+    def test_not_sure_as_root_is_an_entry_with_no_feeling(self, client_and_vault):
+        # "Not sure" is excluded from the wheel as a non-answer; the strip
+        # has to agree, or it would show a sixth colour in its key claiming
+        # to be an emotion. The day still counts as an entry — only the
+        # emotion is absent.
+        client, vault, _ = client_and_vault
+        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "Not sure"})
+        body = client.get("/api/journal/strip").json()
+        assert body["days"][0]["has_entry"] is True
+        assert body["days"][0]["primary_emotion"] is None
+        assert body["total_entries"] == 1
+        assert body["emotion_entries"] == 0
+
+    def test_not_sure_root_is_matched_case_insensitively(self, client_and_vault):
+        client, vault, _ = client_and_vault
+        _write_entry(vault, "2026-06-30", {"date": "2026-06-30", "feeling": "not SURE"})
+        body = client.get("/api/journal/strip").json()
+        assert body["days"][0]["primary_emotion"] is None
+        assert body["emotion_entries"] == 0
+
     def test_leftmost_is_earliest_entry_rightmost_is_today(self, client_and_vault):
         # The exact contract from operator feedback: furthest left is the
         # earliest recorded observation, furthest right is today — fixed

@@ -384,9 +384,16 @@ async def get_journal_strip() -> JournalStripResponse:
                 days.append(StripDay(date=cur.isoformat(), has_entry=False))
             else:
                 chain = parse_emotion_chain(fm)
-                if chain:
+                # "Not sure" is excluded here for the same reason it's excluded
+                # from the wheel: it's a non-answer, not an emotion. A day whose
+                # root value was "Not sure" is an entry with no usable feeling —
+                # the same state as an entry that recorded no feeling at all —
+                # rather than a sixth colour in the key claiming to be an
+                # emotion. It still counts as an entry; just not an emotion one.
+                primary = chain[0] if chain and chain[0].lower() != _EXCLUDED_VALUE else None
+                if primary is not None:
                     emotion_entries += 1
-                days.append(StripDay(date=cur.isoformat(), has_entry=True, primary_emotion=chain[0] if chain else None))
+                days.append(StripDay(date=cur.isoformat(), has_entry=True, primary_emotion=primary))
             cur += timedelta(days=1)
 
     return JournalStripResponse(
