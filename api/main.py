@@ -33,7 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, journal
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, journal, journal_trends
 from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
@@ -289,6 +289,7 @@ app.include_router(fitness.router)
 app.include_router(voice.router)
 app.include_router(agent_proxy.router)
 app.include_router(journal.router)
+app.include_router(journal_trends.router)
 
 # Serve static files
 web_dir = Path(__file__).parent.parent / "web"
@@ -738,6 +739,16 @@ async def journal_page():
     if journal_path.exists():
         return FileResponse(str(journal_path))
     return {"message": "Journal page not found"}
+
+
+@app.get("/journal/trends")
+async def journal_trends_page():
+    """Serve the journal trend views UI: the strip, the unexplored wheel,
+    felt-vs-recorded connection, and the scalar stack."""
+    trends_path = Path(__file__).parent.parent / "web" / "journal-trends.html"
+    if trends_path.exists():
+        return FileResponse(str(trends_path))
+    return {"message": "Journal trends page not found"}
 
 
 @app.get("/crm/{path:path}")
