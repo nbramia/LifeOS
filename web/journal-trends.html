@@ -595,6 +595,7 @@
                     ? `<div class="reverse-summary">${reverseCount} day${reverseCount === 1 ? '' : 's'} had recorded messages that weren't marked as "felt connected" — the more actionable direction.</div>`
                     : '';
                 return `<div class="connection-field">` +
+                    `<h3 style="font-size:0.95rem;margin-bottom:0.4rem;">${escapeHtml(f.field)}</h3>` +
                     `<div><span class="connection-status status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></div>` +
                     `<div class="connection-note">${escapeHtml(r.note)}</div>` +
                     unparseableNote +
