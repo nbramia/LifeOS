@@ -9,82 +9,32 @@ preamble closes that gap on every task in ~500 tokens.
 
 The text is intentionally compact. Anything longer is read on demand from
 the vault itself (the agent has `lifeos_search` / `lifeos_ask`).
+
+Source of truth is `config/agent_capabilities.md` — gitignored, because it
+names the operator, their employer, and their vault layout. A fresh clone
+falls back to `config/agent_capabilities.example.md`, which carries the same
+structure with placeholders. Copy the example to `agent_capabilities.md` and
+fill it in.
 """
 
-CAPABILITIES_PREAMBLE = """\
-=== LIFEOS BRIEFING (read first) ===
+from pathlib import Path
 
-WHO: Nathan Ramia. Current job: Movement Labs (a progressive political
-technology org — "ML" in notes). Default work context = ML unless the
-task names another company. Previous jobs (BlueLabs, Deck, Rise,
-Murmuration) are in `zArchive/` — ignore unless explicitly asked.
+_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+_LOCAL = _CONFIG_DIR / "agent_capabilities.md"
+_EXAMPLE = _CONFIG_DIR / "agent_capabilities.example.md"
 
-VAULT: Obsidian vault at `~/Notes 2025/`. Indexed and searchable. Key
-top-level folders:
-  - `Work/ML/`               Movement Labs (Daily Notes, Meetings, People,
-                             Strategy and planning, Finance)
-  - `Work/Job Search/`       career exploration
-  - `Personal/`              Relationship, Self-Improvement, Finance,
-                             User Manual, Coding, Lifelogs, Records
-  - `Granola/`, `Omi/`       meeting + ambient-recorder transcripts
-  - `LifeOS/Tasks/Inbox.md`  where `#agent`-tagged tasks (yours) live
-  - `LLM context - Movement Labs 2026.md`  curated ML context doc
 
-DATA YOU CAN REACH (via the `lifeos` MCP server):
-  Read / search:
-    lifeos_ask              RAG synthesis with citations (best for open
-                            questions: "what do we know about X?")
-    lifeos_search           raw chunks with scores (when you want documents
-                            yourself, not a summary)
-    lifeos_drive_search     Google Drive — many ML strategy docs live here,
-                            NOT in the vault. Always try this for org-level
-                            documents (contracts, plans, decks).
-    lifeos_gmail_search     work + personal email
-    lifeos_calendar_search / lifeos_calendar_upcoming
-    lifeos_people_search, lifeos_person_profile, lifeos_person_timeline
-    lifeos_imessage_search, lifeos_slack_search
-    lifeos_photos_*, lifeos_monarch_* (finance)
-  Write / side-effect:
-    lifeos_vault_write      CREATE FILES IN THE VAULT. Use this for any
-                            task that says "output to a doc", "save as a
-                            note", "create a .md". `path` is vault-relative.
-    lifeos_gmail_draft, lifeos_calendar_create, lifeos_task_create,
-    lifeos_reminder_create, lifeos_memories_create,
-    lifeos_telegram_send
+def _load_preamble() -> str:
+    """Operator's own briefing if present, else the placeholder template."""
+    for candidate in (_LOCAL, _EXAMPLE):
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    # Both files missing (unexpected): a minimal briefing still beats nothing.
+    return "=== LIFEOS BRIEFING (read first) ===\n\n=== TASK ==="
 
-SHELL TOOLS (if you have a shell): the `gws` CLI is the Google Workspace
-CLI — direct Drive / Gmail / Sheets / Calendar access via the user's
-authenticated account. Useful when you need raw API access the `lifeos_*`
-tools don't wrap (e.g. creating a Sheet, downloading a Drive file by id):
-  gws drive files list --params '{"pageSize": 10}'
-  gws gmail users messages list --params '{"userId": "me"}'
-  gws sheets spreadsheets get --params '{"spreadsheetId": "..."}'
-  gws schema <service.resource.method>   # discover params for any call
-Prefer `lifeos_*` for search/synthesis; reach for `gws` for direct,
-typed Google API calls.
 
-SEARCH TIPS (recall can be uneven):
-  - If the first search returns scores near 0.02 and irrelevant titles,
-    re-query with broader OR narrower terms — both, not one. Try the
-    project's *people* and *acronyms* before its mission statement.
-  - For org-wide context on Movement Labs specifically: search for
-    "Listening Tour", "growth plan", "Contest Every Race", individual
-    leaders by name, plus `lifeos_drive_search` (the strategy docs are
-    in Drive, not the vault).
-  - Prefer recent content. Vault goes back years; current thinking is
-    in the last 60-90 days.
-  - If multiple angles all come up empty, that probably means the data
-    really isn't reachable from your current tool surface — say so and
-    suggest what *would* unblock you, rather than fabricating.
-
-COMPLETION CONTRACT (important):
-  - When the task asks for a deliverable file ("output to X.md"), you
-    must call `lifeos_vault_write` to produce it. Returning the content
-    as prose does not count — the operator wants the file.
-  - Always end with a final text reply: what you produced, where it
-    landed, and any caveats. An empty final text is treated as a failed
-    task (since 2026-05-28: the worker tags it `#agent-failed` instead
-    of `#agent-completed`). If you genuinely cannot do the task, say so
-    explicitly with what you tried and what blocked you.
-
-=== TASK ==="""
+CAPABILITIES_PREAMBLE = _load_preamble()

@@ -198,7 +198,7 @@ When a person or project has known context (company, project folder), target tho
 2. **iMessage** - Search for messages with Sam's phone number in last 30 days
 3. **Calendar** - Search for events with Sam's email (personal appointments, trips)
 4. **Gmail** - Search personal Gmail for threads with Sam
-5. **Vault** - Search in `Personal/` folders for mentions of "Sam" or "Samlor"
+5. **Vault** - Search in `Personal/` folders for mentions of "Sam" or "Sammy"
 
 **Expected Searches:**
 | Source | Query/Filter | Time Range |
@@ -207,7 +207,7 @@ When a person or project has known context (company, project folder), target tho
 | iMessage | phone = +12125550173 | Last 30 days |
 | Calendar | attendees contains partner@example.com | Last 30 days + next 30 days |
 | Gmail (personal) | from:partner@example.com OR to:... | Last 30 days |
-| Vault | path:Personal/* AND (Sam OR Samlor) | Last 60 days |
+| Vault | path:Personal/* AND (Sam OR Sammy) | Last 60 days |
 
 **Output Should Include:**
 - Summary of text conversation topics
@@ -312,7 +312,7 @@ When a person or project has known context (company, project folder), target tho
 **Query:** "What's the latest on the Acme Corp partnership?"
 
 **Orchestration Steps:**
-1. **People** - Identify Acme Corp contacts (Joe Huston, etc.)
+1. **People** - Identify Acme Corp contacts (Jane Doe, etc.)
 2. **Gmail** - Threads with Acme Corp contacts, recent first
 3. **Calendar** - Recent/upcoming meetings with ML folks
 4. **Vault** - Search `Work/Acme/` folder for recent notes
@@ -488,23 +488,23 @@ When a person or project has known context (company, project folder), target tho
 ## 5. Preparation Queries
 
 ### 5.1 Meeting Prep - External
-**Query:** "Prep me for my meeting with the Mobilize team tomorrow"
+**Query:** "Prep me for my meeting with the Contoso team tomorrow"
 
 **Orchestration Steps:**
-1. **Calendar** - Find tomorrow's meeting with Mobilize, get attendees
+1. **Calendar** - Find tomorrow's meeting with Contoso, get attendees
 2. **People** - Look up each attendee, generate briefings
-3. **Gmail** - Recent threads with Mobilize contacts
-4. **Vault** - Notes about Mobilize, recent interactions
-5. **Drive** - Shared documents with Mobilize, recent presentations
+3. **Gmail** - Recent threads with Contoso contacts
+4. **Vault** - Notes about Contoso, recent interactions
+5. **Drive** - Shared documents with Contoso, recent presentations
 
 **Expected Searches:**
 | Source | Query/Filter | Time Range |
 |--------|-------------|------------|
-| Calendar | title contains "Mobilize" AND date = tomorrow | Exact match |
+| Calendar | title contains "Contoso" AND date = tomorrow | Exact match |
 | People | emails in attendee list | Full profiles |
-| Gmail | from:*@mobilize.us OR to:*@mobilize.us | Last 30 days |
-| Vault | semantic: "Mobilize" | Last 60 days |
-| Drive | sharedWith *@mobilize.us OR name contains "Mobilize" | Last 60 days |
+| Gmail | from:*@contoso.example OR to:*@contoso.example | Last 30 days |
+| Vault | semantic: "Contoso" | Last 60 days |
+| Drive | sharedWith *@contoso.example OR name contains "Contoso" | Last 60 days |
 
 **Output Should Include:**
 - Meeting time, attendees, agenda (if in invite)
@@ -899,7 +899,7 @@ When a person or project has known context (company, project folder), target tho
 - [ ] Recognizing meeting aliases ("all hands" = "team stand up")
 - [x] Vault folder targeting based on entity context (searches all vault, not context-specific)
 - [ ] Combining results from multiple sources coherently
-- [ ] Team name extraction (e.g., "Mobilize team" extracts "the Mobilize" incorrectly)
+- [ ] Team name extraction (e.g., "Contoso team" extracts "the Contoso" incorrectly)
 
 ---
 
@@ -924,7 +924,7 @@ When a person or project has known context (company, project folder), target tho
    - Result: Proper date filtering for temporal queries
 
 3. **Vault search filter bug (ChromaDB)**
-   - Issue: `{"people": ["Samlor"]}` filter passed to ChromaDB caused error
+   - Issue: `{"people": ["Sammy"]}` filter passed to ChromaDB caused error
    - Fix: Removed list-based filter in `briefings.py`, rely on semantic search
    - Result: Vault searches work correctly
 
@@ -934,7 +934,7 @@ When a person or project has known context (company, project folder), target tho
 |------|-------|----------------|---------------|-------|
 | 2.1 | Recent interactions with Alex Johnson | `['people']` | `['people', 'gmail', 'calendar', 'vault']` | 7/8 |
 | 2.2 | What have Sam and I been talking about lately? | `['people', 'vault']` | `['people', 'gmail', 'calendar', 'vault']` + iMessage | 7/8 |
-| 5.1 | Prep me for meeting with Mobilize team | - | `['people', 'vault', 'calendar']` | 4/7 |
+| 5.1 | Prep me for meeting with Contoso team | - | `['people', 'vault', 'calendar']` | 4/7 |
 | 5.3 | Quick context before my 3pm call | - | `['vault', 'calendar']` | 3/5 |
 
 **Remaining Work:**

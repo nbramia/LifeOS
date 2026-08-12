@@ -8,30 +8,44 @@ algorithm being too permissive.
 
 This script clears linkedin_url, company, and position fields for
 identified bad matches.
+
+The match list names real contacts, so it lives in `config/linkedin_bad_matches.json`
+(gitignored) rather than in this file. Copy `config/linkedin_bad_matches.example.json`
+to that path and fill it in. Each entry is:
+
+    {"name": "<canonical name>", "username": "<wrong linkedin fragment>", "reason": "<why>"}
 """
 
+import json
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.person_entity import PersonEntityStore
 
-# List of people with confirmed bad LinkedIn data
-# Format: (canonical_name, expected_linkedin_username_fragment, reason)
-BAD_MATCHES = [
-    ("Madeline Eden", "denismikush", "Completely different name"),
-    ("Tamara Miller", "liliomere", "Completely different name"),
-    ("Samuel Miller", "amitpatel2008", "Completely different name - Amit Patel"),
-    ("Sarah Long, CLC, CSC", "val-sanin", "Completely different name"),
-    # Add more as needed
-]
+MATCHES_FILE = Path(__file__).parent.parent / "config" / "linkedin_bad_matches.json"
+
+
+def load_bad_matches(path: Path = MATCHES_FILE):
+    """Read the (name, username, reason) triples from the gitignored data file."""
+    if not path.exists():
+        print(f"No match list at {path}.")
+        print("Copy config/linkedin_bad_matches.example.json there and fill it in.")
+        return []
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    return [(e["name"], e["username"], e.get("reason", "")) for e in entries]
+
 
 def main():
+    bad_matches = load_bad_matches()
+    if not bad_matches:
+        return 0
+
     store = PersonEntityStore()
     fixed = 0
     errors = 0
 
-    for canonical_name, bad_username, reason in BAD_MATCHES:
+    for canonical_name, bad_username, reason in bad_matches:
         entity = store.get_by_name(canonical_name)
 
         if not entity:
@@ -65,7 +79,7 @@ def main():
 
         store.update(entity)
         fixed += 1
-        print(f"  --> Cleared!")
+        print("  --> Cleared!")
         print()
 
     if fixed > 0:
