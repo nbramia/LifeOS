@@ -2,16 +2,11 @@
 Tests for EntityResolver.
 """
 import pytest
-import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from api.services.entity_resolver import (
     EntityResolver,
-    ResolutionCandidate,
-    ResolutionResult,
-    get_entity_resolver,
 )
 
 
@@ -475,9 +470,9 @@ class TestParseName:
         from api.services.entity_resolver import parse_name
 
         # Simple credentials after comma
-        result = parse_name("Sarah Long, CLC, CSC")
-        assert result.first == "Sarah"
-        assert result.last == "Long"
+        result = parse_name("Alice Reed, CLC, CSC")
+        assert result.first == "Alice"
+        assert result.last == "Reed"
         assert result.middles == []
 
         # PhD after comma

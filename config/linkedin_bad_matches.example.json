@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Alex Chen",
+    "username": "someoneelse123",
+    "reason": "Completely different name"
+  },
+  {
+    "name": "Jordan Lee, PMP",
+    "username": "j-different",
+    "reason": "Credential suffix confused the old token_set_ratio matcher"
+  }
+]

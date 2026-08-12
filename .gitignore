@@ -68,6 +68,8 @@ config/relationship_overrides.json
 config/family_members.json
 config/linkedin_tags.json
 config/linkedin_industry_mappings.json
+config/linkedin_bad_matches.json
+config/agent_capabilities.md
 config/crm_mappings.yaml
 config/gsheet_sync.yaml
 config/gdoc_sync.yaml
