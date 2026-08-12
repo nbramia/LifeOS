@@ -374,18 +374,18 @@ class TestConnectionsEndpoint:
 
     def test_resolved_field_matches_self_report_against_interaction_counts(self, client_and_vault, tmp_path, monkeypatch):
         client, vault, _ = client_and_vault
-        _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "connection_taylor": True})
-        _write_entry(vault, "2026-01-28", {"date": "2026-01-28", "connection_taylor": False})
+        _write_entry(vault, "2026-01-27", {"date": "2026-01-27", "connection_rowan": True})
+        _write_entry(vault, "2026-01-28", {"date": "2026-01-28", "connection_rowan": False})
 
-        person = PersonEntity(id="person-taylor", canonical_name="Taylor Walker")
+        person = PersonEntity(id="person-rowan", canonical_name="Rowan Placeholder")
         result = ResolutionResult(entity=person, is_new=False, confidence=0.95, match_type="name_exact")
-        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({"Taylor": result}))
+        monkeypatch.setattr(journal_trends, "get_entity_resolver", lambda: _FakeResolver({"Rowan": result}))
 
         db_path = _make_interactions_db(tmp_path / "interactions.db", [
-            ("person-taylor", "2026-01-27T09:00:00+00:00"),
+            ("person-rowan", "2026-01-27T09:00:00+00:00"),
             # The "reverse direction" case: not self-reported as connecting,
             # but a real interaction happened that day.
-            ("person-taylor", "2026-01-28T09:00:00+00:00"),
+            ("person-rowan", "2026-01-28T09:00:00+00:00"),
         ])
         monkeypatch.setattr(journal_trends, "get_interaction_db_path", lambda: db_path)
 
