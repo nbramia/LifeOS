@@ -15,6 +15,7 @@ This directory contains product specifications — what the system does from a c
 - `crm-ui.md` — `/crm` page index (links out to the per-view specs above)
 - `data-model.md` — Canonical entities (SourceEntity, PersonEntity) and relationships
 - `entity-resolution.md` — How emails, phones, and names link to canonical people
+- `journal-analytics.md` — The daily-journal emotion-wheel view (`/journal`)
 - `mcp-tools.md` — The MCP tool catalog exposed to Claude Code and other agents
 - `task-management.md` — Obsidian-backed task system (create/list/update/complete)
 
