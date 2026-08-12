@@ -31,6 +31,7 @@ load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 import argparse
 import json
 import logging
+import re
 import signal
 import subprocess
 import sys
@@ -903,50 +904,191 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
     return False
 
 
-def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
+# =============================================================================
+# Transient-failure retry (issue #541)
+# =============================================================================
+#
+# Mechanism chosen: a retry loop inside this orchestrator, around each
+# per-source subprocess invocation. Rejected alternatives:
+#
+#   - systemd Restart=/OnFailure on lifeos-sync.service: restarts the WHOLE
+#     run_all_syncs.py invocation, which would re-run sources that already
+#     succeeded tonight (explicitly out of scope per the issue: "Retrying the
+#     whole pipeline. A source that succeeded must not be re-run") and loses
+#     the in-memory `failed`/`dep_skipped` sets that the depends_on skip logic
+#     relies on, so a partial restart would have to re-derive that state from
+#     the DB — more moving parts for less precision.
+#   - A follow-up systemd timer some minutes later: same "whole pipeline"
+#     problem unless it's taught to run only the sources that failed, which
+#     means persisting failure state across a process boundary and adding a
+#     second scheduled unit — more infrastructure than a loop that already
+#     has that state in memory for free.
+#
+# A loop here keeps everything in one process, reuses the existing
+# depends_on skip logic untouched (that skip happens in run_all_syncs before
+# run_sync is ever called, so a dependency-skipped source is never retried as
+# though it had failed), and lets one attempt campaign share a single
+# sync_runs row — so the retry doesn't skew the duration/yield history that
+# other detectors (#438, #494) rely on by counting one logical run twice.
+#
+# Idempotence: a retry re-runs a source's script from scratch, so a script
+# that fails partway through (after writing some data) and then retries must
+# not duplicate what it already wrote. This is not a new risk introduced
+# here — the nightly sync already re-runs every script over overlapping
+# windows every night, so a genuinely non-idempotent source would already be
+# duplicating data on every ordinary night. A retry just does the same thing
+# sooner. Verified per write path (not assumed):
+#   - Sources writing through InteractionStore (most Phase 1/2 sources):
+#     `UNIQUE INDEX idx_interactions_source_unique ON interactions(source_type,
+#     source_id)` plus `INSERT OR IGNORE`/`ON CONFLICT ... DO UPDATE` in
+#     interaction_store.py make a repeat write a no-op or a plain overwrite,
+#     never a duplicate row.
+#   - photos (sync_photos.py -> ApplePhotosSync): explicitly checks
+#     `source_store.get_by_source(...)` before creating a SourceEntity, on
+#     top of the InteractionStore guarantee above.
+#   - monarch_money: `write_monthly_report` does a single `file_path
+#     .write_text(content, ...)` — a full overwrite of a fixed-name file, not
+#     an append. Re-running regenerates and overwrites the same file.
+#   - google_docs / google_sheets: same full-overwrite `write_text` pattern
+#     (gdoc_sync.py) as monarch_money.
+#   - vault_reindex (IndexerService.index_all): explicitly designed to
+#     survive a crash mid-run — progress is saved to a state file every 10
+#     files, and both writes it makes per file are delete-then-add, not
+#     append: `VectorStore.update_document` deletes existing chunks for that
+#     file_path before adding new ones, and `BM25Index.delete_by_path` runs
+#     before re-adding. Re-indexing the same file twice (which already
+#     happens on ordinary incremental runs) is a no-op in effect.
+#   - crm_vectorstore (person_indexer.index_person_to_vectorstore): same
+#     delete-then-add pattern, keyed by `person:{person.id}`.
+#   - push_birthdays_to_contacts: sets a single Apple Contacts field
+#     (`setBirthday_`) to an exact value — setting it twice is the same as
+#     setting it once, not an append.
+# No source examined writes by unconditional append or by an external side
+# effect (e.g. sending a message, charging something) that would make a
+# repeat attempt unsafe. Per-source retry-eligibility metadata is therefore
+# not needed — if a genuinely non-idempotent source turns up later, exclude
+# it explicitly rather than adding a configuration surface for a
+# hypothetical.
+MAX_SYNC_RETRIES = 2  # up to 3 attempts total per source
+RETRY_BACKOFF_SECONDS = [30, 120]  # wait before attempt 2, then before attempt 3
+
+# Conservative allowlist: only failures that plausibly clear on their own get
+# retried. Matched against the captured output (stdout+stderr, or whatever
+# partial output was flushed before a timeout kill) — not against a specific
+# library's error *wording*, since issue #540 (landing separately) is
+# changing what Gmail's current "expired/revoked" message actually means.
+# These patterns key on the underlying signature instead: the DNS-resolution
+# errno/exception names, generic connection-level failures, and rate-limit
+# responses, which are stable across that kind of wording churn. Anything
+# that doesn't match — bad config, auth/permission errors, unexpected
+# exceptions, a bare timeout with no matching signature in its partial
+# output — is treated as non-transient and is not retried; per the issue,
+# the default when unsure must be "don't retry" (retrying a failure that
+# reproduces identically burns the retry budget for nothing).
+_TRANSIENT_ERROR_PATTERNS = [
+    r"\[Errno -3\]",                        # getaddrinfo failure (glibc EAI_AGAIN)
+    r"Temporary failure in name resolution",
+    r"Name or service not known",
+    r"nodename nor servname provided",
+    r"NameResolutionError",
+    r"gaierror",
+    # Requires the quote urllib3 always emits right after this phrase
+    # ("Failed to resolve 'host.name' (...)") — bare "Failed to resolve"
+    # would also match this codebase's *entity*-resolution vocabulary
+    # (e.g. "Failed to resolve duplicate entity for source_id=..."), which
+    # is a real bug, not a network blip.
+    r"Failed to resolve ['\"]",
+    r"Failed to establish a new connection",
+    r"Connection refused",
+    r"Connection reset by peer",
+    r"ConnectionResetError",
+    r"RemoteDisconnected",
+    r"Network is unreachable",
+    r"\bETIMEDOUT\b",
+    r"\bEHOSTUNREACH\b",
+    r"\bECONNRESET\b",
+    r"ConnectTimeout",
+    r"ReadTimeout",
+    # Negative lookahead excludes "RateLimiter" (a class name several HTTP
+    # clients use) so an unrelated bug like "'RateLimiter' object has no
+    # attribute 'foo'" doesn't get misread as an actual rate-limit response.
+    r"rate.?limit(?!er)",
+    r"ratelimited",
+    r"Too Many Requests",
+    # Bare "429" collides with line numbers, byte counts, and message ids in
+    # an unrelated traceback — require status-code context on one side.
+    r"(?:HTTP|status|response|code)[^\n]{0,40}\b429\b",
+    r"\b429\b[^\n]{0,40}(?:Too Many Requests|rate.?limit)",
+    r"503 Service Unavailable",
+]
+_TRANSIENT_ERROR_RE = re.compile("|".join(_TRANSIENT_ERROR_PATTERNS), re.IGNORECASE)
+
+
+def _is_transient_failure(error_text: str | None) -> bool:
+    """True only when ``error_text`` carries a recognizable connectivity or
+    rate-limit signature. Conservative by construction: no match means "not
+    transient", which is the safe default whenever the cause is unclear.
     """
-    Run a single sync operation.
+    if not error_text:
+        return False
+    return bool(_TRANSIENT_ERROR_RE.search(error_text))
 
-    Returns:
-        Tuple of (success, stats_dict)
+
+# Counter fields that get merged across a retry campaign (see
+# `_merge_campaign_stats` and its call sites in run_sync). If attempt 1 does
+# real work and then fails partway with a transient error, the sources are
+# idempotent (see the idempotence note above MAX_SYNC_RETRIES) so attempt 2
+# legitimately re-processes the same window and reports near-zero new
+# counters for rows attempt 1 already wrote. Recording only the final
+# attempt's numbers would under-report — or even zero out — a run that
+# actually did work, and `_detect_yield_collapse`/the consecutive-zero-run
+# streak read exactly these fields. Taking the max observed for each field
+# across every attempt in the campaign guarantees a success-after-retry
+# never reports less than the most any single attempt already achieved.
+# (Mirrors `_run_yield`'s own reasoning: these fields overlap by
+# construction, so max is the right merge — summing would double-count.)
+_MERGEABLE_STAT_FIELDS = (
+    "processed", "created", "updated", "errors",
+    "people_created", "people_updated",
+    "interactions_created", "source_entities_created",
+)
+
+
+def _merge_campaign_stats(campaign_stats: dict, attempt_stats: dict) -> None:
+    """Update ``campaign_stats`` in place with the elementwise max of each
+    mergeable field against ``attempt_stats``. Non-numeric/attempt-specific
+    keys (e.g. ``skipped_reason``, ``duration_collapse``) are untouched —
+    those describe the attempt that produced the final outcome, not the
+    campaign as a whole.
     """
-    if source not in SYNC_SCRIPTS:
-        logger.warning(f"No script configured for source: {source}")
-        return False, {"error": f"No script for {source}"}
+    for field in _MERGEABLE_STAT_FIELDS:
+        if field in attempt_stats:
+            campaign_stats[field] = max(campaign_stats.get(field, 0), attempt_stats.get(field, 0) or 0)
 
-    script_path, args = SYNC_SCRIPTS[source]
-    full_path = Path(__file__).parent.parent / script_path
 
-    if not full_path.exists():
-        logger.error(f"Script not found: {full_path}")
-        return False, {"error": f"Script not found: {script_path}"}
+def _execute_sync_once(source: str, script_path: str, args: list, full_path: Path) -> dict:
+    """Run exactly one subprocess attempt for ``source``.
 
-    if dry_run:
-        logger.info(f"[DRY RUN] Would run: python {script_path} {' '.join(args)}")
-        return True, {"dry_run": True}
+    Deliberately does none of the sync_health/markdown recording — the
+    retry loop in ``run_sync`` decides whether an attempt's failure is
+    terminal (and thus worth persisting) or retryable, so persistence has to
+    happen after that decision, not here.
 
-    # Record sync start — track globally for SIGTERM cleanup.
-    # Mask SIGTERM briefly so a signal can't arrive between the DB insert
-    # and the global assignment, which would leave a stale RUNNING row.
-    global _active_run_id, _active_source
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    run_id = record_sync_start(source)
-    _active_run_id = run_id
-    _active_source = source
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    Returns a dict with:
+        success: bool
+        stats: dict — parsed SYNC_STATS/regex-fallback stats (partial on failure)
+        error_type: str | None — "subprocess_error" | "timeout" | exception class name
+        health_message: str | None — goes to sync_runs.error_message (short)
+        log_message: str | None — goes to sync_errors.error_message
+        markdown_message: str | None — goes to the human-readable markdown log
+        classify_message: str | None — text the transient-failure classifier reads
+        stack_trace: str | None
+        context: str | None
+    """
+    cmd = [sys.executable, str(full_path)] + args
+    timeout_seconds = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT)
 
     try:
-        logger.info(f"Starting sync for {source}...")
-
-        # Build command - use the same Python that's running this script
-        # This ensures child scripts use the correct venv (e.g., ~/.venvs/lifeos)
-        cmd = [sys.executable, str(full_path)] + args
-
-        # Get per-source timeout (default 60 minutes)
-        timeout_seconds = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT)
-
-        # Run subprocess
-        sync_started_monotonic = time.monotonic()
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -967,112 +1109,23 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
         if result.returncode != 0:
             error_msg = result.stderr or result.stdout or "Unknown error"
             logger.error(f"Sync failed for {source}: {error_msg}")
-
-            record_sync_complete(
-                run_id,
-                SyncStatus.FAILED,
-                records_processed=stats.get("processed", 0),
-                records_created=stats.get("created", 0),
-                records_updated=stats.get("updated", 0),
-                errors=1,
-                error_message=error_msg[:500],
-                people_created=stats.get("people_created", 0),
-                people_updated=stats.get("people_updated", 0),
-                interactions_created=stats.get("interactions_created", 0),
-                source_entities_created=stats.get("source_entities_created", 0),
-            )
-            _active_run_id = None
-
-            record_sync_error(
-                source,
-                error_msg[:1000],
-                error_type="subprocess_error",
-                context=f"Command: {' '.join(cmd)}"
-            )
-
-            # Log to markdown for visibility
-            log_error_to_markdown(source, error_msg, "subprocess_error")
-
-            return False, {"error": error_msg, **stats}
+            return {
+                "success": False,
+                "stats": stats,
+                "error_type": "subprocess_error",
+                "health_message": error_msg[:500],
+                "log_message": error_msg[:1000],
+                "markdown_message": error_msg,
+                "classify_message": error_msg,
+                "stack_trace": None,
+                "context": f"Command: {' '.join(cmd)}",
+            }
 
         logger.info(f"Sync completed for {source}: {stats}")
-
-        # Check for duration collapse BEFORE recording completion, so the
-        # current run (still status=running) can't contaminate the history.
-        elapsed_seconds = time.monotonic() - sync_started_monotonic
-        collapse = _detect_duration_collapse(source, elapsed_seconds)
-        if collapse:
-            stats["duration_collapse"] = collapse
-            msg = (
-                f"Duration collapse for {source}: completed in "
-                f"{collapse['elapsed_seconds']:.1f}s but typically takes "
-                f"{collapse['typical_seconds']:.0f}s — possible silent no-op "
-                f"(e.g. missing credentials)"
-            )
-            logger.error(msg)
-            record_sync_error(source, msg, error_type="duration_collapse")
-
-        # A source that exits early because it isn't configured must not count
-        # as a healthy success — that inflates the nightly "N/N green" summary.
-        skipped_reason = stats.pop("skipped_reason", None)
-
-        # Yield-based no-op detection (issue #494). Only meaningful when the
-        # source actually ran; a skipped source is expected to produce nothing.
-        if not skipped_reason:
-            yield_collapse = _detect_yield_collapse(source, stats)
-            if yield_collapse:
-                stats["yield_collapse"] = yield_collapse
-                msg = (
-                    f"Yield collapse for {source}: produced 0 records but "
-                    f"typically produces ~{yield_collapse['typical_yield']:.0f} "
-                    f"— possible silent no-op"
-                )
-                logger.error(msg)
-                record_sync_error(source, msg, error_type="yield_collapse")
-
-            never_yielded = _detect_never_yielded(source, stats)
-            if never_yielded:
-                stats["never_yielded"] = never_yielded
-                # Damped (#494 follow-up): only warn when the condition is
-                # newly true, or periodically — not every night for the same
-                # chronic sources.
-                if not _recently_warned_never_yielded(source):
-                    msg = (
-                        f"{source} has never produced records in "
-                        f"{never_yielded['runs']} runs (avg "
-                        f"{never_yielded['avg_duration_seconds']:.1f}s) — likely "
-                        f"dead or misconfigured"
-                    )
-                    logger.warning(msg)
-                    record_sync_error(source, msg, error_type="never_yielded")
-                    stats["never_yielded_warned"] = True
-
-        if skipped_reason:
-            stats["skipped"] = True
-            stats["skipped_reason"] = skipped_reason
-            logger.info(f"Sync skipped for {source}: {skipped_reason}")
-            record_sync_complete(run_id, SyncStatus.SKIPPED)
-            _active_run_id = None
-            return True, stats
-
-        record_sync_complete(
-            run_id,
-            SyncStatus.SUCCESS,
-            records_processed=stats.get("processed", 0),
-            records_created=stats.get("created", 0),
-            records_updated=stats.get("updated", 0),
-            errors=stats.get("errors", 0),
-            people_created=stats.get("people_created", 0),
-            people_updated=stats.get("people_updated", 0),
-            interactions_created=stats.get("interactions_created", 0),
-            source_entities_created=stats.get("source_entities_created", 0),
-        )
-        _active_run_id = None
-
-        return True, stats
+        return {"success": True, "stats": stats}
 
     except subprocess.TimeoutExpired as e:
-        timeout_minutes = SYNC_TIMEOUTS.get(source, DEFAULT_SYNC_TIMEOUT) // 60
+        timeout_minutes = timeout_seconds // 60
 
         # Capture partial output from the killed process.
         # NOTE: TimeoutExpired.stdout/.stderr are bytes even when subprocess.run
@@ -1103,53 +1156,296 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             last_lines = "\n".join(combined_partial.strip().split("\n")[-50:])
             logger.info(f"Partial output before timeout:\n{last_lines}")
 
-        record_sync_complete(
-            run_id,
-            SyncStatus.FAILED,
-            records_processed=stats.get("processed", 0),
-            records_created=stats.get("created", 0),
-            records_updated=stats.get("updated", 0),
-            errors=1,
-            error_message=error_msg,
-            people_created=stats.get("people_created", 0),
-            people_updated=stats.get("people_updated", 0),
-            interactions_created=stats.get("interactions_created", 0),
-            source_entities_created=stats.get("source_entities_created", 0),
-        )
-        _active_run_id = None
-
-        # Include partial output in markdown log for visibility
         full_error_msg = error_msg
         if combined_partial.strip():
             full_error_msg += f"\n\nLast output before timeout:\n{combined_partial[-2000:]}"
 
-        record_sync_error(source, full_error_msg[:1000], error_type="timeout")
-        log_error_to_markdown(source, full_error_msg, "timeout")
-        return False, {"error": error_msg, **stats}
+        return {
+            "success": False,
+            "stats": stats,
+            "error_type": "timeout",
+            "health_message": error_msg,
+            "log_message": full_error_msg[:1000],
+            "markdown_message": full_error_msg,
+            "classify_message": full_error_msg,
+            "stack_trace": None,
+            "context": None,
+        }
 
     except Exception as e:
         error_msg = str(e)
+        tb = traceback.format_exc()
         logger.error(f"Sync exception for {source}: {error_msg}")
-        logger.error(traceback.format_exc())
+        logger.error(tb)
+        full_error = f"{error_msg}\n\n{tb}"
 
-        record_sync_complete(
-            run_id,
-            SyncStatus.FAILED,
-            errors=1,
-            error_message=error_msg[:500],
-        )
+        return {
+            "success": False,
+            "stats": {},
+            "error_type": type(e).__name__,
+            "health_message": error_msg[:500],
+            "log_message": error_msg,
+            "markdown_message": full_error,
+            "classify_message": full_error,
+            "stack_trace": tb,
+            "context": None,
+        }
+
+
+def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
+    """
+    Run a single sync operation, retrying a transient (connectivity or
+    rate-limit) failure up to MAX_SYNC_RETRIES times with backoff before
+    giving up. See the "Transient-failure retry" block above for the
+    rationale and the failure classification this relies on.
+
+    Returns:
+        Tuple of (success, stats_dict)
+    """
+    if source not in SYNC_SCRIPTS:
+        logger.warning(f"No script configured for source: {source}")
+        return False, {"error": f"No script for {source}"}
+
+    script_path, args = SYNC_SCRIPTS[source]
+    full_path = Path(__file__).parent.parent / script_path
+
+    if not full_path.exists():
+        logger.error(f"Script not found: {full_path}")
+        return False, {"error": f"Script not found: {script_path}"}
+
+    if dry_run:
+        logger.info(f"[DRY RUN] Would run: python {script_path} {' '.join(args)}")
+        return True, {"dry_run": True}
+
+    # Record sync start — track globally for SIGTERM cleanup.
+    # Mask SIGTERM briefly so a signal can't arrive between the DB insert
+    # and the global assignment, which would leave a stale RUNNING row.
+    global _active_run_id, _active_source
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    run_id = record_sync_start(source)
+    _active_run_id = run_id
+    _active_source = source
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    max_attempts = MAX_SYNC_RETRIES + 1
+    # Running max of each counter field across every attempt in this
+    # campaign — see `_merge_campaign_stats` for why this can't just be the
+    # last attempt's numbers.
+    campaign_stats: dict = {}
+
+    try:
+        logger.info(f"Starting sync for {source}...")
+
+        for attempt in range(1, max_attempts + 1):
+            # Per-attempt clock, not per-campaign: `duration_seconds` passed
+            # to record_sync_complete below must reflect only the attempt
+            # that produced the final outcome. If it instead spanned from
+            # the very first attempt (started_at), a retried run would record
+            # failed-attempt time + backoff on top of the real execution
+            # time — inflating get_typical_duration_seconds's baseline and
+            # making _detect_duration_collapse progressively less sensitive
+            # every time a retry fires (issue #541 adversarial review).
+            attempt_started_monotonic = time.monotonic()
+            outcome = _execute_sync_once(source, script_path, args, full_path)
+            attempt_elapsed_seconds = time.monotonic() - attempt_started_monotonic
+
+            _merge_campaign_stats(campaign_stats, outcome["stats"])
+
+            if outcome["success"]:
+                stats = outcome["stats"]
+                # Counter fields reflect the whole campaign's max, not just
+                # this attempt — see _merge_campaign_stats.
+                stats.update(campaign_stats)
+
+                # Check for duration collapse BEFORE recording completion, so
+                # the current run (still status=running) can't contaminate
+                # the history.
+                elapsed_seconds = attempt_elapsed_seconds
+                collapse = _detect_duration_collapse(source, elapsed_seconds)
+                if collapse:
+                    stats["duration_collapse"] = collapse
+                    msg = (
+                        f"Duration collapse for {source}: completed in "
+                        f"{collapse['elapsed_seconds']:.1f}s but typically takes "
+                        f"{collapse['typical_seconds']:.0f}s — possible silent no-op "
+                        f"(e.g. missing credentials)"
+                    )
+                    logger.error(msg)
+                    record_sync_error(source, msg, error_type="duration_collapse")
+
+                # A source that exits early because it isn't configured must not
+                # count as a healthy success — that inflates the nightly "N/N
+                # green" summary.
+                skipped_reason = stats.pop("skipped_reason", None)
+
+                # Yield-based no-op detection (issue #494). Only meaningful when
+                # the source actually ran; a skipped source is expected to
+                # produce nothing.
+                if not skipped_reason:
+                    yield_collapse = _detect_yield_collapse(source, stats)
+                    if yield_collapse:
+                        stats["yield_collapse"] = yield_collapse
+                        msg = (
+                            f"Yield collapse for {source}: produced 0 records but "
+                            f"typically produces ~{yield_collapse['typical_yield']:.0f} "
+                            f"— possible silent no-op"
+                        )
+                        logger.error(msg)
+                        record_sync_error(source, msg, error_type="yield_collapse")
+
+                    never_yielded = _detect_never_yielded(source, stats)
+                    if never_yielded:
+                        stats["never_yielded"] = never_yielded
+                        # Damped (#494 follow-up): only warn when the condition
+                        # is newly true, or periodically — not every night for
+                        # the same chronic sources.
+                        if not _recently_warned_never_yielded(source):
+                            msg = (
+                                f"{source} has never produced records in "
+                                f"{never_yielded['runs']} runs (avg "
+                                f"{never_yielded['avg_duration_seconds']:.1f}s) — "
+                                f"likely dead or misconfigured"
+                            )
+                            logger.warning(msg)
+                            record_sync_error(source, msg, error_type="never_yielded")
+                            stats["never_yielded_warned"] = True
+
+                if skipped_reason:
+                    stats["skipped"] = True
+                    stats["skipped_reason"] = skipped_reason
+                    logger.info(f"Sync skipped for {source}: {skipped_reason}")
+                    record_sync_complete(
+                        run_id,
+                        SyncStatus.SKIPPED,
+                        attempt_count=attempt,
+                        duration_seconds=attempt_elapsed_seconds,
+                    )
+                    _active_run_id = None
+                    return True, stats
+
+                if attempt > 1:
+                    logger.info(f"{source} succeeded on attempt {attempt}/{max_attempts} after retry")
+
+                record_sync_complete(
+                    run_id,
+                    SyncStatus.SUCCESS,
+                    records_processed=stats.get("processed", 0),
+                    records_created=stats.get("created", 0),
+                    records_updated=stats.get("updated", 0),
+                    errors=stats.get("errors", 0),
+                    people_created=stats.get("people_created", 0),
+                    people_updated=stats.get("people_updated", 0),
+                    interactions_created=stats.get("interactions_created", 0),
+                    source_entities_created=stats.get("source_entities_created", 0),
+                    attempt_count=attempt,
+                    duration_seconds=attempt_elapsed_seconds,
+                )
+                _active_run_id = None
+                return True, stats
+
+            # This attempt failed. Decide whether it's worth retrying.
+            retriable = attempt < max_attempts and _is_transient_failure(outcome["classify_message"])
+
+            if retriable:
+                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                logger.warning(
+                    f"{source}: transient failure on attempt {attempt}/{max_attempts} "
+                    f"({outcome['error_type']}) — retrying in {backoff}s"
+                )
+                # Record the attempt for visibility/debugging without touching
+                # the sync_runs row — that row stays RUNNING until a terminal
+                # outcome, so history-based detectors see one row per logical
+                # run rather than one per attempt.
+                record_sync_error(
+                    source,
+                    outcome["log_message"],
+                    error_type=outcome["error_type"],
+                    stack_trace=outcome["stack_trace"],
+                    context=outcome["context"],
+                )
+                time.sleep(backoff)
+                continue
+
+            # Non-transient, or retries exhausted: terminal failure.
+            if attempt > 1:
+                logger.error(f"{source}: giving up after {attempt} attempts")
+
+            stats = outcome["stats"]
+            # Even on a terminal failure, an earlier attempt may have done
+            # real (idempotent) work before this one failed — don't let the
+            # last attempt's numbers erase that from the record.
+            stats.update(campaign_stats)
+            record_sync_complete(
+                run_id,
+                SyncStatus.FAILED,
+                records_processed=stats.get("processed", 0),
+                records_created=stats.get("created", 0),
+                records_updated=stats.get("updated", 0),
+                errors=1,
+                error_message=outcome["health_message"],
+                people_created=stats.get("people_created", 0),
+                people_updated=stats.get("people_updated", 0),
+                interactions_created=stats.get("interactions_created", 0),
+                source_entities_created=stats.get("source_entities_created", 0),
+                attempt_count=attempt,
+                duration_seconds=attempt_elapsed_seconds,
+            )
+            _active_run_id = None
+
+            record_sync_error(
+                source,
+                outcome["log_message"],
+                error_type=outcome["error_type"],
+                stack_trace=outcome["stack_trace"],
+                context=outcome["context"],
+            )
+            log_error_to_markdown(source, outcome["markdown_message"], outcome["error_type"])
+
+            return False, {"error": outcome["health_message"], **stats}
+
+    except Exception as e:
+        # `_execute_sync_once` already catches everything the subprocess
+        # attempt itself can raise (adversarial review finding #1: that
+        # helper's own try/except covers TimeoutExpired and Exception). This
+        # guards the orchestration *around* it instead — duration/yield
+        # detection, and the record_sync_error/record_sync_complete calls —
+        # since a locked sync_health.db (this host runs many agents against
+        # it concurrently) is a realistic way for one of those to raise.
+        # Before the retry refactor, `run_sync` had exactly this guard
+        # around its single subprocess call; losing it here would mean one
+        # source's DB hiccup takes down the entire nightly pipeline instead
+        # of just that source, since run_all_syncs has no exception guard of
+        # its own around each run_sync call.
+        error_msg = str(e)
+        tb = traceback.format_exc()
+        logger.error(f"Sync orchestration exception for {source}: {error_msg}")
+        logger.error(tb)
+
+        # Best-effort — the DB write is exactly what may be failing right
+        # now (mirrors the same pattern already used in _handle_sigterm).
+        try:
+            record_sync_complete(
+                run_id,
+                SyncStatus.FAILED,
+                errors=1,
+                error_message=error_msg[:500],
+            )
+        except Exception:
+            pass
         _active_run_id = None
-
-        record_sync_error(
-            source,
-            error_msg,
-            error_type=type(e).__name__,
-            stack_trace=traceback.format_exc(),
-        )
-
-        # Log to markdown with full stack trace
-        full_error = f"{error_msg}\n\n{traceback.format_exc()}"
-        log_error_to_markdown(source, full_error, type(e).__name__)
+        try:
+            record_sync_error(
+                source,
+                error_msg,
+                error_type=type(e).__name__,
+                stack_trace=tb,
+            )
+        except Exception:
+            pass
+        try:
+            log_error_to_markdown(source, f"{error_msg}\n\n{tb}", type(e).__name__)
+        except Exception:
+            pass
 
         return False, {"error": error_msg}
 

@@ -380,6 +380,20 @@ def _init_schema(conn: sqlite3.Connection):
         migrations.append("ALTER TABLE sync_runs ADD COLUMN source_entities_created INTEGER DEFAULT 0")
     if "trigger_source" not in columns:
         migrations.append("ALTER TABLE sync_runs ADD COLUMN trigger_source TEXT DEFAULT 'unknown'")
+    if "attempt_count" not in columns:
+        # Issue #541: within-run retry for transient (connectivity/rate-limit)
+        # failures. 1 = succeeded or failed on the first try (no retry
+        # attempted); >1 = a retry was needed before the final status. This
+        # single column is enough to derive all three states the health
+        # record must distinguish: first-time success (status=success,
+        # attempt_count=1), success-after-retry (status=success,
+        # attempt_count>1), and gave-up (status=failed, attempt_count>1 means
+        # retries were exhausted; attempt_count=1 means the failure was
+        # classified non-transient and never retried).
+        # DEFAULT 1 makes every pre-existing row (from before this column
+        # existed) read as "no retry" rather than NULL, so historical rows
+        # stay queryable without special-casing NULL everywhere.
+        migrations.append("ALTER TABLE sync_runs ADD COLUMN attempt_count INTEGER DEFAULT 1")
 
     for sql in migrations:
         conn.execute(sql)
@@ -485,19 +499,44 @@ def record_sync_complete(
     people_updated: int = 0,
     interactions_created: int = 0,
     source_entities_created: int = 0,
+    attempt_count: int = 1,
+    duration_seconds: Optional[float] = None,
 ):
-    """Record completion of a sync operation."""
+    """Record completion of a sync operation.
+
+    ``attempt_count`` is the total number of attempts the orchestrator made
+    before reaching this final status (1 = no retry needed; >1 = one or more
+    transient-failure retries happened first — see issue #541). One row per
+    logical run still gets one update, keeping the row *count* history
+    detectors see unchanged by retries.
+
+    ``duration_seconds``, when given, is used verbatim instead of being
+    derived from ``started_at``. The retry loop passes the elapsed time of
+    only the attempt that produced this final outcome — not the earlier
+    failed attempts or the backoff sleeps between them — because
+    ``get_typical_duration_seconds``/``_detect_duration_collapse`` assume
+    this column means "how long a normal run takes". Deriving it from
+    ``started_at`` (set once, at the first attempt) would let a retried
+    run's failed-attempt-plus-backoff time inflate that baseline upward
+    every time a retry happens, making the collapse detector progressively
+    less sensitive given how often retries are expected to fire (issue #541
+    adversarial review). When omitted (e.g. a caller outside the retry
+    loop), duration still falls back to the ``started_at``-derived value.
+    """
     conn = get_sync_health_db()
 
-    # Get start time to calculate duration
-    row = conn.execute(
-        "SELECT started_at FROM sync_runs WHERE id = ?", (run_id,)
-    ).fetchone()
+    if duration_seconds is not None:
+        duration = duration_seconds
+    else:
+        # Get start time to calculate duration
+        row = conn.execute(
+            "SELECT started_at FROM sync_runs WHERE id = ?", (run_id,)
+        ).fetchone()
 
-    duration = None
-    if row:
-        started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
-        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        duration = None
+        if row:
+            started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+            duration = (datetime.now(timezone.utc) - started).total_seconds()
 
     conn.execute(
         """
@@ -513,7 +552,8 @@ def record_sync_complete(
             people_created = ?,
             people_updated = ?,
             interactions_created = ?,
-            source_entities_created = ?
+            source_entities_created = ?,
+            attempt_count = ?
         WHERE id = ?
         """,
         (
@@ -529,6 +569,7 @@ def record_sync_complete(
             people_updated,
             interactions_created,
             source_entities_created,
+            attempt_count,
             run_id,
         )
     )
