@@ -4,13 +4,13 @@ Nickname lookup for entity resolution.
 Provides bidirectional lookup between formal names and nicknames/diminutives.
 E.g., "Benjamin" <-> "Ben", "Michael" <-> "Mike", "Katherine" <-> "Kate"
 
-Data source: https://github.com/carltonnorthern/nicknames
+Data source: https://github.com/carltonnorthern/nicknames (Apache-2.0).
+See THIRD_PARTY_NOTICES.md for attribution and license terms.
 """
 
 import csv
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 # Path to the nicknames CSV file
 NICKNAMES_CSV = Path(__file__).parent / "nicknames.csv"

@@ -338,4 +338,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE)
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
+
+Third-party material redistributed here (currently the Apache-2.0 nickname dataset) is recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
