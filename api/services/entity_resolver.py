@@ -50,7 +50,7 @@ def parse_name(name: str) -> ParsedName:
         "Dr. Mary Katherine Palmer MD" -> {first="Mary", middles=["Katherine"], last="Palmer"}
         "Taylor" -> {first="Taylor", middles=[], last=None}
         "Jane Mary Smith" -> {first="Jane", middles=["Mary"], last="Smith"}
-        "Sarah Long, CLC, CSC" -> {first="Sarah", middles=[], last="Long"}
+        "Alice Reed, CLC, CSC" -> {first="Alice", middles=[], last="Reed"}
 
     Args:
         name: Name string to parse
