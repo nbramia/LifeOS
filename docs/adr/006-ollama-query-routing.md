@@ -2,7 +2,8 @@
 
 **Status:** Complete
 **Last Updated:** 2026-02-19
-**Decision:** Accepted
+**Decision:** Superseded
+**Superseded By:** [ADR-017](017-retire-ollama-llama-server-routing.md) — Ollama retired; routing moved to the same `llama-server` runtime used for orchestration
 
 ## Context
 
