@@ -1,4 +1,4 @@
-"""Investments snapshot — Nathan's Schwab pipeline, served from Syncthing.
+"""Investments snapshot — the operator's Schwab pipeline, served from Syncthing.
 
 The macbook's nightly refresh (~/Code/Personal/investments, private repo
 nbramia/investments) aggregates 5 Schwab accounts + Guideline 401(k) + TSP

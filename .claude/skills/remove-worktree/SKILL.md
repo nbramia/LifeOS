@@ -17,7 +17,8 @@ Tear down a worktree from `~/.claude/worktrees/LifeOS/`.
 
 - Current directory: !`pwd`
 - Worktree info (if inside one): !`cat .worktree-info 2>/dev/null || echo "(not in a worktree)"`
-- Active worktrees: !`/home/nathanramia/Code/LifeOS/scripts/list-worktrees.sh 2>/dev/null || echo "(none)"`
+- Main repo checkout: !`dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`
+- Active worktrees: !`"$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/scripts/list-worktrees.sh" 2>/dev/null || echo "(none)"`
 - Arguments: **$ARGUMENTS**
 
 ## Instructions
@@ -38,14 +39,14 @@ If `$ARGUMENTS` contains `--delete-branch`, prepare to set `LIFEOS_WORKTREE_DELE
 
 ### Step 3: Get out of the worktree if necessary
 
-If `pwd` is under `~/.claude/worktrees/LifeOS/`, `cd` to `/home/nathanramia/Code/LifeOS` first. `git worktree remove --force` will delete the directory out from under the shell otherwise.
+If `pwd` is under `~/.claude/worktrees/LifeOS/`, `cd` to the main repo checkout (shown in Context above) first. `git worktree remove --force` will delete the directory out from under the shell otherwise.
 
 ### Step 4: Run the removal script
 
 From the main repo:
 
 ```bash
-cd /home/nathanramia/Code/LifeOS
+cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 LIFEOS_WORKTREE_DELETE_BRANCH=<0 or 1> ./scripts/remove-worktree.sh <name>
 ```
 

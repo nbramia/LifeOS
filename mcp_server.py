@@ -1626,7 +1626,7 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_investments":
             # Household portfolio snapshot from the Schwab pipeline (synced from
-            # nathan-macbook). Mirrors the search_finances 'investments' digest.
+            # the Mac export host). Mirrors the search_finances 'investments' digest.
             totals = data.get("totals") or {}
             tb = totals.get("tax_buckets") or {}
             lines = [

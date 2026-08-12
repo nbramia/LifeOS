@@ -215,7 +215,7 @@ class TestChannelIndexing:
 
     def test_sync_messages_enumerates_member_channels_only(self, sync_with_mocks):
         """Channel enumeration must use membership (users.conversations), not
-        the full workspace list — Nathan can only have messages where he's a
+        the full workspace list — the user can only have messages where they are a
         member, and the full list burns rate limit (a catch-up sync 429'd on
         page 3 of conversations.list)."""
         sync = sync_with_mocks
