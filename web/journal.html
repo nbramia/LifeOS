@@ -277,10 +277,10 @@
             }[c]));
         }
 
-        function renderWheel(wheel, entryCount) {
+        function renderWheel(wheel, emotionEntries) {
             const svg = document.getElementById('wheelSvg');
             svg.innerHTML = '';
-            if (!wheel.length || entryCount === 0) {
+            if (!wheel.length || emotionEntries === 0) {
                 svg.style.display = 'none';
                 return;
             }
@@ -300,7 +300,7 @@
                     const rInner = INNER_HOLE + (level - 1) * ringThickness;
                     const rOuter = INNER_HOLE + level * ringThickness;
                     const d = arcPath(CENTER, CENTER, rInner, rOuter, a0, a1);
-                    const pct = ((node.count / entryCount) * 100).toFixed(1);
+                    const pct = ((node.count / emotionEntries) * 100).toFixed(1);
                     const nodePath = [...path, node.value];
                     const wedgeId = `wedge-${parts.length}`;
                     parts.push(
@@ -331,7 +331,7 @@
             }
 
             // Full circle starting at 12 o'clock (-PI/2), sweeping clockwise.
-            walk(wheel, 1, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI, entryCount, []);
+            walk(wheel, 1, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI, emotionEntries, []);
             svg.innerHTML = parts.join('');
 
             svg.querySelectorAll('.wedge').forEach((el) => {
@@ -349,14 +349,14 @@
             });
         }
 
-        function renderLegend(wheel, entryCount) {
+        function renderLegend(wheel, emotionEntries) {
             const legend = document.getElementById('legend');
-            if (!wheel.length || entryCount === 0) {
+            if (!wheel.length || emotionEntries === 0) {
                 legend.innerHTML = '';
                 return;
             }
             const rows = wheel.map((n) => {
-                const pct = ((n.count / entryCount) * 100).toFixed(1);
+                const pct = ((n.count / emotionEntries) * 100).toFixed(1);
                 return `<div class="legend-row">` +
                     `<span class="legend-swatch" style="background:${colorFor(n.value, 1)}"></span>` +
                     `<span class="legend-value">${escapeHtml(n.value)}</span>` +
@@ -368,16 +368,27 @@
 
         function renderSampleBanner(data) {
             const banner = document.getElementById('sampleBanner');
-            const { entry_count, window: win, start_date, end_date } = data;
+            const { total_entries, emotion_entries, start_date, end_date } = data;
             const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
-            const thin = entry_count > 0 && entry_count < 5;
+            // Percentages in the wheel/legend are always out of
+            // emotion_entries (the emotion-bearing subset) — the thin-sample
+            // caveat is keyed to that same denominator, not the raw file count.
+            const thin = emotion_entries > 0 && emotion_entries < 5;
             banner.classList.toggle('sample-thin', thin);
-            if (entry_count === 0) {
+            if (total_entries === 0) {
                 banner.innerHTML = `No journal entries in this window (${rangeText}).`;
-            } else {
-                banner.innerHTML = `<strong>${entry_count}</strong> journal entr${entry_count === 1 ? 'y' : 'ies'} ` +
+            } else if (emotion_entries === 0) {
+                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
+                    `in this window (${rangeText}), but none logged emotion data.`;
+            } else if (emotion_entries === total_entries) {
+                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
                     `in this window (${rangeText})` +
                     (thin ? ' — small sample, read the wheel loosely.' : '.');
+            } else {
+                banner.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
+                    `entries had emotion data in this window (${rangeText}) — percentages below are out of ` +
+                    `${emotion_entries}` +
+                    (thin ? '; small sample, read the wheel loosely.' : '.');
             }
         }
 
@@ -393,12 +404,12 @@
                 if (!res.ok) throw new Error(`API error: ${res.status}`);
                 const data = await res.json();
                 renderSampleBanner(data);
-                if (data.entry_count === 0) {
+                if (data.emotion_entries === 0) {
                     document.getElementById('wheelSvg').style.display = 'none';
                     document.getElementById('legend').innerHTML = '';
                 } else {
-                    renderWheel(data.wheel, data.entry_count);
-                    renderLegend(data.wheel, data.entry_count);
+                    renderWheel(data.wheel, data.emotion_entries);
+                    renderLegend(data.wheel, data.emotion_entries);
                 }
             } catch (err) {
                 banner.textContent = `Failed to load: ${err.message}`;

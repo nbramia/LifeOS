@@ -16,9 +16,11 @@ This is unrelated to the CRM's two-tier `SourceEntity`/`PersonEntity` model (see
 2. [The Emotion Chain](#the-emotion-chain)
 3. [Handling "Not sure"](#handling-not-sure)
 4. [Aggregation API](#aggregation-api)
-5. [Emotion Wheel View](#emotion-wheel-view)
-6. [Sample Size Honesty](#sample-size-honesty)
-7. [Deviations From a Literal Plutchik Wheel](#deviations-from-a-literal-plutchik-wheel)
+5. [Value Disclosure Policy](#value-disclosure-policy)
+6. [File Access Safety](#file-access-safety)
+7. [Emotion Wheel View](#emotion-wheel-view)
+8. [Sample Size Honesty](#sample-size-honesty)
+9. [Deviations From a Literal Plutchik Wheel](#deviations-from-a-literal-plutchik-wheel)
 
 ---
 
@@ -68,7 +70,8 @@ The aggregation tree (`build_wheel`) keys nodes by their **position in the chain
   "window": "month",
   "start_date": "2026-06-01",
   "end_date": "2026-06-30",
-  "entry_count": 4,
+  "total_entries": 5,
+  "emotion_entries": 4,
   "wheel": [
     {
       "value": "Happy",
@@ -91,9 +94,47 @@ The aggregation tree (`build_wheel`) keys nodes by their **position in the chain
 
 (Sample data above is invented — see [Privacy-First Documentation](../../AGENTS.md#privacy-first-documentation).)
 
-`wheel` is a pre-aggregated tree (value / count / children), sorted by count descending then alphabetically — the frontend renders it directly rather than re-deriving structure from raw rows, matching the response shape used by the CRM interaction dashboards. `entry_count` is the number of journal entries in the window that had a parseable `feeling:` value (entries with no `feeling:` key, or files with no frontmatter at all, are silently skipped — same never-raise convention as `extract_frontmatter` elsewhere in the codebase — and don't count toward `entry_count`).
+`wheel` is a pre-aggregated tree (value / count / children), sorted by count descending then alphabetically — the frontend renders it directly rather than re-deriving structure from raw rows, matching the response shape used by the CRM interaction dashboards.
+
+The response tracks two counts, and callers must not confuse them:
+
+- `total_entries` — every valid dated journal file in the window (see [File Access Safety](#file-access-safety) for what "valid" means).
+- `emotion_entries` — the subset of those that had a parseable `feeling:` value. Wheel node counts and percentages are always fractions of `emotion_entries`, not `total_entries`.
+
+An earlier version of this endpoint had a single `entry_count` field that actually meant `emotion_entries`, so a window of mostly feeling-less entries (say, 6 of 7 dated files with no `feeling:` at all) silently looked like "1 entry, 100% coverage" instead of what it really was — 1 of 7 entries carrying emotion data. That's the same "missing data presented as a complete small answer" failure mode described in [Sample Size Honesty](#sample-size-honesty), just one level up (missing *fields*, not missing *entries*) — worth naming explicitly since it's exactly the class of bug this feature exists to avoid, not fix elsewhere.
 
 A child's `count` can be less than its parent's `count`: that's not a bug, it's the chain terminating early for some of the parent's entries. The wheel view (below) renders this as empty space in the outer ring rather than forcing every branch down to a fixed depth.
+
+An unrecognized `window` value is normalized to `"month"` *before* both computing the date bounds and populating the response's `window` field, so `?window=banana` returns month-bounded data labeled `"window": "month"` — never an echoed-back value that doesn't match what was actually computed.
+
+## Value Disclosure Policy
+
+`feeling:` and its follow-up fields are free text as far as the parser is concerned — today's Google Form only offers a fixed set of buttons, but a hand-edited entry (or a future form change) could put anything there, including a full sentence about a specific real event. Because chain values become public display text (wedge label, legend row, tooltip, and the raw JSON response), returning them verbatim would turn a display bug into a disclosure risk the moment someone edits a file by hand.
+
+The fix is **not** an allowlist of the current ~6 primary and ~17 secondary values. That taxonomy comes from the Google Form and changes independently of this code; hardcoding it would silently start dropping or misclassifying real data the moment the form's options change — a worse failure than the one being fixed, and exactly the kind of brittle-to-the-source-format mistake this codebase has spent effort removing elsewhere.
+
+Instead, every chain value passes through a conservative **shape policy** (`_is_plausible_label` in `api/routes/journal.py`) before it can be displayed:
+
+- At most 30 characters.
+- At most 3 words.
+- No line breaks.
+
+Every real observed value is a single word, or "Not sure" (two words) — these caps have generous headroom over that, so ordinary vocabulary growth never trips them. A value that fails the check is replaced with a neutral `"Unrecognized"` label; the raw text is never returned in the API response or rendered anywhere. Multiple different failing values in the same window collapse into one shared `"Unrecognized"` wedge (their counts sum) rather than each getting its own.
+
+Separately, the number of *distinct* values (excluding the shared `"Unrecognized"` bucket) that can each get their own wedge in one response is capped at 50 (`build_wheel`'s `max_distinct_values`). The shape policy alone doesn't bound this: a corrupted file could in principle contain hundreds of distinct short strings that each individually pass the shape check. Past the cap, further not-yet-seen values are folded into `"Unrecognized"` too, so the wheel stays bounded regardless of how much distinct garbage a corrupted file contains. Real vocabulary (~23 words) sits far under this cap in normal operation.
+
+Traversal itself (which frontmatter key to look up next) always uses the raw, pre-policy value — a free-text value can't sensibly continue the chain in practice anyway, but even if some future entry made it look like it could, the chain must still never leak the text that got it there.
+
+## File Access Safety
+
+The aggregator reads whatever files are directly inside `<vault_path>/Personal/Journal/`, so `_iter_valid_journal_files` (`api/routes/journal.py`) treats a file as a trustworthy journal entry only if all of the following hold:
+
+- **Filename is canonical.** The file must be named `YYYY-MM-DD.md`; the date comes from the filename, never from frontmatter alone. This also means a file that doesn't match the pattern at all (an `Index.md`, a README, anything else someone drops in the folder) is never admitted just because it happens to carry `date:` and `feeling:` fields.
+- **Not a symlink, and the resolved path stays inside the real journal directory.** A symlink placed in the journal folder pointing at, say, a therapy note elsewhere in the vault must not be followed and aggregated just because it landed in this directory — that would be a real privacy-boundary violation, not just a data-quality one. Both checks are redundant with each other by design (defense in depth): rejecting symlinks outright catches the direct case, and the resolved-path check catches indirect cases (e.g. a symlinked ancestor directory).
+- **Frontmatter `date:` agrees with the filename, if present at all.** If the two disagree, the entry isn't safely attributable to either date, so it's skipped rather than silently trusting one or the other.
+- **Readable as UTF-8 and parseable as frontmatter.** A file with invalid UTF-8 bytes or malformed YAML is skipped, not raised — one bad file must not turn the whole endpoint into a 500.
+
+Every request re-reads and re-parses every `*.md` file directly in the journal directory (no caching, no index). That's a non-issue at the real-world scale here — dozens of entries as of this writing — and stays that way as long as the journal is what it is: a hand-written daily note, not a high-volume log. It's the ceiling on this design, recorded here so a future reader with a much larger journal (or a different data source entirely) knows to revisit it rather than rediscover it.
 
 ## Emotion Wheel View
 
@@ -102,7 +143,7 @@ A child's `count` can be less than its parent's `count`: that's not a bug, it's 
 A single self-contained page (`web/journal.html`, vanilla JS + inline SVG, no build step) with:
 
 - A **window selector** (day / week / month / quarter / all-time pills).
-- A **sample-size banner** stating the entry count and date range for the current window in plain text above the wheel — see [Sample Size Honesty](#sample-size-honesty).
+- A **sample-size banner** stating `total_entries`, `emotion_entries` (when they differ), and the date range for the current window in plain text above the wheel — see [Sample Size Honesty](#sample-size-honesty).
 - The **wheel itself**: a radial partition (sunburst) diagram. Each ring is one level of the chain; a wedge's angular width is proportional to its count relative to its parent's count, so early-terminating chains naturally leave a visible gap in the outer ring rather than needing special-case handling.
 - A **legend** listing each top-level emotion with its count and percentage of the window, as a text-based fallback for anyone who prefers reading counts to reading wedge sizes.
 - Hover tooltips on wedges showing the full chain path, count, and percentage of the window.
@@ -111,13 +152,14 @@ Color is assigned by hashing each value's text to a hue (`fnv1aHue` in `web/jour
 
 ## Sample Size Honesty
 
-The journal has produced entries sporadically since it started, and any given window can easily contain zero, one, or a handful of entries. A wheel built from three entries visually resembles a wheel built from three hundred if nothing calls that out — the same "presenting a thin answer as a complete one" failure mode this codebase has been auditing for elsewhere in chat responses this week.
+The journal has produced entries sporadically since it started, and any given window can easily contain zero, one, or a handful of entries — and not every entry that exists carries emotion data. A wheel built from three entries visually resembles a wheel built from three hundred if nothing calls that out — the same "presenting a thin answer as a complete one" failure mode this codebase has been auditing for elsewhere in chat responses this week.
 
-The view addresses this in three ways:
+The view addresses this in four ways:
 
-1. The sample-size banner **always** states the entry count and date range, in the same place, regardless of window size — it's not a footnote.
-2. Below a threshold (fewer than 5 entries), the banner adds an explicit caveat ("small sample, read the wheel loosely") rather than letting a thin wheel pass as a confident one.
-3. **Zero entries** in a window renders no wheel at all — an empty ring would visually claim "nothing happened" when the true state is "no data," so the view shows a plain "No journal entries in this window" message instead.
+1. The sample-size banner **always** states both counts and the date range, in the same place, regardless of window size — it's not a footnote.
+2. When `total_entries` and `emotion_entries` differ, the banner says so explicitly ("N of M entries had emotion data") instead of only reporting the emotion-bearing count as if it were the entry count — see the [Aggregation API](#aggregation-api) section for why this distinction exists at all.
+3. Below a threshold (fewer than 5 emotion-bearing entries), the banner adds an explicit caveat ("small sample, read the wheel loosely") rather than letting a thin wheel pass as a confident one. The threshold is keyed to `emotion_entries`, since that's the denominator the wheel's percentages actually use.
+4. **Zero entries, or zero with emotion data,** renders no wheel at all — an empty ring would visually claim "nothing happened" when the true state is "no data" (or "data without a logged feeling"), so the view shows a plain text message distinguishing the two instead.
 
 ## Deviations From a Literal Plutchik Wheel
 

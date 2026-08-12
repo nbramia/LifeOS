@@ -52,7 +52,8 @@ _NONEMPTY_RESPONSE = {
     "window": "all-time",
     "start_date": None,
     "end_date": "2026-06-30",
-    "entry_count": 4,
+    "total_entries": 4,
+    "emotion_entries": 4,
     "wheel": [
         {
             "value": "Happy",
@@ -70,8 +71,18 @@ _EMPTY_RESPONSE = {
     "window": "day",
     "start_date": "2026-06-30",
     "end_date": "2026-06-30",
-    "entry_count": 0,
+    "total_entries": 0,
+    "emotion_entries": 0,
     "wheel": [],
+}
+
+_PARTIAL_COVERAGE_RESPONSE = {
+    "window": "week",
+    "start_date": "2026-06-24",
+    "end_date": "2026-06-30",
+    "total_entries": 7,
+    "emotion_entries": 1,
+    "wheel": [{"value": "Happy", "count": 1, "children": []}],
 }
 
 
@@ -104,9 +115,10 @@ class TestJournalWheelView:
         expect(page.locator("#wheelSvg path")).to_have_count(5)
 
     def test_thin_sample_gets_a_visible_caveat(self, page: Page, journal_base_url):
-        thin_response = {**_NONEMPTY_RESPONSE, "entry_count": 2, "wheel": [
-            {"value": "Sad", "count": 2, "children": []},
-        ]}
+        thin_response = {
+            **_NONEMPTY_RESPONSE, "total_entries": 2, "emotion_entries": 2,
+            "wheel": [{"value": "Sad", "count": 2, "children": []}],
+        }
         _open_journal(page, journal_base_url, default=thin_response)
         expect(page.locator("#sampleBanner")).to_contain_text("small sample")
 
@@ -115,6 +127,16 @@ class TestJournalWheelView:
         expect(page.locator("#sampleBanner")).to_contain_text("No journal entries")
         expect(page.locator("#wheelSvg path")).to_have_count(0)
         expect(page.locator(".legend-row")).to_have_count(0)
+
+    def test_partial_emotion_coverage_names_both_counts(self, page: Page, journal_base_url):
+        # 7 dated entries, only 1 carried emotion data — the banner must say
+        # so explicitly rather than reporting "1 entry" as if that were the
+        # whole window (the exact bug FIX 2 closed).
+        _open_journal(page, journal_base_url, default=_PARTIAL_COVERAGE_RESPONSE)
+        expect(page.locator("#sampleBanner")).to_contain_text("1")
+        expect(page.locator("#sampleBanner")).to_contain_text("7")
+        expect(page.locator("#sampleBanner")).to_contain_text("emotion data")
+        expect(page.locator("#wheelSvg path")).to_have_count(1)
 
     def test_window_pill_click_refetches_and_updates_banner(self, page: Page, journal_base_url):
         by_window = {
