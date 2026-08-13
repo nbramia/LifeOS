@@ -11,17 +11,35 @@ def test_chroma_url_setting():
 
 
 def test_local_llm_autostart_defaults_false():
-    """Local LLM autostart should default to False."""
+    """
+    Local LLM autostart should default to False.
+
+    Asserts the FIELD default, not a live instance. ``Settings()`` reads the
+    local .env, so this used to assert whatever the developer's machine had
+    configured — it failed on any host that sets LIFEOS_LOCAL_LLM_AUTOSTART and
+    passed everywhere else, which is the opposite of what it claims to check.
+    """
     from config.settings import Settings
-    s = Settings()
-    assert s.local_llm_autostart is False
+
+    assert Settings.model_fields["local_llm_autostart"].default is False
 
 
 def test_local_llm_model_default():
-    """Local LLM model should default to gpt-oss-120b."""
+    """
+    The shipped local-LLM default is a deliberate pin — update it here when the
+    default model changes. It drifted silently once already: the assertion
+    still named gpt-oss-120b long after the default moved to Gemma, so this
+    test failed for everyone, including a fresh clone.
+
+    Reads the field default so a host-level LIFEOS_LLM_MODEL override doesn't
+    turn a local config choice into a test failure.
+    """
     from config.settings import Settings
-    s = Settings()
-    assert s.local_llm_model == "ggml-org/gpt-oss-120b-GGUF"
+
+    assert (
+        Settings.model_fields["local_llm_model"].default
+        == "unsloth/gemma-4-26B-A4B-it-GGUF"
+    )
 
 
 def test_local_llm_autostart_from_env(monkeypatch):
