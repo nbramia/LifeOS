@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-08-09
+> **Last Updated:** 2026-08-13
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -124,7 +124,8 @@ All data syncing is consolidated into a single daily sync with proper phase orde
                === PHASE 7: Consistency Verification ===
                Verify cross-store data consistency after all syncs complete
                └─ Consistency verify (check orphans, stale merged IDs, cached
-                 counts; auto-fixes below a threshold)
+                 counts, vault files that moved or vanished; auto-fixes below
+                 a threshold)
 
 ~03:16         Unified sync complete
 07:00          Post-sync health check (API server)
@@ -182,6 +183,7 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | Interactions | `data/interactions.db` | Interactions per person | People v2 sync, Slack sync |
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
 | iMessage | `data/imessage.db` | Message export cache | iMessage sync |
+| Gmail Skip Cache | `data/gmail_skip_cache.db` | Message IDs already judged marketing, per account | Gmail sync |
 | Task Index | `data/task_index.json` | Parsed task cache | Task CRUD, file watcher |
 | Scheduler | `LifeOS/Scheduler/Inbox.md` (source) + `data/scheduler_index.json` (cache) | Schedules (trigger + action) | Scheduler store, file watcher |
 | Memories | `~/.lifeos/memories.json` | User-saved memories | Memory CRUD |
@@ -205,6 +207,24 @@ All sync scripts in `scripts/` follow the pattern:
 | `apple_data_import.py` | Import Apple ecosystem data (contacts, phone, iMessage, photos, WhatsApp) from the Mac Mini export | Apple Data Agent export (Linux only) |
 | `sync_phone_calls.py` | Sync phone calls (not in nightly `SYNC_ORDER` — runs via the separate FDA cron on macOS) | Apple Data Agent export |
 | `sync_slack.py` | Sync Slack users, DMs, and member channels | Slack API |
+
+**Gmail fetch cost.** A message is judged marketing only after it is fetched, and
+a discarded message writes no interaction row — so the "already seen" set derived
+from `interactions` cannot remember it, and it would be re-fetched every night for
+its whole look-back window. Two mechanisms keep that bounded:
+
+- **Batched fetches.** `GmailService.get_messages_batch()` carries many message
+  fetches per HTTP round-trip. Batches are paced per message and back off on
+  quota errors by retrying the whole chunk — retrying each message individually
+  once the quota is exhausted only deepens the hole.
+- **Skip cache.** `data/gmail_skip_cache.db` records the IDs each account has
+  already judged to be marketing, so they are fetched once rather than nightly.
+  Entries are keyed by `(account, message_id)` — Gmail IDs are unique only within
+  a mailbox — and pruned well past the look-back window.
+
+A cached skip is not re-evaluated while its entry lives. To apply changed rules
+from `config/marketing_patterns` to already-skipped mail, delete the database
+file; the next run re-fetches and re-evaluates the whole window.
 
 ### Apple Data Agent
 
@@ -268,7 +288,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
-| `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts) and auto-fix | `data/crm.db`, `data/interactions.db` |
+| `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix | `data/crm.db`, `data/interactions.db` |
 
 ### Unified Sync Runner
 
@@ -448,7 +468,7 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 22. `entity_cleanup` - Auto-hide obvious non-human entities
 
 **Phase 7: Consistency Verification**
-23. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts) and auto-fix
+23. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

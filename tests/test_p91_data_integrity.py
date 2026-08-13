@@ -90,7 +90,14 @@ class TestR2EntityResolution:
     # created when a name was present can outlive the text that justified it.
     # The point of the ceiling is to catch *new* bad links without pretending
     # the existing backlog is clean. Lower it when links are cleaned up.
-    MAX_UNVERIFIABLE_LINKS = 47
+    #
+    # The remainder was audited individually: it is dominated by one close
+    # family member appearing across journal and therapy notes that discuss
+    # her without naming her. The links resolution actually got wrong — vault
+    # mentions attached to people whose name is an initial plus a surname,
+    # which matched any extracted name sharing that letter (#551) — were
+    # removed, along with two non-person entities parsed out of note text.
+    MAX_UNVERIFIABLE_LINKS = 28
 
     @staticmethod
     def _declared_people(content: str) -> list[str]:
