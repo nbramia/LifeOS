@@ -18,6 +18,7 @@ from typing import Optional
 
 from api.utils.datetime_utils import make_aware as _make_aware
 from api.utils.db_paths import get_crm_db_path
+from config.marketing_patterns import is_blocklisted_domain
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,19 @@ SOURCE_TYPES = {
     "phone",
     "photos",
 }
+
+def _is_blocklisted_entity(entity: "SourceEntity") -> bool:
+    """
+    True if this entity's observed email is on a marketing blocklist.
+
+    Such entities can never resolve to a person, so re-attempting them is pure
+    waste — and because the linking script recorded a match attempt on every
+    skip, they were re-queued under backoff forever and permanently inflated
+    the reported capped backlog (#550). Entities with no observed_email are
+    never blocklisted; they may still be matchable by name or phone.
+    """
+    return bool(entity.observed_email) and is_blocklisted_domain(entity.observed_email)
+
 
 # Link status values
 LINK_STATUS_AUTO = "auto"  # Automatically linked
@@ -973,6 +987,7 @@ class SourceEntityStore:
         limit: int = 1000,
         backoff_multiplier: int = 3,
         max_capped_per_run: Optional[int] = 200,
+        exclude_blocklisted: bool = True,
     ) -> list[SourceEntity]:
         """
         Get unlinked entities eligible for re-matching.
@@ -1014,6 +1029,10 @@ class SourceEntityStore:
             backoff_multiplier: Growth factor applied per attempt past max_attempts
             max_capped_per_run: Max capped (attempt_count >= max_attempts) entities
                 to include per call. None disables the cap.
+            exclude_blocklisted: Drop entities whose observed_email is on a
+                blocklisted (marketing) domain. Being blocklisted is a permanent
+                property of the address, not a match that failed and deserves a
+                retry, so these are never eligible (#550).
 
         Returns:
             List of SourceEntity objects eligible for re-matching
@@ -1048,6 +1067,9 @@ class SourceEntityStore:
             candidates = [SourceEntity.from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+        if exclude_blocklisted:
+            candidates = [e for e in candidates if not _is_blocklisted_entity(e)]
 
         now = datetime.now(timezone.utc)
         normal: list[SourceEntity] = []
@@ -1120,6 +1142,7 @@ class SourceEntityStore:
         self,
         source_type: Optional[str] = None,
         max_attempts: int = 3,
+        exclude_blocklisted: bool = True,
     ) -> int:
         """
         Count unlinked entities that have hit ``max_attempts`` or more.
@@ -1129,9 +1152,14 @@ class SourceEntityStore:
         sync stats so a saturated backlog is visible (#507) instead of
         looking identical to "nothing to do".
 
+        Blocklisted entities are excluded by default so the number tracks work
+        that can actually drain. Counting them made the metric useless: they
+        were 70% of the reported backlog and could never be linked (#550).
+
         Args:
             source_type: Optional filter by source type
             max_attempts: Attempt count considered "capped"
+            exclude_blocklisted: Skip entities on blocklisted marketing domains
 
         Returns:
             Count of unlinked entities with match_attempt_count >= max_attempts
@@ -1140,21 +1168,28 @@ class SourceEntityStore:
         try:
             if source_type:
                 cursor = conn.execute("""
-                    SELECT COUNT(*) FROM source_entities
+                    SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type = ?
                       AND match_attempt_count >= ?
                 """, (source_type, max_attempts))
             else:
                 cursor = conn.execute("""
-                    SELECT COUNT(*) FROM source_entities
+                    SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND match_attempt_count >= ?
                 """, (max_attempts,))
 
-            return cursor.fetchone()[0]
+            emails = [row[0] for row in cursor.fetchall()]
         finally:
             conn.close()
+
+        if not exclude_blocklisted:
+            return len(emails)
+        return sum(
+            1 for email in emails
+            if not (email and is_blocklisted_domain(email))
+        )
 
     def delete(self, entity_id: str) -> bool:
         """Delete a source entity."""

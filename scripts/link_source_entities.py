@@ -180,12 +180,13 @@ def link_source_entities(
             st = entity.source_type
             stats['by_source'][st] = stats['by_source'].get(st, 0) + 1
 
-            # Check if email domain is blocklisted
+            # Backstop only — the store already filters blocklisted entities out
+            # of the eligible pool. Deliberately no record_match_attempt() here:
+            # bumping the count re-queued these under backoff forever, and since
+            # the blocklist is a permanent property of the address there is
+            # nothing for a retry to discover (#550).
             if entity.observed_email and is_blocklisted_domain(entity.observed_email):
                 stats['blocklist_skipped'] += 1
-                # Record attempt so we don't keep trying
-                if not dry_run:
-                    source_store.record_match_attempt(entity.id)
                 continue
 
             try:
