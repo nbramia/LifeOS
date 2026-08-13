@@ -486,6 +486,50 @@ class TestParseName:
         assert result.last == "Wilhelm"
 
 
+class TestSingleLetterFirstNameEntity:
+    """
+    An entity whose first name is a single letter must not swallow every query
+    sharing that initial.
+
+    "A Reader" matched ADP, ACP, and ADS, Inc. — all promoted to
+    first_name_context_clear and silently linked, because the entire match
+    rested on one shared letter (#551).
+    """
+
+    def test_first_name_only_query_does_not_match_on_initial_alone(self, temp_store):
+        """Without a last name to corroborate, a shared initial is not a match."""
+        temp_store.add(PersonEntity(
+            canonical_name="A Reader",
+            last_seen=datetime.now() - timedelta(days=5),
+        ))
+        resolver = EntityResolver(temp_store)
+
+        for query in ("ADP", "ACP", "ADS, Inc.", "Andrew"):
+            assert resolver.resolve_by_name(query) is None, f"{query} should not match"
+
+    def test_matching_last_name_still_resolves_from_initial(self, temp_store):
+        """The legitimate case survives: 'J Smith' is still found by 'John Smith'."""
+        temp_store.add(PersonEntity(
+            canonical_name="J Smith",
+            last_seen=datetime.now() - timedelta(days=5),
+        ))
+        resolver = EntityResolver(temp_store)
+
+        result = resolver.resolve_by_name("John Smith")
+        assert result is not None
+        assert result.entity.canonical_name == "J Smith"
+
+    def test_non_matching_last_name_does_not_resolve(self, temp_store):
+        """A last name that disagrees is not corroboration."""
+        temp_store.add(PersonEntity(
+            canonical_name="J Smith",
+            last_seen=datetime.now() - timedelta(days=5),
+        ))
+        resolver = EntityResolver(temp_store)
+
+        assert resolver.resolve_by_name("John Walker") is None
+
+
 class TestStructuredNameMatching:
     """Tests for the new structured name matching in _score_candidates."""
 

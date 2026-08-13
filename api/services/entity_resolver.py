@@ -401,8 +401,16 @@ class EntityResolver:
                 elif is_first_initial and entity_first_lower.startswith(query_first_lower):
                     score += 10  # Initial prefix match
                     first_matched = True
-                elif len(entity_first_lower) == 1 and query_first_lower.startswith(entity_first_lower):
-                    score += 10  # Entity has initial, query has full name
+                elif (
+                    len(entity_first_lower) == 1
+                    and not is_first_name_only
+                    and query_first_lower.startswith(entity_first_lower)
+                ):
+                    # Entity has initial, query has full name ("J Smith" <- "John Smith").
+                    # Requires a last name in the query to corroborate: without one the
+                    # whole match rests on a single shared letter, so an entity stored
+                    # as "A Reader" swallowed every name starting with "a" (#551).
+                    score += 10
                     first_matched = True
                 elif are_name_variants(query_first_lower, entity_first_lower):
                     score += 20  # Nickname match (Ben/Benjamin, Mike/Michael)
