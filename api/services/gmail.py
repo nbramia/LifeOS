@@ -428,14 +428,17 @@ class GmailService:
                 try:
                     batch.execute()
                 except Exception as e:
+                    # A whole-batch failure usually means no callback ran, but a
+                    # partial one is possible — don't re-fetch what already landed.
+                    unfinished = [m for m in pending if m not in results]
                     if self._is_rate_limit_error(e):
-                        rate_limited = list(pending)
+                        rate_limited = unfinished
                     else:
                         logger.warning(
-                            f"Gmail batch request failed for {len(pending)} "
+                            f"Gmail batch request failed for {len(unfinished)} "
                             f"messages, falling back to individual fetches: {e}"
                         )
-                        failed = list(pending)
+                        failed = unfinished
 
                 fallback_ids.extend(failed)
 
