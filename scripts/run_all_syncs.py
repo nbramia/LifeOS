@@ -1586,6 +1586,41 @@ def backup_interactions():
     return backup_path
 
 
+def backup_crm():
+    """Create a crm.db backup before sync operations.
+
+    crm.db holds person_entities, source_entities, relationships and facts, and
+    several nightly phases write to it destructively — entity_cleanup hides
+    entities, consistency_verify deletes orphans, relationship_discovery
+    rewrites edge weights wholesale. It went unbacked while interactions.db was
+    snapshotted nightly, leaving no rollback path (#562).
+
+    A failure here is reported but never aborts the sync: losing a backup is
+    worse than not syncing, but not worse than skipping the night's data.
+    """
+    from pathlib import Path as _Path
+
+    from api.services import backup_retention
+    from api.utils.db_paths import get_crm_db_path
+    from config.settings import settings
+
+    logger.info("Creating pre-sync crm backup...")
+    try:
+        backup_path = backup_retention.create_snapshot(
+            _Path(get_crm_db_path()),
+            _Path(settings.backup_path),
+            "crm.db",
+        )
+        if backup_path:
+            logger.info(f"CRM backup: {backup_path}")
+        return backup_path
+    except Exception as e:
+        logger.error(f"Failed to create crm backup: {e}")
+        from api.services.notifications import record_failure
+        record_failure("backup_storage", f"CRM backup failed: {e}", severity="warning")
+        return None
+
+
 def run_all_syncs(
     sources: list[str] = None,
     dry_run: bool = False,
@@ -1659,10 +1694,10 @@ def run_all_syncs(
         except Exception as e:
             logger.warning(f"Could not open Photos.app: {e}")
 
-    # Create interactions backup before any syncs
-    # (person entities backup happens automatically on save)
+    # Create interactions and CRM backups before any syncs
     if not dry_run:
         backup_interactions()
+        backup_crm()
 
     # Suppress CRITICAL alerts during sync (ChromaDB may have transient SQLite issues
     # during heavy indexing). 4 hours covers even the longest full reindex.

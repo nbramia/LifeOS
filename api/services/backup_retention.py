@@ -179,3 +179,59 @@ def prune(
             except OSError as e:
                 logger.warning(f"Could not remove old backup {path}: {e}")
     return removed
+
+
+def create_snapshot(
+    db_path: Path,
+    backup_dir: Path,
+    db_basename: str,
+    *,
+    policy: RetentionPolicy = DEFAULT_POLICY,
+    now: Optional[datetime] = None,
+) -> Optional[Path]:
+    """Snapshot a live SQLite database, then prune older snapshots.
+
+    Uses SQLite's online backup API rather than a file copy. The nightly sync
+    runs while the API server is serving requests, and copying a WAL-mode
+    database out from under an active writer can capture a torn state — the
+    main DB file without the committed pages still sitting in the -wal.
+    ``Connection.backup`` takes a transactionally consistent snapshot instead.
+
+    Args:
+        db_path: Database to snapshot
+        backup_dir: Directory to write into (created if absent)
+        db_basename: Basename used by the filename convention and the pruner,
+            which is what keeps retention per-database
+        policy: Retention tiers to apply afterwards
+        now: Timestamp for the filename; defaults to the current time
+
+    Returns:
+        Path to the new snapshot, or None if the source database is absent.
+    """
+    import sqlite3
+
+    if not db_path.exists():
+        logger.warning(f"No {db_basename} to backup")
+        return None
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / backup_filename(db_basename, now or datetime.now())
+
+    source = sqlite3.connect(str(db_path))
+    try:
+        dest = sqlite3.connect(str(backup_path))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+
+    logger.info(f"Created {db_basename} backup: {backup_path}")
+
+    removed = prune(backup_dir, db_basename, policy=policy, now=now)
+    if removed:
+        logger.info(
+            f"Backup retention pruned {len(removed)} old {db_basename} backup(s)"
+        )
+    return backup_path
