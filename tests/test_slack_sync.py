@@ -1,6 +1,6 @@
 """Tests for SlackSync orchestrator — the daily-vs-full-sync entry points."""
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 @pytest.fixture
@@ -113,6 +113,15 @@ class TestIncrementalSyncCallsSyncUsers:
         # Real store, isolated from the project DB.
         entity_store = SourceEntityStore(db_path=str(tmp_path / "crm.db"))
 
+        # Pin the workspace so source_ids are predictable. slack_integration
+        # reads SLACK_TEAM_ID into a module constant at import time, so whether
+        # this test saw "default" or a real team id depended on whether some
+        # other module had already called load_dotenv() — it passed alone and
+        # failed under xdist purely on import order.
+        workspace_patch = patch(
+            "api.services.slack_sync.get_workspace_id", return_value="default"
+        )
+
         # Mock SlackClient returns one workspace user.
         new_user = SlackUser(
             user_id="U_NEW_HUMAN",
@@ -129,12 +138,13 @@ class TestIncrementalSyncCallsSyncUsers:
 
         # sync_messages is irrelevant for this test — short-circuit it.
         mock_indexer = MagicMock()
-        sync = SlackSync(
-            client=mock_client,
-            indexer=mock_indexer,
-            entity_store=entity_store,
-            interaction_store=MagicMock(),
-        )
+        with workspace_patch:
+            sync = SlackSync(
+                client=mock_client,
+                indexer=mock_indexer,
+                entity_store=entity_store,
+                interaction_store=MagicMock(),
+            )
         sync.sync_messages = MagicMock(return_value={
             "channels_synced": 0, "messages_indexed": 0,
             "interactions_created": 0, "errors": [],
