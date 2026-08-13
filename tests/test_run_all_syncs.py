@@ -193,7 +193,8 @@ def _run_llm_test(
         patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
         patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
         patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
-        patch("scripts.run_all_syncs.backup_interactions"),
+        patch("scripts.run_all_syncs.backup_databases"),
+        patch("scripts.run_all_syncs.prune_backups_after_success") as prune_mock,
         patch("scripts.run_all_syncs.send_sync_summary_telegram"),
         patch("scripts.run_all_syncs.reap_orphan_sync_runs", return_value=0),
         patch("scripts.run_all_syncs.detect_silent_source_entity_drift", return_value=[]),
@@ -214,7 +215,7 @@ def _run_llm_test(
 
         result = run_all_syncs(dry_run=False, force=True)
 
-    return result, run_sync_mock, stop_mock, start_mock
+    return result, run_sync_mock, stop_mock, start_mock, prune_mock
 
 
 class TestLLMMemoryGating:
@@ -223,7 +224,7 @@ class TestLLMMemoryGating:
     def test_llm_stopped_when_memory_insufficient(self):
         """LLM is stopped when GPU memory is below threshold."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
-        result, _, stop_mock, start_mock = _run_llm_test(
+        result, _, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
@@ -233,7 +234,7 @@ class TestLLMMemoryGating:
     def test_llm_not_stopped_when_memory_sufficient(self):
         """LLM stays running when GPU memory is above threshold."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
-        result, _, stop_mock, start_mock = _run_llm_test(
+        result, _, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB + 10_000,
         )
 
@@ -243,7 +244,7 @@ class TestLLMMemoryGating:
     def test_llm_not_stopped_when_not_running(self):
         """No action taken when LLM is not running."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
-        result, _, stop_mock, start_mock = _run_llm_test(
+        result, _, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=False, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
@@ -253,7 +254,7 @@ class TestLLMMemoryGating:
     def test_llm_restarted_after_last_embedding_source(self):
         """LLM is restarted after the last embedding source, not the first."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
-        result, run_sync_mock, stop_mock, start_mock = _run_llm_test(
+        result, run_sync_mock, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
@@ -268,7 +269,7 @@ class TestLLMMemoryGating:
 
     def test_llm_not_stopped_when_memory_unknown(self):
         """LLM is stopped (conservative) when sysfs returns None."""
-        result, _, stop_mock, start_mock = _run_llm_test(
+        result, _, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=None,
         )
 
@@ -277,7 +278,7 @@ class TestLLMMemoryGating:
     def test_internal_keys_not_in_results(self):
         """Internal _llm_* keys are not leaked in the result dict."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
-        result, _, _, _ = _run_llm_test(
+        result, _, _, _, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
@@ -291,7 +292,7 @@ class TestLLMMemoryGating:
         from scripts import run_all_syncs as module
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
 
-        result, _, stop_mock, start_mock = _run_llm_test(
+        result, _, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
         )
 
@@ -309,7 +310,7 @@ class TestSystemRAMPreFlight:
 
     def test_embeddings_skipped_when_ram_low(self):
         """Embedding sources are skipped when system RAM is below threshold."""
-        result, run_sync_mock, _, _ = _run_llm_test(
+        result, run_sync_mock, _, _, _ = _run_llm_test(
             llm_running=False, gpu_memory_mb=50_000, system_ram_mb=2000,
         )
 
@@ -324,7 +325,7 @@ class TestSystemRAMPreFlight:
 
     def test_embeddings_run_when_ram_sufficient(self):
         """Embedding sources run normally when system RAM is above threshold."""
-        result, run_sync_mock, _, _ = _run_llm_test(
+        result, run_sync_mock, _, _, _ = _run_llm_test(
             llm_running=False, gpu_memory_mb=50_000, system_ram_mb=16_000,
         )
 
@@ -334,7 +335,7 @@ class TestSystemRAMPreFlight:
 
     def test_non_embedding_sources_unaffected_by_low_ram(self):
         """Non-embedding sources still run even when RAM is low."""
-        result, run_sync_mock, _, _ = _run_llm_test(
+        result, run_sync_mock, _, _, _ = _run_llm_test(
             llm_running=False, gpu_memory_mb=50_000, system_ram_mb=2000,
         )
 
@@ -345,7 +346,7 @@ class TestSystemRAMPreFlight:
     def test_low_ram_with_llm_running_skips_embeddings_without_stopping_llm(self):
         """When LLM is running but RAM is low, embedding sources are skipped
         and the LLM is NOT stopped (no point stopping it only to skip the work)."""
-        result, run_sync_mock, stop_mock, start_mock = _run_llm_test(
+        result, run_sync_mock, stop_mock, start_mock, _ = _run_llm_test(
             llm_running=True, gpu_memory_mb=2000, system_ram_mb=2000,
         )
 
@@ -366,7 +367,7 @@ class TestSystemRAMPreFlight:
 
     def test_ram_check_unknown_allows_embeddings(self):
         """When RAM check returns None (unsupported OS), embeddings proceed."""
-        result, run_sync_mock, _, _ = _run_llm_test(
+        result, run_sync_mock, _, _, _ = _run_llm_test(
             llm_running=False, gpu_memory_mb=50_000, system_ram_mb=None,
         )
 
@@ -883,3 +884,62 @@ class TestSkippedMarker:
         from scripts.run_all_syncs import _parse_sync_output
 
         assert _parse_sync_output("normal sync output\n").get("skipped_reason") is None
+
+
+class TestBackupRetentionGating:
+    """
+    Retention must not run when the sync failed (#562).
+
+    Snapshots are taken before the sync; whether they are a usable rollback
+    point is only known once the run finishes. Pruning on a failed night could
+    rotate away the last good copy exactly when it is most needed.
+    """
+
+    def test_clean_run_prunes(self):
+        _, _, _, _, prune_mock = _run_llm_test(fail_sources=set())
+
+        prune_mock.assert_called_once()
+
+    def test_failed_source_skips_pruning(self):
+        _, _, _, _, prune_mock = _run_llm_test(fail_sources={"source_a"})
+
+        prune_mock.assert_not_called()
+
+    def test_backups_are_still_taken_on_a_failing_run(self):
+        """
+        Only the *deletion* is gated. A failing night still gets its snapshot —
+        that is the run most likely to need one.
+        """
+        from scripts.run_all_syncs import run_all_syncs
+
+        fake_restart = MagicMock(returncode=0, stdout="", stderr="")
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", LLM_TEST_SYNC_SOURCES),
+            patch("scripts.run_all_syncs.SYNC_ORDER", LLM_TEST_SYNC_ORDER),
+            patch("scripts.run_all_syncs.run_sync",
+                  MagicMock(side_effect=_make_run_sync_side_effect({"source_a"}))),
+            patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+            patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+            patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+            patch("scripts.run_all_syncs.backup_databases") as backup_mock,
+            patch("scripts.run_all_syncs.prune_backups_after_success") as prune_mock,
+            patch("scripts.run_all_syncs.send_sync_summary_telegram"),
+            patch("scripts.run_all_syncs.reap_orphan_sync_runs", return_value=0),
+            patch("scripts.run_all_syncs.detect_silent_source_entity_drift", return_value=[]),
+            patch("scripts.run_all_syncs.subprocess.run", return_value=fake_restart),
+            patch("urllib.request.urlopen"),
+            patch("scripts.run_all_syncs._is_llm_running", return_value=False),
+            patch("scripts.run_all_syncs._get_available_gpu_memory_mb", return_value=20000),
+            patch("scripts.run_all_syncs._get_available_system_ram_mb", return_value=16000),
+            patch("scripts.run_all_syncs._start_llm"),
+            patch("scripts.run_all_syncs.get_sync_health") as health_mock,
+        ):
+            mock_health = MagicMock()
+            mock_health.hours_since_sync = 24.0
+            mock_health.last_status = "SUCCESS"
+            health_mock.return_value = mock_health
+
+            run_all_syncs(dry_run=False, force=True)
+
+        backup_mock.assert_called_once()
+        prune_mock.assert_not_called()

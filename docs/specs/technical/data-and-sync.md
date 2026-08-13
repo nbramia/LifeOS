@@ -184,6 +184,25 @@ Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync step
 | Relationships | `data/crm.db` | Person-to-person edges | Relationship discovery |
 | iMessage | `data/imessage.db` | Message export cache | iMessage sync |
 | Gmail Skip Cache | `data/gmail_skip_cache.db` | Message IDs already judged marketing, per account | Gmail sync |
+
+### Backups
+
+`interactions.db` and `crm.db` are snapshotted to `LIFEOS_BACKUP_PATH` before
+the nightly sync runs, using SQLite's online backup API so a live WAL-mode
+database is captured consistently.
+
+Retention keeps `LIFEOS_BACKUP_KEEP` snapshots per database (default 2), and is
+deliberately conservative about when it deletes:
+
+- **Pruning is deferred to the end of the run**, and skipped entirely if any
+  source failed. A snapshot is only known to be a usable rollback point once
+  the run it protects has finished cleanly, so a string of failing nights
+  cannot rotate away the last good copy.
+- **The newest snapshot must pass an integrity check** before anything older is
+  removed. A snapshot that fails verification is deleted immediately and prunes
+  nothing.
+- Files that don't match the `<db>.<timestamp>.backup` convention are ignored,
+  so hand-named copies kept for safekeeping survive.
 | Task Index | `data/task_index.json` | Parsed task cache | Task CRUD, file watcher |
 | Scheduler | `LifeOS/Scheduler/Inbox.md` (source) + `data/scheduler_index.json` (cache) | Schedules (trigger + action) | Scheduler store, file watcher |
 | Memories | `~/.lifeos/memories.json` | User-saved memories | Memory CRUD |
