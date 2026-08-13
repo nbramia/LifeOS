@@ -517,7 +517,7 @@ TOOL_DEFINITIONS = [
             "Query live financial data. "
             "Actions: 'accounts' (current balances), 'transactions' (recent spending, filterable), "
             "'cashflow' (income/expenses/savings summary), 'budgets' (budget vs actual by category), "
-            "'investments' (Nathan's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
+            "'investments' (the user's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
             "buckets, per-position holdings with cost basis, savings by year, wealth trend, taxable "
             "unrealized gains; aggregated nightly by the investments pipeline). "
             "'movers' (which held positions moved most today — live day-change % for the snapshot's "
@@ -3029,7 +3029,7 @@ async def _tool_search_finances(inp: dict) -> str:
     action = inp["action"]
 
     if action == "investments":
-        # Schwab pipeline snapshot, synced from nathan-macbook via Syncthing
+        # Schwab pipeline snapshot, synced from the Mac export host via Syncthing
         # (see api/routes/investments.py). Read from disk — no client needed.
         import json as _json
         import os as _os

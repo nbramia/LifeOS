@@ -4,7 +4,7 @@
 #
 # Usage: ./scripts/remote-test.sh [test.sh-args]   (default: auto)
 #
-# Runs the test suite on nathan-linux for checkouts that have no local venv
+# Runs the test suite on the server host for checkouts that have no local venv
 # (the MacBook). Rsyncs the CURRENT WORKING TREE — uncommitted and untracked
 # changes included — to an isolated dir on the server, then runs
 # ./scripts/test.sh there. No commit or push is required, so this satisfies
@@ -29,12 +29,20 @@
 #   ./scripts/remote-test.sh > "$OUT" 2>&1 &   # (or run_in_background)
 #   until grep -q "\[remote-test\] DONE" "$OUT"; do sleep 5; done
 #
-# Overridable via env: LIFEOS_REMOTE_HOST (ssh target, default nathan-linux-ts),
+# Configure via env: LIFEOS_REMOTE_HOST (ssh target of the machine that has the
+# venv — required, no default, since it is specific to your setup),
 # LIFEOS_REMOTE_TEST_DIR (remote parent dir, default /tmp/lifeos-remote-test).
 
 set -u
 
-REMOTE_HOST="${LIFEOS_REMOTE_HOST:-nathan-linux-ts}"
+REMOTE_HOST="${LIFEOS_REMOTE_HOST:-}"
+if [ -z "$REMOTE_HOST" ]; then
+    echo "remote-test: LIFEOS_REMOTE_HOST is not set." >&2
+    echo "  Set it to the ssh target of the machine that hosts the LifeOS venv, e.g." >&2
+    echo "    export LIFEOS_REMOTE_HOST=my-server" >&2
+    echo "  (add it to your shell profile so it persists)." >&2
+    exit 2
+fi
 REMOTE_BASE="${LIFEOS_REMOTE_TEST_DIR:-/tmp/lifeos-remote-test}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

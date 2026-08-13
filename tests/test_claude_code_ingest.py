@@ -118,9 +118,9 @@ def test_validate_session_id_accepts_subagent_synthetic():
 
 @pytest.mark.unit
 def test_decode_project_key():
-    assert cc.decode_project_key("-home-nathan-Code-LifeOS") == "/home/nathan/Code/LifeOS"
+    assert cc.decode_project_key("-home-user-Code-LifeOS") == "/home/user/Code/LifeOS"
     assert cc.decode_project_key("") == ""
-    assert cc.basename_for("/home/nathan/Code/LifeOS") == "LifeOS"
+    assert cc.basename_for("/home/user/Code/LifeOS") == "LifeOS"
 
 
 # ---------------------------------------------------------------------------

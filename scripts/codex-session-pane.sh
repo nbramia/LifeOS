@@ -10,7 +10,7 @@
 #         "matcher": "startup|resume",
 #         "hooks": [{
 #           "type": "command",
-#           "command": "/home/nathanramia/Code/LifeOS/scripts/codex-session-pane.sh"
+#           "command": "/path/to/LifeOS/scripts/codex-session-pane.sh"
 #         }]
 #       }]
 #     }

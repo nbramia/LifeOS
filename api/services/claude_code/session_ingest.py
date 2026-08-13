@@ -100,7 +100,7 @@ def validate_session_id(session_id: str) -> str:
 def decode_project_key(key: str) -> str:
     """Decode an encoded cwd path back to the original.
 
-    Claude Code stores projects as `~/.claude/projects/-home-nathan-Code-X/`.
+    Claude Code stores projects as `~/.claude/projects/-home-user-Code-X/`.
     The encoding replaces `/` with `-`, so a leading `-` represents `/`.
     """
     if not key:

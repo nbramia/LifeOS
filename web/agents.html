@@ -984,7 +984,7 @@
   });
 
   // Strip the user's home directory prefix for display.
-  // /home/nathanramia/Code/LifeOS → /Code/LifeOS
+  // /home/user/Code/LifeOS → /Code/LifeOS
   function shortenCwd(p) {
     if (!p) return p;
     const m = p.match(/^\/(home|Users)\/[^/]+(\/.*)?$/);
