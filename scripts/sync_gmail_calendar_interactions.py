@@ -208,6 +208,28 @@ def sync_gmail_interactions(
         processed = 0
 
         logger.info(f"Starting to process messages (existing base IDs: {len(existing_base_ids)})...")
+
+        # Pre-fetch every message we haven't seen, in batched round-trips.
+        #
+        # Marketing mail is discarded below without ever producing an
+        # interaction row, so it never lands in existing_base_ids and is
+        # re-fetched every night for the full window. On the personal account
+        # that is ~13k messages, and fetching them one at a time cost ~42 min
+        # per run — most of it the per-call rate-limit sleep (#552).
+        new_message_ids = [
+            m["id"] for m in messages if m["id"] not in existing_base_ids
+        ]
+        logger.info(
+            f"  {len(messages) - len(new_message_ids)} already synced, "
+            f"{len(new_message_ids)} to fetch"
+        )
+        fetched_emails = gmail.get_messages_batch(
+            new_message_ids, include_body=False
+        )
+        logger.info(
+            f"  Fetched {len(fetched_emails)}/{len(new_message_ids)} new messages"
+        )
+
         checked = 0
         for msg_data in messages:
             message_id = msg_data["id"]
@@ -228,13 +250,10 @@ def sync_gmail_interactions(
                 stats['already_exists'] += 1
                 continue
 
-            # Log when fetching new message
-            if checked <= 5:
-                logger.info(f"    Fetching new message {message_id[:8]}...")
-
             try:
-                # Fetch message details (metadata only for speed)
-                email = gmail.get_message(message_id, include_body=False)
+                # Already fetched above; a miss means the batch (and its
+                # individual retry) failed for this message.
+                email = fetched_emails.get(message_id)
                 if not email:
                     stats['errors'] += 1
                     continue

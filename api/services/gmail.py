@@ -13,14 +13,14 @@ import re
 # Set a default socket timeout for all network operations (30 seconds)
 # This prevents Gmail API calls from hanging indefinitely
 socket.setdefaulttimeout(30)
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Optional
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from typing import Optional  # noqa: E402
+from email.utils import parsedate_to_datetime  # noqa: E402
 
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build  # noqa: E402
 
-from api.services.google_auth import get_google_auth, GoogleAccount
+from api.services.google_auth import get_google_auth, GoogleAccount  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,150 @@ class GmailService:
         # All retries exhausted
         logger.error(f"Failed to get message {message_id} after {max_retries} retries: {last_error}")
         return None
+
+    @staticmethod
+    def _is_rate_limit_error(exception) -> bool:
+        """True if an exception is Gmail telling us to slow down."""
+        status = getattr(getattr(exception, "resp", None), "status", None)
+        if status in (429, 403):
+            # 403 covers both quota exhaustion and genuine permission errors;
+            # only the former mentions a rate/quota reason.
+            text = str(exception).lower()
+            return "ratelimit" in text or "quota" in text or "userratelimit" in text
+        return False
+
+    def get_messages_batch(
+        self,
+        message_ids: list[str],
+        include_body: bool = False,
+        batch_size: int = 50,
+        seconds_per_message: float = 0.04,
+        max_retries: int = 5,
+    ) -> dict[str, EmailMessage]:
+        """
+        Fetch many messages using the Gmail batch endpoint.
+
+        One HTTP round-trip carries up to ``batch_size`` message fetches
+        instead of one, and one pause covers the whole batch rather than each
+        message. The pause matters most: at the default 0.1s per-call delay,
+        fetching 13k messages individually spends ~22 minutes asleep before
+        any network time counts (#552).
+
+        Pacing is deliberate. The per-call sleep this replaces was also, by
+        accident, the thing keeping us under Gmail's per-user quota. Removing
+        it without a replacement exhausts the quota partway through a large
+        mailbox, so batches are paced to ``seconds_per_message`` per message.
+
+        Rate-limit errors back off and retry the whole chunk rather than
+        falling back to individual fetches: once the quota is gone, retrying
+        each message separately is a thundering herd that makes it worse.
+        Only non-quota failures fall back to ``get_message()``, which carries
+        its own retry logic.
+
+        Args:
+            message_ids: Gmail message IDs to fetch
+            include_body: Whether to fetch full bodies
+            batch_size: Messages per HTTP round-trip (Gmail's ceiling is 100,
+                but 50 measured faster — larger batches trip throttling)
+            seconds_per_message: Pacing budget; a chunk is spaced out to at
+                least ``batch_size * seconds_per_message`` seconds
+            max_retries: Backoff attempts per chunk before giving up on it
+
+        Returns:
+            Mapping of message_id -> EmailMessage, omitting any that failed.
+            Callers must not assume every requested id is present.
+        """
+        format_type = "full" if include_body else "metadata"
+        metadata_headers = (
+            ["Subject", "From", "To", "Cc", "Date"] if not include_body else None
+        )
+        chunk_interval = batch_size * seconds_per_message
+
+        results: dict[str, EmailMessage] = {}
+        fallback_ids: list[str] = []
+
+        for start in range(0, len(message_ids), batch_size):
+            chunk = message_ids[start:start + batch_size]
+            pending = list(chunk)
+
+            for attempt in range(max_retries + 1):
+                rate_limited: list[str] = []
+                failed: list[str] = []
+
+                def callback(request_id, response, exception):
+                    if exception is not None:
+                        if self._is_rate_limit_error(exception):
+                            rate_limited.append(request_id)
+                        else:
+                            failed.append(request_id)
+                        return
+                    parsed = self._parse_message(response, include_body)
+                    if parsed:
+                        results[request_id] = parsed
+
+                batch = self.service.new_batch_http_request()
+                for message_id in pending:
+                    batch.add(
+                        self.service.users().messages().get(
+                            userId="me",
+                            id=message_id,
+                            format=format_type,
+                            metadataHeaders=metadata_headers,
+                        ),
+                        request_id=message_id,
+                        callback=callback,
+                    )
+
+                started = time.time()
+                try:
+                    batch.execute()
+                except Exception as e:
+                    # A whole-batch failure usually means no callback ran, but a
+                    # partial one is possible — don't re-fetch what already landed.
+                    unfinished = [m for m in pending if m not in results]
+                    if self._is_rate_limit_error(e):
+                        rate_limited = unfinished
+                    else:
+                        logger.warning(
+                            f"Gmail batch request failed for {len(unfinished)} "
+                            f"messages, falling back to individual fetches: {e}"
+                        )
+                        failed = unfinished
+
+                fallback_ids.extend(failed)
+
+                if not rate_limited:
+                    # Pace the next chunk, crediting time already spent on the wire.
+                    time.sleep(max(0.0, chunk_interval - (time.time() - started)))
+                    break
+
+                if attempt == max_retries:
+                    logger.error(
+                        f"Gmail batch: {len(rate_limited)} messages still rate "
+                        f"limited after {max_retries} retries, giving up on them"
+                    )
+                    break
+
+                pending = rate_limited
+                backoff = (2 ** attempt) + 1.0  # 2s, 3s, 5s, 9s, 17s
+                logger.warning(
+                    f"Gmail rate limit hit on {len(pending)} messages, "
+                    f"backing off {backoff:.0f}s (attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(backoff)
+
+        for message_id in fallback_ids:
+            message = self.get_message(message_id, include_body=include_body)
+            if message:
+                results[message_id] = message
+
+        if fallback_ids:
+            logger.info(
+                f"Gmail batch: {len(fallback_ids)} of {len(message_ids)} messages "
+                "needed an individual retry"
+            )
+
+        return results
 
     def _parse_message(self, msg: dict, include_body: bool = False) -> Optional[EmailMessage]:
         """
