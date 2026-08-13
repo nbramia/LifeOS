@@ -391,6 +391,94 @@ class TestRematchingEligibility:
         assert store.count_capped_backlog(max_attempts=3) == 3
 
 
+class TestBlocklistedExcludedFromRematching:
+    """
+    Blocklisted marketing addresses must never enter the rematching pool.
+
+    They can never resolve to a person, but the linking script recorded a match
+    attempt on every skip, so they were re-queued under backoff forever and made
+    up 70% of the reported capped backlog (#550).
+    """
+
+    # A marketing ESP domain, not a personal address.
+    BLOCKLISTED_EMAIL = "campaign@mailchimp.com"
+
+    def _set_attempts(self, store, entity_id, count, days_ago):
+        attempted = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        conn = sqlite3.connect(store.db_path)
+        conn.execute(
+            "UPDATE source_entities SET match_attempt_count = ?, match_attempted_at = ? "
+            "WHERE id = ?",
+            (count, attempted, entity_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_blocklisted_entity_excluded_from_pool(self, store):
+        """A blocklisted entity is never returned for rematching."""
+        blocked = SourceEntity(
+            source_type="gmail",
+            source_id="promo1",
+            observed_email=self.BLOCKLISTED_EMAIL,
+        )
+        store.add(blocked)
+        self._set_attempts(store, blocked.id, count=3, days_ago=60)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3,
+        )
+        assert blocked.id not in [e.id for e in results]
+
+    def test_non_blocklisted_entity_still_eligible(self, store):
+        """The filter is targeted — an ordinary address is unaffected."""
+        ordinary = SourceEntity(
+            source_type="gmail",
+            source_id="real1",
+            observed_email="sam@example.com",
+        )
+        store.add(ordinary)
+        self._set_attempts(store, ordinary.id, count=3, days_ago=60)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3,
+        )
+        assert ordinary.id in [e.id for e in results]
+
+    def test_entity_without_email_still_eligible(self, store):
+        """No observed_email means not blocklisted — may still match on name/phone."""
+        no_email = SourceEntity(source_type="imessage", source_id="sms1")
+        store.add(no_email)
+        self._set_attempts(store, no_email.id, count=3, days_ago=60)
+
+        results = store.get_unlinked_for_rematching(
+            min_days_since_attempt=30, max_attempts=3,
+        )
+        assert no_email.id in [e.id for e in results]
+
+    def test_capped_backlog_excludes_blocklisted(self, store):
+        """The reported backlog counts only work that can actually drain."""
+        blocked = SourceEntity(
+            source_type="gmail",
+            source_id="promo2",
+            observed_email=self.BLOCKLISTED_EMAIL,
+        )
+        store.add(blocked)
+        self._set_attempts(store, blocked.id, count=3, days_ago=1)
+
+        ordinary = SourceEntity(
+            source_type="gmail",
+            source_id="real2",
+            observed_email="sam@example.com",
+        )
+        store.add(ordinary)
+        self._set_attempts(store, ordinary.id, count=3, days_ago=1)
+
+        assert store.count_capped_backlog(max_attempts=3) == 1
+        assert store.count_capped_backlog(
+            max_attempts=3, exclude_blocklisted=False,
+        ) == 2
+
+
 class TestLinkMethod:
     """Tests for link_method provenance tracking."""
 
