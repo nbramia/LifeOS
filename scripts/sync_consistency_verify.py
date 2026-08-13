@@ -474,7 +474,14 @@ def _classify_missing_vault_files() -> dict:
         if not candidates:
             buckets["gone"].append((stale_path, None))
         elif len(candidates) > 1:
-            buckets["ambiguous"].append((stale_path, candidates))
+            if all(c in known_paths for c in candidates):
+                # The move target is unknown, but every candidate already has
+                # its own interactions — so whichever one it was, the history is
+                # already represented and this row is a duplicate either way.
+                # No guess required.
+                buckets["duplicate"].append((stale_path, None))
+            else:
+                buckets["ambiguous"].append((stale_path, candidates))
         elif candidates[0] in known_paths:
             buckets["duplicate"].append((stale_path, candidates[0]))
         else:
