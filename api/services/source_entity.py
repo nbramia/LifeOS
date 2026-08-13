@@ -41,6 +41,7 @@ SOURCE_TYPES = {
     "photos",
 }
 
+
 def _is_blocklisted_entity(entity: "SourceEntity") -> bool:
     """
     True if this entity's observed email is on a marketing blocklist.
