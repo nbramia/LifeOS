@@ -31,6 +31,7 @@ from api.services.google_auth import GoogleAccount
 from api.services.entity_resolver import get_entity_resolver
 from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
+from api.services.gmail_skip_cache import get_gmail_skip_cache
 from api.services.source_entity import (
     get_source_entity_store,
     create_gmail_source_entity,
@@ -155,6 +156,17 @@ def sync_gmail_interactions(
             existing_base_ids.add(base_id)
     logger.info(f"Found {len(existing)} existing gmail interactions ({len(existing_base_ids)} unique message IDs)")
 
+    # Messages previously fetched and discarded as marketing. They produce no
+    # interaction row, so existing_base_ids alone can never remember them and
+    # they were re-fetched every night for their whole 30-day life (#552).
+    skip_cache = get_gmail_skip_cache()
+    if not dry_run:
+        pruned = skip_cache.prune()
+        if pruned:
+            logger.info(f"Pruned {pruned} expired skip-cache entries")
+    previously_skipped = skip_cache.get_skipped_ids(account_type.value)
+    logger.info(f"Skip cache holds {len(previously_skipped)} known-marketing message IDs")
+
     gmail = GmailService(account_type=account_type)
     after_date = datetime.now(timezone.utc) - timedelta(days=days_back)
     before_date = datetime.now(timezone.utc) - timedelta(days=before_days) if before_days else None
@@ -217,11 +229,13 @@ def sync_gmail_interactions(
         # that is ~13k messages, and fetching them one at a time cost ~42 min
         # per run — most of it the per-call rate-limit sleep (#552).
         new_message_ids = [
-            m["id"] for m in messages if m["id"] not in existing_base_ids
+            m["id"] for m in messages
+            if m["id"] not in existing_base_ids
+            and m["id"] not in previously_skipped
         ]
         logger.info(
-            f"  {len(messages) - len(new_message_ids)} already synced, "
-            f"{len(new_message_ids)} to fetch"
+            f"  {len(messages) - len(new_message_ids)} already synced or "
+            f"known-marketing, {len(new_message_ids)} to fetch"
         )
         fetched_emails = gmail.get_messages_batch(
             new_message_ids, include_body=False
@@ -230,6 +244,7 @@ def sync_gmail_interactions(
             f"  Fetched {len(fetched_emails)}/{len(new_message_ids)} new messages"
         )
 
+        newly_skipped: list[str] = []
         checked = 0
         for msg_data in messages:
             message_id = msg_data["id"]
@@ -250,6 +265,12 @@ def sync_gmail_interactions(
                 stats['already_exists'] += 1
                 continue
 
+            # Judged marketing on an earlier run — never fetched, so there is
+            # nothing in fetched_emails and this is not an error.
+            if message_id in previously_skipped:
+                stats['marketing_skipped'] += 1
+                continue
+
             try:
                 # Already fetched above; a miss means the batch (and its
                 # individual retry) failed for this message.
@@ -261,6 +282,7 @@ def sync_gmail_interactions(
                 # Skip marketing/promotional emails (check both email and sender name)
                 if is_marketing_email(email.sender, email.sender_name):
                     stats['marketing_skipped'] += 1
+                    newly_skipped.append(message_id)
                     continue
 
                 # Resolve the sender
@@ -477,6 +499,16 @@ def sync_gmail_interactions(
 
         if not dry_run:
             conn.commit()
+            # Remember this run's discards so tomorrow doesn't re-fetch them.
+            # Written after the interaction commit: a crash in between costs a
+            # redundant fetch next run, which is exactly today's behaviour, and
+            # is far safer than recording a skip for a message we never stored.
+            if newly_skipped:
+                skip_cache.record_skipped(account_type.value, newly_skipped)
+                logger.info(
+                    f"Recorded {len(newly_skipped)} newly skipped marketing "
+                    "messages in the skip cache"
+                )
 
     except Exception as e:
         logger.error(f"Failed to sync Gmail: {e}")
