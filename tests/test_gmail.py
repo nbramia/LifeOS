@@ -14,17 +14,19 @@ import pytest
 
 # All tests in this file use mocks (unit tests)
 pytestmark = pytest.mark.unit
-from datetime import datetime, timezone
-from unittest.mock import Mock, patch, MagicMock
-import base64
+from datetime import datetime, timezone  # noqa: E402
+from unittest.mock import patch, MagicMock  # noqa: E402
+import base64  # noqa: E402
 
-from api.services.gmail import (
+from googleapiclient.errors import HttpError  # noqa: E402
+
+from api.services.gmail import (  # noqa: E402
     GmailService,
     EmailMessage,
     DraftMessage,
     build_gmail_query,
 )
-from api.services.google_auth import GoogleAccount
+from api.services.google_auth import GoogleAccount  # noqa: E402
 
 
 class TestEmailMessage:
@@ -164,7 +166,7 @@ class TestGmailService:
         gmail_service._service.users().messages().list().execute.return_value = mock_messages
         gmail_service._service.users().messages().get().execute.return_value = mock_detail
 
-        messages = gmail_service.search(from_email="kevin@example.com")
+        gmail_service.search(from_email="kevin@example.com")
 
         # Should have called with from: in query
         call_args = gmail_service._service.users().messages().list.call_args
@@ -207,6 +209,215 @@ class TestGmailService:
         # Rate limit should be set
         assert hasattr(gmail_service, 'rate_limit_delay')
         assert gmail_service.rate_limit_delay >= 0
+
+
+class TestGetMessagesBatch:
+    """
+    Batched message fetching.
+
+    Fetching one at a time cost ~42 min per nightly run on a busy mailbox,
+    dominated by the per-call rate-limit sleep (#552).
+    """
+
+    @pytest.fixture
+    def mock_auth_service(self):
+        mock = MagicMock()
+        mock_creds = MagicMock()
+        mock_creds.valid = True
+        mock.get_credentials.return_value = mock_creds
+        return mock
+
+    @pytest.fixture
+    def gmail_service(self, mock_auth_service):
+        with patch('api.services.gmail.get_google_auth', return_value=mock_auth_service):
+            with patch('api.services.gmail.build') as mock_build:
+                mock_service = MagicMock()
+                mock_build.return_value = mock_service
+                service = GmailService(account_type=GoogleAccount.PERSONAL)
+                service._service = mock_service
+                return service
+
+    @staticmethod
+    def _raw(message_id):
+        return {
+            "id": message_id,
+            "threadId": f"thread_{message_id}",
+            "snippet": "Quarterly planning notes",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": f"Subject {message_id}"},
+                    {"name": "From", "value": "Dana Reyes <dana@example.com>"},
+                    {"name": "Date", "value": "Tue, 7 Jan 2026 10:00:00 -0800"},
+                ]
+            },
+        }
+
+    def _install_batch(self, gmail_service, fail_ids=()):
+        """Make new_batch_http_request() drive callbacks like the real client."""
+        added = []
+
+        class FakeBatch:
+            def add(self, request, request_id=None, callback=None):
+                added.append((request_id, callback))
+
+            def execute(_self):
+                for request_id, callback in added:
+                    if request_id in fail_ids:
+                        callback(request_id, None, Exception("boom"))
+                    else:
+                        callback(request_id, TestGetMessagesBatch._raw(request_id), None)
+                added.clear()
+
+        gmail_service._service.new_batch_http_request.side_effect = lambda: FakeBatch()
+        return added
+
+    def test_returns_all_requested_messages(self, gmail_service):
+        """Every id resolves to a parsed message keyed by its id."""
+        self._install_batch(gmail_service)
+        ids = [f"msg{i}" for i in range(5)]
+
+        result = gmail_service.get_messages_batch(ids)
+
+        assert set(result) == set(ids)
+        assert result["msg0"].sender == "dana@example.com"
+        assert result["msg3"].subject == "Subject msg3"
+
+    def test_uses_one_round_trip_per_batch_size(self, gmail_service):
+        """120 messages at batch_size=50 is 3 round-trips, not 120."""
+        self._install_batch(gmail_service)
+        ids = [f"msg{i}" for i in range(120)]
+
+        gmail_service.get_messages_batch(ids, batch_size=50)
+
+        assert gmail_service._service.new_batch_http_request.call_count == 3
+
+    def test_failed_message_falls_back_to_individual_fetch(self, gmail_service):
+        """A per-message failure retries individually rather than being dropped."""
+        self._install_batch(gmail_service, fail_ids={"msg1"})
+        gmail_service._service.users().messages().get().execute.return_value = self._raw("msg1")
+
+        result = gmail_service.get_messages_batch(["msg0", "msg1", "msg2"])
+
+        assert set(result) == {"msg0", "msg1", "msg2"}
+
+    def test_whole_batch_failure_falls_back(self, gmail_service):
+        """If execute() raises, the chunk is retried individually, not lost."""
+        class ExplodingBatch:
+            def add(self, *a, **kw):
+                pass
+
+            def execute(self):
+                raise Exception("transport died")
+
+        gmail_service._service.new_batch_http_request.side_effect = lambda: ExplodingBatch()
+        gmail_service._service.users().messages().get().execute.return_value = self._raw("msg0")
+
+        result = gmail_service.get_messages_batch(["msg0"])
+
+        assert "msg0" in result
+
+    def test_empty_input_makes_no_requests(self, gmail_service):
+        """No ids means no round-trips."""
+        self._install_batch(gmail_service)
+
+        assert gmail_service.get_messages_batch([]) == {}
+        assert gmail_service._service.new_batch_http_request.call_count == 0
+
+    @staticmethod
+    def _quota_error():
+        """An HttpError shaped like Gmail's quota-exhaustion response."""
+        resp = MagicMock()
+        resp.status = 403
+        return HttpError(
+            resp,
+            b'{"error": {"message": "Quota exceeded for quota metric '
+            b'\'Queries\'", "errors": [{"reason": "rateLimitExceeded"}]}}',
+        )
+
+    def test_rate_limited_messages_retry_as_a_batch_not_individually(self, gmail_service):
+        """
+        Quota errors back off and re-run the chunk.
+
+        Falling back to individual fetches here is a thundering herd: the quota
+        is already gone, so thousands of single requests make it worse. This is
+        not hypothetical — it exhausted the live quota during development.
+        """
+        calls = {"n": 0}
+
+        class FlakyBatch:
+            def __init__(self):
+                self.items = []
+
+            def add(self, request, request_id=None, callback=None):
+                self.items.append((request_id, callback))
+
+            def execute(_self):
+                calls["n"] += 1
+                first_attempt = calls["n"] == 1
+                for request_id, callback in _self.items:
+                    if first_attempt:
+                        callback(request_id, None, TestGetMessagesBatch._quota_error())
+                    else:
+                        callback(request_id, TestGetMessagesBatch._raw(request_id), None)
+
+        gmail_service._service.new_batch_http_request.side_effect = lambda: FlakyBatch()
+
+        with patch('api.services.gmail.time.sleep'):
+            result = gmail_service.get_messages_batch(["msg0", "msg1"])
+
+        assert set(result) == {"msg0", "msg1"}
+        assert calls["n"] == 2, "should have retried as a batch"
+        # The individual endpoint must not have been used for quota errors.
+        gmail_service._service.users().messages().get().execute.assert_not_called()
+
+    def test_gives_up_after_max_retries(self, gmail_service):
+        """Persistent quota exhaustion stops rather than looping forever."""
+        class AlwaysLimited:
+            def add(self, request, request_id=None, callback=None):
+                self._id, self._cb = request_id, callback
+
+            def execute(_self):
+                _self._cb(_self._id, None, TestGetMessagesBatch._quota_error())
+
+        gmail_service._service.new_batch_http_request.side_effect = lambda: AlwaysLimited()
+
+        with patch('api.services.gmail.time.sleep'):
+            result = gmail_service.get_messages_batch(["msg0"], max_retries=2)
+
+        assert result == {}
+        assert gmail_service._service.new_batch_http_request.call_count == 3
+
+    def test_non_quota_error_still_falls_back_individually(self, gmail_service):
+        """A one-off failure is worth an individual retry; quota exhaustion isn't."""
+        self._install_batch(gmail_service, fail_ids={"msg1"})
+        gmail_service._service.users().messages().get().execute.return_value = self._raw("msg1")
+
+        with patch('api.services.gmail.time.sleep'):
+            result = gmail_service.get_messages_batch(["msg0", "msg1"])
+
+        assert set(result) == {"msg0", "msg1"}
+
+    def test_batches_are_paced(self, gmail_service):
+        """Chunks are spaced out — the per-call sleep was what kept us under quota."""
+        self._install_batch(gmail_service)
+
+        with patch('api.services.gmail.time.sleep') as mock_sleep:
+            gmail_service.get_messages_batch(
+                [f"msg{i}" for i in range(4)], batch_size=2, seconds_per_message=0.5,
+            )
+
+        # Two chunks, each paced to batch_size * seconds_per_message = 1.0s.
+        assert mock_sleep.call_count == 2
+        assert all(0 < c.args[0] <= 1.0 for c in mock_sleep.call_args_list)
+
+    def test_rate_limit_detection_ignores_plain_permission_errors(self, gmail_service):
+        """A 403 that isn't about quota is a real error, not a signal to back off."""
+        resp = MagicMock()
+        resp.status = 403
+        denied = HttpError(resp, b'{"error": {"message": "Insufficient permission"}}')
+
+        assert gmail_service._is_rate_limit_error(denied) is False
+        assert gmail_service._is_rate_limit_error(self._quota_error()) is True
 
 
 class TestGmailAPI:
