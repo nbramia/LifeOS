@@ -100,6 +100,37 @@ class TestClassification:
         assert len(buckets["ambiguous"]) == 1
         assert buckets["duplicate"] == [] and buckets["repoint"] == []
 
+    def test_ambiguous_but_all_candidates_covered_is_a_duplicate(self, vault_env):
+        """
+        The move target is unknown, but every candidate already carries its own
+        interactions — so the history survives whichever one it was, and the
+        stale row is a duplicate either way. Decidable without guessing.
+        """
+        vault, add, _ = vault_env
+        (vault / "Work" / "Notes.md").write_text("one")
+        (vault / "Personal" / "Notes.md").write_text("two")
+        add(str(vault / "Notes.md"))
+        add(str(vault / "Work" / "Notes.md"))
+        add(str(vault / "Personal" / "Notes.md"))
+
+        buckets = _classify_missing_vault_files()
+
+        assert len(buckets["duplicate"]) == 1
+        assert buckets["ambiguous"] == []
+
+    def test_partial_candidate_coverage_stays_ambiguous(self, vault_env):
+        """One uncovered candidate means the row might be its only history."""
+        vault, add, _ = vault_env
+        (vault / "Work" / "Notes.md").write_text("one")
+        (vault / "Personal" / "Notes.md").write_text("two")
+        add(str(vault / "Notes.md"))
+        add(str(vault / "Work" / "Notes.md"))  # Personal/ left uncovered
+
+        buckets = _classify_missing_vault_files()
+
+        assert len(buckets["ambiguous"]) == 1
+        assert buckets["duplicate"] == []
+
     def test_existing_files_are_not_flagged(self, vault_env):
         vault, add, _ = vault_env
         (vault / "Work" / "Present.md").write_text("here")
