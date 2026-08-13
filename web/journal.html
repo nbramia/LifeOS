@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LifeOS · Journal Emotion Wheel</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a24;
+            --text-primary: #e8e8ed;
+            --text-secondary: #8888a0;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --border: #2a2a3a;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .page {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+
+        .back-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+
+        .back-link:hover {
+            color: var(--accent-hover);
+        }
+
+        /* This is the only route to the trend views now that they no longer
+           have a home-page card, so it can't read as muted as the back link
+           sitting beside it. */
+        .forward-link {
+            color: var(--accent-hover);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 600;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 0.3rem 0.8rem;
+        }
+
+        .forward-link:hover {
+            border-color: var(--accent-hover);
+            background: var(--bg-secondary);
+        }
+
+        .window-selector {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .window-pill {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            border-radius: 999px;
+            padding: 0.4rem 1rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .window-pill:hover {
+            border-color: var(--accent-hover);
+            color: var(--text-primary);
+        }
+
+        .window-pill.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .sample-banner {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 0.9rem 1.2rem;
+            margin-bottom: 1.5rem;
+            font-size: 0.95rem;
+        }
+
+        .sample-banner strong {
+            color: var(--accent-hover);
+        }
+
+        .sample-banner.sample-thin {
+            border-color: #a855f7;
+        }
+
+        .wheel-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+            position: relative;
+        }
+
+        .wheel-card svg {
+            width: 100%;
+            max-width: 560px;
+            height: auto;
+        }
+
+        .empty-state {
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 3rem 1rem;
+        }
+
+        .legend {
+            width: 100%;
+            margin-top: 0.5rem;
+        }
+
+        .legend-row {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0.35rem 0;
+            font-size: 0.85rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .legend-row:last-child {
+            border-bottom: none;
+        }
+
+        .legend-swatch {
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+
+        .legend-value {
+            flex: 1;
+        }
+
+        .legend-count {
+            color: var(--text-secondary);
+        }
+
+        .wedge {
+            cursor: default;
+            stroke: var(--bg-primary);
+            stroke-width: 1;
+        }
+
+        .wedge-label {
+            fill: var(--bg-primary);
+            font-size: 10px;
+            pointer-events: none;
+        }
+
+        #tooltip {
+            position: fixed;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.5rem 0.75rem;
+            font-size: 0.85rem;
+            pointer-events: none;
+            display: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <header>
+            <h1>Journal Emotion Wheel</h1>
+            <span>
+                <a class="forward-link" href="/journal/trends">Trend views &rarr;</a>
+                &nbsp;&nbsp;
+                <a class="back-link" href="/">&larr; Home</a>
+            </span>
+        </header>
+
+        <div class="window-selector" id="windowSelector">
+            <button class="window-pill" data-window="day">Day</button>
+            <button class="window-pill" data-window="week">Week</button>
+            <button class="window-pill" data-window="month">Month</button>
+            <button class="window-pill" data-window="quarter">Quarter</button>
+            <button class="window-pill active" data-window="all-time">All-time</button>
+        </div>
+
+        <div class="sample-banner" id="sampleBanner">Loading…</div>
+
+        <div class="wheel-card" id="wheelCard">
+            <svg id="wheelSvg" viewBox="0 0 560 560" preserveAspectRatio="xMidYMid meet"></svg>
+            <div class="legend" id="legend"></div>
+        </div>
+    </div>
+
+    <div id="tooltip"></div>
+
+    <script>
+        const SVG_SIZE = 560;
+        const CENTER = SVG_SIZE / 2;
+        const OUTER_RADIUS = 250;
+        const INNER_HOLE = 50;
+
+        let currentWindow = 'all-time';
+
+        function fnv1aHue(str) {
+            // Deterministic hash -> hue (0-360). No hardcoded emotion->color
+            // map: any value the journal ever introduces gets a stable color
+            // without needing a code change.
+            let h = 0x811c9dc5;
+            for (let i = 0; i < str.length; i++) {
+                h ^= str.toLowerCase().charCodeAt(i);
+                h = Math.imul(h, 0x01000193);
+            }
+            return Math.abs(h) % 360;
+        }
+
+        function colorFor(value, depth) {
+            const hue = fnv1aHue(value);
+            const lightness = 62 - depth * 12; // deeper rings shade darker
+            return `hsl(${hue}, 55%, ${Math.max(lightness, 26)}%)`;
+        }
+
+        function maxDepth(nodes, depth = 1) {
+            let m = depth;
+            for (const n of nodes) {
+                if (n.children && n.children.length) {
+                    m = Math.max(m, maxDepth(n.children, depth + 1));
+                }
+            }
+            return m;
+        }
+
+        function arcPath(cx, cy, rInner, rOuter, a0, a1) {
+            // A true 360-degree span degenerates (start/end points coincide,
+            // SVG draws nothing) — clip a hair short so a single-value wheel
+            // (e.g. one entry, one feeling) still renders as a full ring.
+            if (a1 - a0 >= 2 * Math.PI - 1e-6) {
+                a1 = a0 + 2 * Math.PI - 1e-6;
+            }
+            const toXY = (r, a) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+            const [x0o, y0o] = toXY(rOuter, a0);
+            const [x1o, y1o] = toXY(rOuter, a1);
+            const [x0i, y0i] = toXY(rInner, a1);
+            const [x1i, y1i] = toXY(rInner, a0);
+            const largeArc = (a1 - a0) > Math.PI ? 1 : 0;
+            return [
+                `M ${x0o} ${y0o}`,
+                `A ${rOuter} ${rOuter} 0 ${largeArc} 1 ${x1o} ${y1o}`,
+                `L ${x0i} ${y0i}`,
+                `A ${rInner} ${rInner} 0 ${largeArc} 0 ${x1i} ${y1i}`,
+                'Z',
+            ].join(' ');
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, (c) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            }[c]));
+        }
+
+        function renderWheel(wheel, emotionEntries) {
+            const svg = document.getElementById('wheelSvg');
+            svg.innerHTML = '';
+            if (!wheel.length || emotionEntries === 0) {
+                svg.style.display = 'none';
+                return;
+            }
+            svg.style.display = '';
+
+            const depth = maxDepth(wheel);
+            const ringThickness = (OUTER_RADIUS - INNER_HOLE) / depth;
+            const parts = [];
+            const tooltip = document.getElementById('tooltip');
+
+            function walk(nodes, level, angleStart, angleEnd, parentCount, path) {
+                let a = angleStart;
+                for (const node of nodes) {
+                    const span = (node.count / parentCount) * (angleEnd - angleStart);
+                    const a0 = a;
+                    const a1 = a + span;
+                    const rInner = INNER_HOLE + (level - 1) * ringThickness;
+                    const rOuter = INNER_HOLE + level * ringThickness;
+                    const d = arcPath(CENTER, CENTER, rInner, rOuter, a0, a1);
+                    const pct = ((node.count / emotionEntries) * 100).toFixed(1);
+                    const nodePath = [...path, node.value];
+                    const wedgeId = `wedge-${parts.length}`;
+                    parts.push(
+                        `<path id="${wedgeId}" class="wedge" d="${d}" fill="${colorFor(node.value, level)}" ` +
+                        `data-tooltip="${escapeHtml(nodePath.join(' → '))}: ${node.count} (${pct}%)"></path>`
+                    );
+
+                    const midAngle = (a0 + a1) / 2;
+                    const arcLen = span * (rInner + rOuter) / 2;
+                    if (arcLen > 26) {
+                        const rMid = (rInner + rOuter) / 2;
+                        const lx = CENTER + rMid * Math.cos(midAngle);
+                        const ly = CENTER + rMid * Math.sin(midAngle);
+                        let rot = (midAngle * 180 / Math.PI);
+                        if (rot > 90 && rot < 270) rot += 180;
+                        parts.push(
+                            `<text class="wedge-label" x="${lx}" y="${ly}" text-anchor="middle" ` +
+                            `dominant-baseline="middle" transform="rotate(${rot} ${lx} ${ly})">` +
+                            `${escapeHtml(node.value)}</text>`
+                        );
+                    }
+
+                    if (node.children && node.children.length) {
+                        walk(node.children, level + 1, a0, a1, node.count, nodePath);
+                    }
+                    a = a1;
+                }
+            }
+
+            // Full circle starting at 12 o'clock (-PI/2), sweeping clockwise.
+            walk(wheel, 1, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI, emotionEntries, []);
+            svg.innerHTML = parts.join('');
+
+            svg.querySelectorAll('.wedge').forEach((el) => {
+                el.addEventListener('mouseenter', (e) => {
+                    tooltip.textContent = el.dataset.tooltip;
+                    tooltip.style.display = 'block';
+                });
+                el.addEventListener('mousemove', (e) => {
+                    tooltip.style.left = `${e.clientX + 12}px`;
+                    tooltip.style.top = `${e.clientY + 12}px`;
+                });
+                el.addEventListener('mouseleave', () => {
+                    tooltip.style.display = 'none';
+                });
+            });
+        }
+
+        function renderLegend(wheel, emotionEntries) {
+            const legend = document.getElementById('legend');
+            if (!wheel.length || emotionEntries === 0) {
+                legend.innerHTML = '';
+                return;
+            }
+            const rows = wheel.map((n) => {
+                const pct = ((n.count / emotionEntries) * 100).toFixed(1);
+                return `<div class="legend-row">` +
+                    `<span class="legend-swatch" style="background:${colorFor(n.value, 1)}"></span>` +
+                    `<span class="legend-value">${escapeHtml(n.value)}</span>` +
+                    `<span class="legend-count">${n.count} (${pct}%)</span>` +
+                    `</div>`;
+            });
+            legend.innerHTML = rows.join('');
+        }
+
+        function renderSampleBanner(data) {
+            const banner = document.getElementById('sampleBanner');
+            const { total_entries, emotion_entries, start_date, end_date } = data;
+            const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
+            // Percentages in the wheel/legend are always out of
+            // emotion_entries (the emotion-bearing subset) — the thin-sample
+            // caveat is keyed to that same denominator, not the raw file count.
+            const thin = emotion_entries > 0 && emotion_entries < 5;
+            banner.classList.toggle('sample-thin', thin);
+            if (total_entries === 0) {
+                banner.innerHTML = `No journal entries in this window (${rangeText}).`;
+            } else if (emotion_entries === 0) {
+                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
+                    `in this window (${rangeText}), but none logged emotion data.`;
+            } else if (emotion_entries === total_entries) {
+                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
+                    `in this window (${rangeText})` +
+                    (thin ? ' — small sample, read the wheel loosely.' : '.');
+            } else {
+                banner.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
+                    `entries had emotion data in this window (${rangeText}) — percentages below are out of ` +
+                    `${emotion_entries}` +
+                    (thin ? '; small sample, read the wheel loosely.' : '.');
+            }
+        }
+
+        async function loadWindow(win) {
+            currentWindow = win;
+            document.querySelectorAll('.window-pill').forEach((p) => {
+                p.classList.toggle('active', p.dataset.window === win);
+            });
+            const banner = document.getElementById('sampleBanner');
+            banner.textContent = 'Loading…';
+            try {
+                const res = await fetch(`/api/journal/emotions?window=${encodeURIComponent(win)}`);
+                if (!res.ok) throw new Error(`API error: ${res.status}`);
+                const data = await res.json();
+                renderSampleBanner(data);
+                if (data.emotion_entries === 0) {
+                    document.getElementById('wheelSvg').style.display = 'none';
+                    document.getElementById('legend').innerHTML = '';
+                } else {
+                    renderWheel(data.wheel, data.emotion_entries);
+                    renderLegend(data.wheel, data.emotion_entries);
+                }
+            } catch (err) {
+                banner.textContent = `Failed to load: ${err.message}`;
+            }
+        }
+
+        document.getElementById('windowSelector').addEventListener('click', (e) => {
+            const pill = e.target.closest('.window-pill');
+            if (pill) loadWindow(pill.dataset.window);
+        });
+
+        loadWindow(currentWindow);
+    </script>
+</body>
+</html>

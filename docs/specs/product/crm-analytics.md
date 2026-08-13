@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-08-12
 
 The aggregated views that sit alongside the people list: Family Dashboard (`/crm#family`), Me Dashboard (`/me`, the CRM landing page), Birthdays Page (`/birthdays`), and Relationship Dashboard (`/relationship`). Each surfaces interaction patterns and insights derived from the CRM data model.
 
@@ -259,4 +259,5 @@ Each panel has a refresh button to re-extract insights on demand.
 - [crm-interactions.md](crm-interactions.md) — Interaction source ingestion (the dashboards aggregate over these)
 - [crm-graph.md](crm-graph.md) — Relationship graph (some dashboards link out to the graph view)
 - [api-reference.md](api-reference.md) — Full HTTP endpoint catalog
+- [journal-analytics.md](journal-analytics.md) — Sibling analytics view (daily-journal emotion wheel) using the same pre-aggregated-response, graceful-window-fallback pattern
 - [configuration.md](../../guides/configuration.md) — `LIFEOS_PARTNER_NAME`, `LIFEOS_THERAPIST_PATTERNS`, `LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS`

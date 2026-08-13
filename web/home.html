@@ -58,7 +58,7 @@
 
         .cards {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 1.5rem;
         }
 
@@ -153,10 +153,19 @@
                 <div class="card-title">Agents</div>
                 <div class="card-description">See what your agents are working on right now</div>
             </a>
+
+            <!-- Trend views live one level down, linked from /journal's own
+                 header — they're a second look at the same journal data, not a
+                 separate destination worth a top-level card. -->
+            <a href="/journal" class="card">
+                <div class="card-icon">🎨</div>
+                <div class="card-title">Journal</div>
+                <div class="card-description">See which emotions dominate your entries, and how they trend</div>
+            </a>
         </div>
 
         <p class="keyboard-hint">
-            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, or <kbd>3</kbd> for Agents
+            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, <kbd>3</kbd> for Agents, or <kbd>4</kbd> for Journal
         </p>
     </div>
 
@@ -165,6 +174,7 @@
             if (e.key === '1') window.location.href = '/chat';
             if (e.key === '2') window.location.href = '/crm';
             if (e.key === '3') window.location.href = '/agents';
+            if (e.key === '4') window.location.href = '/journal';
         });
     </script>
 </body>

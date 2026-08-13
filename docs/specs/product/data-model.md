@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-08-12
 
 LifeOS uses a two-tier data model to separate raw observations from canonical records.
 
@@ -166,3 +166,4 @@ The relationship discovery system scans interactions to build person-to-person r
 - [Data & Sync](../technical/data-and-sync.md) -- Sync pipeline and data stores
 - [ADR-003: Two-Tier Data Model](../../adr/003-two-tier-data-model.md) -- Why SourceEntity and PersonEntity are separate
 - [CRM UI](crm-ui.md) -- CRM interface product spec
+- [Journal Analytics](journal-analytics.md) -- Emotion-wheel and trend views that read vault notes directly and are explicitly outside this two-tier model (one exception: the felt-vs-recorded connection view crosses into entity resolution and interaction history — see that view's section for how)
