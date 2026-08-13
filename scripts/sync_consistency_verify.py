@@ -15,6 +15,8 @@ Checks performed:
   4. Self-loop and hidden-person relationships — always cleaned up
   5. Orphaned CRM records — per-table threshold for relationships, facts,
      overrides, source_entities with invalid person_ids
+  6. Missing vault files — interactions pointing at notes that were moved or
+     deleted; re-points moves, drops duplicates, flags ambiguous cases
 
 Usage:
     python scripts/sync_consistency_verify.py --dry-run          # report only
@@ -416,6 +418,127 @@ def _check_orphaned_crm_records(valid_ids: set, dry_run: bool, fix_threshold: in
     return {"count": total_count, "fixed": total_fixed, "details": details}
 
 
+def _classify_missing_vault_files() -> dict:
+    """
+    Sort vault interactions whose file is gone into what should happen to them.
+
+    Moving a note in Obsidian leaves the old interaction pointing at a path that
+    no longer exists, and the next reindex creates fresh interactions at the new
+    path. So a dangling row is usually a *duplicate*, not lost history — but not
+    always, and blanket-deleting them would destroy the exceptions.
+
+    Returns lists keyed by disposition:
+      duplicate — the note moved and the new path already has interactions;
+                  the old rows are stale copies and can go
+      repoint   — the note moved and nothing points at the new path yet;
+                  deleting these would lose the interaction entirely
+      gone      — no file with that name anywhere in the vault
+      ambiguous — the name matches several files, so the move target is a
+                  guess; left alone for a human
+    """
+    from api.services.interaction_store import get_interaction_db_path
+    from config.settings import settings
+
+    conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
+    try:
+        known_paths = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT source_id FROM interactions "
+                "WHERE source_type IN ('vault', 'granola') AND source_id IS NOT NULL"
+            )
+        }
+    finally:
+        conn.close()
+
+    missing = [
+        p for p in known_paths
+        if p.startswith("/") and not Path(p).exists()
+    ]
+    buckets = {"duplicate": [], "repoint": [], "gone": [], "ambiguous": []}
+    if not missing:
+        return buckets
+
+    vault_root = Path(settings.vault_path)
+    if not vault_root.is_dir():
+        # Vault not mounted — every path would look missing. Report nothing
+        # rather than propose deleting the entire interaction history.
+        logger.warning("vault path %s not present — skipping vault file check", vault_root)
+        return buckets
+
+    by_name: dict[str, list[str]] = {}
+    for path in vault_root.rglob("*.md"):
+        by_name.setdefault(path.name, []).append(str(path))
+
+    for stale_path in missing:
+        candidates = by_name.get(Path(stale_path).name, [])
+        if not candidates:
+            buckets["gone"].append((stale_path, None))
+        elif len(candidates) > 1:
+            buckets["ambiguous"].append((stale_path, candidates))
+        elif candidates[0] in known_paths:
+            buckets["duplicate"].append((stale_path, candidates[0]))
+        else:
+            buckets["repoint"].append((stale_path, candidates[0]))
+
+    return buckets
+
+
+def _check_missing_vault_files(dry_run: bool, fix_threshold: int) -> dict:
+    """
+    Check 6: vault interactions pointing at files that no longer exist.
+
+    Notes get moved between folders, which silently strands their interactions
+    (78 of 3,022 on the corpus that prompted this). Re-point where the history
+    would otherwise be lost, delete where it is a duplicate of rows already
+    created at the new path, and never guess when the target is ambiguous.
+    """
+    from api.services.interaction_store import get_interaction_db_path
+
+    buckets = _classify_missing_vault_files()
+    deletable = buckets["duplicate"] + buckets["gone"]
+    repointable = buckets["repoint"]
+    count = len(deletable) + len(repointable) + len(buckets["ambiguous"])
+    if count == 0:
+        return {"count": 0, "fixed": 0}
+
+    details = (
+        f"duplicate={len(buckets['duplicate'])}, repoint={len(repointable)}, "
+        f"gone={len(buckets['gone'])}, ambiguous={len(buckets['ambiguous'])}"
+    )
+
+    fixed = 0
+    actionable = len(deletable) + len(repointable)
+    if not dry_run and 0 < actionable <= fix_threshold:
+        conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
+        try:
+            # Re-point first: if a later delete ever overlapped, we would rather
+            # have preserved the row than removed it.
+            for stale_path, new_path in repointable:
+                cursor = conn.execute(
+                    "UPDATE interactions SET source_id = ? WHERE source_id = ?",
+                    (new_path, stale_path),
+                )
+                fixed += cursor.rowcount
+            for stale_path, _ in deletable:
+                cursor = conn.execute(
+                    "DELETE FROM interactions WHERE source_id = ?", (stale_path,)
+                )
+                fixed += cursor.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+
+    if buckets["ambiguous"]:
+        logger.warning(
+            "%d vault interactions point at moved notes whose name matches "
+            "several files — resolve these manually: %s",
+            len(buckets["ambiguous"]),
+            ", ".join(p for p, _ in buckets["ambiguous"][:5]),
+        )
+
+    return {"count": count, "fixed": fixed, "details": details}
+
+
 def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRESHOLD) -> dict:
     """
     Run all consistency checks.
@@ -439,6 +562,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
             "stale_merged_relationships": {"count": 0, "fixed": 0},
             "relationship_hygiene": {"count": 0, "fixed": 0, "self_loops": 0, "hidden": 0},
             "orphaned_crm_records": {"count": 0, "fixed": 0},
+            "missing_vault_files": {"count": 0, "fixed": 0},
             "total_issues": 0,
             "total_fixed": 0,
             "auto_fix_skipped": False,
@@ -453,19 +577,22 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
     # Clean up self-loops and hidden-person relationships BEFORE orphan check
     rel_hygiene = _check_relationship_hygiene(hidden_ids, valid_ids, dry_run)
     orphaned_crm_records = _check_orphaned_crm_records(valid_ids, dry_run, fix_threshold)
+    # Vault paths drift when notes are moved between folders
+    missing_vault_files = _check_missing_vault_files(dry_run, fix_threshold)
     # Person stats AFTER interaction-modifying checks so counts reflect final state
     person_stats = _check_person_stats(dry_run)
 
     checks = [
         person_stats, orphaned_interactions, hidden_interactions,
         stale_merged_ids, stale_merged_rels, rel_hygiene, orphaned_crm_records,
+        missing_vault_files,
     ]
     total_issues = sum(c["count"] for c in checks)
     total_fixed = sum(c["fixed"] for c in checks)
 
     auto_fix_skipped = any(
         check["count"] > fix_threshold and check["count"] > 0
-        for check in [orphaned_interactions, orphaned_crm_records]
+        for check in [orphaned_interactions, orphaned_crm_records, missing_vault_files]
     )
 
     return {
@@ -476,6 +603,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
         "stale_merged_relationships": stale_merged_rels,
         "relationship_hygiene": rel_hygiene,
         "orphaned_crm_records": orphaned_crm_records,
+        "missing_vault_files": missing_vault_files,
         "total_issues": total_issues,
         "total_fixed": total_fixed,
         "auto_fix_skipped": auto_fix_skipped,
