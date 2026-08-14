@@ -828,6 +828,15 @@ class Settings(BaseSettings):
         description="Directory for database backups (use fast storage like NVMe)"
     )
 
+    backup_keep: int = Field(
+        default=2,
+        alias="LIFEOS_BACKUP_KEEP",
+        description="Nightly snapshots retained per database. Older ones are "
+                    "pruned only after a fully successful sync whose newest "
+                    "snapshot passes an integrity check, so a run of failures "
+                    "cannot rotate away the last good copy."
+    )
+
     # Claude Code orchestration
     claude_binary: str = Field(
         default="claude",

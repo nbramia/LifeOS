@@ -99,6 +99,11 @@ class RetentionPolicy:
     week_days: int = 7
     month_days: int = 30
     quarter_days: int = 90
+    #: When False, keep exactly the ``daily_keep`` most recent snapshots and
+    #: drop everything older — no weekly/monthly/quarterly tail. The tiered
+    #: policy never forgets anything entirely, which is the right trade for a
+    #: small database and the wrong one for a 640 MB store snapshotted nightly.
+    tiered: bool = True
 
 
 #: A shared, immutable default. ``frozen=True`` on ``RetentionPolicy`` is
@@ -158,7 +163,7 @@ def prune(
 
     # Tiers 2/3/4: bucket the older ones; keep the newest in each bucket.
     seen_buckets: set[tuple[str, int]] = set()
-    for ts, path in candidates[policy.daily_keep:]:
+    for ts, path in ([] if not policy.tiered else candidates[policy.daily_keep:]):
         age_days = (now - ts).total_seconds() / 86400.0
         if age_days < policy.weekly_horizon_days:
             bucket = ("week", int(age_days // policy.week_days))
@@ -181,6 +186,43 @@ def prune(
     return removed
 
 
+def verify_snapshot(path: Path) -> bool:
+    """Is this snapshot a readable, structurally intact SQLite database?
+
+    Gates retention: a snapshot that fails here must never be counted as a
+    replacement for an older one. Running ``integrity_check`` is cheap next to
+    the cost of discovering, weeks later, that the only surviving backups are
+    all copies of a broken file.
+
+    This checks that the *file* is sound, not that its contents are correct —
+    no amount of page-level verification can tell you the sync wrote sensible
+    data. Retention is additionally gated on the sync succeeding for that.
+    """
+    import sqlite3
+
+    if not path.exists() or path.stat().st_size == 0:
+        logger.error(f"Backup verification failed: {path} missing or empty")
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                logger.error(f"Backup verification failed: {path} failed integrity_check")
+                return False
+            tables = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+            ).fetchone()[0]
+            if not tables:
+                logger.error(f"Backup verification failed: {path} contains no tables")
+                return False
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Backup verification failed: {path} could not be read: {e}")
+        return False
+    return True
+
+
 def create_snapshot(
     db_path: Path,
     backup_dir: Path,
@@ -188,6 +230,7 @@ def create_snapshot(
     *,
     policy: RetentionPolicy = DEFAULT_POLICY,
     now: Optional[datetime] = None,
+    prune_after: bool = True,
 ) -> Optional[Path]:
     """Snapshot a live SQLite database, then prune older snapshots.
 
@@ -204,9 +247,14 @@ def create_snapshot(
             which is what keeps retention per-database
         policy: Retention tiers to apply afterwards
         now: Timestamp for the filename; defaults to the current time
+        prune_after: Prune older snapshots once this one verifies. Pass False
+            to defer pruning until the caller knows the run it is protecting
+            actually succeeded — see ``prune_verified``.
 
     Returns:
-        Path to the new snapshot, or None if the source database is absent.
+        Path to the new snapshot, or None if the source database is absent or
+        the snapshot failed verification (in which case nothing is pruned and
+        the bad file is removed).
     """
     import sqlite3
 
@@ -227,11 +275,54 @@ def create_snapshot(
     finally:
         source.close()
 
+    if not verify_snapshot(backup_path):
+        # Never let a broken snapshot displace a good one. Drop it and leave
+        # existing backups untouched.
+        try:
+            backup_path.unlink()
+        except OSError as e:
+            logger.warning(f"Could not remove failed backup {backup_path}: {e}")
+        return None
+
     logger.info(f"Created {db_basename} backup: {backup_path}")
+
+    if prune_after:
+        prune_verified(backup_dir, db_basename, policy=policy, now=now)
+    return backup_path
+
+
+def prune_verified(
+    backup_dir: Path,
+    db_basename: str,
+    *,
+    policy: RetentionPolicy = DEFAULT_POLICY,
+    now: Optional[datetime] = None,
+) -> list[Path]:
+    """Prune, but only while at least one surviving snapshot verifies.
+
+    Tight retention is only safe if the copy being kept is known good. This
+    checks the newest snapshot before removing anything; if it fails, nothing
+    is pruned and the older backups stay, however many there are. Keeping too
+    many files is recoverable, keeping only broken ones is not.
+    """
+    survivors = sorted(
+        (p for p in backup_dir.glob(f"{db_basename}.*.backup")
+         if parse_backup_timestamp(p.name, db_basename)),
+        key=lambda p: parse_backup_timestamp(p.name, db_basename),
+        reverse=True,
+    )
+    if not survivors:
+        return []
+    if not verify_snapshot(survivors[0]):
+        logger.error(
+            f"Newest {db_basename} backup failed verification — skipping "
+            "retention so existing backups are preserved"
+        )
+        return []
 
     removed = prune(backup_dir, db_basename, policy=policy, now=now)
     if removed:
         logger.info(
             f"Backup retention pruned {len(removed)} old {db_basename} backup(s)"
         )
-    return backup_path
+    return removed

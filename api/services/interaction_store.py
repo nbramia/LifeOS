@@ -1218,37 +1218,22 @@ class InteractionStore:
 
     def create_backup(self) -> Optional[Path]:
         """
-        Create a backup of interactions.db and prune old ones via the
-        tiered retention policy in ``_prune_backups``.
+        Create a verified backup of interactions.db and prune old ones.
 
         Returns:
-            Path to backup file if created, None if no db to backup
+            Path to backup file, or None if there is no db to back up or the
+            snapshot failed verification (in which case nothing is pruned).
         """
-        import shutil
-
-        db_path = Path(self.db_path)
-        if not db_path.exists():
-            logger.warning("No interactions.db to backup")
-            return None
-
-        backup_dir = Path(settings.backup_path)
-        backup_dir.mkdir(parents=True, exist_ok=True)
-
-        # Filename construction goes through the same helper the pruner
-        # uses to parse, so any future schema tweak stays in sync.
-        backup_path = backup_dir / _backup_filename(datetime.now())
-
         try:
-            shutil.copy2(db_path, backup_path)
-            logger.info(f"Created interactions backup: {backup_path}")
-
-            removed = _prune_backups(backup_dir)
-            if removed:
-                logger.info(
-                    f"Backup retention pruned {len(removed)} old backup(s)"
-                )
-
-            return backup_path
+            # Delegates to the shared helper so interactions.db gets the same
+            # treatment as every other store: a WAL-safe online-backup snapshot
+            # rather than a file copy, and verification before anything older
+            # is discarded.
+            return _backup_retention.create_snapshot(
+                Path(self.db_path),
+                Path(settings.backup_path),
+                _BACKUP_DB_BASENAME,
+            )
         except Exception as e:
             logger.error(f"Failed to create backup: {e}")
             # Record backup failure for nightly alert

@@ -19,6 +19,8 @@ from api.services.backup_retention import (
     create_snapshot,
     parse_backup_timestamp,
     prune,
+    prune_verified,
+    verify_snapshot,
 )
 
 
@@ -242,3 +244,113 @@ class TestCreateSnapshot:
         create_snapshot(src, out, "crm.db")
 
         assert manual.exists()
+
+
+class TestVerificationGatesRetention:
+    """
+    Tight retention is only safe if the copy being kept is known good (#562).
+
+    With a long tail, a corrupt snapshot was survivable — older tiers remained.
+    Keeping only a couple means a bad snapshot could be the last one standing,
+    so verification has to gate the delete.
+    """
+
+    @staticmethod
+    def _db(path: Path) -> Path:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO t (id) VALUES (1)")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_verify_accepts_a_real_database(self, tmp_path):
+        assert verify_snapshot(self._db(tmp_path / "ok.db")) is True
+
+    def test_verify_rejects_corrupt_empty_and_missing(self, tmp_path):
+        corrupt = tmp_path / "corrupt.db"
+        corrupt.write_bytes(b"this is not a sqlite database, not even close")
+        empty = tmp_path / "empty.db"
+        empty.touch()
+
+        assert verify_snapshot(corrupt) is False
+        assert verify_snapshot(empty) is False
+        assert verify_snapshot(tmp_path / "absent.db") is False
+
+    def test_verify_rejects_a_database_with_no_tables(self, tmp_path):
+        """A snapshot of nothing is not a usable rollback point."""
+        blank = tmp_path / "blank.db"
+        sqlite3.connect(str(blank)).close()
+
+        assert verify_snapshot(blank) is False
+
+    def test_corrupt_newest_snapshot_blocks_pruning(self, tmp_path):
+        """The whole point: a bad backup must not displace good ones."""
+        out = tmp_path / "b"
+        out.mkdir()
+        base = datetime(2026, 1, 1)
+        olds = [_touch_backup(out, "crm.db", base - timedelta(days=10 + i)) for i in range(5)]
+        for p in olds:
+            self._db(p)
+        newest = out / backup_filename("crm.db", base)
+        newest.write_bytes(b"truncated garbage")
+
+        removed = prune_verified(
+            out, "crm.db", policy=RetentionPolicy(daily_keep=2, tiered=False), now=base,
+        )
+
+        assert removed == []
+        assert all(p.exists() for p in olds)
+
+    def test_good_newest_snapshot_allows_pruning(self, tmp_path):
+        out = tmp_path / "b"
+        out.mkdir()
+        base = datetime(2026, 1, 1)
+        for i in range(5):
+            self._db(_touch_backup(out, "crm.db", base - timedelta(days=10 + i)))
+        self._db(out / backup_filename("crm.db", base))
+
+        removed = prune_verified(
+            out, "crm.db", policy=RetentionPolicy(daily_keep=2, tiered=False), now=base,
+        )
+
+        assert removed
+        assert len(list(out.glob("crm.db.*.backup"))) == 2
+
+    def test_failed_snapshot_is_deleted_and_prunes_nothing(self, tmp_path, monkeypatch):
+        """A snapshot that cannot be verified leaves no trace and no damage."""
+        out = tmp_path / "b"
+        out.mkdir()
+        existing = self._db(_touch_backup(out, "crm.db", datetime(2025, 1, 1)))
+        monkeypatch.setattr(
+            "api.services.backup_retention.verify_snapshot", lambda p: False
+        )
+
+        result = create_snapshot(self._db(tmp_path / "crm.db"), out, "crm.db")
+
+        assert result is None
+        assert existing.exists()
+        assert len(list(out.glob("crm.db.*.backup"))) == 1
+
+
+class TestUntieredRetention:
+    """`tiered=False` keeps exactly N and drops the long tail."""
+
+    def test_keeps_only_the_n_most_recent(self, tmp_path):
+        base = datetime(2026, 1, 1)
+        for i in range(12):
+            _touch_backup(tmp_path, "crm.db", base - timedelta(days=i * 40))
+
+        prune(tmp_path, "crm.db", policy=RetentionPolicy(daily_keep=2, tiered=False), now=base)
+
+        assert len(list(tmp_path.glob("crm.db.*.backup"))) == 2
+
+    def test_tiered_default_still_keeps_a_tail(self, tmp_path):
+        """Regression guard: the default policy is unchanged."""
+        base = datetime(2026, 1, 1)
+        for i in range(12):
+            _touch_backup(tmp_path, "crm.db", base - timedelta(days=i * 40))
+
+        prune(tmp_path, "crm.db", policy=DEFAULT_POLICY, now=base)
+
+        assert len(list(tmp_path.glob("crm.db.*.backup"))) > 2

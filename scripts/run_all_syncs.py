@@ -1575,50 +1575,88 @@ def _parse_sync_output(output: str) -> dict:
     return stats
 
 
-def backup_interactions():
-    """Create interactions backup before sync operations."""
-    from api.services.interaction_store import InteractionStore
-    logger.info("Creating pre-sync interactions backup...")
-    store = InteractionStore()
-    backup_path = store.create_backup()
-    if backup_path:
-        logger.info(f"Interactions backup: {backup_path}")
-    return backup_path
+def _retention_policy():
+    """Retention for nightly snapshots: keep N, no long tail."""
+    from api.services.backup_retention import RetentionPolicy
+    from config.settings import settings
+    return RetentionPolicy(daily_keep=max(1, settings.backup_keep), tiered=False)
 
 
-def backup_crm():
-    """Create a crm.db backup before sync operations.
+#: Databases snapshotted before the nightly sync. interactions.db holds the
+#: per-person interaction history; crm.db holds people, source entities and
+#: relationships. Both are rewritten destructively by nightly phases.
+def _backup_targets():
+    from api.services.interaction_store import get_interaction_db_path
+    from api.utils.db_paths import get_crm_db_path
+    return [
+        ("interactions.db", get_interaction_db_path()),
+        ("crm.db", get_crm_db_path()),
+    ]
 
-    crm.db holds person_entities, source_entities, relationships and facts, and
-    several nightly phases write to it destructively — entity_cleanup hides
-    entities, consistency_verify deletes orphans, relationship_discovery
-    rewrites edge weights wholesale. It went unbacked while interactions.db was
-    snapshotted nightly, leaving no rollback path (#562).
+
+def backup_databases():
+    """Snapshot interactions.db and crm.db before sync operations.
+
+    Pruning is deliberately deferred to ``prune_backups_after_success``. A
+    snapshot taken now is only known to be a *usable* rollback point once the
+    run it protects has finished cleanly, so nothing older is discarded until
+    then — a string of failing nights must not rotate away the last good copy.
 
     A failure here is reported but never aborts the sync: losing a backup is
-    worse than not syncing, but not worse than skipping the night's data.
+    bad, losing the night's data is worse.
     """
     from pathlib import Path as _Path
 
     from api.services import backup_retention
-    from api.utils.db_paths import get_crm_db_path
     from config.settings import settings
 
-    logger.info("Creating pre-sync crm backup...")
-    try:
-        backup_path = backup_retention.create_snapshot(
-            _Path(get_crm_db_path()),
-            _Path(settings.backup_path),
-            "crm.db",
-        )
-        if backup_path:
-            logger.info(f"CRM backup: {backup_path}")
-        return backup_path
-    except Exception as e:
-        logger.error(f"Failed to create crm backup: {e}")
-        from api.services.notifications import record_failure
-        record_failure("backup_storage", f"CRM backup failed: {e}", severity="warning")
-        return None
+    paths = []
+    for basename, db_path in _backup_targets():
+        logger.info(f"Creating pre-sync {basename} backup...")
+        try:
+            backup_path = backup_retention.create_snapshot(
+                _Path(db_path),
+                _Path(settings.backup_path),
+                basename,
+                policy=_retention_policy(),
+                prune_after=False,
+            )
+            if backup_path:
+                logger.info(f"{basename} backup: {backup_path}")
+                paths.append(backup_path)
+            else:
+                from api.services.notifications import record_failure
+                record_failure(
+                    "backup_storage",
+                    f"{basename} backup missing or failed verification",
+                    severity="warning",
+                )
+        except Exception as e:
+            logger.error(f"Failed to create {basename} backup: {e}")
+            from api.services.notifications import record_failure
+            record_failure("backup_storage", f"{basename} backup failed: {e}", severity="warning")
+    return paths
+
+
+def prune_backups_after_success():
+    """Apply retention once the run has completed without failures.
+
+    Two conditions must hold before an old snapshot is discarded: the sync
+    succeeded, and the newest snapshot passes an integrity check. Either one
+    failing leaves every existing backup in place.
+    """
+    from pathlib import Path as _Path
+
+    from api.services import backup_retention
+    from config.settings import settings
+
+    for basename, _ in _backup_targets():
+        try:
+            backup_retention.prune_verified(
+                _Path(settings.backup_path), basename, policy=_retention_policy(),
+            )
+        except Exception as e:
+            logger.warning(f"Retention for {basename} failed: {e}")
 
 
 def run_all_syncs(
@@ -1694,10 +1732,10 @@ def run_all_syncs(
         except Exception as e:
             logger.warning(f"Could not open Photos.app: {e}")
 
-    # Create interactions and CRM backups before any syncs
+    # Snapshot interactions.db and crm.db before any syncs. Retention runs at
+    # the end, and only if this run succeeds.
     if not dry_run:
-        backup_interactions()
-        backup_crm()
+        backup_databases()
 
     # Suppress CRITICAL alerts during sync (ChromaDB may have transient SQLite issues
     # during heavy indexing). 4 hours covers even the longest full reindex.
@@ -1854,6 +1892,19 @@ def run_all_syncs(
     if never_yielded_sources:
         logger.warning(f"Never produced records: {', '.join(never_yielded_sources)}")
     logger.info("=" * 60)
+
+    # Apply backup retention only now, and only if nothing failed. Tonight's
+    # snapshot is only worth keeping *instead of* an older one once the run it
+    # protects has finished cleanly; otherwise the older copies are the more
+    # trustworthy ones and all of them stay.
+    if not dry_run:
+        if failed:
+            logger.warning(
+                f"Skipping backup retention — {len(failed)} source(s) failed, "
+                "so existing backups are preserved"
+            )
+        else:
+            prune_backups_after_success()
 
     # Check overall health
     is_healthy, health_msg = check_sync_health()
