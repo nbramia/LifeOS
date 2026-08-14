@@ -5,6 +5,7 @@ The integration tests over ``interaction_store._prune_backups`` live in
 same code path via the legacy alias. These tests target the helper
 directly so any other store can adopt it with confidence.
 """
+import sqlite3
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from api.services.backup_retention import (
     DEFAULT_POLICY,
     RetentionPolicy,
     backup_filename,
+    create_snapshot,
     parse_backup_timestamp,
     prune,
 )
@@ -142,3 +144,101 @@ class TestNoOps:
         # in-place mutation by a caller can't bleed into other callers.
         with pytest.raises(FrozenInstanceError):
             DEFAULT_POLICY.daily_keep = 99  # type: ignore[misc]
+
+
+class TestCreateSnapshot:
+    """Snapshotting a live database (#562 — crm.db had no backup at all)."""
+
+    @staticmethod
+    def _db(path: Path, rows: int = 3) -> Path:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.executemany(
+            "INSERT INTO people (name) VALUES (?)", [(f"person{i}",) for i in range(rows)]
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_snapshot_copies_the_data(self, tmp_path):
+        src = self._db(tmp_path / "crm.db")
+        out = tmp_path / "backups"
+
+        snap = create_snapshot(src, out, "crm.db")
+
+        assert snap is not None and snap.exists()
+        conn = sqlite3.connect(str(snap))
+        assert conn.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 3
+        conn.close()
+
+    def test_snapshot_is_consistent_with_an_open_writer(self, tmp_path):
+        """
+        A file copy of a live WAL database can capture a torn state — the main
+        file without committed pages still in the -wal. The online backup API
+        must not.
+        """
+        src = self._db(tmp_path / "crm.db")
+        writer = sqlite3.connect(str(src))
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("INSERT INTO people (name) VALUES ('committed_via_wal')")
+        writer.commit()
+        try:
+            snap = create_snapshot(src, tmp_path / "backups", "crm.db")
+        finally:
+            writer.close()
+
+        conn = sqlite3.connect(str(snap))
+        names = {r[0] for r in conn.execute("SELECT name FROM people")}
+        conn.close()
+        assert "committed_via_wal" in names
+
+    def test_missing_source_returns_none(self, tmp_path):
+        assert create_snapshot(tmp_path / "absent.db", tmp_path / "b", "crm.db") is None
+
+    def test_creates_backup_dir(self, tmp_path):
+        src = self._db(tmp_path / "crm.db")
+        out = tmp_path / "nested" / "backups"
+
+        assert create_snapshot(src, out, "crm.db") is not None
+        assert out.is_dir()
+
+    def test_uses_canonical_filename(self, tmp_path):
+        src = self._db(tmp_path / "crm.db")
+        ts = datetime(2026, 8, 13, 3, 30, 0)
+
+        snap = create_snapshot(src, tmp_path / "b", "crm.db", now=ts)
+
+        assert snap.name == backup_filename("crm.db", ts)
+        assert parse_backup_timestamp(snap.name, "crm.db") == ts
+
+    def test_prunes_only_its_own_basename(self, tmp_path):
+        """
+        Retention stays per-database: snapshotting crm.db must not evict
+        interactions.db backups sharing the directory.
+        """
+        src = self._db(tmp_path / "crm.db")
+        out = tmp_path / "backups"
+        out.mkdir()
+        base = datetime(2026, 1, 1)
+        # Clustered a day apart so they share a retention bucket and are
+        # genuinely eligible for pruning; spread out, each would be kept.
+        for i in range(10):
+            _touch_backup(out, "crm.db", base - timedelta(days=400 + i))
+        survivor = _touch_backup(out, "interactions.db", base - timedelta(days=900))
+
+        create_snapshot(src, out, "crm.db", now=base)
+
+        assert survivor.exists()
+        assert len(list(out.glob("crm.db.*.backup"))) < 11
+
+    def test_leaves_manual_backups_alone(self, tmp_path):
+        """Operators drop hand-named files here; retention must not eat them."""
+        src = self._db(tmp_path / "crm.db")
+        out = tmp_path / "backups"
+        out.mkdir()
+        manual = out / "crm.db.pre-junk-entity-purge.backup"
+        manual.touch()
+
+        create_snapshot(src, out, "crm.db")
+
+        assert manual.exists()
