@@ -354,3 +354,59 @@ class TestUntieredRetention:
         prune(tmp_path, "crm.db", policy=DEFAULT_POLICY, now=base)
 
         assert len(list(tmp_path.glob("crm.db.*.backup"))) > 2
+
+
+class TestSnapshotIsSelfContained:
+    """
+    A snapshot must be one file, not three.
+
+    ``Connection.backup`` gives the destination the source's journal_mode, so
+    snapshotting a WAL database produced a .backup plus -wal and -shm. Retention
+    only tracks ``*.backup``, so the sidecars were orphaned the moment their
+    parent was pruned — and a snapshot whose committed pages live in a separate
+    -wal is not safe to copy or restore on its own.
+    """
+
+    @staticmethod
+    def _wal_db(path: Path) -> Path:
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT INTO t (v) VALUES ('committed')")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_no_sidecar_files_are_left_behind(self, tmp_path):
+        out = tmp_path / "b"
+
+        snap = create_snapshot(self._wal_db(tmp_path / "src.db"), out, "src.db")
+
+        assert snap is not None
+        assert not (out / f"{snap.name}-wal").exists()
+        assert not (out / f"{snap.name}-shm").exists()
+        assert [p.name for p in out.iterdir()] == [snap.name]
+
+    def test_snapshot_is_not_in_wal_mode(self, tmp_path):
+        snap = create_snapshot(self._wal_db(tmp_path / "src.db"), tmp_path / "b", "src.db")
+
+        conn = sqlite3.connect(str(snap))
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+        assert mode.lower() != "wal"
+
+    def test_data_survives_the_journal_mode_change(self, tmp_path):
+        snap = create_snapshot(self._wal_db(tmp_path / "src.db"), tmp_path / "b", "src.db")
+
+        conn = sqlite3.connect(str(snap))
+        rows = [r[0] for r in conn.execute("SELECT v FROM t")]
+        conn.close()
+        assert rows == ["committed"]
+
+    def test_verifying_a_snapshot_creates_no_sidecars(self, tmp_path):
+        """Read-only opens of a WAL database still spawn -shm; ours must not."""
+        out = tmp_path / "b"
+        snap = create_snapshot(self._wal_db(tmp_path / "src.db"), out, "src.db")
+
+        assert verify_snapshot(snap) is True
+        assert [p.name for p in out.iterdir()] == [snap.name]

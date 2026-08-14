@@ -270,6 +270,14 @@ def create_snapshot(
         dest = sqlite3.connect(str(backup_path))
         try:
             source.backup(dest)
+            # The snapshot inherits journal_mode from the source, so a WAL-mode
+            # database yields a snapshot that is three files, not one. That is
+            # wrong twice over: retention only tracks ``*.backup`` and would
+            # orphan the -wal/-shm forever, and a snapshot whose committed pages
+            # live in a separate -wal is not safe to copy or restore on its own.
+            # Fold it down to a single self-contained file.
+            dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dest.execute("PRAGMA journal_mode=DELETE")
         finally:
             dest.close()
     finally:
