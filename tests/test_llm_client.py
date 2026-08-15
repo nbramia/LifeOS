@@ -764,6 +764,32 @@ class TestRoutingHelpers:
         assert kwargs["temperature"] == 0.5
 
     @pytest.mark.asyncio
+    async def test_generate_text_with_timeout_uses_routing_url(self, _routing_singleton_reset):
+        """Regression: generate_text's ``timeout is not None`` branch builds a
+        transient LocalLLMClient instead of using the cached routing
+        singleton — that transient client must still be pinned to
+        settings.routing_llm_url, not silently fall back to the default
+        local LLM URL. Two of three routing/validation callers pass a
+        timeout (agent_viz_summary, person_facts), so this branch is the
+        common case, not an edge case."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        fake_instance = MagicMock()
+        fake_resp = MagicMock(text="ok", reasoning_starved=False)
+        fake_instance.acreate = AsyncMock(return_value=fake_resp)
+        with (
+            patch.object(mod, "settings") as mock_settings,
+            patch.object(mod, "LocalLLMClient", return_value=fake_instance) as mock_cls,
+        ):
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            await mod.generate_text("hi", timeout=30)
+
+        kwargs = mock_cls.call_args.kwargs
+        assert kwargs["base_url"] == "http://routing-box:9090"
+        assert kwargs["timeout"] == 30
+
+    @pytest.mark.asyncio
     async def test_generate_text_warns_on_reasoning_starvation(self, _routing_singleton_reset, caplog):
         """generate_text logs a distinct warning when the model burned its
         whole budget on reasoning and returned no answer — otherwise this

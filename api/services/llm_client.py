@@ -984,12 +984,19 @@ async def generate_text(
     """Generate raw text from the local LLM.
 
     Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
-    A per-call ``timeout`` uses a transient client so concurrent default-
-    timeout calls aren't affected. ``enable_thinking``/``reasoning_effort``
-    are forwarded to ``LocalLLMClient.acreate`` unchanged — see
-    ``_reasoning_control_payload``; both default to ``None`` (unset).
+    A per-call ``timeout`` uses a transient client (still pinned to
+    ``settings.routing_llm_url``, same as the cached singleton — a caller
+    passing ``timeout`` must not silently fall back to the main chat model's
+    URL) so concurrent default-timeout calls aren't affected.
+    ``enable_thinking``/``reasoning_effort`` are forwarded to
+    ``LocalLLMClient.acreate`` unchanged — see ``_reasoning_control_payload``;
+    both default to ``None`` (unset).
     """
-    client = LocalLLMClient(timeout=timeout) if timeout is not None else _get_local_routing_client()
+    client = (
+        LocalLLMClient(base_url=settings.routing_llm_url, timeout=timeout)
+        if timeout is not None
+        else _get_local_routing_client()
+    )
     response = await client.acreate(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
