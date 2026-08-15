@@ -58,6 +58,49 @@ def test_local_llm_model_from_env(monkeypatch):
     assert s.local_llm_model == "some-org/qwen3-32b-GGUF"
 
 
+def test_routing_llm_url_falls_back_to_local_llm_url_when_unset(monkeypatch):
+    """Routing target URL defaults to the global local LLM URL when unset, so
+    a fresh clone with no override behaves exactly as today (#566 PR 2)."""
+    monkeypatch.delenv("LIFEOS_LOCAL_ROUTING_LLM_URL", raising=False)
+    monkeypatch.setenv("LIFEOS_LOCAL_LLM_URL", "http://localhost:8080")
+    from config.settings import Settings
+    s = Settings()
+    assert s.routing_llm_url == "http://localhost:8080"
+
+
+def test_routing_llm_url_override(monkeypatch):
+    """An explicit LIFEOS_LOCAL_ROUTING_LLM_URL wins over local_llm_url."""
+    monkeypatch.setenv("LIFEOS_LOCAL_ROUTING_LLM_URL", "http://routing-box:9090")
+    from config.settings import Settings
+    s = Settings()
+    assert s.routing_llm_url == "http://routing-box:9090"
+
+
+def test_routing_llm_model_falls_back_to_local_llm_model_when_unset(monkeypatch):
+    """Routing target model label defaults to the global local LLM model when
+    unset, so a fresh clone with no override behaves exactly as today."""
+    monkeypatch.delenv("LIFEOS_LOCAL_ROUTING_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LIFEOS_LLM_MODEL", "some-org/base-model-GGUF")
+    from config.settings import Settings
+    s = Settings()
+    assert s.routing_llm_model == "some-org/base-model-GGUF"
+
+
+def test_routing_llm_model_override(monkeypatch):
+    """An explicit LIFEOS_LOCAL_ROUTING_LLM_MODEL wins over local_llm_model."""
+    monkeypatch.setenv("LIFEOS_LOCAL_ROUTING_LLM_MODEL", "some-org/other-model-GGUF")
+    from config.settings import Settings
+    s = Settings()
+    assert s.routing_llm_model == "some-org/other-model-GGUF"
+
+
+def test_router_enable_thinking_defaults_true():
+    """Router thinking stays on by default (#566 PR 2 does not flip
+    behaviour) — the eventual flip is a one-line default change here."""
+    from config.settings import Settings
+    assert Settings.model_fields["router_enable_thinking"].default is True
+
+
 def test_specialist_model_default_is_current_alias():
     """#470 regression pin: the specialist-call model must be a model ALIAS,
     never a dated snapshot. The previous pin (claude-sonnet-4-20250514)

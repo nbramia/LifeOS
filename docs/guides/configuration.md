@@ -67,6 +67,18 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 
+### Routing Target and Reasoning Control (#566)
+
+Query routing, fact filtering, and entity-cleanup auto-hide decisions always go through the local llama-server (`_get_local_routing_client`), regardless of `LIFEOS_LLM_BACKEND`. These settings let that routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_LOCAL_ROUTING_LLM_URL` | str | — (falls back to `LIFEOS_LOCAL_LLM_URL`) | Dedicated llama-server endpoint for routing/validation calls. Set only once a distinct routing server is actually running elsewhere. |
+| `LIFEOS_LOCAL_ROUTING_LLM_MODEL` | str | — (falls back to `LIFEOS_LLM_MODEL`) | Informational label for the routing target's model. Not sent in requests — the model actually served is whatever `LIFEOS_LOCAL_ROUTING_LLM_URL` points at. |
+| `LIFEOS_ROUTER_ENABLE_THINKING` | bool | `true` | Whether `query_router`'s LLM routing call requests reasoning from the local model. Measured on the live host: 23-32s/call with thinking on vs. 2-9s with it off, with substantively identical routing decisions. Left `true` (unchanged behaviour) pending a broader correctness A/B — flipping to `false` is a one-line default change once confirmed. |
+
+`LocalLLMClient.create`/`acreate`/`astream` (and the `generate_text`/`generate_json` routing helpers) also accept per-request `enable_thinking` (bool) and `reasoning_effort` (str) keyword arguments, sent as `chat_template_kwargs: {"enable_thinking": ...}` and `reasoning_effort` on the request body. Leaving both unset adds no new keys to the request — existing callers are unaffected.
+
 ## Embedding & Search
 
 Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012](../adr/012-embedding-pipeline.md).
