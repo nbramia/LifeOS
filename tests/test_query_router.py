@@ -72,6 +72,47 @@ class TestQueryRouter:
             assert "keyword" in result.reasoning.lower()
 
     @pytest.mark.asyncio
+    async def test_route_thinking_setting_default_omits_kwarg(self):
+        """settings.router_enable_thinking defaults True ⇒ the router passes
+        enable_thinking=None to generate_text, so the request body stays
+        unchanged from before this setting existed (#566 PR 2)."""
+        from api.services.query_router import QueryRouter
+
+        with (
+            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+            patch(
+                "api.services.query_router.generate_text",
+                AsyncMock(return_value='{"sources": ["vault"], "reasoning": "test"}'),
+            ) as mock_generate_text,
+        ):
+            router = QueryRouter()
+            await router.route("test query")
+            kwargs = mock_generate_text.await_args.kwargs
+            assert kwargs["enable_thinking"] is None
+
+    @pytest.mark.asyncio
+    async def test_route_thinking_disabled_passes_false(self):
+        """When settings.router_enable_thinking is False, the router
+        explicitly requests thinking off — this is the one-line flip a
+        follow-up PR will make once the correctness A/B confirms no
+        regression."""
+        from api.services.query_router import QueryRouter
+
+        with (
+            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+            patch("api.services.query_router.settings") as mock_settings,
+            patch(
+                "api.services.query_router.generate_text",
+                AsyncMock(return_value='{"sources": ["vault"], "reasoning": "test"}'),
+            ) as mock_generate_text,
+        ):
+            mock_settings.router_enable_thinking = False
+            router = QueryRouter()
+            await router.route("test query")
+            kwargs = mock_generate_text.await_args.kwargs
+            assert kwargs["enable_thinking"] is False
+
+    @pytest.mark.asyncio
     async def test_route_includes_latency(self):
         """Router result should include latency measurement."""
         from api.services.query_router import QueryRouter
