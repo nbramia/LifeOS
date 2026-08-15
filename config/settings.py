@@ -309,17 +309,23 @@ class Settings(BaseSettings):
                     "A/B; flip to False to opt in once confirmed."
     )
     local_agent_enable_thinking: bool = Field(
-        default=True,
+        default=False,
         alias="LIFEOS_LOCAL_AGENT_ENABLE_THINKING",
         description="Whether run_agent_loop's tool-round and synthesis calls "
                     "request reasoning/thinking from a LOCAL model (Anthropic "
                     "backend ignores this — see agent_loop._select_client). "
-                    "Default True (current behaviour, unchanged). Measured "
-                    "reasoning starvation on a reasoning-capable local model "
-                    "(Qwen3.8-27B): 4 of 6 questions spent the entire "
-                    "4096-token max_tokens budget on chain-of-thought and "
-                    "returned an empty answer (#567). Flip to False to stop "
-                    "reasoning from starving the answer."
+                    "Default False (#567): measured on the real orchestrator "
+                    "with Gemma 4 26B-A4B, 6 multi-step questions — thinking "
+                    "ON 233.0s mean / 1032 char answers, thinking OFF 72.6s "
+                    "mean / 1714 char answers, 6/6 answered either way. "
+                    "3.2x faster with LONGER answers; time-to-first-token "
+                    "~195s -> ~60s. Answer quality was reviewed side by side "
+                    "on the four most judgement-heavy questions and showed no "
+                    "regression (thinking-off was better on two: it cited "
+                    "task ids and surfaced more recent items). The reasoning "
+                    "budget was crowding out the answer — the same mechanism "
+                    "as the starvation that can empty it entirely on a "
+                    "reasoning-heavy model. Set True to restore reasoning."
     )
 
     @property

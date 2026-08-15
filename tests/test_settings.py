@@ -83,11 +83,16 @@ def test_router_enable_thinking_defaults_true():
     assert Settings.model_fields["router_enable_thinking"].default is True
 
 
-def test_local_agent_enable_thinking_defaults_true():
-    """The orchestrator's local-model thinking control (#567) defaults True —
-    current behaviour, unchanged — mirroring router_enable_thinking (#566)."""
+def test_local_agent_enable_thinking_defaults_false():
+    """The orchestrator's local-model thinking control (#567) defaults False.
+
+    Measured on the real orchestrator (Gemma 4 26B-A4B, 6 multi-step
+    questions): thinking ON 233.0s mean / 1032 char answers vs OFF 72.6s /
+    1714 chars, 6/6 answered either way — 3.2x faster with longer answers and
+    no quality regression on side-by-side review. Pinned so the default can't
+    drift back silently."""
     from config.settings import Settings
-    assert Settings.model_fields["local_agent_enable_thinking"].default is True
+    assert Settings.model_fields["local_agent_enable_thinking"].default is False
 
 
 def test_specialist_model_default_is_current_alias():
