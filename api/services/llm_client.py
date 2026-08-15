@@ -43,6 +43,23 @@ class LLMResponse:
     model: str = ""
     finish_reason: str = ""
     tool_calls: list[dict] | None = None
+    reasoning: str = ""
+
+    @property
+    def reasoning_starved(self) -> bool:
+        """True when the model spent its whole token budget on reasoning and
+        never got to an answer.
+
+        Reasoning-capable models (e.g. Gemma 4 26B-A4B via llama-server) can
+        return chain-of-thought separately from the answer — via a dedicated
+        ``reasoning_content`` field or inline ``<think>...</think>`` tags —
+        both stripped into ``reasoning`` by ``_parse_response``. If the token
+        budget runs out before the model reaches its answer, ``text`` ends up
+        empty with ``finish_reason == "length"``, which is otherwise
+        indistinguishable from a legitimate empty response. Computed rather
+        than stored so it can't drift out of sync with the fields it reads.
+        """
+        return not self.text and bool(self.reasoning) and self.finish_reason == "length"
 
 
 def _anthropic_tools_to_openai(tools: list[dict]) -> list[dict]:
@@ -99,6 +116,142 @@ class _ToolUseBlock:
     name: str
     input: dict
     type: str = "tool_use"
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _extract_inline_thinking(content: str) -> tuple[str, str]:
+    """Strip a leading inline ``<think>...</think>`` reasoning prefix out of
+    ``content``.
+
+    Reasoning is always a PREFIX of the response, never mid-text — a real
+    reasoning block opens at the very start of the content (modulo leading
+    whitespace). A ``<think>``/``</think>`` pair appearing after ordinary
+    prose (e.g. a user asking about the tag itself) is just text and is left
+    completely alone.
+
+    Returns ``(content, reasoning)``. Two cases open a reasoning prefix:
+
+    1. ``content`` starts with ``<think>`` (after stripping leading
+       whitespace): everything up to the matching ``</think>`` is reasoning,
+       or — if the tag is never closed (the response ran out of tokens
+       mid-thought) — everything to the end of the string.
+    2. ``content`` has no leading ``<think>`` but contains a ``</think>``
+       with no ``<think>`` anywhere before it: many llama.cpp jinja
+       templates pre-fill the opening ``<think>`` into the *prompt* rather
+       than the model's output, so the model emits only the closing tag.
+       Everything before that first ``</think>`` is reasoning; everything
+       after is the answer.
+
+    If neither case applies, ``content`` is returned completely untouched
+    (no ``.strip()``, nothing) so ordinary non-reasoning responses are
+    byte-for-byte unchanged.
+    """
+    if not content:
+        return content, ""
+
+    stripped = content.lstrip()
+    if stripped.startswith(_THINK_OPEN):
+        after_open = stripped[len(_THINK_OPEN):]
+        close_idx = after_open.find(_THINK_CLOSE)
+        if close_idx == -1:
+            return "", after_open.strip()
+        return after_open[close_idx + len(_THINK_CLOSE):].strip(), after_open[:close_idx].strip()
+
+    close_idx = content.find(_THINK_CLOSE)
+    if close_idx != -1:
+        open_idx = content.find(_THINK_OPEN)
+        if open_idx == -1 or open_idx > close_idx:
+            return content[close_idx + len(_THINK_CLOSE):].strip(), content[:close_idx].strip()
+
+    return content, ""
+
+
+def _split_reasoning(content: str, reasoning_field: str) -> tuple[str, str]:
+    """Combine a dedicated ``reasoning_content`` field with any inline
+    ``<think>...</think>`` tags found in ``content`` into one reasoning
+    string, separate from the answer text.
+    """
+    content, inline_reasoning = _extract_inline_thinking(content or "")
+    parts = [p for p in (reasoning_field or "", inline_reasoning) if p]
+    return content, "\n\n".join(parts)
+
+
+def _longest_partial_tag_suffix(buffer: str, tag: str) -> int:
+    """Length of the longest suffix of ``buffer`` that could be the start of
+    ``tag`` — i.e. a tag possibly split across two stream chunks."""
+    max_len = min(len(buffer), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if tag.startswith(buffer[-length:]):
+            return length
+    return 0
+
+
+# Phase values for _consume_think_stream's state machine:
+#   "undetermined" — not yet known whether the stream opens with a leading
+#     <think>. Bounded to at most len("<think>") - 1 = 6 buffered characters:
+#     as soon as the leading non-whitespace text stops being a viable prefix
+#     of "<think>", it's ruled out and we go straight to passthrough.
+#   "in_think"     — inside a leading <think>...</think> block.
+#   "passthrough"  — resolved: no reasoning prefix (or the prefix has already
+#     closed). Everything from here on, tags included, is emitted verbatim —
+#     a tag appearing later in the stream is just text, never reasoning.
+#
+# Unlike _extract_inline_thinking (the non-streaming path), this does NOT
+# also detect a closing-only "</think>" with no preceding opener. Measured
+# against the live llama-server deployment (Gemma 4 26B-A4B, --jinja,
+# default --reasoning-format): a real streamed request produced 281
+# reasoning_content deltas and 0 occurrences of "<think>"/"</think>" in any
+# content delta. llama.cpp's reasoning-format parser pulls chain-of-thought
+# into the dedicated reasoning_content channel before it ever reaches
+# content, so on this deployment inline reasoning tags simply don't occur in
+# the stream. Handling the closing-only case here would mean buffering
+# either indefinitely or behind an arbitrary cap on every single streamed
+# turn — a real, visible latency cost — to guard against a case this server
+# doesn't produce. The non-streaming path keeps handling it (no latency
+# cost there, and it's still reachable: a different server, a
+# --reasoning-format none config, or a non-streaming client).
+
+
+def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
+    """Incrementally resolve a growing streamed text buffer against the
+    leading-reasoning-prefix rule used by ``_extract_inline_thinking``,
+    restricted to the leading-``<think>`` case (see module note above for
+    why the closing-only case is intentionally not handled here).
+
+    Returns ``(emit_text, phase, remainder)``: ``emit_text`` is safe to
+    yield to the caller now; ``remainder`` must be carried over to the next
+    chunk (e.g. a ``<think>``/``</think>`` tag split across two chunks isn't
+    fully visible yet, so it's held back rather than emitted or discarded).
+    """
+    if phase == "passthrough":
+        return buffer, phase, ""
+
+    if phase == "in_think":
+        idx = buffer.find(_THINK_CLOSE)
+        if idx == -1:
+            keep = _longest_partial_tag_suffix(buffer, _THINK_CLOSE)
+            return "", phase, (buffer[-keep:] if keep else "")
+        return buffer[idx + len(_THINK_CLOSE):], "passthrough", ""
+
+    # phase == "undetermined"
+    stripped = buffer.lstrip()
+    if stripped.startswith(_THINK_OPEN):
+        after_open = stripped[len(_THINK_OPEN):]
+        idx = after_open.find(_THINK_CLOSE)
+        if idx == -1:
+            return "", "in_think", after_open
+        return after_open[idx + len(_THINK_CLOSE):], "passthrough", ""
+    if not stripped or _THINK_OPEN.startswith(stripped):
+        # All whitespace so far, or still a viable prefix of "<think>" —
+        # keep waiting to see it confirmed or ruled out.
+        return "", "undetermined", buffer
+
+    # Ruled out — this stream does not open with "<think>". Resolve
+    # immediately and stream in real time from here on.
+    return buffer, "passthrough", ""
 
 
 class LocalLLMClient:
@@ -305,6 +458,18 @@ class LocalLLMClient:
             {"type": "text", "content": "..."}     — text delta
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
+
+        Reasoning models may inline chain-of-thought as a leading
+        <think>...</think> prefix in the content delta. That's buffered and
+        stripped below via _consume_think_stream (never yielded as text); a
+        <think>/</think> appearing later, mid-answer, is left alone since
+        reasoning is only ever a leading prefix. _consume_think_stream does
+        NOT also handle a closing-only "</think>" with no preceding opener
+        (see its module-level comment) — on this deployment reasoning
+        arrives via the separate ``reasoning_content`` delta field instead,
+        which is simply not read here, so it never reaches a "text" event
+        either. No consumer needs the reasoning text itself, so unlike
+        _parse_response it isn't reassembled or surfaced here.
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
@@ -325,6 +490,8 @@ class LocalLLMClient:
         ) as resp:
             resp.raise_for_status()
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
+            think_buffer = ""  # holds text not yet resolved against the reasoning-prefix rule
+            think_phase = "undetermined"
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -342,9 +509,15 @@ class LocalLLMClient:
                 delta = choices[0].get("delta", {})
                 finish_reason = choices[0].get("finish_reason")
 
-                # Text content
+                # Text content — strip a leading <think>...</think> reasoning
+                # prefix before it reaches a "text" event (delta.reasoning_content,
+                # the other place reasoning shows up, is intentionally never
+                # read here, so it can't leak either).
                 if delta.get("content"):
-                    yield {"type": "text", "content": delta["content"]}
+                    think_buffer += delta["content"]
+                    emit_text, think_phase, think_buffer = _consume_think_stream(think_buffer, think_phase)
+                    if emit_text:
+                        yield {"type": "text", "content": emit_text}
 
                 # Tool calls (streamed incrementally)
                 if delta.get("tool_calls"):
@@ -366,6 +539,18 @@ class LocalLLMClient:
                             acc["function"]["arguments"] += func_delta["arguments"]
 
                 if finish_reason:
+                    # Flush whatever's left in the buffer — unless it's an
+                    # unterminated <think> (truncated mid-thought), which is
+                    # reasoning, not an answer, so it's discarded rather than
+                    # leaked as text. A buffer still "undetermined" at this
+                    # point never resolved into a reasoning prefix at all (no
+                    # <think>, no </think> ever showed up), so per the
+                    # leading-prefix rule it's just ordinary text and is
+                    # flushed rather than dropped.
+                    if think_buffer and think_phase != "in_think":
+                        yield {"type": "text", "content": think_buffer}
+                    think_buffer = ""
+
                     usage_data = chunk.get("usage", {})
                     usage = LLMUsage(
                         input_tokens=usage_data.get("prompt_tokens", 0),
@@ -391,8 +576,13 @@ class LocalLLMClient:
         if message.get("tool_calls"):
             tool_calls = message["tool_calls"]
 
+        text, reasoning = _split_reasoning(
+            message.get("content", "") or "",
+            message.get("reasoning_content", "") or "",
+        )
+
         return LLMResponse(
-            text=message.get("content", "") or "",
+            text=text,
             usage=LLMUsage(
                 input_tokens=usage_data.get("prompt_tokens", 0),
                 output_tokens=usage_data.get("completion_tokens", 0),
@@ -401,6 +591,7 @@ class LocalLLMClient:
             model=data.get("model", ""),
             finish_reason=choice.get("finish_reason", ""),
             tool_calls=tool_calls,
+            reasoning=reasoning,
         )
 
     def is_available(self) -> bool:
@@ -758,6 +949,13 @@ async def generate_text(
         max_tokens=max_tokens,
         temperature=temperature,
     )
+    if response.reasoning_starved:
+        logger.warning(
+            "LLM reasoning starved the response: spent the entire %d-token budget "
+            "on chain-of-thought and returned no answer (finish_reason=length). "
+            "Consider raising max_tokens. reasoning=%r",
+            max_tokens, response.reasoning[:200],
+        )
     return response.text or ""
 
 

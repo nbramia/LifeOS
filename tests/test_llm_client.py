@@ -4,6 +4,8 @@ Tests for the unified LLM client.
 Covers tool format translation, message conversion, response parsing,
 and singleton/backend switching behavior.
 """
+import json
+
 import pytest
 from unittest.mock import patch
 
@@ -291,6 +293,173 @@ class TestParseResponse:
         assert resp.text == ""
         assert resp.tool_calls is None
 
+    def test_plain_response_unaffected_by_reasoning_handling(self):
+        """A response with no reasoning_content and no <think> tags is
+        byte-for-byte unchanged — no stripping, no whitespace changes."""
+        client = self._client()
+        data = {
+            "choices": [{"message": {"content": "  Hello!  \n"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == "  Hello!  \n"
+        assert resp.reasoning == ""
+        assert resp.reasoning_starved is False
+
+    def test_reasoning_content_field_kept_separate(self):
+        """A dedicated reasoning_content field is exposed on .reasoning, never
+        merged into .text."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {
+                    "content": "The answer is 42.",
+                    "reasoning_content": "Let me think... 6 * 7 = 42.",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == "The answer is 42."
+        assert resp.reasoning == "Let me think... 6 * 7 = 42."
+
+    def test_inline_think_tag_stripped(self):
+        """Inline <think>...</think> in content is stripped out and routed to
+        .reasoning instead."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "<think>6 * 7 = 42</think>The answer is 42."},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == "The answer is 42."
+        assert resp.reasoning == "6 * 7 = 42"
+
+    def test_unterminated_think_tag_truncation(self):
+        """An unterminated <think> (response truncated mid-thought) has
+        everything from the tag onward treated as reasoning, not answer text."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "<think>still working through the mat"},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2048, "total_tokens": 2058},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == ""
+        assert resp.reasoning == "still working through the mat"
+
+    def test_reasoning_starved_true_when_budget_exhausted_on_reasoning(self):
+        """reasoning_starved distinguishes 'ran out of budget mid-thought'
+        from a legitimate empty answer."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "", "reasoning_content": "Thinking very hard..."},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2048, "total_tokens": 2058},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == ""
+        assert resp.reasoning == "Thinking very hard..."
+        assert resp.reasoning_starved is True
+
+    def test_reasoning_starved_false_for_legitimate_empty_answer(self):
+        """A genuinely empty response (no reasoning at all) is NOT flagged as
+        reasoning-starved."""
+        client = self._client()
+        data = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == ""
+        assert resp.reasoning_starved is False
+
+    def test_reasoning_starved_false_when_finish_reason_is_stop(self):
+        """Reasoning present but finish_reason=stop (not length) — the model
+        chose to answer with nothing, this isn't budget starvation."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "", "reasoning_content": "hmm"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.reasoning_starved is False
+
+    def test_closing_only_think_tag_leaks_no_reasoning(self):
+        """Finding 1 (CRITICAL): many llama.cpp jinja templates pre-fill the
+        opening <think> into the prompt, so the model emits only a closing
+        </think>. Everything before it is reasoning; everything after is the
+        answer — none of the reasoning should leak into .text."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {
+                    "content": 'internal reasoning\n</think>{"sources":["calendar"],"reasoning":"ok"}',
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == '{"sources":["calendar"],"reasoning":"ok"}'
+        assert resp.reasoning == "internal reasoning"
+        assert "internal reasoning" not in resp.text
+
+    def test_literal_think_tag_in_legitimate_content_untouched(self):
+        """Finding 2 (MAJOR): a literal <think>...</think> pair appearing
+        after ordinary prose (not at the start of the response) is just text
+        a user is asking about — it must not be corrupted or split into
+        .reasoning."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "Use `<think>draft</think>` as the example tag."},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == "Use `<think>draft</think>` as the example tag."
+        assert resp.reasoning == ""
+
+    def test_reasoning_starved_true_for_closing_only_truncation(self):
+        """Finding 3 (MAJOR): a closing-only <think> block that consumed the
+        whole token budget must be flagged as reasoning_starved, same as the
+        full-pair case."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "long hidden reasoning\n</think>"},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2048, "total_tokens": 2058},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == ""
+        assert resp.reasoning == "long hidden reasoning"
+        assert resp.reasoning_starved is True
+
 
 # ---- Singleton ----
 
@@ -429,6 +598,48 @@ class TestRoutingHelpers:
         assert kwargs["temperature"] == 0.5
 
     @pytest.mark.asyncio
+    async def test_generate_text_warns_on_reasoning_starvation(self, _routing_singleton_reset, caplog):
+        """generate_text logs a distinct warning when the model burned its
+        whole budget on reasoning and returned no answer — otherwise this
+        failure mode is silent (query_router falls through to a generic
+        failure path with no clue why)."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+        from api.services.llm_client import LLMResponse, LLMUsage
+        mod = _routing_singleton_reset
+
+        starved_resp = LLMResponse(
+            text="",
+            usage=LLMUsage(),
+            finish_reason="length",
+            reasoning="thinking forever...",
+        )
+        fake_client = MagicMock()
+        fake_client.acreate = AsyncMock(return_value=starved_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
+            with caplog.at_level(logging.WARNING, logger="api.services.llm_client"):
+                text = await mod.generate_text("hi", max_tokens=10)
+        assert text == ""
+        assert any("reasoning starved" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_generate_text_no_warning_for_normal_response(self, _routing_singleton_reset, caplog):
+        """A normal, non-starved response logs no reasoning warning."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+        from api.services.llm_client import LLMResponse, LLMUsage
+        mod = _routing_singleton_reset
+
+        normal_resp = LLMResponse(text="42", usage=LLMUsage(), finish_reason="stop")
+        fake_client = MagicMock()
+        fake_client.acreate = AsyncMock(return_value=normal_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
+            with caplog.at_level(logging.WARNING, logger="api.services.llm_client"):
+                text = await mod.generate_text("hi", max_tokens=10)
+        assert text == "42"
+        assert not any("reasoning starved" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_generate_json_extracts(self, _routing_singleton_reset):
         """generate_json should parse the JSON object from the LLM response."""
         from unittest.mock import AsyncMock
@@ -480,6 +691,8 @@ class TestDataClasses:
         assert resp.model == ""
         assert resp.finish_reason == ""
         assert resp.tool_calls is None
+        assert resp.reasoning == ""
+        assert resp.reasoning_starved is False
 
     def test_llm_usage_cache_fields_default_zero(self):
         """Cache-token fields default to 0 (only populated on the Anthropic backend)."""
@@ -487,6 +700,206 @@ class TestDataClasses:
         usage = LLMUsage()
         assert usage.cache_creation_input_tokens == 0
         assert usage.cache_read_input_tokens == 0
+
+
+# ---- LocalLLMClient.astream reasoning handling ----
+
+
+class _FakeSSEResponse:
+    """Mimics the httpx streaming response astream() reads from."""
+
+    def __init__(self, chunks: list[dict]):
+        # Each chunk is serialized as its own "data: ..." SSE line, followed
+        # by a final "data: [DONE]" sentinel, matching llama-server's format.
+        self._lines = [f"data: {json.dumps(c)}" for c in chunks] + ["data: [DONE]"]
+
+    def raise_for_status(self):
+        pass
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _FakeStreamCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeAsyncClient:
+    """Stand-in for httpx.AsyncClient — only implements what astream() calls."""
+
+    def __init__(self, resp):
+        self.is_closed = False
+        self._resp = resp
+
+    def stream(self, method, url, **kwargs):
+        return _FakeStreamCtx(self._resp)
+
+
+def _done_chunk(finish_reason="stop", completion_tokens=1):
+    return {
+        "choices": [{"delta": {}, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": completion_tokens, "total_tokens": completion_tokens + 1},
+    }
+
+
+class TestAStreamReasoning:
+    """Tests for LocalLLMClient.astream()'s reasoning handling."""
+
+    def _client_with_chunks(self, chunks: list[dict]):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080")
+        client._async_client = _FakeAsyncClient(_FakeSSEResponse(chunks))
+        return client
+
+    @pytest.mark.asyncio
+    async def test_plain_stream_unaffected(self):
+        """A normal, non-reasoning stream is unaffected — every content delta
+        is yielded as text, in order."""
+        chunks = [
+            {"choices": [{"delta": {"content": "Hello"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": ", world!"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "Hello, world!"
+        done = next(e for e in events if e["type"] == "done")
+        assert done["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_content_delta_never_surfaced_as_text(self):
+        """A delta carrying only reasoning_content (no content) never becomes
+        a text event."""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "hmm, let's see..."}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text_events = [e for e in events if e["type"] == "text"]
+        assert len(text_events) == 1
+        assert text_events[0]["content"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_inline_think_tag_split_across_chunks_is_stripped(self):
+        """<think>...</think> split across multiple content deltas is still
+        fully stripped — only text outside the tag reaches "text" events."""
+        chunks = [
+            {"choices": [{"delta": {"content": "<thi"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "nk>reasoning here"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "</thi"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "nk>The answer is 42."}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "The answer is 42."
+        assert "reasoning here" not in text
+        assert "<think>" not in text and "</think>" not in text
+
+    @pytest.mark.asyncio
+    async def test_unterminated_think_tag_at_truncation_not_leaked(self):
+        """An unterminated <think> at the end of the stream (truncated by
+        max_tokens) is discarded rather than flushed as text."""
+        chunks = [
+            {"choices": [{"delta": {"content": "<think>still reasoning"}, "finish_reason": None}]},
+            _done_chunk(finish_reason="length", completion_tokens=2048),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text_events = [e for e in events if e["type"] == "text"]
+        assert text_events == []
+        done = next(e for e in events if e["type"] == "done")
+        assert done["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_literal_angle_bracket_in_text_not_swallowed(self):
+        """Ordinary text containing '<' (not part of a <think> tag) still
+        reaches the caller in full once the stream ends."""
+        chunks = [
+            {"choices": [{"delta": {"content": "5 < 10 is true"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "5 < 10 is true"
+
+    @pytest.mark.asyncio
+    async def test_closing_only_think_tag_is_not_stripped_in_streaming_path(self):
+        """Streaming intentionally does NOT handle a closing-only </think>
+        (no preceding opener), unlike the non-streaming path.
+
+        Measured against the live llama-server deployment: a real streamed
+        request produced 281 reasoning_content deltas and 0 occurrences of
+        <think>/</think> in any content delta — llama.cpp's reasoning-format
+        parser pulls chain-of-thought into the dedicated reasoning_content
+        channel before it reaches content, so this shape does not occur in
+        the stream on this deployment. Buffering to catch it anyway (behind
+        a cap, or indefinitely) would cost real, visible latency on every
+        streamed turn to guard a case that never happens. So this content
+        passes through unstripped, letter for letter, rather than being
+        held back — documenting the deliberate scope narrowing, not a
+        regression. (_parse_response — the non-streaming path — still
+        strips this shape; see TestParseResponse.
+        test_closing_only_think_tag_leaks_no_reasoning.)"""
+        chunks = [
+            {"choices": [{"delta": {"content": "internal"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " reasoning</thi"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "nk>answer"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "internal reasoning</think>answer"
+
+    @pytest.mark.asyncio
+    async def test_literal_think_tag_in_stream_not_corrupted(self):
+        """Finding 2 (MAJOR), streaming version: a literal <think>...</think>
+        pair after ordinary prose (not a leading prefix) must reach the
+        caller untouched, not be split into reasoning."""
+        chunks = [
+            {"choices": [{"delta": {"content": "Use `<think>draft</think>`"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " as the example tag."}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "Use `<think>draft</think>` as the example tag."
+
+    @pytest.mark.asyncio
+    async def test_normal_answer_first_delta_emitted_immediately(self):
+        """A normal (non-reasoning) answer's first content delta is emitted
+        as its own "text" event right away — not buffered pending a later
+        chunk or the end of the stream. This is the latency regression that
+        matters in practice: a delta whose leading characters aren't even a
+        possible prefix of "<think>" is ruled out and streamed in real time,
+        with no cap or indefinite hold."""
+        chunks = [
+            {"choices": [{"delta": {"content": "The answer is 42."}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " Anything else?"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = []
+        async for e in client.astream([{"role": "user", "content": "hi"}]):
+            events.append(e)
+            if e["type"] == "text":
+                break
+        assert events[0] == {"type": "text", "content": "The answer is 42."}
 
 
 # ---- Anthropic prompt caching (#383 Phase 1) ----
