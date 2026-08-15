@@ -403,6 +403,63 @@ class TestParseResponse:
         resp = client._parse_response(data)
         assert resp.reasoning_starved is False
 
+    def test_closing_only_think_tag_leaks_no_reasoning(self):
+        """Finding 1 (CRITICAL): many llama.cpp jinja templates pre-fill the
+        opening <think> into the prompt, so the model emits only a closing
+        </think>. Everything before it is reasoning; everything after is the
+        answer — none of the reasoning should leak into .text."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {
+                    "content": 'internal reasoning\n</think>{"sources":["calendar"],"reasoning":"ok"}',
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == '{"sources":["calendar"],"reasoning":"ok"}'
+        assert resp.reasoning == "internal reasoning"
+        assert "internal reasoning" not in resp.text
+
+    def test_literal_think_tag_in_legitimate_content_untouched(self):
+        """Finding 2 (MAJOR): a literal <think>...</think> pair appearing
+        after ordinary prose (not at the start of the response) is just text
+        a user is asking about — it must not be corrupted or split into
+        .reasoning."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "Use `<think>draft</think>` as the example tag."},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == "Use `<think>draft</think>` as the example tag."
+        assert resp.reasoning == ""
+
+    def test_reasoning_starved_true_for_closing_only_truncation(self):
+        """Finding 3 (MAJOR): a closing-only <think> block that consumed the
+        whole token budget must be flagged as reasoning_starved, same as the
+        full-pair case."""
+        client = self._client()
+        data = {
+            "choices": [{
+                "message": {"content": "long hidden reasoning\n</think>"},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2048, "total_tokens": 2058},
+            "model": "local",
+        }
+        resp = client._parse_response(data)
+        assert resp.text == ""
+        assert resp.reasoning == "long hidden reasoning"
+        assert resp.reasoning_starved is True
+
 
 # ---- Singleton ----
 
@@ -778,6 +835,61 @@ class TestAStreamReasoning:
         events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
         text = "".join(e["content"] for e in events if e["type"] == "text")
         assert text == "5 < 10 is true"
+
+    @pytest.mark.asyncio
+    async def test_closing_only_think_tag_split_across_chunks_is_stripped(self):
+        """Finding 1 (CRITICAL), streaming version: a template pre-fills
+        <think> into the prompt so the model emits only a closing </think>,
+        with the tag itself split across chunk boundaries. Nothing can be
+        emitted until it's known whether a </think> is coming, so the first
+        chunks must be buffered rather than leaked as text."""
+        chunks = [
+            {"choices": [{"delta": {"content": "internal"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " reasoning</thi"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "nk>answer"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "answer"
+        assert "internal" not in text
+        assert "reasoning" not in text
+
+    @pytest.mark.asyncio
+    async def test_literal_think_tag_in_stream_not_corrupted(self):
+        """Finding 2 (MAJOR), streaming version: a literal <think>...</think>
+        pair after ordinary prose (not a leading prefix) must reach the
+        caller untouched, not be split into reasoning."""
+        chunks = [
+            {"choices": [{"delta": {"content": "Use `<think>draft</think>`"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " as the example tag."}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "Use `<think>draft</think>` as the example tag."
+
+    @pytest.mark.asyncio
+    async def test_undetermined_cap_flushes_normal_long_answer(self):
+        """A normal (non-reasoning) answer that never contains a think tag
+        isn't held back for the entire stream — once the undetermined buffer
+        exceeds the cap, it's flushed and streaming resumes in real time."""
+        from api.services.llm_client import _THINK_STREAM_UNDETERMINED_CAP
+        long_text = "x" * (_THINK_STREAM_UNDETERMINED_CAP + 50)
+        chunks = [
+            {"choices": [{"delta": {"content": long_text}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " more"}, "finish_reason": None}]},
+            _done_chunk(),
+        ]
+        client = self._client_with_chunks(chunks)
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text_events = [e for e in events if e["type"] == "text"]
+        # Flushed before the final "done" — i.e. resolved mid-stream, not
+        # held back until the stream ended.
+        assert len(text_events) >= 2
+        assert "".join(e["content"] for e in text_events) == long_text + " more"
 
 
 # ---- Anthropic prompt caching (#383 Phase 1) ----

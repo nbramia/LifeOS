@@ -120,40 +120,53 @@ class _ToolUseBlock:
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_THINK_BLOCK_RE = re.compile(re.escape(_THINK_OPEN) + r"(.*?)" + re.escape(_THINK_CLOSE), re.DOTALL)
 
 
 def _extract_inline_thinking(content: str) -> tuple[str, str]:
-    """Strip inline ``<think>...</think>`` blocks out of ``content``.
+    """Strip a leading inline ``<think>...</think>`` reasoning prefix out of
+    ``content``.
 
-    Returns ``(content, reasoning)``. If no ``<think>`` tag is present at
-    all, ``content`` is returned completely untouched (no ``.strip()``,
-    nothing) so ordinary non-reasoning responses are byte-for-byte unchanged.
+    Reasoning is always a PREFIX of the response, never mid-text — a real
+    reasoning block opens at the very start of the content (modulo leading
+    whitespace). A ``<think>``/``</think>`` pair appearing after ordinary
+    prose (e.g. a user asking about the tag itself) is just text and is left
+    completely alone.
 
-    Handles a truncated, unterminated ``<think>`` (the response ran out of
-    tokens mid-thought) by treating everything from that tag to the end of
-    the string as reasoning rather than leaking a fragment into the answer.
+    Returns ``(content, reasoning)``. Two cases open a reasoning prefix:
+
+    1. ``content`` starts with ``<think>`` (after stripping leading
+       whitespace): everything up to the matching ``</think>`` is reasoning,
+       or — if the tag is never closed (the response ran out of tokens
+       mid-thought) — everything to the end of the string.
+    2. ``content`` has no leading ``<think>`` but contains a ``</think>``
+       with no ``<think>`` anywhere before it: many llama.cpp jinja
+       templates pre-fill the opening ``<think>`` into the *prompt* rather
+       than the model's output, so the model emits only the closing tag.
+       Everything before that first ``</think>`` is reasoning; everything
+       after is the answer.
+
+    If neither case applies, ``content`` is returned completely untouched
+    (no ``.strip()``, nothing) so ordinary non-reasoning responses are
+    byte-for-byte unchanged.
     """
-    reasoning_parts = []
-    matched = False
-
-    def _collect(m: re.Match) -> str:
-        nonlocal matched
-        matched = True
-        reasoning_parts.append(m.group(1))
-        return ""
-
-    remaining = _THINK_BLOCK_RE.sub(_collect, content)
-
-    open_idx = remaining.find(_THINK_OPEN)
-    if open_idx != -1:
-        matched = True
-        reasoning_parts.append(remaining[open_idx + len(_THINK_OPEN):])
-        remaining = remaining[:open_idx]
-
-    if not matched:
+    if not content:
         return content, ""
-    return remaining.strip(), "\n\n".join(p.strip() for p in reasoning_parts if p.strip())
+
+    stripped = content.lstrip()
+    if stripped.startswith(_THINK_OPEN):
+        after_open = stripped[len(_THINK_OPEN):]
+        close_idx = after_open.find(_THINK_CLOSE)
+        if close_idx == -1:
+            return "", after_open.strip()
+        return after_open[close_idx + len(_THINK_CLOSE):].strip(), after_open[:close_idx].strip()
+
+    close_idx = content.find(_THINK_CLOSE)
+    if close_idx != -1:
+        open_idx = content.find(_THINK_OPEN)
+        if open_idx == -1 or open_idx > close_idx:
+            return content[close_idx + len(_THINK_CLOSE):].strip(), content[:close_idx].strip()
+
+    return content, ""
 
 
 def _split_reasoning(content: str, reasoning_field: str) -> tuple[str, str]:
@@ -176,36 +189,78 @@ def _longest_partial_tag_suffix(buffer: str, tag: str) -> int:
     return 0
 
 
-def _consume_think_stream(buffer: str, in_think: bool) -> tuple[str, bool, str]:
-    """Incrementally strip ``<think>...</think>`` out of a growing streamed
-    text buffer.
+# Bound on how much leading, unresolved text astream() will buffer before
+# concluding a stream carries no reasoning prefix at all (see
+# _consume_think_stream). Chosen as a middle ground: a template-pre-filled
+# ("closing-only") reasoning preamble is typically a sentence or two — well
+# under this — before the model reaches its `</think>`, so real reasoning
+# gets buffered off screen as intended. A normal, non-reasoning answer that
+# never mentions either tag is held back at most this many characters before
+# streaming resumes in real time, rather than for the rest of the response.
+_THINK_STREAM_UNDETERMINED_CAP = 1000
 
-    Returns ``(emit_text, in_think, remainder)``: ``emit_text`` is safe to
+# Phase values for _consume_think_stream's state machine:
+#   "undetermined" — not yet known whether the stream opens with a reasoning
+#     prefix (a leading <think>, or a closing-only </think> left behind by a
+#     template that pre-filled the opener into the prompt instead of the
+#     model's output).
+#   "in_think"     — inside a leading <think>...</think> block.
+#   "passthrough"  — resolved: no reasoning prefix (or the prefix has already
+#     closed). Everything from here on, tags included, is emitted verbatim —
+#     a tag appearing later in the stream is just text, never reasoning.
+
+
+def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
+    """Incrementally resolve a growing streamed text buffer against the
+    leading-reasoning-prefix rule used by ``_extract_inline_thinking``.
+
+    Returns ``(emit_text, phase, remainder)``: ``emit_text`` is safe to
     yield to the caller now; ``remainder`` must be carried over to the next
     chunk (e.g. a ``<think>``/``</think>`` tag split across two chunks isn't
     fully visible yet, so it's held back rather than emitted or discarded).
     """
-    emit_parts = []
-    while True:
-        if in_think:
-            idx = buffer.find(_THINK_CLOSE)
+    if phase == "passthrough":
+        return buffer, phase, ""
+
+    if phase == "in_think":
+        idx = buffer.find(_THINK_CLOSE)
+        if idx == -1:
+            keep = _longest_partial_tag_suffix(buffer, _THINK_CLOSE)
+            return "", phase, (buffer[-keep:] if keep else "")
+        return buffer[idx + len(_THINK_CLOSE):], "passthrough", ""
+
+    # phase == "undetermined"
+    stripped = buffer.lstrip()
+    if stripped:
+        if stripped.startswith(_THINK_OPEN):
+            after_open = stripped[len(_THINK_OPEN):]
+            idx = after_open.find(_THINK_CLOSE)
             if idx == -1:
-                keep = _longest_partial_tag_suffix(buffer, _THINK_CLOSE)
-                buffer = buffer[-keep:] if keep else ""
-                break
-            buffer = buffer[idx + len(_THINK_CLOSE):]
-            in_think = False
-        else:
-            idx = buffer.find(_THINK_OPEN)
-            if idx == -1:
-                keep = _longest_partial_tag_suffix(buffer, _THINK_OPEN)
-                emit_parts.append(buffer[:len(buffer) - keep] if keep else buffer)
-                buffer = buffer[-keep:] if keep else ""
-                break
-            emit_parts.append(buffer[:idx])
-            buffer = buffer[idx + len(_THINK_OPEN):]
-            in_think = True
-    return "".join(emit_parts), in_think, buffer
+                return "", "in_think", after_open
+            return after_open[idx + len(_THINK_CLOSE):], "passthrough", ""
+        if _THINK_OPEN.startswith(stripped):
+            # Still a viable prefix of "<think>" — keep waiting to see it
+            # confirmed or ruled out.
+            return "", "undetermined", buffer
+
+    # Ruled out a leading "<think>", but a template may have pre-filled the
+    # opener into the prompt, in which case the model's entire output up to
+    # the first "</think>" is reasoning with no opening tag at all. Keep
+    # watching for that until it resolves or the cap trips.
+    idx = buffer.find(_THINK_CLOSE)
+    if idx != -1:
+        open_idx = buffer.find(_THINK_OPEN)
+        if open_idx == -1 or open_idx > idx:
+            return buffer[idx + len(_THINK_CLOSE):], "passthrough", ""
+        # A "<think>" appears before this "</think>" — a literal pair in
+        # ordinary prose, not a closing-only reasoning prefix. Not
+        # reasoning; flush as-is and stop watching for tags.
+        return buffer, "passthrough", ""
+
+    if len(buffer) >= _THINK_STREAM_UNDETERMINED_CAP:
+        return buffer, "passthrough", ""
+
+    return "", "undetermined", buffer
 
 
 class LocalLLMClient:
@@ -413,12 +468,17 @@ class LocalLLMClient:
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
 
-        Reasoning models may inline chain-of-thought as <think>...</think>
-        tags in the content delta (buffered and stripped below — never
-        yielded as text), or as a separate ``reasoning_content`` delta field
-        (simply not read, so it never reaches a "text" event either). No
-        consumer needs the reasoning text itself, so unlike _parse_response
-        it isn't reassembled or surfaced here.
+        Reasoning models may inline chain-of-thought as a leading
+        <think>...</think> prefix in the content delta — either a full pair,
+        or (when a template pre-fills the opener into the prompt) a bare
+        closing tag with no opener at all. Either shape is buffered and
+        stripped below via _consume_think_stream (never yielded as text); a
+        <think>/</think> appearing later, mid-answer, is left alone since
+        reasoning is only ever a leading prefix. Reasoning may also arrive as
+        a separate ``reasoning_content`` delta field (simply not read here,
+        so it never reaches a "text" event either). No consumer needs the
+        reasoning text itself, so unlike _parse_response it isn't reassembled
+        or surfaced here.
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
@@ -439,8 +499,8 @@ class LocalLLMClient:
         ) as resp:
             resp.raise_for_status()
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
-            think_buffer = ""  # holds text that might be a <think> tag split across chunks
-            in_think = False
+            think_buffer = ""  # holds text not yet resolved against the reasoning-prefix rule
+            think_phase = "undetermined"
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -458,13 +518,13 @@ class LocalLLMClient:
                 delta = choices[0].get("delta", {})
                 finish_reason = choices[0].get("finish_reason")
 
-                # Text content — strip inline <think>...</think> reasoning
-                # before it reaches a "text" event (delta.reasoning_content,
+                # Text content — strip a leading <think>...</think> reasoning
+                # prefix before it reaches a "text" event (delta.reasoning_content,
                 # the other place reasoning shows up, is intentionally never
                 # read here, so it can't leak either).
                 if delta.get("content"):
                     think_buffer += delta["content"]
-                    emit_text, in_think, think_buffer = _consume_think_stream(think_buffer, in_think)
+                    emit_text, think_phase, think_buffer = _consume_think_stream(think_buffer, think_phase)
                     if emit_text:
                         yield {"type": "text", "content": emit_text}
 
@@ -491,8 +551,12 @@ class LocalLLMClient:
                     # Flush whatever's left in the buffer — unless it's an
                     # unterminated <think> (truncated mid-thought), which is
                     # reasoning, not an answer, so it's discarded rather than
-                    # leaked as text.
-                    if think_buffer and not in_think:
+                    # leaked as text. A buffer still "undetermined" at this
+                    # point never resolved into a reasoning prefix at all (no
+                    # <think>, no </think> ever showed up), so per the
+                    # leading-prefix rule it's just ordinary text and is
+                    # flushed rather than dropped.
+                    if think_buffer and think_phase != "in_think":
                         yield {"type": "text", "content": think_buffer}
                     think_buffer = ""
 
