@@ -118,6 +118,28 @@ class _ToolUseBlock:
     type: str = "tool_use"
 
 
+def _reasoning_control_payload(
+    enable_thinking: bool | None, reasoning_effort: str | None
+) -> dict[str, Any]:
+    """Optional per-request reasoning-control fields for the llama-server payload.
+
+    ``enable_thinking`` is sent as ``chat_template_kwargs: {"enable_thinking": ...}``
+    (llama-server's jinja template switch); ``reasoning_effort`` is forwarded
+    as-is — llama-server parses it directly (server-common.cpp) and treats
+    ``"none"`` as its own way to disable reasoning, separate from
+    ``enable_thinking``. Both are ``None`` by default, in which case this
+    returns ``{}`` — no new keys appear in the request body unless a caller
+    explicitly asks, so an unset call stays byte-identical to the payload
+    before this existed.
+    """
+    extra: dict[str, Any] = {}
+    if enable_thinking is not None:
+        extra["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    if reasoning_effort is not None:
+        extra["reasoning_effort"] = reasoning_effort
+    return extra
+
+
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
@@ -396,8 +418,15 @@ class LocalLLMClient:
         max_tokens: int = 4096,
         tools: list[dict] | None = None,
         temperature: float | None = None,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
-        """Synchronous chat completion."""
+        """Synchronous chat completion.
+
+        ``enable_thinking``/``reasoning_effort`` control reasoning for this
+        request only — see ``_reasoning_control_payload``. Both default to
+        ``None`` (unset), which adds no new keys to the request body.
+        """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
             "model": "local",
@@ -409,6 +438,7 @@ class LocalLLMClient:
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = _anthropic_tools_to_openai(tools)
+        payload.update(_reasoning_control_payload(enable_thinking, reasoning_effort))
 
         resp = self.sync_client.post("/v1/chat/completions", json=payload)
         resp.raise_for_status()
@@ -423,8 +453,15 @@ class LocalLLMClient:
         max_tokens: int = 4096,
         tools: list[dict] | None = None,
         temperature: float | None = None,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> LLMResponse:
-        """Async chat completion."""
+        """Async chat completion.
+
+        ``enable_thinking``/``reasoning_effort`` control reasoning for this
+        request only — see ``_reasoning_control_payload``. Both default to
+        ``None`` (unset), which adds no new keys to the request body.
+        """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
             "model": "local",
@@ -436,6 +473,7 @@ class LocalLLMClient:
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = _anthropic_tools_to_openai(tools)
+        payload.update(_reasoning_control_payload(enable_thinking, reasoning_effort))
 
         resp = await self.async_client.post("/v1/chat/completions", json=payload)
         resp.raise_for_status()
@@ -451,6 +489,8 @@ class LocalLLMClient:
         tools: list[dict] | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Async streaming chat completion.
 
@@ -458,6 +498,10 @@ class LocalLLMClient:
             {"type": "text", "content": "..."}     — text delta
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
+
+        ``enable_thinking``/``reasoning_effort`` control reasoning for this
+        request only — see ``_reasoning_control_payload``. Both default to
+        ``None`` (unset), which adds no new keys to the request body.
 
         Reasoning models may inline chain-of-thought as a leading
         <think>...</think> prefix in the content delta. That's buffered and
@@ -482,6 +526,7 @@ class LocalLLMClient:
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = _anthropic_tools_to_openai(tools)
+        payload.update(_reasoning_control_payload(enable_thinking, reasoning_effort))
 
         request_timeout = httpx.Timeout(timeout or self.timeout, connect=10.0) if timeout else None
         async with self.async_client.stream(
@@ -849,10 +894,11 @@ def get_anthropic_llm() -> AnthropicLLMClient:
 
 def reset_local_llm() -> None:
     """Reset all singletons (for testing)."""
-    global _llm_client, _anthropic_client, _routing_client
+    global _llm_client, _anthropic_client, _routing_client, _routing_client_url
     _llm_client = None
     _anthropic_client = None
     _routing_client = None
+    _routing_client_url = None
 
 
 # ============================================================================
@@ -867,6 +913,7 @@ def reset_local_llm() -> None:
 # ============================================================================
 
 _routing_client: LocalLLMClient | None = None
+_routing_client_url: str | None = None  # URL the cached client above was built against
 
 
 def _get_local_routing_client() -> LocalLLMClient:
@@ -875,10 +922,18 @@ def _get_local_routing_client() -> LocalLLMClient:
     Distinct from ``get_local_llm`` because that one switches to Anthropic
     when the backend is set to ``anthropic``; routing/validation should stay
     local even then.
+
+    Cached per resolved URL rather than unconditionally: settings.routing_llm_url
+    is configurable (#566), so if it changes after the first call — an operator
+    edits LIFEOS_LOCAL_ROUTING_LLM_URL, or a test monkeypatches settings mid-process
+    — the client is rebuilt against the new target instead of silently keeping
+    traffic pinned to wherever it first resolved.
     """
-    global _routing_client
-    if _routing_client is None:
-        _routing_client = LocalLLMClient()
+    global _routing_client, _routing_client_url
+    url = settings.routing_llm_url
+    if _routing_client is None or _routing_client_url != url:
+        _routing_client = LocalLLMClient(base_url=url)
+        _routing_client_url = url
     return _routing_client
 
 
@@ -936,18 +991,31 @@ async def generate_text(
     max_tokens: int = 2048,
     temperature: float = 0.3,
     timeout: float | None = None,
+    enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Generate raw text from the local LLM.
 
     Replaces ``OllamaClient.generate(...)`` for routing / validation callers.
-    A per-call ``timeout`` uses a transient client so concurrent default-
-    timeout calls aren't affected.
+    A per-call ``timeout`` uses a transient client (still pinned to
+    ``settings.routing_llm_url``, same as the cached singleton — a caller
+    passing ``timeout`` must not silently fall back to the main chat model's
+    URL) so concurrent default-timeout calls aren't affected.
+    ``enable_thinking``/``reasoning_effort`` are forwarded to
+    ``LocalLLMClient.acreate`` unchanged — see ``_reasoning_control_payload``;
+    both default to ``None`` (unset).
     """
-    client = LocalLLMClient(timeout=timeout) if timeout is not None else _get_local_routing_client()
+    client = (
+        LocalLLMClient(base_url=settings.routing_llm_url, timeout=timeout)
+        if timeout is not None
+        else _get_local_routing_client()
+    )
     response = await client.acreate(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=temperature,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
     if response.reasoning_starved:
         logger.warning(
@@ -965,17 +1033,23 @@ async def generate_json(
     max_tokens: int = 4096,
     temperature: float = 0.1,
     timeout: float | None = None,
+    enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """Generate a JSON dict from the local LLM.
 
     Replaces ``OllamaClient.generate_json(...)`` for routing / validation
     callers. Uses a low temperature by default for structured output.
+    ``enable_thinking``/``reasoning_effort`` are forwarded to
+    ``generate_text`` unchanged; both default to ``None`` (unset).
     """
     text = await generate_text(
         prompt,
         max_tokens=max_tokens,
         temperature=temperature,
         timeout=timeout,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
     return extract_json(text)
 

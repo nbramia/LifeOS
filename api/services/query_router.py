@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from config.settings import settings
 from api.services.llm_client import (
     generate_text,
     is_local_routing_llm_available,
@@ -417,7 +418,13 @@ class QueryRouter:
             RoutingResult from LLM decision
         """
         prompt = ROUTER_PROMPT.format(query=query)
-        response = await generate_text(prompt)
+        # settings.router_enable_thinking defaults True (current behaviour) —
+        # translated to enable_thinking=None so the request body stays
+        # byte-identical to before this setting existed. Flipping the
+        # default to False (once the correctness A/B in #566 confirms no
+        # regression) is then a one-line config change.
+        enable_thinking = None if settings.router_enable_thinking else False
+        response = await generate_text(prompt, enable_thinking=enable_thinking)
 
         # Try to parse JSON from response
         try:

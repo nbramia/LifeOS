@@ -461,6 +461,172 @@ class TestParseResponse:
         assert resp.reasoning_starved is True
 
 
+# ---- Reasoning control (#566 PR 2: per-request thinking/reasoning_effort) ----
+
+
+class TestReasoningControlPayloadHelper:
+    """Tests for the ``_reasoning_control_payload`` helper shared by
+    create/acreate/astream."""
+
+    def test_both_unset_returns_empty(self):
+        """The critical backward-compat case: no keys unless a caller asks."""
+        from api.services.llm_client import _reasoning_control_payload
+        assert _reasoning_control_payload(None, None) == {}
+
+    def test_enable_thinking_true(self):
+        from api.services.llm_client import _reasoning_control_payload
+        assert _reasoning_control_payload(True, None) == {
+            "chat_template_kwargs": {"enable_thinking": True}
+        }
+
+    def test_enable_thinking_false(self):
+        from api.services.llm_client import _reasoning_control_payload
+        assert _reasoning_control_payload(False, None) == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    def test_reasoning_effort_passthrough(self):
+        from api.services.llm_client import _reasoning_control_payload
+        assert _reasoning_control_payload(None, "low") == {"reasoning_effort": "low"}
+
+    def test_both_set(self):
+        from api.services.llm_client import _reasoning_control_payload
+        assert _reasoning_control_payload(True, "high") == {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_effort": "high",
+        }
+
+
+class TestCreateReasoningControl:
+    """create()/acreate() forward reasoning control into the request body,
+    and the request body is byte-identical to before this feature existed
+    when neither knob is passed."""
+
+    def _client(self):
+        from api.services.llm_client import LocalLLMClient
+        return LocalLLMClient(base_url="http://fake:8080")
+
+    def _fake_sync_client(self):
+        from unittest.mock import MagicMock
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [], "model": "local"}
+        fake_sync_client = MagicMock(is_closed=False)
+        fake_sync_client.post.return_value = fake_resp
+        return fake_sync_client
+
+    def test_create_unset_body_byte_identical(self):
+        """No enable_thinking/reasoning_effort ⇒ no new keys in the request body."""
+        client = self._client()
+        fake_sync_client = self._fake_sync_client()
+        client._sync_client = fake_sync_client
+
+        client.create([{"role": "user", "content": "hi"}])
+
+        args, kwargs = fake_sync_client.post.call_args
+        assert args == ("/v1/chat/completions",)
+        assert kwargs["json"] == {
+            "model": "local",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4096,
+            "stream": False,
+        }
+
+    def test_create_enable_thinking_false(self):
+        client = self._client()
+        fake_sync_client = self._fake_sync_client()
+        client._sync_client = fake_sync_client
+
+        client.create([{"role": "user", "content": "hi"}], enable_thinking=False)
+
+        payload = fake_sync_client.post.call_args.kwargs["json"]
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_create_reasoning_effort_passthrough(self):
+        client = self._client()
+        fake_sync_client = self._fake_sync_client()
+        client._sync_client = fake_sync_client
+
+        client.create([{"role": "user", "content": "hi"}], reasoning_effort="low")
+
+        payload = fake_sync_client.post.call_args.kwargs["json"]
+        assert payload["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_acreate_unset_body_byte_identical(self):
+        from unittest.mock import AsyncMock, MagicMock
+        client = self._client()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [], "model": "local"}
+        fake_async_client = MagicMock(is_closed=False)
+        fake_async_client.post = AsyncMock(return_value=fake_resp)
+        client._async_client = fake_async_client
+
+        await client.acreate([{"role": "user", "content": "hi"}])
+
+        payload = fake_async_client.post.call_args.kwargs["json"]
+        assert payload == {
+            "model": "local",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4096,
+            "stream": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_acreate_enable_thinking_true(self):
+        from unittest.mock import AsyncMock, MagicMock
+        client = self._client()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [], "model": "local"}
+        fake_async_client = MagicMock(is_closed=False)
+        fake_async_client.post = AsyncMock(return_value=fake_resp)
+        client._async_client = fake_async_client
+
+        await client.acreate([{"role": "user", "content": "hi"}], enable_thinking=True, reasoning_effort="high")
+
+        payload = fake_async_client.post.call_args.kwargs["json"]
+        assert payload["chat_template_kwargs"] == {"enable_thinking": True}
+        assert payload["reasoning_effort"] == "high"
+
+
+class TestAStreamReasoningControl:
+    """astream() forwards reasoning control the same way create()/acreate() do."""
+
+    def _client_with_capture(self, chunks):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080")
+        captured = {}
+
+        class _CapturingAsyncClient(_FakeAsyncClient):
+            def stream(self, method, url, **kwargs):
+                captured["kwargs"] = kwargs
+                return super().stream(method, url, **kwargs)
+
+        client._async_client = _CapturingAsyncClient(_FakeSSEResponse(chunks))
+        return client, captured
+
+    @pytest.mark.asyncio
+    async def test_astream_unset_body_byte_identical(self):
+        client, captured = self._client_with_capture([_done_chunk()])
+        _ = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        assert captured["kwargs"]["json"] == {
+            "model": "local",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4096,
+            "stream": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_astream_enable_thinking_false(self):
+        client, captured = self._client_with_capture([_done_chunk()])
+        _ = [
+            e async for e in client.astream(
+                [{"role": "user", "content": "hi"}], enable_thinking=False, reasoning_effort="low"
+            )
+        ]
+        assert captured["kwargs"]["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert captured["kwargs"]["json"]["reasoning_effort"] == "low"
+
+
 # ---- Singleton ----
 
 
@@ -569,12 +735,15 @@ class TestExtractJson:
 
 @pytest.fixture
 def _routing_singleton_reset():
-    """Reset the routing-client singleton around each test so mutations don't leak."""
+    """Reset the routing-client singleton (and its cache key) around each
+    test so mutations don't leak."""
     from api.services import llm_client as mod
-    prev = mod._routing_client
+    prev_client, prev_url = mod._routing_client, mod._routing_client_url
     mod._routing_client = None
+    mod._routing_client_url = None
     yield mod
-    mod._routing_client = prev
+    mod._routing_client = prev_client
+    mod._routing_client_url = prev_url
 
 
 class TestRoutingHelpers:
@@ -596,6 +765,32 @@ class TestRoutingHelpers:
         kwargs = fake_client.acreate.await_args.kwargs
         assert kwargs["max_tokens"] == 10
         assert kwargs["temperature"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_generate_text_with_timeout_uses_routing_url(self, _routing_singleton_reset):
+        """Regression: generate_text's ``timeout is not None`` branch builds a
+        transient LocalLLMClient instead of using the cached routing
+        singleton — that transient client must still be pinned to
+        settings.routing_llm_url, not silently fall back to the default
+        local LLM URL. Two of three routing/validation callers pass a
+        timeout (agent_viz_summary, person_facts), so this branch is the
+        common case, not an edge case."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        fake_instance = MagicMock()
+        fake_resp = MagicMock(text="ok", reasoning_starved=False)
+        fake_instance.acreate = AsyncMock(return_value=fake_resp)
+        with (
+            patch.object(mod, "settings") as mock_settings,
+            patch.object(mod, "LocalLLMClient", return_value=fake_instance) as mock_cls,
+        ):
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            await mod.generate_text("hi", timeout=30)
+
+        kwargs = mock_cls.call_args.kwargs
+        assert kwargs["base_url"] == "http://routing-box:9090"
+        assert kwargs["timeout"] == 30
 
     @pytest.mark.asyncio
     async def test_generate_text_warns_on_reasoning_starvation(self, _routing_singleton_reset, caplog):
@@ -640,6 +835,36 @@ class TestRoutingHelpers:
         assert not any("reasoning starved" in r.message.lower() for r in caplog.records)
 
     @pytest.mark.asyncio
+    async def test_generate_text_forwards_reasoning_control(self, _routing_singleton_reset):
+        """generate_text forwards enable_thinking/reasoning_effort to acreate() unchanged."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        fake_client = MagicMock()
+        fake_resp = MagicMock(text="ok", reasoning_starved=False)
+        fake_client.acreate = AsyncMock(return_value=fake_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
+            await mod.generate_text("hi", enable_thinking=False, reasoning_effort="low")
+        kwargs = fake_client.acreate.await_args.kwargs
+        assert kwargs["enable_thinking"] is False
+        assert kwargs["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_generate_text_reasoning_control_unset_by_default(self, _routing_singleton_reset):
+        """Callers that don't ask for reasoning control get None through to acreate()."""
+        from unittest.mock import AsyncMock, MagicMock
+        mod = _routing_singleton_reset
+
+        fake_client = MagicMock()
+        fake_resp = MagicMock(text="ok", reasoning_starved=False)
+        fake_client.acreate = AsyncMock(return_value=fake_resp)
+        with patch.object(mod, "_get_local_routing_client", return_value=fake_client):
+            await mod.generate_text("hi")
+        kwargs = fake_client.acreate.await_args.kwargs
+        assert kwargs["enable_thinking"] is None
+        assert kwargs["reasoning_effort"] is None
+
+    @pytest.mark.asyncio
     async def test_generate_json_extracts(self, _routing_singleton_reset):
         """generate_json should parse the JSON object from the LLM response."""
         from unittest.mock import AsyncMock
@@ -660,6 +885,27 @@ class TestRoutingHelpers:
             mock_settings.local_llm_timeout = 90
             client = mod._get_local_routing_client()
             assert isinstance(client, mod.LocalLLMClient)
+
+    def test_get_local_routing_client_rebuilds_when_url_changes(self, _routing_singleton_reset):
+        """Regression: the cached routing client must rebuild when
+        settings.routing_llm_url changes mid-process (an operator edits
+        LIFEOS_LOCAL_ROUTING_LLM_URL, or a test monkeypatches settings),
+        not silently keep pointing at wherever it first resolved."""
+        mod = _routing_singleton_reset
+
+        with patch.object(mod, "settings") as mock_settings:
+            mock_settings.routing_llm_url = "http://localhost:8080"
+            first = mod._get_local_routing_client()
+            assert first.base_url == "http://localhost:8080"
+
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            second = mod._get_local_routing_client()
+            assert second is not first
+            assert second.base_url == "http://routing-box:9090"
+
+            # Same (new) URL on the next call returns the cached instance.
+            third = mod._get_local_routing_client()
+            assert third is second
 
     def test_is_available_swallows_errors(self, _routing_singleton_reset):
         """is_local_routing_llm_available returns False rather than propagating."""

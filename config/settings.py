@@ -277,6 +277,43 @@ class Settings(BaseSettings):
         description="HuggingFace GGUF model ID for llama-server"
     )
 
+    # Routing target (query_router, fact filtering, entity-cleanup auto-hide —
+    # see _get_local_routing_client). Optional override so routing calls can
+    # eventually point at a distinct llama-server instance without touching
+    # local_llm_url, which chat synthesis uses. Empty (default) falls back to
+    # that global value — see routing_llm_url — so a fresh clone behaves
+    # exactly as it does today (#566 PR 2). llama-server serves one model per
+    # process and ignores the request's "model" field, so on this
+    # architecture "which model" *is* "which URL" — there is no separate
+    # model-name setting to wire up.
+    local_routing_llm_url: str = Field(
+        default="",
+        alias="LIFEOS_LOCAL_ROUTING_LLM_URL",
+        description="Optional dedicated llama-server endpoint for routing/"
+                    "validation calls. Empty (default) falls back to "
+                    "LIFEOS_LOCAL_LLM_URL. Set this to point routing at a "
+                    "second llama-server that has a different model loaded — "
+                    "that's the actual mechanism for selecting a distinct "
+                    "routing model, since llama-server ignores the request's "
+                    "model field."
+    )
+    router_enable_thinking: bool = Field(
+        default=True,
+        alias="LIFEOS_ROUTER_ENABLE_THINKING",
+        description="Whether query_router's LLM routing call requests "
+                    "reasoning/thinking from the local model. Default True "
+                    "(current behaviour, unchanged) — measured on the live "
+                    "host at 23-32s per routing call vs 2-9s with thinking "
+                    "off, with substantively identical routing decisions "
+                    "(#566). Left True here pending a broader correctness "
+                    "A/B; flip to False to opt in once confirmed."
+    )
+
+    @property
+    def routing_llm_url(self) -> str:
+        """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
+        return self.local_routing_llm_url or self.local_llm_url
+
     # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
     mcp_http_port: int = Field(
         default=8765,
