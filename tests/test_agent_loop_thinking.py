@@ -75,18 +75,26 @@ def _local_client_with_chunks(chunks):
 
 
 @pytest.mark.asyncio
-async def test_local_default_true_omits_enable_thinking_from_wire_body():
-    """settings.local_agent_enable_thinking defaults True -> the orchestrator's
-    outgoing request body to a LOCAL client is byte-identical to before this
-    setting existed (mirrors #566 PR 2's router-level payload assertion) —
-    asserted at the actual wire body, not a mocked call-kwargs shape."""
+async def test_local_thinking_enabled_omits_enable_thinking_from_wire_body():
+    """With thinking ENABLED, the orchestrator's outgoing body to a LOCAL client
+    is byte-identical to before this setting existed (mirrors #566 PR 2's
+    router-level payload assertion) — asserted at the actual wire body, not a
+    mocked call-kwargs shape.
+
+    The setting is patched explicitly rather than relying on the field default:
+    the default flipped to False in #567 once the measurement showed thinking
+    OFF was 3.2x faster with no quality regression, and this test guards the
+    enabled path regardless of which way the default points."""
     from api.services import agent_loop
 
     client, async_client = _local_client_with_chunks([
         {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]},
         _done_chunk(),
     ])
-    with patch.object(agent_loop, "_select_client", return_value=client):
+    with (
+        patch.object(agent_loop, "_select_client", return_value=client),
+        patch.object(agent_loop.settings, "local_agent_enable_thinking", True),
+    ):
         events = [e async for e in agent_loop.run_agent_loop("what is 6x7", max_tool_rounds=1)]
 
     result = next(e["result"] for e in events if e["type"] == "result")
