@@ -837,12 +837,23 @@ class TestAStreamReasoning:
         assert text == "5 < 10 is true"
 
     @pytest.mark.asyncio
-    async def test_closing_only_think_tag_split_across_chunks_is_stripped(self):
-        """Finding 1 (CRITICAL), streaming version: a template pre-fills
-        <think> into the prompt so the model emits only a closing </think>,
-        with the tag itself split across chunk boundaries. Nothing can be
-        emitted until it's known whether a </think> is coming, so the first
-        chunks must be buffered rather than leaked as text."""
+    async def test_closing_only_think_tag_is_not_stripped_in_streaming_path(self):
+        """Streaming intentionally does NOT handle a closing-only </think>
+        (no preceding opener), unlike the non-streaming path.
+
+        Measured against the live llama-server deployment: a real streamed
+        request produced 281 reasoning_content deltas and 0 occurrences of
+        <think>/</think> in any content delta — llama.cpp's reasoning-format
+        parser pulls chain-of-thought into the dedicated reasoning_content
+        channel before it reaches content, so this shape does not occur in
+        the stream on this deployment. Buffering to catch it anyway (behind
+        a cap, or indefinitely) would cost real, visible latency on every
+        streamed turn to guard a case that never happens. So this content
+        passes through unstripped, letter for letter, rather than being
+        held back — documenting the deliberate scope narrowing, not a
+        regression. (_parse_response — the non-streaming path — still
+        strips this shape; see TestParseResponse.
+        test_closing_only_think_tag_leaks_no_reasoning.)"""
         chunks = [
             {"choices": [{"delta": {"content": "internal"}, "finish_reason": None}]},
             {"choices": [{"delta": {"content": " reasoning</thi"}, "finish_reason": None}]},
@@ -852,9 +863,7 @@ class TestAStreamReasoning:
         client = self._client_with_chunks(chunks)
         events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
         text = "".join(e["content"] for e in events if e["type"] == "text")
-        assert text == "answer"
-        assert "internal" not in text
-        assert "reasoning" not in text
+        assert text == "internal reasoning</think>answer"
 
     @pytest.mark.asyncio
     async def test_literal_think_tag_in_stream_not_corrupted(self):
@@ -872,24 +881,25 @@ class TestAStreamReasoning:
         assert text == "Use `<think>draft</think>` as the example tag."
 
     @pytest.mark.asyncio
-    async def test_undetermined_cap_flushes_normal_long_answer(self):
-        """A normal (non-reasoning) answer that never contains a think tag
-        isn't held back for the entire stream — once the undetermined buffer
-        exceeds the cap, it's flushed and streaming resumes in real time."""
-        from api.services.llm_client import _THINK_STREAM_UNDETERMINED_CAP
-        long_text = "x" * (_THINK_STREAM_UNDETERMINED_CAP + 50)
+    async def test_normal_answer_first_delta_emitted_immediately(self):
+        """A normal (non-reasoning) answer's first content delta is emitted
+        as its own "text" event right away — not buffered pending a later
+        chunk or the end of the stream. This is the latency regression that
+        matters in practice: a delta whose leading characters aren't even a
+        possible prefix of "<think>" is ruled out and streamed in real time,
+        with no cap or indefinite hold."""
         chunks = [
-            {"choices": [{"delta": {"content": long_text}, "finish_reason": None}]},
-            {"choices": [{"delta": {"content": " more"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "The answer is 42."}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": " Anything else?"}, "finish_reason": None}]},
             _done_chunk(),
         ]
         client = self._client_with_chunks(chunks)
-        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
-        text_events = [e for e in events if e["type"] == "text"]
-        # Flushed before the final "done" — i.e. resolved mid-stream, not
-        # held back until the stream ended.
-        assert len(text_events) >= 2
-        assert "".join(e["content"] for e in text_events) == long_text + " more"
+        events = []
+        async for e in client.astream([{"role": "user", "content": "hi"}]):
+            events.append(e)
+            if e["type"] == "text":
+                break
+        assert events[0] == {"type": "text", "content": "The answer is 42."}
 
 
 # ---- Anthropic prompt caching (#383 Phase 1) ----

@@ -189,30 +189,37 @@ def _longest_partial_tag_suffix(buffer: str, tag: str) -> int:
     return 0
 
 
-# Bound on how much leading, unresolved text astream() will buffer before
-# concluding a stream carries no reasoning prefix at all (see
-# _consume_think_stream). Chosen as a middle ground: a template-pre-filled
-# ("closing-only") reasoning preamble is typically a sentence or two — well
-# under this — before the model reaches its `</think>`, so real reasoning
-# gets buffered off screen as intended. A normal, non-reasoning answer that
-# never mentions either tag is held back at most this many characters before
-# streaming resumes in real time, rather than for the rest of the response.
-_THINK_STREAM_UNDETERMINED_CAP = 1000
-
 # Phase values for _consume_think_stream's state machine:
-#   "undetermined" — not yet known whether the stream opens with a reasoning
-#     prefix (a leading <think>, or a closing-only </think> left behind by a
-#     template that pre-filled the opener into the prompt instead of the
-#     model's output).
+#   "undetermined" — not yet known whether the stream opens with a leading
+#     <think>. Bounded to at most len("<think>") - 1 = 6 buffered characters:
+#     as soon as the leading non-whitespace text stops being a viable prefix
+#     of "<think>", it's ruled out and we go straight to passthrough.
 #   "in_think"     — inside a leading <think>...</think> block.
 #   "passthrough"  — resolved: no reasoning prefix (or the prefix has already
 #     closed). Everything from here on, tags included, is emitted verbatim —
 #     a tag appearing later in the stream is just text, never reasoning.
+#
+# Unlike _extract_inline_thinking (the non-streaming path), this does NOT
+# also detect a closing-only "</think>" with no preceding opener. Measured
+# against the live llama-server deployment (Gemma 4 26B-A4B, --jinja,
+# default --reasoning-format): a real streamed request produced 281
+# reasoning_content deltas and 0 occurrences of "<think>"/"</think>" in any
+# content delta. llama.cpp's reasoning-format parser pulls chain-of-thought
+# into the dedicated reasoning_content channel before it ever reaches
+# content, so on this deployment inline reasoning tags simply don't occur in
+# the stream. Handling the closing-only case here would mean buffering
+# either indefinitely or behind an arbitrary cap on every single streamed
+# turn — a real, visible latency cost — to guard against a case this server
+# doesn't produce. The non-streaming path keeps handling it (no latency
+# cost there, and it's still reachable: a different server, a
+# --reasoning-format none config, or a non-streaming client).
 
 
 def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
     """Incrementally resolve a growing streamed text buffer against the
-    leading-reasoning-prefix rule used by ``_extract_inline_thinking``.
+    leading-reasoning-prefix rule used by ``_extract_inline_thinking``,
+    restricted to the leading-``<think>`` case (see module note above for
+    why the closing-only case is intentionally not handled here).
 
     Returns ``(emit_text, phase, remainder)``: ``emit_text`` is safe to
     yield to the caller now; ``remainder`` must be carried over to the next
@@ -231,36 +238,20 @@ def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
 
     # phase == "undetermined"
     stripped = buffer.lstrip()
-    if stripped:
-        if stripped.startswith(_THINK_OPEN):
-            after_open = stripped[len(_THINK_OPEN):]
-            idx = after_open.find(_THINK_CLOSE)
-            if idx == -1:
-                return "", "in_think", after_open
-            return after_open[idx + len(_THINK_CLOSE):], "passthrough", ""
-        if _THINK_OPEN.startswith(stripped):
-            # Still a viable prefix of "<think>" — keep waiting to see it
-            # confirmed or ruled out.
-            return "", "undetermined", buffer
+    if stripped.startswith(_THINK_OPEN):
+        after_open = stripped[len(_THINK_OPEN):]
+        idx = after_open.find(_THINK_CLOSE)
+        if idx == -1:
+            return "", "in_think", after_open
+        return after_open[idx + len(_THINK_CLOSE):], "passthrough", ""
+    if not stripped or _THINK_OPEN.startswith(stripped):
+        # All whitespace so far, or still a viable prefix of "<think>" —
+        # keep waiting to see it confirmed or ruled out.
+        return "", "undetermined", buffer
 
-    # Ruled out a leading "<think>", but a template may have pre-filled the
-    # opener into the prompt, in which case the model's entire output up to
-    # the first "</think>" is reasoning with no opening tag at all. Keep
-    # watching for that until it resolves or the cap trips.
-    idx = buffer.find(_THINK_CLOSE)
-    if idx != -1:
-        open_idx = buffer.find(_THINK_OPEN)
-        if open_idx == -1 or open_idx > idx:
-            return buffer[idx + len(_THINK_CLOSE):], "passthrough", ""
-        # A "<think>" appears before this "</think>" — a literal pair in
-        # ordinary prose, not a closing-only reasoning prefix. Not
-        # reasoning; flush as-is and stop watching for tags.
-        return buffer, "passthrough", ""
-
-    if len(buffer) >= _THINK_STREAM_UNDETERMINED_CAP:
-        return buffer, "passthrough", ""
-
-    return "", "undetermined", buffer
+    # Ruled out — this stream does not open with "<think>". Resolve
+    # immediately and stream in real time from here on.
+    return buffer, "passthrough", ""
 
 
 class LocalLLMClient:
@@ -469,16 +460,16 @@ class LocalLLMClient:
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
 
         Reasoning models may inline chain-of-thought as a leading
-        <think>...</think> prefix in the content delta — either a full pair,
-        or (when a template pre-fills the opener into the prompt) a bare
-        closing tag with no opener at all. Either shape is buffered and
+        <think>...</think> prefix in the content delta. That's buffered and
         stripped below via _consume_think_stream (never yielded as text); a
         <think>/</think> appearing later, mid-answer, is left alone since
-        reasoning is only ever a leading prefix. Reasoning may also arrive as
-        a separate ``reasoning_content`` delta field (simply not read here,
-        so it never reaches a "text" event either). No consumer needs the
-        reasoning text itself, so unlike _parse_response it isn't reassembled
-        or surfaced here.
+        reasoning is only ever a leading prefix. _consume_think_stream does
+        NOT also handle a closing-only "</think>" with no preceding opener
+        (see its module-level comment) — on this deployment reasoning
+        arrives via the separate ``reasoning_content`` delta field instead,
+        which is simply not read here, so it never reaches a "text" event
+        either. No consumer needs the reasoning text itself, so unlike
+        _parse_response it isn't reassembled or surfaced here.
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
