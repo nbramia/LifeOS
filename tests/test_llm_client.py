@@ -735,12 +735,15 @@ class TestExtractJson:
 
 @pytest.fixture
 def _routing_singleton_reset():
-    """Reset the routing-client singleton around each test so mutations don't leak."""
+    """Reset the routing-client singleton (and its cache key) around each
+    test so mutations don't leak."""
     from api.services import llm_client as mod
-    prev = mod._routing_client
+    prev_client, prev_url = mod._routing_client, mod._routing_client_url
     mod._routing_client = None
+    mod._routing_client_url = None
     yield mod
-    mod._routing_client = prev
+    mod._routing_client = prev_client
+    mod._routing_client_url = prev_url
 
 
 class TestRoutingHelpers:
@@ -882,6 +885,27 @@ class TestRoutingHelpers:
             mock_settings.local_llm_timeout = 90
             client = mod._get_local_routing_client()
             assert isinstance(client, mod.LocalLLMClient)
+
+    def test_get_local_routing_client_rebuilds_when_url_changes(self, _routing_singleton_reset):
+        """Regression: the cached routing client must rebuild when
+        settings.routing_llm_url changes mid-process (an operator edits
+        LIFEOS_LOCAL_ROUTING_LLM_URL, or a test monkeypatches settings),
+        not silently keep pointing at wherever it first resolved."""
+        mod = _routing_singleton_reset
+
+        with patch.object(mod, "settings") as mock_settings:
+            mock_settings.routing_llm_url = "http://localhost:8080"
+            first = mod._get_local_routing_client()
+            assert first.base_url == "http://localhost:8080"
+
+            mock_settings.routing_llm_url = "http://routing-box:9090"
+            second = mod._get_local_routing_client()
+            assert second is not first
+            assert second.base_url == "http://routing-box:9090"
+
+            # Same (new) URL on the next call returns the cached instance.
+            third = mod._get_local_routing_client()
+            assert third is second
 
     def test_is_available_swallows_errors(self, _routing_singleton_reset):
         """is_local_routing_llm_available returns False rather than propagating."""

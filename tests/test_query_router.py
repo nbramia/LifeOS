@@ -72,23 +72,57 @@ class TestQueryRouter:
             assert "keyword" in result.reasoning.lower()
 
     @pytest.mark.asyncio
-    async def test_route_thinking_setting_default_omits_kwarg(self):
-        """settings.router_enable_thinking defaults True ⇒ the router passes
-        enable_thinking=None to generate_text, so the request body stays
-        unchanged from before this setting existed (#566 PR 2)."""
-        from api.services.query_router import QueryRouter
+    async def test_route_thinking_setting_default_payload_byte_identical(self):
+        """settings.router_enable_thinking defaults True ⇒ the actual JSON
+        body sent over HTTP is byte-identical to before
+        LIFEOS_ROUTER_ENABLE_THINKING existed (#566 PR 2).
 
-        with (
-            patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
-            patch(
-                "api.services.query_router.generate_text",
-                AsyncMock(return_value='{"sources": ["vault"], "reasoning": "test"}'),
-            ) as mock_generate_text,
-        ):
-            router = QueryRouter()
-            await router.route("test query")
-            kwargs = mock_generate_text.await_args.kwargs
-            assert kwargs["enable_thinking"] is None
+        Runs the real generate_text -> LocalLLMClient.acreate path (only the
+        httpx client underneath is faked) rather than mocking generate_text
+        itself — a mock-call-shape assertion (enable_thinking=None was
+        passed to generate_text) would still pass even if acreate later
+        started serializing that as chat_template_kwargs:
+        {"enable_thinking": None}; this asserts the wire body directly
+        (#569 review)."""
+        from unittest.mock import AsyncMock, MagicMock
+        from api.services import llm_client as llm_mod
+        from api.services.query_router import QueryRouter, ROUTER_PROMPT
+
+        prev_client, prev_url = llm_mod._routing_client, llm_mod._routing_client_url
+        llm_mod._routing_client = None
+        llm_mod._routing_client_url = None
+        try:
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = {
+                "choices": [{
+                    "message": {"content": '{"sources": ["vault"], "reasoning": "test"}'},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "model": "local",
+            }
+            fake_async_client = MagicMock(is_closed=False)
+            fake_async_client.post = AsyncMock(return_value=fake_resp)
+
+            client = llm_mod._get_local_routing_client()
+            client._async_client = fake_async_client
+
+            with patch("api.services.query_router.is_local_routing_llm_available", return_value=True):
+                router = QueryRouter()
+                result = await router.route("test query")
+        finally:
+            llm_mod._routing_client = prev_client
+            llm_mod._routing_client_url = prev_url
+
+        assert "vault" in result.sources
+        payload = fake_async_client.post.call_args.kwargs["json"]
+        assert payload == {
+            "model": "local",
+            "messages": [{"role": "user", "content": ROUTER_PROMPT.format(query="test query")}],
+            "max_tokens": 2048,
+            "temperature": 0.3,
+            "stream": False,
+        }
 
     @pytest.mark.asyncio
     async def test_route_thinking_disabled_passes_false(self):

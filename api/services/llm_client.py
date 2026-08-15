@@ -125,9 +125,12 @@ def _reasoning_control_payload(
 
     ``enable_thinking`` is sent as ``chat_template_kwargs: {"enable_thinking": ...}``
     (llama-server's jinja template switch); ``reasoning_effort`` is forwarded
-    as-is. Both are ``None`` by default, in which case this returns ``{}`` —
-    no new keys appear in the request body unless a caller explicitly asks,
-    so an unset call stays byte-identical to the payload before this existed.
+    as-is — llama-server parses it directly (server-common.cpp) and treats
+    ``"none"`` as its own way to disable reasoning, separate from
+    ``enable_thinking``. Both are ``None`` by default, in which case this
+    returns ``{}`` — no new keys appear in the request body unless a caller
+    explicitly asks, so an unset call stays byte-identical to the payload
+    before this existed.
     """
     extra: dict[str, Any] = {}
     if enable_thinking is not None:
@@ -891,10 +894,11 @@ def get_anthropic_llm() -> AnthropicLLMClient:
 
 def reset_local_llm() -> None:
     """Reset all singletons (for testing)."""
-    global _llm_client, _anthropic_client, _routing_client
+    global _llm_client, _anthropic_client, _routing_client, _routing_client_url
     _llm_client = None
     _anthropic_client = None
     _routing_client = None
+    _routing_client_url = None
 
 
 # ============================================================================
@@ -909,6 +913,7 @@ def reset_local_llm() -> None:
 # ============================================================================
 
 _routing_client: LocalLLMClient | None = None
+_routing_client_url: str | None = None  # URL the cached client above was built against
 
 
 def _get_local_routing_client() -> LocalLLMClient:
@@ -917,10 +922,18 @@ def _get_local_routing_client() -> LocalLLMClient:
     Distinct from ``get_local_llm`` because that one switches to Anthropic
     when the backend is set to ``anthropic``; routing/validation should stay
     local even then.
+
+    Cached per resolved URL rather than unconditionally: settings.routing_llm_url
+    is configurable (#566), so if it changes after the first call — an operator
+    edits LIFEOS_LOCAL_ROUTING_LLM_URL, or a test monkeypatches settings mid-process
+    — the client is rebuilt against the new target instead of silently keeping
+    traffic pinned to wherever it first resolved.
     """
-    global _routing_client
-    if _routing_client is None:
-        _routing_client = LocalLLMClient(base_url=settings.routing_llm_url)
+    global _routing_client, _routing_client_url
+    url = settings.routing_llm_url
+    if _routing_client is None or _routing_client_url != url:
+        _routing_client = LocalLLMClient(base_url=url)
+        _routing_client_url = url
     return _routing_client
 
 
