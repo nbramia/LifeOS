@@ -298,15 +298,24 @@ class Settings(BaseSettings):
                     "model field."
     )
     router_enable_thinking: bool = Field(
-        default=True,
+        default=False,
         alias="LIFEOS_ROUTER_ENABLE_THINKING",
         description="Whether query_router's LLM routing call requests "
-                    "reasoning/thinking from the local model. Default True "
-                    "(current behaviour, unchanged) — measured on the live "
-                    "host at 23-32s per routing call vs 2-9s with thinking "
-                    "off, with substantively identical routing decisions "
-                    "(#566). Left True here pending a broader correctness "
-                    "A/B; flip to False to opt in once confirmed."
+                    "reasoning/thinking from the local model. Default False "
+                    "(#566/#567). The broader correctness A/B this was "
+                    "waiting on has now run: 12 labelled cases through the "
+                    "real QueryRouter._llm_route — thinking ON 24.65s mean, "
+                    "OFF 3.00s mean (8.2x), with IDENTICAL correctness "
+                    "(11/12 both ways, and the single miss is the same in "
+                    "both modes — a pre-existing router limitation on "
+                    "general-knowledge queries, unrelated to thinking). "
+                    "Decisions agreed on 9/12; of the 3 that differed, "
+                    "thinking-off selected FEWER irrelevant sources on 2 "
+                    "(no vault search for 'did anyone message me', none for "
+                    "'draft a reply to an email') and one justified extra "
+                    "(people, for a query naming a person). Routing is "
+                    "source classification — it does not benefit from "
+                    "chain-of-thought. Set True to restore reasoning."
     )
     local_agent_enable_thinking: bool = Field(
         default=False,

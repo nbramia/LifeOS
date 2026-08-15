@@ -76,11 +76,16 @@ def test_routing_llm_url_override(monkeypatch):
     assert s.routing_llm_url == "http://routing-box:9090"
 
 
-def test_router_enable_thinking_defaults_true():
-    """Router thinking stays on by default (#566 PR 2 does not flip
-    behaviour) — the eventual flip is a one-line default change here."""
+def test_router_enable_thinking_defaults_false():
+    """query_router's thinking control (#566) defaults False.
+
+    12 labelled cases through the real QueryRouter._llm_route: thinking ON
+    24.65s mean vs OFF 3.00s (8.2x), IDENTICAL correctness 11/12 both ways —
+    the single miss is the same in both modes. Of the 3 decisions that
+    differed, thinking-off picked fewer irrelevant sources on 2. Pinned so
+    the default can't drift back silently."""
     from config.settings import Settings
-    assert Settings.model_fields["router_enable_thinking"].default is True
+    assert Settings.model_fields["router_enable_thinking"].default is False
 
 
 def test_local_agent_enable_thinking_defaults_false():

@@ -72,10 +72,15 @@ class TestQueryRouter:
             assert "keyword" in result.reasoning.lower()
 
     @pytest.mark.asyncio
-    async def test_route_thinking_setting_default_payload_byte_identical(self):
-        """settings.router_enable_thinking defaults True ⇒ the actual JSON
-        body sent over HTTP is byte-identical to before
-        LIFEOS_ROUTER_ENABLE_THINKING existed (#566 PR 2).
+    async def test_route_thinking_enabled_payload_byte_identical(self):
+        """With thinking ENABLED, the actual JSON body sent over HTTP is
+        byte-identical to before LIFEOS_ROUTER_ENABLE_THINKING existed
+        (#566 PR 2).
+
+        The setting is patched explicitly rather than relying on the field
+        default: the default flipped to False in #566/#567 once the 12-case
+        A/B showed identical correctness at 8.2x the speed. This guards the
+        enabled path regardless of which way the default points.
 
         Runs the real generate_text -> LocalLLMClient.acreate path (only the
         httpx client underneath is faked) rather than mocking generate_text
@@ -87,6 +92,7 @@ class TestQueryRouter:
         from unittest.mock import AsyncMock, MagicMock
         from api.services import llm_client as llm_mod
         from api.services.query_router import QueryRouter, ROUTER_PROMPT
+        from api.services.query_router import settings as qr_settings
 
         prev_client, prev_url = llm_mod._routing_client, llm_mod._routing_client_url
         llm_mod._routing_client = None
@@ -107,7 +113,10 @@ class TestQueryRouter:
             client = llm_mod._get_local_routing_client()
             client._async_client = fake_async_client
 
-            with patch("api.services.query_router.is_local_routing_llm_available", return_value=True):
+            with (
+                patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
+                patch.object(qr_settings, "router_enable_thinking", True),
+            ):
                 router = QueryRouter()
                 result = await router.route("test query")
         finally:
