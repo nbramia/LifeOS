@@ -43,6 +43,23 @@ class LLMResponse:
     model: str = ""
     finish_reason: str = ""
     tool_calls: list[dict] | None = None
+    reasoning: str = ""
+
+    @property
+    def reasoning_starved(self) -> bool:
+        """True when the model spent its whole token budget on reasoning and
+        never got to an answer.
+
+        Reasoning-capable models (e.g. Gemma 4 26B-A4B via llama-server) can
+        return chain-of-thought separately from the answer — via a dedicated
+        ``reasoning_content`` field or inline ``<think>...</think>`` tags —
+        both stripped into ``reasoning`` by ``_parse_response``. If the token
+        budget runs out before the model reaches its answer, ``text`` ends up
+        empty with ``finish_reason == "length"``, which is otherwise
+        indistinguishable from a legitimate empty response. Computed rather
+        than stored so it can't drift out of sync with the fields it reads.
+        """
+        return not self.text and bool(self.reasoning) and self.finish_reason == "length"
 
 
 def _anthropic_tools_to_openai(tools: list[dict]) -> list[dict]:
@@ -99,6 +116,96 @@ class _ToolUseBlock:
     name: str
     input: dict
     type: str = "tool_use"
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_THINK_BLOCK_RE = re.compile(re.escape(_THINK_OPEN) + r"(.*?)" + re.escape(_THINK_CLOSE), re.DOTALL)
+
+
+def _extract_inline_thinking(content: str) -> tuple[str, str]:
+    """Strip inline ``<think>...</think>`` blocks out of ``content``.
+
+    Returns ``(content, reasoning)``. If no ``<think>`` tag is present at
+    all, ``content`` is returned completely untouched (no ``.strip()``,
+    nothing) so ordinary non-reasoning responses are byte-for-byte unchanged.
+
+    Handles a truncated, unterminated ``<think>`` (the response ran out of
+    tokens mid-thought) by treating everything from that tag to the end of
+    the string as reasoning rather than leaking a fragment into the answer.
+    """
+    reasoning_parts = []
+    matched = False
+
+    def _collect(m: re.Match) -> str:
+        nonlocal matched
+        matched = True
+        reasoning_parts.append(m.group(1))
+        return ""
+
+    remaining = _THINK_BLOCK_RE.sub(_collect, content)
+
+    open_idx = remaining.find(_THINK_OPEN)
+    if open_idx != -1:
+        matched = True
+        reasoning_parts.append(remaining[open_idx + len(_THINK_OPEN):])
+        remaining = remaining[:open_idx]
+
+    if not matched:
+        return content, ""
+    return remaining.strip(), "\n\n".join(p.strip() for p in reasoning_parts if p.strip())
+
+
+def _split_reasoning(content: str, reasoning_field: str) -> tuple[str, str]:
+    """Combine a dedicated ``reasoning_content`` field with any inline
+    ``<think>...</think>`` tags found in ``content`` into one reasoning
+    string, separate from the answer text.
+    """
+    content, inline_reasoning = _extract_inline_thinking(content or "")
+    parts = [p for p in (reasoning_field or "", inline_reasoning) if p]
+    return content, "\n\n".join(parts)
+
+
+def _longest_partial_tag_suffix(buffer: str, tag: str) -> int:
+    """Length of the longest suffix of ``buffer`` that could be the start of
+    ``tag`` — i.e. a tag possibly split across two stream chunks."""
+    max_len = min(len(buffer), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if tag.startswith(buffer[-length:]):
+            return length
+    return 0
+
+
+def _consume_think_stream(buffer: str, in_think: bool) -> tuple[str, bool, str]:
+    """Incrementally strip ``<think>...</think>`` out of a growing streamed
+    text buffer.
+
+    Returns ``(emit_text, in_think, remainder)``: ``emit_text`` is safe to
+    yield to the caller now; ``remainder`` must be carried over to the next
+    chunk (e.g. a ``<think>``/``</think>`` tag split across two chunks isn't
+    fully visible yet, so it's held back rather than emitted or discarded).
+    """
+    emit_parts = []
+    while True:
+        if in_think:
+            idx = buffer.find(_THINK_CLOSE)
+            if idx == -1:
+                keep = _longest_partial_tag_suffix(buffer, _THINK_CLOSE)
+                buffer = buffer[-keep:] if keep else ""
+                break
+            buffer = buffer[idx + len(_THINK_CLOSE):]
+            in_think = False
+        else:
+            idx = buffer.find(_THINK_OPEN)
+            if idx == -1:
+                keep = _longest_partial_tag_suffix(buffer, _THINK_OPEN)
+                emit_parts.append(buffer[:len(buffer) - keep] if keep else buffer)
+                buffer = buffer[-keep:] if keep else ""
+                break
+            emit_parts.append(buffer[:idx])
+            buffer = buffer[idx + len(_THINK_OPEN):]
+            in_think = True
+    return "".join(emit_parts), in_think, buffer
 
 
 class LocalLLMClient:
@@ -305,6 +412,13 @@ class LocalLLMClient:
             {"type": "text", "content": "..."}     — text delta
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
+
+        Reasoning models may inline chain-of-thought as <think>...</think>
+        tags in the content delta (buffered and stripped below — never
+        yielded as text), or as a separate ``reasoning_content`` delta field
+        (simply not read, so it never reaches a "text" event either). No
+        consumer needs the reasoning text itself, so unlike _parse_response
+        it isn't reassembled or surfaced here.
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
@@ -325,6 +439,8 @@ class LocalLLMClient:
         ) as resp:
             resp.raise_for_status()
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
+            think_buffer = ""  # holds text that might be a <think> tag split across chunks
+            in_think = False
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -342,9 +458,15 @@ class LocalLLMClient:
                 delta = choices[0].get("delta", {})
                 finish_reason = choices[0].get("finish_reason")
 
-                # Text content
+                # Text content — strip inline <think>...</think> reasoning
+                # before it reaches a "text" event (delta.reasoning_content,
+                # the other place reasoning shows up, is intentionally never
+                # read here, so it can't leak either).
                 if delta.get("content"):
-                    yield {"type": "text", "content": delta["content"]}
+                    think_buffer += delta["content"]
+                    emit_text, in_think, think_buffer = _consume_think_stream(think_buffer, in_think)
+                    if emit_text:
+                        yield {"type": "text", "content": emit_text}
 
                 # Tool calls (streamed incrementally)
                 if delta.get("tool_calls"):
@@ -366,6 +488,14 @@ class LocalLLMClient:
                             acc["function"]["arguments"] += func_delta["arguments"]
 
                 if finish_reason:
+                    # Flush whatever's left in the buffer — unless it's an
+                    # unterminated <think> (truncated mid-thought), which is
+                    # reasoning, not an answer, so it's discarded rather than
+                    # leaked as text.
+                    if think_buffer and not in_think:
+                        yield {"type": "text", "content": think_buffer}
+                    think_buffer = ""
+
                     usage_data = chunk.get("usage", {})
                     usage = LLMUsage(
                         input_tokens=usage_data.get("prompt_tokens", 0),
@@ -391,8 +521,13 @@ class LocalLLMClient:
         if message.get("tool_calls"):
             tool_calls = message["tool_calls"]
 
+        text, reasoning = _split_reasoning(
+            message.get("content", "") or "",
+            message.get("reasoning_content", "") or "",
+        )
+
         return LLMResponse(
-            text=message.get("content", "") or "",
+            text=text,
             usage=LLMUsage(
                 input_tokens=usage_data.get("prompt_tokens", 0),
                 output_tokens=usage_data.get("completion_tokens", 0),
@@ -401,6 +536,7 @@ class LocalLLMClient:
             model=data.get("model", ""),
             finish_reason=choice.get("finish_reason", ""),
             tool_calls=tool_calls,
+            reasoning=reasoning,
         )
 
     def is_available(self) -> bool:
@@ -758,6 +894,13 @@ async def generate_text(
         max_tokens=max_tokens,
         temperature=temperature,
     )
+    if response.reasoning_starved:
+        logger.warning(
+            "LLM reasoning starved the response: spent the entire %d-token budget "
+            "on chain-of-thought and returned no answer (finish_reason=length). "
+            "Consider raising max_tokens. reasoning=%r",
+            max_tokens, response.reasoning[:200],
+        )
     return response.text or ""
 
 
