@@ -308,6 +308,19 @@ class Settings(BaseSettings):
                     "(#566). Left True here pending a broader correctness "
                     "A/B; flip to False to opt in once confirmed."
     )
+    local_agent_enable_thinking: bool = Field(
+        default=True,
+        alias="LIFEOS_LOCAL_AGENT_ENABLE_THINKING",
+        description="Whether run_agent_loop's tool-round and synthesis calls "
+                    "request reasoning/thinking from a LOCAL model (Anthropic "
+                    "backend ignores this — see agent_loop._select_client). "
+                    "Default True (current behaviour, unchanged). Measured "
+                    "reasoning starvation on a reasoning-capable local model "
+                    "(Qwen3.8-27B): 4 of 6 questions spent the entire "
+                    "4096-token max_tokens budget on chain-of-thought and "
+                    "returned an empty answer (#567). Flip to False to stop "
+                    "reasoning from starving the answer."
+    )
 
     @property
     def routing_llm_url(self) -> str:

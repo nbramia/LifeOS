@@ -83,6 +83,13 @@ def test_router_enable_thinking_defaults_true():
     assert Settings.model_fields["router_enable_thinking"].default is True
 
 
+def test_local_agent_enable_thinking_defaults_true():
+    """The orchestrator's local-model thinking control (#567) defaults True —
+    current behaviour, unchanged — mirroring router_enable_thinking (#566)."""
+    from config.settings import Settings
+    assert Settings.model_fields["local_agent_enable_thinking"].default is True
+
+
 def test_specialist_model_default_is_current_alias():
     """#470 regression pin: the specialist-call model must be a model ALIAS,
     never a dated snapshot. The previous pin (claude-sonnet-4-20250514)
