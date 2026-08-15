@@ -61,9 +61,26 @@ for i in $(seq 1 $MAX_RETRIES); do
         SYNC_PID=$!
 
         # Watchdog: SIGTERM after MAX_RUNTIME, SIGKILL 60s later as backstop.
+        #
+        # `sleep` returns early if the subshell catches a signal, and the next
+        # line then kills a sync that has run for minutes rather than hours.
+        # That is not hypothetical: on 2026-08-15 this killed the nightly run
+        # 31 minutes in and logged it as a 21600s timeout, taking out
+        # relationship_discovery and every phase after it. So re-check the wall
+        # clock and go back to sleep unless the deadline has genuinely passed.
+        WATCH_START=$(date +%s)
         (
-            sleep "$MAX_RUNTIME"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync (PID $SYNC_PID) after ${MAX_RUNTIME}s" >> "$LOG"
+            while :; do
+                sleep "$MAX_RUNTIME"
+                ELAPSED=$(( $(date +%s) - WATCH_START ))
+                if [ "$ELAPSED" -ge "$MAX_RUNTIME" ]; then
+                    break
+                fi
+                # Woken early — log it, since a signal reaching this subshell
+                # means something is stray-signalling the sync's process group.
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Watchdog woke early at ${ELAPSED}s (limit ${MAX_RUNTIME}s) — not killing" >> "$LOG"
+            done
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Killing stuck sync (PID $SYNC_PID) after ${ELAPSED}s" >> "$LOG"
             kill -TERM "$SYNC_PID" 2>/dev/null
             sleep 60
             kill -KILL "$SYNC_PID" 2>/dev/null
