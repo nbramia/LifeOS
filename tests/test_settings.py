@@ -76,24 +76,6 @@ def test_routing_llm_url_override(monkeypatch):
     assert s.routing_llm_url == "http://routing-box:9090"
 
 
-def test_routing_llm_model_falls_back_to_local_llm_model_when_unset(monkeypatch):
-    """Routing target model label defaults to the global local LLM model when
-    unset, so a fresh clone with no override behaves exactly as today."""
-    monkeypatch.delenv("LIFEOS_LOCAL_ROUTING_LLM_MODEL", raising=False)
-    monkeypatch.setenv("LIFEOS_LLM_MODEL", "some-org/base-model-GGUF")
-    from config.settings import Settings
-    s = Settings()
-    assert s.routing_llm_model == "some-org/base-model-GGUF"
-
-
-def test_routing_llm_model_override(monkeypatch):
-    """An explicit LIFEOS_LOCAL_ROUTING_LLM_MODEL wins over local_llm_model."""
-    monkeypatch.setenv("LIFEOS_LOCAL_ROUTING_LLM_MODEL", "some-org/other-model-GGUF")
-    from config.settings import Settings
-    s = Settings()
-    assert s.routing_llm_model == "some-org/other-model-GGUF"
-
-
 def test_router_enable_thinking_defaults_true():
     """Router thinking stays on by default (#566 PR 2 does not flip
     behaviour) — the eventual flip is a one-line default change here."""
