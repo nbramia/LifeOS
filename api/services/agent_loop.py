@@ -22,7 +22,7 @@ from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
-from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage
+from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
 from api.services.resilience import is_retryable_api_error
 from config.settings import settings
 
@@ -462,6 +462,19 @@ async def run_agent_loop(
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
                                         voice_rules=voice_rules, personal_context=personal_context)
 
+    # Thinking control (#567): only LocalLLMClient.astream accepts
+    # enable_thinking — AnthropicLLMClient.astream has no such kwarg, and
+    # passing it unconditionally would break the (default) Anthropic backend.
+    # isinstance is the simplest correct gate here: there are exactly two
+    # concrete client classes, agent_loop already branches on which one it
+    # has (_select_client), and a capability protocol would be overkill for
+    # a single kwarg on a two-class module. settings.local_agent_enable_thinking
+    # defaults True (current behaviour) -> mapped to None so the request body
+    # stays byte-identical until an operator opts out.
+    astream_kwargs: dict = {}
+    if isinstance(client, LocalLLMClient):
+        astream_kwargs["enable_thinking"] = None if settings.local_agent_enable_thinking else False
+
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
     # sending any draft created during this same turn — sends require the user
     # to confirm in a later turn (draft → confirm → send).
@@ -534,6 +547,7 @@ async def run_agent_loop(
                         system=system_prompt,
                         max_tokens=4096,
                         tools=tools,
+                        **astream_kwargs,
                     ):
                         if event["type"] == "text":
                             text_this_round += event["content"]
@@ -678,6 +692,7 @@ async def run_agent_loop(
                 system=system_prompt,
                 max_tokens=4096,
                 timeout=180,
+                **astream_kwargs,
             ):
                 synthesis_events += 1
                 if event["type"] == "text":

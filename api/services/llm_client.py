@@ -510,10 +510,16 @@ class LocalLLMClient:
         reasoning is only ever a leading prefix. _consume_think_stream does
         NOT also handle a closing-only "</think>" with no preceding opener
         (see its module-level comment) — on this deployment reasoning
-        arrives via the separate ``reasoning_content`` delta field instead,
-        which is simply not read here, so it never reaches a "text" event
-        either. No consumer needs the reasoning text itself, so unlike
-        _parse_response it isn't reassembled or surfaced here.
+        arrives via the separate ``reasoning_content`` delta field instead.
+        That field is only checked for presence (to warn on starvation, see
+        below), never reassembled or surfaced — it still never reaches a
+        "text" event.
+
+        If the stream ends with ``finish_reason == "length"``, reasoning
+        deltas were seen, and no text was ever emitted, the whole token
+        budget was spent on chain-of-thought with no answer to show for it —
+        a warning is logged (not yielded; this never changes what the
+        caller receives).
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
@@ -537,6 +543,14 @@ class LocalLLMClient:
             tool_calls_acc: dict[int, dict] = {}  # index -> accumulated tool call
             think_buffer = ""  # holds text not yet resolved against the reasoning-prefix rule
             think_phase = "undetermined"
+            # Starvation tracking (#567): reasoning_content deltas are never
+            # surfaced as a "text" event (see docstring), which made the
+            # failure mode silent — a reasoning model can burn its entire
+            # max_tokens budget on chain-of-thought and stream nothing back.
+            # These two flags don't change what's yielded; they only decide
+            # whether to log a warning at "done".
+            reasoning_seen = False
+            text_emitted = False
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -562,7 +576,15 @@ class LocalLLMClient:
                     think_buffer += delta["content"]
                     emit_text, think_phase, think_buffer = _consume_think_stream(think_buffer, think_phase)
                     if emit_text:
+                        text_emitted = True
                         yield {"type": "text", "content": emit_text}
+
+                # reasoning_content deltas are never turned into text (see
+                # docstring) — tracked only so a starved response (all
+                # reasoning, no answer) can be logged below instead of
+                # silently returning nothing.
+                if delta.get("reasoning_content"):
+                    reasoning_seen = True
 
                 # Tool calls (streamed incrementally)
                 if delta.get("tool_calls"):
@@ -593,8 +615,19 @@ class LocalLLMClient:
                     # leading-prefix rule it's just ordinary text and is
                     # flushed rather than dropped.
                     if think_buffer and think_phase != "in_think":
+                        text_emitted = True
                         yield {"type": "text", "content": think_buffer}
                     think_buffer = ""
+
+                    if not text_emitted and reasoning_seen and finish_reason == "length":
+                        logger.warning(
+                            "Streamed LLM response reasoning starved: spent the "
+                            "entire %d-token max_tokens budget on chain-of-thought "
+                            "and streamed no answer text (finish_reason=length). "
+                            "Disable thinking for this call (enable_thinking=False) "
+                            "or raise max_tokens.",
+                            payload.get("max_tokens", 0),
+                        )
 
                     usage_data = chunk.get("usage", {})
                     usage = LLMUsage(

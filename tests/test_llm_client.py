@@ -1147,6 +1147,47 @@ class TestAStreamReasoning:
                 break
         assert events[0] == {"type": "text", "content": "The answer is 42."}
 
+    @pytest.mark.asyncio
+    async def test_starvation_warning_fires_when_budget_exhausted_on_reasoning(self, caplog):
+        """#567: astream ignores reasoning_content deltas entirely, so a
+        reasoning model that burns its whole max_tokens budget on
+        chain-of-thought and never reaches an answer used to fail silently
+        (empty text, no signal). When no text was ever emitted, reasoning
+        deltas WERE seen, and finish_reason=="length", a warning must be
+        logged naming the cause (thinking) and the fix (disable it / raise
+        max_tokens) — without changing what's yielded."""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "thinking, thinking..."}, "finish_reason": None}]},
+            {"choices": [{"delta": {"reasoning_content": "still thinking..."}, "finish_reason": None}]},
+            _done_chunk(finish_reason="length", completion_tokens=4096),
+        ]
+        client = self._client_with_chunks(chunks)
+        with caplog.at_level("WARNING", logger="api.services.llm_client"):
+            events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text_events = [e for e in events if e["type"] == "text"]
+        assert text_events == []  # yielded content is unchanged — nothing to emit
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("reasoning starved" in w.lower() for w in warnings)
+        assert any("max_tokens" in w or "enable_thinking" in w for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_no_starvation_warning_for_normal_stream(self, caplog):
+        """A normal stream that reaches an answer (or a legitimate empty
+        response that isn't reasoning-starved) never logs the warning."""
+        chunks = [
+            {"choices": [{"delta": {"reasoning_content": "thinking..."}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "The answer is 42."}, "finish_reason": None}]},
+            _done_chunk(finish_reason="length", completion_tokens=4096),
+        ]
+        client = self._client_with_chunks(chunks)
+        with caplog.at_level("WARNING", logger="api.services.llm_client"):
+            events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "The answer is 42."
+        warnings = [r.message for r in caplog.records
+                    if r.levelname == "WARNING" and "reasoning starved" in r.message.lower()]
+        assert warnings == []
+
 
 # ---- Anthropic prompt caching (#383 Phase 1) ----
 
