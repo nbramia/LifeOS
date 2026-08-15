@@ -73,8 +73,7 @@ Query routing, fact filtering, and entity-cleanup auto-hide decisions always go 
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `LIFEOS_LOCAL_ROUTING_LLM_URL` | str | — (falls back to `LIFEOS_LOCAL_LLM_URL`) | Dedicated llama-server endpoint for routing/validation calls. Set only once a distinct routing server is actually running elsewhere. |
-| `LIFEOS_LOCAL_ROUTING_LLM_MODEL` | str | — (falls back to `LIFEOS_LLM_MODEL`) | Informational label for the routing target's model. Not sent in requests — the model actually served is whatever `LIFEOS_LOCAL_ROUTING_LLM_URL` points at. |
+| `LIFEOS_LOCAL_ROUTING_LLM_URL` | str | — (falls back to `LIFEOS_LOCAL_LLM_URL`) | Dedicated llama-server endpoint for routing/validation calls. `llama-server` serves one model per process and ignores the request's `model` field, so this URL — pointing at a second `llama-server` with a different model loaded — is the actual mechanism for giving routing a distinct model from chat synthesis. Set only once that second server is actually running. |
 | `LIFEOS_ROUTER_ENABLE_THINKING` | bool | `true` | Whether `query_router`'s LLM routing call requests reasoning from the local model. Measured on the live host: 23-32s/call with thinking on vs. 2-9s with it off, with substantively identical routing decisions. Left `true` (unchanged behaviour) pending a broader correctness A/B — flipping to `false` is a one-line default change once confirmed. |
 
 `LocalLLMClient.create`/`acreate`/`astream` (and the `generate_text`/`generate_json` routing helpers) also accept per-request `enable_thinking` (bool) and `reasoning_effort` (str) keyword arguments, sent as `chat_template_kwargs: {"enable_thinking": ...}` and `reasoning_effort` on the request body. Leaving both unset adds no new keys to the request — existing callers are unaffected.

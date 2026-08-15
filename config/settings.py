@@ -278,28 +278,24 @@ class Settings(BaseSettings):
     )
 
     # Routing target (query_router, fact filtering, entity-cleanup auto-hide —
-    # see _get_local_routing_client). Optional overrides so routing calls can
-    # eventually point at a distinct llama-server instance/model without
-    # touching the main local_llm_url/local_llm_model used for chat synthesis.
-    # Both empty (default) falls back to those global values — see
-    # routing_llm_url/routing_llm_model — so a fresh clone behaves exactly as
-    # it does today (#566 PR 2).
+    # see _get_local_routing_client). Optional override so routing calls can
+    # eventually point at a distinct llama-server instance without touching
+    # local_llm_url, which chat synthesis uses. Empty (default) falls back to
+    # that global value — see routing_llm_url — so a fresh clone behaves
+    # exactly as it does today (#566 PR 2). llama-server serves one model per
+    # process and ignores the request's "model" field, so on this
+    # architecture "which model" *is* "which URL" — there is no separate
+    # model-name setting to wire up.
     local_routing_llm_url: str = Field(
         default="",
         alias="LIFEOS_LOCAL_ROUTING_LLM_URL",
         description="Optional dedicated llama-server endpoint for routing/"
                     "validation calls. Empty (default) falls back to "
-                    "LIFEOS_LOCAL_LLM_URL — set this only once a distinct "
-                    "routing server is actually running."
-    )
-    local_routing_llm_model: str = Field(
-        default="",
-        alias="LIFEOS_LOCAL_ROUTING_LLM_MODEL",
-        description="Optional informational label for the routing target's "
-                    "model (mirrors LIFEOS_LLM_MODEL — not sent in requests; "
-                    "the model actually served is whatever "
-                    "LIFEOS_LOCAL_ROUTING_LLM_URL points at). Empty (default) "
-                    "falls back to LIFEOS_LLM_MODEL."
+                    "LIFEOS_LOCAL_LLM_URL. Set this to point routing at a "
+                    "second llama-server that has a different model loaded — "
+                    "that's the actual mechanism for selecting a distinct "
+                    "routing model, since llama-server ignores the request's "
+                    "model field."
     )
     router_enable_thinking: bool = Field(
         default=True,
@@ -317,11 +313,6 @@ class Settings(BaseSettings):
     def routing_llm_url(self) -> str:
         """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
         return self.local_routing_llm_url or self.local_llm_url
-
-    @property
-    def routing_llm_model(self) -> str:
-        """Resolved routing-target model label: the dedicated override if set, else local_llm_model."""
-        return self.local_routing_llm_model or self.local_llm_model
 
     # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
     mcp_http_port: int = Field(
