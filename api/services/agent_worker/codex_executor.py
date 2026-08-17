@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
+from api.services.agent_worker.claude_code_executor import (
+    _ALTERNATE_AUTH_ENV_PREFIXES,
+)
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
@@ -281,10 +284,19 @@ class CodexExecutor:
         """Strip CODEX_* env vars so the subprocess doesn't inherit the
         operator's interactive Codex context — keep CODEX_HOME so auth
         (`~/.codex/auth.json`) is preserved.
+
+        Anthropic credentials go too (#578). Codex doesn't use them itself, but
+        it has a shell and `claude` is on the PATH: an inherited
+        ANTHROPIC_API_KEY would let a codex session start an API-billed Claude
+        Code session, which — like codex itself — is exempt from the per-task
+        dollar cap for being subscription-billed.
         """
         keep = {"CODEX_HOME"}
-        return {k: v for k, v in os.environ.items()
-                if not k.startswith("CODEX_") or k in keep}
+        return {
+            k: v for k, v in os.environ.items()
+            if (not k.startswith("CODEX_") or k in keep)
+            and not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
+        }
 
     def _run(
         self,

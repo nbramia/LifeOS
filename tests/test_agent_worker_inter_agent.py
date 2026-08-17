@@ -945,3 +945,93 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
     kinds = [e["kind"] for e in transcript.read(target.session_id)]
     assert "operator_killed" in kinds
     assert "local_subprocess_killed" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# spawn — a subscription-billed lineage cannot spawn an API-billed child (#578)
+# ---------------------------------------------------------------------------
+
+def _cli_root(store: SessionStore, routing: str = "claude_code"):
+    """A root session on a CLI route — the shape the doctor bot runs as."""
+    return store.create(
+        task_id=f"{routing}_root_task",
+        status=STATUS_RUNNING,
+        routing=routing,
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 10.0},
+    )
+
+
+def _ctx_for(store: SessionStore, transcript: TranscriptStore, session):
+    return InterAgentContext(
+        session_store=store,
+        transcript_store=transcript,
+        caller_session_id=session.session_id,
+        caps=Caps(),
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("routing", ["claude_code", "codex"])
+def test_spawn_managed_child_rejected_from_cli_root(store, transcript, routing):
+    """model='claude' routes through Managed Agents — the Anthropic API — so a
+    CLI lineage (billed to the operator's subscription) may not spawn one."""
+    root = _cli_root(store, routing)
+
+    result = dispatch(_ctx_for(store, transcript, root), "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert not result["ok"]
+    assert result["error"] == "api_billing_blocked"
+    assert store.list_sessions(parent_session_id=root.session_id) == []
+
+
+@pytest.mark.unit
+def test_spawn_managed_child_rejected_through_local_intermediary(store, transcript):
+    """The check reads the ROOT's routing, so an intermediate child on another
+    engine can't be used to launder the API-billed spawn."""
+    root = _cli_root(store)
+    middle = store.create(
+        task_id="middle_task",
+        status=STATUS_RUNNING,
+        routing="local",
+        budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 10.0},
+        parent_session_id=root.session_id,
+        root_session_id=root.session_id,
+        spawn_depth=1,
+    )
+
+    result = dispatch(_ctx_for(store, transcript, middle), "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert not result["ok"]
+    assert result["error"] == "api_billing_blocked"
+
+
+@pytest.mark.unit
+def test_spawn_managed_child_still_allowed_from_managed_root(ctx, store, parent):
+    """Unchanged for lineages that are API-billed by design: the block is about
+    a *subscription* session opening an API side door, not about Managed Agents."""
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert result["ok"]
+    assert store.get_by_session_id(result["child_session_id"]).routing == "claude"
+
+
+@pytest.mark.unit
+def test_spawn_cli_child_with_tier_allowed_from_cli_root(store, transcript):
+    """The route left open to a CLI lineage: another CLI child, on whichever
+    tier suits the work — subscription-billed, so no API charge either way."""
+    root = _cli_root(store)
+
+    result = dispatch(_ctx_for(store, transcript, root), "lifeos_agent_spawn", {
+        "prompt": "implement the fix", "model": "claude_code", "tier": "sonnet",
+    })
+
+    assert result["ok"]
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.routing == "claude_code"
+    assert child.claude_code_model == "sonnet"
