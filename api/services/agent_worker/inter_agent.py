@@ -247,6 +247,28 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
     if caller is None:
         return _err(f"caller session {ctx.caller_session_id} not found", code="no_caller")
 
+    # A subscription-billed lineage must not be able to open an API-billed side
+    # door. `model="claude"` runs the child on Managed Agents — the Anthropic
+    # API — so a lineage rooted in a CLI session (the doctor, and every other
+    # orchestrator the worker drives through Claude Code) is refused it (#578).
+    # Read from the ROOT, not the caller, so an intermediate local child can't
+    # launder the spawn. This is what makes "CLI routes are subscription-billed"
+    # above a fact rather than an assumption — the sibling half is the
+    # executor's env strip (ClaudeCodeExecutor._clean_env), which denies the CLI
+    # itself any API credential.
+    if model == "claude":
+        root_session = ctx.session_store.get_by_session_id(
+            caller.root_session_id or caller.session_id
+        ) or caller
+        if root_session.routing in CLI_ROUTINGS:
+            return _err(
+                f"this lineage is subscription-billed (root session routing="
+                f"{root_session.routing}); model='claude' would bill the "
+                f"Anthropic API. Use model='claude_code' (with tier=) for a "
+                f"Claude child, or 'local' for the on-box model.",
+                code="api_billing_blocked",
+            )
+
     # Cap: spawn depth.
     new_depth = (caller.spawn_depth or 0) + 1
     if new_depth > ctx.caps.max_spawn_depth:

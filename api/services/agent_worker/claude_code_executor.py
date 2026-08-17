@@ -150,6 +150,16 @@ def _resolve_claude_binary() -> str:
 
 # The system prompt is the operator-facing contract for /claude's behavior —
 # scope, clarification protocol, persistence, environment shape.
+# Env prefixes stripped from every CLI subprocess (see
+# `ClaudeCodeExecutor._clean_env`). `ANTHROPIC_` covers the API key, auth
+# token, base URL, custom headers and unix socket — each an auth source the CLI
+# prefers over the operator's claude.ai login. `CLAUDE` covers the OAuth token,
+# the interactive-session context, and the CLAUDE_CODE_USE_BEDROCK / _VERTEX /
+# _MANTLE provider switches (the only way the AWS/GCP credentials also in the
+# environment could become an inference route).
+_ALTERNATE_AUTH_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE")
+
+
 _SYSTEM_PROMPT = """\
 You are being orchestrated by LifeOS on behalf of the user ({user_name}).
 The user sent this task via Telegram and cannot see your full output.
@@ -430,7 +440,12 @@ class ClaudeCodeExecutor:
                 delegation=delegation_preamble(
                     session_id,
                     trigger="To run background work in parallel,",
-                    model='"local" or "claude"',
+                    # Deliberately not "claude": that routes the child through
+                    # Managed Agents (Anthropic API), which a subscription-
+                    # billed CLI lineage is refused anyway (#578). Advertise
+                    # only the routes a child can actually be spawned on.
+                    model='"claude_code" with tier="haiku"/"sonnet"/"opus", '
+                          'or "local" for the on-box model',
                 ),
             ),
         ]
@@ -440,11 +455,26 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _clean_env() -> dict:
-        """Strip CLAUDE* env vars so the subprocess doesn't inherit the
-        operator's interactive Claude Code context. Without this, launching
-        from a Claude-managed terminal would have the child claim it's
-        already inside a session and refuse to run."""
-        return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        """The subprocess environment, with every alternate auth source removed.
+
+        Two problems, one mechanism. ``CLAUDE*`` would leak the operator's
+        interactive Claude Code context, and the child would claim it is
+        already inside a session and refuse to run. ``ANTHROPIC_*`` would hand
+        the CLI API credentials, which *take precedence over the claude.ai
+        login* — the session then runs correctly but bills the Anthropic API
+        (#578). The worker inherits the LifeOS ``.env`` through systemd's
+        ``EnvironmentFile``, and that file carries ``ANTHROPIC_API_KEY`` for
+        the API-backed services running in-process, so without this strip
+        every headless session the worker spawns is silently API-billed.
+
+        Stripping is the entire enforcement, and it has to be: there is no CLI
+        flag that means "use the subscription". The only way to guarantee a
+        session cannot bill the API is to leave it no credential to find.
+        """
+        return {
+            k: v for k, v in os.environ.items()
+            if not k.startswith(_ALTERNATE_AUTH_ENV_PREFIXES)
+        }
 
     @staticmethod
     def _effective_final_text(state: _RunState) -> str:

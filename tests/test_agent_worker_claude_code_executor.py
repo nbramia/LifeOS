@@ -1128,3 +1128,66 @@ def test_clean_completion_wins_over_raced_failed_flip(tmp_path: Path):
     completed = [e for e in _read_transcript(transcripts, session.session_id)
                  if e["kind"] == "claude_code_completed"]
     assert completed[0]["payload"]["final_text"] == "all done."
+
+
+# ---------------------------------------------------------------------------
+# Subprocess environment — subscription billing is enforced by omission (#578)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("var", [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_UNIX_SOCKET",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+])
+def test_clean_env_drops_every_alternate_auth_source(monkeypatch, var):
+    """No auth source may survive into the CLI subprocess.
+
+    Each of these makes the CLI authenticate somewhere other than the
+    operator's claude.ai login — the API key/token/base-URL/socket directly,
+    the provider switches by turning the ambient AWS/GCP credentials into an
+    inference route. The worker inherits all of them from the LifeOS `.env`.
+    """
+    monkeypatch.setenv(var, "would-bill-the-api")
+    assert var not in ClaudeCodeExecutor._clean_env()
+
+
+def test_clean_env_keeps_unrelated_vars(monkeypatch):
+    """The strip is targeted: the subprocess still needs a working environment."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("LIFEOS_VAULT_PATH", "/vault")
+    env = ClaudeCodeExecutor._clean_env()
+    assert env["PATH"] == "/usr/bin"
+    assert env["LIFEOS_VAULT_PATH"] == "/vault"
+
+
+def test_spawned_subprocess_gets_no_api_credential(monkeypatch, tmp_path: Path):
+    """End-to-end: the env actually handed to Popen carries no API key.
+
+    The unit tests above cover `_clean_env` in isolation; this one proves the
+    executor passes *that* env to the subprocess, so the guarantee can't be
+    lost by a future caller reaching for `os.environ` directly.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-would-bill-the-api")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-1"},
+        {"type": "result", "session_id": "cli-1", "total_cost_usd": 0.01, "result": "done."},
+    ]
+    inner = _spawn_with(events, returncode=0)
+    captured: dict = {}
+
+    def _capturing_spawn(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return inner(*args, **kwargs)
+
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_capturing_spawn)
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "task"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
