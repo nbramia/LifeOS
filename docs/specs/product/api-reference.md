@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-07-09
+**Last Updated:** 2026-08-17
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -701,6 +701,8 @@ Schedules can also be created, edited, listed, and deleted via natural language 
 
 Create a schedule. Supports `schedule_type` of `once` (ISO datetime) or `cron`, and `action` of `notify` (static text), `prompt` (runs through the chat pipeline), `endpoint` (calls a LifeOS API endpoint), or `agent` (hands off to the agent worker via an `#agent` task, with `executor` = `local`/`cloud`/`cloud-haiku`/`cloud-sonnet`).
 
+`bot` (optional) selects which Telegram bot delivers the notification. Valid values are `primary` and the names registered in `config/telegram_bots.json`; anything else returns **422** with the accepted names. Omit it, or send an empty string, for the primary bot.
+
 ### GET /api/scheduler
 
 List all schedules.
@@ -711,7 +713,7 @@ Get a specific schedule.
 
 ### PUT /api/scheduler/{id}
 
-Update a schedule.
+Update a schedule. An unrecognised `bot` returns **422** and leaves the schedule unchanged.
 
 ### DELETE /api/scheduler/{id}
 

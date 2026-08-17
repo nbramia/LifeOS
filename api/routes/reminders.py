@@ -84,8 +84,9 @@ class SendMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Message text to send via Telegram")
     bot: Optional[str] = Field(
         default=None,
-        description="Optional bot name to send from (e.g. 'fitness', 'therapy'). "
-                    "Falls back to the primary bot if unset or unrecognised.",
+        description="Optional bot name to send from — a name from the registry "
+                    "(config/telegram_bots.json). Falls back to the primary bot "
+                    "if unset or unrecognised.",
     )
 
 

@@ -73,7 +73,7 @@ class ScheduleEntry:
     message_content: str = ""  # static text or natural-language prompt
     endpoint_config: Optional[dict] = None  # {endpoint, method, params}
     executor: str = ""  # agent executor tag without '#': local / cloud / cloud-haiku ...
-    bot: str = ""  # Telegram bot name for outbound sends (e.g. "fitness", "therapy"); empty = primary
+    bot: str = ""  # Telegram bot name for outbound sends (registry: config/telegram_bots.json); empty = primary
     enabled: bool = True
     created_at: str = ""
     last_triggered_at: Optional[str] = None
@@ -738,6 +738,29 @@ class SchedulerStore:
         return entry.action
 
 
+def _misroute_notice(bot: str) -> str:
+    """Banner for a schedule whose configured bot can't be resolved (#575).
+
+    Delivery stays fail-open — an orphaned bot name (typically the residue of a
+    bot rename) must never cost a notification, so the send still goes out from
+    the primary bot. This makes that substitution visible in the channel the
+    message lands in instead of only in a log line nobody reads. Generic text:
+    it names the unresolvable bot and nothing else.
+    """
+    from api.services.telegram import is_known_bot
+
+    try:
+        known = is_known_bot(bot)
+    except Exception:
+        # Reading the registry must never be what loses a notification: this
+        # runs inside the message the send is about to deliver.
+        return ""
+    if known:
+        return ""
+    return (f"⚠️ *Routing warning:* this schedule's bot '{bot}' is not configured "
+            f"— delivered from the primary bot instead.\n\n")
+
+
 class SchedulerScheduler:
     """
     Background thread that fires due schedules every 60 seconds.
@@ -982,7 +1005,10 @@ class SchedulerScheduler:
 
             if message:
                 from api.services.telegram import send_message_async
-                await send_message_async(f"*{entry.name}*\n\n{message}", bot=entry.bot or None)
+                await send_message_async(
+                    f"{_misroute_notice(entry.bot)}*{entry.name}*\n\n{message}",
+                    bot=entry.bot or None,
+                )
                 self.store.record_run(entry.id, "sent", message[:200])
             else:
                 self.store.record_run(entry.id, "empty", "")
@@ -993,7 +1019,7 @@ class SchedulerScheduler:
             try:
                 from api.services.telegram import send_message_async
                 await send_message_async(
-                    f"*{entry.name}* (failed)\n\n"
+                    f"{_misroute_notice(entry.bot)}*{entry.name}* (failed)\n\n"
                     f"Schedule could not execute: {str(e)[:200]}",
                     bot=entry.bot or None,
                 )

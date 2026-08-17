@@ -71,6 +71,46 @@ def _token_for_bot(bot: Optional[str]) -> Optional[str]:
     return _resolve_bot(bot)[0]
 
 
+def valid_bot_names() -> list[str]:
+    """Names a caller may legitimately route a send to, newest state.
+
+    ``"primary"`` plus whatever the registry (``config/telegram_bots.json``)
+    currently holds. Read on every call rather than cached at import: the
+    ``telegram_bots`` property is uncached and reflects the current
+    environment, and a registry with no specialized bots is a valid state (a
+    fresh clone configures only the primary bot).
+    """
+    return ["primary"] + [cfg.name for cfg in settings.telegram_bots]
+
+
+def is_known_bot(bot: Optional[str]) -> bool:
+    """Whether ``bot`` resolves to a configured bot. Empty means primary."""
+    return not bot or bot in valid_bot_names()
+
+
+def validate_bot_name(bot: Optional[str]) -> Optional[str]:
+    """Return the name to store, or raise ``ValueError`` if it isn't configured.
+
+    Used wherever a bot name is *written* (scheduler create/update) so an
+    orphaned name — the residue of a bot rename — is rejected at the point of
+    entry instead of silently degrading to the primary chat weeks later (#575).
+    Empty or unset stays valid and continues to mean the primary bot.
+
+    Surrounding whitespace is trimmed, so a tool argument that arrived as
+    ``' ledger'`` stores as ``'ledger'`` and resolves at fire time. Case is
+    *not* folded: matching stays exact, in parity with :func:`_resolve_bot`.
+    """
+    if bot is not None:
+        bot = bot.strip()
+    if is_known_bot(bot):
+        return bot
+    raise ValueError(
+        f"Unknown Telegram bot '{bot}'. Configured names: "
+        f"{', '.join(valid_bot_names())} — a registry entry "
+        f"(config/telegram_bots.json) counts only once its token env var is set"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Message sending
 # ---------------------------------------------------------------------------

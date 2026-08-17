@@ -41,7 +41,8 @@ class CreateScheduleRequest(BaseModel):
     message_content: str = Field(default="", description="Static text or natural-language prompt")
     endpoint_config: Optional[dict] = Field(default=None, description="For endpoint action: {endpoint, method, params}")
     executor: str = Field(default="", description="For agent action: local | cloud | cloud-haiku | cloud-sonnet")
-    bot: str = Field(default="", description="Telegram bot to notify from (e.g. 'fitness', 'therapy'); empty = primary")
+    bot: str = Field(default="", description="Telegram bot to notify from — a name from the "
+                                             "registry (config/telegram_bots.json) or 'primary'; empty = primary")
     enabled: bool = Field(default=True)
     timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone for the schedule")
 
@@ -109,8 +110,9 @@ class SendMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Message text to send via Telegram")
     bot: Optional[str] = Field(
         default=None,
-        description="Optional bot name to send from (e.g. 'fitness', 'therapy'). "
-                    "Falls back to the primary bot if unset or unrecognised.",
+        description="Optional bot name to send from — a name from the registry "
+                    "(config/telegram_bots.json). Falls back to the primary bot "
+                    "if unset or unrecognised.",
     )
 
 
@@ -125,6 +127,23 @@ def _resolve_action(action: Optional[str], message_type: Optional[str]) -> str:
     return _TYPE_TO_ACTION.get(message_type or "", "notify")
 
 
+def _require_known_bot(bot: Optional[str]) -> Optional[str]:
+    """Reject a bot name the registry doesn't know, else return it (#575).
+
+    An orphaned name — usually the residue of a bot rename — otherwise stores
+    fine and then silently delivers to the primary chat at every fire. The
+    registry is read here, at request time, because it reflects the current
+    environment; empty or unset stays valid and means the primary bot. Returns
+    the trimmed name so that is what gets stored.
+    """
+    from api.services.telegram import validate_bot_name
+
+    try:
+        return validate_bot_name(bot)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Routes (static paths MUST come before {schedule_id} to avoid capture)
 # ---------------------------------------------------------------------------
@@ -137,6 +156,7 @@ async def create_schedule(request: CreateScheduleRequest):
     action = _resolve_action(request.action, request.message_type)
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
+    request.bot = _require_known_bot(request.bot)
 
     store = get_scheduler_store()
     entry = store.create(
@@ -193,6 +213,7 @@ async def get_schedule(schedule_id: str):
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
 async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     """Update an existing schedule."""
+    request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     entry = store.update(schedule_id, **updates)
