@@ -749,7 +749,13 @@ def _misroute_notice(bot: str) -> str:
     """
     from api.services.telegram import is_known_bot
 
-    if is_known_bot(bot):
+    try:
+        known = is_known_bot(bot)
+    except Exception:
+        # Reading the registry must never be what loses a notification: this
+        # runs inside the message the send is about to deliver.
+        return ""
+    if known:
         return ""
     return (f"⚠️ *Routing warning:* this schedule's bot '{bot}' is not configured "
             f"— delivered from the primary bot instead.\n\n")

@@ -1057,22 +1057,6 @@ class LifeOSMCPServer:
             return {"error": f"Request failed: {e}"}
 
     @staticmethod
-    def _validate_schedule_bot(bot: str | None) -> str | None:
-        """Error message if ``bot`` names no configured bot, else ``None``.
-
-        Reuses the same registry-backed check the scheduler routes apply, so an
-        MCP caller and an HTTP caller are told the same thing. Imported lazily,
-        matching the other app-module imports in this server.
-        """
-        try:
-            from api.services.telegram import validate_bot_name
-
-            validate_bot_name(bot)
-        except ValueError as e:
-            return str(e)
-        return None
-
-    @staticmethod
     def _cache_eligible(tool_name: str) -> bool:
         """Tools whose results are safe to cache for 60s within a session.
 
@@ -1101,14 +1085,6 @@ class LifeOSMCPServer:
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
-
-        # Reject an unknown notification bot before writing the schedule, so an
-        # agent gets the valid names back instead of a schedule that silently
-        # delivers to the primary chat forever (#575).
-        if tool_name in ("lifeos_schedule_create", "lifeos_schedule_update"):
-            error = self._validate_schedule_bot(arguments.get("bot"))
-            if error:
-                return {"error": error}
 
         # Inter-agent tools dispatch through the agent worker's session store
         # (no HTTP round-trip). The caller_session_id arg identifies which

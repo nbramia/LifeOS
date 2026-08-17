@@ -127,18 +127,19 @@ def _resolve_action(action: Optional[str], message_type: Optional[str]) -> str:
     return _TYPE_TO_ACTION.get(message_type or "", "notify")
 
 
-def _require_known_bot(bot: Optional[str]) -> None:
-    """Reject a bot name the registry doesn't know (#575).
+def _require_known_bot(bot: Optional[str]) -> Optional[str]:
+    """Reject a bot name the registry doesn't know, else return it (#575).
 
     An orphaned name — usually the residue of a bot rename — otherwise stores
     fine and then silently delivers to the primary chat at every fire. The
     registry is read here, at request time, because it reflects the current
-    environment; empty or unset stays valid and means the primary bot.
+    environment; empty or unset stays valid and means the primary bot. Returns
+    the trimmed name so that is what gets stored.
     """
     from api.services.telegram import validate_bot_name
 
     try:
-        validate_bot_name(bot)
+        return validate_bot_name(bot)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -155,7 +156,7 @@ async def create_schedule(request: CreateScheduleRequest):
     action = _resolve_action(request.action, request.message_type)
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
-    _require_known_bot(request.bot)
+    request.bot = _require_known_bot(request.bot)
 
     store = get_scheduler_store()
     entry = store.create(
@@ -212,7 +213,7 @@ async def get_schedule(schedule_id: str):
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
 async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     """Update an existing schedule."""
-    _require_known_bot(request.bot)
+    request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     entry = store.update(schedule_id, **updates)

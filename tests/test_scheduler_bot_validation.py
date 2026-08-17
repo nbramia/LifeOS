@@ -92,6 +92,21 @@ class TestValidateBotName:
             with pytest.raises(ValueError):
                 validate_bot_name("alerts")
 
+    @pytest.mark.parametrize("bot", [" ledger", "ledger ", "  ledger  "])
+    def test_trims_surrounding_whitespace_and_returns_the_stored_name(self, bot):
+        # Rejecting ' ledger' against a list showing a visually identical
+        # 'ledger' is unhelpful for an LLM-authored tool argument.
+        from api.services.telegram import validate_bot_name
+        with _patch_registry(_synthetic_bots()):
+            assert validate_bot_name(bot) == "ledger"
+
+    def test_does_not_case_fold(self):
+        # Exact matching is deliberate — parity with _resolve_bot.
+        from api.services.telegram import validate_bot_name
+        with _patch_registry(_synthetic_bots()):
+            with pytest.raises(ValueError):
+                validate_bot_name("Ledger")
+
     def test_is_known_bot_predicate(self):
         from api.services.telegram import is_known_bot
         with _patch_registry(_synthetic_bots()):
@@ -185,6 +200,20 @@ class TestSchedulerRoutesBotValidation:
         assert resp.status_code == 200
         assert mock_store.update.call_args.kwargs["bot"] == "alerts"
 
+    def test_create_trims_whitespace_before_storing(self, client, mock_store):
+        # Stored untrimmed, the name would pass validation and then misroute at
+        # fire time — so the write path has to store the trimmed value.
+        with _patch_registry(_synthetic_bots()):
+            resp = client.post("/api/scheduler", json=self._create_payload(bot=" ledger "))
+        assert resp.status_code == 200
+        assert mock_store.create.call_args.kwargs["bot"] == "ledger"
+
+    def test_update_trims_whitespace_before_storing(self, client, mock_store):
+        with _patch_registry(_synthetic_bots()):
+            resp = client.put("/api/scheduler/sch-1", json={"bot": " alerts "})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["bot"] == "alerts"
+
     def test_empty_registry_accepts_a_schedule_without_a_bot(self, client, mock_store):
         # Fresh clone: only a primary bot configured.
         with _patch_registry([]):
@@ -204,6 +233,16 @@ class TestSchedulerRoutesBotValidation:
 # ---------------------------------------------------------------------------
 
 class TestMcpScheduleBotValidation:
+    """The API is the only validator; MCP just surfaces its rejection.
+
+    The MCP server deliberately does *not* pre-check the bot name. Its view of
+    the registry is not the API's: ``config/telegram_bots.json`` is read
+    relative to the process cwd (the stdio child inherits the agent's cwd, not
+    the repo), and a client pointed at a remote ``LIFEOS_API_URL`` has neither
+    the same file nor the token env vars. A local pre-check would reject names
+    the server accepts, so the 422 is allowed to propagate instead.
+    """
+
     @pytest.fixture
     def server(self):
         from mcp_server import LifeOSMCPServer
@@ -211,6 +250,14 @@ class TestMcpScheduleBotValidation:
         srv.client = MagicMock()
         srv._result_cache = None
         return srv
+
+    def _http_422(self, detail):
+        """Make the transport raise the way httpx does on a 422."""
+        import httpx
+        response = MagicMock()
+        response.status_code = 422
+        response.text = f'{{"detail":"{detail}"}}'
+        return httpx.HTTPStatusError("422", request=MagicMock(), response=response)
 
     @pytest.mark.parametrize(
         "tool_name,arguments",
@@ -223,25 +270,38 @@ class TestMcpScheduleBotValidation:
             ("lifeos_schedule_update", {"schedule_id": "sch-1", "bot": "orphaned"}),
         ],
     )
-    def test_unknown_bot_rejected_without_writing(self, server, tool_name, arguments):
-        with _patch_registry(_synthetic_bots()):
-            result = server._call_api(tool_name, arguments)
+    def test_api_rejection_surfaces_as_the_tool_error(self, server, tool_name, arguments):
+        detail = ("Unknown Telegram bot 'orphaned'. Configured names: "
+                  "primary, alerts, ledger")
+        error = self._http_422(detail)
+        server.client.post.side_effect = error
+        server.client.request.side_effect = error
+
+        result = server._call_api(tool_name, arguments)
+
         assert "error" in result
+        assert "422" in result["error"]
+        # The valid options reach the agent verbatim from the API.
         assert "orphaned" in result["error"]
         assert "alerts" in result["error"] and "primary" in result["error"]
-        server.client.post.assert_not_called()
-        server.client.request.assert_not_called()
+        # And the agent sees it as an error, not a successful write.
+        assert server._format_response(tool_name, result).startswith("Error:")
 
-    def test_registered_bot_passes_through_to_the_api(self, server):
+    def test_no_local_precheck_blocks_a_name_the_api_would_accept(self, server):
+        # The regression guarded here: an MCP client whose local registry is
+        # empty (wrong cwd, or a remote API) must still be able to write a bot
+        # name the server knows. A pre-flight check would have hard-rejected it.
         response = MagicMock()
         response.json.return_value = {"id": "sch-2", "name": "Balance check", "bot": "ledger"}
         server.client.post.return_value = response
 
-        with _patch_registry(_synthetic_bots()):
+        with _patch_registry([]):
             result = server._call_api("lifeos_schedule_create", {
                 "name": "Balance check", "schedule_type": "cron",
                 "schedule_value": "0 7 * * 1-5", "action": "notify", "bot": "ledger",
             })
+
+        assert "error" not in result
         assert result["bot"] == "ledger"
         assert server.client.post.call_args.kwargs["json"]["bot"] == "ledger"
 
@@ -331,6 +391,25 @@ class TestFireTimeMisrouteMarker:
 
         sent = mock_send.call_args[0][0]
         assert sent == "*Balance check*\n\nthe balance is fine"
+
+    @pytest.mark.asyncio
+    async def test_send_survives_a_registry_read_that_raises(self, scheduler):
+        # The banner exists to annotate the send; it must never be the thing
+        # that loses it. A malformed registry makes the lookup raise, and the
+        # notification still has to go out.
+        entry = self._entry(scheduler, "orphaned")
+        with patch("api.services.telegram.is_known_bot",
+                   side_effect=RuntimeError("malformed registry")):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock, return_value=True) as mock_send:
+                await scheduler._fire_entry(entry)
+
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert "the balance is fine" in sent
+        # No banner is better than no message: it degrades, it doesn't abort.
+        assert "not configured" not in sent
+        assert scheduler.store.get(entry.id).last_status == "sent"
 
     @pytest.mark.asyncio
     async def test_failure_notification_also_carries_the_marker(self, scheduler):
