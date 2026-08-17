@@ -71,6 +71,39 @@ def _token_for_bot(bot: Optional[str]) -> Optional[str]:
     return _resolve_bot(bot)[0]
 
 
+def valid_bot_names() -> list[str]:
+    """Names a caller may legitimately route a send to, newest state.
+
+    ``"primary"`` plus whatever the registry (``config/telegram_bots.json``)
+    currently holds. Read on every call rather than cached at import: the
+    ``telegram_bots`` property is uncached and reflects the current
+    environment, and a registry with no specialized bots is a valid state (a
+    fresh clone configures only the primary bot).
+    """
+    return ["primary"] + [cfg.name for cfg in settings.telegram_bots]
+
+
+def is_known_bot(bot: Optional[str]) -> bool:
+    """Whether ``bot`` resolves to a configured bot. Empty means primary."""
+    return not bot or bot in valid_bot_names()
+
+
+def validate_bot_name(bot: Optional[str]) -> None:
+    """Raise ``ValueError`` if ``bot`` names no configured bot.
+
+    Used wherever a bot name is *written* (scheduler create/update) so an
+    orphaned name — the residue of a bot rename — is rejected at the point of
+    entry instead of silently degrading to the primary chat weeks later (#575).
+    Empty or unset stays valid and continues to mean the primary bot.
+    """
+    if is_known_bot(bot):
+        return
+    raise ValueError(
+        f"Unknown Telegram bot '{bot}'. Valid names: "
+        f"{', '.join(valid_bot_names())} (registry: config/telegram_bots.json)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Message sending
 # ---------------------------------------------------------------------------

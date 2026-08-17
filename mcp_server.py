@@ -748,7 +748,7 @@ class LifeOSMCPServer:
                     "message_content": {"type": "string", "description": "Static text, natural-language prompt, or agent task description"},
                     "endpoint_config": {"type": "object", "description": "For action=endpoint: {endpoint, method, params}"},
                     "executor": {"type": "string", "description": "For action=agent: 'local', 'cloud', 'cloud-haiku', or 'cloud-sonnet'"},
-                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from ('fitness', 'therapy'). Omit for the primary bot."},
+                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
                     "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True}
                 },
                 "required": ["name", "schedule_type", "schedule_value", "action"]
@@ -767,7 +767,7 @@ class LifeOSMCPServer:
                     "action": {"type": "string", "description": "'notify', 'prompt', 'endpoint', or 'agent'"},
                     "message_content": {"type": "string", "description": "Message text, prompt, or task description"},
                     "executor": {"type": "string", "description": "For action=agent: local | cloud | cloud-haiku | cloud-sonnet"},
-                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from ('fitness', 'therapy'). Omit for the primary bot."},
+                    "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
                     "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
                     "enabled": {"type": "boolean", "description": "Whether the schedule is active"}
                 },
@@ -820,8 +820,8 @@ class LifeOSMCPServer:
                     "bot": {
                         "type": "string",
                         "description": (
-                            "Optional bot to send from. Use 'fitness' to send from the fitness bot, "
-                            "'therapy' for the therapy bot. Omit to send from the primary bot."
+                            "Optional bot to send from — a name from the registry in "
+                            "config/telegram_bots.json. Omit to send from the primary bot."
                         ),
                     },
                 },
@@ -1057,6 +1057,22 @@ class LifeOSMCPServer:
             return {"error": f"Request failed: {e}"}
 
     @staticmethod
+    def _validate_schedule_bot(bot: str | None) -> str | None:
+        """Error message if ``bot`` names no configured bot, else ``None``.
+
+        Reuses the same registry-backed check the scheduler routes apply, so an
+        MCP caller and an HTTP caller are told the same thing. Imported lazily,
+        matching the other app-module imports in this server.
+        """
+        try:
+            from api.services.telegram import validate_bot_name
+
+            validate_bot_name(bot)
+        except ValueError as e:
+            return str(e)
+        return None
+
+    @staticmethod
     def _cache_eligible(tool_name: str) -> bool:
         """Tools whose results are safe to cache for 60s within a session.
 
@@ -1085,6 +1101,14 @@ class LifeOSMCPServer:
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
+
+        # Reject an unknown notification bot before writing the schedule, so an
+        # agent gets the valid names back instead of a schedule that silently
+        # delivers to the primary chat forever (#575).
+        if tool_name in ("lifeos_schedule_create", "lifeos_schedule_update"):
+            error = self._validate_schedule_bot(arguments.get("bot"))
+            if error:
+                return {"error": error}
 
         # Inter-agent tools dispatch through the agent worker's session store
         # (no HTTP round-trip). The caller_session_id arg identifies which

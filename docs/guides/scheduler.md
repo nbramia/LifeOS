@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-08-17
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
@@ -32,6 +32,7 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - **`[tz:: <IANA zone>]`** — interprets the trigger in that timezone (defaults to the configured timezone).
 - **`[action:: …]`** — what fires (see below).
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
+- **`[bot:: <name>]`** — which Telegram bot delivers the notification (see below); omitted means the primary bot.
 
 Editing a line in Obsidian (changing the cron, toggling the checkbox) is picked
 up within ~2s by the file watcher.
@@ -59,6 +60,22 @@ For `notify` and `prompt`, the Telegram message is **suppressed** when the
 result is empty or a sentinel (`NO_MEETING`, `NOTHING_TO_REPORT`, …) — so
 high-frequency schedules like pre-meeting prep stay quiet when there's nothing
 to say.
+
+### Notification bot
+
+A `notify` or `prompt` schedule can name the Telegram bot that delivers it, so
+finance, health, or therapy content lands in its own channel instead of the
+general feed. The valid names are `primary` plus whatever is registered in
+`config/telegram_bots.json` — that registry is the source of truth, and both
+`POST /api/scheduler` and `PUT /api/scheduler/{id}` reject any other name with
+a 422 that lists the accepted ones. Leaving the field unset means the primary
+bot, which is what an installation with no specialized bots configured gets.
+
+If a stored schedule names a bot the registry no longer has — usually because
+the bot was renamed after the schedule was written — the notification is still
+delivered from the primary bot rather than dropped, but the message carries a
+routing warning naming the unresolvable bot so the misroute is visible in the
+channel it lands in.
 
 ### Agent hand-off
 
