@@ -277,3 +277,47 @@ class TestTasksAPI:
         ]
         for f in expected_fields:
             assert f in data, f"Missing field: {f}"
+
+
+class TestListTasksParameterDocs:
+    """The MCP tool schema for `lifeos_task_list` is generated from this route's
+    OpenAPI spec (mcp_server._build_input_schema). Bare `Optional[str] = None`
+    params produce the placeholder "Query parameter: <name>", which tells a model
+    nothing about valid values — so it guesses a context (0 rows) or omits status
+    (every status, mostly done/cancelled) and reports a partial list as complete.
+    """
+
+    @pytest.fixture
+    def params(self):
+        from api.main import app
+        spec = app.openapi()["paths"]["/api/tasks"]["get"]["parameters"]
+        return {p["name"]: p.get("description", "") for p in spec}
+
+    def test_no_param_falls_back_to_placeholder_description(self, params):
+        assert set(params) == {"status", "context", "tag", "due_before", "query"}
+        for name, desc in params.items():
+            assert desc, f"{name} has no description; MCP would emit a placeholder"
+            assert "Query parameter:" not in desc
+
+    def test_status_description_enumerates_valid_values(self, params):
+        desc = params["status"]
+        for value in ("todo", "done", "in_progress", "cancelled",
+                      "deferred", "blocked", "urgent"):
+            assert value in desc
+        # The failure mode was omitting status entirely and summarising everything.
+        assert "todo" in desc and "omit" in desc.lower()
+
+    def test_context_description_warns_unused_values_return_nothing(self, params):
+        desc = params["context"].lower()
+        assert "zero" in desc or "no tasks" in desc
+        assert "inbox" in desc
+
+    def test_fallback_schema_does_not_invent_context_values(self):
+        """The offline fallback must not advertise contexts that no vault has."""
+        import mcp_server
+        schema = mcp_server.LifeOSMCPServer._fallback_schemas(
+            mcp_server.LifeOSMCPServer.__new__(mcp_server.LifeOSMCPServer)
+        )["lifeos_task_list"]
+        context_desc = schema["properties"]["context"]["description"]
+        assert "Work, Personal" not in context_desc
+        assert "Inbox" in context_desc

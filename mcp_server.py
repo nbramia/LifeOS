@@ -872,8 +872,8 @@ class LifeOSMCPServer:
             "lifeos_task_list": {
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "description": "Filter by status (todo, done, in_progress, cancelled, deferred, blocked, urgent)"},
-                    "context": {"type": "string", "description": "Filter by context (Work, Personal, etc.)"},
+                    "status": {"type": "string", "description": "Filter by status, exact and case-sensitive (todo, done, in_progress, cancelled, deferred, blocked, urgent). Omit to return every status; pass todo for open work."},
+                    "context": {"type": "string", "description": "Filter by context, exact but case-insensitive. Contexts are vault-defined and default to 'Inbox'; a context not in use returns zero tasks."},
                     "tag": {"type": "string", "description": "Filter by tag"},
                     "due_before": {"type": "string", "description": "Tasks due before date (YYYY-MM-DD)"},
                     "query": {"type": "string", "description": "Fuzzy text search across task descriptions"}

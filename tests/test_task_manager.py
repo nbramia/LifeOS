@@ -1287,3 +1287,36 @@ class TestEdgeCases:
 
         tasks = task_manager.list_tasks()
         assert len(tasks) == 2
+
+
+class TestListFilterSemanticsMatchDocs:
+    """The `/api/tasks` query-parameter descriptions make specific promises to
+    LLM callers (see api/routes/tasks.py). These pin the promises to behaviour
+    so the docs cannot drift into lying — a wrong filter hint silently returns
+    the wrong task set rather than erroring, which is how a model ends up
+    confidently reporting a partial list.
+    """
+
+    def test_context_filter_is_case_insensitive(self, populated_manager):
+        """Docs say context is matched case-insensitively."""
+        assert len(populated_manager.list_tasks(context="work")) == 3
+        assert len(populated_manager.list_tasks(context="WORK")) == 3
+
+    def test_status_filter_is_case_sensitive(self, populated_manager):
+        """Docs warn status is case-SENSITIVE, unlike context."""
+        assert len(populated_manager.list_tasks(status="todo")) == 5
+        assert populated_manager.list_tasks(status="Todo") == []
+
+    def test_unused_context_returns_empty_not_everything(self, populated_manager):
+        """A context nobody uses yields zero tasks — it does not fall back to
+        returning the unfiltered set."""
+        assert populated_manager.list_tasks(context="Nonexistent") == []
+
+    def test_due_before_is_inclusive_and_drops_undated(self, populated_manager):
+        """Docs say 'on or before', and that undated tasks are excluded."""
+        on_boundary = populated_manager.list_tasks(due_before="2025-02-10")
+        assert any(t.due_date == "2025-02-10" for t in on_boundary)
+
+        # Fixture has 5 tasks, only 2 with due dates.
+        assert len(populated_manager.list_tasks(due_before="2099-01-01")) == 2
+        assert all(t.due_date is not None for t in populated_manager.list_tasks(due_before="2099-01-01"))
