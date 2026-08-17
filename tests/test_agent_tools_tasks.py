@@ -92,3 +92,42 @@ class TestUnknownAction:
     def test_unknown_action(self, tm):
         out = _tool_manage_tasks({"action": "nope"})
         assert out.startswith("Error:")
+
+
+class TestManageTasksFilterDocs:
+    """The `manage_tasks` schema is what the orchestrator reads before calling the
+    tool, and a bad filter hint fails silently — the call succeeds and returns the
+    wrong slice. Two regressions cost real accuracy in model benchmarking:
+
+    - `context` offered 'Work'/'Personal' as filter examples. Contexts are
+      vault-defined and most tasks are in 'Inbox', so a model that trusted the
+      example filtered to zero rows.
+    - `status` did not say what omitting it does. Unfiltered `list` returns every
+      status uncapped; in an established vault that is mostly done/cancelled, and
+      summarising it yields a partial open-task list stated as complete.
+    """
+
+    @pytest.fixture
+    def props(self):
+        from api.services.agent_tools import TOOL_DEFINITIONS
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "manage_tasks")
+        return tool["input_schema"]["properties"]
+
+    def test_context_does_not_advertise_values_no_vault_need_have(self, props):
+        desc = props["context"]["description"]
+        assert "'Work'" not in desc and "'Personal'" not in desc
+        assert "Inbox" in desc
+
+    def test_context_warns_unknown_filter_matches_nothing(self, props):
+        desc = props["context"]["description"].lower()
+        assert "omit" in desc
+        assert "returns nothing" in desc or "not in use" in desc
+
+    def test_status_enumerates_values_and_warns_about_omitting(self, props):
+        desc = props["status"]["description"]
+        for value in ("todo", "done", "in_progress", "cancelled",
+                      "deferred", "blocked", "urgent"):
+            assert value in desc
+        lowered = desc.lower()
+        assert "every status" in lowered
+        assert "cancelled" in lowered and "todo" in lowered
