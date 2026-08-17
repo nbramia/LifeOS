@@ -472,3 +472,20 @@ def test_codex_child_failure_does_not_mirror(tmp_path: Path):
     worker._dispatch_codex_session(child, [{"content": "do it"}])
 
     assert conv_store.get_messages(conv.id) == []
+
+
+@pytest.mark.unit
+def test_codex_clean_env_drops_anthropic_credentials(monkeypatch):
+    """Codex doesn't use Anthropic credentials — but it has a shell, and
+    `claude` is on the PATH. An inherited key would let a codex session start
+    an API-billed Claude Code session that no dollar cap covers (#578).
+    """
+    from api.services.agent_worker.codex_executor import CodexExecutor
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-would-bill-the-api")
+    monkeypatch.setenv("CODEX_HOME", "/home/agent/.codex")
+
+    env = CodexExecutor._clean_env()
+
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["CODEX_HOME"] == "/home/agent/.codex"  # auth still reachable
