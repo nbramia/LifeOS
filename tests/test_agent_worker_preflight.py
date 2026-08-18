@@ -22,6 +22,7 @@ def _golden_reply(**overrides) -> str:
         "budget": {"wall_seconds": 14400, "max_tokens": 500000, "max_dollars": 5.0},
         "routing": "local",
         "routing_reason": "#local tag present",
+        "routing_explicit": False,
         "expected_output": "text",
         "ambiguity": None,
         "sane": True,
@@ -43,7 +44,8 @@ def test_run_preflight_returns_parsed_result():
 
 @pytest.mark.unit
 def test_preflight_routing_claude():
-    reply = _golden_reply(routing="claude", routing_reason="title says 'use claude opus'")
+    reply = _golden_reply(routing="claude", routing_reason="title says 'use claude opus'",
+                          routing_explicit=True)
     result = pf.run_preflight(title="use claude opus to summarize", tags=["agent"], caller=_stub(reply))
     assert result.routing == pf.ROUTE_CLAUDE
 
@@ -206,14 +208,21 @@ def test_preflight_prompt_includes_ordered_precedence():
 # Tag precedence (#139 §2)
 # ---------------------------------------------------------------------------
 
-def _stub_caller(routing="claude"):
-    """Build a fake caller returning a minimal preflight JSON."""
+def _stub_caller(routing="claude", routing_explicit=False):
+    """Build a fake caller returning a minimal preflight JSON.
+
+    `routing_explicit` mirrors the classifier's own flag: true only when the
+    operator named the engine themselves. Cloud routes without it are
+    downgraded to `ask` (#584), so tests that want a real cloud dispatch either
+    set it (with a title that names the engine) or use a `#cloud*` tag.
+    """
     import json
     def call(_prompt):
         return json.dumps({
             "budget": {"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 0.50},
             "routing": routing,
             "routing_reason": "stub",
+            "routing_explicit": routing_explicit,
             "expected_output": "text",
             "ambiguity": None,
             "sane": True,
@@ -262,12 +271,20 @@ def test_cloud_tag_keeps_preflight_routing_but_defaults_model_to_sonnet():
 
 
 @pytest.mark.unit
-def test_untagged_cloud_route_defaults_to_sonnet():
-    """No model-specifying tag, preflight returns `claude` → Sonnet default."""
+def test_untagged_cloud_route_is_downgraded_to_ask():
+    """An inferred cloud route never dispatches on its own (#584).
+
+    Replaces the former "untagged cloud → Sonnet default" case: without a
+    `#cloud*` tag or an operator who named the engine, a `claude` route from
+    the classifier is a guess, and guessing costs API credits. It becomes
+    `ask`, and the model is left unset for the answer to decide.
+    """
     result = pf.run_preflight("draft an email", tags=["agent"],
                               caller=_stub_caller(routing="claude"))
-    assert result.routing == pf.ROUTE_CLAUDE
-    assert result.model == pf.MODEL_SONNET
+    assert result.routing == pf.ROUTE_ASK
+    assert result.routing_explicit is False
+    assert result.model is None
+    assert "not explicitly requested" in result.routing_reason
 
 
 @pytest.mark.unit
@@ -406,7 +423,7 @@ def test_preset_class_set_on_empty_title_short_circuit():
 def test_cloud_route_emits_cost_estimate():
     """Cloud-routed tasks get a non-zero cache-cold cost estimate so the
     orchestrator can preview cost before dispatch."""
-    result = pf.run_preflight("research task", tags=["agent", "research"],
+    result = pf.run_preflight("research task", tags=["agent", "research", "cloud"],
                               caller=_stub_caller(routing="claude"))
     assert result.routing == pf.ROUTE_CLAUDE
     assert result.estimated_cost_dollars > 0
@@ -426,9 +443,9 @@ def test_local_route_emits_zero_estimate():
 def test_fullstack_estimate_higher_than_research_estimate():
     """Larger preset classes are estimated more expensively — that's the
     whole point of per-class filtering."""
-    full = pf.run_preflight("any task", tags=["agent", "fullstack"],
+    full = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
                             caller=_stub_caller(routing="claude"))
-    research = pf.run_preflight("any task", tags=["agent", "research"],
+    research = pf.run_preflight("any task", tags=["agent", "research", "cloud"],
                                 caller=_stub_caller(routing="claude"))
     assert full.estimated_cost_dollars > research.estimated_cost_dollars
 
@@ -450,7 +467,7 @@ def test_fail_fast_refuses_when_estimate_exceeds_2x_max_dollars():
             "sane": True,
             "sane_reason": "",
         })
-    result = pf.run_preflight("expensive task", tags=["agent", "fullstack"],
+    result = pf.run_preflight("expensive task", tags=["agent", "fullstack", "cloud"],
                               caller=stub_caller)
     assert result.sane is False
     assert "budget_too_small" in result.sane_reason
@@ -483,7 +500,7 @@ def test_cost_confirmation_triggers_above_threshold(monkeypatch):
     """§7 acceptance: estimate > threshold sets needs_cost_confirmation."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_cost_confirm_threshold_dollars", 0.01)
-    result = pf.run_preflight("any task", tags=["agent", "fullstack"],
+    result = pf.run_preflight("any task", tags=["agent", "fullstack", "cloud"],
                               caller=_stub_caller(routing="claude"))
     # fullstack estimate is well over a penny.
     assert result.needs_cost_confirmation is True
@@ -506,3 +523,76 @@ def test_cost_confirmation_disabled_when_threshold_zero(monkeypatch):
     result = pf.run_preflight("any task", tags=["agent", "fullstack"],
                               caller=_stub_caller(routing="claude"))
     assert result.needs_cost_confirmation is False
+
+
+# ---------------------------------------------------------------------------
+# API-spend gate (#584): an inferred cloud route never dispatches on its own
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("title", [
+    "search my gmail for the invoice",   # rule 4 capability inference
+    "check my calendar for tomorrow",
+    "summarize my slack threads",
+])
+def test_capability_inference_never_reaches_the_api_by_itself(title):
+    """Rule 4 is the classifier guessing that a task needs cloud connectors.
+    A guess may not spend API credits — it asks instead."""
+    result = pf.run_preflight(title, tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+def test_classifier_explicit_flag_alone_is_not_enough():
+    """`routing_explicit` is corroborated, not trusted.
+
+    The flag comes from an LLM, so it can be wrong. Unless the title actually
+    names an engine or model, a `true` is treated as the guess it probably is —
+    the direction where a mistake costs a question rather than credits.
+    """
+    result = pf.run_preflight("draft an email to the team", tags=["agent"],
+                              caller=_stub_caller(routing="claude", routing_explicit=True))
+    assert result.routing == pf.ROUTE_ASK
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("title", [
+    "use claude to draft the email",
+    "summarize this with opus",
+    "run it on the cloud model",
+])
+def test_operator_naming_the_engine_dispatches_without_a_question(title):
+    """The other half of the rule: an operator who asked for it gets it.
+    Same principle as the `#cloud` tag — explicit intent is consent."""
+    result = pf.run_preflight(title, tags=["agent"],
+                              caller=_stub_caller(routing="claude", routing_explicit=True))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.routing_explicit is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tag,expected_model", [
+    ("cloud", pf.MODEL_SONNET),
+    ("cloud-haiku", pf.MODEL_HAIKU),
+    ("cloud-sonnet", pf.MODEL_SONNET),
+])
+def test_cloud_tags_are_consent_and_still_dispatch(tag, expected_model):
+    """`#cloud*` tasks were explicitly tagged by the operator, so they keep
+    dispatching straight to the API — the gate is about inference only."""
+    result = pf.run_preflight("any task", tags=["agent", tag],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_CLAUDE
+    assert result.routing_explicit is True
+    assert result.model == expected_model
+
+
+@pytest.mark.unit
+def test_subscription_routes_are_unaffected_by_the_gate():
+    """The gate targets per-token API spend. The CLI routes bill a flat
+    subscription, so they dispatch without a question, as before."""
+    for tag, route in (("claude", pf.ROUTE_CLAUDE_CODE), ("codex", pf.ROUTE_CODEX),
+                       ("local", pf.ROUTE_LOCAL)):
+        result = pf.run_preflight("do the thing", tags=["agent", tag],
+                                  caller=_stub_caller(routing="claude"))
+        assert result.routing == route, tag

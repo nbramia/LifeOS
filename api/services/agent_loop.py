@@ -187,26 +187,55 @@ def _original_request(conversation_history, fallback: str) -> str:
     return fallback
 
 
+# Engines the orchestrator may climb to on its own. All three are free of
+# per-token API cost: `claude_code` and `codex` bill the operator's CLI
+# subscriptions, `local` runs the on-box Gemma. An Anthropic model id is NOT on
+# this list — automatic escalation must never spend API credits, so a model rung
+# is dropped from the climb (#584). The operator can still name a model
+# themselves ("escalate to opus"), which is an explicit request, not an
+# escalation LifeOS chose.
+NON_API_RUNGS = ("claude_code", "codex", "local")
+
+# Default climb when no ladder is configured: the strongest subscription engine
+# first, then the other one. `local` is a legal rung but not a default one —
+# escalation fires *because* a turn failed, and the on-box model is weaker at
+# tool use than the Haiku it would be replacing.
+DEFAULT_LADDER = ["claude_code", "codex"]
+
+
 def _escalation_ladder(escalation_model: str) -> list[str]:
-    """Ordered escalation rungs. Uses settings.agent_escalation_ladder if set
-    (comma-separated model ids / engine names), else derives a default from
-    ``escalation_model``: [escalation_model, claude_code] — so the engine
-    handoff lands on the 2nd pushback (1st → stronger model, 2nd → Claude Code).
-    Set the env var to e.g. 'claude-sonnet-5,claude-opus-4-8,claude_code' to
-    insert an opus rung in between. Empty when escalation isn't configured.
-    Deduped, order preserved."""
+    """Ordered escalation rungs the orchestrator may climb automatically.
+
+    Only non-API rungs (see ``NON_API_RUNGS``) survive: LifeOS escalating on its
+    own must not put a turn on the Anthropic API (#584). A configured
+    ``agent_escalation_ladder`` is filtered rather than rejected, so an existing
+    'claude-sonnet-4-6,claude_code' setting keeps working — it just climbs
+    straight to the engine. ``escalation_model`` no longer contributes a rung of
+    its own; it survives only as the gate that says escalation is configured at
+    all, and as the target for a user-directed "escalate" (handled separately in
+    ``resolve_orchestrator_model``).
+
+    Empty when nothing is left to climb to. Deduped, order preserved.
+    """
     raw = (getattr(settings, "agent_escalation_ladder", "") or "").strip()
     if raw:
         rungs = [r.strip() for r in raw.split(",") if r.strip()]
     elif escalation_model:
-        rungs = [escalation_model, "claude_code"]
+        rungs = list(DEFAULT_LADDER)
     else:
         return []
     seen, out = set(), []
     for r in rungs:
-        if r not in seen:
-            seen.add(r)
-            out.append(r)
+        if r in seen:
+            continue
+        seen.add(r)
+        if r not in NON_API_RUNGS:
+            logger.info(
+                "escalation ladder: dropping API rung %r — automatic escalation "
+                "is limited to %s", r, ", ".join(NON_API_RUNGS),
+            )
+            continue
+        out.append(r)
     return out
 
 

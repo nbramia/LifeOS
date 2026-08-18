@@ -31,7 +31,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |
 | Intent classifier | Claude Haiku via Anthropic API (default); pattern-matching fallback when the API is unavailable |
-| LLM (orchestration + synthesis) | Claude via Anthropic API (default), or a local OpenAI-compatible llama-server (`LIFEOS_LLM_BACKEND=local`). Base model set by `LIFEOS_ANTHROPIC_MODEL` (defaults to `claude-haiku-4-5`). Per-query escalation (Anthropic backend) sits on top: user-directed ("escalate to opus", "use codex") and automatic on refusal+pushback, via `LIFEOS_AGENT_ESCALATION_MODEL` / `LIFEOS_AGENT_ESCALATION_LADDER` |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default), or a local OpenAI-compatible llama-server (`LIFEOS_LLM_BACKEND=local`). Base model set by `LIFEOS_ANTHROPIC_MODEL` (defaults to `claude-haiku-4-5`). Per-query escalation (Anthropic backend) sits on top: user-directed ("escalate to opus", "use codex") and automatic on refusal+pushback, via `LIFEOS_AGENT_ESCALATION_MODEL` / `LIFEOS_AGENT_ESCALATION_LADDER`. **Automatic escalation only climbs to non-API engines** (`claude_code`, `codex`, `local`); reaching an API model takes an explicit request from the operator |
 | LLM Client | `api/services/llm_client.py` — unified wrapper with Anthropic↔OpenAI tool format translation |
 | Embeddings | sentence-transformers (GPU via ROCm/CUDA) |
 | Frontend | Vanilla HTML/JS (no build step) |

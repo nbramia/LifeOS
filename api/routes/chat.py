@@ -759,6 +759,16 @@ async def ask_stream(request: AskStreamRequest):
                 orchestrator_model, escalated = resolve_orchestrator_model(
                     conversation_history, request.question, orchestrator_model, escalation_model
                 )
+            # A `local` rung (#584): the ladder can climb to the on-box model
+            # instead of an API one. Handled here rather than below because it
+            # IS an LLM turn — just on the other backend — so it must set
+            # force_local before the loop builds its client, and must not fall
+            # through to the model path where "local" would be sent to Anthropic
+            # as a model id.
+            if escalated and orchestrator_model == "local":
+                force_local = True
+                logger.info("escalation ladder → local (Gemma) turn")
+
             # Top of the escalation ladder (#305c): when repeated refusals exhaust
             # the model rungs, resolve returns an engine name — hand off to that
             # worker session instead of running the loop on a non-model.

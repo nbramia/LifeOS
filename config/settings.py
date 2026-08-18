@@ -441,21 +441,24 @@ class Settings(BaseSettings):
                     "it detects a refusal/impossibility claim followed by the user "
                     "pushing back ('do research', 'you're wrong'). Empty (default) "
                     "disables escalation — safe for fresh clones and the local "
-                    "backend. Set to a stronger model than LIFEOS_ANTHROPIC_MODEL "
-                    "(e.g. claude-sonnet-5 or claude-opus-4-8) to enable. Only "
-                    "applies to the Anthropic backend."
+                    "backend. Since #584 this no longer names the model the turn "
+                    "climbs to: automatic escalation is limited to non-API engines "
+                    "(claude_code / codex / local), so this setting only switches "
+                    "escalation ON. A model named here is still reachable when the "
+                    "operator asks for it ('escalate to opus'). Only applies to the "
+                    "Anthropic backend."
     )
     agent_escalation_ladder: str = Field(
         default="",
         alias="LIFEOS_AGENT_ESCALATION_LADDER",
         description="Ordered, comma-separated escalation rungs climbed on each "
-                    "successive refusal+pushback cycle (#305c). Each rung is a "
-                    "model id or an engine name (codex / claude_code, which hand "
-                    "off to a worker session). Empty (default) derives a ladder "
-                    "from LIFEOS_AGENT_ESCALATION_MODEL: [that model, claude_code] "
-                    "— so the Claude Code handoff lands on the 2nd pushback. "
-                    "Override to insert rungs, e.g. "
-                    "'claude-sonnet-5,claude-opus-4-8,claude_code'."
+                    "successive refusal+pushback cycle (#305c). Rungs must be "
+                    "non-API engines — 'claude_code' and 'codex' (subscription "
+                    "CLIs, handed off to a worker session) or 'local' (on-box "
+                    "Gemma). Empty (default) is [claude_code, codex]. Anthropic "
+                    "model ids are accepted for backwards compatibility but "
+                    "dropped from the climb with a log line: LifeOS never puts a "
+                    "turn on the API without being asked (#584)."
     )
     agent_cost_confirm_threshold_dollars: float = Field(
         default=1.0,

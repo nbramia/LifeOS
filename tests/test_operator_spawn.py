@@ -19,12 +19,14 @@ from api.services.agent_worker.session_store import (
 )
 
 
-def _preflight(routing: str, *, sane: bool = True, sane_reason: str = ""):
+def _preflight(routing: str, *, sane: bool = True, sane_reason: str = "",
+               routing_explicit: bool = False):
     """Build a fake preflight caller that returns the given routing."""
     def _caller(prompt: str) -> str:
         return json.dumps({
             "budget": {"wall_seconds": 3600, "max_tokens": 1000, "max_dollars": 5.0},
             "routing": routing, "routing_reason": "test",
+            "routing_explicit": routing_explicit,
             "expected_output": "text",
             "ambiguity": None, "sane": sane, "sane_reason": sane_reason,
         })
@@ -66,13 +68,32 @@ def test_explicit_local_routing(tmp_path: Path):
 def test_no_keyword_routes_via_preflight(tmp_path: Path):
     store = SessionStore(db_path=tmp_path / "s.db")
     result = create_operator_session(
-        store, "summarize my week", preflight_caller=_preflight("claude"),
+        store, "summarize my week", preflight_caller=_preflight("local"),
     )
     assert result["ok"]
-    assert result["routing"] == "claude"
+    assert result["routing"] == "local"
     assert result["routing_source"] == "preflight"
     assert not result["needs_routing"]
     assert store.get_by_session_id(result["session_id"]).status == STATUS_CLAIMED
+
+
+@pytest.mark.unit
+def test_inferred_cloud_route_parks_for_confirmation(tmp_path: Path):
+    """A spawn nobody routed by hand can't land on the API on preflight's
+    say-so (#584): it parks at `ask` and waits for the operator to choose.
+
+    The previous version of the test above used a `claude` preflight result to
+    prove pass-through; that exact case is now the one that must NOT pass
+    through, so it gets its own test rather than disappearing.
+    """
+    store = SessionStore(db_path=tmp_path / "s.db")
+    result = create_operator_session(
+        store, "summarize my week", preflight_caller=_preflight("claude"),
+    )
+    assert result["ok"]
+    assert result["routing"] == "ask"
+    assert result["needs_routing"]
+    assert store.get_by_session_id(result["session_id"]).status == STATUS_BLOCKED
 
 
 @pytest.mark.unit

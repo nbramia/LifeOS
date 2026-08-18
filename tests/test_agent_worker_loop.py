@@ -333,7 +333,10 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
     monkeypatch.setattr(_settings, "agent_preset_id", "", raising=False)
     monkeypatch.setattr(_settings, "agent_environment_id", "", raising=False)
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "summarize", "status": "todo", "tags": ["agent"]},
+        # `#cloud` is the operator asking for the API route; without it an
+        # inferred cloud route would park at `ask` instead (#584).
+        {"id": "t1", "description": "summarize", "status": "todo",
+         "tags": ["agent", "cloud"]},
     ])
     executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
     preflight = _golden_preflight(routing="claude")
@@ -354,7 +357,8 @@ def test_claude_routing_with_managed_executor_starts_and_polls(tmp_path: Path):
     managed executor: `start` on first tick (status=RUNNING) and `poll` on
     subsequent ticks until terminal."""
     api = FakeApi(tasks=[
-        {"id": "t1", "description": "summarize my inbox", "status": "todo", "tags": ["agent"]},
+        {"id": "t1", "description": "summarize my inbox", "status": "todo",
+         "tags": ["agent", "cloud"]},
     ])
 
     class _StubManagedExecutor:

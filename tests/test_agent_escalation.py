@@ -125,11 +125,16 @@ def test_giveup_phrases_count_as_refusal(giveup):
 # ---------------------------------------------------------------------------
 
 def test_resolve_escalates_when_configured_and_triggered():
+    """Escalation still fires — it just no longer climbs onto the API (#584).
+
+    `escalation_model` now only says "escalation is configured"; the rung it
+    lands on is the first non-API engine, not the model named here.
+    """
     history = [FakeMessage("assistant", _REFUSAL)]
     model, escalated = resolve_orchestrator_model(
         history, _PUSHBACK, base_model="claude-haiku-4-5", escalation_model="claude-opus-4-8"
     )
-    assert (model, escalated) == ("claude-opus-4-8", True)
+    assert (model, escalated) == ("claude_code", True)
 
 
 def test_resolve_no_escalation_when_model_unset():
@@ -279,9 +284,9 @@ def _refusal_history(n):
 
 
 @pytest.mark.parametrize("n_refusals, expected", [
-    (1, "claude-sonnet-5"),   # rung 0 — the escalation model (1st pushback)
-    (2, "claude_code"),         # rung 1 — engine handoff (2nd pushback)
-    (3, "claude_code"),         # capped at the top rung
+    (1, "claude_code"),   # rung 0 — the strongest subscription engine
+    (2, "codex"),         # rung 1 — the other subscription engine
+    (3, "codex"),         # capped at the top rung
 ])
 def test_ladder_climbs_with_each_refusal(n_refusals, expected):
     model, escalated = resolve_orchestrator_model(
@@ -325,9 +330,12 @@ def test_escalation_cycles_counts_pushback_chain():
     assert _count_escalation_cycles(_refusal_history(3)) == 2
 
 
-def test_stale_refusals_do_not_jump_to_engine_rung():
+def test_stale_refusals_do_not_advance_the_rung():
     """Regression (#309 review): refusals on an earlier topic the user never
-    pushed back on must not catapult the first fresh pushback to the engine."""
+    pushed back on must not catapult the first fresh pushback up the ladder.
+
+    (Formerly "...do_not_jump_to_engine_rung" — since #584 every rung is an
+    engine, so the invariant is about the rung *index*, not its kind.)"""
     history = [
         FakeMessage("user", "question one"),
         FakeMessage("assistant", _REFUSAL),
@@ -337,7 +345,7 @@ def test_stale_refusals_do_not_jump_to_engine_rung():
     model, escalated = resolve_orchestrator_model(
         history, _PUSHBACK, base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5"
     )
-    assert (model, escalated) == ("claude-sonnet-5", True)  # rung 0, not the engine
+    assert (model, escalated) == ("claude_code", True)  # rung 0, not rung 1
 
 
 def test_engine_handoff_recovers_original_request():
@@ -367,16 +375,59 @@ def test_base_model_filtered_from_ladder(monkeypatch):
 
 
 def test_explicit_ladder_setting_overrides_default(monkeypatch):
+    """A configured ladder is honored, order and all."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "codex,claude_code", raising=False,
+    )
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(1), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
+    )
+    assert (model, escalated) == ("codex", True)   # the setting's order, not the default's
+
+
+def test_api_rungs_are_filtered_out_of_a_configured_ladder(monkeypatch):
+    """An all-API ladder leaves nothing to climb, so the turn does not escalate.
+
+    The operator can still reach these models by asking ("escalate to opus") —
+    what's gone is LifeOS deciding to spend API credits by itself (#584).
+    """
     monkeypatch.setattr(
         "api.services.agent_loop.settings.agent_escalation_ladder",
         "claude-sonnet-5,claude-opus-4-8", raising=False,
     )
-    # Custom ladder has no engine rung — 3rd refusal caps at opus.
-    model, _ = resolve_orchestrator_model(
+    model, escalated = resolve_orchestrator_model(
         _refusal_history(3), _PUSHBACK,
         base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
-    assert model == "claude-opus-4-8"
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_api_rungs_are_filtered_but_engine_rungs_survive(monkeypatch):
+    """The filter is surgical: a mixed ladder keeps its non-API rungs."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "claude-opus-4-8,claude_code", raising=False,
+    )
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(1), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
+    )
+    assert (model, escalated) == ("claude_code", True)
+
+
+def test_local_is_a_legal_rung(monkeypatch):
+    """Gemma is an available escalation target — it costs nothing to run."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "local,claude_code", raising=False,
+    )
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(1), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
+    )
+    assert (model, escalated) == ("local", True)
 
 
 # ---------------------------------------------------------------------------
