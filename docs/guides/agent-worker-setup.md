@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-18
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up `#agent`-tagged tasks and executes them via Claude (Anthropic Managed Agents) or a local Gemma model.
@@ -136,7 +136,7 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 
 ## Step 4b — Provision the Managed Agents preset, environment, and vault (Claude path)
 
-`#agent` tasks (without `#local`) route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
+`#agent` tasks tagged `#cloud` (or `#cloud-haiku` / `#cloud-sonnet`) route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. Since [ADR-018](../adr/018-api-spend-requires-consent.md) the tag is required: an untagged task whose title merely *implies* cloud connectors asks you which engine to use rather than dispatching to the API. Set this section up if you want the cloud path available at all — it is the API-billed route, and the only one that reaches Vault-authenticated connectors. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
 
 - **Agent preset** (`agent_…`) — model, system prompt, MCP servers, tools, skills. Sessions reference it by ID.
 - **Environment** (`env_…`) — where tool calls execute. Cloud container by default; self-hosted sandbox tracked in [#111](https://github.com/nbramia/LifeOS/issues/111).

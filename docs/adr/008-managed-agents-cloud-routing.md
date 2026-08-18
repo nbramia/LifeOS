@@ -3,6 +3,7 @@
 **Status:** Complete
 **Last Updated:** 2026-05-27
 **Decision:** Accepted
+**Amended by:** [ADR-018](018-api-spend-requires-consent.md) — routing signal #2 (title cue infers cloud) now asks instead of dispatching; API spend requires explicit operator intent.
 
 ## Context
 

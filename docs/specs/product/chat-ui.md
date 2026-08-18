@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-06-03
+> **Last Updated:** 2026-08-18
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -61,7 +61,7 @@ The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable vi
 **Per-query escalation & engine handoff.** On the Anthropic backend, a turn can run on a stronger model or hand off to a CLI engine instead of answering inline (off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set):
 
 - **User-directed** (imperative, leading or trailing): "escalate to opus" / "use sonnet" runs that turn on the named model via the API; "use codex" / "use claude code" (also "add the games using codex") hands the task to that CLI worker session. Negations and questions ("why did you use codex?") don't trigger it.
-- **Automatic ladder:** when a turn refuses ("hasn't been released") and the user pushes back ("do research", "you're wrong"), the next turn climbs the escalation ladder — the escalation model on the 1st pushback, a Claude Code handoff on the 2nd (tunable via `LIFEOS_AGENT_ESCALATION_LADDER`). The handoff forwards the *original* request, not the pushback.
+- **Automatic ladder:** when a turn refuses ("hasn't been released") and the user pushes back ("do research", "you're wrong"), the next turn climbs the escalation ladder — a Claude Code handoff on the 1st pushback, Codex on the 2nd (tunable via `LIFEOS_AGENT_ESCALATION_LADDER`). The handoff forwards the *original* request, not the pushback. Automatic rungs are limited to engines that cost nothing per token; escalating to a stronger *API* model is user-directed only, so LifeOS never spends credits on a guess about what the user wanted.
 
 CLI handoffs run as async worker sessions and report results via Telegram and `/agents`; on Telegram and the web chat the trigger is the same.
 
