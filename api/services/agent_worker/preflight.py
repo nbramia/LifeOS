@@ -73,6 +73,12 @@ class PreflightResult:
     ambiguity: PreflightAmbiguity | None = None
     sane: bool = True
     sane_reason: str = ""
+    # Whether the cloud (API) route was *asked for* rather than inferred (#584).
+    # Only an explicit request — a `#cloud*` tag, or a model/engine named in the
+    # title — may dispatch to the Anthropic API without confirmation; an
+    # inferred cloud route is downgraded to `ask`. Defaults False so every path
+    # that doesn't positively establish intent lands on the safe side.
+    routing_explicit: bool = False
     # Per-task model selection (#139 §2). For cloud routes, defaults to
     # MODEL_SONNET; can be overridden to MODEL_HAIKU by the `#cloud-haiku`
     # tag (or to MODEL_SONNET by `#cloud-sonnet`). For local routes, set
@@ -125,6 +131,7 @@ Reply with a single JSON object, no prose, matching this exact schema:
   }},
   "routing": "local" | "claude" | "ask",
   "routing_reason": "<one short sentence>",
+  "routing_explicit": <true|false>,
   "expected_output": "text" | "file" | "external_action" | "structured",
   "ambiguity": null | {{"question": "<one clarifying question>"}},
   "sane": <true|false>,
@@ -154,11 +161,18 @@ Rules:
        - workplace systems: "slack", "asana", "ramp", "granola" (these
          only appear in workplace contexts; the bare word is usually safe)
        In each case set routing="claude"; routing_reason="implies <capability>".
+       These are INFERENCES, so set routing_explicit=false — the worker will
+       confirm before spending API credits on them.
        Do NOT trigger on bare nouns where the meaning is ambiguous —
        e.g., "drive home" (vehicle), "book recommendation" (literature),
        "email signature design" (general design task).
     5) If none of the above match, set routing="ask" (the worker will
        ask the operator which model).
+- routing_explicit: true ONLY when the operator named the engine or model
+  themselves — a "#cloud"/"#local"/"#claude"/"#codex" tag, or a title that says
+  "use claude", "with opus", "using gemma". False for every routing you reached
+  by inference (rule 4) or by default. When in doubt, false: a false value costs
+  one confirmation question, a wrong true value spends API credits unasked.
 - expected_output: classify what the agent will produce.
     "text" = a written answer; "file" = creates/edits a file; "external_action" = sends an email, posts a message, schedules a meeting; "structured" = returns structured data the caller will parse.
 - ambiguity: leave null in nearly all cases. The agent is autonomous and is expected to make reasonable assumptions, try one approach, and fall back to another if the first didn't work. Only set non-null when the title would *prevent* the agent from acting at all — e.g., "reply to John" with no John in scope, or "send the contract to her" with no antecedent for "her". Method-of-execution questions ("should I use web search or local data?", "which calendar?", "what format?") are NOT ambiguity — the agent picks one and adapts. 
@@ -237,6 +251,7 @@ def parse_preflight_response(text: str) -> PreflightResult:
         budget=budget,
         routing=routing,
         routing_reason=str(raw.get("routing_reason", "")),
+        routing_explicit=bool(raw.get("routing_explicit", False)),
         expected_output=expected_output,
         ambiguity=ambiguity,
         sane=bool(raw.get("sane", True)),
@@ -299,7 +314,15 @@ def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
     return None
 
 
-def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightResult:
+# Model/engine words that count as the operator naming a cloud route themselves.
+# Used to corroborate the classifier's `routing_explicit` before any API dispatch
+# happens without a confirmation (#584) — the tags are checked separately.
+_TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
+    r"(?i)\b(claude|opus|sonnet|haiku|cloud|anthropic|api)\b"
+)
+
+
+def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
     """Apply tag-based routing/model overrides (#139 §2 precedence).
 
     Tag precedence (a tag always wins over preflight's LLM choice):
@@ -317,6 +340,7 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
     if "local" in normalized:
         result.routing = ROUTE_LOCAL
         result.routing_reason = "#local tag present"
+        result.routing_explicit = True
         result.model = MODEL_LOCAL
         return result
     if "claude" in normalized:
@@ -325,6 +349,7 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
         # rather than per-token Anthropic API rates, so cost-gating is skipped.
         result.routing = ROUTE_CLAUDE_CODE
         result.routing_reason = "#claude tag present"
+        result.routing_explicit = True
         result.model = ""  # CLI picks its own model from settings
         return result
     if "codex" in normalized:
@@ -332,25 +357,46 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str]) -> PreflightR
         # Billed against the operator's ChatGPT plan.
         result.routing = ROUTE_CODEX
         result.routing_reason = "#codex tag present"
+        result.routing_explicit = True
         result.model = ""  # CLI picks its own model from ~/.codex/config.toml
         return result
     if "cloud-haiku" in normalized:
         result.routing = ROUTE_CLAUDE
         result.routing_reason = "#cloud-haiku tag present"
+        result.routing_explicit = True
         result.model = MODEL_HAIKU
         return result
     if "cloud-sonnet" in normalized:
         result.routing = ROUTE_CLAUDE
         result.routing_reason = "#cloud-sonnet tag present"
+        result.routing_explicit = True
         result.model = MODEL_SONNET
         return result
     if "cloud" in normalized:
         result.routing = ROUTE_CLAUDE
+        result.routing_explicit = True
         if not result.routing_reason:
             result.routing_reason = "#cloud tag present"
         if result.model not in ALLOWED_MODELS:
             result.model = MODEL_SONNET
         return result
+    # No tag override. A cloud route that nobody asked for must not dispatch:
+    # downgrade it to `ask` so the worker confirms first (#584). The classifier's
+    # own `routing_explicit` is trusted only when the title actually contains a
+    # model/engine cue — a deterministic cross-check, so a hallucinated `true`
+    # still lands on the safe side. `#cloud*` tags returned above already.
+    if result.routing == ROUTE_CLAUDE and not (
+        result.routing_explicit and _TITLE_NAMES_A_CLOUD_ENGINE.search(title or "")
+    ):
+        result.routing_explicit = False
+        inferred = result.routing_reason or "inferred cloud route"
+        result.routing = ROUTE_ASK
+        result.routing_reason = (
+            f"cloud route not explicitly requested ({inferred}) — confirming before "
+            f"spending API credits"
+        )
+        result.model = None
+
     # No override — pick a sensible default model for the routing.
     if result.model not in ALLOWED_MODELS:
         if result.routing == ROUTE_CLAUDE:
@@ -497,6 +543,6 @@ def run_preflight(
         ))
 
     return _apply_cost_gates(_apply_preset_class(
-        _apply_tag_overrides(parse_preflight_response(reply), tags_list),
+        _apply_tag_overrides(parse_preflight_response(reply), tags_list, title),
         tags_list,
     ))

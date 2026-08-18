@@ -303,13 +303,23 @@ def test_routing_answer_parser_combined_replies():
     from api.services.agent_worker.worker import Worker
     parse = Worker._parse_routing_answer
     assert parse("local") == "local"
-    assert parse("CLAUDE please") == "claude"
-    assert parse("use opus") == "claude"
     assert parse("gemma is fine") == "local"
-    # Combined: ambiguity answer first, model second.
+    assert parse("codex") == "codex"
+    assert parse("claude code") == "claude_code"
+    assert parse("run it on claude-code") == "claude_code"
+    # A bare "claude" means the CLI, not the API (#584): both exist now, and
+    # the subscription reading is the one where a misparse costs nothing.
+    assert parse("CLAUDE please") == "claude_code"
+    assert parse("It's John Doe, and let's use claude") == "claude_code"
+    # Reaching the API takes a word that can only mean the API.
+    assert parse("use opus") == "claude"
+    assert parse("cloud") == "claude"
+    assert parse("go ahead and use the api") == "claude"
+    # Combined: ambiguity answer first, engine second.
     assert parse("1. John Doe 2. local") == "local"
-    assert parse("It's John Doe, and let's use claude") == "claude"
-    # Neither keyword → None.
+    # Several named → the last one wins.
+    assert parse("not local, use codex") == "codex"
+    # No engine word → None.
     assert parse("yes do it") is None
     assert parse("") is None
 

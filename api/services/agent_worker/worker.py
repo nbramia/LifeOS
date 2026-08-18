@@ -62,6 +62,36 @@ from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
 
+# The engine-choice confirmation (#584). Every route offered here except the
+# last is free of per-token cost — the two CLIs bill the operator's
+# subscriptions and Gemma runs on-box — so the API option is listed last and
+# labelled, and nothing reaches it without the operator naming it.
+ROUTING_ASK_QUESTION = (
+    "Which engine should run this? "
+    "Reply 'claude code' (subscription), 'codex' (subscription), "
+    "'local' (on-box Gemma), or 'cloud' (Anthropic API — costs credits)."
+)
+
+# Engine words accepted in a reply. Ordered longest-first so "claude code"
+# matches before the bare "claude" alternative. Each named group maps to the
+# routing it selects.
+_ROUTING_ANSWER_RE = re.compile(
+    r"(?i)"
+    r"(?P<claude_code>claude[\s_-]*code)"
+    r"|(?P<codex>codex)"
+    r"|(?P<local>local|gemma)"
+    r"|(?P<api>cloud|managed|\bapi\b|opus|sonnet|haiku)"
+    r"|(?P<bare_claude>claude)"
+)
+_ROUTING_ANSWER_ROUTES = {
+    "claude_code": ROUTE_CLAUDE_CODE,
+    "codex": ROUTE_CODEX,
+    "local": ROUTE_LOCAL,
+    "api": ROUTE_CLAUDE,
+    "bare_claude": ROUTE_CLAUDE_CODE,
+}
+
+
 logger = logging.getLogger(__name__)
 
 # Inline-summary cap. Telegram allows ~4096 chars; we leave headroom for
@@ -877,8 +907,8 @@ class Worker:
                     })
                     self.ask_user_via_telegram(
                         session_id, task_id,
-                        "I couldn't tell which model you wanted. "
-                        "Please reply 'local' or 'claude'.",
+                        "I couldn't tell which engine you wanted. "
+                        + ROUTING_ASK_QUESTION,
                     )
                     continue
                 self.session_store.set_routing_and_budget(
@@ -1134,22 +1164,28 @@ class Worker:
 
     @staticmethod
     def _parse_routing_answer(answer: str) -> str | None:
-        """Best-effort parse of a "local" / "claude" answer from a free-text
-        Telegram reply. Returns "local", "claude", or None when ambiguous.
+        """Best-effort parse of an engine choice from a free-text Telegram reply.
 
-        Handles combined ambiguity+routing replies like "1. John Doe 2. local"
-        by scanning for the model keyword anywhere in the text. If both
-        keywords appear, returns the one occurring later (operator's most
-        recent statement wins).
+        Returns a routing constant, or None when nothing matched. Handles
+        combined ambiguity+routing replies like "1. John Doe 2. local" by
+        scanning anywhere in the text; when several engines are named, the one
+        mentioned LAST wins (the operator's most recent statement).
+
+        A bare "claude" resolves to the Claude Code CLI, not the API (#584).
+        That is the safe reading of an ambiguous word now that both exist: the
+        CLI is subscription-billed, so a misread costs nothing, while the same
+        misread in the other direction spends credits the operator didn't
+        agree to. Reaching the API takes a word that can only mean the API —
+        "cloud", "api", "managed", or a model name.
         """
         if not answer:
             return None
-        lowered = answer.lower()
-        local_idx = max(lowered.rfind("local"), lowered.rfind("gemma"))
-        claude_idx = max(lowered.rfind("claude"), lowered.rfind("opus"))
-        if local_idx < 0 and claude_idx < 0:
-            return None
-        return "local" if local_idx > claude_idx else "claude"
+        last: tuple[int, str] | None = None
+        for m in _ROUTING_ANSWER_RE.finditer(answer):
+            route = _ROUTING_ANSWER_ROUTES[m.lastgroup]
+            if last is None or m.start() >= last[0]:
+                last = (m.start(), route)
+        return last[1] if last else None
 
     def _timeout_stale_clarifications(self) -> None:
         """Send a one-time nudge for clarifications older than the configured
@@ -2166,10 +2202,7 @@ class Worker:
         if pre.ambiguity:
             question_parts.append(pre.ambiguity.question)
         if pre.routing == ROUTE_ASK:
-            question_parts.append(
-                "Should I run this on the local Gemma model or on Claude Opus? "
-                "Reply 'local' or 'claude'."
-            )
+            question_parts.append(ROUTING_ASK_QUESTION)
         if question_parts:
             self._mark_blocked(session, task, " ".join(question_parts))
             return
