@@ -367,8 +367,11 @@ TOOL_DEFINITIONS = [
                 "context": {
                     "type": "string",
                     "description": (
-                        "Context/category (e.g. 'Work', 'Personal', 'Inbox'). Used as "
-                        "a filter for 'list' and as the target context for 'update'. "
+                        "Context/category. Contexts are vault-defined, not a fixed set, "
+                        "and most tasks sit in 'Inbox'. Used as a filter for 'list' and "
+                        "as the target context for 'update'. As a filter it matches "
+                        "exactly (case-insensitively), so a context that is not in use "
+                        "returns nothing — omit it unless you know the value exists. "
                         "Ignored on 'create' — new tasks always land in Inbox."
                     ),
                 },
@@ -394,8 +397,13 @@ TOOL_DEFINITIONS = [
                 "status": {
                     "type": "string",
                     "description": (
-                        "Filter by status (for list): 'todo', 'done', 'in_progress', etc. "
-                        "Also accepted on update to change status."
+                        "Filter by status (for list), matched exactly and case-sensitively: "
+                        "'todo', 'done', 'in_progress', 'cancelled', 'deferred', 'blocked', "
+                        "'urgent'. Omitting it returns tasks of EVERY status, and in an "
+                        "established vault most tasks are done or cancelled — so pass "
+                        "'todo' for open/outstanding work rather than listing unfiltered "
+                        "and sorting it out afterwards. Also accepted on update to change "
+                        "status."
                     ),
                 },
                 "query": {
