@@ -182,11 +182,43 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
 
 @router.get("", response_model=TaskListResponse)
 async def list_tasks(
-    status: Optional[str] = None,
-    context: Optional[str] = None,
-    tag: Optional[str] = None,
-    due_before: Optional[str] = None,
-    query: Optional[str] = None,
+    status: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by status, matched exactly and case-sensitively. Valid values: "
+            "todo, done, in_progress, cancelled, deferred, blocked, urgent. Omit to "
+            "return every status — in an established vault most tasks are done or "
+            "cancelled, so pass status='todo' for open/outstanding work."
+        ),
+    ),
+    context: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by context, matched exactly but case-insensitively. Contexts are "
+            "vault-defined (one markdown file each) and default to 'Inbox'; there is "
+            "no fixed set. A context that is not in use returns zero tasks, so omit "
+            "this filter unless you know the value exists."
+        ),
+    ),
+    tag: Optional[str] = Query(
+        None,
+        description=(
+            "Filter by tag, case-insensitive, with or without a leading '#'."
+        ),
+    ),
+    due_before: Optional[str] = Query(
+        None,
+        description=(
+            "Only tasks whose due date is on or before this date (YYYY-MM-DD). "
+            "Tasks with no due date are excluded."
+        ),
+    ),
+    query: Optional[str] = Query(
+        None,
+        description=(
+            "Fuzzy text search over task descriptions (e.g. 'taxes' matches '1099')."
+        ),
+    ),
 ):
     """
     List and filter tasks.
