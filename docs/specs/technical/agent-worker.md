@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-07-08
+> **Last Updated:** 2026-08-18
 
 Engineering view of the agent worker — the stand-alone process that consumes `#agent`-tagged tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -393,6 +393,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 ## Related Documents
 
 - [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Decision record for the local-vs-cloud executor split
+- [ADR-018: API Spend Requires Operator Consent](../../adr/018-api-spend-requires-consent.md) — Why an inferred cloud route asks, and why the CLI subprocess carries no API credential
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
 - [Agent Viz — Technical](agent-viz.md) — `/agents` page that reads SessionStore + TranscriptStore here

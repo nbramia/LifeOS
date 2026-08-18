@@ -161,7 +161,7 @@ To stay fully local, set `LIFEOS_LLM_BACKEND=local` and point `LIFEOS_LOCAL_LLM_
 `LIFEOS_ANTHROPIC_MODEL` is the **base** orchestrator model. On top of it, per-query **escalation** (Anthropic backend only, off unless `LIFEOS_AGENT_ESCALATION_MODEL` is set) lets a turn run on a stronger model or hand off to a CLI engine:
 
 - **User-directed:** *"escalate to opus"* / *"use sonnet"* runs that turn on the named model; *"use codex"* / *"use claude code"* hands off to that CLI worker.
-- **Automatic:** when a turn wrongly refuses and you push back, LifeOS retries on `LIFEOS_AGENT_ESCALATION_MODEL`, then — on a second push — hands off to Claude Code. Tune the rungs with `LIFEOS_AGENT_ESCALATION_LADDER`.
+- **Automatic:** when a turn wrongly refuses and you push back, LifeOS climbs to Claude Code, then — on a second push — to Codex. Automatic escalation only ever reaches engines that cost nothing per token (`claude_code`, `codex`, `local`); a stronger *API* model is something you ask for, never something LifeOS picks for you. `LIFEOS_AGENT_ESCALATION_MODEL` switches escalation on; `LIFEOS_AGENT_ESCALATION_LADDER` tunes the rungs.
 
 ---
 
@@ -211,7 +211,7 @@ Data flows from your sources, through local storage and indexing, into an orches
 Most queries go straight to the orchestrator, which decides — over multiple rounds of tool calls — what to search and how to answer:
 
 <p align="center">
-  <img src="docs/images/query-pipeline.svg" width="940" alt="Query pipeline: input surfaces (web, Telegram, voice, MCP) on the left feed a query into the central orchestrator agent loop; the top shows the intra-query tool-call loop (search_vault, email, calendar, web, tasks, people) repeated over multiple rounds; the bottom shows model handoff — the agent loop runs on a local Gemma or cloud Haiku base, and Haiku escalates to Sonnet or Opus or hands off to the Claude Code or Codex CLI engines; the right shows the response returning to the same surface.">
+  <img src="docs/images/query-pipeline.svg" width="940" alt="Query pipeline: input surfaces (web, Telegram, voice, MCP) on the left feed a query into the central orchestrator agent loop; the top shows the intra-query tool-call loop (search_vault, email, calendar, web, tasks, people) repeated over multiple rounds; the bottom shows model handoff — the agent loop runs on a local Gemma or cloud Haiku base, Haiku auto-escalates to the Claude Code or Codex CLI engines, and reaches Sonnet or Opus only when the user asks; the right shows the response returning to the same surface.">
 </p>
 
 The orchestrator defaults to Claude via the Anthropic API (`LIFEOS_LLM_BACKEND=anthropic`, model from `LIFEOS_ANTHROPIC_MODEL`); set `LIFEOS_LLM_BACKEND=local` to route through a local llama-server. Internals: [Search & Indexing](docs/specs/technical/search-indexing.md) · [Architecture](docs/specs/technical/architecture.md).

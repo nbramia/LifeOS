@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-06-21
+> **Last Updated:** 2026-08-18
 
 LifeOS includes an external **agent worker** that picks up tasks you've tagged `#agent` and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -37,7 +37,7 @@ Within a poll cycle (default 60s), the worker:
 
 1. Runs a Haiku preflight to parse the task — budget, routing, expected output, sanity check
 2. Atomically swaps the tag to `#agent-running` (so two workers can't claim the same task)
-3. Routes the task — to your local Gemma model or to Claude on Managed Agents — depending on tags, title cues, or capability inference
+3. Routes the task — to your local Gemma model, a CLI engine, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that the cloud is needed, it asks you first
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
 5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
 
@@ -59,7 +59,11 @@ Optional sub-tags steer routing:
 | `#claude` | Forces routing to Claude Code CLI (the same surface as `/claude`). Billed against your Claude Pro subscription rather than per-token. Good for code/filesystem/browser work where the cloud connectors aren't needed. |
 | `#codex` | Forces routing to Codex CLI (the same surface as `/codex`). Billed against your ChatGPT subscription. Same caveat as `#claude`. |
 
-Without an explicit routing tag, the preflight infers routing from the title. Phrases like "draft an email", "check my calendar", "search my gmail" infer cloud (those need connectors). Phrases like "with local agent" or "using gemma" force local. If the title gives no signal, the worker pauses the task at `#agent-blocked` and asks you on Telegram which model to use.
+Without an explicit routing tag, the preflight reads the title. "With local agent" / "using gemma" force local, and naming an engine or model ("use claude", "with opus") routes there — you asked, so it dispatches.
+
+**Inference alone never spends API credits.** Phrases like "draft an email", "check my calendar", "search my gmail" still tell the preflight the task probably needs cloud connectors, but that is a guess, so the task pauses at `#agent-blocked` and asks instead of dispatching. The same happens when the title gives no signal at all. The question offers `claude code` (subscription), `codex` (subscription), `local` (on-box Gemma), and `cloud` (Anthropic API — costs credits); reply with whichever you want. A bare "claude" in your reply means the Claude Code CLI, not the API — say "cloud" or name a model to reach the API.
+
+To skip the question entirely for a task you know needs connectors, tag it `#cloud`.
 
 Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed; per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
 
@@ -128,7 +132,7 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
-**Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous, the bot asks you "local or claude?" before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
+**Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous — or the cloud route was only inferred — the bot asks which engine before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 
 Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS`). After that the task is abandoned permanently and you get a Telegram heads-up. The transcript is preserved.
 

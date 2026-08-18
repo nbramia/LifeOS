@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-13
+**Last Updated:** 2026-08-18
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -57,8 +57,8 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 |---|---|---|---|
 | `LIFEOS_LLM_BACKEND` | str | `anthropic` | `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`) or `anthropic` (Claude API). Recorded in ADR-009. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
-| `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Stronger model a chat turn escalates to when the user pushes back on a refusal, or asks ("escalate to opus"). Empty disables escalation. Anthropic backend only. |
-| `LIFEOS_AGENT_ESCALATION_LADDER` | str | — (derived) | Comma-separated escalation rungs (models / engine names `codex`,`claude_code`). Empty derives `[escalation_model, claude_code]` — so a 2nd pushback hands off to Claude Code. Override e.g. `claude-sonnet-5,claude-opus-4-8,claude_code`. |
+| `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name it no longer names the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
+| `LIFEOS_AGENT_ESCALATION_LADDER` | str | `claude_code,codex` | Comma-separated rungs climbed on each successive refusal+pushback. Rungs must cost nothing per token: `claude_code`, `codex` (subscription CLIs) or `local` (on-box Gemma). Anthropic model ids are accepted but **dropped from the climb** with a log line — LifeOS never puts a turn on the API unless you ask. Override e.g. `local,claude_code,codex`. |
 | `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also used by specialized calls regardless of backend (relationship insights, fact extraction, web search). |
 | `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |

@@ -1,7 +1,7 @@
 # Claude Code Orchestration Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-05-29
+> **Last Updated:** 2026-08-18
 > **Audience:** Operators
 
 Run Claude Code tasks remotely from Telegram. Send `/claude <task>` (alias: `/claude`) and get results back as messages.
@@ -47,6 +47,8 @@ ssh <your-user>@<your-tailscale-ip> \
 ```
 
 You should see a `system` init event followed by an `assistant` event with Claude's response. If you see `"Invalid API key"`, the token isn't configured — run `setup-token` again.
+
+> **An `ANTHROPIC_API_KEY` in the environment silently outranks this token.** Claude Code prefers an API key over the claude.ai login, so a session that inherits one runs fine and bills the **API** instead of the subscription — the only visible sign is a stderr line saying claude.ai connectors are disabled because another auth source takes precedence. LifeOS's `.env` carries that key for the API-backed services, and the agent worker inherits `.env` wholesale, so both CLI executors strip every `ANTHROPIC_*` and `CLAUDE*` variable from the subprocess before launching it ([ADR-018](../adr/018-api-spend-requires-consent.md)). If you run `claude -p` by hand to debug and it behaves differently from a worker session, an inherited key is the first thing to check: `env | grep ANTHROPIC`.
 
 **Why this is needed:** The LifeOS server runs as a systemd service (Linux) or launchd agent (macOS) with a minimal environment. The service PATH does not include `~/.local/bin`, and interactive OAuth tokens may not be accessible from the server process context. The `setup-token` command stores credentials that are accessible regardless of how the process is launched.
 

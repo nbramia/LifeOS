@@ -645,7 +645,7 @@ def query_pipeline():
         note(
             cx,
             924,
-            "agent loop runs on local Gemma or cloud Haiku · Haiku escalates to Sonnet / Opus or hands off to Claude Code / Codex",
+            "agent loop runs on local Gemma or cloud Haiku · Haiku auto-escalates to Claude Code / Codex · Sonnet / Opus only on request",
             MUT,
             anchor="middle",
             size=11.5,

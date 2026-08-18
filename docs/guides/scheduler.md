@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-08-17
+> **Last Updated:** 2026-08-18
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
@@ -89,6 +89,14 @@ and the executor tag (`#local` / `#cloud` / `#cloud-haiku` / `#cloud-sonnet`).
 The existing [agent worker](../specs/product/agent-worker.md) discovers the
 task and routes it via preflight. Progress is reported through the worker's own
 channel, not the scheduler.
+
+**Tag the executor on scheduled agent work.** A schedule that fires unattended
+should not stop to ask which engine to use — and since
+[ADR-018](../adr/018-api-spend-requires-consent.md) an untagged task whose title
+implies cloud connectors does exactly that, parking at `#agent-blocked` with a
+Telegram question on every fire. Setting `#local`, `#cloud`, `#cloud-haiku`, or
+`#cloud-sonnet` makes the choice explicit up front, so the run proceeds
+unattended.
 
 For **cron** (recurring) schedules the hand-off also stamps a `#sched-<id>` tag
 on the task. The worker reads it on completion and appends every fire's output
