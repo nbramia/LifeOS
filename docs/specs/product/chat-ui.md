@@ -54,6 +54,16 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
 
 ---
 
+## Backend Selector
+
+**Status:** Complete
+
+The composer carries a three-way backend selector — **LifeOS | Agent | Hermes** — rather than a two-way toggle. LifeOS is always available; Agent and Hermes each only appear once configured server-side (`GET /api/agent/status` / `GET /api/hermes/status`). With no stored preference, a fresh session defaults to Hermes if it's configured and reachable, else LifeOS; an explicit user choice — including explicitly picking LifeOS — always wins over that default.
+
+The three backends are not interchangeable: LifeOS is the native orchestrator (full personas, handoff, per-turn model picker); Agent has no personas, no model picker, and no persisted history; Hermes keeps the persona picker but hides the model picker, and its history is LifeOS-owned. Selecting a backend hides the pickers it doesn't support and continues that backend's own conversation thread on refresh. See [Client Surfaces](../technical/client-surfaces.md#text-backends) for the full per-backend capability contract — this doc covers only the selector's product behavior.
+
+---
+
 ## Query Routing
 
 The orchestrator LLM (Claude Haiku via Anthropic API by default; configurable via `LIFEOS_LLM_BACKEND` / `LIFEOS_ANTHROPIC_MODEL`) chooses which tools to call. A lightweight intent classifier runs first to short-circuit a few special cases — Claude Code tasks, ambiguous task/reminder phrasing, and explicit engine handoffs (below) — and everything else flows through the agentic loop where the model picks tools per query.
