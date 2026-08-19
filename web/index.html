@@ -510,6 +510,23 @@
         .routing-source.attachment { border-color: #9c27b0; color: #9c27b0; }
         .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
 
+        /* "Runs on LifeOS" toolbar badge (#596): shown whenever the selected
+           persona orchestrates (spawns a background Claude Code session),
+           regardless of which text backend is selected — that spawn path has
+           no Hermes/Agent equivalent, so the turn always lands on LifeOS. */
+        .orchestrates-badge:not([hidden]) {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0.5rem;
+            font-size: 0.72rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
         .message-actions {
             position: absolute;
             top: 0.5rem;
@@ -660,8 +677,12 @@
             border-color: var(--accent);
         }
 
-        /* LifeOS|Agent text-backend toggle (#361); shown only when the agent
-           backend is configured server-side (body.agent-available). */
+        /* LifeOS|Agent|Hermes text-backend selector (#361, three-way in #587);
+           shown only when at least one of Agent/Hermes is configured
+           server-side (body.agent-available / body.hermes-available). Each
+           non-lifeos option additionally hides itself unless ITS backend is
+           configured, so a machine with only one configured still gets a
+           clean two-way toggle rather than a dead third button. */
         .backend-toggle {
             display: none;
             align-items: center;
@@ -671,7 +692,8 @@
             overflow: hidden;
         }
 
-        body.agent-available .backend-toggle {
+        body.agent-available .backend-toggle,
+        body.hermes-available .backend-toggle {
             display: inline-flex;
         }
 
@@ -690,8 +712,31 @@
             color: white;
         }
 
-        /* Agent mode has no personas — hide the picker. */
+        #backendAgent {
+            display: none;
+        }
+
+        body.agent-available #backendAgent {
+            display: inline-block;
+        }
+
+        #backendHermes {
+            display: none;
+        }
+
+        body.hermes-available #backendHermes {
+            display: inline-block;
+        }
+
+        /* Agent mode has no personas — hide the picker (and, since the model
+           picker shares this class, the model picker too). */
         body.agent-mode .persona-picker {
+            display: none;
+        }
+
+        /* Hermes mode keeps the persona picker visible but hides the per-turn
+           model picker — model selection there is the harness's concern (#587). */
+        body.hermes-mode #modelPicker {
             display: none;
         }
 
@@ -1012,7 +1057,9 @@
            pick as `model_override` on /api/voice/turn/stream, which whisper-relay
            relays to /api/ask/stream (whisper-relay#24) — so it stays visible in
            voice mode. It is still hidden on the Agent backend via
-           `body.agent-mode .persona-picker` (that backend ignores model picks). */
+           `body.agent-mode .persona-picker` (that backend ignores model picks)
+           and on Hermes via `body.hermes-mode #modelPicker` (#587) — Hermes
+           keeps the persona picker visible but owns its own model selection. */
 
         .mode-toggle:hover {
             opacity: 1;
@@ -2800,6 +2847,7 @@
         <!-- Top-of-chat selector toolbar (#361 UI): persona + routing + backend -->
         <div class="chat-toolbar">
             <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
+            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona always runs on the LifeOS backend, no matter which backend is selected">⚙️ Runs on LifeOS</span>
             <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
                 <option value="auto">🤖 Auto</option>
                 <option value="sonnet">Sonnet</option>
@@ -2810,6 +2858,7 @@
             <div class="backend-toggle" role="group" aria-label="Text backend">
                 <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
                 <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
+                <button class="backend-option" id="backendHermes" type="button" title="Hermes backend">Hermes</button>
             </div>
         </div>
 
@@ -3092,6 +3141,7 @@
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
                     personaPicker: document.getElementById('personaPicker'),
+                    orchestratesBadge: document.getElementById('orchestratesBadge'),
                     modelPicker: document.getElementById('modelPicker'),
                     voiceTalkBtn: document.getElementById('voiceTalkBtn'),
                     voiceCancelBtn: document.getElementById('voiceCancelBtn'),
@@ -3100,6 +3150,7 @@
                     voiceAuto: document.getElementById('voiceAuto'),
                     backendLifeos: document.getElementById('backendLifeos'),
                     backendAgent: document.getElementById('backendAgent'),
+                    backendHermes: document.getElementById('backendHermes'),
                 },
                 endpoints: {
                     conversations: '/api/conversations',
@@ -3109,6 +3160,8 @@
                     voice: '/api/voice',
                     agentAsk: '/api/agent/ask/stream',
                     agentStatus: '/api/agent/status',
+                    hermesAsk: '/api/hermes/ask/stream',
+                    hermesStatus: '/api/hermes/status',
                     chatConfig: '/api/chat/config',
                 },
                 hooks: { onAgentThreadReply: sendThreadReply },

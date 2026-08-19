@@ -84,6 +84,7 @@ function renderPersonaOptions() {
     picker.selectedIndex = 0;
     config.personaId = picker.value;
   }
+  updateOrchestratesBadge();
 }
 
 export function onPersonaChange() {
@@ -91,10 +92,23 @@ export function onPersonaChange() {
   if (!picker) return;
   config.personaId = picker.value;
   storePersonaId(config.personaId);
+  updateOrchestratesBadge();
   // Switching persona starts a fresh, persona-scoped conversation — the
   // previous conversation belongs to the previous persona. newChat() re-fetches
   // the sidebar with the new persona filter.
   newChat();
+}
+
+// Shows/hides the toolbar badge telling the user an orchestrating persona
+// (e.g. doctor) always runs on LifeOS (#596) — visible whenever
+// personaOrchestrates() is true, which by construction already excludes the
+// agent backend (no persona pass-through there) and includes both lifeos and
+// hermes. Called on persona change and whenever the backend selector changes
+// (backend.js), since personaOrchestrates() depends on both.
+export function updateOrchestratesBadge() {
+  const badge = elements.orchestratesBadge;
+  if (!badge) return;
+  badge.hidden = !personaOrchestrates();
 }
 
 // True iff the selected persona advertises the `handoff` capability. Gates the
@@ -106,7 +120,15 @@ export function onPersonaChange() {
 // not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
-  if (config.backend === 'agent') return false;  // the agent backend has no handoff
+  // Neither the agent nor the hermes backend has handoff. Hermes now carries
+  // the full persona (preamble, voice rules) to its backend server-side via
+  // the `lifeos_context` envelope (#590), but that backend has no claude_intent
+  // classifier to hand off to — so this stays false regardless of persona.
+  // Restoring orchestration on Hermes (#596, personaOrchestrates() below) does
+  // NOT restore this: handoff and orchestration are different mechanisms, and
+  // an orchestrating persona's Hermes turn is diverted to LifeOS wholesale
+  // rather than handed off mid-stream.
+  if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personas || personas.length === 0) return personaId === DEFAULT_PERSONA_ID;
   const p = personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));
@@ -119,10 +141,17 @@ export function personaSupportsHandoff() {
 // it is excluded; orchestrating bots are the non-primary personas that advertise
 // handoff. Used to decide whether a turn should poll for a `[CLARIFY]`/`[GOAL]`
 // on surfaces (voice) whose stream doesn't expose the `claude_code` routing the
-// text path keys off (#412).
+// text path keys off (#412), and (askStream, #596) whether a Hermes-selected
+// turn must be diverted to the LifeOS endpoint instead of the Hermes proxy —
+// the spawn path this gates is LifeOS-only, so Hermes no longer excludes it.
 export function personaOrchestrates() {
   const { personas, personaId } = config;
-  if (config.backend === 'agent') return false;  // the agent backend has no personas
+  // The agent backend has no persona pass-through at all (no persona_id is
+  // ever sent, see askStream), so it never orchestrates — unlike hermes,
+  // which is deliberately NOT excluded here (#596): an orchestrating
+  // persona's Hermes turn still orchestrates, just via a diverted LifeOS
+  // turn rather than the Hermes proxy.
+  if (config.backend === 'agent') return false;
   if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
   const p = personas && personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));

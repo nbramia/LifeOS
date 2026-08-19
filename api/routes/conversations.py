@@ -37,6 +37,7 @@ class ConversationResponse(BaseModel):
     updated_at: str
     message_count: int
     persona_id: str = "primary"
+    backend: str = "lifeos"
 
 
 class MessageResponse(BaseModel):
@@ -92,16 +93,19 @@ class AnswerRequest(BaseModel):
 
 
 @router.get("", response_model=ConversationListResponse)
-async def list_conversations(persona_id: str = "primary"):
+async def list_conversations(persona_id: str = "primary", backend: Optional[str] = None):
     """
     List conversations for a persona, sorted by most recent.
 
     Returns up to 50 conversations with metadata. ``persona_id`` defaults to
     ``"primary"`` so web chat (which omits it) keeps seeing its own threads;
     pass e.g. ``?persona_id=fitness`` to scope to a specialized persona.
+    ``backend`` is optional and unset by default, preserving today's
+    unfiltered-by-backend behavior; pass e.g. ``?backend=hermes`` to scope the
+    sidebar to threads tagged with that backend (#596).
     """
     store = get_store()
-    conversations = store.list_conversations(persona_id=persona_id)
+    conversations = store.list_conversations(persona_id=persona_id, backend=backend)
 
     return ConversationListResponse(
         conversations=[
@@ -112,6 +116,7 @@ async def list_conversations(persona_id: str = "primary"):
                 updated_at=c.updated_at.isoformat(),
                 message_count=c.message_count,
                 persona_id=c.persona_id,
+                backend=c.backend,
             )
             for c in conversations
         ]

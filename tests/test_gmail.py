@@ -587,8 +587,16 @@ class TestGmailDraftAPI:
     """Test Gmail draft API endpoint."""
 
     @pytest.fixture
-    def mock_gmail_service(self):
+    def mock_gmail_service(self, tmp_path, monkeypatch):
         """Create mock Gmail service."""
+        from api.services import gmail_draft_ledger as ledger_mod
+        from api.services.gmail_draft_ledger import GmailDraftLedger
+
+        # Patch the singleton itself so both the create-side route and the
+        # shared check_send_gate() helper (called from the send route) see
+        # the same throwaway ledger instead of the real one on disk.
+        ledger = GmailDraftLedger(str(tmp_path / "gmail_draft_ledger.db"))
+        monkeypatch.setattr(ledger_mod, "_draft_ledger", ledger)
         mock = MagicMock()
         mock.create_draft.return_value = DraftMessage(
             draft_id="draft123",

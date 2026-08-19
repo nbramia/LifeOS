@@ -32,6 +32,7 @@ from api.services.time_parser import (
 from config.settings import settings
 from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
+from api.services.agent_system_prompt import build_turn_context
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,46 @@ async def chat_config():
     }
 
 
+class TagCount(BaseModel):
+    """A task tag with its usage count."""
+    tag: str
+    count: int
+
+
+class TurnContextResponse(BaseModel):
+    """Response for the per-turn context endpoint (#591)."""
+    current_datetime: str
+    current_datetime_iso: str
+    timezone: str
+    time_resolution_instruction: str
+    personal_context: str
+    existing_tags: list[TagCount]
+    tags_instruction: str
+
+
+@router.get("/chat/turn-context", response_model=TurnContextResponse)
+async def turn_context(persona_id: str = "primary", modality: str = "text"):
+    """Read-only per-turn context: current date/time, timezone, the
+    relative-time-resolution instruction, the persona-scoped personal-context
+    block, and existing task tags with usage counts.
+
+    This is the same computation `build_system_prompt` folds into the native
+    system prompt, exported as structured JSON (no Anthropic content-block
+    dependency) so any MCP client or the Hermes backend can pull it at the
+    start of a turn without a LifeOS-specific integration (#591). It never
+    creates, mutates, or persists anything.
+
+    `modality` is accepted for shape symmetry with `/api/ask/stream` but
+    doesn't currently change any field here — voice-specific material
+    (a persona's spoken-style rules) lives in `persona`, not `turn`.
+
+    400 if `persona_id` isn't a known persona.
+    """
+    if settings.resolve_persona(persona_id) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown persona_id: {persona_id!r}")
+    return build_turn_context(persona_id)
+
+
 # Attachment configuration
 ALLOWED_MEDIA_TYPES = {
     # Images - 5MB each
@@ -335,6 +376,13 @@ class AskStreamRequest(BaseModel):
     # prompt; None/"text" is a normal typed turn. Set by the voice gateway
     # (whisper-relay) on spoken turns; omitted for text.
     modality: Optional[str] = None
+    # Text backend the client had selected, used SOLELY to tag a newly created
+    # conversation for sidebar filtering (#596) — e.g. an orchestrating
+    # persona's turn, diverted here from a Hermes-selected composer because
+    # this handler is where its spawn path lives. Never used to route,
+    # resolve a persona, or pick a model; omitted (the default) reproduces
+    # today's tagging ("lifeos") exactly.
+    backend: Optional[str] = None
 
     @field_validator("persona")
     @classmethod
@@ -489,8 +537,14 @@ async def ask_stream(request: AskStreamRequest):
 
             if not conversation_id:
                 # Create new conversation, tagged with the selected persona so
-                # persona-scoped listing (e.g. the voice sidebar) can filter it.
-                conv = store.create_conversation(persona_id=new_conversation_persona_id)
+                # persona-scoped listing (e.g. the voice sidebar) can filter it,
+                # and with the selected backend (default "lifeos") so a turn
+                # diverted here from Hermes (#596) stays visible in the sidebar
+                # the user started it in rather than vanishing into "lifeos".
+                conv = store.create_conversation(
+                    persona_id=new_conversation_persona_id,
+                    backend=request.backend or "lifeos",
+                )
                 conversation_id = conv.id
                 # Generate title from question
                 title = generate_title(request.question)

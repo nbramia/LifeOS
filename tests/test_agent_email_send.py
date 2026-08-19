@@ -47,6 +47,22 @@ async def test_cannot_send_draft_created_this_turn():
     mock.send_draft.assert_not_called()
 
 
+async def test_in_process_gate_refuses_same_turn_before_send_call():
+    """The agent-loop gate stays in-process and refuses before Gmail send."""
+    begin_email_send_turn()
+    mock = _mock_gmail(draft_id="d1")
+
+    with patch("api.services.gmail.GmailService", return_value=mock):
+        await _tool_create_email_draft(
+            {"to": "recipient@example.com", "subject": "test", "body": "test body"}
+        )
+        result = await _tool_send_email_draft({"draft_id": "d1"})
+
+    assert result.startswith("Error")
+    assert "current turn" in result
+    mock.send_draft.assert_not_called()
+
+
 async def test_can_send_draft_from_prior_turn():
     """A draft NOT created in the current turn (i.e. from a prior turn) can be sent."""
     begin_email_send_turn()  # fresh turn — no drafts created within it

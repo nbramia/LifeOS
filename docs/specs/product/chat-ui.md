@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-08-19
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -51,6 +51,16 @@ The primary chat interface for LifeOS, providing AI-powered search and synthesis
   - Recent context
   - Open items
   - Suggested topics
+
+---
+
+## Backend Selector
+
+**Status:** Complete
+
+The composer carries a three-way backend selector — **LifeOS | Agent | Hermes** — rather than a two-way toggle. LifeOS is always available; Agent and Hermes each only appear once configured server-side (`GET /api/agent/status` / `GET /api/hermes/status`). With no stored preference, a fresh session defaults to Hermes if it's configured and reachable, else LifeOS; an explicit user choice — including explicitly picking LifeOS — always wins over that default.
+
+The three backends are not interchangeable: LifeOS is the native orchestrator (full personas, handoff, per-turn model picker); Agent has no personas, no model picker, and no persisted history; Hermes keeps the persona picker but hides the model picker, and its history is LifeOS-owned. Selecting a backend hides the pickers it doesn't support and continues that backend's own conversation thread on refresh. See [Client Surfaces](../technical/client-surfaces.md#text-backends) for the full per-backend capability contract — this doc covers only the selector's product behavior.
 
 ---
 
@@ -188,7 +198,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - Creates Gmail draft with proper formatting
 - Returns link to open draft in Gmail
 - Supports both personal and work accounts
-- **Gated sending:** even a request phrased as "send an email to X" always drafts first, presents the draft, and waits for explicit confirmation. Only after the user confirms in a later turn is the draft sent. A draft created in the current turn cannot be sent in that same turn (enforced structurally, not just by prompt).
+- **Gated sending:** even a request phrased as "send an email to X" always drafts first, presents the draft, and waits for explicit confirmation. The in-process agent loop refuses drafts created in the current turn, and the Gmail send endpoint enforces the same guarantee for HTTP/MCP callers: a send with the same `X-LifeOS-Turn-ID` as draft creation is refused regardless of elapsed time, as long as that turn-id record is still in the ledger (turn-tagged records are capped by count rather than by age, so they don't expire on a timer, but the ledger isn't unbounded); without an exact different turn id, LifeOS-created drafts are refused during the configured cooling-off window. Hand-written Gmail drafts are not in the LifeOS ledger and can be sent.
 
 ---
 

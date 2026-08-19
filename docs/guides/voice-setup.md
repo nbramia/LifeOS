@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-08-09
+**Last Updated:** 2026-08-19
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
@@ -25,7 +25,7 @@ whisper-relay is a separate app in its own repository — it is **not** installe
 Anything text chat can do, voice can do — because both hit the **same** `POST /api/ask/stream`:
 
 - **Same personas.** The persona picker in `/chat` is shown in voice mode too. Voice sends the chosen `persona_id`; the server applies the matching persona and, on a spoken turn, appends that persona's `voice` frontmatter rules to the system prompt. Those rules are speech-formatting norms only (for example: speak in plain sentences, keep it short, don't read out URLs or file paths) — each persona file defines its own; see [personas.md](personas.md).
-- **Same per-turn model picker.** `Auto` / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. Voice forwards the same `model_override` the text picker uses. The picker is shown in voice mode as well — it is hidden only on the Agent backend (below), which ignores model picks.
+- **Same per-turn model picker.** `Auto` / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. Voice forwards the same `model_override` the text picker uses. The picker is shown in voice mode as well — it is hidden on the Agent and Hermes backends (below), both of which ignore model picks (Hermes still shows the persona picker; Agent hides that too).
 - **Same conversations.** Voice and text share the persona-scoped thread sidebar and conversation history.
 
 ## Setup (LifeOS side)
@@ -78,20 +78,30 @@ In voice mode the text composer is replaced by the dock:
 
 Each spoken response bubble is also **tap-to-replay** — tap it to hear the reply again. (Replay is a per-response affordance, not a dock toggle.) Empty or silent recordings are **skipped automatically** by silence detection — there is no manual "skip silent" control.
 
-### Optional Agent text backend
+### Optional Agent and Hermes text backends
 
-`/chat` carries a second backend toggle, **LifeOS | Agent**, shown only when an Agent backend is configured server-side. The Agent backend is a separate text backend that speaks the same `/api/ask/stream` contract; LifeOS proxies it and injects any bearer token server-side so it never reaches the browser. It has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Configure it with:
+`/chat` carries a backend selector — **LifeOS | Agent | Hermes** — where Agent and Hermes each only appear once configured server-side. Both are separate text backends that speak the same `/api/ask/stream` contract; LifeOS proxies each and injects its bearer token server-side so it never reaches the browser (the same generalized proxy factory backs both, #587). The Agent backend has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Hermes keeps the persona picker visible but hides the per-turn model picker — model selection there is the harness's concern, not LifeOS's. Configure them with:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LIFEOS_AGENT_BACKEND_URL` | *(empty)* | Agent backend base URL. Empty disables the toggle entirely. |
+| `LIFEOS_AGENT_BACKEND_URL` | *(empty)* | Agent backend base URL. Empty disables the Agent option entirely. |
 | `LIFEOS_AGENT_BACKEND_TOKEN` | *(empty)* | Optional bearer token, added server-side. |
+| `LIFEOS_HERMES_BACKEND_URL` | *(empty)* | Hermes backend base URL. Empty disables the Hermes option entirely. |
+| `LIFEOS_HERMES_BACKEND_TOKEN` | *(empty)* | Optional bearer token, added server-side. |
+
+When Hermes is configured and there's no stored backend preference yet, `/chat` defaults to it (falling back to LifeOS if the availability check fails or times out); an explicit choice — including LifeOS — always wins over that default.
+
+An **orchestrating** persona (below) stays selectable on Hermes and keeps working there **for text** — its turn is diverted client-side to the LifeOS endpoint rather than sent to the Hermes proxy, since the spawn it triggers is LifeOS-only (#596). That diversion is **text-only**: voice has no equivalent, so an orchestrating persona's spoken turn on the Hermes backend still reaches the Hermes proxy, which rejects it with a 400 rather than spawning anything (the same backstop client-surfaces.md describes for text). The web client knows this and does not start pending-question polling for a Hermes-selected orchestrating turn — only a LifeOS-backend one, per the limitation described next.
+
+A spoken turn on the Hermes backend routes through LifeOS's **own** Hermes proxy (`POST /api/hermes/ask/stream`) rather than the harness directly — the gateway is expected to call that endpoint for the Hermes backend, exactly as the browser calls it for a typed Hermes turn. That's the seam where persona resolution, the `lifeos_context` envelope, and conversation persistence all live (see [client-surfaces.md](../specs/technical/client-surfaces.md)); reaching the harness directly would skip all three. A gateway not yet updated to route this way (`nbramia/whisper-relay#32`) must fail the turn visibly with its own error — never silently answer without a persona or the spoken-style rules it would otherwise carry.
 
 Like the voice vars, these live in `config/settings.py` and are not in `.env.example`.
 
 ## Known limitation: orchestrating personas don't stream back into voice
 
-Selecting an **orchestrating** persona (for example the `doctor` self-repair bot, `orchestrates: true`) does **not** answer inline. The server spawns a background Claude Code session and streams only an acknowledgement. You can still **answer** that session's follow-up questions from web/voice (the conversation exposes a `pending_question` you can reply to). But the session's **results** currently surface via that bot's **Telegram** thread and the **`/agents`** page — they do **not** yet stream back into the web/voice conversation. Treat orchestrating personas over voice as fire-and-then-check-elsewhere, not a full spoken round-trip. Streaming results back into the web thread is a tracked gap in [client-surfaces.md](../specs/technical/client-surfaces.md).
+Selecting an **orchestrating** persona (for example the `doctor` self-repair bot, `orchestrates: true`) on the **LifeOS** backend does **not** answer inline. The server spawns a background Claude Code session and streams only an acknowledgement. You can still **answer** that session's follow-up questions from web/voice (the conversation exposes a `pending_question` you can reply to). But the session's **results** currently surface via that bot's **Telegram** thread and the **`/agents`** page — they do **not** yet stream back into the web/voice conversation. Treat orchestrating personas over voice as fire-and-then-check-elsewhere, not a full spoken round-trip. Streaming results back into the web thread is a tracked gap in [client-surfaces.md](../specs/technical/client-surfaces.md).
+
+On the **Hermes** backend an orchestrating persona's spoken turn never spawns anything in the first place (see above) — there is no session to answer or check on.
 
 ## Troubleshooting
 
@@ -102,6 +112,7 @@ Selecting an **orchestrating** persona (for example the `doctor` self-repair bot
 | Dock present but turns error immediately | whisper-relay isn't running on `LIFEOS_VOICE_GATEWAY_URL` (default `:9788`). Start the gateway; check `curl http://127.0.0.1:9788` locally. |
 | Voice dock never appears | Voice is opt-in per browser. Toggle to Voice with the mic control, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
+| `Hermes` toggle missing | Expected unless `LIFEOS_HERMES_BACKEND_URL` is set. |
 
 ---
 

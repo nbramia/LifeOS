@@ -39,6 +39,7 @@ AGENT_TRANSCRIPTS_DIR = _REPO_ROOT / "data" / "agent_transcripts"
 
 API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
+TURN_ID_HEADER = "X-LifeOS-Turn-ID"
 
 # Curated list of endpoints to expose as tools (path -> tool config)
 # This allows us to control which endpoints are exposed and how they're described
@@ -116,13 +117,15 @@ CURATED_ENDPOINTS = {
     },
     "/api/gmail/drafts": {
         "name": "lifeos_gmail_draft",
-        "description": "Create a Gmail draft (NOT sent — user reviews). Returns draft ID + URL. Required: to, subject, body. Optional: cc, bcc, account.",
-        "method": "POST"
+        "description": "Create a Gmail draft (not sent). Returns draft ID + URL. Optional turn_id becomes X-LifeOS-Turn-ID for exact send-gate matching. Required: to, subject, body.",
+        "method": "POST",
+        "turn_header_arg": "turn_id",
     },
     "/api/gmail/send": {
         "name": "lifeos_gmail_send",
-        "description": "Send an existing Gmail draft (from lifeos_gmail_draft) by draft_id. SAFETY: only after the user reviews and confirms; never send a draft created this same turn. Required: draft_id. Optional: account.",
-        "method": "POST"
+        "description": "Send an existing Gmail draft by draft_id. Without an exact different turn_id, LifeOS-created drafts are refused during the cooldown; confirm first. Optional turn_id maps to X-LifeOS-Turn-ID.",
+        "method": "POST",
+        "turn_header_arg": "turn_id",
     },
     "/api/slack/search": {
         "name": "lifeos_slack_search",
@@ -335,6 +338,11 @@ CURATED_ENDPOINTS = {
         "method": "DELETE",
         "path": "/api/calendar/events/{event_id}"
     },
+    "/api/chat/turn-context": {
+        "name": "lifeos_turn_context",
+        "description": "Per-turn context: current date/time, timezone, relative-time resolution guidance, persona-scoped personal context, and existing task tags. Read at the start of every turn.",
+        "method": "GET"
+    },
 }
 
 
@@ -434,10 +442,12 @@ class LifeOSMCPServer:
             method = config["method"].lower()
             endpoint_spec = paths.get(spec_path, {}).get(method, {})
 
+            input_schema = self._build_input_schema(endpoint_spec, schemas, method, actual_path)
+            self._add_turn_header_arg(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
-                "inputSchema": self._build_input_schema(endpoint_spec, schemas, method, actual_path)
+                "inputSchema": input_schema,
             }
             self.tools.append(tool)
 
@@ -520,6 +530,16 @@ class LifeOSMCPServer:
         """Get fallback input schema for a tool by name."""
         return self._fallback_schemas().get(tool_name, {"type": "object", "properties": {}})
 
+    def _add_turn_header_arg(self, schema: dict, config: dict) -> None:
+        """Expose an MCP arg that forwards to the Gmail turn-id header."""
+        arg_name = config.get("turn_header_arg")
+        if not arg_name:
+            return
+        schema.setdefault("properties", {})[arg_name] = {
+            "type": "string",
+            "description": f"Optional turn identifier forwarded as {TURN_ID_HEADER}.",
+        }
+
     def _fallback_schemas(self) -> dict:
         """Return fallback schemas for all tools."""
         return {
@@ -562,6 +582,27 @@ class LifeOSMCPServer:
                     "q": {"type": "string", "description": "Search query"}
                 },
                 "required": ["q"]
+            },
+            "lifeos_gmail_draft": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email"},
+                    "subject": {"type": "string", "description": "Email subject"},
+                    "body": {"type": "string", "description": "Email body"},
+                    "cc": {"type": "string", "description": "CC recipients"},
+                    "bcc": {"type": "string", "description": "BCC recipients"},
+                    "html": {"type": "boolean", "description": "Body is HTML", "default": False},
+                    "account": {"type": "string", "description": "Account: personal or work", "default": "personal"},
+                },
+                "required": ["to", "subject", "body"]
+            },
+            "lifeos_gmail_send": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {"type": "string", "description": "Draft ID returned by lifeos_gmail_draft"},
+                    "account": {"type": "string", "description": "Account: personal or work", "default": "personal"},
+                },
+                "required": ["draft_id"]
             },
             "lifeos_drive_search": {
                 "type": "object",
@@ -947,10 +988,15 @@ class LifeOSMCPServer:
         """Build tools from curated list without OpenAPI spec."""
         fallback_schemas = self._fallback_schemas()
         for config in CURATED_ENDPOINTS.values():
+            input_schema = fallback_schemas.get(
+                config["name"],
+                {"type": "object", "properties": {}},
+            )
+            self._add_turn_header_arg(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
-                "inputSchema": fallback_schemas.get(config["name"], {"type": "object", "properties": {}})
+                "inputSchema": input_schema,
             }
             self.tools.append(tool)
 
@@ -1115,6 +1161,12 @@ class LifeOSMCPServer:
 
         method = endpoint_config["method"]
         url = f"{API_BASE}{endpoint_path}"
+        headers = {}
+        turn_header_arg = endpoint_config.get("turn_header_arg")
+        if turn_header_arg:
+            turn_id = (arguments.pop(turn_header_arg, None) or "").strip()
+            if turn_id:
+                headers[TURN_ID_HEADER] = turn_id
 
         # Handle path parameters
         if "{" in endpoint_path:
@@ -1126,13 +1178,13 @@ class LifeOSMCPServer:
 
         try:
             if method == "GET":
-                resp = self.client.get(url, params=arguments)
+                resp = self.client.get(url, params=arguments, headers=headers or None)
             elif method == "DELETE":
-                resp = self.client.delete(url, params=arguments)
+                resp = self.client.delete(url, params=arguments, headers=headers or None)
             elif method in ("PUT", "PATCH"):
-                resp = self.client.request(method, url, json=arguments)
+                resp = self.client.request(method, url, json=arguments, headers=headers or None)
             else:  # POST
-                resp = self.client.post(url, json=arguments)
+                resp = self.client.post(url, json=arguments, headers=headers or None)
 
             resp.raise_for_status()
             result = resp.json()

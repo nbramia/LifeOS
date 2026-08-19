@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-08-19
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -64,6 +64,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 - `persona_id` (optional) — selects a chat persona by id (see [`GET /api/personas`](#get-apipersonas)). The server applies the same system-prompt preamble the matching Telegram bot uses. Unknown ids return **400**. Omit it for the default (`primary`) persona. A new conversation created in this call is tagged with the persona so it can be filtered later (see [`GET /api/conversations`](#get-apiconversations)).
 - `persona` (optional, internal) — raw preamble text used by the in-process Telegram client. Mutually exclusive with `persona_id` (sending both returns **400**); HTTP clients should use `persona_id`.
 - `model_override` (optional) — pins the model for **this turn**. `"sonnet"` / `"opus"` (or a full model id) run the turn on that cloud model; `"gemma"` / `"local"` run it on the local llama-server; `"auto"` or omitted uses the default orchestrator (Haiku) with escalation — which climbs only to non-API engines (`claude_code` / `codex` / `local`), so a cloud model is reached only by an explicit pick here or a user-directed "escalate to opus" in the message. An explicit pick takes precedence over auto-escalation. Honored on the Anthropic backend; unknown values fall back to `auto`. Drives the web chat model picker.
+- `backend` (optional) — tags a **newly created** conversation for sidebar filtering (see `?backend=` on [`GET /api/conversations`](#get-apiconversations)). This is the only thing it does: it never changes routing, model selection, or persona resolution. Omitted, it tags `"lifeos"` (today's behavior, unchanged). The web client sets it to `"hermes"` only when diverting an orchestrating persona's turn from a Hermes-selected composer to this endpoint (#596) — that persona's spawn is LifeOS-native and has no Hermes equivalent, so the turn lands here regardless of the selected backend, and this field keeps the resulting conversation visible in the Hermes-filtered sidebar rather than vanishing into the `lifeos` bucket.
 
 **Response:** Server-Sent Events stream with event types:
 
@@ -85,9 +86,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Claude intent** — terminal, filesystem, browser tasks. Yields `claude_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 18 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 21 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
 
-**Agentic loop tools (18):**
+**Agentic loop tools (21):**
 
 | Tool | Description |
 |------|-------------|
@@ -110,6 +111,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `delete_calendar_event` | Delete a Google Calendar event |
 | `save_memory` | Save a memory for future reference |
 | `search_memories` | Search previously saved memories |
+| `manage_workouts` | Log and query the workout log and fitness metrics (action: log/update/list/history/summary/log_metric/metrics/get_profile/set_profile/readiness) |
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 
@@ -131,6 +133,31 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 - `id` — pass as `persona_id` on [`POST /api/ask/stream`](#post-apiaskstream) and as the `persona_id` query param on [`GET /api/conversations`](#get-apiconversations).
 - `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
 - `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`.
+
+### GET /api/chat/turn-context
+
+Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, and existing task tags with usage counts. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration (#591). Never creates, mutates, or persists anything.
+
+**Query Parameters:**
+- `persona_id` (optional, default `"primary"`) — same registry `GET /api/personas` resolves against. Unknown ids return **400**.
+- `modality` (optional, default `"text"`) — accepted for shape symmetry with [`POST /api/ask/stream`](#post-apiaskstream); no field in the response currently varies with it (voice-specific material lives in a persona's `voice_rules`, not here).
+
+**Response:**
+```json
+{
+  "current_datetime": "Wednesday, August 19, 2026 at 09:14 AM EDT",
+  "current_datetime_iso": "2026-08-19T09:14:22-04:00",
+  "timezone": "America/New_York",
+  "time_resolution_instruction": "When the user asks for something time-relative...",
+  "personal_context": "",
+  "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
+  "tags_instruction": "When the user asks to tag a task, prefer an existing tag..."
+}
+```
+
+- `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
+- `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
+- This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
 
 ### POST /api/chat/handoff
 
@@ -160,12 +187,15 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 }
 ```
 
-### Voice & Agent backends
+### Voice, Agent & Hermes backends
 
-`/chat` reaches two transport surfaces through LifeOS reverse proxies so the browser stays same-origin (#361). The shapes are owned upstream; LifeOS only forwards.
+`/chat` reaches three transport surfaces through LifeOS reverse proxies so the browser stays same-origin (#361, #587). The shapes are owned upstream; LifeOS only forwards.
 
 - `POST /api/voice/turn/stream` — multipart voice turn (`audio` or `transcript`, plus `backend`, `persona_id`, `conversation_id`) → SSE turn events (`started` / `transcript` / `status_audio` / `response` / `main_audio` / `done` / `error` / `cancelled`); the `done` data is authoritative. Proxied to `LIFEOS_VOICE_GATEWAY_URL` (whisper-relay). Also `POST /api/voice/turn/{turn_id}/cancel` and `GET /api/voice/audio/{turn_id}/{clip_id}`.
-- `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI toggle).
+- `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI selector).
+- `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and per-turn context and attaches them to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}, turn: {...}}`, `turn` a sibling of `persona` per [`GET /api/chat/turn-context`](#get-apichatturn-context)) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route — that last case is a backstop, not the user path: the client diverts an orchestrating persona's turn to [`POST /api/ask/stream`](#post-apiaskstream) instead of here in the first place (#596), tagging the conversation it creates with `backend: "hermes"` so it still shows up in this backend's thread list. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
+- **Hermes turns are persisted** (#592), unlike the Agent backend: the route tees the relayed SSE bytes to the browser unchanged and, in parallel, reconstructs the turn from the `conversation_id` and `content` events it already emits (same shapes the native `POST /api/ask/stream` uses) — adopting the id Hermes minted, creating the conversation row (tagged `persona_id` + `backend: "hermes"`) on first sight of it, and storing the user question and assembled assistant reply as two messages. A stream that ends before completion still persists whatever assistant content arrived; a persistence failure is logged and never breaks the turn. This is why `GET /api/conversations?backend=hermes` and the sidebar now show Hermes history at all.
+- **Hermes usage is captured too** (#595), by the same tee: a relayed `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model` — the same shape the native path emits) is recorded to the usage store on turn completion, tagged with the conversation id. The cost is recorded **verbatim** from that event, never recomputed — the cost calculator only knows Anthropic pricing and would misprice a non-Anthropic upstream model (Hermes runs DeepSeek via Fireworks). A `usage` event with no `cost_usd` records a zero cost rather than a guess; a turn with no `usage` event writes no row; a malformed one (missing/wrong-typed model or token counts) is ignored. Conversation persistence and usage persistence are independent — neither gates the other. Since this is the same event shape and client handler (`web/chat/ask-stream.js`'s `data.type === 'usage'` branch) the native path already uses, the browser's session-cost display updates with **no client change**. The Agent backend has no equivalent — it isn't tee'd at all, so its turns stay invisible to the usage store. See [client-surfaces.md](../technical/client-surfaces.md) § "Hermes turn persistence" for the observer internals.
 
 See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
 
@@ -259,7 +289,9 @@ Search emails.
 
 ### POST /api/gmail/drafts
 
-Create a Gmail draft.
+Create a Gmail draft. LifeOS records the returned draft id in its send-safety ledger with the creation timestamp and optional turn identifier.
+
+Header: `X-LifeOS-Turn-ID` (optional). Set the same opaque value on every Gmail draft/send call made during one agent turn to get exact same-turn enforcement.
 
 **Request:**
 ```json
@@ -283,7 +315,9 @@ Create a Gmail draft.
 
 ### POST /api/gmail/send
 
-Send an existing draft (created via `POST /api/gmail/drafts`) by its `draft_id`. The exact draft is sent — there is no compose-and-send shortcut, which keeps a review step in front of every outbound email. Only send after the user has reviewed the draft and explicitly confirmed.
+Send an existing draft by its `draft_id`. The exact draft is sent; there is no compose-and-send shortcut.
+
+Safety gate: if the draft was created by `POST /api/gmail/drafts`, the send endpoint checks the draft ledger before sending. A send with the same `X-LifeOS-Turn-ID` as draft creation is refused with HTTP 409 regardless of age, as long as that turn-id record hasn't aged out of the ledger's row cap (`LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS`, default 10,000 — oldest-first eviction once exceeded, not time-based). Without an exact different turn id, LifeOS-created drafts are refused with HTTP 409 during `LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS` (default 300 seconds). Draft ids not present in the ledger, such as drafts composed by hand in Gmail, send normally. If the ledger cannot be read, or if it shows signs of having lost data, the endpoint fails closed with HTTP 409.
 
 **Request:**
 ```json
@@ -292,6 +326,7 @@ Send an existing draft (created via `POST /api/gmail/drafts`) by its `draft_id`.
 }
 ```
 Query param: `account` (personal or work; must match where the draft was created).
+Header: `X-LifeOS-Turn-ID` (optional). Use a different value from the draft-creation turn only after user confirmation.
 
 **Response:**
 ```json
@@ -486,6 +521,7 @@ List conversations for a persona (most recent first, up to 50).
 
 **Query params:**
 - `persona_id` (optional, default `"primary"`) — scope to a persona's threads (e.g. `?persona_id=fitness`). Omitting it returns the `primary` persona's threads, preserving web-chat behavior. Persona ids come from [`GET /api/personas`](#get-apipersonas).
+- `backend` (optional, default unset) — scope to threads tagged with that backend (e.g. `?backend=hermes`). Unset returns threads from every backend, preserving behavior for every caller that predates this filter (#596).
 
 **Response:**
 ```json
@@ -497,13 +533,14 @@ List conversations for a persona (most recent first, up to 50).
       "created_at": "2026-06-01T12:00:00",
       "updated_at": "2026-06-01T12:05:00",
       "message_count": 4,
-      "persona_id": "primary"
+      "persona_id": "primary",
+      "backend": "lifeos"
     }
   ]
 }
 ```
 
-Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`.
+Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`. They're tagged with `backend` too (default `"lifeos"`; rows predating the column backfill to it) — see the `backend` field on [`POST /api/ask/stream`](#post-apiaskstream) above for how a thread ends up tagged `"hermes"` instead.
 
 ### POST /api/conversations
 
@@ -859,7 +896,7 @@ Exit maintenance mode early. Re-enables CRITICAL alerts.
 
 #### GET /api/admin/usage
 
-Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost breakdown for charting.
+Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost breakdown for charting. Totals include Hermes-proxied (external-backend) turns alongside native ones (#595) — the usage store has no per-model or per-backend filtering, so any row written to it (native or relayed) counts.
 
 ---
 

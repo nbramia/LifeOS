@@ -152,6 +152,21 @@ class Settings(BaseSettings):
         description="Optional bearer token for the Agent text backend"
     )
 
+    # Hermes text backend (an agent harness reached as a gateway, #587). Proxied
+    # the same way as the Agent backend above — same shared factory, same
+    # server-side bearer injection. Empty url = Hermes disabled, and /chat's
+    # default backend resolution falls back to lifeos.
+    hermes_backend_url: str = Field(
+        default="",
+        alias="LIFEOS_HERMES_BACKEND_URL",
+        description="Hermes text backend base URL (empty disables the Hermes option)"
+    )
+    hermes_backend_token: str = Field(
+        default="",
+        alias="LIFEOS_HERMES_BACKEND_TOKEN",
+        description="Optional bearer token for the Hermes text backend"
+    )
+
     # Default /chat input mode. Off (text) by default so a fresh clone without a
     # voice gateway isn't dropped onto a non-functional dock; set true to make
     # voice the default. A ?mode= URL param or a stored preference still wins.
@@ -719,6 +734,21 @@ class Settings(BaseSettings):
         default="",
         alias="LIFEOS_WORK_DOMAIN_2",
         description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
+    )
+    gmail_draft_send_cooldown_seconds: int = Field(
+        default=300,
+        alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
+        description="Cooling-off window, in seconds, during which LifeOS-created "
+                    "Gmail drafts without a different turn id cannot be sent."
+    )
+    gmail_draft_ledger_max_turn_tagged_rows: int = Field(
+        default=10000,
+        alias="LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS",
+        description="Cap on turn-tagged rows kept in the Gmail draft send-gate "
+                    "ledger. Turn-tagged rows must survive past the cooldown "
+                    "window (the same-turn-id guarantee applies regardless of "
+                    "elapsed time), so they are bounded by count with "
+                    "oldest-first eviction instead of by age."
     )
 
     # ==========================================================================
