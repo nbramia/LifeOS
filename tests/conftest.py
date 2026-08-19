@@ -332,6 +332,33 @@ def _isolate_conversation_store_db(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gmail_draft_ledger(tmp_path, monkeypatch):
+    """Stop tests from opening (and writing to) the production Gmail draft
+    send-gate ledger (#588).
+
+    ``GmailDraftLedger`` is a process-wide singleton keyed off
+    ``settings.chroma_path`` — the real ``data/gmail_draft_ledger.db`` on
+    whatever machine runs the suite. It's read and written from three call
+    sites now: the `/api/gmail/drafts` and `/api/gmail/send` routes, and the
+    in-process `create_email_draft`/`send_email_draft` agent tools. Any test
+    exercising any of those without patching it would touch production data.
+    Redirect the shared singleton itself (not just one call site's imported
+    name) to a per-test tmp instance, mirroring
+    ``_isolate_conversation_store_db`` above. Tests that need to seed or
+    inspect specific ledger entries (e.g. ``tests/test_gmail_draft_send_gate.py``)
+    still patch this same singleton with their own instance, which simply
+    overrides this default for that test.
+    """
+    import api.services.gmail_draft_ledger as ledger_mod
+
+    monkeypatch.setattr(
+        ledger_mod,
+        "_draft_ledger",
+        ledger_mod.GmailDraftLedger(str(tmp_path / "gmail_draft_ledger.db")),
+    )
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """

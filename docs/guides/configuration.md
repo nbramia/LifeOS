@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-08-19
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -230,6 +230,15 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
 | `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` | date | — | For undated notes, trust the file's mtime as the interaction date only when the mtime is strictly later than this `YYYY-MM-DD` cutoff; otherwise the note falls back to the 1970 "undated" sentinel. Set to a date after your last bulk migration (clone/restore/mass-rename) so migration-era mtimes don't show up as recent activity. Leave unset to keep all undated notes on the sentinel. Read directly from the environment by `api/services/indexer.py` (not a Pydantic Setting). |
 
+## Gmail Send Safety
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS` | int | `300` | Cooling-off window for LifeOS-created Gmail drafts when the caller does not provide an exact different `X-LifeOS-Turn-ID` on send. During this window, `POST /api/gmail/send` refuses the send with HTTP 409 and asks the caller to obtain user confirmation. |
+| `LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS` | int | `10000` | Cap on turn-tagged rows kept in the Gmail draft send-gate ledger (`data/gmail_draft_ledger.db`). A same-turn-id send is refused regardless of age, so these rows are never pruned by time — only the oldest are evicted once this count is exceeded, bounding the ledger's size without letting the guarantee expire on a timer. |
+
+The ledger also keeps a sibling marker file, `data/gmail_draft_ledger.db.initialized`, next to the database. If the `.db` file goes missing while the marker survives (e.g. it was deleted or a partial backup restored it without the ledger), LifeOS treats that as lost safety-gate data and refuses every Gmail send with HTTP 409 for one `LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS` window, then resumes normal behavior automatically. Deleting both files together (or neither existing yet, e.g. a fresh install) is read as "nothing to distrust" and is not restricted.
+
 ## Multi-Account Sync
 
 All work toggles default to `false` — work data is not indexed unless explicitly enabled.
@@ -385,4 +394,5 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
+- [API Reference](../specs/product/api-reference.md) — Gmail send endpoint behavior controlled by the draft send cooldown.
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.

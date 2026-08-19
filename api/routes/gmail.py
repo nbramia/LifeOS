@@ -3,16 +3,26 @@ Gmail API endpoints for LifeOS.
 
 Provides search, retrieval, and draft creation for emails.
 """
+import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from api.services.gmail import get_gmail_service, EmailMessage, DraftMessage
+from api.services.gmail import get_gmail_service, EmailMessage
+from api.services.gmail_draft_ledger import (
+    GmailSendGateBlocked,
+    check_send_gate,
+    get_gmail_draft_ledger,
+)
 from api.services.google_auth import resolve_account
+from config.settings import settings
 
 router = APIRouter(prefix="/api/gmail", tags=["gmail"])
+logger = logging.getLogger(__name__)
+
+TURN_ID_HEADER = "X-LifeOS-Turn-ID"
 
 
 class EmailResponse(BaseModel):
@@ -67,6 +77,10 @@ class SendResponse(BaseModel):
     """Response model for a sent message."""
     message_id: str = Field(..., description="ID of the sent message")
     source_account: str
+
+
+def _turn_id(value: Optional[str]) -> Optional[str]:
+    return (value or "").strip() or None
 
 
 def _message_to_response(msg: EmailMessage) -> EmailResponse:
@@ -170,6 +184,7 @@ async def get_email(
 async def create_draft(
     request: DraftCreateRequest,
     account: str = Query(default="personal", description="Account: personal or work"),
+    x_lifeos_turn_id: Optional[str] = Header(default=None, alias=TURN_ID_HEADER),
 ):
     """
     **Create a draft email in Gmail.**
@@ -218,6 +233,27 @@ async def create_draft(
         if not draft:
             raise HTTPException(status_code=500, detail="Failed to create draft")
 
+        try:
+            ledger = get_gmail_draft_ledger()
+            ledger.record_created(
+                account=account_type.value,
+                draft_id=draft.draft_id,
+                turn_id=_turn_id(x_lifeos_turn_id),
+            )
+            ledger.prune(
+                window_seconds=settings.gmail_draft_send_cooldown_seconds,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to record Gmail draft in send-safety ledger: %s",
+                e,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to record draft safety gate",
+            )
+
         # Generate Gmail URL to open the draft
         gmail_url = f"https://mail.google.com/mail/u/0/#drafts?compose={draft.draft_id}"
 
@@ -245,6 +281,7 @@ async def create_draft(
 async def send_draft(
     request: DraftSendRequest,
     account: str = Query(default="personal", description="Account: personal or work"),
+    x_lifeos_turn_id: Optional[str] = Header(default=None, alias=TURN_ID_HEADER),
 ):
     """
     **Send an existing Gmail draft.**
@@ -264,11 +301,28 @@ async def send_draft(
     if not request.draft_id or not request.draft_id.strip():
         raise HTTPException(status_code=400, detail="draft_id is required")
 
+    draft_id = request.draft_id.strip()
     try:
         account_type = resolve_account(account)
+        try:
+            check_send_gate(
+                account=account_type.value,
+                draft_id=draft_id,
+                turn_id=_turn_id(x_lifeos_turn_id),
+            )
+        except GmailSendGateBlocked as e:
+            if e.unavailable:
+                logger.error(
+                    "Failed closed on Gmail draft send because the safety "
+                    "ledger is unavailable: %s",
+                    e.message,
+                    exc_info=True,
+                )
+            raise HTTPException(status_code=409, detail=e.message)
+
         service = get_gmail_service(account_type)
 
-        message_id = service.send_draft(request.draft_id.strip())
+        message_id = service.send_draft(draft_id)
         if not message_id:
             raise HTTPException(status_code=500, detail="Failed to send draft")
 

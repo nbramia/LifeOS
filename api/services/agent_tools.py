@@ -7,6 +7,7 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import contextvars
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -26,14 +27,34 @@ logger = logging.getLogger(__name__)
 # cannot be sent in the same turn even if the model tries to. A ContextVar
 # (not a module global) keeps concurrent requests on the shared API isolated:
 # each request runs in its own task/context with its own set.
+#
+# This in-memory check is stricter and cheaper than the ledger (no I/O, exact
+# per-turn membership) so it stays as the first layer. But it is ALSO only
+# ever consulted by this process's own tool calls — it cannot see a draft
+# created via HTTP, and a draft it creates is invisible to any other caller
+# (including the HTTP send endpoint). So both tools additionally go through
+# api.services.gmail_draft_ledger.check_send_gate(), the same choke point the
+# HTTP route uses, before reaching GmailService.send_draft() (#588).
 _drafts_created_this_turn: contextvars.ContextVar = contextvars.ContextVar(
     "drafts_created_this_turn", default=None
+)
+# Turn id for the ledger's exact turn-match check, so a draft created by
+# create_email_draft in this turn is recorded with the same id a later-turn
+# send_email_draft call presents — mirroring the HTTP X-LifeOS-Turn-ID header
+# for callers that share a process instead of a request.
+_email_send_turn_id: contextvars.ContextVar = contextvars.ContextVar(
+    "email_send_turn_id", default=None
 )
 
 
 def begin_email_send_turn() -> None:
     """Bind a fresh per-turn draft set. Call once at the start of each agent turn."""
     _drafts_created_this_turn.set(set())
+    _email_send_turn_id.set(uuid.uuid4().hex)
+
+
+def _current_email_send_turn_id() -> str | None:
+    return _email_send_turn_id.get()
 
 
 def _mark_draft_created_this_turn(draft_id: str) -> None:
@@ -2325,6 +2346,7 @@ def _tool_manage_schedules(inp: dict):
 
 async def _tool_create_email_draft(inp: dict) -> str:
     from api.services.gmail import GmailService
+    from api.services.gmail_draft_ledger import get_gmail_draft_ledger
     account_str = inp.get("account", "personal")
     account = resolve_account(account_str)
     gmail = GmailService(account)
@@ -2338,6 +2360,22 @@ async def _tool_create_email_draft(inp: dict) -> str:
     # Record this draft as created in the current turn so the send gate refuses
     # to send it until the user confirms in a later turn.
     _mark_draft_created_this_turn(draft.draft_id)
+    # Also record it in the shared ledger — the same store the HTTP
+    # /api/gmail/send route consults — so the guarantee holds even if this
+    # draft is later sent through a different caller/process (#588).
+    try:
+        ledger = get_gmail_draft_ledger()
+        ledger.record_created(
+            account=account.value,
+            draft_id=draft.draft_id,
+            turn_id=_current_email_send_turn_id(),
+        )
+        ledger.prune(window_seconds=settings.gmail_draft_send_cooldown_seconds)
+    except Exception as e:
+        logger.error(
+            "Failed to record Gmail draft in send-safety ledger: %s", e, exc_info=True
+        )
+        return "Error: Failed to record draft safety gate."
     return (
         f"Draft created in {account_str} Gmail (draft_id={draft.draft_id}): "
         f"\"{inp['subject']}\" to {inp['to']}. "
@@ -2349,12 +2387,13 @@ async def _tool_create_email_draft(inp: dict) -> str:
 
 async def _tool_send_email_draft(inp: dict) -> str:
     from api.services.gmail import GmailService
+    from api.services.gmail_draft_ledger import GmailSendGateBlocked, check_send_gate
     draft_id = (inp.get("draft_id") or "").strip()
     if not draft_id:
         return "Error: draft_id is required to send a draft. Create the draft first with create_email_draft."
-    # SAFETY GATE: never send a draft that was created in this same turn. Sends
-    # are only allowed for drafts created in a prior turn, giving the user a
-    # chance to review and explicitly confirm before anything goes out.
+    # SAFETY GATE, layer 1: never send a draft that was created in this same
+    # turn. This is the cheap, exact, in-memory check — it only sees drafts
+    # this same process created in the current turn.
     if _draft_created_this_turn(draft_id):
         return (
             "Error: This draft was just created in the current turn, so it cannot be sent yet. "
@@ -2363,6 +2402,18 @@ async def _tool_send_email_draft(inp: dict) -> str:
         )
     account_str = inp.get("account", "personal")
     account = resolve_account(account_str)
+    # SAFETY GATE, layer 2: the shared ledger check every caller of
+    # GmailService.send_draft() must pass — same helper the HTTP
+    # /api/gmail/send route uses, so a draft created by this tool (or by the
+    # HTTP route, or by a fresh turn/process) is gated consistently (#588).
+    try:
+        check_send_gate(
+            account=account.value,
+            draft_id=draft_id,
+            turn_id=_current_email_send_turn_id(),
+        )
+    except GmailSendGateBlocked as e:
+        return f"Error: {e.message}"
     gmail = GmailService(account)
     message_id = gmail.send_draft(draft_id)
     if message_id:

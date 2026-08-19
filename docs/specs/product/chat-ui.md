@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-08-18
+> **Last Updated:** 2026-08-19
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -188,7 +188,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - Creates Gmail draft with proper formatting
 - Returns link to open draft in Gmail
 - Supports both personal and work accounts
-- **Gated sending:** even a request phrased as "send an email to X" always drafts first, presents the draft, and waits for explicit confirmation. Only after the user confirms in a later turn is the draft sent. A draft created in the current turn cannot be sent in that same turn (enforced structurally, not just by prompt).
+- **Gated sending:** even a request phrased as "send an email to X" always drafts first, presents the draft, and waits for explicit confirmation. The in-process agent loop refuses drafts created in the current turn, and the Gmail send endpoint enforces the same guarantee for HTTP/MCP callers: a send with the same `X-LifeOS-Turn-ID` as draft creation is refused regardless of elapsed time, as long as that turn-id record is still in the ledger (turn-tagged records are capped by count rather than by age, so they don't expire on a timer, but the ledger isn't unbounded); without an exact different turn id, LifeOS-created drafts are refused during the configured cooling-off window. Hand-written Gmail drafts are not in the LifeOS ledger and can be sent.
 
 ---
 
