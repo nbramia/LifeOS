@@ -3578,8 +3578,11 @@
 
         async function openUsageModal() {
             document.getElementById('usageModal').classList.add('visible');
-            // Show current session cost in modal
-            document.getElementById('usageSession').textContent = '$' + chatState.sessionCost.toFixed(3);
+            // Show current session cost in modal. Mirrors the header display's
+            // #602 lower-bound marker: once any turn this session had no
+            // reported cost, the figure is a floor, not a total.
+            const unpricedPrefix = chatState.sessionCostUnpriced > 0 ? '~' : '';
+            document.getElementById('usageSession').textContent = unpricedPrefix + '$' + chatState.sessionCost.toFixed(3);
             await loadUsageStats();
         }
 
