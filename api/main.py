@@ -33,7 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, journal, journal_trends
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends
 from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
@@ -288,6 +288,7 @@ app.include_router(vault.router)
 app.include_router(fitness.router)
 app.include_router(voice.router)
 app.include_router(agent_proxy.router)
+app.include_router(hermes_proxy.router)
 app.include_router(journal.router)
 app.include_router(journal_trends.router)
 
