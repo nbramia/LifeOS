@@ -824,7 +824,9 @@ async function consumeTurnStream(response) {
 export async function submitTurn({ blob, mime, transcript } = {}) {
   voiceBusy = true;
   state.isLoading = true;
-  setStatus('loading', getBackendMode() === 'agent' ? 'Agent thinking…' : 'Thinking…');
+  const mode = getBackendMode();
+  setStatus('loading', mode === 'agent' ? 'Agent thinking…'
+    : mode === 'hermes' ? 'Hermes thinking…' : 'Thinking…');
   showThinking();
   activeTurnId = null;
   activeTurnAbort = new AbortController();
@@ -833,17 +835,25 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
   if (blob) form.append('audio', blob, blobFilename(mime));
   if (transcript) form.append('transcript', transcript);
   if (state.currentConversationId) form.append('conversation_id', state.currentConversationId);
-  form.append('backend', getBackendMode());
-  if (getBackendMode() === 'lifeos' && config.personaId) {
+  form.append('backend', mode);
+  // Persona rides along on lifeos and hermes alike now (#593), mirroring the
+  // `backend !== 'agent'` gate askStream() uses for text turns — this used to
+  // gate on 'lifeos' only, which left a spoken Hermes turn with no persona
+  // and no spoken-style rules once it reached the Hermes proxy. The agent
+  // backend keeps its current field-dropping behavior (it has no persona
+  // pass-through at all, on either surface).
+  if (mode !== 'agent' && config.personaId) {
     form.append('persona_id', config.personaId);
   }
   // Per-turn model pick — forwarded as `model_override`, mirroring how text
   // turns send it on /api/ask/stream (web/chat/ask-stream.js). Omitted for
   // 'auto' so the default turn stays byte-identical; only the lifeos backend
-  // honors model picks. whisper-relay relays the field to /api/ask/stream
-  // (whisper-relay#24) — until that ships the gateway drops it, degrading
-  // gracefully to the default orchestrator.
-  if (getBackendMode() === 'lifeos' && config.model && config.model !== 'auto') {
+  // honors model picks — deliberately NOT extended to hermes (#593): model
+  // selection on that backend belongs to the harness, not to LifeOS.
+  // whisper-relay relays the field to /api/ask/stream (whisper-relay#24) —
+  // until that ships the gateway drops it, degrading gracefully to the
+  // default orchestrator.
+  if (mode === 'lifeos' && config.model && config.model !== 'auto') {
     form.append('model_override', config.model);
   }
 
@@ -872,7 +882,13 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
       // gate on the selected persona instead — only an orchestrating bot (e.g.
       // doctor) spawns a session that can ask. Poll the linked conversation so
       // a `[CLARIFY]`/`[GOAL]` can be answered here without Telegram.
-      if (personaOrchestrates()) {
+      // Also gated on the lifeos backend specifically (#593): the spawn is
+      // LifeOS-native, and unlike the text path (#596) voice has no
+      // client-side diversion of a Hermes-selected orchestrating turn back
+      // to LifeOS — an orchestrating persona_id sent to the Hermes proxy is
+      // rejected there with a 400 (hermes_proxy.py) rather than spawning
+      // anything, so a Hermes-backend turn never has a session to poll for.
+      if (mode === 'lifeos' && personaOrchestrates()) {
         startPendingQuestionPolling(data.conversation_id);
       }
     }
