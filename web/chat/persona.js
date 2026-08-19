@@ -106,7 +106,9 @@ export function onPersonaChange() {
 // not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
-  if (config.backend === 'agent') return false;  // the agent backend has no handoff
+  // Neither the agent nor the hermes backend has handoff; hermes keeps the
+  // persona picker visible (#587) but persona pass-through isn't wired yet.
+  if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personas || personas.length === 0) return personaId === DEFAULT_PERSONA_ID;
   const p = personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));
@@ -122,7 +124,8 @@ export function personaSupportsHandoff() {
 // text path keys off (#412).
 export function personaOrchestrates() {
   const { personas, personaId } = config;
-  if (config.backend === 'agent') return false;  // the agent backend has no personas
+  // Neither backend orchestrates via persona yet — see personaSupportsHandoff().
+  if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
   const p = personas && personas.find(x => x.id === personaId);
   return !!(p && p.capabilities && p.capabilities.includes('handoff'));

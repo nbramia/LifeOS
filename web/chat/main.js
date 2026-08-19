@@ -55,7 +55,12 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   // conversation key (which is persona-scoped for lifeos) reads the right
   // persona on a refresh.
   loadPersonas();
-  initBackend();  // LifeOS|Agent toggle + restore per-backend conversation (#361)
+  // LifeOS|Agent|Hermes selector + restore per-backend conversation (#361,
+  // #587). The promise is stashed on the bridge (below) so tests can await
+  // "default resolution actually happened" instead of polling UI state that
+  // can look identical before and after (e.g. the lifeos default matches
+  // index.html's initial markup).
+  window.lifeChat.backendReady = initBackend();
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
   setStatus('', 'Ready');

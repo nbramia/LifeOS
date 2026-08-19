@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-08-09
+**Last Updated:** 2026-08-19
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
@@ -25,7 +25,7 @@ whisper-relay is a separate app in its own repository — it is **not** installe
 Anything text chat can do, voice can do — because both hit the **same** `POST /api/ask/stream`:
 
 - **Same personas.** The persona picker in `/chat` is shown in voice mode too. Voice sends the chosen `persona_id`; the server applies the matching persona and, on a spoken turn, appends that persona's `voice` frontmatter rules to the system prompt. Those rules are speech-formatting norms only (for example: speak in plain sentences, keep it short, don't read out URLs or file paths) — each persona file defines its own; see [personas.md](personas.md).
-- **Same per-turn model picker.** `Auto` / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. Voice forwards the same `model_override` the text picker uses. The picker is shown in voice mode as well — it is hidden only on the Agent backend (below), which ignores model picks.
+- **Same per-turn model picker.** `Auto` / `Sonnet` / `Opus` / `Gemma (local)` / `Claude Code`. Voice forwards the same `model_override` the text picker uses. The picker is shown in voice mode as well — it is hidden on the Agent and Hermes backends (below), both of which ignore model picks (Hermes still shows the persona picker; Agent hides that too).
 - **Same conversations.** Voice and text share the persona-scoped thread sidebar and conversation history.
 
 ## Setup (LifeOS side)
@@ -78,14 +78,18 @@ In voice mode the text composer is replaced by the dock:
 
 Each spoken response bubble is also **tap-to-replay** — tap it to hear the reply again. (Replay is a per-response affordance, not a dock toggle.) Empty or silent recordings are **skipped automatically** by silence detection — there is no manual "skip silent" control.
 
-### Optional Agent text backend
+### Optional Agent and Hermes text backends
 
-`/chat` carries a second backend toggle, **LifeOS | Agent**, shown only when an Agent backend is configured server-side. The Agent backend is a separate text backend that speaks the same `/api/ask/stream` contract; LifeOS proxies it and injects any bearer token server-side so it never reaches the browser. It has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Configure it with:
+`/chat` carries a backend selector — **LifeOS | Agent | Hermes** — where Agent and Hermes each only appear once configured server-side. Both are separate text backends that speak the same `/api/ask/stream` contract; LifeOS proxies each and injects its bearer token server-side so it never reaches the browser (the same generalized proxy factory backs both, #587). The Agent backend has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Hermes keeps the persona picker visible but hides the per-turn model picker — model selection there is the harness's concern, not LifeOS's. Configure them with:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `LIFEOS_AGENT_BACKEND_URL` | *(empty)* | Agent backend base URL. Empty disables the toggle entirely. |
+| `LIFEOS_AGENT_BACKEND_URL` | *(empty)* | Agent backend base URL. Empty disables the Agent option entirely. |
 | `LIFEOS_AGENT_BACKEND_TOKEN` | *(empty)* | Optional bearer token, added server-side. |
+| `LIFEOS_HERMES_BACKEND_URL` | *(empty)* | Hermes backend base URL. Empty disables the Hermes option entirely. |
+| `LIFEOS_HERMES_BACKEND_TOKEN` | *(empty)* | Optional bearer token, added server-side. |
+
+When Hermes is configured and there's no stored backend preference yet, `/chat` defaults to it (falling back to LifeOS if the availability check fails or times out); an explicit choice — including LifeOS — always wins over that default.
 
 Like the voice vars, these live in `config/settings.py` and are not in `.env.example`.
 
@@ -102,6 +106,7 @@ Selecting an **orchestrating** persona (for example the `doctor` self-repair bot
 | Dock present but turns error immediately | whisper-relay isn't running on `LIFEOS_VOICE_GATEWAY_URL` (default `:9788`). Start the gateway; check `curl http://127.0.0.1:9788` locally. |
 | Voice dock never appears | Voice is opt-in per browser. Toggle to Voice with the mic control, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
+| `Hermes` toggle missing | Expected unless `LIFEOS_HERMES_BACKEND_URL` is set. |
 
 ---
 

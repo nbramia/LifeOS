@@ -31,16 +31,18 @@ export async function askStream({ question, conversationId, attachments, persona
     }));
   }
 
-  // The agent backend has no personas and is reached via its own proxied
-  // endpoint (bearer added server-side); lifeos sends persona_id to
-  // /api/ask/stream exactly as before.
-  const isAgent = backend === 'agent';
-  if (!isAgent && personaId != null) body.persona_id = personaId;
+  // The agent and hermes backends have no persona/model pass-through yet and
+  // are each reached via their own proxied endpoint (bearer added server-side);
+  // lifeos sends persona_id + model_override to /api/ask/stream exactly as
+  // before (#361, #587).
+  const proxiedAskEndpoint = { agent: endpoints.agentAsk, hermes: endpoints.hermesAsk };
+  const isLifeos = !proxiedAskEndpoint[backend];
+  if (isLifeos && personaId != null) body.persona_id = personaId;
   // Per-turn model picker (lifeos backend only). 'auto' is the default — omit
   // it so the request stays byte-identical for users who never touch the picker.
-  if (!isAgent && model && model !== 'auto') body.model_override = model;
+  if (isLifeos && model && model !== 'auto') body.model_override = model;
 
-  const response = await fetch(isAgent ? endpoints.agentAsk : endpoints.ask, {
+  const response = await fetch(isLifeos ? endpoints.ask : proxiedAskEndpoint[backend], {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)

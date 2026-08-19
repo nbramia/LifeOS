@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-08-19
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -28,6 +28,10 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_BACKUP_KEEP` | int | `2` | Nightly snapshots retained per database. Older ones are pruned only after a fully successful sync whose newest snapshot passes an integrity check, so repeated failures cannot rotate away the last good copy. |
 | `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output, and returned as `secure_url` by `GET /api/chat/config` so `/chat` can offer a one-tap link here when the mic is blocked by an insecure context. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
+| `LIFEOS_AGENT_BACKEND_URL` | str | *(empty)* | Agent text backend base URL. LifeOS proxies it at `/api/agent/ask/stream`, adding a bearer server-side. Empty disables the `/chat` Agent option entirely. Deliberately absent from `.env.example` — see [voice-setup.md](voice-setup.md#optional-agent-and-hermes-text-backends). |
+| `LIFEOS_AGENT_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Agent text backend, added server-side (never exposed to the browser). |
+| `LIFEOS_HERMES_BACKEND_URL` | str | *(empty)* | Hermes text backend base URL, proxied the same way at `/api/hermes/ask/stream` (#587). Empty disables the `/chat` Hermes option; with no stored backend preference, `/chat` defaults to Hermes when it's configured and reachable, else LifeOS. Deliberately absent from `.env.example`. |
+| `LIFEOS_HERMES_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Hermes text backend, added server-side. |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
 
@@ -380,6 +384,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 
 - [Installation](installation.md) — Initial setup; points back here for env-var reference.
 - [First Run](first-run.md) — Post-install verification.
+- [Voice Setup](voice-setup.md) — The `/chat` Agent/Hermes text-backend toggle and voice dock that the vars above configure.
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.

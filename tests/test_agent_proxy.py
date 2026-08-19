@@ -129,3 +129,6 @@ async def test_502_when_backend_unreachable(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
         resp = await c.post("/api/agent/ask/stream", json={"question": "hi"})
     assert resp.status_code == 502
+    # Pins the exact pre-#587 detail string — the generalized proxy (_proxy.py)
+    # must render this identically for backend_label="agent".
+    assert resp.json()["detail"] == "agent backend unreachable: refused"
