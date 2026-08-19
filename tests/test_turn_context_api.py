@@ -1,0 +1,158 @@
+"""Tests for GET /api/chat/turn-context (#591).
+
+Covers the endpoint's literal response shape, persona-scoped
+`personal_context`, the unknown-persona 400, and the empty-tags degradation
+when the task manager is unreachable. Mirrors the registry-fixture pattern
+in tests/test_persona_api.py.
+"""
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+
+from api.main import app
+from config.settings import settings
+
+pytestmark = pytest.mark.unit
+
+_TURN_KEYS = {
+    "current_datetime", "current_datetime_iso", "timezone",
+    "time_resolution_instruction", "personal_context",
+    "existing_tags", "tags_instruction",
+}
+
+
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+
+def _registry(tmp_path, entries):
+    reg = tmp_path / "bots.json"
+    reg.write_text(json.dumps(entries))
+    return reg
+
+
+def test_shape_and_literal_keys(client):
+    resp = client.get("/api/chat/turn-context")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Exact key set, not a subset check — matches the literal contract pinned
+    # on #590 for lifeos_context.turn.
+    assert set(body.keys()) == _TURN_KEYS
+    assert isinstance(body["current_datetime"], str) and body["current_datetime"]
+    assert isinstance(body["current_datetime_iso"], str) and body["current_datetime_iso"]
+    assert body["timezone"] == settings.timezone
+    assert isinstance(body["time_resolution_instruction"], str) and body["time_resolution_instruction"]
+    assert isinstance(body["personal_context"], str)
+    assert isinstance(body["existing_tags"], list)
+    assert isinstance(body["tags_instruction"], str) and body["tags_instruction"]
+
+
+def test_defaults_to_primary_persona(client):
+    resp = client.get("/api/chat/turn-context")
+    assert resp.status_code == 200
+    # Same personal_context primary would get natively (empty — not therapist).
+    assert resp.json()["personal_context"] == ""
+
+
+def test_unknown_persona_id_returns_400(client):
+    resp = client.get("/api/chat/turn-context", params={"persona_id": "ghost"})
+    assert resp.status_code == 400
+    assert "ghost" in resp.json()["detail"]
+
+
+def test_personal_context_populated_for_therapist(client, monkeypatch):
+    monkeypatch.setattr(settings, "partner_name", "Sam")
+    monkeypatch.setattr(settings, "therapist_patterns", "Dr. A")
+    resp = client.get("/api/chat/turn-context", params={"persona_id": "therapist"})
+    assert resp.status_code == 200
+    assert "Sam" in resp.json()["personal_context"]
+
+
+def test_personal_context_empty_for_other_personas(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "partner_name", "Sam")
+    monkeypatch.setattr(settings, "therapist_patterns", "Dr. A")
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FIT PERSONA")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+    assert client.get(
+        "/api/chat/turn-context", params={"persona_id": "primary"}
+    ).json()["personal_context"] == ""
+    assert client.get(
+        "/api/chat/turn-context", params={"persona_id": "fitness"}
+    ).json()["personal_context"] == ""
+
+
+def test_personal_context_empty_when_config_unset(client, monkeypatch):
+    monkeypatch.setattr(settings, "partner_name", "Partner")  # the placeholder default
+    monkeypatch.setattr(settings, "therapist_patterns", "")
+    resp = client.get("/api/chat/turn-context", params={"persona_id": "therapist"})
+    assert resp.status_code == 200
+    assert resp.json()["personal_context"] == ""
+
+
+def test_empty_tags_when_task_manager_unreachable(client, monkeypatch):
+    import api.services.task_manager as tm_mod
+
+    def boom():
+        raise RuntimeError("task manager unavailable")
+
+    monkeypatch.setattr(tm_mod, "get_task_manager", boom)
+    resp = client.get("/api/chat/turn-context")
+    assert resp.status_code == 200  # a degraded case, not an error
+    assert resp.json()["existing_tags"] == []
+
+
+def test_existing_tags_with_counts(client, tmp_path, monkeypatch):
+    from api.services.task_manager import TaskManager
+    import api.services.task_manager as tm_mod
+
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "task_index.json",
+    )
+    manager.create("a", tags=["work", "urgent"])
+    manager.create("b", tags=["work"])
+    monkeypatch.setattr(tm_mod, "get_task_manager", lambda: manager)
+
+    resp = client.get("/api/chat/turn-context")
+    assert resp.status_code == 200
+    tags = {(t["tag"], t["count"]) for t in resp.json()["existing_tags"]}
+    assert ("work", 2) in tags
+    assert ("urgent", 1) in tags
+
+
+def test_modality_accepted_but_does_not_change_response(client):
+    """`modality` is accepted for shape symmetry with /api/ask/stream, but no
+    field in `turn` varies with it (voice-specific material lives in
+    `persona`, not `turn` — see the #590 pinned schema)."""
+    text_body = client.get("/api/chat/turn-context", params={"modality": "text"}).json()
+    voice_body = client.get("/api/chat/turn-context", params={"modality": "voice"}).json()
+    # current_datetime(_iso) may tick a fraction of a second between calls —
+    # compare everything else exactly.
+    for key in _TURN_KEYS - {"current_datetime", "current_datetime_iso"}:
+        assert text_body[key] == voice_body[key]
+
+
+def test_read_only_does_not_mutate_tags(client, tmp_path, monkeypatch):
+    """Calling the endpoint must never create, mutate, or persist anything —
+    two calls in a row see the identical tag list."""
+    from api.services.task_manager import TaskManager
+    import api.services.task_manager as tm_mod
+
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "task_index.json",
+    )
+    manager.create("a", tags=["work"])
+    monkeypatch.setattr(tm_mod, "get_task_manager", lambda: manager)
+
+    first = client.get("/api/chat/turn-context").json()["existing_tags"]
+    second = client.get("/api/chat/turn-context").json()["existing_tags"]
+    assert first == second == [{"tag": "work", "count": 1}]

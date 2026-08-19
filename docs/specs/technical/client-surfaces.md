@@ -73,7 +73,7 @@ Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifec
 
 ### The `lifeos_context` envelope (Hermes only)
 
-Because Hermes has no way to resolve a LifeOS persona id on its own, `POST /api/hermes/ask/stream` (`api/routes/hermes_proxy.py`, `_build_envelope()`) parses the JSON body, resolves `persona_id` against the same registry `resolve_persona()` / `persona_voice()` / `persona_orchestrates()` the native `/api/ask/stream` uses, and adds one top-level key, `lifeos_context`, before forwarding. Every field the browser sent is forwarded unchanged alongside it. This is a **cross-repo contract** with `nbramia/hermes`, pinned as the schema comment on issue #590 — the field names below are not suggestions.
+Because Hermes has no way to resolve a LifeOS persona id or the current per-turn context on its own, `POST /api/hermes/ask/stream` (`api/routes/hermes_proxy.py`, `_build_envelope()`) parses the JSON body, resolves both, and adds one top-level key, `lifeos_context`, before forwarding. Every field the browser sent is forwarded unchanged alongside it. This is a **cross-repo contract** with `nbramia/hermes`, pinned as the schema comment on issue #590 — the field names below are not suggestions.
 
 ```json
 {
@@ -89,6 +89,15 @@ Because Hermes has no way to resolve a LifeOS persona id on its own, `POST /api/
       "preamble": "...",
       "voice_rules": ["..."],
       "orchestrates": false
+    },
+    "turn": {
+      "current_datetime": "Wednesday, August 19, 2026 at 09:14 AM EDT",
+      "current_datetime_iso": "2026-08-19T09:14:22-04:00",
+      "timezone": "America/New_York",
+      "time_resolution_instruction": "...",
+      "personal_context": "",
+      "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
+      "tags_instruction": "..."
     }
   }
 }
@@ -97,7 +106,7 @@ Because Hermes has no way to resolve a LifeOS persona id on its own, `POST /api/
 - `schema_version` is currently `1`.
 - `modality` duplicates the request's `modality` (`"voice"` or `"text"`) so the envelope is self-contained.
 - `persona.id` defaults to `primary` when the client sends no `persona_id`; `preamble` is the persona's markdown body verbatim (may be empty); `voice_rules` is populated only on voice turns, matching the `modality == "voice"` gate `ask_stream` in `api/routes/chat.py` uses for the native path; `orchestrates` is always `false` here — an orchestrating persona (`doctor`) never reaches this envelope, because the route rejects it with a 400 first (see below).
-- A sibling `turn` sub-object (auto-injected date/timezone/tag context) lands next to `persona` under the same `lifeos_context` key — added by #591, not this route. The two are never merged: `persona` is stable across a conversation, `turn` changes every turn.
+- `turn` (#591) is a **sibling** of `persona`, resolved by `build_turn_context()` in `api/services/agent_system_prompt.py` — the same function [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) returns, so the two shapes can never drift apart. `current_datetime`/`current_datetime_iso`/`timezone` describe the current instant; `time_resolution_instruction` is prompt-ready guidance for resolving relative time expressions ("last week") into concrete date ranges; `personal_context` is a persona-scoped people block (non-empty only for `therapist` today, empty string otherwise); `existing_tags` is `[{tag, count}]` for reuse when tagging tasks (empty when none or the task manager is unreachable), paired with `tags_instruction`. **Never merge `turn` into `persona`** — `persona` is stable across a whole conversation (cacheable), `turn` changes every turn; merging them would invalidate a consumer's prompt cache on every turn.
 
 **Validation and rejection**, in order, before any upstream request is made: malformed JSON → 400; unknown `persona_id` → 400 naming the id; a known but *orchestrating* `persona_id` → 400 (its arrival means the client-side routing that should have sent that turn to the LifeOS endpoint instead — #596 — failed; the persona itself stays selectable on the Hermes backend, this is a routing guard, not a picker exclusion). Attachment size/type caps are enforced via the same `AskStreamRequest` model the native endpoint uses, so the limits can't drift between the two paths.
 

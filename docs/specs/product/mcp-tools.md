@@ -48,6 +48,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 |------|-------------|
 | `lifeos_ask` | Query knowledge base with synthesized answer |
 | `lifeos_search` | Search vault without synthesis (raw results) |
+| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags) — read at the start of a turn |
 
 ### Calendar & Meeting Tools
 | Tool | Description |

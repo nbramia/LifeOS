@@ -541,6 +541,51 @@ def test_investments_format_tolerates_null_fields():
     assert "Investment portfolio" in out2  # must not raise
 
 
+# ---------------------------------------------------------------------------
+# Turn-context tool (#591)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_turn_context_tool_curated_and_registered(openapi_spec, monkeypatch):
+    """lifeos_turn_context is a curated GET tool exposing the #591 per-turn
+    context endpoint, with a description telling clients to read it at the
+    start of a turn, and it appears on the built tool surface.
+
+    Builds the server against the in-process OpenAPI spec (this checkout's
+    code), not whatever's live on localhost:8000 — a running server may
+    still be on pre-#591 code and wouldn't have this path yet.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cfg = next((c for c in module.CURATED_ENDPOINTS.values()
+                if c["name"] == "lifeos_turn_context"), None)
+    assert cfg is not None, "lifeos_turn_context missing from CURATED_ENDPOINTS"
+    assert cfg["method"] == "GET"
+    assert len(cfg["description"].split()) <= 30
+    assert "start of" in cfg["description"].lower()
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return openapi_spec
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, *a, **k):
+            return _FakeResp()
+
+    monkeypatch.setattr(module.httpx, "Client", _FakeClient)
+    server = module.LifeOSMCPServer()
+    tool = next((t for t in server.tools if t["name"] == "lifeos_turn_context"), None)
+    assert tool is not None, "lifeos_turn_context not built onto the MCP tool surface"
+
+
 @pytest.mark.unit
 def test_investments_route_404_matches_mcp_not_synced_branch(tmp_path, monkeypatch):
     """The MCP graceful branch keys on 'not synced' in the route's 404 detail;

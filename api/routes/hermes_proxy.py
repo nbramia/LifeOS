@@ -1,4 +1,4 @@
-"""Hermes text-backend proxy (#587) + persona/modality envelope (#590).
+"""Hermes text-backend proxy (#587) + persona/modality/turn envelope (#590, #591).
 
 `/chat`'s third text backend: Hermes, an agent harness running as a gateway
 (same box or reached over the tailnet), which speaks the same `/api/ask/stream`
@@ -8,14 +8,15 @@ reaches the browser. Empty ``LIFEOS_HERMES_BACKEND_URL`` disables it entirely �
 `GET /api/hermes/status` then reports unavailable and `/chat` behaves exactly as
 it does today.
 
-Unlike the Agent backend, Hermes has no way to resolve a LifeOS persona id on
-its own, so this route resolves it here and attaches the result to the
-forwarded body as a `lifeos_context` envelope (the cross-repo contract pinned
-on issue #590) before forwarding. That means this route buffers the request
-body instead of streaming it straight through — the only place that happens
-among the text-backend proxies. The status/bearer-injection/streaming-response
-logic is otherwise shared with the Agent backend via `make_backend_router()`
-in `_proxy.py`.
+Unlike the Agent backend, Hermes has no way to resolve a LifeOS persona id or
+the current per-turn context (date/time, task tags, etc.) on its own, so this
+route resolves both here and attaches the result to the forwarded body as a
+`lifeos_context` envelope (the cross-repo contract pinned on issue #590,
+extended with a `turn` sibling by #591) before forwarding. That means this
+route buffers the request body instead of streaming it straight through — the
+only place that happens among the text-backend proxies. The status/
+bearer-injection/streaming-response logic is otherwise shared with the Agent
+backend via `make_backend_router()` in `_proxy.py`.
 """
 
 import json
@@ -33,6 +34,7 @@ from config.settings import settings  # noqa: F401
 
 from api.routes._proxy import TIMEOUT, make_backend_router
 from api.routes.chat import AskStreamRequest
+from api.services.agent_system_prompt import build_turn_context
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +119,14 @@ def _build_envelope(raw_body: bytes) -> bytes:
             # this field honest regardless.
             "orchestrates": settings.persona_orchestrates(persona_id),
         },
+        # A sibling of `persona`, never merged into it (#591) — `persona` is
+        # stable across a conversation and cacheable; `turn` changes every
+        # turn. Built by the same function the turn-context endpoint uses, so
+        # the two can't drift apart. Note: `personal_context` here resolves
+        # from `persona_id` alone, unlike the native path's Telegram-preamble
+        # reverse lookup above — Hermes turns always carry a persona_id (or
+        # default to "primary"), so that reverse lookup doesn't apply here.
+        "turn": build_turn_context(persona_id),
     }
     return json.dumps(data).encode("utf-8")
 

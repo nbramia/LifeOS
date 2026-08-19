@@ -96,6 +96,53 @@ def test_existing_tags_block_helper_returns_none_when_empty(tm):
     assert agent_system_prompt._existing_tags_block() is None
 
 
+# ---------------------------------------------------------------------------
+# build_turn_context (#591) — the per-turn context shared with the
+# turn-context endpoint and the Hermes envelope. See
+# tests/test_agent_system_prompt_golden.py for the byte-identical native
+# prompt guarantee and tests/test_turn_context_api.py / test_hermes_proxy.py
+# for the endpoint/envelope-level coverage.
+# ---------------------------------------------------------------------------
+
+def test_build_turn_context_shape(tm):
+    turn = agent_system_prompt.build_turn_context()
+    assert set(turn.keys()) == {
+        "current_datetime", "current_datetime_iso", "timezone",
+        "time_resolution_instruction", "personal_context",
+        "existing_tags", "tags_instruction",
+    }
+    assert turn["existing_tags"] == []
+    assert turn["personal_context"] == ""
+
+
+def test_build_turn_context_existing_tags_populated(tm):
+    tm.create("a", tags=["work", "urgent"])
+    turn = agent_system_prompt.build_turn_context()
+    assert {"tag": "work", "count": 1} in turn["existing_tags"]
+    assert {"tag": "urgent", "count": 1} in turn["existing_tags"]
+
+
+def test_build_turn_context_degrades_on_task_manager_failure(monkeypatch):
+    def boom():
+        raise RuntimeError("task manager unavailable")
+
+    import api.services.task_manager as tm_mod
+    monkeypatch.setattr(tm_mod, "get_task_manager", boom)
+
+    turn = agent_system_prompt.build_turn_context()
+    assert turn["existing_tags"] == []  # degraded, not raised
+
+
+def test_build_turn_context_personal_context_scoped_to_persona_id(tm, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "partner_name", "Sam")
+    monkeypatch.setattr(settings, "therapist_patterns", "Dr. A")
+
+    assert "Sam" in agent_system_prompt.build_turn_context("therapist")["personal_context"]
+    assert agent_system_prompt.build_turn_context("primary")["personal_context"] == ""
+    assert agent_system_prompt.build_turn_context(None)["personal_context"] == ""
+
+
 def test_no_persona_block_by_default(tm):
     prompt = build_system_prompt()
     assert "FITNESS-PERSONA-MARKER" not in "\n".join(_text_blocks(prompt))
