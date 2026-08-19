@@ -63,10 +63,15 @@ export function setupSwipeGestures() {
 
 export async function loadConversations() {
   try {
-    // Scope the sidebar to the selected persona (#359). Conversation detail
-    // (loadConversation / search) is fetched by id and is not persona-scoped.
+    // Scope the sidebar to the selected persona (#359) and backend (#596).
+    // Conversation detail (loadConversation / search) is fetched by id and is
+    // not persona/backend-scoped. config.backend is null for lifeos (see
+    // backend.js), so it's normalized to the "lifeos" tag the server stores.
     const personaId = config.personaId || 'primary';
-    const response = await fetch(`${endpoints.conversations}?persona_id=${encodeURIComponent(personaId)}`);
+    const backend = config.backend || 'lifeos';
+    const response = await fetch(
+      `${endpoints.conversations}?persona_id=${encodeURIComponent(personaId)}&backend=${encodeURIComponent(backend)}`
+    );
     if (response.ok) {
       const data = await response.json();
       state.allConversations = data.conversations || [];

@@ -3,9 +3,8 @@ Tests for api/routes/conversations.py
 
 Tests conversation CRUD endpoints and messaging functionality.
 """
-import json
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 from datetime import datetime
 from fastapi.testclient import TestClient
 
@@ -135,6 +134,38 @@ class TestListConversations:
         assert "T" in conv["created_at"]
 
 
+@pytest.mark.unit
+class TestListConversationsBackendParam:
+    """The optional `backend` query filter (#596)."""
+
+    def test_omitted_backend_leaves_filter_unset(self, client, mock_store):
+        # Preserves today's behavior exactly: no backend filter applied.
+        mock_store.list_conversations.return_value = []
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            client.get("/api/conversations")
+        _, kwargs = mock_store.list_conversations.call_args
+        assert kwargs["backend"] is None
+
+    def test_explicit_backend_forwarded_to_store(self, client, mock_store):
+        mock_store.list_conversations.return_value = []
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.get("/api/conversations?backend=hermes")
+        assert response.status_code == 200
+        _, kwargs = mock_store.list_conversations.call_args
+        assert kwargs["backend"] == "hermes"
+
+    def test_response_includes_backend_tag(self, client, mock_store):
+        now = datetime.now()
+        conv = Conversation(
+            id="conv-h", title="Hermes thread", created_at=now, updated_at=now,
+            message_count=0, backend="hermes",
+        )
+        mock_store.list_conversations.return_value = [conv]
+        with patch("api.routes.conversations.get_store", return_value=mock_store):
+            response = client.get("/api/conversations?backend=hermes")
+        assert response.json()["conversations"][0]["backend"] == "hermes"
+
+
 # =============================================================================
 # POST /api/conversations Tests
 # =============================================================================
@@ -174,7 +205,6 @@ class TestCreateConversation:
             )
 
         assert response.status_code == 201
-        data = response.json()
         mock_store.create_conversation.assert_called_once_with(title=None)
 
     def test_create_conversation_returns_id(self, client, mock_store, sample_conversation):
@@ -528,6 +558,36 @@ class TestAnswerInConversation:
         )
         # The answer is echoed into the conversation thread.
         mock_store.add_message.assert_called_once()
+
+    def test_answer_reaches_session_from_a_hermes_tagged_conversation(self, client, mock_store):
+        """#596: a session spawned from a Hermes-selected turn links to its
+        conversation exactly as on lifeos (test_persona_api.py's
+        test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes) — this
+        endpoint doesn't branch on `backend` at all, so the answer path must
+        work unchanged regardless of which backend tagged the thread."""
+        now = datetime.now()
+        hermes_conv = Conversation(
+            id="conv-403", title="Doctor session", created_at=now, updated_at=now,
+            message_count=1, persona_id="doctor", agent_session_id="sess_abc",
+            backend="hermes",
+        )
+        mock_store.get_conversation.return_value = hermes_conv
+        fake_session_store = MagicMock()
+        fake_session_store.deposit_answer_by_session_id.return_value = True
+
+        with patch("api.routes.conversations.get_store", return_value=mock_store), \
+             patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=fake_session_store):
+            response = client.post(
+                "/api/conversations/conv-403/answer",
+                json={"answer": "the lifeos repo"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        fake_session_store.deposit_answer_by_session_id.assert_called_once_with(
+            "sess_abc", "the lifeos repo"
+        )
 
     def test_answer_empty_is_400(self, client, mock_store):
         mock_store.get_conversation.return_value = self._linked_conversation()

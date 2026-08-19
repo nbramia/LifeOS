@@ -18,7 +18,7 @@ import {
   filterConversations, loadConversation, deleteConversation,
 } from './conversations.js';
 import { sendMessage, askQuestion } from './ask-stream.js';
-import { loadPersonas, onPersonaChange } from './persona.js';
+import { loadPersonas, onPersonaChange, personaOrchestrates, personaSupportsHandoff } from './persona.js';
 import { initVoice, toggleVoiceMode, submitTurn } from './voice.js';
 import { initBackend } from './backend.js';
 import { initModel, onModelChange } from './model.js';
@@ -68,7 +68,11 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 }
 
 // --- Bridge for the classic shell script + inline handlers ---
-window.lifeChat = { state, config, initChat };
+// personaOrchestrates/personaSupportsHandoff are exposed read-only for tests
+// (a browser-test truth table across backends, #596) — nothing in the app
+// itself needs them off this bridge; ask-stream.js/voice.js import them
+// directly as module functions.
+window.lifeChat = { state, config, initChat, personaOrchestrates, personaSupportsHandoff };
 
 Object.assign(window, {
   // thread.js

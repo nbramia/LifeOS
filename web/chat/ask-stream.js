@@ -38,11 +38,24 @@ export async function askStream({ question, conversationId, attachments, persona
   // model_override stays lifeos-only — a persona's `model` frontmatter field
   // is a no-op on the other backends.
   const proxiedAskEndpoint = { agent: endpoints.agentAsk, hermes: endpoints.hermesAsk };
-  const isLifeos = !proxiedAskEndpoint[backend];
+  // Orchestrating personas (e.g. doctor) always run on LifeOS, even with
+  // Hermes selected — the spawn path (background Claude Code session +
+  // thread linking) is LifeOS-native and has no Hermes equivalent (#596).
+  // This must be decided before the endpoint lookup below so it can override
+  // the Hermes route for exactly this case. personaOrchestrates() is already
+  // false for the agent backend, so this never diverts agent traffic.
+  const divertsToLifeos = backend === 'hermes' && personaOrchestrates();
+  const isLifeos = divertsToLifeos || !proxiedAskEndpoint[backend];
   if (backend !== 'agent' && personaId != null) body.persona_id = personaId;
   // Per-turn model picker (lifeos backend only). 'auto' is the default — omit
   // it so the request stays byte-identical for users who never touch the picker.
   if (isLifeos && model && model !== 'auto') body.model_override = model;
+  // Tag a diverted turn's newly created conversation with the backend the
+  // user actually selected, so it stays visible in the Hermes-filtered
+  // sidebar instead of vanishing into LifeOS's own thread list (#596). Only
+  // set when diverting — an ordinary lifeos turn omits it, keeping that
+  // request body byte-identical to before this change.
+  if (divertsToLifeos) body.backend = backend;
 
   const response = await fetch(isLifeos ? endpoints.ask : proxiedAskEndpoint[backend], {
     method: 'POST',

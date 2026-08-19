@@ -16,6 +16,7 @@ import http.server
 import json
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -249,6 +250,148 @@ class TestPersonaPickerAcrossBackends:
         assert hermes_ids == lifeos_ids
 
 
+class TestOrchestratingPersonaOnHermes:
+    """#596: an orchestrating persona (e.g. doctor) always runs on LifeOS,
+    even with Hermes selected — the spawn path has no Hermes equivalent, so
+    the composer diverts its turn to `/api/ask/stream` instead of the Hermes
+    proxy. A non-orchestrating persona is unaffected, and the agent backend
+    (no persona pass-through at all) is unaffected too."""
+
+    _PERSONAS = [
+        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"]},
+        {"id": "fitness", "label": "Fitness", "capabilities": []},
+        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"]},
+    ]
+
+    def test_orchestrating_persona_on_hermes_diverts_to_lifeos_endpoint(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        page.locator("#personaPicker").select_option("doctor")
+
+        page.locator("#inputField").fill("fix it")
+        with page.expect_request("**/api/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        body = json.loads(req_info.value.post_data)
+        assert body["persona_id"] == "doctor"
+        # Tagged with the backend actually selected, so the conversation this
+        # diverted turn creates stays visible in the Hermes-filtered sidebar.
+        assert body["backend"] == "hermes"
+
+    def test_non_orchestrating_persona_on_hermes_still_posts_to_proxy(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        page.locator("#personaPicker").select_option("fitness")
+
+        page.locator("#inputField").fill("log a run")
+        with page.expect_request("**/api/hermes/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        body = json.loads(req_info.value.post_data)
+        assert body["persona_id"] == "fitness"
+        # Never tagged — this turn was never diverted, so there's no LifeOS-
+        # native conversation to tag.
+        assert "backend" not in body
+
+    def test_primary_on_hermes_still_posts_to_proxy_untagged(self, page: Page, chat_base_url):
+        # Primary is the inline orchestrator's own persona, but does not spawn
+        # (settings.persona_orchestrates("primary") is False) — it must not be
+        # diverted either.
+        _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+
+        page.locator("#inputField").fill("hello")
+        with page.expect_request("**/api/hermes/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        body = json.loads(req_info.value.post_data)
+        assert "backend" not in body
+
+    def test_orchestrating_persona_on_agent_is_not_diverted(self, page: Page, chat_base_url):
+        # The agent backend has no persona pass-through at all — select doctor
+        # while lifeos (picker visible), then switch to agent; the turn must
+        # go to the agent proxy, not get diverted to lifeos.
+        _open_chat(page, chat_base_url, agent_available=True, personas=self._PERSONAS)
+        page.locator("#personaPicker").select_option("doctor")
+        page.locator("#backendAgent").click()
+        expect(page.locator("#backendAgent")).to_have_class("backend-option active")
+
+        page.locator("#inputField").fill("fix it")
+        with page.expect_request("**/api/agent/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        body = json.loads(req_info.value.post_data)
+        assert "persona_id" not in body  # agent backend never sends persona_id
+        assert "backend" not in body
+
+    def test_lifeos_turn_still_omits_backend_field(self, page: Page, chat_base_url):
+        # Regression guard alongside TestLifeosRequestBodyContract below: a
+        # genuine lifeos turn (not diverted) must never carry `backend`.
+        _open_chat(page, chat_base_url, hermes_available=False, personas=self._PERSONAS)
+        page.locator("#personaPicker").select_option("doctor")
+        page.locator("#inputField").fill("fix it")
+        with page.expect_request("**/api/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        assert "backend" not in json.loads(req_info.value.post_data)
+
+    def test_switching_to_hermes_keeps_orchestrating_persona_selected(self, page: Page, chat_base_url):
+        # AC: switching to Hermes while an orchestrating persona is selected
+        # keeps that persona rather than falling back to primary.
+        _open_chat(
+            page, chat_base_url, hermes_available=True, personas=self._PERSONAS,
+            session_items={"lifeos:chat:backend_mode": "lifeos"},
+        )
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+        page.locator("#personaPicker").select_option("doctor")
+
+        page.locator("#backendHermes").click()
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        assert page.locator("#personaPicker").input_value() == "doctor"
+        assert page.evaluate("window.lifeChat.config.personaId") == "doctor"
+
+    def test_orchestrates_truth_table_across_backends(self, page: Page, chat_base_url):
+        """personaOrchestrates()/personaSupportsHandoff() (#596): orchestration
+        is restored on Hermes but handoff is not — they are separate
+        mechanisms, and only orchestration has a LifeOS-side diversion to run
+        on. The agent backend gets neither (no persona pass-through)."""
+        _open_chat(
+            page, chat_base_url, agent_available=True, hermes_available=True,
+            personas=self._PERSONAS,
+            session_items={"lifeos:chat:backend_mode": "lifeos"},
+        )
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+        page.locator("#personaPicker").select_option("doctor")
+
+        def truth():
+            return page.evaluate(
+                "() => [window.lifeChat.personaOrchestrates(), window.lifeChat.personaSupportsHandoff()]"
+            )
+
+        assert truth() == [True, True]  # lifeos: doctor orchestrates AND has handoff
+
+        page.locator("#backendHermes").click()
+        assert truth() == [True, False]  # hermes: orchestration restored, handoff still not
+
+        page.locator("#backendAgent").click()
+        assert truth() == [False, False]  # agent: neither — no persona pass-through at all
+
+        page.locator("#backendLifeos").click()
+        assert truth() == [True, True]  # back to lifeos, unchanged
+
+    def test_orchestrates_badge_visible_on_lifeos_and_hermes_not_agent(self, page: Page, chat_base_url):
+        _open_chat(
+            page, chat_base_url, agent_available=True, hermes_available=True,
+            personas=self._PERSONAS, session_items={"lifeos:chat:backend_mode": "lifeos"},
+        )
+        badge = page.locator("#orchestratesBadge")
+        expect(badge).to_be_hidden()  # primary (default persona) never orchestrates
+
+        page.locator("#personaPicker").select_option("doctor")
+        expect(badge).to_be_visible()
+
+        page.locator("#backendHermes").click()
+        expect(badge).to_be_visible()  # still runs on LifeOS, regardless of backend
+
+        page.locator("#backendAgent").click()
+        expect(badge).to_be_hidden()  # agent has no persona pass-through at all
+
+
 class TestPerBackendConversationIsolation:
     """Each backend's conversation id lives under its own sessionStorage key,
     and switching backends restores the right one."""
@@ -317,3 +460,61 @@ class TestLifeosRequestBodyContract:
         assert posted_body == json.dumps(
             {"question": "hello there", "persona_id": "primary"}, separators=(",", ":")
         )
+
+
+class TestSidebarBackendFilter:
+    """#596 follow-up: the sidebar's `GET /api/conversations` request must
+    carry the selected backend, and must carry the *resolved* one — not
+    whatever config.backend happened to be before initBackend()'s async
+    default-resolution finished. Regression guard for the gap where
+    conversations.js sent only `persona_id`, so the server-side `backend`
+    filter (tested directly in tests/test_conversations.py) was never
+    actually exercised from the browser and the sidebar showed every
+    backend's threads regardless of selection."""
+
+    @staticmethod
+    def _conversations_backend_params(page: Page, base_url, **open_chat_kwargs):
+        """Opens /chat, collecting every `/api/conversations` request made
+        during load, and returns the `backend` query param from each, in
+        order. The last entry is what the sidebar ends up showing."""
+        requests = []
+        page.on(
+            "request",
+            lambda req: requests.append(parse_qs(urlparse(req.url).query).get("backend", [None])[0])
+            if "/api/conversations" in req.url and "/api/conversations/" not in req.url
+            else None,
+        )
+        _open_chat(page, base_url, **open_chat_kwargs)
+        return requests
+
+    def test_sidebar_request_carries_resolved_hermes_default(self, page: Page, chat_base_url):
+        backends = self._conversations_backend_params(page, chat_base_url, hermes_available=True)
+        assert backends, "expected at least one /api/conversations request"
+        # The final request — the one whose response the sidebar actually
+        # renders — must reflect the resolved default (hermes), not the
+        # pre-resolution lifeos assumption loadPersonas() fetched with.
+        assert backends[-1] == "hermes"
+
+    def test_sidebar_request_carries_resolved_lifeos_default(self, page: Page, chat_base_url):
+        backends = self._conversations_backend_params(page, chat_base_url, hermes_available=False)
+        assert backends, "expected at least one /api/conversations request"
+        assert backends[-1] == "lifeos"
+
+    def test_sidebar_refetches_with_new_backend_on_switch(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, agent_available=True, hermes_available=True,
+                    session_items={"lifeos:chat:backend_mode": "lifeos"})
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+
+        with page.expect_request(
+            lambda req: "/api/conversations" in req.url and "/api/conversations/" not in req.url
+        ) as req_info:
+            page.locator("#backendAgent").click()
+        params = parse_qs(urlparse(req_info.value.url).query)
+        assert params.get("backend") == ["agent"]
+
+        with page.expect_request(
+            lambda req: "/api/conversations" in req.url and "/api/conversations/" not in req.url
+        ) as req_info:
+            page.locator("#backendHermes").click()
+        params = parse_qs(urlparse(req_info.value.url).query)
+        assert params.get("backend") == ["hermes"]

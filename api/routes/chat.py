@@ -376,6 +376,13 @@ class AskStreamRequest(BaseModel):
     # prompt; None/"text" is a normal typed turn. Set by the voice gateway
     # (whisper-relay) on spoken turns; omitted for text.
     modality: Optional[str] = None
+    # Text backend the client had selected, used SOLELY to tag a newly created
+    # conversation for sidebar filtering (#596) — e.g. an orchestrating
+    # persona's turn, diverted here from a Hermes-selected composer because
+    # this handler is where its spawn path lives. Never used to route,
+    # resolve a persona, or pick a model; omitted (the default) reproduces
+    # today's tagging ("lifeos") exactly.
+    backend: Optional[str] = None
 
     @field_validator("persona")
     @classmethod
@@ -530,8 +537,14 @@ async def ask_stream(request: AskStreamRequest):
 
             if not conversation_id:
                 # Create new conversation, tagged with the selected persona so
-                # persona-scoped listing (e.g. the voice sidebar) can filter it.
-                conv = store.create_conversation(persona_id=new_conversation_persona_id)
+                # persona-scoped listing (e.g. the voice sidebar) can filter it,
+                # and with the selected backend (default "lifeos") so a turn
+                # diverted here from Hermes (#596) stays visible in the sidebar
+                # the user started it in rather than vanishing into "lifeos".
+                conv = store.create_conversation(
+                    persona_id=new_conversation_persona_id,
+                    backend=request.backend or "lifeos",
+                )
                 conversation_id = conv.id
                 # Generate title from question
                 title = generate_title(request.question)
