@@ -8,8 +8,7 @@ import os
 import sqlite3
 import tempfile
 import pytest
-from datetime import datetime, timedelta
-from unittest.mock import patch
+from datetime import datetime
 
 from api.services.conversation_store import (
     Conversation,
@@ -140,7 +139,7 @@ class TestConversationStoreInit:
 
     def test_init_creates_tables(self, temp_db):
         """Test that initialization creates required tables."""
-        store = ConversationStore(db_path=temp_db)
+        ConversationStore(db_path=temp_db)
 
         conn = sqlite3.connect(temp_db)
         cursor = conn.execute(
@@ -154,7 +153,7 @@ class TestConversationStoreInit:
 
     def test_init_creates_index(self, temp_db):
         """Test that initialization creates the messages index."""
-        store = ConversationStore(db_path=temp_db)
+        ConversationStore(db_path=temp_db)
 
         conn = sqlite3.connect(temp_db)
         cursor = conn.execute(
@@ -167,7 +166,7 @@ class TestConversationStoreInit:
 
     def test_init_idempotent(self, temp_db):
         """Test that calling init multiple times doesn't cause errors."""
-        store1 = ConversationStore(db_path=temp_db)
+        ConversationStore(db_path=temp_db)
         store2 = ConversationStore(db_path=temp_db)
 
         # Should not raise any errors
@@ -281,8 +280,8 @@ class TestListConversations:
     def test_list_ordered_by_updated_at_desc(self, store):
         """Test that conversations are ordered by updated_at descending."""
         conv1 = store.create_conversation(title="Old")
-        conv2 = store.create_conversation(title="Middle")
-        conv3 = store.create_conversation(title="New")
+        store.create_conversation(title="Middle")
+        store.create_conversation(title="New")
 
         # Add a message to conv1 to make it the most recently updated
         store.add_message(conv1.id, "user", "Update me")
@@ -312,6 +311,77 @@ class TestListConversations:
         found = next((c for c in result if c.id == conv.id), None)
         assert found is not None
         assert found.message_count == 2
+
+
+@pytest.mark.unit
+class TestConversationBackendTagging:
+    """The `backend` column (#596): a sidebar-filtering label only, never
+    used to route. Defaults to 'lifeos' — the native backend — for both a
+    fresh create and a pre-#596 database."""
+
+    def test_create_defaults_to_lifeos(self, store):
+        conv = store.create_conversation(title="t")
+        assert conv.backend == "lifeos"
+        assert store.get_conversation(conv.id).backend == "lifeos"
+
+    def test_create_with_explicit_backend(self, store):
+        conv = store.create_conversation(title="t", backend="hermes")
+        assert conv.backend == "hermes"
+        assert store.get_conversation(conv.id).backend == "hermes"
+
+    def test_list_filters_by_backend(self, store):
+        store.create_conversation(title="native", backend="lifeos")
+        store.create_conversation(title="h1", backend="hermes")
+        store.create_conversation(title="h2", backend="hermes")
+
+        lifeos = store.list_conversations(backend="lifeos")
+        hermes = store.list_conversations(backend="hermes")
+        assert {c.title for c in lifeos} == {"native"}
+        assert {c.title for c in hermes} == {"h1", "h2"}
+
+    def test_list_without_backend_filter_returns_all(self, store):
+        store.create_conversation(title="native", backend="lifeos")
+        store.create_conversation(title="h1", backend="hermes")
+        assert len(store.list_conversations()) == 2
+
+    def test_backend_and_persona_filters_combine(self, store):
+        store.create_conversation(title="a", persona_id="doctor", backend="hermes")
+        store.create_conversation(title="b", persona_id="doctor", backend="lifeos")
+        store.create_conversation(title="c", persona_id="primary", backend="hermes")
+
+        result = store.list_conversations(persona_id="doctor", backend="hermes")
+        assert {c.title for c in result} == {"a"}
+
+    def test_migration_backfills_existing_rows_to_lifeos(self):
+        # A pre-#596 conversations table (no backend column) must migrate and
+        # backfill existing rows to 'lifeos', idempotently across restarts.
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+                "persona_id TEXT NOT NULL DEFAULT 'primary', "
+                "created_at TIMESTAMP, updated_at TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) "
+                "VALUES ('old', 'legacy', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+            conn.close()
+
+            store = ConversationStore(db_path=path)  # triggers migration
+            conv = store.get_conversation("old")
+            assert conv is not None
+            assert conv.backend == "lifeos"
+
+            # Re-initializing (a second startup) must be a no-op, not an error.
+            store2 = ConversationStore(db_path=path)
+            assert store2.get_conversation("old").backend == "lifeos"
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 @pytest.mark.unit

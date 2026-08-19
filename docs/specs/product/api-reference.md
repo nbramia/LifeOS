@@ -64,6 +64,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 - `persona_id` (optional) — selects a chat persona by id (see [`GET /api/personas`](#get-apipersonas)). The server applies the same system-prompt preamble the matching Telegram bot uses. Unknown ids return **400**. Omit it for the default (`primary`) persona. A new conversation created in this call is tagged with the persona so it can be filtered later (see [`GET /api/conversations`](#get-apiconversations)).
 - `persona` (optional, internal) — raw preamble text used by the in-process Telegram client. Mutually exclusive with `persona_id` (sending both returns **400**); HTTP clients should use `persona_id`.
 - `model_override` (optional) — pins the model for **this turn**. `"sonnet"` / `"opus"` (or a full model id) run the turn on that cloud model; `"gemma"` / `"local"` run it on the local llama-server; `"auto"` or omitted uses the default orchestrator (Haiku) with escalation — which climbs only to non-API engines (`claude_code` / `codex` / `local`), so a cloud model is reached only by an explicit pick here or a user-directed "escalate to opus" in the message. An explicit pick takes precedence over auto-escalation. Honored on the Anthropic backend; unknown values fall back to `auto`. Drives the web chat model picker.
+- `backend` (optional) — tags a **newly created** conversation for sidebar filtering (see `?backend=` on [`GET /api/conversations`](#get-apiconversations)). This is the only thing it does: it never changes routing, model selection, or persona resolution. Omitted, it tags `"lifeos"` (today's behavior, unchanged). The web client sets it to `"hermes"` only when diverting an orchestrating persona's turn from a Hermes-selected composer to this endpoint (#596) — that persona's spawn is LifeOS-native and has no Hermes equivalent, so the turn lands here regardless of the selected backend, and this field keeps the resulting conversation visible in the Hermes-filtered sidebar rather than vanishing into the `lifeos` bucket.
 
 **Response:** Server-Sent Events stream with event types:
 
@@ -167,7 +168,7 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 
 - `POST /api/voice/turn/stream` — multipart voice turn (`audio` or `transcript`, plus `backend`, `persona_id`, `conversation_id`) → SSE turn events (`started` / `transcript` / `status_audio` / `response` / `main_audio` / `done` / `error` / `cancelled`); the `done` data is authoritative. Proxied to `LIFEOS_VOICE_GATEWAY_URL` (whisper-relay). Also `POST /api/voice/turn/{turn_id}/cancel` and `GET /api/voice/audio/{turn_id}/{clip_id}`.
 - `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI selector).
-- `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and attaches it to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}}`) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
+- `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and attaches it to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}}`) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route — that last case is a backstop, not the user path: the client diverts an orchestrating persona's turn to [`POST /api/ask/stream`](#post-apiaskstream) instead of here in the first place (#596), tagging the conversation it creates with `backend: "hermes"` so it still shows up in this backend's thread list. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
 
 See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
 
@@ -488,6 +489,7 @@ List conversations for a persona (most recent first, up to 50).
 
 **Query params:**
 - `persona_id` (optional, default `"primary"`) — scope to a persona's threads (e.g. `?persona_id=fitness`). Omitting it returns the `primary` persona's threads, preserving web-chat behavior. Persona ids come from [`GET /api/personas`](#get-apipersonas).
+- `backend` (optional, default unset) — scope to threads tagged with that backend (e.g. `?backend=hermes`). Unset returns threads from every backend, preserving behavior for every caller that predates this filter (#596).
 
 **Response:**
 ```json
@@ -499,13 +501,14 @@ List conversations for a persona (most recent first, up to 50).
       "created_at": "2026-06-01T12:00:00",
       "updated_at": "2026-06-01T12:05:00",
       "message_count": 4,
-      "persona_id": "primary"
+      "persona_id": "primary",
+      "backend": "lifeos"
     }
   ]
 }
 ```
 
-Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`.
+Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`. They're tagged with `backend` too (default `"lifeos"`; rows predating the column backfill to it) — see the `backend` field on [`POST /api/ask/stream`](#post-apiaskstream) above for how a thread ends up tagged `"hermes"` instead.
 
 ### POST /api/conversations
 

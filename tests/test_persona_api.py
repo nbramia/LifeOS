@@ -442,6 +442,40 @@ class TestOrchestratingPersonaSpawn:
         assert r.status_code == 200
         assert spawned.get("called")  # voice doctor spawns too (gate keys on persona_id)
 
+    def test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes(self, client, tmp_path, monkeypatch):
+        """A doctor turn sent with `backend: "hermes"` (the client diverting an
+        orchestrating persona's Hermes-selected turn to this LifeOS endpoint,
+        #596) spawns exactly as it does natively, and the conversation it
+        creates is tagged "hermes" so it stays in the sidebar the user started
+        it in — not silently reclassified as a lifeos thread."""
+        import re
+        import api.services.agent_worker.claude_code_spawn as ccs
+        self._doctor_registry(tmp_path, monkeypatch)
+        spawned: dict = {}
+
+        def fake_spawn(store, prompt, **kw):
+            spawned["called"] = True
+            return {"ok": True, "session_id": "sess_hermes123"}
+
+        monkeypatch.setattr(ccs, "spawn_claude_code_session", fake_spawn)
+        monkeypatch.setattr("api.services.agent_worker.session_store.SessionStore", lambda *a, **k: object())
+
+        r = client.post(
+            "/api/ask/stream",
+            json={"question": "lifeos is broken", "persona_id": "doctor", "backend": "hermes"},
+        )
+        assert r.status_code == 200
+        assert spawned.get("called")  # the spawn path fires exactly as on lifeos
+
+        m = re.search(r'"conversation_id": "([^"]+)"', r.text)
+        assert m
+        from api.services.conversation_store import ConversationStore
+        store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+        conv = store.get_conversation(m.group(1))
+        assert conv.backend == "hermes"
+        assert conv.persona_id == "doctor"
+        assert conv.agent_session_id == "sess_hermes123"  # answer path still linked
+
     def test_doctor_spawn_failure_acks_gracefully(self, client, tmp_path, monkeypatch):
         import api.services.agent_worker.claude_code_spawn as ccs
         self._doctor_registry(tmp_path, monkeypatch)

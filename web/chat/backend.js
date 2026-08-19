@@ -19,7 +19,8 @@
 // turn, via the same state.isLoading gate sendMessage() already respects.
 
 import { state, config, elements, endpoints } from './session.js';
-import { newChat, loadConversation } from './conversations.js';
+import { newChat, loadConversation, loadConversations } from './conversations.js';
+import { updateOrchestratesBadge } from './persona.js';
 
 const BACKEND_MODE_KEY = 'lifeos:chat:backend_mode';
 const BACKEND_MODES = ['lifeos', 'agent', 'hermes'];
@@ -79,6 +80,10 @@ function applyBackendUi() {
   if (elements.backendLifeos) elements.backendLifeos.classList.toggle('active', mode === 'lifeos');
   if (elements.backendAgent) elements.backendAgent.classList.toggle('active', mode === 'agent');
   if (elements.backendHermes) elements.backendHermes.classList.toggle('active', mode === 'hermes');
+  // personaOrchestrates() depends on the backend (excludes agent), so the
+  // "runs on LifeOS" badge (#596) must be re-evaluated on every backend switch,
+  // not just on persona change.
+  updateOrchestratesBadge();
 }
 
 function setBackendMode(mode) {
@@ -159,6 +164,14 @@ export async function initBackend() {
   if (elements.backendAgent) elements.backendAgent.addEventListener('click', () => setBackendMode('agent'));
   if (elements.backendHermes) elements.backendHermes.addEventListener('click', () => setBackendMode('hermes'));
   applyBackendUi();
+
+  // loadPersonas() (main.js) already loaded the sidebar once, in parallel with
+  // this async availability check, so it filtered by whatever config.backend
+  // was at that moment — null/lifeos, since this function hadn't resolved the
+  // real default yet. Now that config.backend reflects the resolved mode
+  // (stored preference or the hermes-if-available default), refresh so the
+  // sidebar isn't stuck showing the wrong backend's threads on first paint (#596).
+  loadConversations();
 
   // Restore the current backend's conversation id (continuity across refresh).
   state.currentConversationId = getStoredConversationId();

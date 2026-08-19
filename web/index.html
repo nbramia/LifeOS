@@ -510,6 +510,23 @@
         .routing-source.attachment { border-color: #9c27b0; color: #9c27b0; }
         .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
 
+        /* "Runs on LifeOS" toolbar badge (#596): shown whenever the selected
+           persona orchestrates (spawns a background Claude Code session),
+           regardless of which text backend is selected — that spawn path has
+           no Hermes/Agent equivalent, so the turn always lands on LifeOS. */
+        .orchestrates-badge:not([hidden]) {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0.5rem;
+            font-size: 0.72rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
         .message-actions {
             position: absolute;
             top: 0.5rem;
@@ -2830,6 +2847,7 @@
         <!-- Top-of-chat selector toolbar (#361 UI): persona + routing + backend -->
         <div class="chat-toolbar">
             <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
+            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona always runs on the LifeOS backend, no matter which backend is selected">⚙️ Runs on LifeOS</span>
             <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
                 <option value="auto">🤖 Auto</option>
                 <option value="sonnet">Sonnet</option>
@@ -3123,6 +3141,7 @@
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
                     personaPicker: document.getElementById('personaPicker'),
+                    orchestratesBadge: document.getElementById('orchestratesBadge'),
                     modelPicker: document.getElementById('modelPicker'),
                     voiceTalkBtn: document.getElementById('voiceTalkBtn'),
                     voiceCancelBtn: document.getElementById('voiceCancelBtn'),

@@ -6,6 +6,8 @@ P2.1/P2.2 Acceptance Criteria:
 - Save to vault creates proper note structure
 - Empty requests return 400 errors
 """
+import json
+
 import pytest
 from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
@@ -103,6 +105,88 @@ class TestAskStreamEndpoint:
         # inline answer is synthesized.
         assert '"type": "content"' not in body
         mock_classify.assert_not_called()
+
+
+class TestBackendTaggingField:
+    """AskStreamRequest.backend (#596): tags a newly created conversation's
+    sidebar-filtering label ONLY — never routing, model selection, or persona
+    resolution. Omitted reproduces today's tagging ("lifeos") exactly."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    @staticmethod
+    def _ask(client, extra_body=None):
+        body = {"question": "hello there"}
+        if extra_body:
+            body.update(extra_body)
+        with patch('api.routes.chat.VectorStore') as mock_vs, \
+                patch('api.routes.chat.get_synthesizer') as mock_synth:
+            mock_vs.return_value.search.return_value = []
+
+            async def mock_stream(*args, **kwargs):
+                yield "Test response"
+            mock_synth.return_value.stream_response = mock_stream
+
+            response = client.post("/api/ask/stream", json=body)
+        return response
+
+    @staticmethod
+    def _conversation_id(response_text):
+        import re
+        m = re.search(r'"conversation_id": "([^"]+)"', response_text)
+        assert m, f"no conversation_id event in: {response_text!r}"
+        return m.group(1)
+
+    def _conversation(self, tmp_path, conv_id):
+        from api.services.conversation_store import ConversationStore
+        store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+        conv = store.get_conversation(conv_id)
+        assert conv is not None
+        return conv
+
+    def test_omitted_backend_tags_conversation_lifeos(self, client, tmp_path):
+        response = self._ask(client)
+        assert response.status_code == 200
+        conv = self._conversation(tmp_path, self._conversation_id(response.text))
+        assert conv.backend == "lifeos"
+
+    def test_explicit_backend_tags_conversation(self, client, tmp_path):
+        response = self._ask(client, {"backend": "hermes"})
+        assert response.status_code == 200
+        conv = self._conversation(tmp_path, self._conversation_id(response.text))
+        assert conv.backend == "hermes"
+
+    @staticmethod
+    def _events(response_text, *, drop_types=("conversation_id", "perf_trace")):
+        """Parsed SSE `data:` events, dropping per-request-instance noise
+        (the minted conversation id, and perf-trace timings that are never
+        deterministic) so two otherwise-equivalent turns compare equal."""
+        events = []
+        for line in response_text.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            data = json.loads(line[len("data: "):])
+            if data.get("type") not in drop_types:
+                events.append(data)
+        return events
+
+    def test_backend_field_does_not_alter_response_or_persona(self, client, tmp_path):
+        """Same question, same persona (default primary) — only the `backend`
+        field differs. The response's content/routing/persona resolution must
+        be identical; only the tag on the (different) created conversation
+        should differ."""
+        plain = self._ask(client)
+        tagged = self._ask(client, {"backend": "hermes"})
+
+        assert self._events(plain.text) == self._events(tagged.text)
+
+        plain_conv = self._conversation(tmp_path, self._conversation_id(plain.text))
+        tagged_conv = self._conversation(tmp_path, self._conversation_id(tagged.text))
+        assert plain_conv.persona_id == tagged_conv.persona_id == "primary"
+        assert plain_conv.backend == "lifeos"
+        assert tagged_conv.backend == "hermes"
 
 
 class TestChatRequestValidation:

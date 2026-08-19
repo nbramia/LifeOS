@@ -91,6 +91,8 @@ Each spoken response bubble is also **tap-to-replay** — tap it to hear the rep
 
 When Hermes is configured and there's no stored backend preference yet, `/chat` defaults to it (falling back to LifeOS if the availability check fails or times out); an explicit choice — including LifeOS — always wins over that default.
 
+An **orchestrating** persona (below) stays selectable on Hermes and keeps working there — its turn is diverted client-side to the LifeOS endpoint rather than sent to the Hermes proxy, since the spawn it triggers is LifeOS-only (#596). That diversion is **text-only**: a voice turn for an orchestrating persona still follows the limitation described next, regardless of which backend is selected.
+
 Like the voice vars, these live in `config/settings.py` and are not in `.env.example`.
 
 ## Known limitation: orchestrating personas don't stream back into voice
