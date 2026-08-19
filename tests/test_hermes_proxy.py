@@ -10,6 +10,7 @@ the proxy's httpx client through an in-process stub backend via ASGITransport
 import base64
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from api.routes import hermes_proxy as hp
 from api.services.conversation_store import ConversationStore
+from api.services.usage_store import UsageStore
 
 pytestmark = pytest.mark.unit
 
@@ -464,6 +466,16 @@ def hermes_store(tmp_path, monkeypatch):
     return store
 
 
+@pytest.fixture
+def usage_store(tmp_path, monkeypatch):
+    """A real UsageStore on a throwaway db, wired in place of the singleton
+    `get_usage_store()` hermes_proxy imports (#595) — same pattern as
+    `hermes_store` above."""
+    store = UsageStore(db_path=str(tmp_path / "usage.db"))
+    monkeypatch.setattr(hp, "get_usage_store", lambda: store)
+    return store
+
+
 stub_hermes_persist = FastAPI()
 
 # Two "content" frames deliberately split across the yielded chunk boundary
@@ -778,6 +790,199 @@ async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, herm
     ]
 
 
+# ---------------------------------------------------------------------------
+# Usage capture (#595) — the same read-only tee that persists a Hermes turn
+# (#592, above) also captures its `usage` event, if any, and writes a usage
+# row on `finalize()`. The relay's byte-identity guarantee applies equally
+# here: capturing usage is observation, never a rewrite of what the browser
+# receives.
+# ---------------------------------------------------------------------------
+
+stub_hermes_usage = FastAPI()
+
+# cost_usd (0.00087) is deliberately *not* what Anthropic sonnet-fallback
+# pricing (api/services/cost_tracker.py's MODEL_PRICING, the price any
+# non-haiku/opus model falls through to) would compute for these same token
+# counts: (120/1e6)*3.0 + (340/1e6)*15.0 = 0.00546. Recording the wrong,
+# upstream-reported number rather than that recomputed one is exactly the
+# behavior under test — proof the store isn't quietly recalculating it.
+_USAGE_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "usage-conv-1"}\n\n',
+    b'data: {"type": "content", "content": "here is your answer"}\n\n',
+    b'data: {"type": "usage", "model": "deepseek-v3-fireworks", '
+    b'"input_tokens": 120, "output_tokens": 340, "cost_usd": 0.00087}\n\n',
+    b'data: {"type": "done"}\n\n',
+]
+
+
+@stub_hermes_usage.post("/api/ask/stream")
+async def _stub_usage_ask(request: Request):
+    async def gen():
+        for chunk in _USAGE_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@pytest.fixture
+def usage_proxy_client(monkeypatch, hermes_store, usage_store):
+    def _stub_client():
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_usage), base_url="http://hermes"
+        )
+
+    monkeypatch.setattr(hp, "_client", _stub_client)
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_usage_event_writes_a_row_with_verbatim_cost(usage_proxy_client, usage_store):
+    resp = await usage_proxy_client.post("/api/hermes/ask/stream", json={"question": "what's 2+2?"})
+    assert resp.status_code == 200
+    # Byte-identical relay even though this same pass captures usage.
+    assert resp.content == b"".join(_USAGE_SSE_CHUNKS)
+
+    with sqlite3.connect(usage_store.db_path) as conn:
+        row = conn.execute(
+            "SELECT model, input_tokens, output_tokens, cost_usd, conversation_id FROM usage"
+        ).fetchone()
+    assert row is not None
+    model, input_tokens, output_tokens, cost_usd, conversation_id = row
+    assert model == "deepseek-v3-fireworks"
+    assert input_tokens == 120
+    assert output_tokens == 340
+    # Verbatim, not the ~0.00546 sonnet-fallback recompute — see the chunk
+    # comment above.
+    assert cost_usd == pytest.approx(0.00087)
+    assert conversation_id == "usage-conv-1"
+
+
+stub_hermes_usage_no_cost = FastAPI()
+
+_USAGE_NO_COST_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "usage-conv-2"}\n\n',
+    b'data: {"type": "content", "content": "answer"}\n\n',
+    b'data: {"type": "usage", "model": "some-model", "input_tokens": 10, "output_tokens": 5}\n\n',
+    b'data: {"type": "done"}\n\n',
+]
+
+
+@stub_hermes_usage_no_cost.post("/api/ask/stream")
+async def _stub_usage_no_cost_ask(request: Request):
+    async def gen():
+        for chunk in _USAGE_NO_COST_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def test_usage_event_without_cost_records_zero(monkeypatch, hermes_store, usage_store):
+    monkeypatch.setattr(
+        hp, "_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_usage_no_cost), base_url="http://hermes"
+        ),
+    )
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post("/api/hermes/ask/stream", json={"question": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_USAGE_NO_COST_SSE_CHUNKS)
+
+    stats = usage_store.get_usage_stats()
+    assert stats["request_count"] == 1
+    assert stats["total_input_tokens"] == 10
+    assert stats["total_output_tokens"] == 5
+    assert stats["total_cost"] == 0.0
+
+
+stub_hermes_malformed_usage = FastAPI()
+
+# Missing "model" -- partial, must be ignored rather than raised, and must
+# not stop the (otherwise complete) turn from streaming and persisting.
+_MALFORMED_USAGE_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "usage-conv-3"}\n\n',
+    b'data: {"type": "content", "content": "answer"}\n\n',
+    b'data: {"type": "usage", "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01}\n\n',
+    b'data: {"type": "done"}\n\n',
+]
+
+
+@stub_hermes_malformed_usage.post("/api/ask/stream")
+async def _stub_malformed_usage_ask(request: Request):
+    async def gen():
+        for chunk in _MALFORMED_USAGE_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def test_malformed_usage_event_is_ignored_and_does_not_interrupt_the_relay(
+    monkeypatch, hermes_store, usage_store,
+):
+    monkeypatch.setattr(
+        hp, "_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_malformed_usage), base_url="http://hermes"
+        ),
+    )
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post("/api/hermes/ask/stream", json={"question": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_MALFORMED_USAGE_SSE_CHUNKS)
+
+    # No usage row -- the malformed event was dropped, not recorded.
+    assert usage_store.get_usage_stats()["request_count"] == 0
+    # The turn itself still completed and persisted normally.
+    messages = hermes_store.get_messages("usage-conv-3")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "hi"),
+        ("assistant", "answer"),
+    ]
+
+
+async def test_no_usage_event_writes_no_row_and_turn_completes_normally(
+    persist_proxy_client, hermes_store, usage_store,
+):
+    """_PERSIST_SSE_CHUNKS (above) carries no `usage` event at all."""
+    resp = await persist_proxy_client.post("/api/hermes/ask/stream", json={"question": "hi there"})
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_PERSIST_SSE_CHUNKS)
+    assert usage_store.get_usage_stats()["request_count"] == 0
+    # Conversation persistence (#592) is unaffected by usage capture.
+    assert hermes_store.get_conversation("hermes-conv-1") is not None
+
+
+async def test_usage_store_failure_is_logged_and_never_breaks_the_relay(
+    usage_proxy_client, monkeypatch, caplog,
+):
+    def _boom():
+        raise RuntimeError("usage db exploded")
+
+    monkeypatch.setattr(hp, "get_usage_store", _boom)
+    with caplog.at_level(logging.WARNING, logger="api.routes.hermes_proxy"):
+        resp = await usage_proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_USAGE_SSE_CHUNKS)
+    assert "hermes turn persistence" in caplog.text
+
+
 class TestHermesTurnPersisterDirect:
     """Direct, non-HTTP tests of `_HermesTurnPersister` — the SSE frame
     reassembly and store-write logic in isolation from the transport."""
@@ -879,6 +1084,90 @@ class TestHermesTurnPersisterDirect:
         # No row under either the truncated id or the verbatim one.
         assert hermes_store.get_conversation(overlong[:hp._MAX_CONVERSATION_ID_LEN]) is None
         assert hermes_store.get_conversation(overlong) is None
+
+    def test_observe_never_calls_the_usage_store(self, monkeypatch, hermes_store):
+        """Same structural guarantee as `test_observe_never_calls_the_store`
+        above (#592 review), extended to usage capture (#595): `observe()`
+        must only reassemble frames and buffer the parsed usage fields in
+        memory. Every usage-store call belongs in `finalize()`."""
+        calls = []
+
+        class _TrackingUsageStore:
+            def record_usage(self, **kw):
+                calls.append(("record_usage", kw))
+
+        monkeypatch.setattr(hp, "get_usage_store", lambda: _TrackingUsageStore())
+
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(b'data: {"type": "conversation_id", "conversation_id": "usage-track-1"}\n\n')
+        persister.observe(
+            b'data: {"type": "usage", "model": "m", "input_tokens": 1, '
+            b'"output_tokens": 2, "cost_usd": 0.01}\n\n'
+        )
+
+        # Still mid-stream: nothing written to the usage store yet.
+        assert calls == []
+
+        persister.finalize()
+
+        assert calls == [
+            ("record_usage", {
+                "model": "m", "input_tokens": 1, "output_tokens": 2,
+                "cost_usd": 0.01, "conversation_id": "usage-track-1",
+            }),
+        ]
+
+    def test_usage_event_missing_model_is_ignored(self, hermes_store, usage_store):
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(
+            b'data: {"type": "usage", "input_tokens": 1, "output_tokens": 2, "cost_usd": 0.01}\n\n'
+        )
+        persister.finalize()
+        assert usage_store.get_usage_stats()["request_count"] == 0
+
+    def test_usage_event_with_non_int_tokens_is_ignored(self, hermes_store, usage_store):
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(
+            b'data: {"type": "usage", "model": "m", "input_tokens": "lots", "output_tokens": 2}\n\n'
+        )
+        persister.finalize()
+        assert usage_store.get_usage_stats()["request_count"] == 0
+
+    def test_a_malformed_usage_event_does_not_shadow_a_later_valid_one(self, hermes_store, usage_store):
+        """Unlike `conversation_id` (recorded "once" regardless of
+        validity), a malformed `usage` event must not permanently block
+        capture — only a successfully validated one sets
+        `_usage_captured`."""
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(b'data: {"type": "usage", "input_tokens": 1, "output_tokens": 2}\n\n')
+        persister.observe(
+            b'data: {"type": "usage", "model": "m", "input_tokens": 10, '
+            b'"output_tokens": 20, "cost_usd": 0.5}\n\n'
+        )
+        persister.finalize()
+
+        stats = usage_store.get_usage_stats()
+        assert stats["request_count"] == 1
+        assert stats["total_input_tokens"] == 10
+        assert stats["total_output_tokens"] == 20
+        assert stats["total_cost"] == pytest.approx(0.5)
+
+    def test_usage_recorded_even_without_a_conversation_id(self, hermes_store, usage_store):
+        """Conversation persistence and usage persistence are independent
+        (#595) -- a usage event with no preceding `conversation_id` still
+        gets recorded, with a null conversation id, rather than being
+        dropped because there's nothing to attach a conversation row to."""
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(
+            b'data: {"type": "usage", "model": "m", "input_tokens": 1, '
+            b'"output_tokens": 2, "cost_usd": 0.001}\n\n'
+        )
+        persister.finalize()
+
+        assert hermes_store.list_conversations() == []
+        stats = usage_store.get_usage_stats()
+        assert stats["request_count"] == 1
+        assert stats["total_cost"] == pytest.approx(0.001)
 
 
 class TestMakePersister:
