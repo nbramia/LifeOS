@@ -180,6 +180,38 @@ ssh <user>@<server-ip> "cd ~/Code/LifeOS && \
 
 Test queries and expected results are defined in `BENCHMARK_QUERIES` within the test file. Personal data can be overridden via `tests/fixtures/benchmark_config.json` (gitignored).
 
+## Golden/Snapshot Fixtures
+
+Several modules cache a config-derived value in a module-level constant at
+import time (e.g. `agent_system_prompt._STATIC_PROMPT`, which interpolates
+`settings.user_name` once, on first import, and is never recomputed). A
+golden/snapshot fixture that captures one of these must pin every
+config-derived input it depends on to an explicit, synthetic value chosen
+before capture -- never whatever a live machine's real `.env` happens to
+contain. Two enforced reasons:
+
+1. **Determinism across test ordering.** Because the constant is cached at
+   first import, whichever test triggers that import first (an accident of
+   `pytest -n N --dist loadscope` work distribution, not something a test
+   controls) decides the value for the rest of that worker process. Pinning
+   removes the dependency on import order entirely.
+2. **Privacy.** This is an open-source repo; a fixture captured against a
+   real `.env` bakes the operator's real personal data into a committed
+   file. `tests/test_fixtures_no_personal_data.py` scans committed fixtures
+   for known identity-sensitive settings values whenever a real `.env` is
+   actually reachable, but is a backstop, not a substitute for pinning at
+   capture time.
+
+`tests/fixtures/agent_system_prompt_golden_591.py` is the reference example:
+its module docstring documents exactly which inputs are pinned, why each one
+matters, and the recapture recipe (pin env vars before importing anything
+from this repo, then capture against the pre-change code). Follow that
+pattern for any new golden/snapshot fixture. See #598 for the underlying
+defect this guards against -- `api/main.py`'s `load_dotenv()` now loads an
+explicit repo-root path rather than searching upward, which is the primary
+fix, but pinning at capture time remains the standard for any fixture that
+touches config-derived output.
+
 ## Singleton Reset
 
 The `reset_singletons_after_test` autouse fixture (in `conftest.py`) calls `tests/reset_singletons.py` after every test to clear cached service instances. This prevents state leakage between tests. ML singletons (embedding model) are only reset once at session end to avoid expensive reloads.
