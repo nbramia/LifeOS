@@ -134,30 +134,83 @@ _STATIC_PROMPT = _STATIC_PROMPT_TEMPLATE.format(
 )
 
 
-def _existing_tags_block() -> str | None:
-    """Build a dynamic block listing existing task tags so the assistant can reuse them.
+# The relative-time-resolution instruction, verbatim in both the native prompt
+# and the exported turn context (#591) — the pinned cross-repo schema on #590
+# quotes this exact string as `turn.time_resolution_instruction`.
+TIME_RESOLUTION_INSTRUCTION = (
+    "When the user asks for something time-relative ('recent', 'lately', "
+    "'last week', 'this month', 'past few days'), resolve it against the "
+    "current date above into a concrete YYYY-MM-DD range and pass it as "
+    "date_from/date_to to lifeos_search or lifeos_ask (and the equivalent "
+    "after/before on email, message, and calendar tools). Prefer the most "
+    "recent matches, and treat results more than a few months old as stale "
+    "for a 'recent' query unless nothing newer exists."
+)
 
-    Returns None if there are no tags or the task manager isn't reachable.
+# The existing-tags instruction, verbatim in both the native prompt and the
+# exported turn context (#591), as `turn.tags_instruction`.
+TAGS_INSTRUCTION = (
+    "When the user asks to tag a task, prefer an existing tag if it clearly "
+    "matches the user's intent semantically — including casing and hyphenation. "
+    "Only create a new tag when none of the existing tags fits. If the user "
+    "explicitly names a tag that differs from any existing one (e.g. asks for "
+    "'the ai tag' when only 'ai-agent-tag' exists), follow the user's wording "
+    "rather than collapsing to a similar existing tag."
+)
+
+
+def _get_existing_tags() -> list[dict]:
+    """Existing task tags with usage counts, shared by the native prompt, the
+    turn-context endpoint, and the Hermes envelope (#591).
+
+    Returns [] if there are no tags or the task manager isn't reachable, so a
+    caller can render an empty list as a normal degraded case rather than an
+    error.
     """
     try:
         from api.services.task_manager import get_task_manager
         rows = get_task_manager().list_tags()
     except Exception as e:
-        logger.debug(f"Skipping task tags in system prompt: {e}")
-        return None
+        logger.debug(f"Skipping task tags in turn context: {e}")
+        return []
+    return [{"tag": row["tag"], "count": row["count"]} for row in rows]
+
+
+def _existing_tags_block() -> str | None:
+    """Build a dynamic block listing existing task tags so the assistant can reuse them.
+
+    Returns None if there are no tags or the task manager isn't reachable.
+    """
+    rows = _get_existing_tags()
     if not rows:
         return None
     lines = ", ".join(f"{row['tag']} ({row['count']})" for row in rows)
-    return (
-        "Existing task tags (with usage counts): "
-        f"{lines}.\n"
-        "When the user asks to tag a task, prefer an existing tag if it clearly "
-        "matches the user's intent semantically — including casing and hyphenation. "
-        "Only create a new tag when none of the existing tags fits. If the user "
-        "explicitly names a tag that differs from any existing one (e.g. asks for "
-        "'the ai tag' when only 'ai-agent-tag' exists), follow the user's wording "
-        "rather than collapsing to a similar existing tag."
-    )
+    return f"Existing task tags (with usage counts): {lines}.\n{TAGS_INSTRUCTION}"
+
+
+def build_turn_context(persona_id: str | None = None) -> dict:
+    """Build the per-turn context shared by the turn-context endpoint, the
+    Hermes upstream envelope, and (via its constituent pieces) the native
+    system prompt (#591).
+
+    Read-only: makes no writes. Degrades gracefully — an unreachable task
+    manager yields an empty ``existing_tags`` list rather than raising.
+
+    Returns a JSON-serializable dict with the literal keys pinned by the
+    `lifeos_context` cross-repo contract (#590): ``current_datetime``,
+    ``current_datetime_iso``, ``timezone``, ``time_resolution_instruction``,
+    ``personal_context``, ``existing_tags``, ``tags_instruction``.
+    """
+    now = datetime.now(ZoneInfo(settings.timezone))
+    return {
+        "current_datetime": now.strftime("%A, %B %d, %Y at %I:%M %p %Z"),
+        "current_datetime_iso": now.isoformat(),
+        "timezone": settings.timezone,
+        "time_resolution_instruction": TIME_RESOLUTION_INSTRUCTION,
+        "personal_context": settings.personal_context(persona_id or ""),
+        "existing_tags": _get_existing_tags(),
+        "tags_instruction": TAGS_INSTRUCTION,
+    }
 
 
 def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5,
@@ -176,6 +229,10 @@ def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5,
             never drift, and the cached prefix stays byte-stable regardless.
         voice_rules: The selected persona's spoken-response rules; appended as an
             uncached block only on voice turns (empty tuple = a text turn).
+        personal_context: Already resolved by the caller (it needs the raw
+            Telegram-preamble reverse lookup `build_turn_context` doesn't do —
+            see api/routes/chat.py), so it's taken as-is rather than re-derived
+            here from a persona id.
     """
     tz = ZoneInfo(settings.timezone)
     now = datetime.now(tz)
@@ -209,13 +266,7 @@ def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5,
                 f"Current date/time: {current_dt}\nTimezone: {settings.timezone}\n"
                 f"You have {max_tool_rounds} tool rounds this turn to gather "
                 "information before you must give your final answer.\n"
-                "When the user asks for something time-relative ('recent', 'lately', "
-                "'last week', 'this month', 'past few days'), resolve it against the "
-                "current date above into a concrete YYYY-MM-DD range and pass it as "
-                "date_from/date_to to lifeos_search or lifeos_ask (and the equivalent "
-                "after/before on email, message, and calendar tools). Prefer the most "
-                "recent matches, and treat results more than a few months old as stale "
-                "for a 'recent' query unless nothing newer exists."
+                + TIME_RESOLUTION_INSTRUCTION
             ),
         }
     )

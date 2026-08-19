@@ -32,6 +32,7 @@ from api.services.time_parser import (
 from config.settings import settings
 from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
+from api.services.agent_system_prompt import build_turn_context
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,46 @@ async def chat_config():
         "default_voice": bool(settings.chat_default_voice),
         "secure_url": (settings.tailnet_https_url or "").rstrip("/"),
     }
+
+
+class TagCount(BaseModel):
+    """A task tag with its usage count."""
+    tag: str
+    count: int
+
+
+class TurnContextResponse(BaseModel):
+    """Response for the per-turn context endpoint (#591)."""
+    current_datetime: str
+    current_datetime_iso: str
+    timezone: str
+    time_resolution_instruction: str
+    personal_context: str
+    existing_tags: list[TagCount]
+    tags_instruction: str
+
+
+@router.get("/chat/turn-context", response_model=TurnContextResponse)
+async def turn_context(persona_id: str = "primary", modality: str = "text"):
+    """Read-only per-turn context: current date/time, timezone, the
+    relative-time-resolution instruction, the persona-scoped personal-context
+    block, and existing task tags with usage counts.
+
+    This is the same computation `build_system_prompt` folds into the native
+    system prompt, exported as structured JSON (no Anthropic content-block
+    dependency) so any MCP client or the Hermes backend can pull it at the
+    start of a turn without a LifeOS-specific integration (#591). It never
+    creates, mutates, or persists anything.
+
+    `modality` is accepted for shape symmetry with `/api/ask/stream` but
+    doesn't currently change any field here — voice-specific material
+    (a persona's spoken-style rules) lives in `persona`, not `turn`.
+
+    400 if `persona_id` isn't a known persona.
+    """
+    if settings.resolve_persona(persona_id) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown persona_id: {persona_id!r}")
+    return build_turn_context(persona_id)
 
 
 # Attachment configuration

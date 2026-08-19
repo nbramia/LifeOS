@@ -335,6 +335,11 @@ CURATED_ENDPOINTS = {
         "method": "DELETE",
         "path": "/api/calendar/events/{event_id}"
     },
+    "/api/chat/turn-context": {
+        "name": "lifeos_turn_context",
+        "description": "Per-turn context: current date/time, timezone, relative-time resolution guidance, persona-scoped personal context, and existing task tags. Read at the start of every turn.",
+        "method": "GET"
+    },
 }
 
 

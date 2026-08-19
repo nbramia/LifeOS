@@ -177,9 +177,10 @@ async def test_envelope_defaults_to_primary_persona(proxy_client):
     resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
-    # Pin the exact key sets, not just presence — no stray fields (e.g. a
-    # `turn` key must NOT appear; that's #591's, added as a sibling later).
-    assert set(ctx.keys()) == {"schema_version", "modality", "persona"}
+    # Pin the exact key sets, not just presence. `turn` is a sibling of
+    # `persona` added by #591 — see the `turn` sub-object tests below for its
+    # own shape and its relationship to persona.
+    assert set(ctx.keys()) == {"schema_version", "modality", "persona", "turn"}
     assert set(ctx["persona"].keys()) == {"id", "label", "preamble", "voice_rules", "orchestrates"}
     assert ctx["schema_version"] == 1
     assert ctx["modality"] == "text"
@@ -373,3 +374,70 @@ async def test_non_envelope_fields_forwarded_unchanged(proxy_client):
     expected["lifeos_context"] = forwarded.get("lifeos_context")
     assert forwarded == expected
     assert set(forwarded.keys()) == set(payload.keys()) | {"lifeos_context"}
+
+
+# ---------------------------------------------------------------------------
+# `lifeos_context.turn` (#591) — a sibling of `persona`, sharing its shape
+# and literal keys with GET /api/chat/turn-context so one parser handles
+# either source.
+# ---------------------------------------------------------------------------
+
+async def test_turn_shape_and_literal_keys(proxy_client):
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    turn = ctx["turn"]
+    # Literal keys pinned by the cross-repo schema comment on #590, exactly —
+    # not a subset check.
+    assert set(turn.keys()) == {
+        "current_datetime", "current_datetime_iso", "timezone",
+        "time_resolution_instruction", "personal_context",
+        "existing_tags", "tags_instruction",
+    }
+    assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
+    assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
+    assert isinstance(turn["timezone"], str) and turn["timezone"]
+    assert isinstance(turn["time_resolution_instruction"], str) and turn["time_resolution_instruction"]
+    assert isinstance(turn["personal_context"], str)  # may be empty
+    assert isinstance(turn["existing_tags"], list)
+    assert isinstance(turn["tags_instruction"], str) and turn["tags_instruction"]
+    # `turn` and `persona` are siblings under `lifeos_context`, never merged
+    # into one object — each key set is disjoint from the other's.
+    assert set(turn.keys()).isdisjoint(set(ctx["persona"].keys()))
+
+
+async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch):
+    """The envelope's `turn` and GET /api/chat/turn-context's body must come
+    from the same call to build_turn_context() — pinned by comparing them
+    directly rather than by re-deriving each independently, so the two
+    surfaces cannot silently diverge.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from api.services import agent_system_prompt as asp
+
+    fixed_now = datetime(2026, 8, 19, 9, 14, 22, tzinfo=ZoneInfo("America/New_York"))
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(asp, "datetime", _Frozen)
+
+    from fastapi import FastAPI as _FastAPI
+    from api.routes import chat as chat_routes
+
+    app = _FastAPI()
+    app.include_router(chat_routes.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://chat") as chat_client:
+        endpoint_resp = await chat_client.get("/api/chat/turn-context", params={"persona_id": "primary"})
+    assert endpoint_resp.status_code == 200
+    endpoint_turn = endpoint_resp.json()
+
+    hermes_resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert hermes_resp.status_code == 200
+    envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
+
+    assert envelope_turn == endpoint_turn

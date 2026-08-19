@@ -133,6 +133,31 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 - `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
 - `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`.
 
+### GET /api/chat/turn-context
+
+Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, and existing task tags with usage counts. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration (#591). Never creates, mutates, or persists anything.
+
+**Query Parameters:**
+- `persona_id` (optional, default `"primary"`) — same registry `GET /api/personas` resolves against. Unknown ids return **400**.
+- `modality` (optional, default `"text"`) — accepted for shape symmetry with [`POST /api/ask/stream`](#post-apiaskstream); no field in the response currently varies with it (voice-specific material lives in a persona's `voice_rules`, not here).
+
+**Response:**
+```json
+{
+  "current_datetime": "Wednesday, August 19, 2026 at 09:14 AM EDT",
+  "current_datetime_iso": "2026-08-19T09:14:22-04:00",
+  "timezone": "America/New_York",
+  "time_resolution_instruction": "When the user asks for something time-relative...",
+  "personal_context": "",
+  "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
+  "tags_instruction": "When the user asks to tag a task, prefer an existing tag..."
+}
+```
+
+- `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
+- `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
+- This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
+
 ### POST /api/chat/handoff
 
 Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on the SSE stream. HTTP clients call this endpoint; Telegram spawns in-process instead.
@@ -167,7 +192,7 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 
 - `POST /api/voice/turn/stream` — multipart voice turn (`audio` or `transcript`, plus `backend`, `persona_id`, `conversation_id`) → SSE turn events (`started` / `transcript` / `status_audio` / `response` / `main_audio` / `done` / `error` / `cancelled`); the `done` data is authoritative. Proxied to `LIFEOS_VOICE_GATEWAY_URL` (whisper-relay). Also `POST /api/voice/turn/{turn_id}/cancel` and `GET /api/voice/audio/{turn_id}/{clip_id}`.
 - `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI selector).
-- `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and attaches it to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}}`) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
+- `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and per-turn context and attaches them to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}, turn: {...}}`, `turn` a sibling of `persona` per [`GET /api/chat/turn-context`](#get-apichatturn-context)) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
 
 See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
 
