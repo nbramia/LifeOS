@@ -76,7 +76,7 @@ def _wait_for_backend_ready(page: Page):
 
 def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=True,
                 hermes_status_fails=False, hermes_status_hangs=False, status_timeout_ms=None,
-                session_items=None, personas=None):
+                session_items=None, personas=None, conversations=None):
     """Load `/chat` with `/api/agent/status` and `/api/hermes/status` stubbed,
     and every other `/api/` call stubbed empty so nothing depends on a running
     server. `session_items` are written to sessionStorage before any app JS
@@ -92,6 +92,12 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
     `GET /api/personas` returns, e.g. `[{"id": "doctor", "label": "Doctor"}]`)
     instead of falling through to the generic `{}` stub — needed to assert
     what `renderPersonaOptions()` does with more than the bare primary persona.
+
+    `conversations` (#592) maps a conversation id to the body `GET
+    /api/conversations/{id}` returns for it (the shape `loadConversation()`
+    expects: `{"title": ..., "messages": [{"role": ..., "content": ...}]}`)
+    — needed to assert what a backend switch renders for a stored id, instead
+    of falling through to the generic `{}` stub.
     """
     if status_timeout_ms is not None:
         page.add_init_script(
@@ -107,6 +113,7 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
 
     def handler(route):
         url = route.request.url
+        conv_id = url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
         if "/api/agent/status" in url:
             route.fulfill(status=200, content_type="application/json",
                           body=json.dumps({"available": agent_available}))
@@ -121,6 +128,9 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
         elif personas is not None and "/api/personas" in url:
             route.fulfill(status=200, content_type="application/json",
                           body=json.dumps({"personas": personas}))
+        elif conversations is not None and "/api/conversations/" in url and conv_id in conversations:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(conversations[conv_id]))
         else:
             route.fulfill(status=200, content_type="application/json", body="{}")
 
@@ -435,6 +445,59 @@ class TestPerBackendConversationIsolation:
         assert page.evaluate("window.lifeChat.state.currentConversationId") == "conv-hermes-primary"
         page.locator("#backendAgent").click()
         assert page.evaluate("window.lifeChat.state.currentConversationId") == "conv-agent-only"
+
+
+class TestHermesThreadRendering:
+    """#592: a Hermes turn is now persisted server-side like a lifeos one, so
+    switching to Hermes with a stored conversation id must render that
+    conversation's messages — not the blank view the Agent backend (whose
+    history genuinely lives elsewhere) still gets."""
+
+    def test_switching_to_hermes_renders_its_stored_conversation(self, page: Page, chat_base_url):
+        _open_chat(
+            page, chat_base_url, hermes_available=True,
+            session_items={
+                "lifeos:chat:backend_mode": "lifeos",
+                "lifeos:chat:conv:hermes:primary": "conv-hermes-1",
+            },
+            conversations={
+                "conv-hermes-1": {
+                    "title": "A hermes thread",
+                    "messages": [
+                        {"role": "user", "content": "hello from hermes"},
+                        {"role": "assistant", "content": "hi there"},
+                    ],
+                },
+            },
+        )
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+
+        page.locator("#backendHermes").click()
+        expect(page.locator("#chatTitle")).to_have_text("A hermes thread")
+        expect(page.locator("#messages")).to_contain_text("hello from hermes")
+        expect(page.locator("#messages")).to_contain_text("hi there")
+
+    def test_switching_to_agent_still_shows_a_blank_view(self, page: Page, chat_base_url):
+        # Unlike Hermes, the Agent backend's history isn't persisted here —
+        # switching to it must not attempt to render a thread.
+        _open_chat(
+            page, chat_base_url, agent_available=True, hermes_available=True,
+            session_items={
+                "lifeos:chat:backend_mode": "lifeos",
+                "lifeos:chat:conv:agent": "conv-agent-1",
+            },
+            conversations={
+                "conv-agent-1": {
+                    "title": "Should not appear",
+                    "messages": [{"role": "user", "content": "should not render"}],
+                },
+            },
+        )
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+
+        page.locator("#backendAgent").click()
+        expect(page.locator("#messages")).not_to_contain_text("should not render")
+        assert page.evaluate("window.lifeChat.state.currentConversationId") == "conv-agent-1"
 
 
 class TestLifeosRequestBodyContract:
