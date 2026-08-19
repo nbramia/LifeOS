@@ -75,7 +75,7 @@ def _wait_for_backend_ready(page: Page):
 
 def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=True,
                 hermes_status_fails=False, hermes_status_hangs=False, status_timeout_ms=None,
-                session_items=None):
+                session_items=None, personas=None):
     """Load `/chat` with `/api/agent/status` and `/api/hermes/status` stubbed,
     and every other `/api/` call stubbed empty so nothing depends on a running
     server. `session_items` are written to sessionStorage before any app JS
@@ -86,6 +86,11 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
     `status_timeout_ms` to shrink `backend.js`'s real 5s abort timeout down to
     something a test can wait out (see the `STATUS_TIMEOUT_MS` testability
     hook in backend.js).
+
+    `personas` stubs `/api/personas` with a specific persona list (the shape
+    `GET /api/personas` returns, e.g. `[{"id": "doctor", "label": "Doctor"}]`)
+    instead of falling through to the generic `{}` stub — needed to assert
+    what `renderPersonaOptions()` does with more than the bare primary persona.
     """
     if status_timeout_ms is not None:
         page.add_init_script(
@@ -112,6 +117,9 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
             else:
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"available": hermes_available}))
+        elif personas is not None and "/api/personas" in url:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"personas": personas}))
         else:
             route.fulfill(status=200, content_type="application/json", body="{}")
 
@@ -205,6 +213,40 @@ class TestBackendModeUi:
         # The click was refused — still on hermes.
         assert page.evaluate("window.lifeChat.config.backend") == "hermes"
         expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+
+
+class TestPersonaPickerAcrossBackends:
+    """AC (#590): 'The persona picker's contents shall not change based on
+    the selected backend' — every persona, orchestrating or not, stays
+    selectable on Hermes. The proxy rejects an orchestrating persona's turn
+    server-side (api/routes/hermes_proxy.py, test_orchestrating_persona_400_
+    and_not_forwarded in tests/test_hermes_proxy.py) rather than the client
+    hiding it from the picker."""
+
+    _PERSONAS = [
+        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"]},
+        {"id": "fitness", "label": "Fitness", "capabilities": []},
+        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"]},
+    ]
+
+    @staticmethod
+    def _picker_option_ids(page: Page):
+        return page.eval_on_selector_all("#personaPicker option", "opts => opts.map(o => o.value)")
+
+    def test_picker_contents_identical_on_lifeos_and_hermes(self, page: Page, chat_base_url):
+        _open_chat(page, chat_base_url, hermes_available=False, personas=self._PERSONAS)
+        expect(page.locator("#backendLifeos")).to_have_class("backend-option active")
+        lifeos_ids = self._picker_option_ids(page)
+        # Doctor (orchestrates=true) is offered on lifeos too — proves this
+        # isn't an artifact of the stub, but the actual full persona list.
+        assert lifeos_ids == ["primary", "fitness", "doctor"]
+
+        _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        hermes_ids = self._picker_option_ids(page)
+
+        # The AC under test: the picker is identical regardless of backend.
+        assert hermes_ids == lifeos_ids
 
 
 class TestPerBackendConversationIsolation:

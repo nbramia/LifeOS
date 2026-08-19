@@ -6,6 +6,7 @@ voice, agent, and hermes proxies stay in lockstep.
 """
 
 import logging
+from typing import Callable, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -35,7 +36,10 @@ def filter_headers(headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
 
-def make_backend_router(*, prefix, tag, backend_label, url_attr, token_attr, client_factory):
+def make_backend_router(
+    *, prefix, tag, backend_label, url_attr, token_attr, client_factory,
+    transform_body: Optional[Callable[[bytes], bytes]] = None,
+):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
 
     Originally the Agent proxy's own routes (`agent_proxy.py`, #361); pulled out
@@ -46,6 +50,15 @@ def make_backend_router(*, prefix, tag, backend_label, url_attr, token_attr, cli
     `client_factory` is the caller's own `_client()` seam — passed in (rather
     than imported) so each backend module keeps an independently-monkeypatchable
     `_client`.
+
+    `transform_body` (#590) lets a caller rewrite the JSON body before it's
+    forwarded — the Hermes route uses it to attach the `lifeos_context`
+    envelope. Its absence (the Agent route's default) keeps the body an
+    unbuffered `request.stream()`, exactly as before; supplying it buffers the
+    body via `request.body()` so it can be parsed, rewritten, and re-serialized.
+    It may raise `HTTPException` (e.g. a 400 for a bad persona) — that happens
+    before `client_factory()` runs, so a rejected turn never reaches the
+    backend.
     """
     router = APIRouter(prefix=prefix, tags=[tag])
 
@@ -69,10 +82,16 @@ def make_backend_router(*, prefix, tag, backend_label, url_attr, token_attr, cli
         if token:
             headers["authorization"] = f"Bearer {token}"
 
+        # Buffer + rewrite the body only when the caller asked for it (Hermes);
+        # otherwise stream straight through unbuffered (Agent), unchanged from
+        # before #590. transform_body may raise HTTPException (e.g. a bad
+        # persona) — that happens before client_factory(), so nothing is sent.
+        body = transform_body(await request.body()) if transform_body else request.stream()
+
         client = client_factory()
         try:
             upstream_req = client.build_request(
-                "POST", url, headers=headers, content=request.stream(),
+                "POST", url, headers=headers, content=body,
             )
             upstream = await client.send(upstream_req, stream=True)
         except (httpx.RequestError, httpx.InvalidURL) as exc:

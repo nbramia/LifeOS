@@ -106,8 +106,10 @@ export function onPersonaChange() {
 // not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
-  // Neither the agent nor the hermes backend has handoff; hermes keeps the
-  // persona picker visible (#587) but persona pass-through isn't wired yet.
+  // Neither the agent nor the hermes backend has handoff. Hermes now carries
+  // the full persona (preamble, voice rules) to its backend server-side via
+  // the `lifeos_context` envelope (#590), but that backend has no claude_intent
+  // classifier to hand off to — so this stays false regardless of persona.
   if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personas || personas.length === 0) return personaId === DEFAULT_PERSONA_ID;
   const p = personas.find(x => x.id === personaId);
@@ -124,7 +126,11 @@ export function personaSupportsHandoff() {
 // text path keys off (#412).
 export function personaOrchestrates() {
   const { personas, personaId } = config;
-  // Neither backend orchestrates via persona yet — see personaSupportsHandoff().
+  // [CLARIFY]/[GOAL] are LifeOS-native SSE markers; neither the agent nor the
+  // hermes backend ever emits them, so this stays false on both regardless of
+  // persona — see personaSupportsHandoff(). The server rejects an orchestrating
+  // persona sent to the hermes proxy outright (#590) rather than exposing it
+  // to this client-side poll.
   if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
   const p = personas && personas.find(x => x.id === personaId);

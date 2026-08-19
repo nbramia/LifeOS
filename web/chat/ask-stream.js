@@ -31,13 +31,15 @@ export async function askStream({ question, conversationId, attachments, persona
     }));
   }
 
-  // The agent and hermes backends have no persona/model pass-through yet and
-  // are each reached via their own proxied endpoint (bearer added server-side);
-  // lifeos sends persona_id + model_override to /api/ask/stream exactly as
-  // before (#361, #587).
+  // Both proxied backends are reached via their own endpoint (bearer added
+  // server-side). Hermes resolves persona_id server-side into the
+  // `lifeos_context` envelope (#590), so it gets persona_id exactly like
+  // lifeos does; the Agent backend still has no persona pass-through.
+  // model_override stays lifeos-only — a persona's `model` frontmatter field
+  // is a no-op on the other backends.
   const proxiedAskEndpoint = { agent: endpoints.agentAsk, hermes: endpoints.hermesAsk };
   const isLifeos = !proxiedAskEndpoint[backend];
-  if (isLifeos && personaId != null) body.persona_id = personaId;
+  if (backend !== 'agent' && personaId != null) body.persona_id = personaId;
   // Per-turn model picker (lifeos backend only). 'auto' is the default — omit
   // it so the request stays byte-identical for users who never touch the picker.
   if (isLifeos && model && model !== 'auto') body.model_override = model;

@@ -69,7 +69,37 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifecycle (Voice|Text toggle, SSE `done` data, sequential audio, cancel via `AbortController`), same-origin via the reverse proxy. Mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
-**Agent and Hermes text backends.** Both modes carry a `backend` (`lifeos` | `agent` | `hermes`). `agent` is the OpenClaw voice-adapter and `hermes` is an agent harness reached as a gateway (#587); both speak the same `/api/ask/stream` SSE contract, at `LIFEOS_AGENT_BACKEND_URL` / `LIFEOS_HERMES_BACKEND_URL` respectively, and may each require a bearer token. LifeOS proxies them at `POST /api/agent/ask/stream` and `POST /api/hermes/ask/stream`, **adding the bearer server-side** so it never reaches the browser; `GET /api/agent/status` / `GET /api/hermes/status` report whether each is configured (drives the UI selector). Both routers are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Neither backend has handoff, and persona pass-through to either is a separate follow-on — but Hermes keeps the persona picker visible in the UI (Agent hides it) while both hide the per-turn model picker.
+**Agent and Hermes text backends.** Both modes carry a `backend` (`lifeos` | `agent` | `hermes`). `agent` is the OpenClaw voice-adapter and `hermes` is an agent harness reached as a gateway (#587); both speak the same `/api/ask/stream` SSE contract, at `LIFEOS_AGENT_BACKEND_URL` / `LIFEOS_HERMES_BACKEND_URL` respectively, and may each require a bearer token. LifeOS proxies them at `POST /api/agent/ask/stream` and `POST /api/hermes/ask/stream`, **adding the bearer server-side** so it never reaches the browser; `GET /api/agent/status` / `GET /api/hermes/status` report whether each is configured (drives the UI selector). Both routers are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Neither backend has handoff. The Agent route stays a pure byte relay (`request.stream()`, unbuffered) — it has no personas at all, so the picker is hidden for it. The Hermes route keeps the picker visible and, as of #590, buffers the body to resolve the selected persona and attach it: see "The `lifeos_context` envelope" below.
+
+### The `lifeos_context` envelope (Hermes only)
+
+Because Hermes has no way to resolve a LifeOS persona id on its own, `POST /api/hermes/ask/stream` (`api/routes/hermes_proxy.py`, `_build_envelope()`) parses the JSON body, resolves `persona_id` against the same registry `resolve_persona()` / `persona_voice()` / `persona_orchestrates()` the native `/api/ask/stream` uses, and adds one top-level key, `lifeos_context`, before forwarding. Every field the browser sent is forwarded unchanged alongside it. This is a **cross-repo contract** with `nbramia/hermes`, pinned as the schema comment on issue #590 — the field names below are not suggestions.
+
+```json
+{
+  "question": "...",
+  "persona_id": "fitness",
+  "modality": "voice",
+  "lifeos_context": {
+    "schema_version": 1,
+    "modality": "voice",
+    "persona": {
+      "id": "fitness",
+      "label": "Fitness",
+      "preamble": "...",
+      "voice_rules": ["..."],
+      "orchestrates": false
+    }
+  }
+}
+```
+
+- `schema_version` is currently `1`.
+- `modality` duplicates the request's `modality` (`"voice"` or `"text"`) so the envelope is self-contained.
+- `persona.id` defaults to `primary` when the client sends no `persona_id`; `preamble` is the persona's markdown body verbatim (may be empty); `voice_rules` is populated only on voice turns, matching the `modality == "voice"` gate `ask_stream` in `api/routes/chat.py` uses for the native path; `orchestrates` is always `false` here — an orchestrating persona (`doctor`) never reaches this envelope, because the route rejects it with a 400 first (see below).
+- A sibling `turn` sub-object (auto-injected date/timezone/tag context) lands next to `persona` under the same `lifeos_context` key — added by #591, not this route. The two are never merged: `persona` is stable across a conversation, `turn` changes every turn.
+
+**Validation and rejection**, in order, before any upstream request is made: malformed JSON → 400; unknown `persona_id` → 400 naming the id; a known but *orchestrating* `persona_id` → 400 (its arrival means the client-side routing that should have sent that turn to the LifeOS endpoint instead — #596 — failed; the persona itself stays selectable on the Hermes backend, this is a routing guard, not a picker exclusion). Attachment size/type caps are enforced via the same `AskStreamRequest` model the native endpoint uses, so the limits can't drift between the two paths.
 
 Conversation ids are stored per backend in `sessionStorage` (`lifeos:chat:conv:agent`; `lifeos:chat:conv:hermes:<persona>`, persona-scoped like lifeos; and `lifeos:chat:conv:lifeos:<persona>`) so switching and refreshing continues the right thread. `web/chat/backend.js` owns the three-way selector + per-backend conversation persistence, including the default: with no stored preference, a fresh session resolves to `hermes` if its availability check succeeds, else `lifeos` — an explicit choice (including `lifeos`) always wins over that default, and a client-supplied `Authorization` header is always stripped before either proxy substitutes its own bearer.
 

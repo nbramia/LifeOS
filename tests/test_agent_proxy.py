@@ -111,6 +111,18 @@ async def test_503_when_not_configured(monkeypatch):
     assert resp.status_code == 503
 
 
+async def test_malformed_json_is_forwarded_unmodified(proxy_client):
+    # Unlike the Hermes route (#590), the Agent route has no transform_body —
+    # it stays a pure byte relay and never parses the body as JSON, so even a
+    # malformed body is forwarded as-is rather than rejected.
+    resp = await proxy_client.post(
+        "/api/agent/ask/stream", content=b"{not valid json",
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert _received["body"] == b"{not valid json"
+
+
 async def test_502_when_backend_unreachable(monkeypatch):
     class _Failing:
         def build_request(self, *a, **k):

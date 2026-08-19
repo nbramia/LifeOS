@@ -2,10 +2,12 @@
 // persistence (#361, PR-D; three-way selector added in #587).
 //
 // The composer can target three text backends: `lifeos` (the orchestrator, with
-// personas + handoff), `agent` (the OpenClaw voice-adapter), and `hermes` (an
-// agent harness) — the latter two proxied with a server-side bearer at
-// /api/agent/ask/stream and /api/hermes/ask/stream respectively (no persona, no
-// handoff wired through yet). The selection persists in sessionStorage, and
+// personas + handoff), `agent` (the OpenClaw voice-adapter, no personas), and
+// `hermes` (an agent harness, personas resolved server-side into a
+// `lifeos_context` envelope — #590) — the latter two proxied with a
+// server-side bearer at /api/agent/ask/stream and /api/hermes/ask/stream
+// respectively. Neither proxied backend has handoff wired through. The
+// selection persists in sessionStorage, and
 // each backend keeps its own conversation id (lifeos and hermes are further
 // scoped per persona) so switching back and forth — and refreshing — continues
 // the right thread.
