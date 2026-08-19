@@ -224,6 +224,32 @@ class TestCreateConversation:
         ids = {conv1.id, conv2.id, conv3.id}
         assert len(ids) == 3  # All unique
 
+    def test_create_with_caller_supplied_id_used_verbatim(self, store):
+        """#592: a caller-supplied id (the Hermes proxy adopting an
+        upstream-minted id) is used as-is, not replaced with a fresh uuid."""
+        conv = store.create_conversation(title="t", conv_id="hermes-abc-123")
+        assert conv.id == "hermes-abc-123"
+        assert store.get_conversation("hermes-abc-123") is not None
+
+    def test_create_without_conv_id_mints_uuid_as_before(self, store):
+        """Omitting conv_id keeps minting a uuid exactly as today."""
+        conv = store.create_conversation(title="t")
+        assert len(conv.id) == 36
+
+    def test_create_with_existing_id_returns_existing_not_duplicate(self, store):
+        """#592: calling create_conversation() again with an id that already
+        exists returns the existing row rather than raising or duplicating
+        it — the Hermes proxy does this on every turn of a thread it already
+        created."""
+        first = store.create_conversation(title="original", persona_id="doctor", backend="hermes", conv_id="dup-id")
+        second = store.create_conversation(title="ignored", persona_id="primary", backend="lifeos", conv_id="dup-id")
+
+        assert second.id == first.id
+        assert second.title == "original"  # untouched, not overwritten
+        assert second.persona_id == "doctor"
+        assert second.backend == "hermes"
+        assert len(store.list_conversations()) == 1  # no duplicate row
+
 
 @pytest.mark.unit
 class TestGetConversation:
@@ -590,6 +616,40 @@ class TestGetMessages:
         """Test getting messages for a non-existent conversation."""
         messages = store.get_messages("nonexistent-id")
         assert messages == []
+
+    def test_order_is_deterministic_on_a_timestamp_tie(self, store, conversation, monkeypatch):
+        """MINOR (#592 review): a user message and its assistant reply are
+        two separate add_message() calls; `created_at` alone left their
+        order undefined if `datetime.now()` ever ties between them. Freeze
+        the clock so both calls get the identical timestamp, then confirm
+        insertion order (via the added `rowid` tiebreaker) still wins."""
+        frozen = datetime(2026, 1, 1, 12, 0, 0)
+
+        class _FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen
+
+        import api.services.conversation_store as cs_module
+        monkeypatch.setattr(cs_module, "datetime", _FrozenDatetime)
+
+        store.add_message(conversation.id, "user", "tied user turn")
+        store.add_message(conversation.id, "assistant", "tied assistant turn")
+
+        messages = store.get_messages(conversation.id)
+        assert all(m.created_at == frozen for m in messages)
+        assert [(m.role, m.content) for m in messages] == [
+            ("user", "tied user turn"),
+            ("assistant", "tied assistant turn"),
+        ]
+
+        # Same tie, requested through the limit branch (ORDER BY ... DESC
+        # then reversed) — must land in the same order.
+        limited = store.get_messages(conversation.id, limit=2)
+        assert [(m.role, m.content) for m in limited] == [
+            ("user", "tied user turn"),
+            ("assistant", "tied assistant turn"),
+        ]
 
 
 @pytest.mark.unit

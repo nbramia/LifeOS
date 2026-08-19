@@ -39,6 +39,7 @@ def filter_headers(headers) -> dict:
 def make_backend_router(
     *, prefix, tag, backend_label, url_attr, token_attr, client_factory,
     transform_body: Optional[Callable[[bytes], bytes]] = None,
+    make_observer: Optional[Callable[[bytes], Optional[object]]] = None,
 ):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
 
@@ -59,6 +60,34 @@ def make_backend_router(
     It may raise `HTTPException` (e.g. a 400 for a bad persona) — that happens
     before `client_factory()` runs, so a rejected turn never reaches the
     backend.
+
+    `make_observer` (#592) is a read-only tee on the relayed response: called
+    once per request with the same raw, pre-transform body `transform_body`
+    receives, it returns either `None` (nothing to observe) or an object with
+    `observe(chunk: bytes) -> None` and `finalize() -> None`. `observe()` is
+    called with a copy of each chunk *before* that chunk is yielded to the
+    browser, and must never alter it — the chunk object handed to `yield` is
+    always the untouched original, so the browser's bytes are unaffected.
+    Calling `observe()` first (rather than after, as an earlier version of
+    this hook did) matters for an early client disconnect: closing this
+    generator raises `GeneratorExit` at the point it's currently suspended
+    (the `yield`), which skips any code written *after* that yield in the
+    same loop iteration — so a chunk already handed to the browser could be
+    lost to the tee. Observing before the yield means it's captured
+    regardless of what happens after. `observe()` itself must be
+    non-blocking and in-memory-only (the implementation's job, not this
+    contract's) — nothing here awaits it or bounds its cost, so any I/O
+    inside it would stall this relay loop, and with it every other chunk
+    still queued behind it, before the browser sees the next byte.
+    `finalize()` always runs when the relay ends, including an early client
+    disconnect, so partial content is still handed off — this is the place
+    a slower operation (e.g. a store write) belongs, since by the time it
+    runs there is no further byte left to delay. Its absence (the Agent
+    route's default) leaves the relay loop exactly as it was before this
+    parameter existed. Sharing `transform_body`'s "only buffer when actually
+    needed" gate means Hermes (which already buffers for the envelope)
+    doesn't pay for a second `request.body()` read, and Agent (neither hook
+    set) still never buffers.
     """
     router = APIRouter(prefix=prefix, tags=[tag])
 
@@ -86,7 +115,11 @@ def make_backend_router(
         # otherwise stream straight through unbuffered (Agent), unchanged from
         # before #590. transform_body may raise HTTPException (e.g. a bad
         # persona) — that happens before client_factory(), so nothing is sent.
-        body = transform_body(await request.body()) if transform_body else request.stream()
+        # make_observer (#592) shares this same raw body rather than a second
+        # request.body() read.
+        raw_body = await request.body() if (transform_body or make_observer) else None
+        body = transform_body(raw_body) if transform_body else request.stream()
+        observer = make_observer(raw_body) if make_observer else None
 
         client = client_factory()
         try:
@@ -102,8 +135,15 @@ def make_backend_router(
         async def relay():
             try:
                 async for chunk in upstream.aiter_raw():
+                    # Observe before yielding (#592 review) — see
+                    # make_backend_router's docstring for why the order
+                    # matters for an early client disconnect.
+                    if observer is not None:
+                        observer.observe(chunk)
                     yield chunk
             finally:
+                if observer is not None:
+                    observer.finalize()
                 await upstream.aclose()
                 await client.aclose()
 

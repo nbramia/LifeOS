@@ -157,6 +157,7 @@ class ConversationStore:
         title: Optional[str] = None,
         persona_id: str = "primary",
         backend: str = "lifeos",
+        conv_id: Optional[str] = None,
     ) -> Conversation:
         """
         Create a new conversation.
@@ -166,11 +167,18 @@ class ConversationStore:
             persona_id: Persona that owns the thread (default "primary")
             backend: Text backend to tag the thread with (default "lifeos"),
                 purely a sidebar-filtering label (#596) — never used to route.
+            conv_id: Optional caller-supplied id, used verbatim when given
+                (#592 — the Hermes proxy adopts the id its upstream backend
+                already minted for the thread). Omitted (the default), a
+                uuid4 is minted exactly as before. If the id already exists,
+                the existing conversation is returned rather than raising or
+                duplicating the row — the proxy calls this on every turn of a
+                thread it already created, not just the first.
 
         Returns:
-            Created conversation
+            Created conversation (or the existing one, if conv_id collided)
         """
-        conv_id = str(uuid.uuid4())
+        new_id = conv_id or str(uuid.uuid4())
         title = title or "New Conversation"
         now = datetime.now()
 
@@ -179,14 +187,20 @@ class ConversationStore:
             conn.execute(
                 "INSERT INTO conversations (id, title, persona_id, backend, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (conv_id, title, persona_id, backend, now, now)
+                (new_id, title, persona_id, backend, now, now)
             )
             conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            existing = self.get_conversation(new_id)
+            if existing is None:
+                raise
+            return existing
         finally:
             conn.close()
 
         return Conversation(
-            id=conv_id,
+            id=new_id,
             title=title,
             created_at=now,
             updated_at=now,
@@ -403,6 +417,13 @@ class ConversationStore:
 
         Returns:
             List of messages in chronological order
+
+        `created_at` alone doesn't guarantee order: a user message and its
+        assistant reply are two separate `add_message()` calls, and
+        `datetime.now()` can tie between them (#592 review). `rowid` (the
+        table's implicit insertion-order column) breaks that tie, since it
+        reflects the order rows were actually written rather than their
+        clock reading.
         """
         conn = self._connect()
         try:
@@ -413,7 +434,7 @@ class ConversationStore:
                     SELECT id, conversation_id, role, content, sources, routing, created_at
                     FROM messages
                     WHERE conversation_id = ?
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     LIMIT ?
                     """,
                     (conv_id, limit)
@@ -426,7 +447,7 @@ class ConversationStore:
                     SELECT id, conversation_id, role, content, sources, routing, created_at
                     FROM messages
                     WHERE conversation_id = ?
-                    ORDER BY created_at ASC
+                    ORDER BY created_at ASC, rowid ASC
                     """,
                     (conv_id,)
                 )

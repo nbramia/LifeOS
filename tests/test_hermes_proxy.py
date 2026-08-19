@@ -9,6 +9,7 @@ the proxy's httpx client through an in-process stub backend via ASGITransport
 
 import base64
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -17,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
 from api.routes import hermes_proxy as hp
+from api.services.conversation_store import ConversationStore
 
 pytestmark = pytest.mark.unit
 
@@ -441,3 +443,435 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
     assert envelope_turn == endpoint_turn
+
+
+# ---------------------------------------------------------------------------
+# Turn persistence (#592) — the proxy is a read-only tee on its own relay:
+# the browser gets byte-identical output, and a parallel copy is reassembled
+# from the SSE frames and written to the conversation store. `_HermesTurnPersister`
+# is exercised both directly (frame reassembly, partial-stream, dedup) and
+# through the full HTTP path (byte-exactness, persona/backend on the created
+# row, store-failure resilience).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def hermes_store(tmp_path, monkeypatch):
+    """A real ConversationStore on a throwaway db, wired in place of the
+    singleton `get_store()` hermes_proxy imports, so these tests assert real
+    rows without touching the shared conversations.db."""
+    store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    monkeypatch.setattr(hp, "get_store", lambda: store)
+    return store
+
+
+stub_hermes_persist = FastAPI()
+
+# Two "content" frames deliberately split across the yielded chunk boundary
+# (`...conte` | `nt": "world"}...`) — a chunk is a network read, not an SSE
+# frame, so the persister must reassemble it rather than assume one frame per
+# chunk. Concatenated, these are also the exact bytes the byte-identity
+# assertion below expects — a relay that reflows or re-chunks would fail it.
+_PERSIST_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "hermes-conv-1"}\n\n',
+    b'data: {"type": "content", "content": "Hello "}\n\ndata: {"type": "content", "content": "wo',
+    b'rld"}\n\n',
+    b'data: {"type": "done"}\n\n',
+]
+
+
+@stub_hermes_persist.post("/api/ask/stream")
+async def _stub_persist_ask(request: Request):
+    async def gen():
+        for chunk in _PERSIST_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@pytest.fixture
+def persist_proxy_client(monkeypatch, hermes_store):
+    def _stub_client():
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_persist), base_url="http://hermes"
+        )
+
+    monkeypatch.setattr(hp, "_client", _stub_client)
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_persists_turn_and_relay_stays_byte_identical(persist_proxy_client, hermes_store):
+    resp = await persist_proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi there", "persona_id": "primary"},
+    )
+    assert resp.status_code == 200
+    # Exact bytes despite the split frame — persistence tees a copy, it
+    # never reflows what reaches the browser.
+    assert resp.content == b"".join(_PERSIST_SSE_CHUNKS)
+
+    conv = hermes_store.get_conversation("hermes-conv-1")
+    assert conv is not None
+    assert conv.persona_id == "primary"
+    assert conv.backend == "hermes"
+
+    messages = hermes_store.get_messages("hermes-conv-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "hi there"),
+        ("assistant", "Hello world"),
+    ]
+
+
+async def test_persists_with_the_selected_persona(persist_proxy_client, hermes_store, tmp_path, monkeypatch):
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FITNESS BODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "label": "Fitness Coach", "token_env": "TG_FIT_592", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT_592", "tok")
+
+    resp = await persist_proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "workout plan?", "persona_id": "fitness"},
+    )
+    assert resp.status_code == 200
+    conv = hermes_store.get_conversation("hermes-conv-1")
+    assert conv.persona_id == "fitness"
+    assert conv.backend == "hermes"
+
+
+async def test_store_failure_is_logged_and_never_breaks_the_relay(persist_proxy_client, monkeypatch, caplog):
+    def _boom():
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(hp, "get_store", _boom)
+    with caplog.at_level(logging.WARNING, logger="api.routes.hermes_proxy"):
+        resp = await persist_proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_PERSIST_SSE_CHUNKS)
+    assert "hermes turn persistence" in caplog.text
+
+
+stub_hermes_truncated = FastAPI()
+
+# No "done" event and no closing content frame — simulates the upstream
+# connection dying mid-turn. Whatever arrived before that must still be
+# persisted (a partial turn is not discarded).
+_TRUNCATED_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "trunc-1"}\n\n',
+    b'data: {"type": "content", "content": "partial reply"}\n\n',
+]
+
+
+@stub_hermes_truncated.post("/api/ask/stream")
+async def _stub_truncated_ask(request: Request):
+    async def gen():
+        for chunk in _TRUNCATED_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def test_truncated_stream_still_persists_partial_content(monkeypatch, hermes_store):
+    monkeypatch.setattr(
+        hp, "_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_truncated), base_url="http://hermes"
+        ),
+    )
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post("/api/hermes/ask/stream", json={"question": "will this finish?"})
+
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_TRUNCATED_SSE_CHUNKS)
+
+    messages = hermes_store.get_messages("trunc-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "will this finish?"),
+        ("assistant", "partial reply"),
+    ]
+
+
+stub_hermes_crlf = FastAPI()
+
+# CRLF frame separators (`\r\n\r\n`) rather than bare LF — SSE permits both
+# (WHATWG spec), and an intermediary is free to rewrite line endings even
+# though the Hermes adapter itself emits LF today (#592 review: without
+# handling this, `_FRAME_SEP` never matched and nothing was persisted —
+# silent total data loss, not an error).
+_CRLF_SSE_CHUNKS = [
+    b'data: {"type": "conversation_id", "conversation_id": "crlf-1"}\r\n\r\n',
+    b'data: {"type": "content", "content": "crlf reply"}\r\n\r\n',
+]
+
+
+@stub_hermes_crlf.post("/api/ask/stream")
+async def _stub_crlf_ask(request: Request):
+    async def gen():
+        for chunk in _CRLF_SSE_CHUNKS:
+            yield chunk
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def test_crlf_framed_stream_still_persists(monkeypatch, hermes_store):
+    monkeypatch.setattr(
+        hp, "_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=stub_hermes_crlf), base_url="http://hermes"
+        ),
+    )
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post("/api/hermes/ask/stream", json={"question": "crlf ok?"})
+
+    assert resp.status_code == 200
+    # The relay is byte-for-byte untouched regardless of framing style —
+    # persistence tees a copy, it never reflows what reaches the browser.
+    assert resp.content == b"".join(_CRLF_SSE_CHUNKS)
+
+    conv = hermes_store.get_conversation("crlf-1")
+    assert conv is not None
+    messages = hermes_store.get_messages("crlf-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "crlf ok?"),
+        ("assistant", "crlf reply"),
+    ]
+
+
+async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, hermes_store):
+    """MAJOR (#592 review): `_proxy.py`'s relay loop used to call
+    `observer.observe(chunk)` *after* `yield chunk`. Closing the response
+    generator while it's suspended at that yield — exactly what an early
+    client disconnect does — raises `GeneratorExit` right there, which
+    skips any code written after the yield in that same loop iteration. The
+    chunk the relay had already handed off was silently never observed, so
+    a disconnect mid-turn lost the very content the partial-turn guarantee
+    (see `test_truncated_stream_still_persists_partial_content` above)
+    exists to keep.
+
+    Drives the endpoint's returned `StreamingResponse.body_iterator` by
+    hand — pulling exactly one chunk, then closing it without ever asking
+    for the second — to reproduce that precise "closed while suspended at
+    the yield" moment deterministically, rather than relying on real
+    socket/ASGI disconnect timing (which httpx's in-process ASGITransport
+    doesn't reliably reproduce chunk-for-chunk anyway). A fake upstream
+    client (mirroring the `_Failing` pattern in test_agent_proxy.py) gives
+    exact control over chunk boundaries that a real ASGI transport can
+    silently coalesce away.
+    """
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    disco_chunks = [
+        b'data: {"type": "conversation_id", "conversation_id": "disco-1"}\n\n'
+        b'data: {"type": "content", "content": "first chunk"}\n\n',
+        b'data: {"type": "content", "content": "never requested"}\n\n',
+    ]
+
+    class _FakeUpstream:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "text/event-stream"})
+
+        async def aiter_raw(self):
+            for c in disco_chunks:
+                yield c
+
+        async def aclose(self):
+            pass
+
+    class _FakeClient:
+        def build_request(self, *a, **k):
+            return object()
+
+        async def send(self, *a, **k):
+            return _FakeUpstream()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", lambda: _FakeClient())
+
+    endpoint = next(r for r in hp.router.routes if r.path.endswith("/ask/stream")).endpoint
+
+    body = json.dumps({"question": "will this survive a disconnect?"}).encode()
+    body_sent = False
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/hermes/ask/stream",
+        "raw_path": b"/api/hermes/ask/stream",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("testclient", 123),
+        "server": ("testserver", 80),
+        "http_version": "1.1",
+    }
+    request = Request(scope, receive=receive)
+
+    response = await endpoint(request)
+    gen = response.body_iterator
+
+    first = await gen.__anext__()
+    assert first == disco_chunks[0]
+
+    # Simulate the client vanishing right here: close the generator without
+    # ever pulling the second chunk. This is exactly the "suspended at the
+    # yield" moment the finding describes.
+    await gen.aclose()
+
+    conv = hermes_store.get_conversation("disco-1")
+    assert conv is not None
+    messages = hermes_store.get_messages("disco-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "will this survive a disconnect?"),
+        ("assistant", "first chunk"),
+    ]
+
+
+class TestHermesTurnPersisterDirect:
+    """Direct, non-HTTP tests of `_HermesTurnPersister` — the SSE frame
+    reassembly and store-write logic in isolation from the transport."""
+
+    def test_reassembles_frame_split_across_observe_calls(self, hermes_store):
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(b'data: {"type": "conversation_id", "conv')
+        persister.observe(b'ersation_id": "split-1"}\n\n')
+        persister.observe(b'data: {"type": "content", "content": "he')
+        persister.observe(b'llo"}\n\n')
+        persister.finalize()
+
+        messages = hermes_store.get_messages("split-1")
+        assert [(m.role, m.content) for m in messages] == [
+            ("user", "q"),
+            ("assistant", "hello"),
+        ]
+
+    def test_observe_never_calls_the_store(self, monkeypatch):
+        """BLOCKER (#592 review): `observe()` used to call
+        `store.create_conversation()`/`add_message()` synchronously as soon
+        as a `conversation_id` event was parsed, so a locked db
+        (`ConversationStore._connect()`'s 10s busy timeout) could stall
+        delivery of this stream's own next chunk. `observe()` must do only
+        in-memory parsing; every store call belongs in `finalize()`, once,
+        after the relay has already handed off every byte of the turn.
+        """
+        calls = []
+
+        class _TrackingStore:
+            def create_conversation(self, **kw):
+                calls.append(("create_conversation", kw))
+
+            def add_message(self, *a, **kw):
+                calls.append(("add_message", a))
+
+        monkeypatch.setattr(hp, "get_store", lambda: _TrackingStore())
+
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(b'data: {"type": "conversation_id", "conversation_id": "track-1"}\n\n')
+        persister.observe(b'data: {"type": "content", "content": "hello"}\n\n')
+
+        # Still mid-stream: nothing written to the store yet.
+        assert calls == []
+
+        persister.finalize()
+
+        assert calls == [
+            ("create_conversation", {"conv_id": "track-1", "persona_id": "primary", "backend": "hermes"}),
+            ("add_message", ("track-1", "user", "q")),
+            ("add_message", ("track-1", "assistant", "hello")),
+        ]
+
+    def test_finalize_without_a_conversation_id_persists_nothing(self, hermes_store):
+        # Content arrived but the backend never sent a conversation_id event
+        # (e.g. it errored before assigning one) — nothing to attach it to.
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        persister.observe(b'data: {"type": "content", "content": "orphaned"}\n\n')
+        persister.finalize()
+        assert hermes_store.list_conversations() == []
+
+    def test_continues_an_existing_conversation_without_duplicating(self, hermes_store):
+        hermes_store.create_conversation(conv_id="existing-1", persona_id="primary", backend="hermes")
+
+        persister = hp._HermesTurnPersister(question="second turn q", persona_id="primary")
+        persister.observe(b'data: {"type": "conversation_id", "conversation_id": "existing-1"}\n\n')
+        persister.observe(b'data: {"type": "content", "content": "second turn a"}\n\n')
+        persister.finalize()
+
+        assert len(hermes_store.list_conversations()) == 1
+        messages = hermes_store.get_messages("existing-1")
+        assert [(m.role, m.content) for m in messages] == [
+            ("user", "second turn q"),
+            ("assistant", "second turn a"),
+        ]
+
+    def test_overlong_conversation_id_is_dropped_not_truncated(self, hermes_store, caplog):
+        """MAJOR (#592 review): an overlong id used to be silently
+        truncated (`conv_id[:_MAX_CONVERSATION_ID_LEN]`) before the store
+        write. The browser keeps the verbatim upstream id and would later
+        request it in full via `GET /api/conversations/{id}` — a row
+        created under the truncated id could never be found on reload.
+        Now it's logged and dropped instead of creating that mismatched
+        row.
+        """
+        overlong = "x" * (hp._MAX_CONVERSATION_ID_LEN + 50)
+        persister = hp._HermesTurnPersister(question="q", persona_id="primary")
+        with caplog.at_level(logging.WARNING, logger="api.routes.hermes_proxy"):
+            persister.observe(
+                b'data: ' + json.dumps(
+                    {"type": "conversation_id", "conversation_id": overlong}
+                ).encode() + b'\n\n'
+            )
+            persister.observe(b'data: {"type": "content", "content": "hi"}\n\n')
+            persister.finalize()
+
+        assert "over the" in caplog.text
+        assert hermes_store.list_conversations() == []
+        # No row under either the truncated id or the verbatim one.
+        assert hermes_store.get_conversation(overlong[:hp._MAX_CONVERSATION_ID_LEN]) is None
+        assert hermes_store.get_conversation(overlong) is None
+
+
+class TestMakePersister:
+    """`_make_persister()` — the minimal reparse of the raw request body
+    that builds this turn's `_HermesTurnPersister`."""
+
+    def test_defaults_persona_to_primary_when_omitted(self):
+        p = hp._make_persister(json.dumps({"question": "hi"}).encode())
+        assert p is not None
+        assert p._persona_id == "primary"
+        assert p._question == "hi"
+
+    def test_uses_the_given_persona_id(self):
+        p = hp._make_persister(json.dumps({"question": "hi", "persona_id": "doctor"}).encode())
+        assert p._persona_id == "doctor"
+
+    def test_returns_none_for_malformed_json(self):
+        assert hp._make_persister(b"{not valid json") is None
+
+    def test_returns_none_when_question_is_missing_or_wrong_type(self):
+        assert hp._make_persister(json.dumps({}).encode()) is None
+        assert hp._make_persister(json.dumps({"question": 5}).encode()) is None

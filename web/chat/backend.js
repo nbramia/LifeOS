@@ -99,16 +99,17 @@ function setBackendMode(mode) {
   restoreBackendConversation();
 }
 
-// Switch the view to the selected backend's stored conversation. LifeOS owns its
-// conversation history (render it); agent/hermes history isn't LifeOS-owned, so
-// we keep a fresh view but retain its id for turn continuity.
+// Switch the view to the selected backend's stored conversation. LifeOS and
+// Hermes threads are both stored server-side (#592) and render the same way;
+// the Agent backend's history genuinely lives elsewhere, so it keeps a fresh
+// view and just retains the id for turn continuity.
 function restoreBackendConversation() {
   const storedId = getStoredConversationId();
-  if (storedId && getBackendMode() === 'lifeos') {
+  if (storedId && getBackendMode() !== 'agent') {
     loadConversation(storedId);
   } else {
     newChat();
-    state.currentConversationId = storedId;  // continue the agent/hermes thread on next turn
+    state.currentConversationId = storedId;  // continue the agent thread on next turn
   }
 }
 
