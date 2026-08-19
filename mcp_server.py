@@ -290,6 +290,16 @@ CURATED_ENDPOINTS = {
         "description": "Full investment portfolio (Schwab + 401k + TSP): total value, tax buckets, top holdings with cost basis. Prefer over monarch_accounts for net-worth or portfolio questions.",
         "method": "GET"
     },
+    "/api/fitness/workouts:POST": {
+        "name": "lifeos_workout_manage",
+        "description": (
+            "Log and query workouts/fitness metrics (fitness bot backend). action: "
+            "log/update/list/history/summary/log_metric/metrics/get_profile/"
+            "set_profile/readiness."
+        ),
+        "method": "POST",
+        "path": "/api/fitness/workouts"
+    },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
         "description": "Create a task (Obsidian markdown). Supports context, priority, due_date, tags. With dry_run=true + #agent tag, returns preflight routing + cost estimate instead of creating.",
@@ -467,6 +477,29 @@ class LifeOSMCPServer:
 
         return None
 
+    @staticmethod
+    def _unwrap_optional(schema: dict) -> dict:
+        """Unwrap a nullable `anyOf` schema down to its real, non-null branch.
+
+        Pydantic v2 renders `Optional[X]` as `anyOf: [<X's schema>, {"type":
+        "null"}]` with no top-level `type` — every optional field in this
+        codebase's request models takes this shape. Reading only the
+        top-level `type` (the old behavior) silently falls back to a default,
+        so `sets: Optional[list[...]]` was advertised as `"type": "string"`
+        and a schema-following MCP client couldn't build the array a workout
+        log needs. A schema that already has a top-level `type` (a required
+        field) passes through unchanged; unwrapping returns the branch as-is
+        so its `items` (and any nested `$ref` inside it) survive intact —
+        only the outer null-wrapper is peeled off, nothing inside is resolved
+        further.
+        """
+        if "type" in schema:
+            return schema
+        for branch in schema.get("anyOf", []):
+            if branch.get("type") != "null":
+                return branch
+        return schema
+
     def _build_input_schema(self, endpoint_spec: dict, schemas: dict, method: str, path: str) -> dict:
         """Build JSON Schema for tool input from OpenAPI endpoint spec."""
         properties = {}
@@ -476,11 +509,13 @@ class LifeOSMCPServer:
         for param in endpoint_spec.get("parameters", []):
             if param.get("in") == "query":
                 name = param["name"]
-                param_schema = param.get("schema", {"type": "string"})
+                param_schema = self._unwrap_optional(param.get("schema", {"type": "string"}))
                 properties[name] = {
                     "type": param_schema.get("type", "string"),
                     "description": param.get("description", f"Query parameter: {name}")
                 }
+                if "items" in param_schema:
+                    properties[name]["items"] = param_schema["items"]
                 if param.get("required"):
                     required.append(name)
 
@@ -509,10 +544,13 @@ class LifeOSMCPServer:
 
             # Merge body properties into tool schema
             for prop_name, prop_schema in body_schema.get("properties", {}).items():
+                resolved = self._unwrap_optional(prop_schema)
                 properties[prop_name] = {
-                    "type": prop_schema.get("type", "string"),
+                    "type": resolved.get("type", "string"),
                     "description": prop_schema.get("description", f"Request field: {prop_name}")
                 }
+                if "items" in resolved:
+                    properties[prop_name]["items"] = resolved["items"]
                 if prop_schema.get("default") is not None:
                     properties[prop_name]["default"] = prop_schema["default"]
 
@@ -1882,6 +1920,12 @@ class LifeOSMCPServer:
         elif tool_name == "lifeos_task_delete":
             return f"Task deleted (ID: {data.get('id', data.get('task_id', 'unknown'))})"
 
+        elif tool_name == "lifeos_workout_manage":
+            # The endpoint already returns the same plain-text confirmation/
+            # error string the native orchestrator gets from this tool — pass
+            # it straight through instead of re-wrapping it as JSON.
+            return data.get("result", json.dumps(data, indent=2))
+
         # Default: return formatted JSON
         return json.dumps(data, indent=2)
 
@@ -1928,6 +1972,13 @@ def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
             data = server._call_api(tool_name, arguments)
             formatted = server._format_response(tool_name, data)
             result = {"content": [{"type": "text", "text": formatted}]}
+            # Same "error" key convention the agent worker's ToolRegistry
+            # already uses to decide is_error (api/services/agent_worker/tools.py)
+            # — set it here too so an MCP client that checks the structured
+            # `isError` field, not just the formatted prose, can tell a failed
+            # tool call from a successful one (MCP tool-result spec).
+            if isinstance(data, dict) and "error" in data:
+                result["isError"] = True
             return None if is_notification else _ok(request_id, result)
 
         # Unknown method

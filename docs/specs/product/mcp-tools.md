@@ -104,6 +104,14 @@ Schedules can also be managed via natural language chat. See [Scheduler Guide](.
 
 The legacy `lifeos_reminder_*` tools remain registered as deprecated aliases.
 
+### Fitness Tools
+
+The fitness persona's central capability — logging a workout — routed through natural language chat on the native backend. See [config/personas/fitness.md](../../../config/personas/fitness.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_workout_manage` | Log/query workouts and fitness metrics (log, update, list, history, summary, log_metric, metrics, get_profile, set_profile, readiness) |
+
 ### Photos Tools
 | Tool | Description |
 |------|-------------|
@@ -516,6 +524,31 @@ Get current budget status from Monarch Money.
 | end_date | string | No | End date (YYYY-MM-DD), defaults to today |
 
 **Returns:** List of budgets with category, budgeted amount, actual spending, and remaining balance.
+
+### lifeos_workout_manage
+
+Log and query the fitness bot's workout log and metrics — the same store and dispatcher (`manage_workouts`) the native orchestrator uses, exposed over REST so external MCP clients can log a workout too.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| action | string | Yes | log \| update \| list \| history \| summary \| log_metric \| metrics \| get_profile \| set_profile \| readiness |
+| sets | array | No | Exercises for log/update — one entry per distinct exercise/load: `{exercise, reps, weight, unit, count, rpe, duration_seconds, notes}` |
+| date | string | No | Session date YYYY-MM-DD (log/update). Omit on log to use today |
+| kind | string | No | strength \| cardio \| mobility \| sport \| other |
+| title | string | No | Session title |
+| notes | string | No | Session notes |
+| session_id | string | No | Target session for 'update' (defaults to most recent) |
+| exercise | string | No | Exercise name for 'history' / 'summary' |
+| date_start | string | No | Window start YYYY-MM-DD (list/summary/metrics) |
+| date_end | string | No | Window end YYYY-MM-DD (list/summary/metrics) |
+| metric_type | string | No | Metric name for log_metric/metrics, e.g. 'body_weight' |
+| value | string | No | Numeric for 'log_metric', free text for 'set_profile' |
+| unit | string | No | Metric unit for 'log_metric', e.g. 'lb' |
+| key | string | No | Training-profile key for 'set_profile' |
+| limit | integer | No | Max rows for list/history/metrics |
+
+**Returns:** `{"result": "<plain-text confirmation or error>"}` — the same string the native orchestrator gets from this tool (e.g. `Logged — 2026-08-19: Bench Press 8 @135 lb (session id: ...)`).
 
 ---
 

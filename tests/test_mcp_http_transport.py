@@ -135,6 +135,52 @@ def test_tools_call_dispatches_to_handler(client: TestClient, bearer_token: str)
 
 
 @pytest.mark.unit
+def test_tools_call_sets_is_error_on_tool_failure(client: TestClient, bearer_token: str, monkeypatch):
+    """#603 review (MAJOR): a tool-level failure must surface as MCP
+    `isError: true`, not just as prose inside a structurally-successful
+    JSON-RPC result — the same "error" key convention the agent worker's
+    ToolRegistry already uses (api/services/agent_worker/tools.py) to decide
+    is_error, applied here so an MCP client reading the structured field
+    (not just the formatted text) can also tell success from failure."""
+    monkeypatch.setattr(
+        mcp_server.LifeOSMCPServer, "_call_api",
+        lambda self, name, args: {"error": "boom"},
+    )
+    resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "lifeos_workout_manage", "arguments": {"action": "log", "sets": []}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"]["isError"] is True
+
+
+@pytest.mark.unit
+def test_tools_call_omits_is_error_on_success(client: TestClient, bearer_token: str):
+    """A successful call (no "error" key in the tool's data) must not carry
+    `isError` at all — confirms the new field is failure-only, not a blanket
+    addition that could confuse existing callers."""
+    resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "lifeos_search", "arguments": {"query": "hello"}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    assert "isError" not in resp.json()["result"]
+
+
+@pytest.mark.unit
 def test_notification_returns_202_no_body(client: TestClient, bearer_token: str):
     """JSON-RPC notifications (no id) get 202 Accepted per MCP streamable-HTTP spec."""
     resp = client.post(
