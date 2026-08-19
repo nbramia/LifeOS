@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-08-19
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Two adjacent catalogs split out for size:
 
@@ -85,9 +85,9 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
 2. **Claude intent** — terminal, filesystem, browser tasks. Yields `claude_intent` event for Telegram to spawn Claude Code.
-3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 18 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list.
+3. **Agentic loop** — everything else (including compose, tasks, reminders). Claude gets 21 tools and up to 5 rounds to fetch data and synthesize an answer. See `api/services/agent_tools.py::TOOL_DEFINITIONS` for the canonical list — count `len(TOOL_DEFINITIONS)` to re-derive this number.
 
-**Agentic loop tools (18):**
+**Agentic loop tools (21):**
 
 | Tool | Description |
 |------|-------------|
@@ -110,6 +110,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `delete_calendar_event` | Delete a Google Calendar event |
 | `save_memory` | Save a memory for future reference |
 | `search_memories` | Search previously saved memories |
+| `manage_workouts` | Log and query the workout log and fitness metrics (action: log/update/list/history/summary/log_metric/metrics/get_profile/set_profile/readiness) |
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 
