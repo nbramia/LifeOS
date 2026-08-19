@@ -1,7 +1,7 @@
 # Testing Standards
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-11
+> **Last Updated:** 2026-08-19
 > **Audience:** All developers and AI agents
 
 Testing patterns and conventions for the LifeOS codebase.
@@ -168,6 +168,9 @@ When changing chat or conversation APIs, run the tests in [Client Surfaces](../t
 |-----------|-----------|
 | `tests/test_chat_api.py` | ask/stream, handoff |
 | `tests/test_conversations_api.py` | conversation list/detail |
+| `tests/test_agent_proxy.py` | agent/ask/stream, agent/status |
+| `tests/test_hermes_proxy.py` | hermes/ask/stream, hermes/status, `lifeos_context` envelope, turn persistence |
+| `tests/test_voice_proxy.py` | voice/turn/stream and related voice proxy routes |
 
 ## Benchmark Tests
 

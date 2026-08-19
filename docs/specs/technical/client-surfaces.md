@@ -74,9 +74,31 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifecycle (Voice|Text toggle, SSE `done` data, sequential audio, cancel via `AbortController`), same-origin via the reverse proxy. Mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
-**Agent and Hermes text backends.** Both modes carry a `backend` (`lifeos` | `agent` | `hermes`). `agent` is the OpenClaw voice-adapter and `hermes` is an agent harness reached as a gateway (#587); both speak the same `/api/ask/stream` SSE contract, at `LIFEOS_AGENT_BACKEND_URL` / `LIFEOS_HERMES_BACKEND_URL` respectively, and may each require a bearer token. LifeOS proxies them at `POST /api/agent/ask/stream` and `POST /api/hermes/ask/stream`, **adding the bearer server-side** so it never reaches the browser; `GET /api/agent/status` / `GET /api/hermes/status` report whether each is configured (drives the UI selector). Both routers are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Neither backend has handoff. The Agent route stays a pure byte relay (`request.stream()`, unbuffered) — it has no personas at all, so the picker is hidden for it and an orchestrating persona's turn is never diverted there either (nothing to divert — `persona_id` is never sent). The Hermes route keeps the picker visible and, as of #590, buffers the body to resolve the selected persona and attach it: see "The `lifeos_context` envelope" below — except for an orchestrating persona's turn, which never reaches this route at all, having been diverted client-side to `POST /api/ask/stream` (#596, above).
+## Text Backends
 
-**Hermes turn persistence (#592) and usage capture (#595).** Unlike the Agent backend, whose history genuinely lives elsewhere, Hermes turns are persisted into the same conversation store the native path uses, and their usage/cost is recorded into the same usage store. `make_backend_router()`'s relay loop (`api/routes/_proxy.py`) accepts an optional `make_observer` hook: given the same raw request body `transform_body` already buffers, it returns a `_HermesTurnPersister` (`api/routes/hermes_proxy.py`) whose `observe(chunk)` is called with a copy of each chunk immediately *before* that chunk is yielded to the browser (this ordering matters for an early disconnect — see the docstring on `make_backend_router()`), and whose `finalize()` runs whenever the relay ends — normal completion or an early disconnect alike. The persister reassembles SSE frames from the observed bytes (a chunk is a network read, not a frame, so frames can split across chunk boundaries) and reacts to the same event types the native path emits: on the first `conversation_id` event it adopts that id via `ConversationStore.create_conversation(conv_id=..., persona_id=..., backend="hermes")` (existing rows are returned unchanged, so a continuing thread doesn't get re-tagged) and stores the user's question; `content` events accumulate into the assistant reply, written on `finalize()` — including whatever arrived if the stream died mid-turn; a `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model`) is captured and, on `finalize()`, written to `UsageStore.record_usage()` tagged with the conversation id — **cost is recorded verbatim, never recomputed**, and a cost-less event records a zero cost. Conversation persistence and usage persistence are independent: a turn with no `usage` event writes no usage row (and vice versa), and each is retried/skipped on its own. Every store call is wrapped so a persistence failure is logged and swallowed, never surfacing as a broken turn. The Agent proxy passes neither `transform_body` nor `make_observer`, so its relay is byte-for-byte what it was before this hook existed.
+`/chat` (and voice, via the gateway) targets one of three text backends, carried as an optional `backend` field (`lifeos` | `agent` | `hermes`, omitted/`lifeos` reproducing pre-#361 behavior exactly). Each gets its own section below because their capabilities genuinely differ — treat no statement in one backend's section as implying anything about another's.
+
+### LifeOS
+
+The native orchestrator (`POST /api/ask/stream`, documented above and in [api-reference.md](../product/api-reference.md)). Full personas (including orchestrating ones, which spawn a background Claude Code session — see the Persona contract above), spoken-style rules on voice turns, the per-turn model picker, CLI-engine handoff, and conversation history that has always lived in LifeOS's own `ConversationStore`. Every other backend is described relative to this one.
+
+### Agent
+
+`agent` is the OpenClaw voice-adapter, reached at `LIFEOS_AGENT_BACKEND_URL` (optional bearer token) and proxied at `POST /api/agent/ask/stream` — LifeOS **adds the bearer server-side** so it never reaches the browser, and `GET /api/agent/status` reports whether it's configured (drives the UI selector). It speaks the same `/api/ask/stream` SSE contract as the native path. It has **no personas at all** — `persona_id` is never sent, so the persona and model pickers are both hidden while it's selected, no persona is ever diverted (nothing to divert), and no per-turn context is attached. It has **no handoff**. The route (`api/routes/agent_proxy.py`) is a pure byte relay (`request.stream()`, unbuffered — no `transform_body`, no `make_observer`), so its behavior is byte-for-byte what it was before Hermes existed. Its conversation history is **not** LifeOS-owned: nothing here persists it, so switching to `agent` shows a fresh view even though the stored conversation id is retained for continuity with whatever does own that history upstream. Because it isn't tee'd at all, its turns are also invisible to the usage store — unlike Hermes, below.
+
+**These are properties of the Agent backend specifically, not of "external backends" generally** — Hermes, below, shares only some of them.
+
+### Hermes
+
+`hermes` is an agent harness reached as a gateway (#587), at `LIFEOS_HERMES_BACKEND_URL` (optional bearer token), proxied at `POST /api/hermes/ask/stream` with the same server-side bearer injection and a `GET /api/hermes/status` availability check. Both proxies are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Hermes has **no handoff** either — but unlike Agent, it keeps the persona picker visible, carries spoken-style rules on voice turns, receives the orchestrator's auto-injected turn context, and its history **is** LifeOS-owned. Its route (`api/routes/hermes_proxy.py`) buffers the request body (`transform_body`) to resolve the selected persona and attach it as the `lifeos_context` envelope below — the only text-backend proxy that does. Orchestrating personas never reach this route: they're diverted client-side to `POST /api/ask/stream` instead (#596, above), because the spawn they trigger is LifeOS-native and Hermes has no equivalent.
+
+#### Hermes turn persistence (#592) and usage capture (#595)
+
+Unlike the Agent backend, whose history genuinely lives elsewhere, Hermes turns are persisted into the same conversation store the native path uses, and their usage/cost is recorded into the same usage store. `make_backend_router()`'s relay loop (`api/routes/_proxy.py`) accepts an optional `make_observer` hook: given the same raw request body `transform_body` already buffers, it returns a `_HermesTurnPersister` (`api/routes/hermes_proxy.py`) whose `observe(chunk)` is called with a copy of each chunk immediately *before* that chunk is yielded to the browser (so an early client disconnect — which raises `GeneratorExit` at the `yield` — can never skip a chunk the tee hasn't seen yet), and whose `finalize()` runs whenever the relay ends — normal completion or an early disconnect alike. The persister reassembles SSE frames from the observed bytes (a chunk is a network read, not a frame, so frames can split across chunk boundaries) and reacts to the event types the native path emits: on the first `conversation_id` event it adopts that id via `ConversationStore.create_conversation(conv_id=..., persona_id=..., backend="hermes")` (existing rows are returned unchanged, so a continuing thread doesn't get re-tagged) and stores the user's question; `content` events accumulate into the assistant reply, written on `finalize()` — including whatever arrived if the stream died mid-turn; a `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model`) is captured and, on `finalize()`, written to `UsageStore.record_usage()` tagged with the conversation id — **cost is recorded verbatim, never recomputed** (Hermes runs DeepSeek via Fireworks; LifeOS's calculator only knows Anthropic pricing), and a cost-less event records a zero cost rather than an invented one. Conversation persistence and usage persistence are independent: a turn with no `usage` event writes no usage row (and vice versa), and each is retried/skipped on its own. A malformed or partial `usage` event (missing/wrong-typed model or token counts) is ignored entirely. Every store call is wrapped so a persistence failure is logged and swallowed, never surfacing as a broken turn. The Agent proxy passes neither `transform_body` nor `make_observer`, so its relay is byte-for-byte what it was before this hook existed.
+
+#### Usage and cost reporting (external backends) — #595
+
+Both proxied backends are expected to emit a `usage` SSE event matching LifeOS's native one — but a **subset** of its fields, since an external backend has no prompt-cache accounting to report: `type: "usage"`, `model`, `input_tokens`, `output_tokens`, `cost_usd` (no `cache_read_tokens`/`cache_creation_tokens`). Today only Hermes is actually tee'd and captured (above); the Agent proxy has no observer, so an Agent-backend `usage` event, if one were ever emitted, would simply pass through unrecorded. **No client change was required**: the browser's existing handler (`state.sessionCost += data.cost_usd || 0` in `web/chat/ask-stream.js`) already consumes this shape, since it matches the native event rather than inventing a parallel one. [`GET /api/admin/usage`](../product/api-reference.md#get-apiadminusage) includes these rows in its totals — the usage store applies no per-model or per-backend filter, so anything written to it (native or relayed) counts.
 
 ### The `lifeos_context` envelope (Hermes only)
 
@@ -113,18 +135,58 @@ Because Hermes has no way to resolve a LifeOS persona id or the current per-turn
 - `schema_version` is currently `1`.
 - `modality` duplicates the request's `modality` (`"voice"` or `"text"`) so the envelope is self-contained.
 - `persona.id` defaults to `primary` when the client sends no `persona_id`; `preamble` is the persona's markdown body verbatim (may be empty); `voice_rules` is populated only on voice turns, matching the `modality == "voice"` gate `ask_stream` in `api/routes/chat.py` uses for the native path; `orchestrates` is always `false` here — an orchestrating persona (`doctor`) never reaches this envelope, because the route rejects it with a 400 first (see below).
-- `turn` (#591) is a **sibling** of `persona`, resolved by `build_turn_context()` in `api/services/agent_system_prompt.py` — the same function [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) returns, so the two shapes can never drift apart. `current_datetime`/`current_datetime_iso`/`timezone` describe the current instant; `time_resolution_instruction` is prompt-ready guidance for resolving relative time expressions ("last week") into concrete date ranges; `personal_context` is a persona-scoped people block (non-empty only for `therapist` today, empty string otherwise); `existing_tags` is `[{tag, count}]` for reuse when tagging tasks (empty when none or the task manager is unreachable), paired with `tags_instruction`. **Never merge `turn` into `persona`** — `persona` is stable across a whole conversation (cacheable), `turn` changes every turn; merging them would invalidate a consumer's prompt cache on every turn.
+- `turn` (#591) is a **sibling** of `persona`, resolved by `build_turn_context()` in `api/services/agent_system_prompt.py` — the same function [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) returns, so the two shapes can never drift apart. **Never merge `turn` into `persona`** — `persona` is stable across a whole conversation (cacheable), `turn` changes every turn; merging them would invalidate a consumer's prompt cache on every turn.
 
 **Validation and rejection**, in order, before any upstream request is made: malformed JSON → 400; unknown `persona_id` → 400 naming the id; a known but *orchestrating* `persona_id` → 400. That last case is a **backstop, not the user-facing path**: the client-side diversion (#596, above) is what's supposed to route an orchestrating persona's turn to `POST /api/ask/stream` instead of here, so this 400 firing means that diversion didn't happen — a bug, not a normal outcome. The persona itself stays selectable on the Hermes backend regardless (a routing guard, not a picker exclusion). Attachment size/type caps are enforced via the same `AskStreamRequest` model the native endpoint uses, so the limits can't drift between the two paths.
 
-Conversation ids are stored per backend in `sessionStorage` (`lifeos:chat:conv:agent`; `lifeos:chat:conv:hermes:<persona>`, persona-scoped like lifeos; and `lifeos:chat:conv:lifeos:<persona>`) so switching and refreshing continues the right thread. `web/chat/backend.js` owns the three-way selector + per-backend conversation persistence, including the default: with no stored preference, a fresh session resolves to `hermes` if its availability check succeeds, else `lifeos` — an explicit choice (including `lifeos`) always wins over that default, and a client-supplied `Authorization` header is always stripped before either proxy substitutes its own bearer. Since #592, `restoreBackendConversation()` renders the stored conversation on a switch **to either `lifeos` or `hermes`** (both are LifeOS-owned history now) — only switching to `agent` keeps the fresh-view-but-retain-the-id behavior, because that backend's history still isn't persisted here.
+#### Turn-context payload
+
+The `turn` object above — identical in shape to the response body of [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context), since both come from the same `build_turn_context()` call:
+
+| Field | Type | Presence | Meaning |
+|---|---|---|---|
+| `current_datetime` | string | always | Human-formatted local date/time, prompt-ready (`%A, %B %d, %Y at %I:%M %p %Z`). |
+| `current_datetime_iso` | string | always | The same instant as ISO 8601 with offset, for machine use. |
+| `timezone` | string | always | IANA zone name, e.g. `"America/New_York"` (`settings.timezone`). |
+| `time_resolution_instruction` | string | always | Prompt-ready instruction to resolve relative time expressions ("last week") into concrete `YYYY-MM-DD` ranges before calling search tools. |
+| `personal_context` | string | always present, often empty | A persona-scoped people block. Non-empty only for the `therapist` persona (and only once the relevant config is set); empty string for every other persona. |
+| `existing_tags` | array of `{tag, count}` | always present, may be empty | Task tags already in use, for reuse when tagging. Empty when there are no tags or the task manager is unreachable — a normal degraded case, not an error. |
+| `tags_instruction` | string | always | Prompt-ready instruction to prefer an existing tag over inventing a near-duplicate; pair with `existing_tags`. |
+
+### Capability comparison
+
+| Capability | LifeOS | Agent | Hermes |
+|---|---|---|---|
+| Persona support | Yes (full registry) | No — `persona_id` never sent | Yes (registry, resolved server-side into the envelope) |
+| Spoken-style rules (`voice_rules`) | Yes, on voice turns | No | Yes, on voice turns (in the envelope) |
+| Turn-context delivery | Folded directly into the system prompt | None | Via the `lifeos_context.turn` envelope (#591) |
+| Handoff (CLI engine) | Yes | No | No |
+| Orchestrating personas | Runs natively (spawns a background session) | N/A — never selectable | Diverted client-side to LifeOS (#596); never actually forwarded to Hermes |
+| Per-turn model selection | Yes (`model_override`: Auto/Sonnet/Opus/Gemma/Claude Code) | No — picker hidden | No — picker hidden; model choice is the harness's call, not LifeOS's |
+| Conversation history LifeOS-owned | Yes (always has been) | No | Yes, since #592 (tee-persisted) |
+
+### Default backend selection
+
+`web/chat/backend.js` owns the three-way selector. With **no stored preference**, a fresh session resolves to `hermes` if its availability check (`GET /api/hermes/status`) succeeds, else `lifeos` — this default applies **only when Hermes is configured and reachable**; a machine with no `LIFEOS_HERMES_BACKEND_URL` set behaves exactly as it did before Hermes existed. An **explicit user choice — including explicitly picking `lifeos`** — always overrides this default and is remembered for the session. A client-supplied `Authorization` header is always stripped before either proxy substitutes its own bearer.
+
+### Conversation-id storage keys
+
+Conversation ids are stored per backend in `sessionStorage` so switching and refreshing continues the right thread:
+
+| Backend | Key |
+|---|---|
+| `lifeos` | `lifeos:chat:conv:lifeos:<persona>` (persona-scoped) |
+| `agent` | `lifeos:chat:conv:agent` (not persona-scoped — Agent has no personas) |
+| `hermes` | `lifeos:chat:conv:hermes:<persona>` (persona-scoped, like `lifeos`) |
+
+Since #592, `restoreBackendConversation()` renders the stored conversation on a switch **to either `lifeos` or `hermes`** (both are LifeOS-owned history now) — only switching to `agent` keeps the fresh-view-but-retain-the-id behavior, because that backend's history still isn't persisted here.
 
 ---
 
 ## Before changing chat or conversation APIs
 
 1. Read [api-reference.md](../product/api-reference.md) § Chat and Conversations endpoints.
-2. Compare `web/index.html`, `api/services/telegram.py`, and `~/Code/whisper-relay/src/voice_gateway/adapters/lifeos.py`.
+2. Compare `web/index.html`, `api/services/telegram.py`, `~/Code/whisper-relay/src/voice_gateway/adapters/lifeos.py`, and the Hermes proxy (`api/routes/hermes_proxy.py`, plus its shared plumbing in `api/routes/_proxy.py` — a change there also affects `api/routes/agent_proxy.py`).
 3. Run contract tests listed in [testing-standards.md](../standards/testing-standards.md#http-client-contract-tests).
 4. Treat removals or renames of public fields/events as a **breaking change** — update whisper-relay in the same release or maintain backward compatibility.
 
@@ -144,3 +206,6 @@ Conversation ids are stored per backend in `sessionStorage` (`lifeos:chat:conv:a
 ### Code References
 - [Chat route](../../api/routes/chat.py) — SSE emission and handoff handler
 - [Conversations route](../../api/routes/conversations.py) — List/detail handlers
+- [Proxy factory](../../api/routes/_proxy.py) — Shared status/ask-stream plumbing for the Agent and Hermes backends
+- [Agent proxy](../../api/routes/agent_proxy.py) — Agent text-backend routes
+- [Hermes proxy](../../api/routes/hermes_proxy.py) — Hermes text-backend routes, `lifeos_context` envelope, turn persistence
