@@ -735,6 +735,21 @@ class Settings(BaseSettings):
         alias="LIFEOS_WORK_DOMAIN_2",
         description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
     )
+    gmail_draft_send_cooldown_seconds: int = Field(
+        default=300,
+        alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
+        description="Cooling-off window, in seconds, during which LifeOS-created "
+                    "Gmail drafts without a different turn id cannot be sent."
+    )
+    gmail_draft_ledger_max_turn_tagged_rows: int = Field(
+        default=10000,
+        alias="LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS",
+        description="Cap on turn-tagged rows kept in the Gmail draft send-gate "
+                    "ledger. Turn-tagged rows must survive past the cooldown "
+                    "window (the same-turn-id guarantee applies regardless of "
+                    "elapsed time), so they are bounded by count with "
+                    "oldest-first eviction instead of by age."
+    )
 
     # ==========================================================================
     # WORK INTEGRATION TOGGLES

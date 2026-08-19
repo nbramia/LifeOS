@@ -261,7 +261,9 @@ Search emails.
 
 ### POST /api/gmail/drafts
 
-Create a Gmail draft.
+Create a Gmail draft. LifeOS records the returned draft id in its send-safety ledger with the creation timestamp and optional turn identifier.
+
+Header: `X-LifeOS-Turn-ID` (optional). Set the same opaque value on every Gmail draft/send call made during one agent turn to get exact same-turn enforcement.
 
 **Request:**
 ```json
@@ -285,7 +287,9 @@ Create a Gmail draft.
 
 ### POST /api/gmail/send
 
-Send an existing draft (created via `POST /api/gmail/drafts`) by its `draft_id`. The exact draft is sent — there is no compose-and-send shortcut, which keeps a review step in front of every outbound email. Only send after the user has reviewed the draft and explicitly confirmed.
+Send an existing draft by its `draft_id`. The exact draft is sent; there is no compose-and-send shortcut.
+
+Safety gate: if the draft was created by `POST /api/gmail/drafts`, the send endpoint checks the draft ledger before sending. A send with the same `X-LifeOS-Turn-ID` as draft creation is refused with HTTP 409 regardless of age, as long as that turn-id record hasn't aged out of the ledger's row cap (`LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS`, default 10,000 — oldest-first eviction once exceeded, not time-based). Without an exact different turn id, LifeOS-created drafts are refused with HTTP 409 during `LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS` (default 300 seconds). Draft ids not present in the ledger, such as drafts composed by hand in Gmail, send normally. If the ledger cannot be read, or if it shows signs of having lost data, the endpoint fails closed with HTTP 409.
 
 **Request:**
 ```json
@@ -294,6 +298,7 @@ Send an existing draft (created via `POST /api/gmail/drafts`) by its `draft_id`.
 }
 ```
 Query param: `account` (personal or work; must match where the draft was created).
+Header: `X-LifeOS-Turn-ID` (optional). Use a different value from the draft-creation turn only after user confirmation.
 
 **Response:**
 ```json
