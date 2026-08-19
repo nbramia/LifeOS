@@ -543,6 +543,32 @@ async def test_persists_with_the_selected_persona(persist_proxy_client, hermes_s
     assert conv.backend == "hermes"
 
 
+async def test_voice_turn_persists_like_a_typed_turn(persist_proxy_client, hermes_store):
+    """#593: a spoken Hermes turn (persona_id + modality=voice, the shape a
+    gateway routing voice through this proxy is expected to send) persists
+    exactly like a typed one -- modality only affects the upstream envelope
+    (test_envelope_voice_modality_populates_voice_rules above), never the
+    read-only persistence tee. This is what lets a completed Hermes voice
+    turn show up in the sidebar and render after reload, same as text."""
+    resp = await persist_proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "hi there", "persona_id": "primary", "modality": "voice"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_PERSIST_SSE_CHUNKS)
+
+    conv = hermes_store.get_conversation("hermes-conv-1")
+    assert conv is not None
+    assert conv.persona_id == "primary"
+    assert conv.backend == "hermes"
+
+    messages = hermes_store.get_messages("hermes-conv-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "hi there"),
+        ("assistant", "Hello world"),
+    ]
+
+
 async def test_store_failure_is_logged_and_never_breaks_the_relay(persist_proxy_client, monkeypatch, caplog):
     def _boom():
         raise RuntimeError("db exploded")

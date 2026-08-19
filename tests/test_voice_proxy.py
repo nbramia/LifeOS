@@ -81,6 +81,22 @@ async def test_turn_stream_forwards_multipart_and_sse(proxy_client):
     assert '"persona_id": "fitness"' in body
 
 
+async def test_turn_stream_forwards_hermes_backend_value_unchanged(proxy_client):
+    """#593: backend selection is a field on the turn, not a route -- the
+    catch-all here has no branch on its value, so a hermes-selected turn
+    reaches the gateway through the exact same handler as a lifeos one
+    (proven by the same route succeeding for a different backend string,
+    with the value itself passed through untouched)."""
+    files = {"audio": ("turn.webm", b"\x00\x01\x02fakeaudio", "audio/webm")}
+    data = {"backend": "hermes", "persona_id": "fitness", "conversation_id": "c1"}
+    resp = await proxy_client.post("/api/voice/turn/stream", files=files, data=data)
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert '"backend": "hermes"' in body
+    assert '"persona_id": "fitness"' in body
+
+
 async def test_audio_clip_forwards_bytes_and_headers(proxy_client):
     resp = await proxy_client.get("/api/voice/audio/t1/status-0")
     assert resp.status_code == 200
