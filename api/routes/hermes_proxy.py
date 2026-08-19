@@ -37,6 +37,7 @@ from api.routes._proxy import TIMEOUT, make_backend_router
 from api.routes.chat import AskStreamRequest
 from api.services.agent_system_prompt import build_turn_context
 from api.services.conversation_store import get_store
+from api.services.usage_store import get_usage_store
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,16 @@ logger = logging.getLogger(__name__)
 # costs nothing and the native path's own ids (uuid4, 36 chars) are nowhere
 # near it.
 _MAX_CONVERSATION_ID_LEN = 200
+
+
+def _coerce_token_count(value: object) -> Optional[int]:
+    """A `usage` event's token count is well-formed only as a plain int
+    (`bool` is a `int` subclass in Python, so it's excluded explicitly).
+    Anything else (missing, float, string) makes the event partial — the
+    caller drops it rather than guessing."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _client() -> httpx.AsyncClient:
@@ -141,24 +152,25 @@ def _build_envelope(raw_body: bytes) -> bytes:
 
 
 class _HermesTurnPersister:
-    """Read-only tee (#592) that reconstructs a Hermes turn from the bytes
-    relayed to the browser and writes it to the conversation store, without
-    altering, buffering, or delaying that relay.
+    """Read-only tee (#592, extended by #595) that reconstructs a Hermes turn
+    from the bytes relayed to the browser and writes it to the conversation
+    and usage stores, without altering, buffering, or delaying that relay.
 
     `_proxy.py`'s relay loop calls `observe()` with a copy of each chunk
     right *before* that chunk is handed to the browser, and calls
     `finalize()` exactly once when the relay ends — normal completion or an
     early disconnect alike. Hermes speaks the same SSE contract the native
     `/api/ask/stream` path emits (see api/routes/chat.py): `data: {...}\\n\\n`
-    frames, a `conversation_id` event once, and zero or more `content`
-    events carrying incremental text. A chunk is a network read, not a
-    frame, so frames can split across chunk boundaries — `observe()`
-    reassembles them from a buffer rather than assuming one frame per chunk.
+    frames, a `conversation_id` event once, zero or more `content` events
+    carrying incremental text, and at most one `usage` event carrying token
+    counts, cost, and model. A chunk is a network read, not a frame, so
+    frames can split across chunk boundaries — `observe()` reassembles them
+    from a buffer rather than assuming one frame per chunk.
 
     `observe()` does no I/O: it only reassembles frames and buffers parsed
-    text in memory (#592 review — a store call here, in the relay's
-    per-chunk hot path, let a slow or locked db stall delivery of this
-    stream's own next chunk; `ConversationStore._connect()`'s 10s busy
+    text/usage data in memory (#592 review — a store call here, in the
+    relay's per-chunk hot path, let a slow or locked db stall delivery of
+    this stream's own next chunk; `ConversationStore._connect()`'s 10s busy
     timeout made that concrete). Every store write happens exactly once, in
     `finalize()`, after every byte of this turn has already been handed to
     the browser (or the client disconnected and no more are coming) — so a
@@ -167,6 +179,15 @@ class _HermesTurnPersister:
 
     Every store call is wrapped: a persistence failure is logged and
     swallowed here so it can never surface as a broken turn.
+
+    Usage capture (#595) shares this same observer rather than adding a
+    second one over the same stream: the `usage` event's cost is recorded
+    **verbatim**, never recomputed from the token counts — the cost
+    calculator (`api/services/cost_tracker.py`) only knows Anthropic pricing
+    and would misprice a non-Anthropic upstream model badly. A malformed or
+    partial `usage` event (missing/wrong-typed model or token counts) is
+    ignored rather than raised; a well-formed event with no `cost_usd` is
+    recorded with a zero cost rather than an invented one.
     """
 
     _FRAME_SEP = b"\n\n"
@@ -178,6 +199,11 @@ class _HermesTurnPersister:
         self._conversation_id_seen = False
         self._conversation_id: Optional[str] = None
         self._content_parts: list[str] = []
+        self._usage_captured = False
+        self._usage_model: Optional[str] = None
+        self._usage_input_tokens = 0
+        self._usage_output_tokens = 0
+        self._usage_cost_usd = 0.0
 
     def observe(self, chunk: bytes) -> None:
         """Non-blocking, in-memory-only frame reassembly — see the class
@@ -240,28 +266,69 @@ class _HermesTurnPersister:
             content = event.get("content")
             if isinstance(content, str):
                 self._content_parts.append(content)
+        elif etype == "usage" and not self._usage_captured:
+            # Not "seen once" like conversation_id above: a malformed usage
+            # event (below) leaves `_usage_captured` False, so a later
+            # well-formed one can still be captured rather than being
+            # permanently shadowed by an earlier bad one.
+            self._handle_usage(event)
+
+    def _handle_usage(self, event: dict) -> None:
+        """Validate and capture a `usage` event's fields (#595). Cost is
+        taken verbatim from upstream — never recomputed here — and a
+        missing/non-numeric cost records as zero rather than a guess. A
+        malformed or partial event (bad model or token counts) is dropped
+        silently; it must never raise or interrupt the relay."""
+        model = event.get("model")
+        input_tokens = _coerce_token_count(event.get("input_tokens"))
+        output_tokens = _coerce_token_count(event.get("output_tokens"))
+        if not isinstance(model, str) or not model or input_tokens is None or output_tokens is None:
+            return
+        cost = event.get("cost_usd")
+        cost_usd = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
+        self._usage_captured = True
+        self._usage_model = model
+        self._usage_input_tokens = input_tokens
+        self._usage_output_tokens = output_tokens
+        self._usage_cost_usd = cost_usd
 
     def finalize(self) -> None:
-        """Write this turn to the store, once. Runs after the relay has
-        already handed off every byte it's going to (normal completion or
-        an early client disconnect), so it's the only place in this class a
-        blocking store call is allowed to happen."""
-        if self._conversation_id is None or not self._content_parts:
-            return
-        conv_id = self._conversation_id
-        try:
-            store = get_store()
-            store.create_conversation(
-                conv_id=conv_id, persona_id=self._persona_id, backend="hermes",
-            )
-            store.add_message(conv_id, "user", self._question)
-        except Exception:
-            logger.warning("hermes turn persistence: failed to create conversation %r", conv_id, exc_info=True)
-            return
-        try:
-            store.add_message(conv_id, "assistant", "".join(self._content_parts))
-        except Exception:
-            logger.warning("hermes turn persistence: failed to save assistant reply", exc_info=True)
+        """Write this turn to the stores, once each. Runs after the relay
+        has already handed off every byte it's going to (normal completion
+        or an early client disconnect), so it's the only place in this
+        class a blocking store call is allowed to happen.
+
+        Conversation persistence and usage persistence are independent: a
+        turn with no `conversation_id`/content still records usage if a
+        `usage` event arrived, and vice versa — neither gates the other.
+        """
+        if self._conversation_id is not None and self._content_parts:
+            conv_id = self._conversation_id
+            try:
+                store = get_store()
+                store.create_conversation(
+                    conv_id=conv_id, persona_id=self._persona_id, backend="hermes",
+                )
+                store.add_message(conv_id, "user", self._question)
+            except Exception:
+                logger.warning("hermes turn persistence: failed to create conversation %r", conv_id, exc_info=True)
+            else:
+                try:
+                    store.add_message(conv_id, "assistant", "".join(self._content_parts))
+                except Exception:
+                    logger.warning("hermes turn persistence: failed to save assistant reply", exc_info=True)
+
+        if self._usage_captured:
+            try:
+                get_usage_store().record_usage(
+                    model=self._usage_model,
+                    input_tokens=self._usage_input_tokens,
+                    output_tokens=self._usage_output_tokens,
+                    cost_usd=self._usage_cost_usd,
+                    conversation_id=self._conversation_id,
+                )
+            except Exception:
+                logger.warning("hermes turn persistence: failed to record usage", exc_info=True)
 
 
 def _make_persister(raw_body: bytes) -> Optional[_HermesTurnPersister]:
