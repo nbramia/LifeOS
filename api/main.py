@@ -16,9 +16,26 @@ server instances with different code versions.
 
 See CLAUDE.md for full instructions for AI coding agents.
 """
-# Load environment variables from .env file first, before any imports
+# Load environment variables from .env file first, before any imports.
+#
+# The path is explicit (repo root, derived from this file's own location) —
+# NOT a bare `load_dotenv()`. python-dotenv's default search (`usecwd=False`)
+# walks upward from *this file's own directory* — not the process cwd —
+# until it finds a `.env`, climbing all the way to the filesystem root if
+# necessary. That's fine when this file lives in the real checkout (the
+# first candidate found one level up IS the real checkout's own `.env`),
+# but it's exactly the wrong behavior anywhere else this module gets
+# imported from with no `.env` of its own (a git worktree, notably): the
+# search keeps climbing past that directory and can load an unrelated,
+# real `.env` from a parent — including another checkout's machine-specific
+# config (see #598). Anchoring to `Path(__file__).parent.parent / ".env"`
+# loads the exact same file as today for the real checkout (that first
+# candidate IS the repo root there), so server behavior is unchanged, while
+# a nested import (worktree, tests) only loads a `.env` that actually lives
+# in that same checkout — never a parent's.
+from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import logging
 import socket
@@ -30,7 +47,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
-from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends

@@ -62,7 +62,23 @@ def test_unknown_persona_id_returns_400(client):
     assert "ghost" in resp.json()["detail"]
 
 
-def test_personal_context_populated_for_therapist(client, monkeypatch):
+def _register_therapist(tmp_path, monkeypatch):
+    """Give "therapist" a synthetic, self-contained registry entry so these
+    tests don't depend on this machine's real config/telegram_bots.json
+    entry plus a real TELEGRAM_THERAPIST_BOT_TOKEN happening to be set in
+    the environment -- settings.telegram_bots() drops any entry whose token
+    env var is unset, so "therapist" silently isn't a recognized persona at
+    all without this (see #598: relying on ambient real config for a
+    persona to resolve is exactly the kind of test-isolation gap that issue
+    is about, even though this particular resolution isn't cached).
+    """
+    reg = _registry(tmp_path, [{"name": "therapist", "token_env": "TG_THERAPIST_TEST_TOKEN"}])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_THERAPIST_TEST_TOKEN", "tok")
+
+
+def test_personal_context_populated_for_therapist(client, tmp_path, monkeypatch):
+    _register_therapist(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "partner_name", "Sam")
     monkeypatch.setattr(settings, "therapist_patterns", "Dr. A")
     resp = client.get("/api/chat/turn-context", params={"persona_id": "therapist"})
@@ -89,7 +105,8 @@ def test_personal_context_empty_for_other_personas(client, tmp_path, monkeypatch
     ).json()["personal_context"] == ""
 
 
-def test_personal_context_empty_when_config_unset(client, monkeypatch):
+def test_personal_context_empty_when_config_unset(client, tmp_path, monkeypatch):
+    _register_therapist(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "partner_name", "Partner")  # the placeholder default
     monkeypatch.setattr(settings, "therapist_patterns", "")
     resp = client.get("/api/chat/turn-context", params={"persona_id": "therapist"})
