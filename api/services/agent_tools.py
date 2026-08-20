@@ -9,6 +9,7 @@ import contextvars
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import resolve_account, get_configured_accounts
@@ -2618,12 +2619,90 @@ def _summarize_session(session) -> str:
     return f"{session.date}: {body}"
 
 
+# Validation for `log`/`update` (#603 review). This is the trust boundary for
+# both call paths into `_tool_manage_workouts` — the native orchestrator's own
+# tool-calling loop and the REST/MCP surface both pass raw, model-authored
+# dicts through here, so a garbage or destructive write can't reach the store
+# regardless of which caller sent it. Bounds are generous (real training, not
+# a client-side allowlist) — they exist to catch nonsense, not to constrain
+# legitimate values.
+_VALID_WORKOUT_KINDS = {"strength", "cardio", "mobility", "sport", "other"}
+_MAX_REPS = 1000
+_MAX_WEIGHT = 2000  # lb/kg — heaviest plausible loaded lift
+_MAX_RPE = 10
+_MAX_DURATION_SECONDS = 24 * 60 * 60  # a full day
+_MAX_SET_COUNT = 50  # identical sets folded into one entry
+_MAX_SETS_PER_CALL = 200  # distinct entries in one log/update call
+
+
+def _validate_workout_date(raw) -> Optional[str]:
+    """None if `raw` is a valid 'YYYY-MM-DD' date (or absent), else an error."""
+    if not raw:
+        return None
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return f"Error: 'date' must be YYYY-MM-DD, got {raw!r}."
+    return None
+
+
+def _validate_workout_kind(raw) -> Optional[str]:
+    """None if `raw` is a known session kind (or absent/blank), else an error."""
+    if not raw:
+        return None
+    if raw not in _VALID_WORKOUT_KINDS:
+        return f"Error: 'kind' must be one of {sorted(_VALID_WORKOUT_KINDS)}, got {raw!r}."
+    return None
+
+
+def _validate_workout_sets(sets: list) -> Optional[str]:
+    """None if every entry in `sets` is a well-formed set, else the first error.
+
+    Rejects the shapes a fuzzed or careless caller sends: a blank/missing
+    exercise, an entry with no measure at all (reps/weight/duration), and
+    out-of-range or wrong-typed numbers — before any of it reaches the store.
+    """
+    if len(sets) > _MAX_SETS_PER_CALL:
+        return f"Error: too many sets ({len(sets)}, max {_MAX_SETS_PER_CALL})."
+    for i, s in enumerate(sets):
+        if not isinstance(s, dict):
+            return f"Error: set {i} must be an object."
+        exercise = s.get("exercise")
+        if not exercise or not str(exercise).strip():
+            return f"Error: set {i} is missing a non-empty 'exercise'."
+        reps, weight, duration = s.get("reps"), s.get("weight"), s.get("duration_seconds")
+        if reps is None and weight is None and duration is None:
+            return f"Error: set {i} ({exercise!r}) has no reps, weight, or duration_seconds — nothing to log."
+        for field, val, lo, hi in (
+            ("reps", reps, 1, _MAX_REPS),
+            ("weight", weight, 0, _MAX_WEIGHT),
+            ("duration_seconds", duration, 1, _MAX_DURATION_SECONDS),
+        ):
+            if val is None:
+                continue
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not (lo <= val <= hi):
+                return f"Error: set {i} ({exercise!r}) has an invalid '{field}': {val!r}."
+        rpe = s.get("rpe")
+        if rpe is not None and (isinstance(rpe, bool) or not isinstance(rpe, (int, float)) or not (0 <= rpe <= _MAX_RPE)):
+            return f"Error: set {i} ({exercise!r}) has an invalid 'rpe': {rpe!r} (must be 0-{_MAX_RPE})."
+        count = s.get("count")
+        if count is not None and (isinstance(count, bool) or not isinstance(count, int) or not (1 <= count <= _MAX_SET_COUNT)):
+            return f"Error: set {i} ({exercise!r}) has an invalid 'count': {count!r} (must be 1-{_MAX_SET_COUNT})."
+    return None
+
+
 def _workout_log(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     store = get_fitness_store()
     sets = inp.get("sets") or []
     if not sets:
         return "Error: 'log' needs at least one entry in 'sets'."
+    if err := _validate_workout_sets(sets):
+        return err
+    if err := _validate_workout_date(inp.get("date")):
+        return err
+    if err := _validate_workout_kind(inp.get("kind")):
+        return err
     session = store.add_session(
         sets=sets,
         date=inp.get("date"),
@@ -2638,6 +2717,19 @@ def _workout_log(inp: dict) -> str:
 def _workout_update(inp: dict) -> str:
     from api.services.fitness_store import get_fitness_store
     store = get_fitness_store()
+    sets = inp.get("sets")
+    if sets is not None:
+        # `sets=[]` would otherwise reach `update_session`, which treats "sets
+        # provided" (even empty) as "replace the sets" — silently deleting the
+        # session's existing sets. Reject before anything is touched.
+        if not sets:
+            return "Error: 'update' with 'sets' needs at least one entry — pass sets to replace them, or omit 'sets' to leave them unchanged."
+        if err := _validate_workout_sets(sets):
+            return err
+    if err := _validate_workout_date(inp.get("date")):
+        return err
+    if err := _validate_workout_kind(inp.get("kind")):
+        return err
     session = store.update_session(
         session_id=inp.get("session_id"),
         target="latest",
@@ -2645,7 +2737,7 @@ def _workout_update(inp: dict) -> str:
         kind=inp.get("kind"),
         title=inp.get("title"),
         notes=inp.get("notes"),
-        sets=inp.get("sets"),
+        sets=sets,
     )
     if not session:
         return "Error: no session to update (none logged yet, or session_id not found)."

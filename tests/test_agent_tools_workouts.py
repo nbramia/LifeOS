@@ -1,9 +1,10 @@
 """
 Tests for the manage_workouts orchestrator tool (issue #320).
 
-The fitness bot logs/queries via this tool (not the MCP server). Verifies the
-dispatcher, the log/update/history/summary/metric/profile actions, and the
-compact session summary the bot echoes back.
+The fitness bot logs/queries via this tool on the native orchestrator path;
+`POST /api/fitness/workouts` (#603) calls this same dispatcher for the MCP
+surface. Verifies the dispatcher, the log/update/history/summary/metric/
+profile actions, and the compact session summary the bot echoes back.
 """
 import pytest
 
@@ -36,6 +37,20 @@ class TestDispatch:
     def test_log_requires_sets(self, temp_store):
         out = _tool_manage_workouts({"action": "log", "sets": []})
         assert out.startswith("Error")
+
+    def test_update_with_empty_sets_preserves_existing_sets(self, temp_store):
+        """#603 review (BLOCKER): 'update' with sets=[] must not delete the
+        session's existing sets. Previously this returned 200/"Updated —
+        (no sets)" and the stored session's sets became [] — a silent data
+        loss reported as a success."""
+        _tool_manage_workouts({"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]})
+        session_id = temp_store.get_latest_session().id
+        out = _tool_manage_workouts({"action": "update", "sets": []})
+        assert out.startswith("Error")
+        session = temp_store.get_session(session_id)
+        assert len(session.sets) == 1
+        assert session.sets[0].exercise == "Bench Press"
+        assert session.sets[0].reps == 8 and session.sets[0].weight == 135
 
     def test_update_targets_latest(self, temp_store):
         _tool_manage_workouts({"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]})
@@ -207,3 +222,88 @@ class TestDurationThroughTool:
         })
         out = _tool_manage_workouts({"action": "history", "exercise": "stairs"})
         assert "in 7:01" in out
+
+
+class TestSetValidation:
+    """#603 review (MAJOR): the write path accepted garbage — an empty
+    exercise, no measure at all, negative numbers, an out-of-range RPE, an
+    unparseable date. Every case here must be rejected before it reaches the
+    store, for both 'log' and 'update'."""
+
+    def _assert_rejected_and_nothing_stored(self, temp_store, inp):
+        out = _tool_manage_workouts(inp)
+        assert out.startswith("Error"), out
+        assert temp_store.list_sessions() == []
+
+    def test_empty_set_object_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{}]}
+        )
+
+    def test_missing_exercise_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{"reps": 8, "weight": 135}]}
+        )
+
+    def test_null_exercise_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{"exercise": None, "reps": 8, "weight": 135}]}
+        )
+
+    def test_negative_reps_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{"exercise": "bench", "reps": -8, "weight": 135}]}
+        )
+
+    def test_negative_weight_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": -135}]}
+        )
+
+    def test_negative_duration_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store, {"action": "log", "sets": [{"exercise": "run", "duration_seconds": -5}]}
+        )
+
+    def test_out_of_range_rpe_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store,
+            {"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135, "rpe": 99}]},
+        )
+
+    def test_invalid_date_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store,
+            {"action": "log", "date": "not-a-date", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]},
+        )
+
+    def test_unknown_kind_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store,
+            {"action": "log", "kind": "bogus", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]},
+        )
+
+    def test_excessive_count_rejected(self, temp_store):
+        self._assert_rejected_and_nothing_stored(
+            temp_store,
+            {"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135, "count": 10_000}]},
+        )
+
+    def test_valid_set_still_logs(self, temp_store):
+        """The validation must not reject legitimate entries."""
+        out = _tool_manage_workouts({
+            "action": "log",
+            "sets": [{"exercise": "bench", "reps": 8, "weight": 135, "rpe": 8.5, "count": 3}],
+        })
+        assert out.startswith("Logged —")
+        assert temp_store.get_latest_session() is not None
+
+    def test_update_applies_same_validation(self, temp_store):
+        """The 'update' path shares the same validation as 'log' — garbage
+        sets must not overwrite a valid session."""
+        _tool_manage_workouts({"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]})
+        session_id = temp_store.get_latest_session().id
+        out = _tool_manage_workouts({"action": "update", "sets": [{"reps": -8}]})
+        assert out.startswith("Error")
+        session = temp_store.get_session(session_id)
+        assert session.sets[0].reps == 8 and session.sets[0].weight == 135
