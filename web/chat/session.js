@@ -18,6 +18,12 @@ export const state = {
   // Shape: {sessionId, resumable, label, status, convCount}.
   currentAgentThread: null,
   sessionCost: 0,
+  // Count of `usage` events this session whose `cost_usd` was absent/non-numeric
+  // (#602) -- an external backend that genuinely can't price a turn sends no
+  // cost rather than inventing a zero. Once any turn is unpriced, sessionCost
+  // is a lower bound rather than a figure, and stays that way for the rest of
+  // the session (it never decreases).
+  sessionCostUnpriced: 0,
   attachments: [], // {id, file, dataUrl, filename, mediaType, sizeBytes}
   allConversations: [], // all conversations, for client-side filtering
 };

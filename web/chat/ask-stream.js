@@ -166,8 +166,25 @@ export async function sendMessage() {
           state.currentConversationId = data.conversation_id;
           setStoredConversationId(data.conversation_id);  // per-backend persistence
         } else if (data.type === 'usage') {
-          state.sessionCost += data.cost_usd || 0;
-          elements.sessionCostEl.textContent = '$' + state.sessionCost.toFixed(3);
+          // #602: a backend that can't price a turn sends no `cost_usd`
+          // rather than inventing a zero. `data.cost_usd || 0` treated an
+          // absent cost the same as a real one, silently turning "unknown"
+          // into a confident (wrong) claim of "free". An explicit
+          // presence-and-type check keeps the two apart -- `0` still takes
+          // this branch and adds nothing, same as before, but leaves no
+          // mark; anything else (missing, null, a string) adds nothing and
+          // marks the total as a lower bound instead.
+          const cost = data.cost_usd;
+          if (typeof cost === 'number' && Number.isFinite(cost)) {
+            state.sessionCost += cost;
+          } else {
+            state.sessionCostUnpriced += 1;
+          }
+          const prefix = state.sessionCostUnpriced > 0 ? '~' : '';
+          elements.sessionCostEl.textContent = prefix + '$' + state.sessionCost.toFixed(3);
+          elements.sessionCostEl.title = state.sessionCostUnpriced > 0
+            ? state.sessionCostUnpriced + ' turn(s) this session had no reported cost -- total is a lower bound.'
+            : '';
         } else if (data.type === 'claude_intent') {
           // Engine handoff (#305b/c): the orchestrator delegated to a CLI
           // worker. Gate it on the selected persona's advertised capabilities
