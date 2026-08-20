@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-08-19
 
 Codebase organization and module structure for efficient navigation.
 
@@ -28,6 +28,10 @@ api/
 │   │   ├── __init__.py        # Re-exports models and utils
 │   │   ├── models.py          # All Pydantic models (~600 LOC)
 │   │   └── _utils.py          # Shared helper functions
+│   ├── _proxy.py              # Shared reverse-proxy router factory (agent/hermes)
+│   ├── agent_proxy.py         # Agent text-backend reverse proxy
+│   ├── hermes_proxy.py        # Hermes text-backend reverse proxy + persona envelope
+│   ├── voice.py               # Voice gateway (whisper-relay) reverse proxy
 │   ├── drive.py               # Google Drive
 │   ├── gmail.py               # Gmail integration
 │   ├── imessage.py            # iMessage search
@@ -66,6 +70,19 @@ api/
 | slack.py | ~500 | 10 | Slack integration |
 | admin.py | ~300 | 15 | Admin/maintenance |
 | jobs.py | ~70 | 3 | Job queue status |
+| hermes_proxy.py | ~360 | 2 (via factory) | Hermes text-backend reverse proxy, persona envelope, turn persistence |
+| _proxy.py | ~160 | 2 (factory) | Shared reverse-proxy router factory used by `agent_proxy.py` and `hermes_proxy.py` |
+| agent_proxy.py | ~40 | 2 (via factory) | Agent text-backend reverse proxy |
+| voice.py | ~80 | 1 | Voice gateway (whisper-relay) reverse proxy |
+
+**Reverse-proxy layer.** `/chat` targets one of three text backends (`lifeos` native, `agent`, `hermes`), plus a separate voice transport — the latter three are reverse proxies, not LifeOS-native logic:
+
+- `_proxy.py` — `make_backend_router()`, a factory building the shared `GET /status` + `POST /ask/stream` pair (header filtering, bearer injection, streaming relay) that both text-backend proxies mount. Optional `transform_body`/`make_observer` hooks let a backend rewrite the outbound body or tee the relayed stream without touching the shared relay loop.
+- `agent_proxy.py` — mounts that factory at `/api/agent`; a byte-for-byte relay to `LIFEOS_AGENT_BACKEND_URL` with no persona or context injection.
+- `hermes_proxy.py` — mounts the same factory at `/api/hermes`, adding a `transform_body` that resolves the LifeOS persona and attaches a `lifeos_context` envelope, and a `make_observer` that persists the turn (conversation + usage) from the relayed SSE stream.
+- `voice.py` — a separate catch-all reverse proxy (`/api/voice/*` → `LIFEOS_VOICE_GATEWAY_URL`) fronting the whisper-relay voice gateway; the gateway calls back into one of the three text-backend paths above to answer a spoken turn. Frontend counterpart: `web/chat/voice.js`.
+
+Per-backend capabilities (personas, handoff, history ownership, usage capture) and the full voice turn contract are specified in [Client Surfaces](client-surfaces.md) — this section covers code layout only.
 
 ### Services (api/services/)
 
