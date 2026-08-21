@@ -10,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from api.services.google_auth import get_configured_accounts
+from api.services.usage_store import get_usage_store
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ def _existing_tags_block() -> str | None:
     return f"Existing task tags (with usage counts): {lines}.\n{TAGS_INSTRUCTION}"
 
 
-def build_turn_context(persona_id: str | None = None) -> dict:
+def build_turn_context(persona_id: str | None = None, conversation_id: str | None = None) -> dict:
     """Build the per-turn context shared by the turn-context endpoint, the
     Hermes upstream envelope, and (via its constituent pieces) the native
     system prompt (#591).
@@ -199,9 +200,17 @@ def build_turn_context(persona_id: str | None = None) -> dict:
     Returns a JSON-serializable dict with the literal keys pinned by the
     `lifeos_context` cross-repo contract (#590): ``current_datetime``,
     ``current_datetime_iso``, ``timezone``, ``time_resolution_instruction``,
-    ``personal_context``, ``existing_tags``, ``tags_instruction``.
+    ``personal_context``, ``existing_tags``, ``tags_instruction``, plus the
+    session-cost fields added by #610 below.
+
+    ``conversation_id`` scopes the session-cost fields to one conversation's
+    prior turns (``UsageStore.get_conversation_usage`` — never recomputed,
+    always the verbatim sum already recorded for that id). None (a
+    brand-new conversation with no id yet, or a caller that doesn't track
+    one) reports the fields present and zero rather than omitting them.
     """
     now = datetime.now(ZoneInfo(settings.timezone))
+    session_usage = get_usage_store().get_conversation_usage(conversation_id)
     return {
         "current_datetime": now.strftime("%A, %B %d, %Y at %I:%M %p %Z"),
         "current_datetime_iso": now.isoformat(),
@@ -210,6 +219,20 @@ def build_turn_context(persona_id: str | None = None) -> dict:
         "personal_context": settings.personal_context(persona_id or ""),
         "existing_tags": _get_existing_tags(),
         "tags_instruction": TAGS_INSTRUCTION,
+        # Session-to-date cost (#610): the verbatim sum of every turn
+        # already recorded for this conversation, EXCLUDING the turn
+        # currently being built (its own usage isn't recorded until its
+        # stream finishes, after this context was already handed out).
+        # This is a **floor, not an exact total**: a turn whose provider
+        # reported no cost is recorded as cost_usd=0.0 repo-wide (there is
+        # no separate "unpriced" marker anywhere in the usage store, and
+        # inferring one from which turns look free would be a guess
+        # presented as fact) — so state it as a floor whenever reporting
+        # it, never as a precise total.
+        "session_cost_usd": session_usage["cost_usd"],
+        "session_turn_count": session_usage["turn_count"],
+        "session_input_tokens": session_usage["input_tokens"],
+        "session_output_tokens": session_usage["output_tokens"],
     }
 
 

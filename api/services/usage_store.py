@@ -98,6 +98,55 @@ class UsageStore:
             conn.commit()
             return cursor.lastrowid
 
+    def get_conversation_usage(self, conversation_id: Optional[str]) -> dict:
+        """
+        Session-to-date usage for one conversation (#610): the sum of every
+        turn already recorded under `conversation_id`, for a caller that
+        wants to report "what has this conversation cost so far" without
+        recomputing anything.
+
+        Deliberately excludes the turn currently being built: this reads
+        only rows a prior call to `record_usage()` already wrote, and the
+        in-flight turn's row (if any) isn't written until its own stream
+        finishes.
+
+        Returns all-zero for a conversation with no recorded usage
+        (including `conversation_id=None`, e.g. the first turn of a
+        brand-new conversation) -- present and zero rather than raising,
+        since "no usage yet" is a normal state, not an error.
+
+        This is a **floor, not an exact total**: a turn whose provider
+        reported no cost is recorded as `cost_usd=0.0` repo-wide (see
+        `record_usage()` callers — there is no separate "unpriced" marker
+        anywhere in this store), so a summed `0.0` can mean either "these
+        turns were free" or "some of them were unpriced." Callers must
+        present the figure as a floor rather than implying precision either
+        way — see `build_turn_context()`'s `session_cost_usd` docstring.
+
+        Returns:
+            Dict with cost_usd, input_tokens, output_tokens (verbatim sums)
+            and turn_count (how many recorded turns the sum covers).
+        """
+        if not conversation_id:
+            return {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "turn_count": 0}
+
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT SUM(cost_usd), SUM(input_tokens), SUM(output_tokens), COUNT(*)
+                FROM usage WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+
+        cost, input_tokens, output_tokens, turn_count = row
+        return {
+            "cost_usd": cost or 0.0,
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "turn_count": turn_count or 0,
+        }
+
     def get_usage_stats(
         self,
         days: int = None,

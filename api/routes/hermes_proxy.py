@@ -146,7 +146,7 @@ def _build_envelope(raw_body: bytes) -> bytes:
         # from `persona_id` alone, unlike the native path's Telegram-preamble
         # reverse lookup above — Hermes turns always carry a persona_id (or
         # default to "primary"), so that reverse lookup doesn't apply here.
-        "turn": build_turn_context(persona_id),
+        "turn": build_turn_context(persona_id, parsed.conversation_id),
     }
     return json.dumps(data).encode("utf-8")
 

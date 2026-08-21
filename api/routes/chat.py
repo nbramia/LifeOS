@@ -266,7 +266,7 @@ class TagCount(BaseModel):
 
 
 class TurnContextResponse(BaseModel):
-    """Response for the per-turn context endpoint (#591)."""
+    """Response for the per-turn context endpoint (#591, extended by #610)."""
     current_datetime: str
     current_datetime_iso: str
     timezone: str
@@ -274,13 +274,18 @@ class TurnContextResponse(BaseModel):
     personal_context: str
     existing_tags: list[TagCount]
     tags_instruction: str
+    session_cost_usd: float
+    session_turn_count: int
+    session_input_tokens: int
+    session_output_tokens: int
 
 
 @router.get("/chat/turn-context", response_model=TurnContextResponse)
-async def turn_context(persona_id: str = "primary", modality: str = "text"):
+async def turn_context(persona_id: str = "primary", modality: str = "text", conversation_id: Optional[str] = None):
     """Read-only per-turn context: current date/time, timezone, the
     relative-time-resolution instruction, the persona-scoped personal-context
-    block, and existing task tags with usage counts.
+    block, existing task tags with usage counts, and (#610) session-to-date
+    cost/token totals for `conversation_id`.
 
     This is the same computation `build_system_prompt` folds into the native
     system prompt, exported as structured JSON (no Anthropic content-block
@@ -292,11 +297,16 @@ async def turn_context(persona_id: str = "primary", modality: str = "text"):
     doesn't currently change any field here — voice-specific material
     (a persona's spoken-style rules) lives in `persona`, not `turn`.
 
+    `conversation_id` is optional — omitted (or a conversation with no
+    recorded usage yet) reports the session-cost fields present and zero
+    rather than erroring or omitting them. `session_cost_usd` is a floor,
+    not an exact total — see `build_turn_context()`'s docstring.
+
     400 if `persona_id` isn't a known persona.
     """
     if settings.resolve_persona(persona_id) is None:
         raise HTTPException(status_code=400, detail=f"Unknown persona_id: {persona_id!r}")
-    return build_turn_context(persona_id)
+    return build_turn_context(persona_id, conversation_id)
 
 
 # Attachment configuration

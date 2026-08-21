@@ -19,6 +19,8 @@ _TURN_KEYS = {
     "current_datetime", "current_datetime_iso", "timezone",
     "time_resolution_instruction", "personal_context",
     "existing_tags", "tags_instruction",
+    "session_cost_usd", "session_turn_count",
+    "session_input_tokens", "session_output_tokens",
 }
 
 
@@ -47,6 +49,11 @@ def test_shape_and_literal_keys(client):
     assert isinstance(body["personal_context"], str)
     assert isinstance(body["existing_tags"], list)
     assert isinstance(body["tags_instruction"], str) and body["tags_instruction"]
+    # No conversation_id given -- present and zero, not omitted or an error.
+    assert body["session_cost_usd"] == 0.0
+    assert body["session_turn_count"] == 0
+    assert body["session_input_tokens"] == 0
+    assert body["session_output_tokens"] == 0
 
 
 def test_defaults_to_primary_persona(client):
@@ -173,3 +180,68 @@ def test_read_only_does_not_mutate_tags(client, tmp_path, monkeypatch):
     first = client.get("/api/chat/turn-context").json()["existing_tags"]
     second = client.get("/api/chat/turn-context").json()["existing_tags"]
     assert first == second == [{"tag": "work", "count": 1}]
+
+
+# ---------------------------------------------------------------------------
+# Session-to-date cost (#610) — `conversation_id` scopes `session_cost_usd`
+# and friends to one conversation's already-recorded usage.
+# ---------------------------------------------------------------------------
+
+def test_session_cost_sums_prior_turns_for_the_conversation_id(client):
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()  # per-test isolated singleton (conftest)
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-x",
+    )
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=50, output_tokens=25,
+        cost_usd=0.001, conversation_id="conv-x",
+    )
+    # A different conversation's usage must never leak into this sum.
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=999, output_tokens=999,
+        cost_usd=9.99, conversation_id="conv-y",
+    )
+
+    resp = client.get("/api/chat/turn-context", params={"conversation_id": "conv-x"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_cost_usd"] == pytest.approx(0.003)
+    assert body["session_input_tokens"] == 150
+    assert body["session_output_tokens"] == 75
+    assert body["session_turn_count"] == 2
+
+
+def test_session_cost_unknown_conversation_id_is_zero_not_an_error(client):
+    resp = client.get("/api/chat/turn-context", params={"conversation_id": "never-seen"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_cost_usd"] == 0.0
+    assert body["session_turn_count"] == 0
+
+
+def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(client):
+    """A conversation containing a turn recorded with cost_usd=0.0 (free or
+    simply unreported by its provider -- the store doesn't distinguish the
+    two) must still report a truthful sum and turn count for the whole
+    conversation, not error or silently drop it."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-mixed",
+    )
+    store.record_usage(
+        model="some-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-mixed",
+    )
+
+    body = client.get("/api/chat/turn-context", params={"conversation_id": "conv-mixed"}).json()
+
+    assert body["session_cost_usd"] == pytest.approx(0.002)
+    assert body["session_input_tokens"] == 110
+    assert body["session_output_tokens"] == 60
+    assert body["session_turn_count"] == 2
