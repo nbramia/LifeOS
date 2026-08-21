@@ -44,6 +44,12 @@ _EXPLICIT_MEMORY_RE = re.compile(
     r"note\s+(?:that\s+)?|save\s+this\s+as\s+(?:a\s+)?memory\s*:\s*)(.+?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+_IMPLICIT_CAPTURE_RE = re.compile(
+    r"^\s*(?:i\s+(?:want|would\s+like|plan|hope|intend|need|am\s+going)\s+to\b|"
+    r"i(?:'m|\s+am)\s+(?:building|working\s+on|creating|developing)\b|"
+    r"(?:my\s+)?(?:goal|project|idea|plan|vision)\s*(?:is|:|-)\b)",
+    re.IGNORECASE,
+)
 
 
 def _explicit_memory_content(question: str) -> str | None:
@@ -53,6 +59,22 @@ def _explicit_memory_content(question: str) -> str | None:
     """
     match = _EXPLICIT_MEMORY_RE.match(question or "")
     return match.group(1).strip() if match else None
+
+
+def _capture_candidate(question: str) -> str | None:
+    """Return meaningful personal capture text without requiring a command.
+
+    Explicit remember requests always qualify. Common first-person goal/idea
+    statements qualify as inbox captures; reminders (``remember to``) do not.
+    Other conversation remains conversational unless the model chooses a tool.
+    """
+    explicit = _explicit_memory_content(question)
+    if explicit:
+        return explicit
+    text = (question or "").strip()
+    if text and "?" not in text and _IMPLICIT_CAPTURE_RE.search(text):
+        return text
+    return None
 
 
 # =============================================================================
