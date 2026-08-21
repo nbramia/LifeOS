@@ -136,11 +136,12 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 
 ### GET /api/chat/turn-context
 
-Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, and existing task tags with usage counts. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration (#591). Never creates, mutates, or persists anything.
+Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, existing task tags with usage counts, and (#610) session-to-date cost/token totals. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration (#591). Never creates, mutates, or persists anything.
 
 **Query Parameters:**
 - `persona_id` (optional, default `"primary"`) — same registry `GET /api/personas` resolves against. Unknown ids return **400**.
 - `modality` (optional, default `"text"`) — accepted for shape symmetry with [`POST /api/ask/stream`](#post-apiaskstream); no field in the response currently varies with it (voice-specific material lives in a persona's `voice_rules`, not here).
+- `conversation_id` (optional, default none) — scopes `session_cost_usd` and friends (#610) to that conversation's already-recorded usage. Omitted, or a conversation with no recorded usage yet, reports those fields present and zero rather than omitting them.
 
 **Response:**
 ```json
@@ -151,12 +152,17 @@ Read-only per-turn context: the current date/time, the relative-time-resolution 
   "time_resolution_instruction": "When the user asks for something time-relative...",
   "personal_context": "",
   "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
-  "tags_instruction": "When the user asks to tag a task, prefer an existing tag..."
+  "tags_instruction": "When the user asks to tag a task, prefer an existing tag...",
+  "session_cost_usd": 0.0031,
+  "session_turn_count": 2,
+  "session_input_tokens": 300,
+  "session_output_tokens": 130
 }
 ```
 
 - `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
 - `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
+- `session_cost_usd`/`session_input_tokens`/`session_output_tokens` are the verbatim sum of every turn already recorded under `conversation_id`, excluding the turn currently being built; `session_turn_count` is how many recorded turns that sum covers. `session_cost_usd` is always a **floor, not an exact total** — a turn whose provider reported no cost is recorded as `cost_usd=0.0` indistinguishably from a turn that genuinely cost zero, so the figure must be presented as a lower bound regardless — see [client-surfaces.md](../technical/client-surfaces.md) § "Session-to-date cost" for the full contract.
 - This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
 
 ### POST /api/chat/handoff

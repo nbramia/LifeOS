@@ -397,6 +397,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
         "existing_tags", "tags_instruction",
+        "session_cost_usd", "session_turn_count",
+        "session_input_tokens", "session_output_tokens",
     }
     assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
     assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
@@ -445,6 +447,101 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
     assert envelope_turn == endpoint_turn
+
+
+# ---------------------------------------------------------------------------
+# Session-to-date cost (#610) — `lifeos_context.turn` carries the verbatim
+# sum of this conversation's already-recorded usage, never `persona` (which
+# must stay cacheable/turn-invariant), scoped by the request's own
+# `conversation_id` and excluding the in-flight turn.
+# ---------------------------------------------------------------------------
+
+async def test_session_cost_lands_in_turn_never_in_persona(proxy_client):
+    """The cache-busting regression this issue exists to prevent: a
+    cumulative, every-turn-changing figure in `persona` would invalidate a
+    consumer's prompt cache on every single turn."""
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+
+    assert "session_cost_usd" in ctx["turn"]
+    for key in ("session_cost_usd", "session_turn_count",
+                "session_input_tokens", "session_output_tokens"):
+        assert key not in ctx["persona"]
+
+
+async def test_session_cost_sums_prior_turns_and_excludes_the_in_flight_one(proxy_client):
+    """Seeded usage for this request's own `conversation_id` must be summed
+    into the envelope -- and, since the stub backend below emits no `usage`
+    event of its own, nothing from *this* turn is added on top, proving the
+    figure reflects only turns already completed before this one started."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()  # per-test isolated singleton (conftest)
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-in-progress",
+    )
+    store.record_usage(
+        model="deepseek-v3-fireworks", input_tokens=200, output_tokens=80,
+        cost_usd=0.0009, conversation_id="conv-in-progress",
+    )
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "what has this cost so far?", "conversation_id": "conv-in-progress"},
+    )
+    assert resp.status_code == 200
+    turn = json.loads(_received["body"])["lifeos_context"]["turn"]
+
+    assert turn["session_cost_usd"] == pytest.approx(0.002 + 0.0009)
+    assert turn["session_input_tokens"] == 300
+    assert turn["session_output_tokens"] == 130
+    assert turn["session_turn_count"] == 2
+
+
+async def test_session_cost_fresh_conversation_is_zero_not_an_error(proxy_client):
+    """No `conversation_id` on the request (the first turn of a brand-new
+    conversation) reports the fields present and zero rather than omitting
+    them or failing."""
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    turn = json.loads(_received["body"])["lifeos_context"]["turn"]
+
+    assert turn["session_cost_usd"] == 0.0
+    assert turn["session_turn_count"] == 0
+    assert turn["session_input_tokens"] == 0
+    assert turn["session_output_tokens"] == 0
+
+
+async def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(proxy_client):
+    """A conversation containing a turn recorded with cost_usd=0.0 (free or
+    simply unreported by its provider -- the store doesn't distinguish the
+    two, and this field must not pretend it does) must still report a
+    truthful sum and turn count for the whole conversation, rather than
+    erroring or silently dropping the zero-cost turn."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-mixed",
+    )
+    store.record_usage(
+        model="some-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-mixed",
+    )
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-mixed"},
+    )
+    assert resp.status_code == 200
+    turn = json.loads(_received["body"])["lifeos_context"]["turn"]
+
+    assert turn["session_cost_usd"] == pytest.approx(0.002)
+    assert turn["session_input_tokens"] == 110
+    assert turn["session_output_tokens"] == 60
+    assert turn["session_turn_count"] == 2
 
 
 # ---------------------------------------------------------------------------

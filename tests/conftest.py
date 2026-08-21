@@ -359,6 +359,39 @@ def _isolate_gmail_draft_ledger(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_usage_store_db(tmp_path, monkeypatch):
+    """Stop tests from opening (and writing to) the production usage-
+    tracking DB (#610).
+
+    ``UsageStore`` is a process-wide singleton (``get_usage_store()``) keyed
+    off ``settings.chroma_path`` — the real ``data/usage.db`` on whatever
+    machine runs the suite. ``build_turn_context()``
+    (``api/services/agent_system_prompt.py``) now calls it on every call to
+    look up session-to-date cost, so any test exercising
+    ``GET /api/chat/turn-context`` or the Hermes envelope without patching
+    it would open (and, via ``record_usage()``, write to) production data.
+    The native orchestrator's own system prompt (``build_system_prompt()``)
+    does not call ``build_turn_context()`` and is unaffected. Redirect the
+    shared singleton itself to a per-test tmp instance, mirroring
+    ``_isolate_gmail_draft_ledger`` above — every caller that imports
+    ``get_usage_store`` (``hermes_proxy.py``, ``agent_system_prompt.py``,
+    ``chat.py``, ...) reads the same patched global, so a test can seed rows
+    through any one of them and see them from any other. Tests that need
+    their own isolated instance (e.g. tests/test_hermes_proxy.py,
+    tests/test_usage_store.py) still patch a specific call site's imported
+    name with their own store, which simply overrides this default for that
+    test.
+    """
+    import api.services.usage_store as usage_store_mod
+
+    monkeypatch.setattr(
+        usage_store_mod,
+        "_usage_store",
+        usage_store_mod.UsageStore(str(tmp_path / "usage.db")),
+    )
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """

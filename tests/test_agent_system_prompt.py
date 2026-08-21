@@ -110,9 +110,17 @@ def test_build_turn_context_shape(tm):
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
         "existing_tags", "tags_instruction",
+        "session_cost_usd", "session_turn_count",
+        "session_input_tokens", "session_output_tokens",
     }
     assert turn["existing_tags"] == []
     assert turn["personal_context"] == ""
+    # No conversation_id given -- a fresh/unscoped session reports zero
+    # rather than omitting the fields or erroring (#610).
+    assert turn["session_cost_usd"] == 0.0
+    assert turn["session_turn_count"] == 0
+    assert turn["session_input_tokens"] == 0
+    assert turn["session_output_tokens"] == 0
 
 
 def test_build_turn_context_existing_tags_populated(tm):
@@ -141,6 +149,75 @@ def test_build_turn_context_personal_context_scoped_to_persona_id(tm, monkeypatc
     assert "Sam" in agent_system_prompt.build_turn_context("therapist")["personal_context"]
     assert agent_system_prompt.build_turn_context("primary")["personal_context"] == ""
     assert agent_system_prompt.build_turn_context(None)["personal_context"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Session-to-date cost (#610) — a model that can't see what its own
+# conversation has cost so far can't reason about its own expense (issue
+# #610). `build_turn_context()`'s `session_*` fields expose the verbatim
+# sum already recorded in the usage store (never recomputed), scoped to
+# `conversation_id`, excluding the in-flight turn (its own usage isn't
+# written until its stream finishes, after this context is built).
+# ---------------------------------------------------------------------------
+
+def test_build_turn_context_sums_prior_turns_for_the_conversation(tm):
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()  # the per-test isolated singleton (conftest)
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-a",
+    )
+    store.record_usage(
+        model="deepseek-v3-fireworks", input_tokens=200, output_tokens=80,
+        cost_usd=0.0009, conversation_id="conv-a",
+    )
+    # A different conversation's usage must never leak into this sum.
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=999, output_tokens=999,
+        cost_usd=9.99, conversation_id="conv-b",
+    )
+
+    turn = agent_system_prompt.build_turn_context(conversation_id="conv-a")
+    assert turn["session_cost_usd"] == pytest.approx(0.002 + 0.0009)
+    assert turn["session_input_tokens"] == 300
+    assert turn["session_output_tokens"] == 130
+    assert turn["session_turn_count"] == 2
+
+
+def test_build_turn_context_unknown_conversation_id_reports_zero(tm):
+    """A conversation_id that has never recorded usage (e.g. the very first
+    turn under a freshly-minted id) is a normal state, not an error --
+    present-and-zero rather than absent or raising."""
+    turn = agent_system_prompt.build_turn_context(conversation_id="never-seen-before")
+    assert turn["session_cost_usd"] == 0.0
+    assert turn["session_turn_count"] == 0
+    assert turn["session_input_tokens"] == 0
+    assert turn["session_output_tokens"] == 0
+
+
+def test_build_turn_context_zero_cost_turn_still_reports_a_truthful_sum(tm):
+    """A conversation containing a turn recorded with cost_usd=0.0 (free or
+    simply unreported by its provider -- the store doesn't distinguish the
+    two, see UsageStore.get_conversation_usage's docstring) must still
+    report a truthful sum and turn count, not error or silently drop it."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-mixed",
+    )
+    store.record_usage(
+        model="some-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-mixed",
+    )
+
+    turn = agent_system_prompt.build_turn_context(conversation_id="conv-mixed")
+    assert turn["session_cost_usd"] == pytest.approx(0.002)
+    assert turn["session_input_tokens"] == 110
+    assert turn["session_output_tokens"] == 60
+    assert turn["session_turn_count"] == 2
 
 
 def test_no_persona_block_by_default(tm):
