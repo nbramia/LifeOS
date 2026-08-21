@@ -97,6 +97,10 @@ explicit remember requests and for meaningful personal statements that should
 survive the current conversation. Memories are automatically retrieved when
 relevant.
 
+**review_inbox:**
+Reviews raw messages captured for later classification. Use this for weekly
+reviews or when the user asks what still needs to be processed.
+
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
 
