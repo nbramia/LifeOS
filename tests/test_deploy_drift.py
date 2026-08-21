@@ -593,3 +593,68 @@ def test_main_no_thrash_on_repeat_run_with_no_new_commits(tmp_path: Path):
     assert restart_log_after.count("restart lifeos-api") == 1, (
         "second tick with no new commits restarted an already-current service"
     )
+
+
+@pytest.mark.unit
+def test_main_proceeds_when_only_untracked_files_are_present(tmp_path: Path):
+    """#634: an untracked path must not block the deploy.
+
+    `.worktrees/` is the conventional location for worktree-based development
+    here — `.git/hooks/post-commit` already expects worktrees to exist — and it
+    is untracked. While the guard counted untracked paths, its mere presence
+    made `git status --porcelain` non-empty, so auto-deploy skipped every tick
+    silently: 62 consecutive skips on the real host, during which #631's drift
+    check never executed at all. The service stayed stale and the only evidence
+    was a log line nobody reads.
+    """
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    stale = code_epoch - 3600
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(stale))
+
+    # Exactly the real-world shape: an untracked directory at the repo root.
+    (repo / ".worktrees" / "issue-999").mkdir(parents=True)
+    (repo / ".worktrees" / "issue-999" / "scratch.py").write_text("x = 1\n", encoding="utf-8")
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip(), "fixture must actually leave the tree untracked-dirty"
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "not auto-deploying over local edits" not in deploy_log, deploy_log
+    restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
+    assert "restart lifeos-api" in restart_log, (deploy_log, restart_log)
+
+
+@pytest.mark.unit
+def test_main_still_skips_when_a_tracked_file_is_modified(tmp_path: Path):
+    """The guard's actual purpose survives #634's narrowing: uncommitted edits
+    to tracked code still stop the deploy. Loosening to
+    `--untracked-files=no` must not become "never skip"."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    stale = code_epoch - 3600
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(stale))
+
+    tracked = next(
+        p for p in (repo / "api").rglob("*.py")
+        if subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(p.relative_to(repo))],
+            cwd=repo, capture_output=True,
+        ).returncode == 0
+    )
+    tracked.write_text(tracked.read_text(encoding="utf-8") + "\n# local edit\n", encoding="utf-8")
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    deploy_log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "not auto-deploying over local edits" in deploy_log, deploy_log
+    restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
+    assert "restart lifeos-api" not in restart_log, restart_log
