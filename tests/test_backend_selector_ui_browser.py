@@ -76,7 +76,8 @@ def _wait_for_backend_ready(page: Page):
 
 def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=True,
                 hermes_status_fails=False, hermes_status_hangs=False, status_timeout_ms=None,
-                session_items=None, personas=None, conversations=None):
+                session_items=None, personas=None, personas_fails=False,
+                conversations=None, conversation_list=None):
     """Load `/chat` with `/api/agent/status` and `/api/hermes/status` stubbed,
     and every other `/api/` call stubbed empty so nothing depends on a running
     server. `session_items` are written to sessionStorage before any app JS
@@ -93,11 +94,25 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
     instead of falling through to the generic `{}` stub — needed to assert
     what `renderPersonaOptions()` does with more than the bare primary persona.
 
+    `personas_fails` answers `/api/personas` with a 500 — a genuine discovery
+    *failure*, distinct from the generic `{}` stub any other test falls
+    through to (which is a 200 with no `personas` key: a successful response
+    that happens to carry zero personas, not a failure to discover any).
+    `persona.js` treats those two differently (#607) — only the latter is
+    ever persisted as confirmation that a stored persona id is gone.
+
     `conversations` (#592) maps a conversation id to the body `GET
     /api/conversations/{id}` returns for it (the shape `loadConversation()`
     expects: `{"title": ..., "messages": [{"role": ..., "content": ...}]}`)
     — needed to assert what a backend switch renders for a stored id, instead
     of falling through to the generic `{}` stub.
+
+    `conversation_list` (#607) stubs the body of the sidebar's `GET
+    /api/conversations` *list* call (no id in the path) with
+    `{"conversations": conversation_list}` — needed to assert what actually
+    renders in the sidebar on first load, e.g. a Hermes-tagged thread, rather
+    than falling through to the generic `{}` stub (which `loadConversations()`
+    treats as an empty list).
     """
     if status_timeout_ms is not None:
         page.add_init_script(
@@ -125,12 +140,17 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
             else:
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"available": hermes_available}))
+        elif personas_fails and "/api/personas" in url:
+            route.fulfill(status=500, content_type="application/json", body="{}")
         elif personas is not None and "/api/personas" in url:
             route.fulfill(status=200, content_type="application/json",
                           body=json.dumps({"personas": personas}))
         elif conversations is not None and "/api/conversations/" in url and conv_id in conversations:
             route.fulfill(status=200, content_type="application/json",
                           body=json.dumps(conversations[conv_id]))
+        elif conversation_list is not None and "/api/conversations" in url and "/api/conversations/" not in url:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"conversations": conversation_list}))
         else:
             route.fulfill(status=200, content_type="application/json", body="{}")
 
@@ -581,3 +601,216 @@ class TestSidebarBackendFilter:
             page.locator("#backendHermes").click()
         params = parse_qs(urlparse(req_info.value.url).query)
         assert params.get("backend") == ["hermes"]
+
+
+class TestSidebarInitialLoadRace:
+    """#607: the initial sidebar load must wait for backend resolution rather
+    than racing it. Before the fix, `persona.js`'s `loadPersonas()` fired an
+    unresolved-backend listing (`backend=lifeos`) in parallel with
+    `initBackend()`'s corrected one; both requests were in flight
+    simultaneously with no guarantee on the order their *responses* landed,
+    so whichever settled last silently won the final write to
+    `state.allConversations`. Request order alone (asserted by
+    `TestSidebarBackendFilter` above) can't catch that — requests are always
+    sent in the same order; only responses could arrive out of order. The fix
+    removes the early listing entirely, so these tests pin "exactly one
+    request, already carrying the resolved backend" rather than re-deriving
+    the race.
+    """
+
+    @staticmethod
+    def _list_request_backends(page: Page, base_url, **open_chat_kwargs):
+        requests = []
+        page.on(
+            "request",
+            lambda req: requests.append(parse_qs(urlparse(req.url).query).get("backend", [None])[0])
+            if "/api/conversations" in req.url and "/api/conversations/" not in req.url
+            else None,
+        )
+        _open_chat(page, base_url, **open_chat_kwargs)
+        return requests
+
+    def test_exactly_one_listing_request_when_default_resolves_to_lifeos(self, page: Page, chat_base_url):
+        # Hermes unconfigured: the resolved default (lifeos) is the same value
+        # a pre-resolution guess would already use — exactly the "resolves to
+        # the default" case the AC calls out. A "list early, then refresh"
+        # implementation sends two identical requests here; the fix sends one.
+        backends = self._list_request_backends(page, chat_base_url, hermes_available=False)
+        assert backends == ["lifeos"]
+
+    def test_exactly_one_listing_request_when_default_resolves_to_hermes(self, page: Page, chat_base_url):
+        # Hermes configured: still exactly one request, and it already carries
+        # the resolved backend — there's no earlier wrong-backend request left
+        # in flight for a slow response to race against.
+        backends = self._list_request_backends(page, chat_base_url, hermes_available=True)
+        assert backends == ["hermes"]
+
+    def test_hermes_thread_visible_on_first_load_without_switching(self, page: Page, chat_base_url):
+        thread = {
+            "id": "conv-hermes-boot", "title": "Hermes boot thread",
+            "created_at": "2026-08-19T10:00:00", "updated_at": "2026-08-19T10:00:00",
+            "message_count": 2, "persona_id": "primary",
+        }
+        backends = self._list_request_backends(
+            page, chat_base_url, hermes_available=True, conversation_list=[thread],
+        )
+        # The property the issue calls out explicitly: assert the *sent*
+        # parameter, not just what renders — with only this one thread present,
+        # a wrong filter could still render a correct-looking list by
+        # coincidence (that's exactly how the bug shipped undetected).
+        assert backends == ["hermes"]
+        expect(page.locator(".conversation-title")).to_contain_text("Hermes boot thread")
+
+    def test_reload_produces_the_same_sidebar_as_the_fresh_load(self, page: Page, chat_base_url):
+        # Stand-in for the issue's two entry paths (opening /chat directly vs.
+        # navigating to CRM and back): both re-run the identical boot sequence,
+        # so a reload must resolve to the same backend and render the same list.
+        thread = {
+            "id": "conv-hermes-boot", "title": "Hermes boot thread",
+            "created_at": "2026-08-19T10:00:00", "updated_at": "2026-08-19T10:00:00",
+            "message_count": 1, "persona_id": "primary",
+        }
+        _open_chat(page, chat_base_url, hermes_available=True, conversation_list=[thread])
+        expect(page.locator(".conversation-title")).to_contain_text("Hermes boot thread")
+        first_backend = page.evaluate("window.lifeChat.config.backend")
+
+        page.reload()
+        page.wait_for_selector("#backendLifeos", state="attached")
+        _wait_for_backend_ready(page)
+        expect(page.locator(".conversation-title")).to_contain_text("Hermes boot thread")
+        assert page.evaluate("window.lifeChat.config.backend") == first_backend
+
+
+class TestSidebarPersonaValidationRace:
+    """#607 follow-up: moving the sidebar's single listing into initBackend()
+    fixed the backend race, but `config.personaId` isn't fully resolved just
+    because `loadPersonas()` has started. `persona.js` restores the stored id
+    synchronously, but only *validates* it — falling back to `primary` if the
+    fetched persona list doesn't contain it — after its own `/api/personas`
+    await. `loadPersonas()` runs unawaited alongside `initBackend()`, so if the
+    persona fetch resolves slower than the (near-instant) backend availability
+    checks, the single listing could fire while `config.personaId` still holds
+    a stale, unvalidated id.
+
+    Simulating that ordering with a timed delay doesn't work here: Playwright's
+    sync API dispatches every route callback on one thread via greenlet
+    switching, so a callback that blocks (`time.sleep`) blocks *every other*
+    route's callback too — it doesn't produce "backend resolves fast, persona
+    resolves slow", it just serializes everything behind the sleep. Instead,
+    the `/api/personas` route is held open (never fulfilled) until the test
+    explicitly releases it, which lets the other routes resolve immediately
+    while persona resolution provably hasn't happened yet.
+    """
+
+    def test_listing_waits_for_persona_validation_before_firing(self, page: Page, chat_base_url):
+        requests = []
+        held = {}
+
+        def handler(route):
+            url = route.request.url
+            if "/api/agent/status" in url:
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"available": False}))
+            elif "/api/hermes/status" in url:
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"available": False}))
+            elif "/api/personas" in url:
+                held["route"] = route  # held; released explicitly below
+            elif "/api/conversations" in url and "/api/conversations/" not in url:
+                requests.append(parse_qs(urlparse(url).query).get("persona_id", [None])[0])
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"conversations": []}))
+            else:
+                route.fulfill(status=200, content_type="application/json", body="{}")
+
+        # A stored persona id that "/api/personas" (below) will not offer —
+        # the reader must fall back to primary, but only once it's actually
+        # heard back from that endpoint.
+        page.add_init_script(
+            "window.sessionStorage.setItem('lifeos:chat:persona_id', 'deleted-bot');"
+        )
+        page.route("**/api/**", handler)
+        page.goto(f"{chat_base_url}/chat")
+        page.wait_for_selector("#backendLifeos", state="attached")
+
+        # Give the stubbed (near-instant) backend availability checks ample
+        # real time to resolve while /api/personas is still deliberately held
+        # open — if the sidebar lists on backend resolution alone, it does so
+        # in this window, before persona validation could possibly have run.
+        page.wait_for_timeout(300)
+        assert requests == [], (
+            "the sidebar listed before persona validation finished — it must "
+            "wait on BOTH backend and persona resolution, not backend alone"
+        )
+
+        # Release "/api/personas": "deleted-bot" isn't in the list, so
+        # loadPersonas() must correct config.personaId to "primary" before
+        # the (still-pending) listing is allowed to fire.
+        held["route"].fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"personas": [{"id": "primary", "label": "Primary"}]}),
+        )
+        _wait_for_backend_ready(page)  # only resolves once persona is unblocked too
+        assert requests == ["primary"]
+        assert page.evaluate("window.lifeChat.config.personaId") == "primary"
+
+
+class TestSidebarListsDespitePersonaFailure:
+    """#607 follow-up: `backend.js` now awaits `loadPersonas()`'s promise
+    before its single listing, which opens a new zero-listing path if that
+    promise ever rejects — `await personasReady` with no catch would throw
+    and skip `loadConversations()` entirely, leaving the sidebar permanently
+    empty for the whole session (worse than the original bug, which was only
+    intermittently wrong). `persona.js` is designed to never reject (every
+    risky call is internally try/caught), but the listing must not depend on
+    that guarantee holding forever — so `backend.js` swallows a rejection
+    with `.catch(() => {})` before proceeding. `__LIFEOS_TEST_FORCE_PERSONAS_REJECT__`
+    (mirroring `STATUS_TIMEOUT_MS`'s testability hook) forces the rejection
+    this test needs, since every real path in `loadPersonas()` is already
+    guarded and can't be made to reject by manipulating stubs alone."""
+
+    def test_listing_still_fires_when_persona_resolution_rejects(self, page: Page, chat_base_url):
+        thread = {
+            "id": "conv-1", "title": "Should still render", "created_at": "2026-08-19T10:00:00",
+            "updated_at": "2026-08-19T10:00:00", "message_count": 1, "persona_id": "primary",
+        }
+        page.add_init_script("window.__LIFEOS_TEST_FORCE_PERSONAS_REJECT__ = true;")
+        _open_chat(page, chat_base_url, hermes_available=False, conversation_list=[thread])
+        # backendReady itself must resolve — the swallowed rejection must not
+        # propagate out of initBackend() either.
+        expect(page.locator(".conversation-title")).to_contain_text("Should still render")
+
+
+class TestPersonaIdPersistenceOnDiscoveryFailure:
+    """#607 follow-up: the in-memory fallback to `primary` when a stored
+    persona id can't be confirmed (discovery failed, or succeeded without it)
+    is correct for the current boot — every caller needs an answer now. But
+    *persisting* that fallback is a separate decision: a transient
+    `/api/personas` failure must not permanently overwrite the user's stored
+    preference, since discovery might simply succeed on the next load. Only a
+    successful response that actually omits the stored id should be written
+    back to sessionStorage."""
+
+    STORAGE_KEY = "lifeos:chat:persona_id"
+
+    def test_failed_discovery_does_not_overwrite_stored_persona_id(self, page: Page, chat_base_url):
+        _open_chat(
+            page, chat_base_url, hermes_available=False,
+            session_items={self.STORAGE_KEY: "custom-bot"},
+            personas_fails=True,  # a genuine discovery failure, not "zero personas"
+        )
+        assert page.evaluate("window.lifeChat.config.personaId") == "primary"  # in-memory fallback
+        assert page.evaluate(
+            f"window.sessionStorage.getItem({json.dumps(self.STORAGE_KEY)})"
+        ) == "custom-bot"  # unchanged in storage — never actually confirmed gone
+
+    def test_successful_discovery_without_stored_id_does_overwrite_it(self, page: Page, chat_base_url):
+        _open_chat(
+            page, chat_base_url, hermes_available=False,
+            session_items={self.STORAGE_KEY: "custom-bot"},
+            personas=[{"id": "primary", "label": "Primary"}],  # confirmed absent
+        )
+        assert page.evaluate("window.lifeChat.config.personaId") == "primary"
+        assert page.evaluate(
+            f"window.sessionStorage.getItem({json.dumps(self.STORAGE_KEY)})"
+        ) == "primary"  # overwritten — discovery actually confirmed it's gone
