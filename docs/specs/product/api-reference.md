@@ -79,9 +79,11 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 | `claude_intent` | `task`, `engine` (`claude_code` \| `codex`) | CLI engine handoff; HTTP clients POST `/api/chat/handoff` |
 | `error` | `message` | Fatal error for this turn |
 | `usage` | `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` | Token usage and cost |
-| `done` | — | Stream complete (optional; HTTP stream close also finalizes) |
+| `done` | — | Stream complete |
 
 **Wire format:** lines `data: {json}\n`. Clients may ignore `routing`, `sources`, `usage`, and `done` if they handle stream close.
+
+**A disconnect no longer stops the turn (#611).** The turn keeps running server-side and persists its complete reply once done — closing the tab, backgrounding the app, or a network switch no longer loses the answer. `POST /api/conversations/{id}/cancel` stops it explicitly; `GET /api/conversations/{id}`'s `active_turn` field reports whether one is still running. `modality: "voice"` is the one exception — a voice turn's disconnect still cancels it immediately, matching pre-#611 behavior, because whisper-relay uses abandoning the stream as its deliberate barge-in/hangup cancel gesture. See [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611) for the full contract.
 
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
@@ -194,7 +196,7 @@ Spawn a CLI engine worker session when the orchestrator emits `claude_intent` on
 - `POST /api/voice/turn/stream` — multipart voice turn (`audio` or `transcript`, plus `backend`, `persona_id`, `conversation_id`) → SSE turn events (`started` / `transcript` / `status_audio` / `response` / `main_audio` / `done` / `error` / `cancelled`); the `done` data is authoritative. Proxied to `LIFEOS_VOICE_GATEWAY_URL` (whisper-relay). Also `POST /api/voice/turn/{turn_id}/cancel` and `GET /api/voice/audio/{turn_id}/{clip_id}`.
 - `POST /api/agent/ask/stream` — text turn for the "Agent" backend; same SSE as [`POST /api/ask/stream`](#post-apiaskstream) but no handoff and no persona. Proxied to `LIFEOS_AGENT_BACKEND_URL` with a bearer token added **server-side** (never exposed to the browser). `GET /api/agent/status` → `{"available": bool}` (drives the UI selector).
 - `POST /api/hermes/ask/stream` — text turn for the "Hermes" backend; same SSE and proxy behavior as the Agent backend above (same factory, `LIFEOS_HERMES_BACKEND_URL`), but the persona picker stays visible client-side, and the route resolves the selected persona and per-turn context and attaches them to the forwarded body as a `lifeos_context` envelope (`{schema_version, modality, persona: {id, label, preamble, voice_rules, orchestrates}, turn: {...}}`, `turn` a sibling of `persona` per [`GET /api/chat/turn-context`](#get-apichatturn-context)) — a cross-repo contract with `nbramia/hermes` pinned on issue #590. Rejects with 400 (before forwarding) on malformed JSON, an unknown `persona_id`, or an orchestrating persona (`doctor`) reaching the route — that last case is a backstop, not the user path: the client diverts an orchestrating persona's turn to [`POST /api/ask/stream`](#post-apiaskstream) instead of here in the first place (#596), tagging the conversation it creates with `backend: "hermes"` so it still shows up in this backend's thread list. `GET /api/hermes/status` → `{"available": bool}`. See [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" for the full schema.
-- **Hermes turns are persisted** (#592), unlike the Agent backend: the route tees the relayed SSE bytes to the browser unchanged and, in parallel, reconstructs the turn from the `conversation_id` and `content` events it already emits (same shapes the native `POST /api/ask/stream` uses) — adopting the id Hermes minted, creating the conversation row (tagged `persona_id` + `backend: "hermes"`) on first sight of it, and storing the user question and assembled assistant reply as two messages. A stream that ends before completion still persists whatever assistant content arrived; a persistence failure is logged and never breaks the turn. This is why `GET /api/conversations?backend=hermes` and the sidebar now show Hermes history at all.
+- **Hermes turns are persisted** (#592) **and survive a client disconnect** (#611), unlike the Agent backend: the route tees the relayed SSE bytes to the browser unchanged and, in parallel, reconstructs the turn from the `conversation_id` and `content` events it already emits (same shapes the native `POST /api/ask/stream` uses) — adopting the id Hermes minted, creating the conversation row (tagged `persona_id` + `backend: "hermes"`) on first sight of it, and storing the user question and assembled assistant reply as two messages. Since #611 the upstream drain runs as a background pump independent of the browser connection, so a disconnect no longer cuts a Hermes turn short either — it persists the *complete* reply, not just whatever had streamed so far. A turn whose upstream connection genuinely ends before a `done` event ever arrived still gets a truncation marker + `routing.truncated` (see [client-surfaces.md](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611)). A persistence failure is logged and never breaks the turn. This is why `GET /api/conversations?backend=hermes` and the sidebar now show Hermes history at all.
 - **Hermes usage is captured too** (#595), by the same tee: a relayed `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model` — the same shape the native path emits) is recorded to the usage store on turn completion, tagged with the conversation id. The cost is recorded **verbatim** from that event, never recomputed — the cost calculator only knows Anthropic pricing and would misprice a non-Anthropic upstream model (Hermes runs DeepSeek via Fireworks). A `usage` event with no `cost_usd` records a zero cost rather than a guess; a turn with no `usage` event writes no row; a malformed one (missing/wrong-typed model or token counts) is ignored. Conversation persistence and usage persistence are independent — neither gates the other. Since this is the same event shape and client handler (`web/chat/ask-stream.js`'s `data.type === 'usage'` branch) the native path already uses, the browser's session-cost display updates with **no client change**. The Agent backend has no equivalent — it isn't tee'd at all, so its turns stay invisible to the usage store. See [client-surfaces.md](../technical/client-surfaces.md) § "Hermes turn persistence" for the observer internals.
 
 See [client-surfaces.md](../technical/client-surfaces.md) and [ADR-016](../../adr/016-voice-gateway-reverse-proxy.md).
@@ -567,13 +569,27 @@ Get conversation with messages. Access by id is **not** persona-scoped — any v
       "routing": null
     }
   ],
-  "pending_question": null
+  "pending_question": null,
+  "active_turn": null
 }
 ```
 
 `role` is `user` or `assistant`.
 
 `pending_question` is present only while a spawned **orchestrating-persona** session (e.g. `doctor`) started from this conversation is awaiting an answer — `{ "session_id": "...", "question": "...", "kind": "..." }` — and is `null`/absent otherwise. `kind` is `goal_approval` (a `[GOAL]` awaiting approval) or `followup` (a `[CLARIFY]`). The client renders an answer affordance when it's present and posts to `/answer` below.
+
+`active_turn` (#611) is present only while a chat turn is running server-side for this conversation — native or Hermes-relayed alike — and `null` otherwise: `{ "turn_id": "...", "conversation_id": "...", "started_at": "2026-08-21T09:14:22" }`. Lets a client that reconnects mid-turn show "still working..." and reach the cancel affordance below. A completed turn's message carries no marker on it in the normal case; an *interrupted* one (cancelled, timed out, caught in a server shutdown, or a genuine stream error) has its content suffixed with a visible cut-off marker and `routing: {"truncated": true, "truncation_reason": "cancelled" | "deadline" | "shutdown" | "stream_error"}` — see [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611).
+
+### POST /api/conversations/{id}/cancel
+
+Stop a chat turn in flight for this conversation (#611) — native or Hermes-relayed. Since a disconnect no longer stops a turn on its own, this is the explicit way to do it (also used internally when a new turn on the same conversation supersedes an old one still running).
+
+**Response:**
+```json
+{ "ok": true, "cancelled": true }
+```
+
+`cancelled` is `false` when nothing was in flight (already finished, or never started) — not an error. **Errors:** `404` no such conversation.
 
 ### POST /api/conversations/{id}/answer
 
