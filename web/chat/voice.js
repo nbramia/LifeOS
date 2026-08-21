@@ -55,7 +55,21 @@ let activeTurnId = null;
 let activeTurnAbort = null;
 let activeAudios = [];
 let playbackChain = Promise.resolve();
-let isPlaying = false;
+// Whether a real clip is currently loading/playing, on *either* the shared
+// (iOS/Android) or per-clip (desktop) element -- set/cleared by
+// playSingleUrl() itself, tied to that specific call's own promise via
+// `.finally()`. This replaced a turn-lifecycle `isPlaying` flag that
+// tracked "is a turn nominally still running" instead of "is audio actually
+// audible right now": a turn that threw after its audio event but before
+// playback settled left that flag stuck, and defensively resetting it in
+// every exit path (see git history, #608) opened a *different* hole --
+// audio already handed to playbackChain keeps playing after the turn's
+// promise settles, so a reset tied to the turn's lifecycle goes stale in
+// exactly the window a tap most needs it (onTalkClick's stop-vs-record
+// branch, the cancel button). Tying the flag to the clip's own settlement
+// instead makes both callers correct regardless of what the enclosing
+// turn's control flow does.
+let clipInFlight = false;
 let thinkingEl = null;
 let ttsAudio = null;
 
@@ -121,6 +135,14 @@ function getTtsAudioElement() {
 
 function unlockTtsAudio() {
   if (!useSharedTtsAudio()) return;
+  // A real clip may already be loading or playing on this shared element.
+  // Reassigning `.src` here would abandon whatever `playUrlOnElement()` call
+  // is in flight for it: that call's `oncanplaythrough` handler is still
+  // bound to the old clip's `resolve`, but with the resource swapped out
+  // from under it, it fires against this silent one instead once *it*
+  // becomes ready -- silently completing the turn without the real clip
+  // ever having played (#608).
+  if (clipInFlight) return;
   const audio = getTtsAudioElement();
   audio.volume = 1;
   audio.src = SILENT_WAV;
@@ -293,7 +315,7 @@ export function initVoice() {
   }
   if (elements.voiceCancelBtn) {
     elements.voiceCancelBtn.addEventListener('click', () => {
-      if (voiceBusy || isPlaying) cancelActiveTurn();
+      if (voiceBusy || clipInFlight) cancelActiveTurn();
       else stopAllAudio();
     });
   }
@@ -328,7 +350,7 @@ function onTalkClick(event) {
   if (voiceBusy || state.isLoading) return;
   if (isStarting) return;
 
-  if (isPlaying) {
+  if (clipInFlight) {
     stopAllAudio();
     return;
   }
@@ -620,19 +642,33 @@ function playUrlOnElement(audio, url) {
 }
 
 function playSingleUrl(url) {
+  // Set *before* touching the element: playUrlOnElement()'s Promise executor
+  // runs synchronously (assigning `.src` immediately, before this function
+  // gets anything back), so a flag set only after that call returns would
+  // still leave a window, right at the start of a clip's load, where
+  // unlockTtsAudio() could steal the element out from under it (#608).
+  // Cleared via `.finally()` below -- tied 1:1 to this call's own promise,
+  // regardless of what the enclosing turn's control flow does. Both readers
+  // (unlockTtsAudio()'s guard, and onTalkClick's/the cancel button's
+  // stop-vs-continue branch) need precisely "is a real clip currently
+  // loading or playing right now", not "is a turn nominally still running".
+  clipInFlight = true;
+  let promise;
   if (useSharedTtsAudio()) {
     const audio = getTtsAudioElement();
     if (!activeAudios.includes(audio)) activeAudios.push(audio);
-    return playUrlOnElement(audio, url);
+    promise = playUrlOnElement(audio, url);
+  } else {
+    promise = new Promise((resolve, reject) => {
+      const audio = new Audio(url);
+      applyPlaybackRate(audio);
+      activeAudios.push(audio);
+      audio.onended = () => resolve();
+      audio.onerror = () => reject(new Error('playback failed'));
+      audio.play().catch(reject);
+    });
   }
-  return new Promise((resolve, reject) => {
-    const audio = new Audio(url);
-    applyPlaybackRate(audio);
-    activeAudios.push(audio);
-    audio.onended = () => resolve();
-    audio.onerror = () => reject(new Error('playback failed'));
-    audio.play().catch(reject);
-  });
+  return promise.finally(() => { clipInFlight = false; });
 }
 
 function enqueueClip(url) {
@@ -640,7 +676,9 @@ function enqueueClip(url) {
   playbackChain = playbackChain
     .then(() => playSingleUrl(url))
     .catch((err) => {
-      if (!isBenignPlaybackError(err)) console.warn('voice playback error:', err);
+      if (isBenignPlaybackError(err)) return;
+      console.warn('voice playback error:', err);
+      reportPlaybackFailed();
     });
   return playbackChain;
 }
@@ -649,11 +687,23 @@ function stopAllAudio() {
   for (const a of activeAudios) {
     a.onended = null;
     a.onerror = null;
+    // A clip still loading (not yet past playUrlOnElement()'s canplaythrough
+    // wait) has this armed too. Left uncleared, a later canplaythrough for
+    // the same element -- browsers can and do refire it, e.g. after the
+    // seek below -- calls its stale start(), which re-attaches onended/
+    // onerror and calls .play() again, resuming the very clip this
+    // function was just asked to stop.
+    a.oncanplaythrough = null;
     a.pause();
     a.currentTime = 0;
   }
   activeAudios = [];
-  isPlaying = false;
+  // Nulling the handlers above (rather than firing them) means the
+  // in-flight playSingleUrl() promise for a stopped clip never settles, so
+  // its own `.finally()` never clears clipInFlight on its own -- reset it
+  // explicitly here so a stopped clip doesn't leave unlockTtsAudio() (or
+  // the stop-vs-continue checks above) permanently guarded off.
+  clipInFlight = false;
 }
 
 function isBenignPlaybackError(err) {
@@ -661,6 +711,20 @@ function isBenignPlaybackError(err) {
   const msg = (err?.message || '').toLowerCase();
   return name === 'NotAllowedError' || name === 'AbortError'
     || msg.includes('not allowed by the user agent') || msg.includes('aborted');
+}
+
+// Reported at most once per turn, so several clips failing in the same turn
+// (a status_audio clip and the main_audio clip, say) don't stack duplicate
+// bubbles. Reset per turn in consumeTurnStream(). A voice turn's spoken reply
+// *is* the output (#608) -- rendering the text alone with no signal that
+// speech failed reads as the assistant ignoring the user, so this follows the
+// same idiom as reportMicBlocked() rather than only logging to the console.
+let reportedPlaybackFailure = false;
+
+function reportPlaybackFailed() {
+  if (reportedPlaybackFailure) return;
+  reportedPlaybackFailure = true;
+  addMessage('⚠️ Couldn’t play the spoken reply', 'assistant');
 }
 
 // --- skip-silent: detect an empty/quiet recording before sending ---
@@ -722,13 +786,8 @@ async function replayMessage(el) {
 async function playUrls(urls) {
   if (!shouldPlayAudio() || !urls.length) return;
   stopAllAudio();
-  isPlaying = true;
-  try {
-    for (const url of urls) {
-      await playSingleUrl(url);
-    }
-  } finally {
-    isPlaying = false;
+  for (const url of urls) {
+    await playSingleUrl(url);
   }
 }
 
@@ -773,6 +832,7 @@ function parseSseChunk(buffer, onEvent) {
 
 async function consumeTurnStream(response) {
   playbackChain = Promise.resolve();
+  reportedPlaybackFailure = false;
   let doneData = null;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -792,13 +852,11 @@ async function consumeTurnStream(response) {
     if (event.type === 'status_audio') {
       if (event.message) setStatus('loading', event.message);  // spoken status text
       if (shouldPlayAudio() && event.url) {
-        isPlaying = true;
         enqueueClip(event.url);
       }
     }
     if (event.type === 'main_audio') {
       if (shouldPlayAudio() && event.url) {
-        isPlaying = true;
         enqueueClip(event.url);
       }
     }
@@ -901,7 +959,6 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
     }
 
     await playbackChain;
-    isPlaying = false;
     showCancel(false);
     setStatus('', 'Ready');
     await maybeAutoContinue();  // re-record if Auto-continue is on
