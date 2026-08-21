@@ -449,6 +449,17 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
+    # (#629) the current in-flight round's cumulative usage-so-far, from
+    # AnthropicLLMClient.astream's "usage_update" event. Only that backend
+    # emits it -- LocalLLMClient.astream never does (its protocol has no
+    # mid-stream usage signal), so these stay 0 for a local-backed turn,
+    # same as before this field existed. Folded into total_input_tokens /
+    # total_output_tokens (and reset to 0) as soon as the round's "done"
+    # event arrives -- see _track_usage -- so a caller reading "usage
+    # accrued so far" must add these to the total_* fields rather than
+    # read either in isolation, or it will double- or under-count.
+    provisional_input_tokens: int = 0
+    provisional_output_tokens: int = 0
 
 
 async def run_agent_loop(
@@ -489,7 +500,9 @@ async def run_agent_loop(
     Yields:
         Dicts with "type" key: "turn_state" (first event, #615 -- a live
         reference to the mutable AgentResult, for a caller that needs
-        accrued usage before the loop reaches its terminal event), "text",
+        accrued usage before the loop reaches its terminal event; #629
+        extends what "accrued so far" means -- see AgentResult's
+        provisional_input_tokens/provisional_output_tokens), "text",
         "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
@@ -563,6 +576,12 @@ async def run_agent_loop(
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
         # Local model has no cost
         result.total_cost_usd = 0.0
+        # (#629) this round's usage is now folded into the totals above --
+        # clear the provisional (in-flight) figures so a caller that adds
+        # provisional_* to total_* (chat.py's cancel handler) doesn't
+        # double-count them once the round has actually closed out.
+        result.provisional_input_tokens = 0
+        result.provisional_output_tokens = 0
 
     # Pass tool definitions through with their cache_control marker intact so
     # Anthropic caches the large, stable tool schema across turns and rounds.
@@ -594,6 +613,13 @@ async def run_agent_loop(
                             yield {"type": "text", "content": event["content"]}
                         elif event["type"] == "tool_calls":
                             tool_use_blocks = openai_tool_calls_to_anthropic(event["calls"])
+                        elif event["type"] == "usage_update":
+                            # (#629) Anthropic-only -- see AgentResult's
+                            # provisional_* fields. Folded into total_* (and
+                            # cleared) by _track_usage once "done" arrives
+                            # below, so this is never added twice.
+                            result.provisional_input_tokens = event["usage"].input_tokens
+                            result.provisional_output_tokens = event["usage"].output_tokens
                         elif event["type"] == "done":
                             usage_this_round = event["usage"]
                             finish_reason = event.get("finish_reason", "")
@@ -742,6 +768,10 @@ async def run_agent_loop(
                     # LLM tried to call tools despite no tools in request —
                     # log and ignore (the text, if any, was already captured)
                     print(f"[agent] Synthesis round produced tool_calls (ignored): {[c.get('function', {}).get('name', '?') for c in event.get('calls', [])]}")
+                elif event["type"] == "usage_update":
+                    # (#629) same provisional tracking as the tool-round loop above.
+                    result.provisional_input_tokens = event["usage"].input_tokens
+                    result.provisional_output_tokens = event["usage"].output_tokens
                 elif event["type"] == "done":
                     _track_usage(event["usage"])
                     print(f"[agent] Synthesis round done: finish_reason={event.get('finish_reason', '?')}, events={synthesis_events}")

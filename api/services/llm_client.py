@@ -499,6 +499,15 @@ class LocalLLMClient:
             {"type": "tool_calls", "calls": [...]}  — tool calls (complete)
             {"type": "done", "usage": LLMUsage, "finish_reason": "..."}
 
+        No ``{"type": "usage_update", ...}`` event (#629): unlike
+        AnthropicLLMClient.astream, this backend's OpenAI-compatible
+        streaming protocol carries no mid-stream usage signal at all, so
+        there's nothing to surface incrementally — usage is only ever known
+        at the terminal "done" chunk above. A caller that tracks a running
+        total from "usage_update" events (to credit a mid-round
+        cancellation for tokens already generated) gets no such credit on
+        this backend; that's a real, documented gap, not a bug to fix here.
+
         ``enable_thinking``/``reasoning_effort`` control reasoning for this
         request only — see ``_reasoning_control_payload``. Both default to
         ``None`` (unset), which adds no new keys to the request body.
@@ -780,9 +789,24 @@ class AnthropicLLMClient:
     ) -> AsyncGenerator[dict, None]:
         """Async streaming via Anthropic API.
 
-        Yields the same event format as LocalLLMClient.astream(). ``timeout``
-        (seconds) sets a per-request timeout — the agent loop's synthesis round
-        passes one, and LocalLLMClient.astream accepts the same kwarg.
+        Yields the same event format as LocalLLMClient.astream(), plus one
+        this backend alone can produce (#629):
+
+            {"type": "usage_update", "usage": LLMUsage}  — cumulative
+            usage-so-far for the in-flight response, not a per-event delta.
+
+        Anthropic's wire protocol carries a running usage count via the
+        ``message_start`` and ``message_delta`` SSE events — the former as
+        soon as the request is accepted (before any output token exists),
+        the latter as generation proceeds. Surfacing them lets a caller
+        that's cancelled mid-round credit the tokens that were already
+        billed instead of reporting nothing for the whole round.
+        LocalLLMClient.astream never yields this event — see its docstring
+        for why that backend can't.
+
+        ``timeout`` (seconds) sets a per-request timeout — the agent loop's
+        synthesis round passes one, and LocalLLMClient.astream accepts the
+        same kwarg.
         """
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -802,11 +826,54 @@ class AnthropicLLMClient:
             kwargs["timeout"] = timeout
 
         async with self._async_client.messages.stream(**kwargs) as stream:
+            # (#629) message_start's usage always carries all four fields
+            # (Anthropic's `Usage` type), but message_delta's usage has
+            # input_tokens/cache_* typed Optional and frequently absent —
+            # only output_tokens is guaranteed there. Carry the last-known
+            # value forward per field so an event that omits one doesn't
+            # look like it dropped to zero in the yielded snapshot.
+            last_input_tokens = 0
+            last_cache_creation = 0
+            last_cache_read = 0
             async for event in stream:
-                if hasattr(event, "type"):
-                    if event.type == "content_block_delta":
-                        if hasattr(event.delta, "text"):
-                            yield {"type": "text", "content": event.delta.text}
+                if not hasattr(event, "type"):
+                    continue
+                if event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        yield {"type": "text", "content": event.delta.text}
+                elif event.type == "message_start":
+                    u = event.message.usage
+                    last_input_tokens = u.input_tokens
+                    last_cache_creation = u.cache_creation_input_tokens or 0
+                    last_cache_read = u.cache_read_input_tokens or 0
+                    yield {
+                        "type": "usage_update",
+                        "usage": LLMUsage(
+                            input_tokens=last_input_tokens,
+                            output_tokens=u.output_tokens,
+                            total_tokens=last_input_tokens + u.output_tokens,
+                            cache_creation_input_tokens=last_cache_creation,
+                            cache_read_input_tokens=last_cache_read,
+                        ),
+                    }
+                elif event.type == "message_delta":
+                    u = event.usage
+                    if u.input_tokens is not None:
+                        last_input_tokens = u.input_tokens
+                    if u.cache_creation_input_tokens is not None:
+                        last_cache_creation = u.cache_creation_input_tokens
+                    if u.cache_read_input_tokens is not None:
+                        last_cache_read = u.cache_read_input_tokens
+                    yield {
+                        "type": "usage_update",
+                        "usage": LLMUsage(
+                            input_tokens=last_input_tokens,
+                            output_tokens=u.output_tokens,
+                            total_tokens=last_input_tokens + u.output_tokens,
+                            cache_creation_input_tokens=last_cache_creation,
+                            cache_read_input_tokens=last_cache_read,
+                        ),
+                    }
 
             # Get the final message for tool calls and usage
             msg = await stream.get_final_message()
