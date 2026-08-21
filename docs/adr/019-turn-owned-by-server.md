@@ -247,6 +247,20 @@ change.
   counts are only available at the end of a completed run; a cancelled turn
   has none to record. This is a known, deliberately deferred gap (filed
   separately), not an oversight.
+- **A task cancelled before its first scheduled step never runs its
+  `finally` at all — a real `asyncio` behavior, not something introduced
+  here.** If `TurnRegistry.shutdown()` (or an explicit cancel) ever ran in
+  the exact same event-loop tick as a turn's own `create_task()`, before
+  that task had taken even one step, cancelling it would skip
+  `_run_turn()`'s `finally` entirely — no partial persisted, no registry
+  cleanup for that turn. In practice this can't happen: by the time
+  anything could reach for that turn, it has already taken at least one
+  step (creating the conversation row, emitting the `conversation_id`
+  frame), so the window is theoretical, not reachable through any real
+  request/shutdown ordering. Documented here rather than engineered
+  around, since `shutdown()` — cancelling every registered turn in one
+  pass — is exactly the kind of code a future change might run earlier in
+  a turn's life than today's callers do.
 
 ## Related Documents
 
