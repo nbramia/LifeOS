@@ -8,6 +8,8 @@ caller (SSE endpoint) can stream them to the client in real time.
 Uses the local LLM (OpenAI-compatible llama-server) by default.
 
 Event types yielded:
+  {"type": "turn_state", "result": AgentResult} -- live, mutable accumulator
+                                                     (first event; #615)
   {"type": "text",   "content": "..."}       -- streamed text chunk
   {"type": "status", "message": "..."}       -- tool execution status
   {"type": "self_correction"}                -- model retrying (consumers should clear buffered text)
@@ -485,7 +487,10 @@ async def run_agent_loop(
             "Gemma (local)" option. Builds a per-turn LocalLLMClient.
 
     Yields:
-        Dicts with "type" key: "text", "status", or "result".
+        Dicts with "type" key: "turn_state" (first event, #615 -- a live
+        reference to the mutable AgentResult, for a caller that needs
+        accrued usage before the loop reaches its terminal event), "text",
+        "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
@@ -543,6 +548,12 @@ async def run_agent_loop(
     messages.append({"role": "user", "content": user_content})
 
     result = AgentResult(full_text="", model="local")
+    # #615: hand the caller a live reference to `result` before the loop does
+    # any work. `_track_usage` below mutates it in place every round, so a
+    # caller that stashes this object can read accrued usage at any point --
+    # in particular from a cancel/deadline handler that never reaches the
+    # terminal `result` event because the loop was cancelled mid-round.
+    yield {"type": "turn_state", "result": result}
     phantom_write_nudged = False  # phantom-write self-correction fires at most once per turn
 
     def _track_usage(usage: LLMUsage):

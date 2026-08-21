@@ -601,9 +601,20 @@ async def ask_stream(request: AskStreamRequest):
         await turn.emit(f"data: {json.dumps({'type': 'content', 'content': text})}\n\n")
 
     partial_text = ""
+    # #615: live reference to the agent loop's own AgentResult, stashed from
+    # the `turn_state` event so a cancel/deadline handler can read accrued
+    # usage without waiting for the terminal `result` event, which a
+    # cancelled turn never reaches. Stays None for a fake loop that doesn't
+    # emit `turn_state` (e.g. the ones in tests/test_persona_api.py) --
+    # `usage_recorded` guards against recording it twice if the turn does
+    # reach the normal end-of-turn usage write below. "Accrued" means as of
+    # the last round boundary, not as of the last streamed token -- see the
+    # comment in the CancelledError handler below for what that leaves out.
+    live_result = None
+    usage_recorded = False
 
     async def _run_turn():
-        nonlocal partial_text
+        nonlocal partial_text, live_result, usage_recorded
         # Pre-initialized outside the try (a plain assignment can't itself be
         # interrupted) so the except/finally clauses below always have a
         # defined `conversation_id`, even if a cancellation lands before the
@@ -972,7 +983,11 @@ async def ask_stream(request: AskStreamRequest):
                 personal_context=personal_context,
                 force_local=force_local,
             ):
-                if event["type"] == "text":
+                if event["type"] == "turn_state":
+                    # #615: live, mutable AgentResult -- see the comment by
+                    # `live_result`'s declaration above.
+                    live_result = event["result"]
+                elif event["type"] == "text":
                     await _content(event['content'])
                 elif event["type"] == "status":
                     await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
@@ -1004,6 +1019,7 @@ async def ask_stream(request: AskStreamRequest):
                     cost_usd=agent_result.total_cost_usd,
                     conversation_id=conversation_id,
                 )
+                usage_recorded = True  # #615: the cancel/deadline handler must not double-write this
                 await turn.emit(f"data: {json.dumps({'type': 'usage', 'input_tokens': agent_result.total_input_tokens, 'output_tokens': agent_result.total_output_tokens, 'cost_usd': agent_result.total_cost_usd, 'model': agent_result.model})}\n\n")
 
             # Build source list from tool calls
@@ -1070,6 +1086,51 @@ async def ask_stream(request: AskStreamRequest):
                     conversation_id, "assistant", partial_text + TRUNCATION_MARKER,
                     routing=truncation_routing(turn.cancel_reason or "cancelled"),
                 )
+            # #615: the tokens for a cancelled turn were already spent (and
+            # billed) even though the loop never reached its terminal
+            # `result` event -- read them from the live reference stashed
+            # from `turn_state` instead. `usage_recorded` guards against a
+            # cancellation landing after the normal end-of-turn write above
+            # (e.g. during `finish_trace`/`turn.emit` on the way out) from
+            # double-recording it.
+            #
+            # `total_input_tokens > 0` is NOT "nothing was spent" -- it's
+            # "the accumulator hasn't moved off its initial zero." Both
+            # LocalLLMClient.astream and AnthropicLLMClient.astream
+            # (api/services/llm_client.py) only yield usage in the "done"
+            # event that closes out a full round's stream (the local client
+            # reads it off the OpenAI-compatible finish chunk;
+            # AnthropicLLMClient waits on stream.get_final_message()), and
+            # agent_loop._track_usage() only runs once that event arrives.
+            # A cancellation landing mid-round -- after text has already
+            # streamed to the user and tokens were almost certainly
+            # generated and billed upstream, but before that round's "done"
+            # event fires -- still reports zero here, so this is a known,
+            # narrower surviving gap, not a claim that nothing was spent.
+            # The guard exists because writing a zero-token row would
+            # affirmatively assert "this cost nothing," which is worse than
+            # writing nothing at all; it does not close the mid-round
+            # window. Closing that would need the streaming clients to
+            # surface usage incrementally as it accrues (Anthropic's wire
+            # protocol carries a running count via `message_start`/
+            # `message_delta` events that astream() currently discards in
+            # favor of the final message; the local OpenAI-compatible
+            # protocol has no equivalent mid-stream signal at all) -- a
+            # change to the client layer's event contract, out of scope for
+            # this fix.
+            #
+            # This also covers a cancelled turn before any round completed
+            # (the accumulator never moved) and a fake test loop that never
+            # emits `turn_state` (`live_result` stays None).
+            if conversation_id and not usage_recorded and live_result is not None and live_result.total_input_tokens > 0:
+                get_usage_store().record_usage(
+                    model=live_result.model,
+                    input_tokens=live_result.total_input_tokens,
+                    output_tokens=live_result.total_output_tokens,
+                    cost_usd=live_result.total_cost_usd,
+                    conversation_id=conversation_id,
+                )
+                usage_recorded = True
             finish_trace()
             raise
         except Exception as e:
