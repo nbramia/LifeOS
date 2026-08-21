@@ -201,13 +201,14 @@ def build_turn_context(persona_id: str | None = None, conversation_id: str | Non
     `lifeos_context` cross-repo contract (#590): ``current_datetime``,
     ``current_datetime_iso``, ``timezone``, ``time_resolution_instruction``,
     ``personal_context``, ``existing_tags``, ``tags_instruction``, plus the
-    session-cost fields added by #610 below.
+    session-cost fields added by #610 (and #613's ``session_cost_is_lower_
+    bound``) below.
 
     ``conversation_id`` scopes the session-cost fields to one conversation's
     prior turns (``UsageStore.get_conversation_usage`` — never recomputed,
     always the verbatim sum already recorded for that id). None (a
     brand-new conversation with no id yet, or a caller that doesn't track
-    one) reports the fields present and zero rather than omitting them.
+    one) reports the fields present and zero/False rather than omitting them.
     """
     now = datetime.now(ZoneInfo(settings.timezone))
     session_usage = get_usage_store().get_conversation_usage(conversation_id)
@@ -223,16 +224,18 @@ def build_turn_context(persona_id: str | None = None, conversation_id: str | Non
         # already recorded for this conversation, EXCLUDING the turn
         # currently being built (its own usage isn't recorded until its
         # stream finishes, after this context was already handed out).
-        # This is a **floor, not an exact total**: a turn whose provider
-        # reported no cost is recorded as cost_usd=0.0 repo-wide (there is
-        # no separate "unpriced" marker anywhere in the usage store, and
-        # inferring one from which turns look free would be a guess
-        # presented as fact) — so state it as a floor whenever reporting
-        # it, never as a precise total.
         "session_cost_usd": session_usage["cost_usd"],
         "session_turn_count": session_usage["turn_count"],
         "session_input_tokens": session_usage["input_tokens"],
         "session_output_tokens": session_usage["output_tokens"],
+        # #613: True when any summed turn was recorded `unpriced` (its
+        # provider reported no cost, rather than a real zero) — read this
+        # before treating `session_cost_usd` as exact. Still no substitute
+        # for a floor when the sum spans a row written before the
+        # `unpriced` column existed: that history can't be reclassified,
+        # so it always reads as priced/`0` here regardless of what
+        # actually happened.
+        "session_cost_is_lower_bound": session_usage["is_lower_bound"],
     }
 
 

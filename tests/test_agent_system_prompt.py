@@ -112,6 +112,7 @@ def test_build_turn_context_shape(tm):
         "existing_tags", "tags_instruction",
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
+        "session_cost_is_lower_bound",
     }
     assert turn["existing_tags"] == []
     assert turn["personal_context"] == ""
@@ -121,6 +122,7 @@ def test_build_turn_context_shape(tm):
     assert turn["session_turn_count"] == 0
     assert turn["session_input_tokens"] == 0
     assert turn["session_output_tokens"] == 0
+    assert turn["session_cost_is_lower_bound"] is False
 
 
 def test_build_turn_context_existing_tags_populated(tm):
@@ -183,6 +185,7 @@ def test_build_turn_context_sums_prior_turns_for_the_conversation(tm):
     assert turn["session_input_tokens"] == 300
     assert turn["session_output_tokens"] == 130
     assert turn["session_turn_count"] == 2
+    assert turn["session_cost_is_lower_bound"] is False
 
 
 def test_build_turn_context_unknown_conversation_id_reports_zero(tm):
@@ -194,13 +197,15 @@ def test_build_turn_context_unknown_conversation_id_reports_zero(tm):
     assert turn["session_turn_count"] == 0
     assert turn["session_input_tokens"] == 0
     assert turn["session_output_tokens"] == 0
+    assert turn["session_cost_is_lower_bound"] is False
 
 
 def test_build_turn_context_zero_cost_turn_still_reports_a_truthful_sum(tm):
-    """A conversation containing a turn recorded with cost_usd=0.0 (free or
-    simply unreported by its provider -- the store doesn't distinguish the
-    two, see UsageStore.get_conversation_usage's docstring) must still
-    report a truthful sum and turn count, not error or silently drop it."""
+    """A conversation containing a turn recorded with cost_usd=0.0 and
+    unpriced=False (genuinely free, e.g. a local model) must still report
+    a truthful sum and turn count, not error or silently drop it -- and
+    must not be flagged as a lower bound, since nothing summed here is
+    unpriced."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()
@@ -218,6 +223,29 @@ def test_build_turn_context_zero_cost_turn_still_reports_a_truthful_sum(tm):
     assert turn["session_input_tokens"] == 110
     assert turn["session_output_tokens"] == 60
     assert turn["session_turn_count"] == 2
+    assert turn["session_cost_is_lower_bound"] is False
+
+
+def test_build_turn_context_unpriced_turn_marks_session_cost_as_lower_bound(tm):
+    """#613: a turn recorded `unpriced=True` (its provider reported no
+    cost) must surface as `session_cost_is_lower_bound=True` -- the real
+    distinction this field exists to carry, as opposed to #610's original
+    unconditional-floor wording."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-unpriced", unpriced=False,
+    )
+    store.record_usage(
+        model="some-unrecognized-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-unpriced", unpriced=True,
+    )
+
+    turn = agent_system_prompt.build_turn_context(conversation_id="conv-unpriced")
+    assert turn["session_cost_usd"] == pytest.approx(0.002)
+    assert turn["session_cost_is_lower_bound"] is True
 
 
 def test_no_persona_block_by_default(tm):

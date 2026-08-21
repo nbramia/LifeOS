@@ -159,13 +159,14 @@ Read-only per-turn context: the current date/time, the relative-time-resolution 
   "session_cost_usd": 0.0031,
   "session_turn_count": 2,
   "session_input_tokens": 300,
-  "session_output_tokens": 130
+  "session_output_tokens": 130,
+  "session_cost_is_lower_bound": false
 }
 ```
 
 - `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
 - `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
-- `session_cost_usd`/`session_input_tokens`/`session_output_tokens` are the verbatim sum of every turn already recorded under `conversation_id`, excluding the turn currently being built; `session_turn_count` is how many recorded turns that sum covers. `session_cost_usd` is always a **floor, not an exact total** — a turn whose provider reported no cost is recorded as `cost_usd=0.0` indistinguishably from a turn that genuinely cost zero, so the figure must be presented as a lower bound regardless — see [client-surfaces.md](../technical/client-surfaces.md) § "Session-to-date cost" for the full contract.
+- `session_cost_usd`/`session_input_tokens`/`session_output_tokens` are the verbatim sum of every turn already recorded under `conversation_id`, excluding the turn currently being built; `session_turn_count` is how many recorded turns that sum covers. `session_cost_is_lower_bound` is `true` when any summed turn was recorded `unpriced` — its provider reported no cost, rather than a real zero (the `unpriced` column on the `usage` table). `false` means every row the sum touches was written with the real distinction available and none of them were unpriced — **except** for a sum spanning a row written before that column existed: that history can't be reclassified and always reads as priced, so such a sum is still only a floor even when this flag says `false`. See [client-surfaces.md](../technical/client-surfaces.md) § "Session-to-date cost" for the full contract, including that retroactive gap.
 - This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
 
 ### POST /api/chat/cancel
