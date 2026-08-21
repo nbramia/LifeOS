@@ -50,6 +50,10 @@ _IMPLICIT_CAPTURE_RE = re.compile(
     r"(?:my\s+)?(?:goal|project|idea|plan|vision)\s*(?:is|:|-)\b)",
     re.IGNORECASE,
 )
+_SIGNIFICANT_CAPTURE_RE = re.compile(
+    r"\b(?:top\s+priorit(?:y|ies)|working\s+on|had\s+an?\s+accident|my\s+car)\b",
+    re.IGNORECASE,
+)
 
 
 def _explicit_memory_content(question: str) -> str | None:
@@ -72,7 +76,9 @@ def _capture_candidate(question: str) -> str | None:
     if explicit:
         return explicit
     text = (question or "").strip()
-    if text and "?" not in text and _IMPLICIT_CAPTURE_RE.search(text):
+    if text and "?" not in text and (
+        _IMPLICIT_CAPTURE_RE.search(text) or _SIGNIFICANT_CAPTURE_RE.search(text)
+    ):
         return text
     return None
 
