@@ -751,6 +751,21 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "review_inbox",
+        "description": (
+            "Review raw Life Inbox captures that may not yet have been classified "
+            "as memories, ideas, tasks, or reminders. Use when the user asks what "
+            "was captured, what needs review, or wants a weekly inbox review."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum items to show (default 20)."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "search_memories",
         "description": (
             "Search saved memories by wording and meaning. Use to recall previously saved "
@@ -2490,6 +2505,22 @@ async def _tool_save_memory(inp: dict) -> str:
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
+def _tool_review_inbox(inp: dict) -> str:
+    from api.services.inbox_store import list_items
+
+    try:
+        limit = max(1, min(int(inp.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    items = list_items(limit=limit)
+    if not items:
+        return "Life Inbox is empty — there are no unreviewed captures."
+    lines = [f"Unreviewed Life Inbox items ({len(items)}):"]
+    for item in items:
+        lines.append(f"- [{item['created_at'][:10]}] {item['content']}")
+    return "\n".join(lines)
+
+
 # Result cap for memory search. Exposed to the caller so a memory that missed on
 # wording can be reached by widening; also the truncation yardstick, so it has to
 # be a usable positive int however the model fills it in.
@@ -3473,6 +3504,7 @@ _TOOL_HANDLERS = {
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
+    "review_inbox": _tool_review_inbox,
     "search_memories": _tool_search_memories,
 }
 
@@ -3524,5 +3556,6 @@ TOOL_STATUS_MESSAGES = {
     "update_calendar_event": "Updating calendar event...",
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
+    "review_inbox": "Reviewing your Life Inbox...",
     "search_memories": "Searching memories...",
 }

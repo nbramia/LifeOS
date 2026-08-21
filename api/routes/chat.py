@@ -716,6 +716,15 @@ async def ask_stream(request: AskStreamRequest):
 
             # Save user message
             store.add_message(conversation_id, "user", request.question)
+            # Keep a durable raw inbox copy before the model interprets the
+            # message. This is the recovery/review path when classification or
+            # tool calling is incomplete.
+            from api.services.inbox_store import add_item as add_inbox_item
+            add_inbox_item(
+                request.question,
+                conversation_id=conversation_id,
+                source=request.persona_id or "chat",
+            )
 
             # `/agent [local|claude] <task>` — spawn an operator agent on demand
             # (#235). Equivalent affordance to Telegram's /agent command, calling
@@ -1092,7 +1101,7 @@ async def ask_stream(request: AskStreamRequest):
             # An acknowledgement is not proof that save_memory was called.
             # Persist explicit remember requests deterministically when the
             # model skipped the tool, and tell the user what actually happened.
-            _memory_content = _explicit_memory_content(request.question)
+            _memory_content = _capture_candidate(request.question)
             _memory_tool_succeeded = any(
                 tc.get("tool") == "save_memory" and not tc.get("is_error")
                 for tc in agent_result.tool_calls_log
