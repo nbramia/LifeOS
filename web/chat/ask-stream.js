@@ -90,6 +90,23 @@ export async function askStream({ question, conversationId, attachments, persona
   }
 }
 
+// Stop the turn in flight for the current conversation (#611). A turn now
+// keeps running server-side after the browser gives up on the stream, so an
+// explicit cancel is the only way to actually stop it — closing the tab or
+// navigating away no longer does. Best-effort: on failure there's nothing
+// useful to show the user; the turn just keeps running, same as before #611.
+export async function stopTurn() {
+  const conversationId = state.currentConversationId;
+  if (!conversationId) return;
+  try {
+    await fetch(`${endpoints.conversations}/${encodeURIComponent(conversationId)}/cancel`, {
+      method: 'POST',
+    });
+  } catch (e) {
+    // network blip — nothing to surface here
+  }
+}
+
 export async function sendMessage() {
   const question = elements.inputField.value.trim();
   if (!question || state.isLoading) return;
@@ -104,6 +121,10 @@ export async function sendMessage() {
   state.isLoading = true;
   setStatus('loading', 'Thinking...');
   elements.sendBtn.disabled = true;
+  // Swap Send for Stop (#611) — hidden again once this turn settles, in the
+  // same place sendBtn is re-enabled below.
+  elements.sendBtn.style.display = 'none';
+  elements.stopBtn.classList.add('visible');
 
   // Capture attachments before clearing
   const messageAttachments = [...state.attachments];
@@ -330,6 +351,8 @@ export async function sendMessage() {
 
   state.isLoading = false;
   elements.sendBtn.disabled = false;
+  elements.sendBtn.style.display = '';
+  elements.stopBtn.classList.remove('visible');
   elements.inputField.focus();
 }
 

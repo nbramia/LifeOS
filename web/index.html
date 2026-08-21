@@ -1256,6 +1256,33 @@
             transform: none;
         }
 
+        /* Stop button (#611): swapped in for send-btn while a turn is in
+           flight. Shares send-btn's box so the composer layout doesn't
+           shift; a distinct color signals it's a different action. */
+        .stop-btn {
+            width: 48px;
+            height: 48px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1.1rem;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .stop-btn.visible {
+            display: flex;
+        }
+
+        .stop-btn:hover {
+            background: var(--bg-secondary);
+        }
+
         /* Attach button — iMessage-style round "+" to the left of the box */
         .attach-btn {
             width: 40px;
@@ -2897,6 +2924,10 @@
                     ></textarea>
                 </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+                <!-- Stop (#611): shown in place of Send while a turn is in flight.
+                     Cancels the turn server-side rather than just walking away from
+                     the stream -- the turn otherwise keeps running to completion. -->
+                <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop">⏹</button>
             </div>
             <!-- Voice dock (#361): tap-to-talk + dock toggles; shown in voice mode -->
             <div class="voice-dock" id="voiceDock">
@@ -3131,6 +3162,7 @@
                 elements: {
                     messagesEl, inputField, chatTitle,
                     sendBtn: document.getElementById('sendBtn'),
+                    stopBtn: document.getElementById('stopBtn'),
                     statusDot: document.getElementById('statusDot'),
                     statusText: document.getElementById('statusText'),
                     conversationsList: document.getElementById('conversationsList'),
