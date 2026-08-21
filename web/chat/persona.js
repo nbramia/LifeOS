@@ -8,7 +8,7 @@
 // contract in docs/specs/technical/client-surfaces.md.
 
 import { config, elements, endpoints } from './session.js';
-import { newChat, loadConversations } from './conversations.js';
+import { newChat } from './conversations.js';
 
 const PERSONA_STORAGE_KEY = 'lifeos:chat:persona_id';
 const DEFAULT_PERSONA_ID = 'primary';
@@ -35,30 +35,61 @@ export async function loadPersonas() {
   // first turn and the first conversation fetch already carry the right id.
   config.personaId = readStoredPersonaId();
 
+  // Testability hook only (same pattern as backend.js's STATUS_TIMEOUT_MS):
+  // lets a browser test force this function's promise to reject, so it can
+  // assert that initBackend()'s single listing still fires even when persona
+  // resolution fails outright (#607) — rather than trusting that every path
+  // in this function stays guarded forever.
+  if (typeof window !== 'undefined' && window.__LIFEOS_TEST_FORCE_PERSONAS_REJECT__) {
+    throw new Error('forced persona-resolution failure (test only)');
+  }
+
   let personas = [];
+  let discovered = false;  // did /api/personas actually answer, successfully?
   try {
     const response = await fetch(endpoints.personas);
     if (response.ok) {
       const data = await response.json();
       personas = data.personas || [];
+      discovered = true;
     }
   } catch (e) {
     console.log('Could not load personas');
   }
   config.personas = personas;
 
-  // If the stored persona is no longer offered, fall back to primary.
-  if (personas.length > 0 && !personas.some(p => p.id === config.personaId)) {
+  // Every caller needs *some* in-memory answer right now (the sidebar listing
+  // below, `personaId` on a turn, the persona-scoped conversation key), so
+  // fall back to primary whenever we can't confirm the stored id is still
+  // offered — both when discovery genuinely returned a list without it, and
+  // when discovery failed outright (a failure to confirm gets treated the
+  // same as confirmation that it's gone, in memory, for this boot only).
+  const confirmed = discovered && personas.some(p => p.id === config.personaId);
+  if (!confirmed) {
     config.personaId = DEFAULT_PERSONA_ID;
   }
-  storePersonaId(config.personaId);
+  // Persisting is a separate decision from the in-memory fallback above: a
+  // transient /api/personas failure must not permanently overwrite the
+  // user's stored preference — they may be back on a working network next
+  // load, and the id itself was never actually shown to be gone. Only write
+  // through when discovery succeeded, so `sessionStorage` only ever records
+  // an id we've actually validated (or actually confirmed invalid).
+  if (discovered) {
+    storePersonaId(config.personaId);
+  }
 
   renderPersonaOptions();
-  // Load the sidebar once the persona is resolved so it is correctly scoped.
-  // initChat no longer calls loadConversations itself — this is the single
-  // initial load, which keeps the picker and the sidebar consistent even when
-  // the stored persona had to be reset.
-  loadConversations();
+  // Deliberately does NOT call loadConversations() here (#607): config.backend
+  // hasn't been resolved yet at this point (initBackend() runs after this),
+  // so a fetch fired now would always ask for the `lifeos` fallback and could
+  // still be in flight — and resolve arbitrarily late — when initBackend()'s
+  // own listing lands, racing it for the last write to state.allConversations.
+  // config.personaId is only FULLY resolved (validated against the fetched
+  // list, above) once this whole async function's promise settles — a caller
+  // that only waits for the synchronous assignment at the top of this
+  // function (before this function's first await) would still race the
+  // validation above. initBackend() awaits this function's promise (passed in
+  // as personasReady) before its single listing, precisely to avoid that.
 }
 
 function renderPersonaOptions() {

@@ -133,7 +133,7 @@ async function checkAvailable(url) {
   }
 }
 
-export async function initBackend() {
+export async function initBackend(personasReady) {
   // Block the composer until the default resolves (below) so a turn sent in
   // the resolution window can't land on the wrong backend.
   state.isLoading = true;
@@ -166,12 +166,25 @@ export async function initBackend() {
   if (elements.backendHermes) elements.backendHermes.addEventListener('click', () => setBackendMode('hermes'));
   applyBackendUi();
 
-  // loadPersonas() (main.js) already loaded the sidebar once, in parallel with
-  // this async availability check, so it filtered by whatever config.backend
-  // was at that moment — null/lifeos, since this function hadn't resolved the
-  // real default yet. Now that config.backend reflects the resolved mode
-  // (stored preference or the hermes-if-available default), refresh so the
-  // sidebar isn't stuck showing the wrong backend's threads on first paint (#596).
+  // The sidebar's single initial load (#607) — gated on BOTH resolutions, not
+  // just this one. config.backend is resolved as of the assignment above, but
+  // config.personaId is only *provisionally* set at this point (main.js's
+  // synchronous restore, before loadPersonas() validates it against
+  // /api/personas) — listing here unconditionally would still be able to fire
+  // with a stale, since-deleted persona id if that validation hasn't finished
+  // yet. Awaiting the caller's loadPersonas() promise (personasReady) does NOT
+  // serialize the two fetches — loadPersonas()'s /api/personas request and the
+  // Promise.all() above both started already, concurrently, before either
+  // await point — it only delays *this* listing call until persona validation
+  // has actually landed. Gating on both resolutions this way is also what
+  // keeps this to one request on the common (no-Hermes, no-stale-persona)
+  // path, instead of the two a "list early, then refresh" approach would send.
+  // loadPersonas() is designed to never reject, but the listing must not be
+  // held hostage to that guarantee holding in every browser forever (e.g. a
+  // storage write throwing in Safari private mode) — a persona failure of any
+  // kind must still produce a listing, so a rejection here is swallowed
+  // rather than left to propagate and skip loadConversations() below.
+  if (personasReady) await personasReady.catch(() => {});
   loadConversations();
 
   // Restore the current backend's conversation id (continuity across refresh).

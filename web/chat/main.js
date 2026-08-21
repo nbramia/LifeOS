@@ -49,18 +49,24 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
 
   setupAttachmentHandlers();
   setupSwipeGestures();
-  // loadPersonas() resolves config.personaId synchronously (from sessionStorage,
-  // validated against /api/personas) and then loads the persona-scoped
-  // conversation sidebar. It runs BEFORE initBackend() so the per-backend
-  // conversation key (which is persona-scoped for lifeos) reads the right
-  // persona on a refresh.
-  loadPersonas();
+  // loadPersonas() resolves config.personaId synchronously (from sessionStorage)
+  // before its own first await, so it runs BEFORE initBackend() to guarantee the
+  // per-backend conversation key (which is persona-scoped for lifeos) reads a
+  // persona id on a refresh. That synchronous id is provisional, though — it's
+  // only validated against /api/personas (falling back to primary if the fetch
+  // says it's gone) once loadPersonas()'s own promise settles. It deliberately
+  // does NOT list the conversation sidebar itself — config.backend isn't
+  // resolved yet at this point either, and initBackend() below issues the
+  // sidebar's single initial load once BOTH are (#607) — awaiting this promise
+  // (personasReady) is what makes it wait on persona validation too, not just
+  // the synchronous id restore.
+  const personasReady = loadPersonas();
   // LifeOS|Agent|Hermes selector + restore per-backend conversation (#361,
   // #587). The promise is stashed on the bridge (below) so tests can await
   // "default resolution actually happened" instead of polling UI state that
   // can look identical before and after (e.g. the lifeos default matches
   // index.html's initial markup).
-  window.lifeChat.backendReady = initBackend();
+  window.lifeChat.backendReady = initBackend(personasReady);
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
   setStatus('', 'Ready');
