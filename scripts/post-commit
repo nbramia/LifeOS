@@ -51,7 +51,14 @@ fi
 # Restart the API server if api/ or config/ files changed. server.sh
 # restarts lifeos-api only — the agent worker deliberately does NOT follow
 # (see lifeos-agent-worker.service), so in-flight agent sessions survive.
-CHANGED_API=$(git diff-tree --no-commit-id --name-only -r HEAD -- api/ config/)
+#
+# `-m --first-parent`: without it, `diff-tree -r` on a MERGE commit produces
+# no output at all (it only diffs single-parent commits), so a local merge
+# silently detected zero changed files and restarted nothing (#631). Adding
+# the flags diffs a merge against its first parent same as `diff HEAD^1..HEAD`
+# would, while leaving ordinary (non-merge) and root commits byte-identical
+# to the prior output — verified empirically, not just by flag docs.
+CHANGED_API=$(git diff-tree -m --first-parent --no-commit-id --name-only -r HEAD -- api/ config/)
 
 if [ -n "$IN_WORKTREE" ]; then
     echo "Worktree commit — skipping service restarts (deploy happens on main)"
@@ -67,7 +74,7 @@ fi
 # with lifeos-api, so it does NOT cascade from the api restart. Cloud
 # agents connect to this service exclusively. The sudoers allowlist
 # installed by setup-systemd.sh permits passwordless restart.
-CHANGED_MCP=$(git diff-tree --no-commit-id --name-only -r HEAD -- mcp_server.py)
+CHANGED_MCP=$(git diff-tree -m --first-parent --no-commit-id --name-only -r HEAD -- mcp_server.py)
 
 if [ -z "$IN_WORKTREE" ] && [ -n "$CHANGED_MCP" ]; then
     if systemctl list-unit-files lifeos-mcp-http.service &>/dev/null; then
