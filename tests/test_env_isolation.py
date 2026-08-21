@@ -150,22 +150,68 @@ def test_main_py_does_not_use_bare_load_dotenv():
         "parent checkout's real .env). Pass an explicit repo-root path."
     )
 
-
 def test_settings_user_name_is_deterministic_regardless_of_import_order():
     """The downstream effect of the fix: `settings.user_name` (read into a
     module-level constant at import time by several modules -- see this
-    file's module docstring) is the safe field default, whether or not
-    `api.main` has already been imported by something else in this worker
-    process. Before the fix, whichever test triggered that import first
-    decided the answer for the rest of the process; there was no way for a
-    single test to assert this, because the outcome depended on collection
-    order under xdist. After the fix there's nothing left to depend on.
+    file's module docstring) comes from *this checkout's own* config, whether
+    or not `api.main` has already been imported by something else in this
+    worker process. Before the fix, whichever test triggered that import
+    first decided the answer for the rest of the process; there was no way
+    for a single test to assert this, because the outcome depended on
+    collection order under xdist.
+
+    The expected value is derived from whether this checkout has its own
+    `.env`, rather than assumed absent (#623). Asserting the bare field
+    default only holds in a worktree; in the canonical checkout a real `.env`
+    sits at the repo root and *is* the correct thing to have loaded. Pinning
+    the default there made a correct environment look broken and blocked
+    `git push` outright, since the pre-push hook runs the suite in the
+    pushing repository.
+
+    Be clear about how much this test guards, because it is less than it
+    looks. It is a demonstration of the downstream effect, not the primary
+    regression catcher:
+
+    - In the canonical checkout a bare `load_dotenv()` finds this same
+      repo-root file anyway, so the regression is invisible *by value* here.
+    - Even in a worktree it only catches the regression when `config.settings`
+      is imported *after* `api.main` in the same process. `settings` is a
+      module-level singleton built at its own import time, so when something
+      (conftest, another test) has already imported it, a later leak into
+      `os.environ` no longer changes `settings.user_name`. Verified by
+      reverting `api/main.py` to a bare `load_dotenv()`: this test still
+      passed, and only the static guard below failed.
+
+    So the real coverage lives elsewhere in this file, and both of those are
+    location-independent: `test_bare_load_dotenv_leaks_from_a_worktree_parent`
+    / `test_pinned_load_dotenv_does_not_leak` prove the mechanism in a
+    subprocess against a synthetic nested checkout, and
+    `test_main_py_does_not_use_bare_load_dotenv` guards the call form
+    statically. Keep this test for the downstream illustration it provides --
+    just don't rely on it as the guard.
     """
+    from dotenv import dotenv_values
+
     import api.main  # noqa: F401 -- exercise the (now-pinned) load_dotenv path
     from config.settings import settings
 
-    assert settings.user_name == "User", (
-        "settings.user_name is not the field default. Either a real .env is "
-        "reachable from this checkout (see test_fixtures_no_personal_data.py) "
-        "or api/main.py's load_dotenv regressed to searching upward."
-    )
+    field = type(settings).model_fields["user_name"]
+    own_dotenv = Path(__file__).resolve().parent.parent / ".env"
+
+    # dotenv_values parses without touching os.environ, so reading a real
+    # machine-specific file here can't itself leak config into this process
+    # (same approach as tests/test_fixtures_no_personal_data.py).
+    expected = field.default
+    if own_dotenv.is_file():
+        expected = dotenv_values(own_dotenv).get(field.alias) or field.default
+
+    if settings.user_name != expected:
+        # Deliberately not echoing either value: on a real machine both may
+        # be personal, and this message can reach CI logs.
+        pytest.fail(
+            "settings.user_name did not come from this checkout's own config. "
+            "Either api/main.py's load_dotenv regressed to an upward search "
+            "(escaping a worktree into an ancestor checkout's .env, reopening "
+            "#598), or some other .env is being loaded. Values withheld -- "
+            "they may be personal."
+        )
