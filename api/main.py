@@ -210,6 +210,21 @@ async def lifespan(app: FastAPI):
 
     yield  # Application runs here
 
+    # Shutdown: drain in-flight chat turns (#611). A turn's task now runs
+    # independently of its SSE reader, so a shutdown here (e.g. a mid-turn
+    # auto-redeploy, #437) would otherwise just kill it via task
+    # cancellation at process exit with no chance to persist anything —
+    # this cancels every turn explicitly and awaits its own partial-persist
+    # handling first, so a redeploy stores an honest partial instead of
+    # silently losing the turn. Runs before the other shutdown blocks below
+    # since those don't depend on it and a turn task may itself touch
+    # services (the conversation/usage stores) that should still be up.
+    try:
+        from api.services.chat_turns import get_turn_registry
+        await get_turn_registry().shutdown()
+    except Exception as e:
+        logger.error(f"Failed to drain in-flight chat turns: {e}")
+
     # Shutdown: Stop services
     if _calendar_indexer:
         _calendar_indexer.stop_scheduler()
