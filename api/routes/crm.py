@@ -5032,7 +5032,7 @@ async def analyze_relationship_tone(person_id: Optional[str] = None, months: int
     Samples messages from each month and uses Claude to classify emotional tone.
     Returns monthly tone scores and overall trend.
     """
-    from api.services.llm_client import get_anthropic_llm
+    from api.services.llm_client import get_llm
     from datetime import datetime, timezone, timedelta
 
     target_id = person_id or PARTNER_PERSON_ID
@@ -5087,7 +5087,7 @@ async def analyze_relationship_tone(person_id: Optional[str] = None, months: int
         )
 
     # Use local LLM to analyze tone
-    client = get_anthropic_llm()
+    client = get_llm("specialist")
 
     partner_name = _get_partner_name() or "their partner"
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {settings.user_name} and {partner_name} over time.
@@ -5178,7 +5178,7 @@ async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, mo
     then aggregates to monthly averages. Returns separate scores for each person
     plus a combined average.
     """
-    from api.services.llm_client import get_anthropic_llm
+    from api.services.llm_client import get_llm
     import json
     from datetime import datetime, timezone, timedelta
     from collections import defaultdict
@@ -5254,7 +5254,7 @@ async def analyze_relationship_tone_detailed(person_id: Optional[str] = None, mo
     partner_text = format_weekly_samples(partner_by_week, partner_name)
 
     # Use local LLM to analyze tone for each person
-    client = get_anthropic_llm()
+    client = get_llm("specialist")
 
     prompt = f"""Analyze the emotional warmth of these iMessage conversations between {user_name} and {partner_name}.
 Messages are grouped by week and separated by sender.

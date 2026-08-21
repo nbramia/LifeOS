@@ -70,6 +70,22 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
 | `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
 
+### Provider and model profiles
+
+The legacy `LIFEOS_LLM_BACKEND` setting remains supported. Deployments that
+need more than one provider can define a JSON registry. Model profiles select a
+provider and model per operation; personal data and stored memories are not
+coupled to these profiles.
+
+```bash
+LIFEOS_LLM_PROVIDERS='{"openai":{"type":"openai_compatible","base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_API_KEY"},"deepseek":{"type":"openai_compatible","base_url":"https://api.deepseek.com/v1","api_key_env":"DEEPSEEK_API_KEY"},"local":{"type":"openai_compatible","base_url":"http://localhost:8080"}}'
+LIFEOS_LLM_MODELS='{"default":{"provider":"openai","model":"gpt-4o-mini"},"fast":{"provider":"deepseek","model":"deepseek-chat"},"private":{"provider":"local","model":"qwen-local"}}'
+```
+
+Supported provider types are `anthropic` and `openai_compatible` (also
+`openai`/`local` as aliases). `api_key_env` names an environment variable; do
+not put API keys directly in the JSON or commit them to the repository.
+
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 
 ### Routing Target and Reasoning Control (#566)

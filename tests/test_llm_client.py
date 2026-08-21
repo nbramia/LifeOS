@@ -627,6 +627,61 @@ class TestAStreamReasoningControl:
         assert captured["kwargs"]["json"]["reasoning_effort"] == "low"
 
 
+# ---- Provider/model registry ----
+
+
+class TestProviderModelRegistry:
+    def test_openai_compatible_profile_resolves_url_model_and_key(self):
+        from types import SimpleNamespace
+        from api.services.llm_client import get_llm, OpenAICompatibleLLMClient
+
+        settings = SimpleNamespace(
+            llm_backend="anthropic",
+            anthropic_api_key="",
+            anthropic_model="claude-haiku-4-5",
+            anthropic_specialist_model="claude-sonnet-5",
+            local_llm_url="http://localhost:8080",
+            local_llm_model="local-model",
+            local_llm_timeout=90,
+            llm_providers_json=(
+                '{"openrouter":{"type":"openai_compatible",'
+                '"base_url":"https://openrouter.ai/api/v1",'
+                '"api_key_env":"TEST_OPENROUTER_KEY"}}'
+            ),
+            llm_models_json=(
+                '{"default":{"provider":"openrouter","model":"deepseek/deepseek-chat"}}'
+            ),
+        )
+        with patch("api.services.llm_client.settings", settings), patch.dict(
+            "os.environ", {"TEST_OPENROUTER_KEY": "test-key"}
+        ):
+            client = get_llm()
+
+        assert isinstance(client, OpenAICompatibleLLMClient)
+        assert client.base_url == "https://openrouter.ai/api/v1"
+        assert client.model == "deepseek/deepseek-chat"
+        assert client.headers["Authorization"] == "Bearer test-key"
+
+    def test_legacy_local_backend_still_returns_local_compatible_client(self):
+        from types import SimpleNamespace
+        from api.services.llm_client import get_llm, LocalLLMClient
+
+        settings = SimpleNamespace(
+            llm_backend="local",
+            local_llm_url="http://fake:8080",
+            local_llm_model="qwen-local",
+            local_llm_timeout=90,
+            llm_providers_json="",
+            llm_models_json="",
+        )
+        with patch("api.services.llm_client.settings", settings):
+            client = get_llm()
+
+        assert isinstance(client, LocalLLMClient)
+        assert client.base_url == "http://fake:8080"
+        assert client.model == "qwen-local"
+
+
 # ---- Singleton ----
 
 

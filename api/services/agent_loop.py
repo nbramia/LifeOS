@@ -430,11 +430,11 @@ def _select_client(model: str = "", force_local: bool = False):
     if force_local:
         if getattr(settings, "llm_backend", "anthropic").lower() != "anthropic":
             return get_local_llm()  # already local — reuse the singleton
-        from api.services.llm_client import LocalLLMClient
-        return LocalLLMClient()
-    if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
-        from api.services.llm_client import AnthropicLLMClient
-        return AnthropicLLMClient(model=model)
+        from api.services.llm_client import get_llm
+        return get_llm("private", provider="local")
+    if model:
+        from api.services.llm_client import get_llm
+        return get_llm("default", model=model)
     return get_local_llm()
 
 

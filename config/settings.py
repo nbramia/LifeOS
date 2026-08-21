@@ -284,6 +284,21 @@ class Settings(BaseSettings):
     # LLM Backend: "anthropic" (default) or "local"
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 
+    # Provider/model registry. These are JSON objects so deployments can add
+    # providers without changing Python code. Secrets should be referenced by
+    # environment-variable name (api_key_env), never placed in this JSON.
+    # Empty values preserve the historical LIFEOS_LLM_BACKEND behavior.
+    llm_providers_json: str = Field(
+        default="",
+        alias="LIFEOS_LLM_PROVIDERS",
+        description="JSON provider registry; api_key_env references an environment variable",
+    )
+    llm_models_json: str = Field(
+        default="",
+        alias="LIFEOS_LLM_MODELS",
+        description="JSON model profile registry mapping profile names to provider/model",
+    )
+
     # Anthropic model for orchestration
     anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
 

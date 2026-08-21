@@ -1,17 +1,15 @@
-"""
-Unified LLM client for LifeOS.
+"""Provider-neutral LLM clients and model-profile resolution for LifeOS.
 
-Wraps both Claude (Anthropic) and local (OpenAI-compatible llama-server) backends
-behind a common interface. Claude is the default; local model is available as a
-fallback or for offline use.
-
-The local model server runs at LIFEOS_LOCAL_LLM_URL (default http://localhost:8080)
-and speaks the OpenAI chat completions API.
+Anthropic and OpenAI-compatible providers share the same LifeOS response and
+streaming contract. Legacy ``LIFEOS_LLM_BACKEND`` settings remain supported;
+named provider/model profiles can be added through ``LIFEOS_LLM_PROVIDERS`` and
+``LIFEOS_LLM_MODELS`` without changing the personal data layer.
 """
 import json
 import logging
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -19,6 +17,118 @@ import httpx
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LLMProviderConfig:
+    """Provider connection details, independent of a selected model."""
+
+    name: str
+    type: str
+    base_url: str = ""
+    api_key: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LLMModelConfig:
+    """Named model profile used by an operation or a chat turn."""
+
+    name: str
+    provider: str
+    model: str
+
+
+def _json_setting(value: str, setting_name: str) -> dict:
+    """Parse an optional JSON registry setting without breaking startup."""
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("must be a JSON object")
+        return parsed
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning("Ignoring invalid %s: %s", setting_name, exc)
+        return {}
+
+
+def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModelConfig]]:
+    """Resolve the configured provider and named-model registries.
+
+    The legacy backend settings remain the fallback, so existing installations
+    do not need migration. A provider's ``api_key_env`` is resolved only here;
+    credentials never need to be stored in the registry itself.
+    """
+    providers: dict[str, LLMProviderConfig] = {
+        "anthropic": LLMProviderConfig(
+            name="anthropic", type="anthropic",
+            api_key=getattr(settings, "anthropic_api_key", ""),
+        ),
+        "local": LLMProviderConfig(
+            name="local", type="openai_compatible",
+            base_url=getattr(settings, "local_llm_url", "http://localhost:8080"),
+        ),
+    }
+    raw_providers = _json_setting(
+        getattr(settings, "llm_providers_json", ""), "LIFEOS_LLM_PROVIDERS"
+    )
+    for name, raw in raw_providers.items():
+        if not isinstance(raw, dict):
+            logger.warning("Ignoring provider %r: expected an object", name)
+            continue
+        api_key = str(raw.get("api_key", "") or "")
+        api_key_env = str(raw.get("api_key_env", "") or "")
+        if api_key_env:
+            api_key = os.environ.get(api_key_env, "")
+        headers = raw.get("headers", {})
+        providers[str(name)] = LLMProviderConfig(
+            name=str(name),
+            type=str(raw.get("type", "openai_compatible")),
+            base_url=str(raw.get("base_url", "") or ""),
+            api_key=api_key,
+            headers={str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {},
+        )
+
+    models: dict[str, LLMModelConfig] = {}
+    raw_models = _json_setting(
+        getattr(settings, "llm_models_json", ""), "LIFEOS_LLM_MODELS"
+    )
+    for name, raw in raw_models.items():
+        if not isinstance(raw, dict) or not raw.get("provider") or not raw.get("model"):
+            logger.warning("Ignoring model profile %r: provider and model are required", name)
+            continue
+        models[str(name)] = LLMModelConfig(
+            name=str(name), provider=str(raw["provider"]), model=str(raw["model"])
+        )
+
+    if "default" not in models:
+        backend = getattr(settings, "llm_backend", "anthropic").lower()
+        if backend == "anthropic":
+            models["default"] = LLMModelConfig(
+                name="default", provider="anthropic",
+                model=getattr(settings, "anthropic_model", "claude-haiku-4-5"),
+            )
+        else:
+            models["default"] = LLMModelConfig(
+                name="default", provider="local",
+                model=getattr(settings, "local_llm_model", "local"),
+            )
+    if "specialist" not in models:
+        default = models["default"]
+        # Preserve the historical Sonnet specialist when running the legacy
+        # Anthropic backend. With a custom registry, specialist work follows
+        # the configured default until explicitly assigned another profile.
+        specialist_model = (
+            getattr(settings, "anthropic_specialist_model", default.model)
+            if default.provider == "anthropic" else default.model
+        )
+        models["specialist"] = LLMModelConfig(
+            name="specialist", provider=default.provider, model=specialist_model
+        )
+    if "fast" not in models:
+        models["fast"] = models["default"]
+    return providers, models
 
 
 @dataclass
@@ -279,9 +389,22 @@ def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
 class LocalLLMClient:
     """Client for the local OpenAI-compatible LLM server (llama-server)."""
 
-    def __init__(self, base_url: str | None = None, timeout: float | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        *,
+        model: str = "local",
+        api_key: str = "",
+        headers: dict[str, str] | None = None,
+    ):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
         self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
+        self.model = model
+        self.api_key = api_key
+        self.headers = dict(headers or {})
+        if self.api_key:
+            self.headers.setdefault("Authorization", f"Bearer {self.api_key}")
         self._async_client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
 
@@ -291,6 +414,7 @@ class LocalLLMClient:
             self._async_client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
+                headers=self.headers,
             )
         return self._async_client
 
@@ -300,6 +424,7 @@ class LocalLLMClient:
             self._sync_client = httpx.Client(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
+                headers=self.headers,
             )
         return self._sync_client
 
@@ -429,7 +554,7 @@ class LocalLLMClient:
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
-            "model": "local",
+            "model": self.model,
             "messages": all_messages,
             "max_tokens": max_tokens,
             "stream": False,
@@ -464,7 +589,7 @@ class LocalLLMClient:
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
-            "model": "local",
+            "model": self.model,
             "messages": all_messages,
             "max_tokens": max_tokens,
             "stream": False,
@@ -532,7 +657,7 @@ class LocalLLMClient:
         """
         all_messages = self._build_messages_list(messages, system)
         payload: dict[str, Any] = {
-            "model": "local",
+            "model": self.model,
             "messages": all_messages,
             "max_tokens": max_tokens,
             "stream": True,
@@ -946,6 +1071,44 @@ class AnthropicLLMClient:
         return bool(self._api_key)
 
 
+class OpenAICompatibleLLMClient(LocalLLMClient):
+    """Client for any provider exposing the OpenAI chat-completions shape."""
+
+
+def get_llm(
+    profile: str = "default",
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> LocalLLMClient | AnthropicLLMClient:
+    """Create a client from a named provider/model profile.
+
+    With no registry configured this resolves to the historical Anthropic or
+    local backend, preserving existing deployments.
+    """
+    providers, models = get_llm_registry()
+    selected = models.get(profile) or models["default"]
+    provider_name = provider or selected.provider
+    model_name = model or selected.model
+    if provider and not models.get(profile):
+        if provider_name == "local":
+            model_name = getattr(settings, "local_llm_model", model_name)
+    provider_config = providers.get(provider_name)
+    if provider_config is None:
+        raise ValueError(f"Unknown LLM provider {provider_name!r}")
+
+    if provider_config.type == "anthropic":
+        return AnthropicLLMClient(api_key=provider_config.api_key, model=model_name)
+    if provider_config.type in ("openai", "openai_compatible", "local"):
+        return OpenAICompatibleLLMClient(
+            base_url=provider_config.base_url,
+            model=model_name,
+            api_key=provider_config.api_key,
+            headers=provider_config.headers,
+        )
+    raise ValueError(f"Unsupported LLM provider type {provider_config.type!r}")
+
+
 # --- Singleton ---
 
 _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
@@ -959,13 +1122,8 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """
     global _llm_client
     if _llm_client is None:
-        backend = getattr(settings, "llm_backend", "anthropic").lower()
-        if backend == "anthropic":
-            logger.info("Using Anthropic LLM backend")
-            _llm_client = AnthropicLLMClient()
-        else:
-            logger.info("Using local LLM backend at %s", settings.local_llm_url)
-            _llm_client = LocalLLMClient()
+        _llm_client = get_llm()
+        logger.info("Using configured LLM client %s", type(_llm_client).__name__)
     return _llm_client
 
 

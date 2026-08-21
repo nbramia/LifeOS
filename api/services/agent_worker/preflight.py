@@ -268,12 +268,12 @@ PreflightCaller = Callable[[str], str]
 
 
 def _default_llm_caller(prompt: str) -> str:
-    """Production caller: hit the Anthropic API via the existing llm_client."""
+    """Production caller using the configured fast model profile."""
     # Import inside the function so tests that monkeypatch run_preflight don't
-    # need the Anthropic SDK installed.
-    from api.services.llm_client import AnthropicLLMClient
+    # need an LLM SDK installed.
+    from api.services.llm_client import get_llm
 
-    client = AnthropicLLMClient(model=settings.agent_preflight_model)
+    client = get_llm("fast", model=settings.agent_preflight_model)
     response = client.create(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1024,

@@ -529,9 +529,10 @@ class PersonFactExtractor:
     PRIORITY_SOURCES = {"calendar", "vault", "granola"}
     PRIORITY_BONUS = 1.5  # Priority sources get 50% more of their share
 
-    # Model options (kept for compatibility, actual model is local)
-    MODEL_SONNET = "local"
-    MODEL_HAIKU = "local"
+    # Legacy aliases retained for callers; the active model comes from the
+    # provider/model profile selected by llm_client.
+    MODEL_SONNET = "specialist"
+    MODEL_HAIKU = "fast"
     DEFAULT_MODEL = MODEL_HAIKU
 
     def __init__(self, fact_store: Optional[PersonFactStore] = None):
@@ -543,8 +544,8 @@ class PersonFactExtractor:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            from api.services.llm_client import get_anthropic_llm
-            self._client = get_anthropic_llm()
+            from api.services.llm_client import get_llm
+            self._client = get_llm("specialist")
         return self._client
 
     def _generate_fact_key(self, category: str, value: str) -> str:
