@@ -288,14 +288,17 @@ async def trigger_photo_sync(
     except Exception as e:
         # A plain JSONResponse, not a SyncResponse, so a top-level "error"
         # key can ride alongside the existing fields instead of being
-        # filtered out by response_model validation. #609: the request was
-        # served, but the sync itself failed, and this stays a 200 for that
-        # reason (#614 tracks whether that should change) — the caller
-        # still needs to be able to tell success from failure without
-        # parsing prose, and `mcp_server.py: dispatch()` and the agent
-        # worker's ToolRegistry already flag any tool result as an error
-        # generically whenever the body carries a top-level "error" key.
-        return JSONResponse(content={
+        # filtered out by response_model validation. #609 made this legible
+        # (top-level "error" key); #614 decided a total failure must also
+        # be non-2xx, since a consumer that only checks HTTP status
+        # (`raise_for_status()`) should get correct behavior without
+        # knowing about the body convention. 500 because this is an
+        # unhandled exception, not a classified upstream/dependency
+        # failure. The "error" key stays as additive defense —
+        # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
+        # already flag any tool result as an error generically whenever the
+        # body carries a top-level "error" key.
+        return JSONResponse(status_code=500, content={
             "success": False,
             "stats": {"error": str(e)},
             "message": f"Sync failed: {e}",

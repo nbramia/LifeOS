@@ -226,14 +226,19 @@ async def trigger_calendar_sync(days_past: int = 30, days_future: int = 30) -> C
         logger.error(f"Calendar sync failed: {e}")
         # A plain JSONResponse, not a CalendarSyncResponse, so the extra
         # top-level "error" key survives instead of being filtered out by
-        # response_model validation. #609: the request was served, but the
-        # sync itself failed, and this stays a 200 for that reason (#614
-        # tracks whether that should change) — the caller still needs to be
-        # able to tell success from failure without parsing prose, and
-        # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
-        # already flag any tool result as an error generically whenever the
-        # body carries a top-level "error" key.
-        return JSONResponse(content={
+        # response_model validation. #609 made this legible (top-level
+        # "error" key); #614 decided a total failure must also be non-2xx,
+        # since a consumer that only checks HTTP status (`raise_for_status()`)
+        # should get correct behavior without knowing about the body
+        # convention. 500 because this is an unhandled exception, not a
+        # classified upstream/dependency failure. The "error" key stays as
+        # additive defense — `mcp_server.py: dispatch()` and the agent
+        # worker's ToolRegistry already flag any tool result as an error
+        # generically whenever the body carries a top-level "error" key.
+        # A `partial` outcome (some accounts synced, one failed) is a real,
+        # non-error result and is returned above via CalendarSyncResponse —
+        # this branch is only reached on an exception that escaped sync().
+        return JSONResponse(status_code=500, content={
             "status": "error",
             "events_indexed": 0,
             "errors": [str(e)],

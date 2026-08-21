@@ -702,7 +702,7 @@ Get photos where two people appear together.
 
 ### POST /api/photos/sync
 
-Trigger Photos sync (matches faces to PersonEntity, creates interactions).
+Trigger Photos sync (matches faces to PersonEntity, creates interactions). **Errors:** `500` on a total sync failure (body still carries `success: false` and a top-level `error` key).
 
 ### GET /api/photos/thumbnail/{uuid}
 
@@ -908,7 +908,7 @@ Calendar indexer status.
 
 ### POST /api/admin/calendar/sync
 
-Trigger calendar sync.
+Trigger calendar sync. A partial result (some calendar accounts synced, one failed) is a `200` with `status: "partial"`. **Errors:** `500` on a total sync failure (body still carries `status: "error"` and a top-level `error` key).
 
 ### POST /api/admin/calendar/start
 

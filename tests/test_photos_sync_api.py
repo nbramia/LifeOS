@@ -41,19 +41,21 @@ class TestPhotosSyncEndpoint:
         assert "error" not in data
 
     def test_sync_failure_carries_top_level_error(self, client, photos_enabled):
-        """#609: a sync failure stays a 200 (the request WAS served — see
-        #614 for whether that should change) but must carry a top-level
-        `error` key, since `mcp_server.py: dispatch()` and the agent
-        worker's `ToolRegistry` both key off exactly that to flag a result
-        as failed. Previously the failure detail only lived nested inside
-        `stats["error"]`, invisible to that generic check."""
+        """#609 made a total sync failure legible (top-level `error` key,
+        previously the failure detail only lived nested inside
+        `stats["error"]`, invisible to the generic top-level check); #614
+        decided a total failure must also report non-2xx, since a consumer
+        that only checks HTTP status (`raise_for_status()`) should get
+        correct behavior without knowing about the body convention. 500
+        because this is an unhandled exception, not a classified
+        upstream/dependency failure."""
         with patch(
             "api.services.apple_photos_sync.sync_apple_photos",
             side_effect=RuntimeError("Photos library locked"),
         ):
             response = client.post("/api/photos/sync")
 
-        assert response.status_code == 200
+        assert response.status_code == 500
         data = response.json()
         assert data["success"] is False
         assert "error" in data
