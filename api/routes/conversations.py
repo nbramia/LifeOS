@@ -6,6 +6,7 @@ Manages conversation threads with persistence.
 import json
 import asyncio
 import logging
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -18,6 +19,7 @@ from api.services.conversation_store import (
 from api.services.hybrid_search import HybridSearch
 from api.services.synthesizer import construct_prompt, get_synthesizer
 from api.services.query_router import QueryRouter
+from api.services.chat_turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,16 @@ class PendingQuestionResponse(BaseModel):
     kind: str  # clarification | goal_approval | followup
 
 
+class ActiveTurnResponse(BaseModel):
+    """A chat turn (#611) currently running for this conversation — server-
+    side, regardless of whether any client is watching it. Lets a
+    reconnecting client show "still working..." and reach the Stop
+    affordance even after a reload."""
+    turn_id: str
+    conversation_id: str
+    started_at: str
+
+
 class ConversationDetailResponse(BaseModel):
     """Response with full conversation including messages."""
     id: str
@@ -75,6 +87,10 @@ class ConversationDetailResponse(BaseModel):
     # uses this to STOP once the session is done and nothing awaits an answer —
     # otherwise the 4s poll would run forever after the session finishes.
     agent_session_active: bool = False
+    # Present iff a #611 chat turn is currently in flight for this
+    # conversation (native or Hermes-relayed) — absent/None otherwise,
+    # including for an ordinary completed turn.
+    active_turn: Optional[ActiveTurnResponse] = None
 
 
 class ConversationListResponse(BaseModel):
@@ -205,7 +221,45 @@ async def get_conversation(conversation_id: str):
         ],
         pending_question=pending_question,
         agent_session_active=agent_session_active,
+        active_turn=_active_turn_response(conversation_id),
     )
+
+
+def _active_turn_response(conversation_id: str) -> Optional[ActiveTurnResponse]:
+    """The in-flight #611 turn for this conversation, if any, as the
+    response shape. `None` for a conversation with no turn registered, or
+    whose registered turn has already finished (its task exists but is
+    done) — a narrow window that closes as soon as the task's own `finally`
+    pops the registry entry."""
+    turn = get_turn_registry().get_by_conversation(conversation_id)
+    if turn is None or turn.task is None or turn.task.done():
+        return None
+    return ActiveTurnResponse(
+        turn_id=turn.turn_id,
+        conversation_id=turn.conversation_id,
+        started_at=datetime.fromtimestamp(turn.started_at).isoformat(),
+    )
+
+
+@router.post("/{conversation_id}/cancel")
+async def cancel_conversation_turn(conversation_id: str):
+    """Stop a #611 chat turn in flight for this conversation, if any (native
+    or Hermes-relayed — both register in the same turn registry).
+
+    404 if the conversation itself doesn't exist; otherwise 200 with
+    `cancelled: false` when nothing was in flight (already finished, or
+    never started) — cancelling a turn that isn't running is a no-op, not
+    an error. A repeated cancel while the first is still tearing down
+    reports `cancelled: true` again (harmless — cancelling an
+    already-cancelling task is a no-op); once the turn's task actually
+    finishes and its `finally` pops the registry entry, a further cancel
+    reports `false`.
+    """
+    store = get_store()
+    if store.get_conversation(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    cancelled = get_turn_registry().cancel_conversation(conversation_id)
+    return {"ok": True, "cancelled": cancelled}
 
 
 @router.delete("/{conversation_id}", status_code=204)

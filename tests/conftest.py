@@ -392,6 +392,26 @@ def _isolate_usage_store_db(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_turn_registry():
+    """Reset the #611 chat-turn registry (`api/services/chat_turns.py`)
+    before and after every test.
+
+    It's a process-wide singleton holding live `asyncio.Task`s — a turn left
+    registered by one test (e.g. one that starts `ask_stream()` and never
+    lets its background task finish) would otherwise leak into the next
+    test's registry lookups, and a still-running task from a torn-down test
+    could touch a store another test has already swapped out. Mirrors
+    ``_isolate_conversation_store_db`` above for the same singleton-leakage
+    reason.
+    """
+    from api.services import chat_turns
+
+    chat_turns.reset_turn_registry()
+    yield
+    chat_turns.reset_turn_registry()
+
+
 @pytest.fixture(scope="session")
 def embedding_service():
     """

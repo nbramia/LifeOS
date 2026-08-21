@@ -17,7 +17,7 @@ import {
   setupSwipeGestures, toggleSidebar, closeSidebar, newChat,
   filterConversations, loadConversation, deleteConversation,
 } from './conversations.js';
-import { sendMessage, askQuestion } from './ask-stream.js';
+import { sendMessage, askQuestion, stopTurn } from './ask-stream.js';
 import { loadPersonas, onPersonaChange, personaOrchestrates, personaSupportsHandoff } from './persona.js';
 import { initVoice, toggleVoiceMode, submitTurn } from './voice.js';
 import { initBackend } from './backend.js';
@@ -89,7 +89,7 @@ Object.assign(window, {
   // attachments.js
   openFilePicker, removeAttachment,
   // ask-stream.js
-  sendMessage, askQuestion,
+  sendMessage, askQuestion, stopTurn,
   // persona.js
   onPersonaChange,
   // model.js

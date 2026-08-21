@@ -167,6 +167,19 @@ class Settings(BaseSettings):
         description="Optional bearer token for the Hermes text backend"
     )
 
+    # Bounded lifetime for a chat turn that has detached from its client (#611):
+    # a disconnect no longer stops generation, but an abandoned turn still needs
+    # a ceiling so it can't run forever with nobody watching. Matches the read
+    # timeout the proxy already gives a voice/agent/hermes turn (api/routes/
+    # _proxy.py's TIMEOUT), so a detached turn's own clock (which starts at
+    # detach, not at turn start) doesn't cut it off any earlier than a connected
+    # one already tolerates.
+    detached_turn_timeout_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS",
+        description="How long a chat turn may keep running after its client disconnects before it's cancelled"
+    )
+
     # Default /chat input mode. Off (text) by default so a fresh clone without a
     # voice gateway isn't dropped onto a non-functional dock; set true to make
     # voice the default. A ?mode= URL param or a stored preference still wins.

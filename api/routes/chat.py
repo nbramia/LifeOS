@@ -33,6 +33,7 @@ from config.settings import settings
 from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 from api.services.agent_system_prompt import build_turn_context
+from api.services.chat_turns import get_turn_registry, TRUNCATION_MARKER, truncation_routing
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +394,31 @@ class AskStreamRequest(BaseModel):
     # resolve a persona, or pick a model; omitted (the default) reproduces
     # today's tagging ("lifeos") exactly.
     backend: Optional[str] = None
+    # Opaque, client-generated turn key (#611 review). `conversation_id`
+    # alone can't cancel a turn before its first SSE frame ever arrives —
+    # the request that started it carries `conversation_id: None` for a
+    # brand-new conversation, and the real id only shows up in the
+    # `conversation_id` SSE event. That's exactly the window a voice
+    # barge-in on a first turn falls into, so `POST /api/chat/cancel`
+    # accepts this key too. The client mints it (any opaque string works —
+    # not required to be a UUID) before sending; the server never generates
+    # or returns one. Optional and additive: omitting it changes nothing.
+    client_turn_id: Optional[str] = None
+
+    @field_validator("client_turn_id")
+    @classmethod
+    def validate_client_turn_id(cls, v):
+        # Opaque bounded string, not a trusted identifier — bounded to stop
+        # something huge or control-character-laden from reaching the
+        # in-memory registry key space. Not assumed to be a UUID: whatever
+        # scheme a client uses to generate a locally-unique key is fine.
+        if v is None:
+            return v
+        if len(v) > 200:
+            raise ValueError(f"client_turn_id exceeds 200 chars (got {len(v)})")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            raise ValueError("client_turn_id must not contain control characters")
+        return v
 
     @field_validator("persona")
     @classmethod
@@ -539,11 +565,51 @@ async def ask_stream(request: AskStreamRequest):
         _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
     personal_context = settings.personal_context(_effective_pid or "")
 
-    async def generate():
+    # #611: the turn's lifetime is owned by the server from here on, not by
+    # this SSE connection. `modality` decides how a disconnect behaves once
+    # the turn task is running (see ChatTurn.reader() in chat_turns.py for
+    # the voice gate); text/unset turns survive the client leaving, voice
+    # turns keep today's disconnect-cancels semantics.
+    _modality = (request.modality or "").strip().lower() or "text"
+    # Supersede (#611): a new turn on a conversation OR client_turn_id that
+    # already has one in flight cancels the old one first — asking again is
+    # itself a stop gesture, and it prevents a stale reply landing after a
+    # newer question. Checking client_turn_id too closes the same gap the
+    # explicit cancel endpoint closes (#611 review): a reused/duplicate key
+    # supersedes rather than silently colliding with an unrelated turn.
+    if request.conversation_id:
+        get_turn_registry().cancel_conversation(request.conversation_id)
+    if request.client_turn_id:
+        get_turn_registry().cancel_by_client_turn_id(request.client_turn_id)
+    turn = get_turn_registry().create(
+        conversation_id=request.conversation_id,
+        modality=_modality,
+        client_turn_id=request.client_turn_id,
+    )
+
+    async def _content(text: str) -> None:
+        """Emit a `content` SSE frame AND accumulate it into `partial_text`
+        (#611) — the running "what has the user actually seen so far" used
+        to persist an honest partial if this turn is interrupted. Reset to
+        "" on `self_correction`, mirroring `ask-stream.js`'s `fullContent`:
+        `agent_result.full_text` only gains a round's text at round end, so
+        it is NOT what was actually streamed and isn't safe to use here."""
+        nonlocal partial_text
+        partial_text += text
+        await turn.emit(f"data: {json.dumps({'type': 'content', 'content': text})}\n\n")
+
+    partial_text = ""
+
+    async def _run_turn():
+        nonlocal partial_text
+        # Pre-initialized outside the try (a plain assignment can't itself be
+        # interrupted) so the except/finally clauses below always have a
+        # defined `conversation_id`, even if a cancellation lands before the
+        # branch that would otherwise set it for a brand-new conversation.
+        conversation_id = turn.conversation_id
         try:
             # Get or create conversation
             store = get_store()
-            conversation_id = request.conversation_id
 
             if not conversation_id:
                 # Create new conversation, tagged with the selected persona so
@@ -556,6 +622,11 @@ async def ask_stream(request: AskStreamRequest):
                     backend=request.backend or "lifeos",
                 )
                 conversation_id = conv.id
+                # #611: bind the turn to its conversation id now that one
+                # exists, so it becomes cancellable/supersedable by that id.
+                # (An id supplied in the request was already bound at
+                # creation, in ask_stream(), before this task started.)
+                get_turn_registry().bind(turn, conversation_id)
                 # Generate title from question
                 title = generate_title(request.question)
                 store.update_title(conversation_id, title)
@@ -565,7 +636,7 @@ async def ask_stream(request: AskStreamRequest):
             start_trace(conversation_id, request.question)
 
             # Send conversation ID to client
-            yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n"
+            await turn.emit(f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n")
 
             # Save user message
             store.add_message(conversation_id, "user", request.question)
@@ -576,7 +647,7 @@ async def ask_stream(request: AskStreamRequest):
             _stripped = request.question.strip()
             if _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent "):
                 async for _ev in _handle_agent_slash(_stripped, conversation_id, store):
-                    yield _ev
+                    await turn.emit(_ev)
                 return
 
             # Model picker → "Claude Code": the toolbar model dropdown can pin a
@@ -590,9 +661,9 @@ async def ask_stream(request: AskStreamRequest):
             # not an LLM turn). The frontend treats an explicit pick as its own
             # handoff opt-in, bypassing the persona capability gate (#359).
             if (request.model_override or "").strip().lower() == "claude_code":
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Model picker → Claude Code', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Model picker → Claude Code', 'latency_ms': 0})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             # Orchestrating personas (e.g. doctor) run as a Claude Code session,
@@ -611,7 +682,7 @@ async def ask_stream(request: AskStreamRequest):
                     f"{persona_preamble}\n\n---\n\nThe user just sent this via the "
                     f"{request.persona_id} surface:\n\n{request.question}"
                 )
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': f'Orchestrating persona ({request.persona_id}) → Claude Code session', 'latency_ms': 0})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': f'Orchestrating persona ({request.persona_id}) → Claude Code session', 'latency_ms': 0})}\n\n")
                 try:
                     _spawn = await asyncio.to_thread(
                         spawn_claude_code_session, SessionStore(), spawn_prompt,
@@ -642,12 +713,12 @@ async def ask_stream(request: AskStreamRequest):
                     )
                 else:
                     ack = f"⚠️ Couldn't start the session: {_spawn.get('error', 'spawn failed')}"
-                yield f"data: {json.dumps({'type': 'content', 'content': ack})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'content', 'content': ack})}\n\n")
                 store.add_message(conversation_id, "assistant", ack, routing={
                     "reasoning": f"orchestrating persona {request.persona_id} → claude_code",
                     "sources": ["claude_code"],
                 })
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             # Get conversation history for context in follow-up questions
@@ -696,28 +767,35 @@ async def ask_stream(request: AskStreamRequest):
                                         "created_reminder": {"id": reminder.id, "name": reminder.name},
                                     }
                                     for chunk in response_text:
-                                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                        await _content(chunk)
                                         await asyncio.sleep(0.005)
                                     store.add_message(conversation_id, "assistant", response_text, routing=routing_metadata)
-                                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                                    # Persisted in full above — clear the accumulator so a
+                                    # cancellation on the way out (e.g. during the emit/return
+                                    # below) can't re-persist it as if it were only a partial
+                                    # (#611: would otherwise double-write this message).
+                                    partial_text = ""
+                                    await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                                     return
                             else:
                                 response_text = f"Selected reminder: **\"{reminder.name}\"**"
 
                             for chunk in response_text:
-                                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                                await _content(chunk)
                                 await asyncio.sleep(0.005)
                             store.add_message(conversation_id, "assistant", response_text)
-                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            partial_text = ""  # already persisted in full -- see comment above
+                            await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                             return
                 else:
                     # Invalid number
                     response_text = f"Please enter a number between 1 and {len(conv_context.pending_selection_items)}."
                     for chunk in response_text:
-                        yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                        await _content(chunk)
                         await asyncio.sleep(0.005)
                     store.add_message(conversation_id, "assistant", response_text)
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    partial_text = ""  # already persisted in full -- see comment above
+                    await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                     return
 
             # Explicit engine handoff (#305 part b): the user named a CLI engine
@@ -729,9 +807,9 @@ async def ask_stream(request: AskStreamRequest):
             _engine, _engine_task = parse_engine_directive(request.question)
             if _engine:
                 _label = "Codex" if _engine == "codex" else "Claude Code"
-                yield f"data: {json.dumps({'type': 'routing', 'sources': [_engine], 'reasoning': f'User-directed handoff to {_label}', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': _engine_task, 'engine': _engine})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': [_engine], 'reasoning': f'User-directed handoff to {_label}', 'latency_ms': 0})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': _engine_task, 'engine': _engine})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             # Intent classification for special dispatch cases only.
@@ -745,20 +823,21 @@ async def ask_stream(request: AskStreamRequest):
                 # ---- AMBIGUOUS: could be task or reminder ----
                 print("DETECTED AMBIGUOUS TASK/REMINDER INTENT")
                 response_text = "Should I add this as a **to-do** in your task list, or set a **timed reminder** to ping you about it, or both?"
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['clarification'], 'reasoning': 'Ambiguous task/reminder', 'latency_ms': 0})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['clarification'], 'reasoning': 'Ambiguous task/reminder', 'latency_ms': 0})}\n\n")
                 for chunk in response_text:
-                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    await _content(chunk)
                     await asyncio.sleep(0.005)
                 store.add_message(conversation_id, "assistant", response_text)
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                partial_text = ""  # already persisted in full -- see comment above
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             elif action_intent and action_intent.category == "claude":
                 # ---- CLAUDE CODE: requires terminal/filesystem/browser ----
                 print("DETECTED CLAUDE INTENT - delegating to Claude Code")
-                yield f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['claude_code'], 'reasoning': 'Action requires terminal/filesystem/browser access', 'latency_ms': 0})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': request.question, 'engine': 'claude_code'})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             # --- REMOVED: legacy compose/task/reminder handlers ---
@@ -844,9 +923,9 @@ async def ask_stream(request: AskStreamRequest):
                 # context.
                 from api.services.agent_loop import _original_request
                 _handoff_task = _original_request(conversation_history, request.question)
-                yield f"data: {json.dumps({'type': 'routing', 'sources': [orchestrator_model], 'reasoning': f'Escalation ladder → {_label}', 'latency_ms': 0})}\n\n"
-                yield f"data: {json.dumps({'type': 'claude_intent', 'task': _handoff_task, 'engine': orchestrator_model})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': [orchestrator_model], 'reasoning': f'Escalation ladder → {_label}', 'latency_ms': 0})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'claude_intent', 'task': _handoff_task, 'engine': orchestrator_model})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
             if escalated:
                 logger.info("escalating chat turn to %s (user-directed or refusal+pushback)", orchestrator_model)
@@ -875,7 +954,7 @@ async def ask_stream(request: AskStreamRequest):
                 f'Agentic loop — escalated to {orchestrator_model}'
                 if escalated else f'Agentic loop ({orchestrator_model})'
             )
-            yield f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': _routing_reason, 'latency_ms': 0})}\n\n"
+            await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': _routing_reason, 'latency_ms': 0})}\n\n")
 
             # Consume the async generator from the agent loop
             agent_result = None
@@ -892,17 +971,25 @@ async def ask_stream(request: AskStreamRequest):
                 force_local=force_local,
             ):
                 if event["type"] == "text":
-                    yield f"data: {json.dumps({'type': 'content', 'content': event['content']})}\n\n"
+                    await _content(event['content'])
                 elif event["type"] == "status":
-                    yield f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n"
+                    await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
                 elif event["type"] == "self_correction":
-                    yield f"data: {json.dumps({'type': 'self_correction'})}\n\n"
+                    # #611: what was streamed so far is superseded by the
+                    # self-corrected retry that follows — mirrors
+                    # ask-stream.js's `fullContent = ''` reset, and matters
+                    # here because `agent_result.full_text` only gains a
+                    # round's text at round end, so it is NOT what the user
+                    # actually saw and isn't safe to persist on a
+                    # cancellation that lands mid-correction.
+                    partial_text = ""
+                    await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
                 elif event["type"] == "result":
                     agent_result = event["result"]
 
             if agent_result is None:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Agent loop returned no result'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'error', 'message': 'Agent loop returned no result'})}\n\n")
+                await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
             # Record usage
@@ -915,7 +1002,7 @@ async def ask_stream(request: AskStreamRequest):
                     cost_usd=agent_result.total_cost_usd,
                     conversation_id=conversation_id,
                 )
-                yield f"data: {json.dumps({'type': 'usage', 'input_tokens': agent_result.total_input_tokens, 'output_tokens': agent_result.total_output_tokens, 'cost_usd': agent_result.total_cost_usd, 'model': agent_result.model})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'usage', 'input_tokens': agent_result.total_input_tokens, 'output_tokens': agent_result.total_output_tokens, 'cost_usd': agent_result.total_cost_usd, 'model': agent_result.model})}\n\n")
 
             # Build source list from tool calls
             sources = []
@@ -939,7 +1026,7 @@ async def ask_stream(request: AskStreamRequest):
                     })
 
             if request.include_sources and sources:
-                yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n")
 
             # Save assistant response
             routing_metadata = {
@@ -954,27 +1041,105 @@ async def ask_stream(request: AskStreamRequest):
                 sources=sources,
                 routing=routing_metadata,
             )
+            # Persisted in full above (the authoritative agent_result.full_text,
+            # not the streamed partial_text) -- clear the accumulator so a
+            # cancellation on the way out below can't re-persist it as a
+            # truncated duplicate of the message just written (#611).
+            partial_text = ""
             print(f"Saved assistant response ({len(agent_result.full_text)} chars, {len(agent_result.tool_calls_log)} tool calls)")
 
             # Finish performance trace and emit it
             perf_trace = finish_trace()
             if perf_trace:
-                yield f"data: {json.dumps({'type': 'perf_trace', 'trace_id': perf_trace.trace_id, 'total_ms': round(perf_trace.total_ms, 1), 'spans': [{'name': s.name, 'duration_ms': s.duration_ms, 'parent': s.parent} for s in perf_trace.spans]})}\n\n"
+                await turn.emit(f"data: {json.dumps({'type': 'perf_trace', 'trace_id': perf_trace.trace_id, 'total_ms': round(perf_trace.total_ms, 1), 'spans': [{'name': s.name, 'duration_ms': s.duration_ms, 'parent': s.parent} for s in perf_trace.spans]})}\n\n")
 
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
 
+        except asyncio.CancelledError:
+            # #611: the client disconnected (survivable turn, now cancelled
+            # by an explicit /cancel, a supersede, the detached-lifetime
+            # deadline, or a shutdown drain), or this is a voice turn whose
+            # disconnect immediately cancels it (see ChatTurn.reader()'s
+            # voice gate). Persist whatever the user had already seen rather
+            # than losing it outright — marked so it's never mistaken for a
+            # finished reply.
+            if conversation_id and partial_text:
+                store.add_message(
+                    conversation_id, "assistant", partial_text + TRUNCATION_MARKER,
+                    routing=truncation_routing(turn.cancel_reason or "cancelled"),
+                )
+            finish_trace()
+            raise
         except Exception as e:
             finish_trace()  # Clean up trace on error
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            if conversation_id and partial_text:
+                # #611: a genuine mid-stream error (e.g. the agent loop
+                # itself raised) used to leave NOTHING persisted even though
+                # partial_text had already reached the browser -- an
+                # invisible truncation with no signal anything went wrong.
+                # Persist it, marked, same as an explicit cancellation.
+                store.add_message(
+                    conversation_id, "assistant", partial_text + TRUNCATION_MARKER,
+                    routing=truncation_routing("stream_error"),
+                )
+            await turn.emit(f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n")
+        finally:
+            get_turn_registry().pop(turn)
+            await turn.close()
 
+    # #611: start the turn as a background task NOW -- it owns its own
+    # lifetime from here on -- and hand StreamingResponse a reader over its
+    # queue rather than the turn's own generator. A connected client's frame
+    # sequence is unaffected (emit() backpressures exactly like a bare
+    # `yield` did), but closing this reader (a disconnect) no longer stops
+    # the task underneath it.
+    turn.task = asyncio.create_task(_run_turn())
     return StreamingResponse(
-        generate(),
+        turn.reader(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
         }
     )
+
+
+class ChatCancelRequest(BaseModel):
+    """Cancel a chat turn by its client-supplied key (#611 review)."""
+    client_turn_id: str
+
+    @field_validator("client_turn_id")
+    @classmethod
+    def validate_client_turn_id(cls, v):
+        if not v:
+            raise ValueError("client_turn_id cannot be empty")
+        if len(v) > 200:
+            raise ValueError(f"client_turn_id exceeds 200 chars (got {len(v)})")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            raise ValueError("client_turn_id must not contain control characters")
+        return v
+
+
+@router.post("/chat/cancel")
+async def chat_cancel(request: ChatCancelRequest):
+    """Cancel a chat turn (native or Hermes-relayed) by `client_turn_id` —
+    the key the client mints and sends on `POST /api/ask/stream`, BEFORE it
+    has a `conversation_id` to cancel by (#611 review). This closes the
+    "first-turn barge-in" gap `POST /api/conversations/{id}/cancel` alone
+    can't: a request that hasn't reached its first SSE frame yet has no
+    conversation id, but the client already has the key it generated.
+
+    There is no 404 here — unlike the conversation-scoped endpoint, there's
+    no existing resource to validate against (a `client_turn_id` might
+    legitimately never have been claimed, e.g. the turn already finished
+    and was popped from the registry, or the key was never used). `200` +
+    `cancelled: false` covers every "nothing to cancel" case; this must
+    never be a 4xx, since a gateway that fires its cancel POST slightly
+    ahead of the turn actually finishing needs that to read as success, not
+    an error.
+    """
+    cancelled = get_turn_registry().cancel_by_client_turn_id(request.client_turn_id)
+    return {"ok": True, "cancelled": cancelled}
 
 
 class HandoffRequest(BaseModel):

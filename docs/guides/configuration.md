@@ -32,6 +32,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_AGENT_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Agent text backend, added server-side (never exposed to the browser). |
 | `LIFEOS_HERMES_BACKEND_URL` | str | *(empty)* | Hermes text backend base URL, proxied the same way at `/api/hermes/ask/stream` (#587). Empty disables the `/chat` Hermes option; with no stored backend preference, `/chat` defaults to Hermes when it's configured and reachable, else LifeOS. Deliberately absent from `.env.example`. |
 | `LIFEOS_HERMES_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Hermes text backend, added server-side. |
+| `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` | float | `300.0` | How long a chat turn (native or Hermes-relayed) may keep running after its client disconnects before it's cancelled (#611). The clock starts at disconnect, not at turn start, so a turn that stays watched is never affected by it. Matches the proxy's own upstream read timeout (`api/routes/_proxy.py`'s `TIMEOUT`), so a detached turn isn't cut off any earlier than a connected one already tolerates. |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
 
@@ -398,6 +399,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
+- [ADR-019: A Turn's Lifetime Is Owned by the Server](../adr/019-turn-owned-by-server.md) — Why `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` exists.
 - [ADR-012: Embedding Pipeline](../adr/012-embedding-pipeline.md) — Why `LIFEOS_EMBEDDING_MODEL` is overridable; the OOM-protection knobs.
 - [API Reference](../specs/product/api-reference.md) — Gmail send endpoint behavior controlled by the draft send cooldown.
 - [`config/settings.py`](../../config/settings.py) — The source of truth; this guide should track it.

@@ -26,7 +26,7 @@ Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https
 
 The gateway connects to LifeOS at `LIFEOS_BASE_URL` for orchestration (ask/stream, handoff). Persona listing and conversation CRUD are **LifeOS-owned** — consumed by `/chat` directly, not through whisper-relay.
 
-**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers).
+**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers). `POST /api/chat/cancel` (`client_turn_id`, #611) exists for the gateway to adopt as its explicit stop path — tracked as `whisper-relay#37`, not yet started — but is not called today: voice still relies on cancel-on-disconnect (see "Turn lifetime and cancellation" below) until that lands.
 
 **Persona contract** (shared by web and voice; lets a thin client expose LifeOS's multi-bot personas without reading LifeOS config):
 
@@ -74,6 +74,84 @@ With #361, LifeOS `/chat` is the unified text+voice client. Voice *transport* st
 
 Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifecycle (Voice|Text toggle, SSE `done` data, sequential audio, cancel via `AbortController`), same-origin via the reverse proxy. Mode persists in `sessionStorage` (`lifeos:chat:voice_mode`).
 
+## Turn lifetime and cancellation (#611)
+
+A chat turn's lifetime is owned by the server, not the SSE connection watching
+it — see [ADR-019](../../adr/019-turn-owned-by-server.md) for the full
+rationale. This applies to the native (`lifeos`) backend and the Hermes
+proxy; the Agent backend is unaffected (below).
+
+- **A client disconnecting no longer stops the turn.** Closing the tab,
+  backgrounding the app, or a network switch used to kill generation within
+  milliseconds and lose the reply outright. Now the turn keeps running
+  server-side and persists the complete reply, readable via `GET
+  /api/conversations/{id}` once it's reopened. A connected client's frame
+  sequence and bytes are unaffected — this is purely about what happens
+  *after* a disconnect.
+- **Exception: voice.** whisper-relay's adapter deliberately abandons the
+  LifeOS/Hermes stream as its cancel gesture on barge-in and hangup. A turn
+  with `modality: "voice"` therefore keeps the *old* disconnect-cancels
+  behavior — a voice-modality disconnect cancels the turn immediately,
+  exactly as before #611 — until whisper-relay is updated to call the
+  cancel endpoint below explicitly instead of just walking away.
+- **`POST /api/conversations/{id}/cancel`** stops whatever turn is in
+  flight for that conversation, native or Hermes-relayed alike. `{ok:
+  true, cancelled: true|false}` — `false` when nothing was running (already
+  finished, or never started); `404` if the conversation itself doesn't
+  exist. A new `POST /api/ask/stream` (or the Hermes equivalent) naming a
+  conversation that already has a turn in flight cancels the old one first
+  (supersede) — asking again is itself a stop gesture.
+- **`client_turn_id` and `POST /api/chat/cancel` (#611 review — closes the
+  first-turn barge-in gap).** `conversation_id` alone can't cancel a turn
+  before its first SSE frame arrives: a brand-new conversation's id doesn't
+  exist until the `conversation_id` event, so a client racing to cancel
+  before then — the common case for a voice barge-in, which tends to land
+  within the first second — has nothing to cancel by. `POST
+  /api/ask/stream` accepts an optional `client_turn_id`: an opaque,
+  client-generated key (bounded to 200 chars, no control characters — not
+  assumed to be a UUID), known before the request is even sent. The
+  registry indexes turns by it in addition to `conversation_id`, and `POST
+  /api/chat/cancel` (body: `{"client_turn_id": "..."}`) cancels by that key
+  alone. Reusing a `client_turn_id` on a later request supersedes the turn
+  currently holding it, mirroring `conversation_id` supersede — a stale or
+  duplicate key always resolves to its current claimant, never a stray
+  earlier turn. Returning a server-minted turn id in a new SSE event or
+  header was considered and rejected: either would break the byte-identity
+  guarantee a connected client already relies on (no new frame, no new
+  header); a request-body field costs nothing and the client knows its own
+  key earlier than the server could mint one anyway.
+- **Cancelling a turn whose reader is still attached is a supported,
+  explicitly-tested ordering** (#611 review) — not just "cancel after
+  disconnect." A gateway that fires its cancel POST from an event handler
+  rather than its SSE read loop (to avoid the latency of checking a flag
+  between reads) can have that POST arrive *before* the client actually
+  stops reading. Cancelling in that ordering works correctly: the
+  still-attached reader gets a clean end-of-stream (no exception), and a
+  disconnect that follows afterward is a no-op — not a second finalize.
+  Cancelling an already-finished (or already-cancelled) turn is `200` +
+  `cancelled: false`, never a 4xx — a gateway treats that as success.
+- **`GET /api/conversations/{id}`** gains an additive `active_turn` field:
+  `{turn_id, conversation_id, started_at}` while a turn is in flight for
+  that conversation, `null` otherwise. Lets a reconnecting client show
+  "still working..." and reach the cancel affordance even after a reload.
+- **A cut-off turn is always marked, never presented as whole.** Whatever
+  text a turn produced before being cancelled, hitting its
+  `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` deadline (default 300s, clock
+  starts at disconnect), being caught in a server shutdown drain, or dying
+  to a genuine stream error is persisted with a trailing, visible marker
+  (`"\n\n_[cut off — the turn ended before it finished]_"`) and a
+  `routing.truncated: true` / `routing.truncation_reason` on the stored
+  message (`"cancelled"` | `"deadline"` | `"shutdown"` | `"stream_error"`
+  on the native path; Hermes can only tell "a `done` event never arrived"
+  from "it did," so every Hermes truncation reports `"stream_error"`).
+  Neither field is new SSE wire protocol — they only ever appear on the
+  persisted message read back via `GET /api/conversations/{id}`, not on any
+  `data:` event.
+- **Byte identity for a connected client is unchanged.** No new SSE event
+  type and no new header were added — cancellation is keyed on
+  `conversation_id`, which every client already receives as the first SSE
+  event on both the native and Hermes paths.
+
 ## Text Backends
 
 `/chat` (and voice, via the gateway) targets one of three text backends, carried as an optional `backend` field (`lifeos` | `agent` | `hermes`, omitted/`lifeos` reproducing pre-#361 behavior exactly). Each gets its own section below because their capabilities genuinely differ — treat no statement in one backend's section as implying anything about another's.
@@ -84,7 +162,7 @@ The native orchestrator (`POST /api/ask/stream`, documented above and in [api-re
 
 ### Agent
 
-`agent` is the OpenClaw voice-adapter, reached at `LIFEOS_AGENT_BACKEND_URL` (optional bearer token) and proxied at `POST /api/agent/ask/stream` — LifeOS **adds the bearer server-side** so it never reaches the browser, and `GET /api/agent/status` reports whether it's configured (drives the UI selector). It speaks the same `/api/ask/stream` SSE contract as the native path. It has **no personas at all** — `persona_id` is never sent, so the persona and model pickers are both hidden while it's selected, no persona is ever diverted (nothing to divert), and no per-turn context is attached. It has **no handoff**. The route (`api/routes/agent_proxy.py`) is a pure byte relay (`request.stream()`, unbuffered — no `transform_body`, no `make_observer`), so its behavior is byte-for-byte what it was before Hermes existed. Its conversation history is **not** LifeOS-owned: nothing here persists it, so switching to `agent` shows a fresh view even though the stored conversation id is retained for continuity with whatever does own that history upstream. Because it isn't tee'd at all, its turns are also invisible to the usage store — unlike Hermes, below.
+`agent` is the OpenClaw voice-adapter, reached at `LIFEOS_AGENT_BACKEND_URL` (optional bearer token) and proxied at `POST /api/agent/ask/stream` — LifeOS **adds the bearer server-side** so it never reaches the browser, and `GET /api/agent/status` reports whether it's configured (drives the UI selector). It speaks the same `/api/ask/stream` SSE contract as the native path. It has **no personas at all** — `persona_id` is never sent, so the persona and model pickers are both hidden while it's selected, no persona is ever diverted (nothing to divert), and no per-turn context is attached. It has **no handoff**. The route (`api/routes/agent_proxy.py`) is a pure byte relay (`request.stream()`, unbuffered — no `transform_body`, no `make_observer`), so its behavior is byte-for-byte what it was before Hermes existed. Its conversation history is **not** LifeOS-owned: nothing here persists it, so switching to `agent` shows a fresh view even though the stored conversation id is retained for continuity with whatever does own that history upstream. Because it isn't tee'd at all, its turns are also invisible to the usage store — unlike Hermes, below. **It's also unaffected by #611** (turn-survives-disconnect): the registry-owned pump is gated on `make_observer` being set, and Agent never sets it, so a disconnected Agent-backend turn still stops exactly as before — detaching a relay nothing persists would only spend money with nothing to show for it.
 
 **These are properties of the Agent backend specifically, not of "external backends" generally** — Hermes, below, shares only some of them.
 
@@ -92,9 +170,13 @@ The native orchestrator (`POST /api/ask/stream`, documented above and in [api-re
 
 `hermes` is an agent harness reached as a gateway (#587), at `LIFEOS_HERMES_BACKEND_URL` (optional bearer token), proxied at `POST /api/hermes/ask/stream` with the same server-side bearer injection and a `GET /api/hermes/status` availability check. Both proxies are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Hermes has **no handoff** either — but unlike Agent, it keeps the persona picker visible, carries spoken-style rules on voice turns, receives the orchestrator's auto-injected turn context, and its history **is** LifeOS-owned. Its route (`api/routes/hermes_proxy.py`) buffers the request body (`transform_body`) to resolve the selected persona and attach it as the `lifeos_context` envelope below — the only text-backend proxy that does. Orchestrating personas never reach this route: they're diverted client-side to `POST /api/ask/stream` instead (#596, above), because the spawn they trigger is LifeOS-native and Hermes has no equivalent.
 
-#### Hermes turn persistence (#592) and usage capture (#595)
+#### Hermes turn persistence (#592, survives disconnect since #611) and usage capture (#595)
 
-Unlike the Agent backend, whose history genuinely lives elsewhere, Hermes turns are persisted into the same conversation store the native path uses, and their usage/cost is recorded into the same usage store. `make_backend_router()`'s relay loop (`api/routes/_proxy.py`) accepts an optional `make_observer` hook: given the same raw request body `transform_body` already buffers, it returns a `_HermesTurnPersister` (`api/routes/hermes_proxy.py`) whose `observe(chunk)` is called with a copy of each chunk immediately *before* that chunk is yielded to the browser (so an early client disconnect — which raises `GeneratorExit` at the `yield` — can never skip a chunk the tee hasn't seen yet), and whose `finalize()` runs whenever the relay ends — normal completion or an early disconnect alike. The persister reassembles SSE frames from the observed bytes (a chunk is a network read, not a frame, so frames can split across chunk boundaries) and reacts to the event types the native path emits: on the first `conversation_id` event it adopts that id via `ConversationStore.create_conversation(conv_id=..., persona_id=..., backend="hermes")` (existing rows are returned unchanged, so a continuing thread doesn't get re-tagged) and stores the user's question; `content` events accumulate into the assistant reply, written on `finalize()` — including whatever arrived if the stream died mid-turn; a `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model`) is captured and, on `finalize()`, written to `UsageStore.record_usage()` tagged with the conversation id — **cost is recorded verbatim, never recomputed** (Hermes runs DeepSeek via Fireworks; LifeOS's calculator only knows Anthropic pricing), and a cost-less event records a zero cost rather than an invented one. Conversation persistence and usage persistence are independent: a turn with no `usage` event writes no usage row (and vice versa), and each is retried/skipped on its own. A malformed or partial `usage` event (missing/wrong-typed model or token counts) is ignored entirely. Every store call is wrapped so a persistence failure is logged and swallowed, never surfacing as a broken turn. The Agent proxy passes neither `transform_body` nor `make_observer`, so its relay is byte-for-byte what it was before this hook existed.
+Unlike the Agent backend, whose history genuinely lives elsewhere, Hermes turns are persisted into the same conversation store the native path uses, and their usage/cost is recorded into the same usage store. `make_backend_router()`'s relay loop (`api/routes/_proxy.py`) accepts an optional `make_observer` hook: given the same raw request body `transform_body` already buffers, it returns a `_HermesTurnPersister` (`api/routes/hermes_proxy.py`) whose `observe(chunk)` is called with a copy of each chunk immediately *before* that chunk is handed onward (never altered — the byte sequence a connected client sees is unaffected), and whose `finalize()` runs once, when the turn truly ends. **Since #611**, `make_observer` being set also gates a second behavior: the upstream drain runs as a registry-owned background pump (`api/services/chat_turns.py`) rather than the browser-facing generator itself, so a client disconnect no longer cuts the drain short — `finalize()` now fires on the pump's own real end, not on whatever the browser happened to still be attached for. The Agent proxy passes neither `transform_body` nor `make_observer`, so it's untouched by this — it never detaches, and its relay stays byte-for-byte what it was before either hook existed.
+
+The persister reassembles SSE frames from the observed bytes (a chunk is a network read, not a frame, so frames can split across chunk boundaries) and reacts to the event types the native path emits: on the first `conversation_id` event it adopts that id via `ConversationStore.create_conversation(conv_id=..., persona_id=..., backend="hermes")` (existing rows are returned unchanged, so a continuing thread doesn't get re-tagged) and stores the user's question, and — since #611 — binds the turn into the shared registry under that id, making it reachable by `POST /api/conversations/{id}/cancel` from that point on; `content` events accumulate into the assistant reply, written on `finalize()` — including whatever arrived if the pump ends early; a `usage` event (`input_tokens`, `output_tokens`, `cost_usd`, `model`) is captured and, on `finalize()`, written to `UsageStore.record_usage()` tagged with the conversation id — **cost is recorded verbatim, never recomputed** (Hermes runs DeepSeek via Fireworks; LifeOS's calculator only knows Anthropic pricing), and a cost-less event records a zero cost rather than an invented one. Conversation persistence and usage persistence are independent: a turn with no `usage` event writes no usage row (and vice versa), and each is retried/skipped on its own. A malformed or partial `usage` event (missing/wrong-typed model or token counts) is ignored entirely. Every store call is wrapped so a persistence failure is logged and swallowed, never surfacing as a broken turn.
+
+**Truncation (#611):** the persister tracks only whether a `done` event was ever observed. `finalize()` without one appends the same truncation marker and `routing.truncated`/`routing.truncation_reason: "stream_error"` the native path uses (see "Turn lifetime and cancellation" above) — the upstream connection ending before `done` arrived (a crash, a kill, a dropped connection) is the only signal available to this side; unlike the native path, Hermes truncation always reports `"stream_error"` regardless of the underlying cause.
 
 #### Usage and cost reporting (external backends) — #595
 
@@ -185,6 +267,8 @@ A Hermes session had no way to answer "what has this cost?" even though the brow
 | Orchestrating personas | Runs natively (spawns a background session) | N/A — never selectable | Diverted client-side to LifeOS (#596); never actually forwarded to Hermes |
 | Per-turn model selection | Yes (`model_override`: Auto/Sonnet/Opus/Gemma/Claude Code) | No — picker hidden | No — picker hidden; model choice is the harness's call, not LifeOS's |
 | Conversation history LifeOS-owned | Yes (always has been) | No | Yes, since #592 (tee-persisted) |
+| Survives a client disconnect (#611) | Yes (voice modality excepted — see above) | No — untouched, no observer to persist a detached turn's output | Yes (voice modality excepted — same gate) |
+| Explicit cancel (`POST .../cancel`, #611) | Yes | Yes (the endpoint doesn't distinguish backends — but nothing detaches here to cancel) | Yes |
 
 ### Default backend selection
 
@@ -216,6 +300,9 @@ Since #592, `restoreBackendConversation()` renders the stored conversation on a 
 ---
 
 ## Related Documents
+
+### Design Context
+- [ADR-019: A Turn's Lifetime Is Owned by the Server, Not the Connection](../../adr/019-turn-owned-by-server.md) — why a disconnect no longer stops a turn, the voice exception, and the tradeoffs
 
 ### Specifications
 - [API Reference](../product/api-reference.md) — Canonical endpoint and SSE shapes

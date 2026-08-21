@@ -5,6 +5,8 @@ Keeps the security-relevant header-filtering and timeout in one place so the
 voice, agent, and hermes proxies stay in lockstep.
 """
 
+import asyncio
+import json
 import logging
 from typing import Callable, Optional
 
@@ -13,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from config.settings import settings
+from api.services.chat_turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,41 @@ HOP_BY_HOP = frozenset({
 def filter_headers(headers) -> dict:
     """Drop hop-by-hop (and inbound auth) headers before forwarding."""
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+
+
+def _sniff_modality(raw_body: bytes) -> str:
+    """Best-effort read of the request's `modality` field (#611), straight
+    off the same raw pre-transform body `transform_body`/`make_observer`
+    already receive — generic across whatever backend uses this router, not
+    Hermes-specific. Used only to gate a relayed turn out of detachment the
+    same way the native path does (see ChatTurn.reader()'s voice gate);
+    anything unparseable defaults to "text" rather than raising, since a
+    malformed body is `transform_body`'s problem to reject, not this one's."""
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "text"
+    if not isinstance(data, dict):
+        return "text"
+    return "voice" if (data.get("modality") or "").strip().lower() == "voice" else "text"
+
+
+def _sniff_client_turn_id(raw_body: bytes) -> Optional[str]:
+    """Best-effort read of the request's opaque `client_turn_id` field
+    (#611 review), the same way `_sniff_modality` reads `modality` — off
+    the raw pre-transform body, generic across whatever backend uses this
+    router. `None` for anything missing, wrong-typed, or unparseable;
+    length/character validation already happened at the native
+    `AskStreamRequest` layer (this is Hermes's own copy of that same
+    request), so this is a plain read, not re-validation."""
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    client_turn_id = data.get("client_turn_id")
+    return client_turn_id if isinstance(client_turn_id, str) and client_turn_id else None
 
 
 def make_backend_router(
@@ -88,6 +126,21 @@ def make_backend_router(
     needed" gate means Hermes (which already buffers for the envelope)
     doesn't pay for a second `request.body()` read, and Agent (neither hook
     set) still never buffers.
+
+    `make_observer` being set ALSO gates a second behavior (#611): the
+    upstream drain runs as a registry-owned background pump
+    (`api/services/chat_turns.py`) rather than the browser-facing generator
+    itself, so a disconnect no longer aborts it mid-relay — the pump keeps
+    draining upstream and calls `observer.observe()`/`finalize()` exactly as
+    before, now from its own `finally` instead of the response generator's.
+    The client-visible bytes and their order are unaffected either way: the
+    browser reads from a `ChatTurn.reader()` that receives the identical
+    sequence of chunks the plain `relay()` below would have yielded it. This
+    is why Agent (no observer, ever) is untouched by #611 — detaching a
+    relay nothing persists would only spend money with nothing to show for
+    it — and why an observer that returns `None` for a given request (a
+    `make_observer` configured but declining to observe this one) falls
+    through to the plain, still-client-tied `relay()` for that request.
     """
     router = APIRouter(prefix=prefix, tags=[tag])
 
@@ -131,6 +184,54 @@ def make_backend_router(
             await client.aclose()
             logger.warning("%s backend request failed: %s", backend_label, exc)
             raise HTTPException(status_code=502, detail=f"{backend_label} backend unreachable: {exc}")
+
+        if observer is not None:
+            # Registry-owned pump (#611): gated on `observer` (not just
+            # `make_observer` being configured) — this is the ONLY backend
+            # with something to persist for THIS request; if `make_observer`
+            # returned None (e.g. an unparseable body it chose not to raise
+            # on) there's nothing to gain from detaching, so that case falls
+            # through to the plain `relay()` below unchanged. The Agent
+            # backend never sets `make_observer` at all, so `observer` is
+            # always None there and it always takes the plain path —
+            # detaching would only spend money on a relay nothing observes.
+            # Supersede (#611 review): a reused client_turn_id cancels
+            # whatever turn is still holding it, same as the native path —
+            # a stale/duplicate key resolves to the newest claimant, never
+            # a stray old one.
+            client_turn_id = _sniff_client_turn_id(raw_body)
+            if client_turn_id:
+                get_turn_registry().cancel_by_client_turn_id(client_turn_id)
+            turn = get_turn_registry().create(
+                conversation_id=None,
+                modality=_sniff_modality(raw_body),
+                client_turn_id=client_turn_id,
+            )
+            if hasattr(observer, "bind_turn"):
+                observer.bind_turn(turn)
+
+            async def _pump():
+                try:
+                    async for chunk in upstream.aiter_raw():
+                        # Observe before emitting (#592 review, preserved) —
+                        # see make_backend_router's docstring above for why
+                        # the order matters for an early client disconnect.
+                        observer.observe(chunk)
+                        await turn.emit(chunk)
+                finally:
+                    observer.finalize()
+                    await upstream.aclose()
+                    await client.aclose()
+                    get_turn_registry().pop(turn)
+                    await turn.close()
+
+            turn.task = asyncio.create_task(_pump())
+            return StreamingResponse(
+                turn.reader(),
+                status_code=upstream.status_code,
+                headers=filter_headers(upstream.headers),
+                media_type=upstream.headers.get("content-type"),
+            )
 
         async def relay():
             try:
