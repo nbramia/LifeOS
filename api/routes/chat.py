@@ -568,10 +568,11 @@ async def ask_stream(request: AskStreamRequest):
     personal_context = settings.personal_context(_effective_pid or "")
 
     # #611: the turn's lifetime is owned by the server from here on, not by
-    # this SSE connection. `modality` decides how a disconnect behaves once
-    # the turn task is running (see ChatTurn.reader() in chat_turns.py for
-    # the voice gate); text/unset turns survive the client leaving, voice
-    # turns keep today's disconnect-cancels semantics.
+    # this SSE connection — every modality survives the client leaving
+    # (#616 lifted the voice-only exception; see ChatTurn.reader() in
+    # chat_turns.py). `modality` is still recorded on the turn for parity
+    # with the request and for other voice-specific behavior elsewhere
+    # (e.g. spoken-style system-prompt rules, below).
     _modality = (request.modality or "").strip().lower() or "text"
     # Supersede (#611): a new turn on a conversation OR client_turn_id that
     # already has one in flight cancels the old one first — asking again is
@@ -1076,11 +1077,10 @@ async def ask_stream(request: AskStreamRequest):
         except asyncio.CancelledError:
             # #611: the client disconnected (survivable turn, now cancelled
             # by an explicit /cancel, a supersede, the detached-lifetime
-            # deadline, or a shutdown drain), or this is a voice turn whose
-            # disconnect immediately cancels it (see ChatTurn.reader()'s
-            # voice gate). Persist whatever the user had already seen rather
-            # than losing it outright — marked so it's never mistaken for a
-            # finished reply.
+            # deadline, or a shutdown drain) — every modality alike since
+            # #616 lifted the voice-only immediate-cancel gate. Persist
+            # whatever the user had already seen rather than losing it
+            # outright — marked so it's never mistaken for a finished reply.
             if conversation_id and partial_text:
                 store.add_message(
                     conversation_id, "assistant", partial_text + TRUNCATION_MARKER,

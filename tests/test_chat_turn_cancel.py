@@ -547,3 +547,202 @@ class TestCancelOrderingsAroundAnAttachedReader:
         assert len(messages) == 2
         assert messages[1].content == "the whole answer"
         assert messages[1].routing != {"truncated": True, "truncation_reason": "cancelled"}
+
+
+class TestVoiceModalityCancelAfterGateLift:
+    """#616: with the modality-keyed detachment gate lifted, a voice turn
+    now goes through the exact same explicit-cancel machinery as a text
+    turn -- these are the acceptance-criteria cases the issue calls out by
+    name: an explicit cancel stops a voice turn on the same bound as web
+    chat's Stop button, the partial reply is marked truncated on the same
+    terms as any other interrupted turn, and a barge-in that lands before
+    the turn's first SSE frame (no conversation_id yet) still halts
+    generation via `client_turn_id` -- exactly the whisper-relay first-turn
+    barge-in gap #611 review closed for text and #616 now extends to voice."""
+
+    async def test_explicit_cancel_stops_a_voice_turn_same_as_web_chats_stop(
+        self, api_client, store, monkeypatch,
+    ):
+        import api.services.agent_loop as agent_loop_mod
+
+        hold = asyncio.Event()
+        monkeypatch.setattr(
+            agent_loop_mod, "run_agent_loop", _fake_agent_loop_holding_at(hold),
+        )
+
+        async def fake_classify(*a, **k):
+            return None
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+
+        request = chat.AskStreamRequest(question="hi there", modality="voice")
+        response = await chat.ask_stream(request)
+        gen = response.body_iterator
+        events = await _drive_until(gen, 3)  # conversation_id, routing, "Hello "
+        conversation_id = next(
+            e["conversation_id"] for e in events if e.get("type") == "conversation_id"
+        )
+        await gen.aclose()  # detach -- must NOT itself cancel (that's #616's point)
+
+        turn = chat_turns.get_turn_registry().get_by_conversation(conversation_id)
+        assert turn is not None and turn.modality == "voice"
+
+        # The explicit cancel -- the same endpoint, same bound, same
+        # response shape web chat's Stop button gets for a text turn.
+        resp = await api_client("POST", f"/api/conversations/{conversation_id}/cancel")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cancelled": True}
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn.task
+
+        # Marked truncated on the same terms as any other interrupted turn
+        # -- not a voice-specific truncation reason.
+        messages = store.get_messages(conversation_id)
+        assert len(messages) == 2
+        assert "Hello " in messages[1].content
+        assert "cut off" in messages[1].content
+        assert messages[1].routing == {"truncated": True, "truncation_reason": "cancelled"}
+
+    async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_first_sse_frame(
+        self, store, monkeypatch,
+    ):
+        """The corrected acceptance criterion #616 adds: a barge-in landing
+        BEFORE the turn's first SSE frame -- so before any conversation_id
+        exists to cancel by -- must still halt generation. This is exactly
+        `client_turn_id`'s reason for existing (#611 review), now proven for
+        a voice-modality turn specifically rather than just a text one."""
+        import api.services.agent_loop as agent_loop_mod
+
+        hang_forever = asyncio.Event()
+
+        async def fake_loop(**kwargs):
+            await hang_forever.wait()  # would hang forever if not cancelled
+            yield {"type": "text", "content": "unreachable"}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+
+        request = chat.AskStreamRequest(
+            question="hi", modality="voice", client_turn_id="voice-barge-in-1",
+        )
+        await chat.ask_stream(request)
+        # Deliberately never touch response.body_iterator -- no SSE frame,
+        # not even conversation_id, has been read. The gateway's only
+        # handle is the client_turn_id it minted before sending.
+
+        turn = chat_turns.get_turn_registry().get_by_client_turn_id("voice-barge-in-1")
+        assert turn is not None and turn.modality == "voice"
+        assert turn.conversation_id is None  # not yet bound -- the whole point
+
+        cancelled = chat_turns.get_turn_registry().cancel_by_client_turn_id("voice-barge-in-1")
+        assert cancelled is True
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn.task
+
+    async def test_voice_cancel_via_client_turn_id_while_reader_attached_then_disconnect_is_clean(
+        self, api_client, store, monkeypatch,
+    ):
+        """Mirrors the real whisper-relay#37 sequence: its `cancel_turn()`
+        fires `POST /api/chat/cancel` with `client_turn_id` from its
+        cancel-event handler (not its SSE read loop), and only afterward
+        abandons the stream -- so the POST can genuinely land while our
+        reader is still attached, with the disconnect following. #611
+        review already proved this ordering safe for a text turn
+        (`TestCancelOrderingsAroundAnAttachedReader` above); this is the
+        same proof for a voice turn specifically, since with the gate
+        removed this exact sequence is what a real barge-in now produces on
+        a detachable voice turn -- the ordering must not depend on modality,
+        and it doesn't: `reader()`'s `finally` no-ops once `finalized` is
+        already True, regardless of which modality got it there."""
+        import api.services.agent_loop as agent_loop_mod
+
+        hang_forever = asyncio.Event()
+
+        async def fake_loop(**kwargs):
+            yield {"type": "text", "content": "partial "}
+            await hang_forever.wait()
+            yield {"type": "text", "content": "unreachable"}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+
+        request = chat.AskStreamRequest(
+            question="hi", modality="voice", client_turn_id="voice-ordering-1",
+        )
+        response = await chat.ask_stream(request)
+        gen = response.body_iterator
+        events = await _drive_until(gen, 3)  # conversation_id, routing, "partial "
+        conversation_id = next(e["conversation_id"] for e in events if e.get("type") == "conversation_id")
+
+        turn = chat_turns.get_turn_registry().get_by_client_turn_id("voice-ordering-1")
+        assert turn is not None and turn.modality == "voice"
+
+        # The gateway's cancel-event handler fires the POST now -- the
+        # reader is STILL attached, the stream hasn't been abandoned yet.
+        resp = await api_client("POST", "/api/chat/cancel", json={"client_turn_id": "voice-ordering-1"})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cancelled": True}
+
+        # The still-attached reader must drain to a clean EOF -- no more
+        # real frames were emitted after cancellation.
+        remaining = [item async for item in gen]
+        assert remaining == []
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn.task  # let the task's own finally (pop + close) fully run
+
+        # NOW the gateway abandons the stream -- after the turn already
+        # finalized. Must not raise or double-finalize.
+        await gen.aclose()
+
+        messages = store.get_messages(conversation_id)
+        assert len(messages) == 2  # one user + one assistant row, not two
+        assert "partial " in messages[1].content
+        assert "cut off" in messages[1].content
+        assert messages[1].routing == {"truncated": True, "truncation_reason": "cancelled"}
+
+    async def test_cancel_of_an_already_finished_voice_turn_is_200_not_4xx(
+        self, api_client, store, monkeypatch,
+    ):
+        """whisper-relay's `cancel_turn()` treats a `cancelled: false`
+        response as success, never as an error -- e.g. if its cancel POST
+        (keyed by `client_turn_id`) lands just after the turn already ran
+        to completion and was popped from the registry. Must read 200, not
+        404/4xx, exactly like the existing text-turn proof of this
+        (`TestCancelOrderingsAroundAnAttachedReader.test_cancel_of_a_normally_finished_turn_is_200_not_4xx`
+        above) -- re-confirmed here via `client_turn_id` specifically,
+        since that's the key whisper-relay actually sends."""
+        import api.services.agent_loop as agent_loop_mod
+
+        async def fake_loop(**kwargs):
+            yield {"type": "text", "content": "the whole answer"}
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=1, total_output_tokens=1, total_cost_usd=0.0,
+                model="m", tool_calls_log=[], full_text="the whole answer",
+            )}
+
+        async def fake_classify(*a, **k):
+            return None
+
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", fake_loop)
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+
+        request = chat.AskStreamRequest(
+            question="hi", modality="voice", client_turn_id="voice-finished-1",
+        )
+        response = await chat.ask_stream(request)
+        async for _ in response.body_iterator:
+            pass  # drain fully -- the fake loop finishes immediately
+
+        # The turn already finished and was popped -- client_turn_id no
+        # longer resolves to anything, same as an unknown/expired key.
+        resp = await api_client("POST", "/api/chat/cancel", json={"client_turn_id": "voice-finished-1"})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "cancelled": False}

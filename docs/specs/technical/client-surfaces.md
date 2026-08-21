@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-08-21
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -26,7 +26,7 @@ Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https
 
 The gateway connects to LifeOS at `LIFEOS_BASE_URL` for orchestration (ask/stream, handoff). Persona listing and conversation CRUD are **LifeOS-owned** — consumed by `/chat` directly, not through whisper-relay.
 
-**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers). `POST /api/chat/cancel` (`client_turn_id`, #611) exists for the gateway to adopt as its explicit stop path — tracked as `whisper-relay#37`, not yet started — but is not called today: voice still relies on cancel-on-disconnect (see "Turn lifetime and cancellation" below) until that lands.
+**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers). `POST /api/chat/cancel` (`client_turn_id`, #611) is the gateway's explicit stop path (`whisper-relay#37`) on barge-in and hangup — voice's old cancel-on-disconnect fallback is retired (#616; see "Turn lifetime and cancellation" below): a gateway not yet calling this endpoint on cancel loses correct barge-in outright, since a disconnect alone now just detaches the turn like any other modality, rather than stopping it.
 
 **Persona contract** (shared by web and voice; lets a thin client expose LifeOS's multi-bot personas without reading LifeOS config):
 
@@ -88,12 +88,17 @@ proxy; the Agent backend is unaffected (below).
   /api/conversations/{id}` once it's reopened. A connected client's frame
   sequence and bytes are unaffected — this is purely about what happens
   *after* a disconnect.
-- **Exception: voice.** whisper-relay's adapter deliberately abandons the
-  LifeOS/Hermes stream as its cancel gesture on barge-in and hangup. A turn
-  with `modality: "voice"` therefore keeps the *old* disconnect-cancels
-  behavior — a voice-modality disconnect cancels the turn immediately,
-  exactly as before #611 — until whisper-relay is updated to call the
-  cancel endpoint below explicitly instead of just walking away.
+- **Voice is no longer an exception (#616).** whisper-relay's adapter used
+  to abandon the LifeOS/Hermes stream as its only cancel gesture on
+  barge-in and hangup, so a turn with `modality: "voice"` kept the *old*
+  disconnect-cancels behavior — a voice-modality disconnect cancelled the
+  turn immediately rather than surviving it, unlike every other turn. That
+  gate is lifted now that whisper-relay's cancel gesture is calling `POST
+  /api/chat/cancel` with its `client_turn_id` (below) explicitly instead of
+  just walking away (whisper-relay#37). A voice turn's disconnect now
+  detaches and survives exactly like a text turn's; only an explicit cancel
+  — the gateway's real barge-in gesture — stops it. See
+  [ADR-020](../../adr/020-voice-cancel-gate-lifted.md) for the history.
 - **`POST /api/conversations/{id}/cancel`** stops whatever turn is in
   flight for that conversation, native or Hermes-relayed alike. `{ok:
   true, cancelled: true|false}` — `false` when nothing was running (already
@@ -269,7 +274,7 @@ A Hermes session had no way to answer "what has this cost?" even though the brow
 | Orchestrating personas | Runs natively (spawns a background session) | N/A — never selectable | Diverted client-side to LifeOS (#596); never actually forwarded to Hermes |
 | Per-turn model selection | Yes (`model_override`: Auto/Sonnet/Opus/Gemma/Claude Code) | No — picker hidden | No — picker hidden; model choice is the harness's call, not LifeOS's |
 | Conversation history LifeOS-owned | Yes (always has been) | No | Yes, since #592 (tee-persisted) |
-| Survives a client disconnect (#611) | Yes (voice modality excepted — see above) | No — untouched, no observer to persist a detached turn's output | Yes (voice modality excepted — same gate) |
+| Survives a client disconnect (#611) | Yes, every modality (#616 lifted the voice exception — see above) | No — untouched, no observer to persist a detached turn's output | Yes, every modality (same as LifeOS) |
 | Explicit cancel (`POST .../cancel`, #611) | Yes | Yes (the endpoint doesn't distinguish backends — but nothing detaches here to cancel) | Yes |
 
 ### Default backend selection
@@ -304,7 +309,8 @@ Since #592, `restoreBackendConversation()` renders the stored conversation on a 
 ## Related Documents
 
 ### Design Context
-- [ADR-019: A Turn's Lifetime Is Owned by the Server, Not the Connection](../../adr/019-turn-owned-by-server.md) — why a disconnect no longer stops a turn, the voice exception, and the tradeoffs
+- [ADR-019: A Turn's Lifetime Is Owned by the Server, Not the Connection](../../adr/019-turn-owned-by-server.md) — why a disconnect no longer stops a turn, the original voice exception, and the tradeoffs
+- [ADR-020: The Voice Detachment Gate Is Lifted](../../adr/020-voice-cancel-gate-lifted.md) — why ADR-019's voice exception was temporary, and what made it safe to remove
 
 ### Specifications
 - [API Reference](../product/api-reference.md) — Canonical endpoint and SSE shapes

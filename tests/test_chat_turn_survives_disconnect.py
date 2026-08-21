@@ -116,24 +116,30 @@ async def test_native_turn_completes_and_persists_after_client_disconnect(
     assert stats["total_output_tokens"] == 34
 
 
-async def test_voice_modality_disconnect_cancels_rather_than_detaches(store, monkeypatch):
-    """LEAD'S DECISION (#611): whisper-relay's adapter deliberately abandons
-    the LifeOS stream as its cancel gesture on barge-in/hangup. A voice
-    turn must NOT survive its client disconnecting — it must be cancelled,
-    same as before #611 — or every interruption would silently run to
-    completion and bill for a reply the operator cut off on purpose."""
+async def test_voice_modality_disconnect_detaches_and_survives_like_text(store, monkeypatch):
+    """#616: this test used to be named
+    `test_voice_modality_disconnect_cancels_rather_than_detaches` and
+    asserted the OPPOSITE of what it asserts now — that a voice-modality
+    turn's disconnect cancelled the task immediately rather than detaching
+    it, because whisper-relay had no way to say "stop" other than
+    abandoning the stream. Now that whisper-relay calls `POST
+    /api/chat/cancel` with its `client_turn_id` on a real cancel gesture
+    (whisper-relay#37), a disconnect alone — a hangup or network drop with
+    no explicit cancel — no longer means "stop": a voice turn detaches and
+    keeps running to completion server-side, exactly like the text turn in
+    `test_native_turn_completes_and_persists_after_client_disconnect`
+    above. This inversion is deliberate, not a weakening — see #616."""
     import api.services.agent_loop as agent_loop_mod
 
-    started = asyncio.Event()
-    never = asyncio.Event()  # never set -- the turn must not reach this
+    resume = asyncio.Event()
 
     async def fake_loop(**kwargs):
         yield {"type": "text", "content": "Hello "}
-        started.set()
-        await never.wait()  # would hang forever if NOT cancelled on disconnect
+        await resume.wait()
+        yield {"type": "text", "content": "world"}
         yield {"type": "result", "result": SimpleNamespace(
             total_input_tokens=1, total_output_tokens=1, total_cost_usd=0.0,
-            model="m", tool_calls_log=[], full_text="Hello unreachable",
+            model="m", tool_calls_log=[], full_text="Hello world",
         )}
 
     async def fake_classify(*a, **k):
@@ -148,25 +154,22 @@ async def test_voice_modality_disconnect_cancels_rather_than_detaches(store, mon
 
     events = await _drive_until(gen, 3)  # conversation_id, routing, "Hello "
     conversation_id = next(e["conversation_id"] for e in events if e.get("type") == "conversation_id")
-    await started.wait()
 
     turn = chat_turns.get_turn_registry().get_by_conversation(conversation_id)
     assert turn is not None and turn.modality == "voice"
 
-    # The client disconnects (a barge-in/hangup) -- a text-modality turn
-    # would detach and keep running; a voice turn must be cancelled instead.
+    # The client disconnects (a hangup or network drop, NOT an explicit
+    # cancel) — the turn must detach and keep running, same as a
+    # text-modality turn.
     await gen.aclose()
+    resume.set()
+    await turn.task  # must run to completion, never cancelled
 
-    with pytest.raises(asyncio.CancelledError):
-        await turn.task
-    assert turn.task.cancelled()
-
-    # The partial reply is still persisted, marked as cut off -- cancelling
-    # doesn't mean losing what was already said.
     messages = store.get_messages(conversation_id)
-    assert [(m.role, m.content) for m in messages[:1]] == [("user", "hi")]
-    assert len(messages) == 2
-    assert messages[1].role == "assistant"
-    assert "Hello " in messages[1].content
-    assert "cut off" in messages[1].content
-    assert (messages[1].routing or {}).get("truncated") is True
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "hi"),
+        ("assistant", "Hello world"),
+    ]
+    # A turn that ran to completion carries no truncation marker.
+    assert "cut off" not in messages[-1].content
+    assert not (messages[-1].routing or {}).get("truncated")

@@ -1069,24 +1069,32 @@ async def test_disconnect_then_completion_persists_full_reply_and_a_usage_row(
     assert stats["total_cost"] == pytest.approx(0.002)
 
 
-async def test_voice_modality_disconnect_cancels_the_pump_rather_than_detaching(
+async def test_voice_modality_disconnect_detaches_the_pump_like_a_text_turn(
     monkeypatch, hermes_store,
 ):
-    """LEAD'S DECISION (#611), extended to the Hermes pump: a voice-modality
-    turn relayed through Hermes must also be cancelled by a disconnect
-    rather than surviving it -- whisper-relay's barge-in/hangup cancel
-    gesture is abandoning whatever LifeOS-speaking stream it's talking to,
-    native or Hermes-relayed alike."""
+    """#616: this test used to be named
+    `test_voice_modality_disconnect_cancels_the_pump_rather_than_detaching`
+    and asserted the OPPOSITE of what it asserts now -- that a
+    voice-modality Hermes turn was cancelled by a disconnect rather than
+    surviving it, because whisper-relay had no way to say "stop" other than
+    abandoning the stream. Now that whisper-relay calls `POST
+    /api/chat/cancel` with its `client_turn_id` on a real cancel gesture
+    (whisper-relay#37), a disconnect alone no longer means "stop": a
+    voice-modality turn relayed through Hermes detaches and keeps draining
+    upstream to completion, exactly like the text turn in
+    `test_client_disconnect_still_persists_the_last_chunk` above. This
+    inversion is deliberate, not a weakening -- see #616."""
     monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
     monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
 
-    never = asyncio.Event()
+    hold = asyncio.Event()
 
     async def gen():
         yield b'data: {"type": "conversation_id", "conversation_id": "voice-disco-1"}\n\n'
         yield b'data: {"type": "content", "content": "Hello "}\n\n'
-        await never.wait()  # would hang forever if the pump weren't cancelled
-        yield b'data: {"type": "content", "content": "unreachable"}\n\n'
+        await hold.wait()
+        yield b'data: {"type": "content", "content": "world"}\n\n'
+        yield b'data: {"type": "done"}\n\n'
 
     monkeypatch.setattr(hp, "_client", lambda: _fake_upstream_and_client(gen)())
 
@@ -1097,20 +1105,64 @@ async def test_voice_modality_disconnect_cancels_the_pump_rather_than_detaching(
     gen_iter = response.body_iterator
     await gen_iter.__anext__()  # conversation_id
     await gen_iter.__anext__()  # "Hello "
-    await gen_iter.aclose()  # the barge-in/hangup disconnect
+
+    # The client disconnects (a hangup or network drop, NOT an explicit
+    # cancel) -- the pump must detach and keep draining, same as a
+    # text-modality turn.
+    await gen_iter.aclose()
+    hold.set()
 
     turn = hp.get_turn_registry().get_by_conversation("voice-disco-1")
     assert turn is not None and turn.modality == "voice"
-    with pytest.raises(asyncio.CancelledError):
-        await turn.task
-    assert turn.task.cancelled()
+    await turn.task  # must run to completion, never cancelled
 
     messages = hermes_store.get_messages("voice-disco-1")
     assert [(m.role, m.content) for m in messages] == [
         ("user", "hi"),
-        ("assistant", "Hello " + hp.TRUNCATION_MARKER),
+        ("assistant", "Hello world"),
     ]
-    assert messages[-1].routing == {"truncated": True, "truncation_reason": "stream_error"}
+    # A turn that ran to completion carries no truncation marker.
+    assert not (messages[-1].routing or {}).get("truncated")
+
+
+async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_first_frame(
+    monkeypatch, hermes_store,
+):
+    """#616 acceptance criterion, extended to the Hermes pump: a barge-in
+    landing before the turn's first SSE frame -- before any conversation_id
+    exists to cancel by -- must still halt generation via `client_turn_id`,
+    the same first-turn barge-in gap #611 review closed for the native
+    path (tests/test_chat_turn_cancel.py's `TestClientTurnIdCancel`)."""
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    hang_forever = asyncio.Event()
+
+    async def gen():
+        await hang_forever.wait()  # would hang forever if not cancelled
+        yield b'data: {"type": "content", "content": "unreachable"}\n\n'
+
+    monkeypatch.setattr(hp, "_client", lambda: _fake_upstream_and_client(gen)())
+
+    endpoint = next(r for r in hp.router.routes if r.path.endswith("/ask/stream")).endpoint
+    request = _manual_request({
+        "question": "hi", "modality": "voice", "client_turn_id": "hermes-voice-barge-in-1",
+    })
+
+    await endpoint(request)
+    # Deliberately never touch the response's body_iterator -- no SSE
+    # frame, not even conversation_id, has been read. The gateway's only
+    # handle is the client_turn_id it minted before sending.
+
+    turn = hp.get_turn_registry().get_by_client_turn_id("hermes-voice-barge-in-1")
+    assert turn is not None and turn.modality == "voice"
+    assert turn.conversation_id is None  # not yet bound -- the whole point
+
+    cancelled = hp.get_turn_registry().cancel_by_client_turn_id("hermes-voice-barge-in-1")
+    assert cancelled is True
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn.task
 
 
 # ---------------------------------------------------------------------------

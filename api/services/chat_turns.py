@@ -73,6 +73,12 @@ class ChatTurn:
         # matters most for voice barge-in, where the interruption is
         # frequently within the first second of a reply.
         self.client_turn_id = client_turn_id
+        # Recorded for parity with the request (voice turns get spoken-style
+        # system-prompt rules elsewhere, e.g. `api/routes/chat.py`'s
+        # `build_system_prompt()` call) and for observability. #616 lifted
+        # the modality-keyed detachment gate `reader()` used to check here —
+        # a voice turn's disconnect now detaches exactly like a text turn's,
+        # so this field no longer changes cancellation behavior on its own.
         self.modality = modality
         self.started_at = time.time()
         self.detached_at: Optional[float] = None
@@ -81,10 +87,7 @@ class ChatTurn:
         # Set by whoever initiates a cancellation (the /cancel endpoint, a
         # supersede, the deadline watcher, or registry.shutdown()) BEFORE
         # calling task.cancel(), so the task's `except asyncio.CancelledError`
-        # handler can record why. Falls back to "cancelled" if unset (the
-        # voice-modality immediate-cancel-on-disconnect path below never sets
-        # it, since a disconnect there is exactly the same gesture as an
-        # explicit cancel).
+        # handler can record why. Falls back to "cancelled" if unset.
         self.cancel_reason: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
         self._deadline_task: Optional[asyncio.Task] = None
@@ -133,23 +136,17 @@ class ChatTurn:
             self.reader_attached = False
             if not self.finalized:
                 self.detached_at = time.time()
-                if self.modality == "voice":
-                    # LEAD'S DECISION (#611): whisper-relay's adapter
-                    # (voice_gateway/adapters/lifeos.py in the whisper-relay
-                    # repo) deliberately abandons this stream as its cancel
-                    # gesture on barge-in/hangup (raises `LifeOSCancelled`).
-                    # If a voice turn detached instead of being cancelled,
-                    # every interruption would silently run to completion and
-                    # bill for a full reply the operator cut off on purpose —
-                    # a behavior regression AND a spend regression on the
-                    # surface used most from mobile. So a voice-modality
-                    # turn keeps today's disconnect-cancels semantics until
-                    # whisper-relay calls the explicit cancel endpoint
-                    # instead of just walking away.
-                    if self.task is not None and not self.task.done():
-                        self.task.cancel()
-                else:
-                    get_turn_registry().arm_deadline(self)
+                # #616 lifted the modality-keyed gate that used to live here:
+                # a voice-modality turn's disconnect immediately cancelled
+                # the task instead of arming the deadline below, because
+                # whisper-relay's adapter (src/voice_gateway/adapters/lifeos.py
+                # in the whisper-relay repo) used to only abandon this stream
+                # on barge-in/hangup, with no explicit way to say "stop". Now
+                # that it calls `POST /api/chat/cancel` with its
+                # `client_turn_id` instead, every modality detaches and
+                # survives its client identically — see ADR-019 (as amended
+                # by ADR-020) for the full history.
+                get_turn_registry().arm_deadline(self)
 
     def request_cancel(self, reason: str) -> bool:
         """Cancel this turn's task, recording why. Returns False (no-op) if

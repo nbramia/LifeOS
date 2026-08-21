@@ -3,6 +3,7 @@
 **Status:** Complete
 **Last Updated:** 2026-08-21
 **Decision:** Accepted
+**Amended by:** [ADR-020](020-voice-cancel-gate-lifted.md)
 
 ## Context
 

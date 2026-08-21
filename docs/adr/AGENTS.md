@@ -20,7 +20,8 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `016-voice-gateway-reverse-proxy.md` — Voice gateway reverse-proxied through LifeOS
 - `017-retire-ollama-llama-server-routing.md` — Ollama retired; query routing moved onto the shared llama-server runtime (supersedes 006)
 - `018-api-spend-requires-consent.md` — LifeOS never picks an API-billed engine on its own (amends 008)
-- `019-turn-owned-by-server.md` — a chat turn's lifetime is owned by the server, not the SSE connection watching it
+- `019-turn-owned-by-server.md` — a chat turn's lifetime is owned by the server, not the SSE connection watching it **(Amended by 020)**
+- `020-voice-cancel-gate-lifted.md` — the voice-only detachment exception in 019 is removed now that whisper-relay cancels explicitly (amends 019)
 
 ## Key Principles
 
