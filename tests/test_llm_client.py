@@ -1192,6 +1192,39 @@ class TestAStreamReasoning:
 # ---- Anthropic prompt caching (#383 Phase 1) ----
 
 
+def _fake_message_start(*, input_tokens=100, output_tokens=1, cache_creation=0, cache_read=0):
+    """A `message_start` SSE event as the Anthropic SDK models it: `.message.usage`
+    is a fully-populated `Usage` (input_tokens/output_tokens are required, never None)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        type="message_start",
+        message=SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+            )
+        ),
+    )
+
+
+def _fake_message_delta(*, output_tokens, input_tokens=None, cache_creation=None, cache_read=None):
+    """A `message_delta` SSE event: `.usage` is `MessageDeltaUsage` -- only
+    output_tokens is guaranteed there; input_tokens/cache_* are frequently
+    omitted (None) even though the SDK's type allows them."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        type="message_delta",
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+        ),
+    )
+
+
 def _fake_anthropic_usage(*, input_tokens=100, output_tokens=10,
                           cache_creation=0, cache_read=0):
     from types import SimpleNamespace
@@ -1338,6 +1371,53 @@ class TestAnthropicCaching:
         assert text == "hello"
         done = next(e for e in events if e["type"] == "done")
         assert done["usage"].cache_read_input_tokens == 2600
+
+    @pytest.mark.asyncio
+    async def test_astream_yields_usage_update_from_message_start_and_message_delta(self):
+        """#629: message_start (usage always fully populated) and
+        message_delta (only output_tokens guaranteed -- input_tokens/cache_*
+        are frequently None) both surface as a "usage_update" event, so a
+        caller cancelled mid-round can credit tokens already billed instead
+        of reporting zero for the whole round. A message_delta that omits
+        input_tokens must NOT look like it dropped to zero -- the
+        last-known value has to carry forward."""
+        from types import SimpleNamespace
+        client = _anthropic_client()
+
+        final = SimpleNamespace(
+            content=[],
+            usage=_fake_anthropic_usage(input_tokens=100, output_tokens=15),
+            stop_reason="end_turn",
+        )
+        text_delta = SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(text="hi"))
+        deltas = [
+            _fake_message_start(input_tokens=100, output_tokens=1, cache_read=2600),
+            text_delta,
+            _fake_message_delta(output_tokens=15),  # input_tokens/cache_* omitted
+        ]
+
+        def fake_stream(**kwargs):
+            return _FakeAnthropicStream(final, deltas=deltas)
+
+        client._async_client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+
+        events = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+
+        usage_updates = [e for e in events if e["type"] == "usage_update"]
+        assert len(usage_updates) == 2
+        first, second = usage_updates
+        assert (first["usage"].input_tokens, first["usage"].output_tokens) == (100, 1)
+        assert first["usage"].cache_read_input_tokens == 2600
+        # message_delta omitted input_tokens and cache_read_input_tokens --
+        # both must carry forward from message_start, not reset to 0.
+        assert (second["usage"].input_tokens, second["usage"].output_tokens) == (100, 15)
+        assert second["usage"].cache_read_input_tokens == 2600
+
+        # "usage_update" events don't disturb the existing "text"/"done" contract.
+        text = "".join(e["content"] for e in events if e["type"] == "text")
+        assert text == "hi"
+        done = next(e for e in events if e["type"] == "done")
+        assert (done["usage"].input_tokens, done["usage"].output_tokens) == (100, 15)
 
     @pytest.mark.asyncio
     async def test_astream_forwards_timeout_to_sdk(self):

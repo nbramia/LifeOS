@@ -100,6 +100,127 @@ def _fake_loop_turn_state_before_any_round(hold):
     return fake_loop
 
 
+def _fake_loop_anthropic_backend_mid_round(hold, first_chunk="Hello "):
+    """#629: mimics an AnthropicLLMClient-backed turn cancelled mid-round.
+    Text streams, then a "usage_update" event (from message_start/
+    message_delta) sets provisional_input_tokens/provisional_output_tokens
+    -- exactly as agent_loop.run_agent_loop does now -- before the round's
+    "done" event (which would fold them into total_* and reset them to 0,
+    per _track_usage) ever arrives."""
+    async def fake_loop(**kwargs):
+        live = SimpleNamespace(
+            total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+            model="fake-anthropic-model", tool_calls_log=[], full_text="",
+            provisional_input_tokens=0, provisional_output_tokens=0,
+        )
+        yield {"type": "turn_state", "result": live}
+        yield {"type": "text", "content": first_chunk}
+        live.provisional_input_tokens = 100
+        live.provisional_output_tokens = 15
+        await hold.wait()
+        yield {"type": "text", "content": "unreachable"}
+        yield {"type": "result", "result": live}
+    return fake_loop
+
+
+def _fake_loop_local_backend_mid_round(hold, first_chunk="Hello "):
+    """#629: mimics a LocalLLMClient-backed turn cancelled mid-round. Text
+    streams, but -- unlike the Anthropic-backed case above -- the local
+    backend's OpenAI-compatible protocol has no mid-stream usage signal at
+    all, so there is no "usage_update" event to set provisional_* from.
+    Usage stays at its initial zero right up to cancellation, exactly as it
+    did before #629 -- this backend gets no incremental-usage improvement,
+    by design (see LocalLLMClient.astream's docstring)."""
+    async def fake_loop(**kwargs):
+        live = SimpleNamespace(
+            total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+            model="fake-local-model", tool_calls_log=[], full_text="",
+            provisional_input_tokens=0, provisional_output_tokens=0,
+        )
+        yield {"type": "turn_state", "result": live}
+        yield {"type": "text", "content": first_chunk}
+        await hold.wait()
+        yield {"type": "text", "content": "unreachable"}
+        yield {"type": "result", "result": live}
+    return fake_loop
+
+
+class TestIncrementalUsageOnCancellation:
+    """#629: a mid-round cancellation on the Anthropic backend now credits
+    the tokens already billed instead of reporting zero for the whole
+    round; the local backend's documented, unclosed gap is unchanged."""
+
+    async def test_anthropic_backed_mid_round_cancel_records_provisional_usage(
+        self, api_client, store, monkeypatch,
+    ):
+        import api.services.agent_loop as agent_loop_mod
+
+        hold = asyncio.Event()
+
+        async def fake_classify(*a, **k):
+            return None
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", _fake_loop_anthropic_backend_mid_round(hold))
+
+        request = chat.AskStreamRequest(question="tell me something")
+        response = await chat.ask_stream(request)
+        gen = response.body_iterator
+        events = await _drive_until(gen, 3)  # conversation_id, routing, "Hello "
+        conversation_id = next(e["conversation_id"] for e in events if e.get("type") == "conversation_id")
+        await gen.aclose()  # detach -- turn keeps running, unwatched
+
+        resp = await api_client("POST", f"/api/conversations/{conversation_id}/cancel")
+        assert resp.json() == {"ok": True, "cancelled": True}
+
+        turn = chat_turns.get_turn_registry().get_by_conversation(conversation_id)
+        if turn is not None and turn.task is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await turn.task
+
+        # Provisional usage (100/15) was credited even though
+        # total_input_tokens/total_output_tokens never moved off 0 -- the
+        # round never closed out, so _track_usage never ran.
+        usage = get_usage_store().get_conversation_usage(conversation_id)
+        assert usage["turn_count"] == 1
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 15
+
+    async def test_local_backed_mid_round_cancel_still_writes_no_usage_row(
+        self, api_client, store, monkeypatch,
+    ):
+        """The local backend's documented, unclosed gap: its streaming
+        protocol carries no mid-stream usage signal, so
+        provisional_input_tokens/provisional_output_tokens never move off
+        0, and a mid-round cancellation writes no usage row -- unchanged
+        from #615's behavior, not a regression introduced by #629."""
+        import api.services.agent_loop as agent_loop_mod
+
+        hold = asyncio.Event()
+
+        async def fake_classify(*a, **k):
+            return None
+        monkeypatch.setattr(chat, "classify_action_intent", fake_classify)
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", _fake_loop_local_backend_mid_round(hold))
+
+        request = chat.AskStreamRequest(question="tell me something")
+        response = await chat.ask_stream(request)
+        gen = response.body_iterator
+        events = await _drive_until(gen, 3)  # conversation_id, routing, "Hello "
+        conversation_id = next(e["conversation_id"] for e in events if e.get("type") == "conversation_id")
+        await gen.aclose()
+
+        resp = await api_client("POST", f"/api/conversations/{conversation_id}/cancel")
+        assert resp.json() == {"ok": True, "cancelled": True}
+
+        turn = chat_turns.get_turn_registry().get_by_conversation(conversation_id)
+        if turn is not None and turn.task is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await turn.task
+
+        usage = get_usage_store().get_conversation_usage(conversation_id)
+        assert usage["turn_count"] == 0
+
+
 class TestCancelledTurnRecordsUsage:
     async def test_cancelled_after_one_round_records_nonzero_usage(
         self, api_client, store, monkeypatch,

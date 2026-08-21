@@ -1094,43 +1094,52 @@ async def ask_stream(request: AskStreamRequest):
             # (e.g. during `finish_trace`/`turn.emit` on the way out) from
             # double-recording it.
             #
-            # `total_input_tokens > 0` is NOT "nothing was spent" -- it's
-            # "the accumulator hasn't moved off its initial zero." Both
-            # LocalLLMClient.astream and AnthropicLLMClient.astream
-            # (api/services/llm_client.py) only yield usage in the "done"
-            # event that closes out a full round's stream (the local client
-            # reads it off the OpenAI-compatible finish chunk;
-            # AnthropicLLMClient waits on stream.get_final_message()), and
-            # agent_loop._track_usage() only runs once that event arrives.
-            # A cancellation landing mid-round -- after text has already
-            # streamed to the user and tokens were almost certainly
-            # generated and billed upstream, but before that round's "done"
-            # event fires -- still reports zero here, so this is a known,
-            # narrower surviving gap, not a claim that nothing was spent.
-            # The guard exists because writing a zero-token row would
+            # #629 narrowed, but did not close, the gap #615 left open: both
+            # LocalLLMClient.astream and AnthropicLLMClient.astream only
+            # yield *confirmed* usage in the "done" event that closes out a
+            # full round's stream, and agent_loop._track_usage() folds that
+            # into total_input_tokens/total_output_tokens only once "done"
+            # arrives. A cancellation landing mid-round used to report zero
+            # for that round no matter what. Now, on the Anthropic backend,
+            # agent_loop also tracks provisional_input_tokens /
+            # provisional_output_tokens -- the in-flight round's cumulative
+            # usage-so-far, from the "usage_update" events Anthropic's wire
+            # protocol carries via `message_start`/`message_delta` (see
+            # AnthropicLLMClient.astream's docstring) -- so a mid-round
+            # cancellation there credits the tokens already billed instead
+            # of reporting nothing. The local backend's OpenAI-compatible
+            # protocol has no equivalent mid-stream signal, so
+            # provisional_input_tokens/provisional_output_tokens stay 0
+            # there always, and a mid-round cancellation on that backend is
+            # unchanged from before #629: still a known, narrower surviving
+            # gap, not a claim that nothing was spent.
+            #
+            # `total_input_tokens + provisional_input_tokens > 0` is NOT
+            # "nothing was spent" -- it's "neither the confirmed nor the
+            # provisional accumulator has moved off its initial zero." The
+            # guard exists because writing a zero-token row would
             # affirmatively assert "this cost nothing," which is worse than
-            # writing nothing at all; it does not close the mid-round
-            # window. Closing that would need the streaming clients to
-            # surface usage incrementally as it accrues (Anthropic's wire
-            # protocol carries a running count via `message_start`/
-            # `message_delta` events that astream() currently discards in
-            # favor of the final message; the local OpenAI-compatible
-            # protocol has no equivalent mid-stream signal at all) -- a
-            # change to the client layer's event contract, out of scope for
-            # this fix.
+            # writing nothing at all. `getattr(..., 0)` tolerates a
+            # `live_result` that predates #629 (e.g. a test double) and
+            # therefore has no provisional_* fields at all.
             #
             # This also covers a cancelled turn before any round completed
-            # (the accumulator never moved) and a fake test loop that never
-            # emits `turn_state` (`live_result` stays None).
-            if conversation_id and not usage_recorded and live_result is not None and live_result.total_input_tokens > 0:
-                get_usage_store().record_usage(
-                    model=live_result.model,
-                    input_tokens=live_result.total_input_tokens,
-                    output_tokens=live_result.total_output_tokens,
-                    cost_usd=live_result.total_cost_usd,
-                    conversation_id=conversation_id,
-                )
-                usage_recorded = True
+            # (neither accumulator ever moved) and a fake test loop that
+            # never emits `turn_state` (`live_result` stays None).
+            if conversation_id and not usage_recorded and live_result is not None:
+                cancelled_input_tokens = live_result.total_input_tokens + getattr(
+                    live_result, "provisional_input_tokens", 0)
+                cancelled_output_tokens = live_result.total_output_tokens + getattr(
+                    live_result, "provisional_output_tokens", 0)
+                if cancelled_input_tokens > 0:
+                    get_usage_store().record_usage(
+                        model=live_result.model,
+                        input_tokens=cancelled_input_tokens,
+                        output_tokens=cancelled_output_tokens,
+                        cost_usd=live_result.total_cost_usd,
+                        conversation_id=conversation_id,
+                    )
+                    usage_recorded = True
             finish_trace()
             raise
         except Exception as e:
