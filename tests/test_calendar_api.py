@@ -2,15 +2,15 @@
 Tests for Calendar API endpoints.
 """
 import pytest
-
-# These tests use TestClient which initializes the app (slow)
-pytestmark = pytest.mark.slow
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone
 
 from api.main import app
 from api.services.calendar import CalendarEvent
+
+# These tests use TestClient which initializes the app (slow)
+pytestmark = pytest.mark.slow
 
 
 client = TestClient(app)
@@ -126,3 +126,30 @@ class TestCalendarSearchEndpoint:
             data = response.json()
             assert "count" in data
             assert isinstance(data["count"], int)
+
+
+class TestCalendarWriteFailures:
+    """#609: a failed create/update/delete must be a non-2xx, never a 200
+    that merely omits the fields a successful write would have."""
+
+    def test_create_event_failure_returns_500(self, mock_calendar_service):
+        mock_calendar_service.create_event.side_effect = Exception("Google API error")
+        with patch('api.routes.calendar.get_calendar_service', return_value=mock_calendar_service):
+            response = client.post("/api/calendar/events", json={
+                "title": "Standup",
+                "start_time": "2026-01-07T10:00:00Z",
+                "end_time": "2026-01-07T10:30:00Z",
+            })
+            assert response.status_code == 500
+
+    def test_update_event_failure_returns_500(self, mock_calendar_service):
+        mock_calendar_service.update_event.side_effect = Exception("Google API error")
+        with patch('api.routes.calendar.get_calendar_service', return_value=mock_calendar_service):
+            response = client.put("/api/calendar/events/evt-1", json={"title": "New title"})
+            assert response.status_code == 500
+
+    def test_delete_event_failure_returns_500(self, mock_calendar_service):
+        mock_calendar_service.delete_event.side_effect = Exception("Google API error")
+        with patch('api.routes.calendar.get_calendar_service', return_value=mock_calendar_service):
+            response = client.delete("/api/calendar/events/evt-1")
+            assert response.status_code == 500

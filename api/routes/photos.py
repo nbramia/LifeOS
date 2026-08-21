@@ -4,12 +4,11 @@ Apple Photos API endpoints for LifeOS.
 Provides endpoints for querying Photos face recognition data
 and syncing to LifeOS CRM.
 """
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from config.settings import settings
@@ -287,11 +286,21 @@ async def trigger_photo_sync(
                     f"created {stats.get('interactions_created', 0)} interactions"
         )
     except Exception as e:
-        return SyncResponse(
-            success=False,
-            stats={"error": str(e)},
-            message=f"Sync failed: {e}"
-        )
+        # A plain JSONResponse, not a SyncResponse, so a top-level "error"
+        # key can ride alongside the existing fields instead of being
+        # filtered out by response_model validation. #609: the request was
+        # served, but the sync itself failed, and this stays a 200 for that
+        # reason (#614 tracks whether that should change) — the caller
+        # still needs to be able to tell success from failure without
+        # parsing prose, and `mcp_server.py: dispatch()` and the agent
+        # worker's ToolRegistry already flag any tool result as an error
+        # generically whenever the body carries a top-level "error" key.
+        return JSONResponse(content={
+            "success": False,
+            "stats": {"error": str(e)},
+            "message": f"Sync failed: {e}",
+            "error": str(e),
+        })
 
 
 def _get_thumbnail_path(uuid: str) -> Path | None:
@@ -512,7 +521,7 @@ async def open_photo_in_app(uuid: str):
                 capture_output=True,
                 timeout=5,
             )
-            return {"success": True, "message": f"Opened thumbnail (original in iCloud)"}
+            return {"success": True, "message": "Opened thumbnail (original in iCloud)"}
         except Exception:
             pass  # Fall through to Photos app
 

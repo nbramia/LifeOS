@@ -631,6 +631,27 @@ class TestGmailDraftAPI:
             assert "gmail_url" in data
             assert "drafts" in data["gmail_url"]
 
+    def test_create_draft_failure_returns_500(self, mock_gmail_service):
+        """#609: a failed draft creation must be a non-2xx, not a 200 body
+        that merely omits the fields a successful draft would have."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_gmail_service.create_draft.return_value = None
+
+        with patch('api.routes.gmail.get_gmail_service', return_value=mock_gmail_service):
+            client = TestClient(app)
+            response = client.post(
+                "/api/gmail/drafts",
+                json={
+                    "to": "recipient@example.com",
+                    "subject": "Test Subject",
+                    "body": "Test body content",
+                }
+            )
+
+            assert response.status_code == 500
+
     def test_create_draft_requires_to(self, mock_gmail_service):
         """Should require 'to' field."""
         from fastapi.testclient import TestClient

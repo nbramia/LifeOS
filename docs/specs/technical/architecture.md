@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-19
+> **Last Updated:** 2026-08-21
 
 Codebase organization and module structure for efficient navigation.
 
@@ -297,6 +297,97 @@ def my_function():
     conn = sqlite3.connect(get_crm_db_path())
     # ...
 ```
+
+---
+
+## Write Endpoint Failure Contract
+
+**Guarantee:** a curated write endpoint must never report a failure inside an
+HTTP 2xx without a top-level `error` key — a caller (human, MCP client, or
+the agent worker) must be able to tell success from failure from the status
+code or that key alone, without parsing prose. This was violated once (#603,
+`fitness.py`) and the class of defect was audited end to end for #609.
+
+**How it's enforced, mechanically:**
+
+- MCP surface (`mcp_server.py: dispatch()`) sets `result["isError"] = True`
+  whenever a tool's `_call_api()` result is a dict containing an `"error"`
+  key. `_call_api()` derives that key either from `resp.raise_for_status()`
+  raising on a non-2xx, **or** from a 2xx JSON body that already carries a
+  top-level `"error"` key (the latter matters for `lifeos_sync_trigger`,
+  whose custom handler — `_handle_sync_trigger` — passes a 2xx body through
+  unmodified rather than routing it through `_call_api`'s own try/except; see
+  `test_sync_trigger_2xx_with_embedded_error_sets_is_error`). Either way this
+  is generic and correct for any tool **only if** the underlying route
+  actually raises on failure or embeds a top-level `error` key.
+- Agent worker (`api/services/agent_worker/tools.py: ToolRegistry.dispatch`)
+  routes MCP-backed tools through that same `_call_api`/`_format_response`
+  pair and derives `ToolResult.is_error` identically (`"error" in data`,
+  proved tool-name-agnostic by `test_registry_lifeos_tool_error_surfaced` in
+  `tests/test_agent_worker_tools.py`) — it inherits both the guarantee and
+  any exemption to it, with no code of its own to go stale.
+- Native chat/Hermes orchestrator (`api/services/agent_loop.py`) never calls
+  the HTTP layer — it dispatches in-process through
+  `api/services/agent_tools.py`, where every handler returns a plain string
+  and a failure is required to start with the literal `"Error:"`.
+  `agent_loop.py` derives the Anthropic `tool_result.is_error` field from that
+  prefix (`tool_result_str.startswith("Error:")`), which becomes the
+  structured signal the model actually receives.
+
+Both HTTP-facing mechanisms are correct by construction; they only fail when
+a *route* returns 2xx with a failure embedded in the body without a
+top-level `error` key. The table below is the audit of every curated write
+endpoint against that condition, plus which of the three mechanisms above
+actually consumes it — an endpoint can be honest while every consumer of it
+is blind, which is how the incident that prompted #609 happened. This is
+what makes the guarantee above true rather than aspirational (docs/AGENTS.md:
+no document may claim an unenforced guarantee).
+
+| MCP tool | Route | Status | Consumers | Regression coverage |
+|---|---|---|---|---|
+| `lifeos_vault_write` | `POST /api/vault/write` | Safe — `OSError` → `HTTPException(500)` | MCP, worker (no native-loop equivalent) | `tests/test_vault_write_route.py` |
+| `lifeos_memories_create` | `POST /api/memories` | Safe — unhandled exception → default 500 | MCP, worker, native (`_tool_save_memory`) | `tests/test_memories_api.py` |
+| `lifeos_person_update` | `PATCH /api/crm/people/{id}` | Safe — 404 on missing person | MCP, worker (no native-loop equivalent) | `tests/test_crm_api.py::test_update_person_not_found` |
+| `lifeos_person_fact_update/confirm/delete` | `{PUT,POST,DELETE} .../facts/{id}[/confirm]` | Safe — 404/400 on missing or mismatched fact | MCP, worker (no native-loop equivalent) | `tests/test_crm_api.py::test_{update,confirm,delete}_fact_not_found` |
+| `lifeos_gmail_draft` | `POST /api/gmail/drafts` | Safe — 500 on a `None` draft; broad `except` re-raises as `HTTPException` | MCP, worker, native (`_tool_create_email_draft`) | `tests/test_gmail.py::test_create_draft_failure_returns_500` |
+| `lifeos_gmail_send` | `POST /api/gmail/send` | Safe — 409 (send gate) / 500 | MCP, worker, native (`_tool_send_email_draft`) | `tests/test_gmail.py::test_send_draft_failure_returns_500` |
+| `lifeos_reminder_create/update/delete` | `{POST,PUT,DELETE} /api/reminders[/{id}]` | Safe — 400/404 | MCP, worker; native covers create only (deprecated `_reminder_create` alias — no native update/delete) | `tests/test_reminders_api.py` |
+| `lifeos_telegram_send` | `POST /api/reminders/send` | Safe — 400 not configured / 500 send failure | MCP, worker (no native-loop equivalent) | `tests/test_reminders_api.py` |
+| `lifeos_schedule_create/update/delete` | `{POST,PUT,DELETE} /api/scheduler[/{id}]` | Safe — 400/404 | MCP, worker, native (`_schedule_create/_update/_delete`) | `tests/test_scheduler_api.py` |
+| `lifeos_sync_trigger` (`source=vault`) | `POST /api/admin/reindex` | Safe — reports enqueue state honestly, never claims completion | MCP, worker (no native-loop equivalent — see note below) | `tests/test_admin.py` |
+| `lifeos_sync_trigger` (`source=calendar`) | `POST /api/admin/calendar/sync` | **Fixed for #609.** `except Exception` now returns a `JSONResponse` with a top-level `"error"` key alongside the existing fields (status stays 200 — the request *was* served; whether a total sync failure should instead be non-2xx is a separate, deliberate question tracked as #614). | MCP, worker (no native-loop equivalent) | `tests/test_calendar_indexer.py::test_trigger_calendar_sync_failure_carries_top_level_error`, `tests/test_mcp_server.py::test_sync_trigger_2xx_with_embedded_error_sets_is_error` |
+| `lifeos_sync_trigger` (`source=contacts`, `slack`) | `POST /api/crm/{contacts,slack}/sync` | Safe — raise `HTTPException` on failure | MCP, worker (no native-loop equivalent) | `tests/test_crm_api.py` |
+| `lifeos_sync_trigger` (`source=photos`) | `POST /api/photos/sync` | **Fixed for #609.** Same mechanism as the calendar case — the error previously lived only nested inside `stats["error"]`, invisible to the generic top-level check; now also present at the top level (status stays 200, same #614 note as above). | MCP, worker (no native-loop equivalent) | `tests/test_photos_sync_api.py::test_sync_failure_carries_top_level_error` |
+| `lifeos_sync_trigger` (`source=gmail`, `imessage`, `phone`, `facetime`, `linkedin`) | `POST /api/crm/sources/{type}/sync` | Stub — always returns `{"status": "queued"}`; no sync is actually implemented yet, so there is no failure path to mis-report. Not a #609 defect. | MCP, worker (no native-loop equivalent) | — |
+| `lifeos_workout_manage` | `POST /api/fitness/workouts` | Safe — fixed in #603 | MCP, worker, native (`_tool_manage_workouts`) | `tests/test_workout_mcp_route.py` |
+| `lifeos_task_create/update/complete/delete` | `{POST,PUT,DELETE} /api/tasks[/{id}[/complete]]` | Safe — unhandled exception → 500; not-found → 404 | MCP, worker, native covers create/update/complete (`_task_create/_update/_complete`) — no native delete | `tests/test_tasks_api.py::test_create_task_failure_is_never_success_shaped` (create); 404 cases elsewhere in the same file |
+| `lifeos_calendar_create/update/delete` | `{POST,PUT,DELETE} /api/calendar/events[/{id}]` | Safe — 401/500 | MCP, worker, native (`_tool_create/update/delete_calendar_event`) | `tests/test_calendar_api.py::TestCalendarWriteFailures` |
+
+Every `lifeos_sync_trigger` row has no native-loop equivalent because that
+loop has no sync-trigger-shaped tool at all — see the paragraph below.
+
+Native-tool-loop write handlers in `api/services/agent_tools.py` (`_task_*`,
+`_reminder_create`, `_schedule_*`, `_tool_create_email_draft`,
+`_tool_send_email_draft`, `_tool_*_calendar_event`, `_tool_save_memory`,
+`_workout_*`) were each checked for a path that returns success-shaped text
+on failure; none exists — every failure either propagates as an exception
+(caught by `execute_tool`/`execute_tool_parallel`'s `except Exception` →
+`"Error: {e}"`) or is an explicit `"Error: ..."`-prefixed string.
+
+The table above is a point-in-time audit; it does not by itself catch a
+*future* write endpoint that reintroduces the anti-pattern.
+`tests/test_mcp_server.py::TestWriteEndpointNeverReturnsSuccessShapedFailure`
+closes that gap mechanically: it enumerates every curated write endpoint
+straight from `CURATED_ENDPOINTS` (plus the sub-routes `_handle_sync_trigger`
+fans `lifeos_sync_trigger` out to) and statically flags any `except` block
+that returns normally without raising, setting an explicit non-2xx status,
+or embedding a top-level `error` key, so a newly added endpoint with this
+shape fails a test that already exists rather than needing a new one. It is
+a static approximation, not a substitute for the failure-injection tests
+cited in the table above.
+`tests/test_mcp_server.py::TestMCPServerToolDiscovery::test_task_create_tags_advertised_as_array`
+separately pins the specific schema mistyping (`tags` as `string` instead of
+`array`) that #603 fixed and #609 traced the original incident to.
 
 ---
 

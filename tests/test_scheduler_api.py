@@ -73,6 +73,19 @@ class TestSchedulerAPI:
         })
         assert resp.status_code == 400
 
+    def test_create_failure_is_never_success_shaped(self, mock_store):
+        """#609: a store write failure must be a non-2xx, never a 200 with
+        the created schedule's own shape."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_store.create.side_effect = OSError("disk write failed")
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/scheduler", json={
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *", "action": "notify",
+        })
+        assert not (200 <= resp.status_code < 300)
+
     def test_create_invalid_action(self, client, mock_store):
         resp = client.post("/api/scheduler", json={
             "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",

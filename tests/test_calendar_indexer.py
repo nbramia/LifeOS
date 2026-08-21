@@ -5,7 +5,7 @@ Tests calendar event indexing and scheduling functionality.
 """
 import pytest
 from unittest.mock import patch, MagicMock
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Mark all tests in this module as unit tests
 pytestmark = pytest.mark.unit
@@ -201,6 +201,21 @@ class TestCalendarAdminEndpoints:
         data = response.json()
         assert data["status"] == "success"
         assert data["events_indexed"] == 50
+
+    def test_trigger_calendar_sync_failure_carries_top_level_error(self, client, mock_indexer):
+        """#609: a sync failure stays a 200 (the request WAS served — see
+        #614 for whether that should change) but must carry a top-level
+        `error` key, since `mcp_server.py: dispatch()` and the agent
+        worker's `ToolRegistry` both key off exactly that to flag a result
+        as failed. Without it, this failure was reported as success-shaped."""
+        mock_indexer.sync.side_effect = RuntimeError("calendar API unreachable")
+        response = client.post("/api/admin/calendar/sync")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "error"
+        assert "error" in data
+        assert "calendar API unreachable" in data["error"]
 
     def test_start_calendar_scheduler(self, client, mock_indexer):
         """Should start the calendar scheduler with time-based schedule by default."""

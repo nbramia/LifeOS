@@ -7,6 +7,7 @@ Provides:
 - Configuration info
 """
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import logging
@@ -223,13 +224,23 @@ async def trigger_calendar_sync(days_past: int = 30, days_future: int = 30) -> C
         )
     except Exception as e:
         logger.error(f"Calendar sync failed: {e}")
-        return CalendarSyncResponse(
-            status="error",
-            events_indexed=0,
-            errors=[str(e)],
-            elapsed_seconds=0,
-            last_sync=""
-        )
+        # A plain JSONResponse, not a CalendarSyncResponse, so the extra
+        # top-level "error" key survives instead of being filtered out by
+        # response_model validation. #609: the request was served, but the
+        # sync itself failed, and this stays a 200 for that reason (#614
+        # tracks whether that should change) — the caller still needs to be
+        # able to tell success from failure without parsing prose, and
+        # `mcp_server.py: dispatch()` and the agent worker's ToolRegistry
+        # already flag any tool result as an error generically whenever the
+        # body carries a top-level "error" key.
+        return JSONResponse(content={
+            "status": "error",
+            "events_indexed": 0,
+            "errors": [str(e)],
+            "elapsed_seconds": 0,
+            "last_sync": "",
+            "error": str(e),
+        })
 
 
 @router.post("/calendar/start")
