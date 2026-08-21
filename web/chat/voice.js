@@ -616,6 +616,7 @@ function playUrlOnElement(audio, url) {
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
+      audio.__abortPlayback = null;
       fn(value);
     };
     const cleanup = () => {
@@ -628,6 +629,13 @@ function playUrlOnElement(audio, url) {
       audio.onended = () => { cleanup(); finish(resolve); };
       audio.onerror = () => { cleanup(); finish(reject, new Error('playback failed')); };
       audio.play().catch((err) => { cleanup(); finish(reject, err); });
+    };
+    // Lets stopAllAudio() settle this promise with a benign rejection
+    // instead of orphaning it (#617) -- nulling onended/onerror below stops
+    // them from ever firing on their own once this clip is interrupted.
+    audio.__abortPlayback = () => {
+      cleanup();
+      finish(reject, new DOMException('Playback stopped', 'AbortError'));
     };
     cleanup();
     audio.pause();
@@ -665,6 +673,10 @@ function playSingleUrl(url) {
       activeAudios.push(audio);
       audio.onended = () => resolve();
       audio.onerror = () => reject(new Error('playback failed'));
+      // Same abort hook as the shared-element path above, for the same
+      // reason (#617) -- a Promise only settles once, so this is a no-op
+      // if onended/onerror already fired.
+      audio.__abortPlayback = () => reject(new DOMException('Playback stopped', 'AbortError'));
       audio.play().catch(reject);
     });
   }
@@ -685,6 +697,16 @@ function enqueueClip(url) {
 
 function stopAllAudio() {
   for (const a of activeAudios) {
+    // Settle a still-in-flight playSingleUrl()/playUrlOnElement() promise
+    // for this element with a benign rejection before its handlers are
+    // nulled below -- otherwise that promise is orphaned (never resolves
+    // or rejects), which hangs whatever awaits it: enqueueClip()'s
+    // playbackChain link and, transitively, submitTurn()'s
+    // `await playbackChain` for a live turn interrupted by replay (#617).
+    // isBenignPlaybackError() already treats AbortError as expected, so
+    // this doesn't surface as a playback-failed bubble.
+    a.__abortPlayback?.();
+    a.__abortPlayback = null;
     a.onended = null;
     a.onerror = null;
     // A clip still loading (not yet past playUrlOnElement()'s canplaythrough
