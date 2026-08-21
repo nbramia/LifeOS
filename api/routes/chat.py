@@ -384,6 +384,31 @@ class AskStreamRequest(BaseModel):
     # resolve a persona, or pick a model; omitted (the default) reproduces
     # today's tagging ("lifeos") exactly.
     backend: Optional[str] = None
+    # Opaque, client-generated turn key (#611 review). `conversation_id`
+    # alone can't cancel a turn before its first SSE frame ever arrives —
+    # the request that started it carries `conversation_id: None` for a
+    # brand-new conversation, and the real id only shows up in the
+    # `conversation_id` SSE event. That's exactly the window a voice
+    # barge-in on a first turn falls into, so `POST /api/chat/cancel`
+    # accepts this key too. The client mints it (any opaque string works —
+    # not required to be a UUID) before sending; the server never generates
+    # or returns one. Optional and additive: omitting it changes nothing.
+    client_turn_id: Optional[str] = None
+
+    @field_validator("client_turn_id")
+    @classmethod
+    def validate_client_turn_id(cls, v):
+        # Opaque bounded string, not a trusted identifier — bounded to stop
+        # something huge or control-character-laden from reaching the
+        # in-memory registry key space. Not assumed to be a UUID: whatever
+        # scheme a client uses to generate a locally-unique key is fine.
+        if v is None:
+            return v
+        if len(v) > 200:
+            raise ValueError(f"client_turn_id exceeds 200 chars (got {len(v)})")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            raise ValueError("client_turn_id must not contain control characters")
+        return v
 
     @field_validator("persona")
     @classmethod
@@ -536,12 +561,21 @@ async def ask_stream(request: AskStreamRequest):
     # the voice gate); text/unset turns survive the client leaving, voice
     # turns keep today's disconnect-cancels semantics.
     _modality = (request.modality or "").strip().lower() or "text"
-    # Supersede (#611): a new turn on a conversation that already has one in
-    # flight cancels the old one first — asking again is itself a stop
-    # gesture, and it prevents a stale reply landing after a newer question.
+    # Supersede (#611): a new turn on a conversation OR client_turn_id that
+    # already has one in flight cancels the old one first — asking again is
+    # itself a stop gesture, and it prevents a stale reply landing after a
+    # newer question. Checking client_turn_id too closes the same gap the
+    # explicit cancel endpoint closes (#611 review): a reused/duplicate key
+    # supersedes rather than silently colliding with an unrelated turn.
     if request.conversation_id:
         get_turn_registry().cancel_conversation(request.conversation_id)
-    turn = get_turn_registry().create(conversation_id=request.conversation_id, modality=_modality)
+    if request.client_turn_id:
+        get_turn_registry().cancel_by_client_turn_id(request.client_turn_id)
+    turn = get_turn_registry().create(
+        conversation_id=request.conversation_id,
+        modality=_modality,
+        client_turn_id=request.client_turn_id,
+    )
 
     async def _content(text: str) -> None:
         """Emit a `content` SSE frame AND accumulate it into `partial_text`
@@ -1058,6 +1092,44 @@ async def ask_stream(request: AskStreamRequest):
             "Connection": "keep-alive",
         }
     )
+
+
+class ChatCancelRequest(BaseModel):
+    """Cancel a chat turn by its client-supplied key (#611 review)."""
+    client_turn_id: str
+
+    @field_validator("client_turn_id")
+    @classmethod
+    def validate_client_turn_id(cls, v):
+        if not v:
+            raise ValueError("client_turn_id cannot be empty")
+        if len(v) > 200:
+            raise ValueError(f"client_turn_id exceeds 200 chars (got {len(v)})")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            raise ValueError("client_turn_id must not contain control characters")
+        return v
+
+
+@router.post("/chat/cancel")
+async def chat_cancel(request: ChatCancelRequest):
+    """Cancel a chat turn (native or Hermes-relayed) by `client_turn_id` —
+    the key the client mints and sends on `POST /api/ask/stream`, BEFORE it
+    has a `conversation_id` to cancel by (#611 review). This closes the
+    "first-turn barge-in" gap `POST /api/conversations/{id}/cancel` alone
+    can't: a request that hasn't reached its first SSE frame yet has no
+    conversation id, but the client already has the key it generated.
+
+    There is no 404 here — unlike the conversation-scoped endpoint, there's
+    no existing resource to validate against (a `client_turn_id` might
+    legitimately never have been claimed, e.g. the turn already finished
+    and was popped from the registry, or the key was never used). `200` +
+    `cancelled: false` covers every "nothing to cancel" case; this must
+    never be a 4xx, since a gateway that fires its cancel POST slightly
+    ahead of the turn actually finishing needs that to read as success, not
+    an error.
+    """
+    cancelled = get_turn_registry().cancel_by_client_turn_id(request.client_turn_id)
+    return {"ok": True, "cancelled": cancelled}
 
 
 class HandoffRequest(BaseModel):

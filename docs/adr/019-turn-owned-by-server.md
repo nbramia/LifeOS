@@ -63,14 +63,25 @@ The SSE stream is a live view of a turn in progress, not its lifeline.**
 
 Four supporting decisions close the constraints above:
 
-1. **An explicit cancel path exists.** `POST /api/conversations/{id}/cancel`
-   stops whatever turn is in flight for that conversation — keyed by
-   conversation id, since every client already has one from the first SSE
-   event, so no new header or event type was needed. A Stop button in the
+1. **An explicit cancel path exists, keyed two ways.** `POST
+   /api/conversations/{id}/cancel` stops whatever turn is in flight for that
+   conversation, since every client already has that id from the first SSE
+   event — no new header or event type was needed. A Stop button in the
    composer calls it while a turn is loading. A new turn on a conversation
    that already has one running cancels the old one first (supersede) —
    asking again is itself a stop gesture, and it prevents a stale reply
-   landing after a newer question.
+   landing after a newer question. Review (the whisper-relay maintainer)
+   found a hole in that alone: a brand-new conversation's id doesn't exist
+   until the `conversation_id` SSE event arrives, so a client racing to
+   cancel *before* that — the common shape of a voice barge-in, which often
+   lands within the first second — has nothing to cancel by. `POST
+   /api/ask/stream` therefore also accepts an optional, client-generated
+   `client_turn_id` (opaque, bounded, not assumed to be a UUID), indexed by
+   the registry alongside `conversation_id` from the moment the turn is
+   created; `POST /api/chat/cancel` cancels by that key alone. Reusing a
+   `client_turn_id` supersedes, exactly like `conversation_id` does — a
+   stale or duplicate key always resolves to whichever turn currently holds
+   it, never a stray earlier one.
 2. **Voice turns are gated out of detachment.** `ChatTurn.reader()` checks
    `modality`: a voice-modality turn's disconnect cancels the task
    immediately, reproducing today's behavior exactly, rather than arming the
@@ -120,12 +131,19 @@ bound a native turn's cost).
   the work) and a queue-backed reader (shows the work) is the smallest
   change that fixes it, and it composes: cancellation, deadlines, and
   shutdown all become "stop the task," not special cases of streaming logic.
-- **Keying cancellation on conversation id, not a new turn id, avoids
-  surface-area growth.** `X-LifeOS-Turn-ID` already exists with a different
-  meaning (the Gmail send-gate header, `api/routes/gmail.py`). Every
-  client — native and Hermes alike — already receives a conversation id as
-  the first SSE event, so reusing it needed no new header, no new event
-  type, and no CORS `expose_headers` change.
+- **Keying cancellation on conversation id (plus a client-generated key),
+  not a new server-minted turn id, avoids surface-area growth.**
+  `X-LifeOS-Turn-ID` already exists with a different meaning (the Gmail
+  send-gate header, `api/routes/gmail.py`). Every client — native and
+  Hermes alike — already receives a conversation id as the first SSE
+  event, so reusing it needed no new header, no new event type, and no
+  CORS `expose_headers` change. `client_turn_id` closes the one real gap
+  (cancelling before that first event) as a request-body field instead — a
+  server-minted id returned via a new SSE event or header was considered
+  and rejected specifically because either would break the byte-identity
+  guarantee a connected client already relies on; a body field costs no
+  frame and the client knows its own key before the server could mint one
+  anyway.
 - **The voice gate is a deliberate, temporary asymmetry, not an oversight.**
   Fixing #611 without it would have been a silent regression on exactly the
   surface (mobile voice) the underlying bug report came from — it would

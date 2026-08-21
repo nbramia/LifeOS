@@ -56,9 +56,23 @@ class ChatTurn:
     `conversation_id` SSE frame it observes).
     """
 
-    def __init__(self, turn_id: str, conversation_id: Optional[str], modality: str = "text"):
+    def __init__(
+        self,
+        turn_id: str,
+        conversation_id: Optional[str],
+        modality: str = "text",
+        client_turn_id: Optional[str] = None,
+    ):
         self.turn_id = turn_id
         self.conversation_id = conversation_id
+        # Opaque, client-generated key (#611 review) — known to the client
+        # BEFORE it ever sends the request, unlike `conversation_id` (which
+        # doesn't exist yet for a brand-new conversation) or `turn_id`
+        # (server-generated, never sent to the client). This is what makes a
+        # turn cancellable before its first SSE frame arrives — the gap that
+        # matters most for voice barge-in, where the interruption is
+        # frequently within the first second of a reply.
+        self.client_turn_id = client_turn_id
         self.modality = modality
         self.started_at = time.time()
         self.detached_at: Optional[float] = None
@@ -179,18 +193,35 @@ class ChatTurn:
 
 class TurnRegistry:
     """Process-global (but instance-per-test-via-`reset_turn_registry`)
-    lookup of in-flight turns, keyed both by their own id and by the
-    conversation they belong to."""
+    lookup of in-flight turns, keyed by their own id, the conversation they
+    belong to, and (#611 review) an opaque client-supplied key."""
 
     def __init__(self):
         self._by_turn_id: dict[str, ChatTurn] = {}
         self._by_conversation_id: dict[str, str] = {}
+        self._by_client_turn_id: dict[str, str] = {}
 
-    def create(self, conversation_id: Optional[str], modality: str = "text") -> ChatTurn:
-        turn = ChatTurn(str(uuid.uuid4()), conversation_id, modality)
+    def create(
+        self,
+        conversation_id: Optional[str],
+        modality: str = "text",
+        client_turn_id: Optional[str] = None,
+    ) -> ChatTurn:
+        turn = ChatTurn(str(uuid.uuid4()), conversation_id, modality, client_turn_id)
         self._by_turn_id[turn.turn_id] = turn
         if conversation_id:
             self._by_conversation_id[conversation_id] = turn.turn_id
+        if client_turn_id:
+            # Known at creation time (the client generated it before
+            # sending), unlike conversation_id for a brand-new conversation
+            # — no separate bind() step needed. A collision with an
+            # in-flight turn's client_turn_id is handled by the caller via
+            # supersede (cancel_by_client_turn_id) before create() runs, the
+            # same pattern conversation_id supersede already uses; this
+            # dict simply always reflects the CURRENT holder of a given key,
+            # so a stale/replayed key can only ever reach whichever turn
+            # most recently claimed it, never one further back.
+            self._by_client_turn_id[client_turn_id] = turn.turn_id
         return turn
 
     def bind(self, turn: ChatTurn, conversation_id: str) -> None:
@@ -200,7 +231,10 @@ class TurnRegistry:
         binds it when the first `conversation_id` SSE frame is observed. In
         both cases there's a sub-second window before the bind where the
         turn exists but isn't yet reachable by conversation id (so it can't
-        be cancelled or superseded) — acceptable per the #611 design."""
+        be cancelled or superseded) — acceptable per the #611 design.
+        `client_turn_id`, if the client sent one, closes exactly this gap:
+        it's known and registered from the moment `create()` runs, before
+        this bind ever happens."""
         turn.conversation_id = conversation_id
         self._by_conversation_id[conversation_id] = turn.turn_id
 
@@ -208,14 +242,21 @@ class TurnRegistry:
         turn_id = self._by_conversation_id.get(conversation_id)
         return self._by_turn_id.get(turn_id) if turn_id else None
 
+    def get_by_client_turn_id(self, client_turn_id: str) -> Optional[ChatTurn]:
+        turn_id = self._by_client_turn_id.get(client_turn_id)
+        return self._by_turn_id.get(turn_id) if turn_id else None
+
     def pop(self, turn: ChatTurn) -> None:
         """Remove a finished turn. Called from the turn task's own
-        `finally`. Only clears the conversation_id mapping if it still
-        points at THIS turn — a supersede may already have replaced it with
-        a newer turn's id, and this must not clobber that."""
+        `finally`. Only clears the conversation_id/client_turn_id mappings
+        if they still point at THIS turn — a supersede may already have
+        replaced either with a newer turn's id, and this must not clobber
+        that (the same guard, applied to both keys)."""
         self._by_turn_id.pop(turn.turn_id, None)
         if turn.conversation_id and self._by_conversation_id.get(turn.conversation_id) == turn.turn_id:
             self._by_conversation_id.pop(turn.conversation_id, None)
+        if turn.client_turn_id and self._by_client_turn_id.get(turn.client_turn_id) == turn.turn_id:
+            self._by_client_turn_id.pop(turn.client_turn_id, None)
         deadline_task = turn._deadline_task
         if deadline_task is not None and not deadline_task.done():
             deadline_task.cancel()
@@ -226,6 +267,17 @@ class TurnRegistry:
         supersede (a new turn on a conversation that already has one running
         cancels it first — asking again IS a stop gesture)."""
         turn = self.get_by_conversation(conversation_id)
+        if turn is None:
+            return False
+        return turn.request_cancel(reason)
+
+    def cancel_by_client_turn_id(self, client_turn_id: str, reason: str = "cancelled") -> bool:
+        """Cancel whatever turn is in flight under this client-supplied key
+        (#611 review). This is the key a client has BEFORE it ever gets a
+        `conversation_id` back — closing the "first-turn barge-in" gap
+        `cancel_conversation` alone can't: a request that hasn't reached its
+        first SSE frame yet has no conversation id to cancel by."""
+        turn = self.get_by_client_turn_id(client_turn_id)
         if turn is None:
             return False
         return turn.request_cancel(reason)

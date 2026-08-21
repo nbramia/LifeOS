@@ -65,6 +65,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 - `persona` (optional, internal) — raw preamble text used by the in-process Telegram client. Mutually exclusive with `persona_id` (sending both returns **400**); HTTP clients should use `persona_id`.
 - `model_override` (optional) — pins the model for **this turn**. `"sonnet"` / `"opus"` (or a full model id) run the turn on that cloud model; `"gemma"` / `"local"` run it on the local llama-server; `"auto"` or omitted uses the default orchestrator (Haiku) with escalation — which climbs only to non-API engines (`claude_code` / `codex` / `local`), so a cloud model is reached only by an explicit pick here or a user-directed "escalate to opus" in the message. An explicit pick takes precedence over auto-escalation. Honored on the Anthropic backend; unknown values fall back to `auto`. Drives the web chat model picker.
 - `backend` (optional) — tags a **newly created** conversation for sidebar filtering (see `?backend=` on [`GET /api/conversations`](#get-apiconversations)). This is the only thing it does: it never changes routing, model selection, or persona resolution. Omitted, it tags `"lifeos"` (today's behavior, unchanged). The web client sets it to `"hermes"` only when diverting an orchestrating persona's turn from a Hermes-selected composer to this endpoint (#596) — that persona's spawn is LifeOS-native and has no Hermes equivalent, so the turn lands here regardless of the selected backend, and this field keeps the resulting conversation visible in the Hermes-filtered sidebar rather than vanishing into the `lifeos` bucket.
+- `client_turn_id` (optional, #611) — an opaque key the **client** generates before sending the request, used to cancel this turn via [`POST /api/chat/cancel`](#post-apichatcancel). Closes a gap `conversation_id` alone can't: a brand-new conversation's id doesn't exist until the `conversation_id` SSE event arrives, so a client that wants to cancel before then (the common voice barge-in case) has nothing to cancel by unless it minted this key itself. Bounded to 200 chars, no control characters; not required to be a UUID — any locally-unique string works. Reusing the same key on a later request supersedes (cancels) whichever turn currently holds it, the same as reusing `conversation_id` does. Purely additive — omitting it changes nothing about the turn.
 
 **Response:** Server-Sent Events stream with event types:
 
@@ -83,7 +84,7 @@ Streaming chat with an agentic pipeline. Claude autonomously decides which tools
 
 **Wire format:** lines `data: {json}\n`. Clients may ignore `routing`, `sources`, `usage`, and `done` if they handle stream close.
 
-**A disconnect no longer stops the turn (#611).** The turn keeps running server-side and persists its complete reply once done — closing the tab, backgrounding the app, or a network switch no longer loses the answer. `POST /api/conversations/{id}/cancel` stops it explicitly; `GET /api/conversations/{id}`'s `active_turn` field reports whether one is still running. `modality: "voice"` is the one exception — a voice turn's disconnect still cancels it immediately, matching pre-#611 behavior, because whisper-relay uses abandoning the stream as its deliberate barge-in/hangup cancel gesture. See [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611) for the full contract.
+**A disconnect no longer stops the turn (#611).** The turn keeps running server-side and persists its complete reply once done — closing the tab, backgrounding the app, or a network switch no longer loses the answer. Two ways to cancel it explicitly: `POST /api/conversations/{id}/cancel` (by conversation id) and [`POST /api/chat/cancel`](#post-apichatcancel) (by `client_turn_id`, for a turn that hasn't reached its first SSE frame yet). `GET /api/conversations/{id}`'s `active_turn` field reports whether one is still running. `modality: "voice"` is the one exception — a voice turn's disconnect still cancels it immediately, matching pre-#611 behavior, because whisper-relay uses abandoning the stream as its deliberate barge-in/hangup cancel gesture. See [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611) for the full contract.
 
 **Pipeline routing (in order of priority):**
 1. **Ambiguous task/reminder** — asks user for clarification (task vs reminder vs both).
@@ -160,6 +161,22 @@ Read-only per-turn context: the current date/time, the relative-time-resolution 
 - `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
 - `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
 - This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
+
+### POST /api/chat/cancel
+
+Cancel a chat turn (native or Hermes-relayed) by `client_turn_id` (#611) — the key the client generated and sent on [`POST /api/ask/stream`](#post-apiaskstream), before it necessarily had a `conversation_id` to cancel by instead. This is the endpoint for the "cancel before the first SSE frame arrives" case (e.g. a voice barge-in on a first turn); once a conversation id is known, `POST /api/conversations/{id}/cancel` works too, and either can supersede the same turn.
+
+**Request:**
+```json
+{ "client_turn_id": "some-opaque-client-generated-key" }
+```
+
+**Response:**
+```json
+{ "ok": true, "cancelled": true }
+```
+
+`cancelled` is `false` when nothing was in flight under that key (never claimed, already finished, or already cancelled) — never an error; there's no resource to 404 on here (unlike the conversation-scoped endpoint), since an unknown or expired key legitimately has nothing to report. Calling this while the turn's SSE reader is still attached works correctly — the reader gets a clean end-of-stream rather than an error, and a client that then also disconnects sees a no-op, not a second finalize. **Errors:** `422` empty/oversized (>200 chars)/control-character `client_turn_id` (standard FastAPI request validation).
 
 ### POST /api/chat/handoff
 

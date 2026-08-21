@@ -56,6 +56,24 @@ def _sniff_modality(raw_body: bytes) -> str:
     return "voice" if (data.get("modality") or "").strip().lower() == "voice" else "text"
 
 
+def _sniff_client_turn_id(raw_body: bytes) -> Optional[str]:
+    """Best-effort read of the request's opaque `client_turn_id` field
+    (#611 review), the same way `_sniff_modality` reads `modality` — off
+    the raw pre-transform body, generic across whatever backend uses this
+    router. `None` for anything missing, wrong-typed, or unparseable;
+    length/character validation already happened at the native
+    `AskStreamRequest` layer (this is Hermes's own copy of that same
+    request), so this is a plain read, not re-validation."""
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    client_turn_id = data.get("client_turn_id")
+    return client_turn_id if isinstance(client_turn_id, str) and client_turn_id else None
+
+
 def make_backend_router(
     *, prefix, tag, backend_label, url_attr, token_attr, client_factory,
     transform_body: Optional[Callable[[bytes], bytes]] = None,
@@ -177,8 +195,17 @@ def make_backend_router(
             # backend never sets `make_observer` at all, so `observer` is
             # always None there and it always takes the plain path —
             # detaching would only spend money on a relay nothing observes.
+            # Supersede (#611 review): a reused client_turn_id cancels
+            # whatever turn is still holding it, same as the native path —
+            # a stale/duplicate key resolves to the newest claimant, never
+            # a stray old one.
+            client_turn_id = _sniff_client_turn_id(raw_body)
+            if client_turn_id:
+                get_turn_registry().cancel_by_client_turn_id(client_turn_id)
             turn = get_turn_registry().create(
-                conversation_id=None, modality=_sniff_modality(raw_body),
+                conversation_id=None,
+                modality=_sniff_modality(raw_body),
+                client_turn_id=client_turn_id,
             )
             if hasattr(observer, "bind_turn"):
                 observer.bind_turn(turn)

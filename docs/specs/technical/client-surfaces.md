@@ -26,7 +26,7 @@ Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https
 
 The gateway connects to LifeOS at `LIFEOS_BASE_URL` for orchestration (ask/stream, handoff). Persona listing and conversation CRUD are **LifeOS-owned** — consumed by `/chat` directly, not through whisper-relay.
 
-**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers).
+**LifeOS endpoints the gateway calls** (shapes: [api-reference.md](../product/api-reference.md)): `POST /api/ask/stream`, `POST /api/chat/handoff`. At startup it may call `GET /api/personas` server-side for handoff capability caching (not exposed to browsers). `POST /api/chat/cancel` (`client_turn_id`, #611) exists for the gateway to adopt as its explicit stop path — tracked as `whisper-relay#37`, not yet started — but is not called today: voice still relies on cancel-on-disconnect (see "Turn lifetime and cancellation" below) until that lands.
 
 **Persona contract** (shared by web and voice; lets a thin client expose LifeOS's multi-bot personas without reading LifeOS config):
 
@@ -101,6 +101,35 @@ proxy; the Agent backend is unaffected (below).
   exist. A new `POST /api/ask/stream` (or the Hermes equivalent) naming a
   conversation that already has a turn in flight cancels the old one first
   (supersede) — asking again is itself a stop gesture.
+- **`client_turn_id` and `POST /api/chat/cancel` (#611 review — closes the
+  first-turn barge-in gap).** `conversation_id` alone can't cancel a turn
+  before its first SSE frame arrives: a brand-new conversation's id doesn't
+  exist until the `conversation_id` event, so a client racing to cancel
+  before then — the common case for a voice barge-in, which tends to land
+  within the first second — has nothing to cancel by. `POST
+  /api/ask/stream` accepts an optional `client_turn_id`: an opaque,
+  client-generated key (bounded to 200 chars, no control characters — not
+  assumed to be a UUID), known before the request is even sent. The
+  registry indexes turns by it in addition to `conversation_id`, and `POST
+  /api/chat/cancel` (body: `{"client_turn_id": "..."}`) cancels by that key
+  alone. Reusing a `client_turn_id` on a later request supersedes the turn
+  currently holding it, mirroring `conversation_id` supersede — a stale or
+  duplicate key always resolves to its current claimant, never a stray
+  earlier turn. Returning a server-minted turn id in a new SSE event or
+  header was considered and rejected: either would break the byte-identity
+  guarantee a connected client already relies on (no new frame, no new
+  header); a request-body field costs nothing and the client knows its own
+  key earlier than the server could mint one anyway.
+- **Cancelling a turn whose reader is still attached is a supported,
+  explicitly-tested ordering** (#611 review) — not just "cancel after
+  disconnect." A gateway that fires its cancel POST from an event handler
+  rather than its SSE read loop (to avoid the latency of checking a flag
+  between reads) can have that POST arrive *before* the client actually
+  stops reading. Cancelling in that ordering works correctly: the
+  still-attached reader gets a clean end-of-stream (no exception), and a
+  disconnect that follows afterward is a no-op — not a second finalize.
+  Cancelling an already-finished (or already-cancelled) turn is `200` +
+  `cancelled: false`, never a 4xx — a gateway treats that as success.
 - **`GET /api/conversations/{id}`** gains an additive `active_turn` field:
   `{turn_id, conversation_id, started_at}` while a turn is in flight for
   that conversation, `null` otherwise. Lets a reconnecting client show
