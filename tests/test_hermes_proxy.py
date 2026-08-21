@@ -400,6 +400,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
         "existing_tags", "tags_instruction",
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
+        "session_cost_is_lower_bound",
     }
     assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
     assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
@@ -451,23 +452,29 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# Session-to-date cost (#610) — `lifeos_context.turn` carries the verbatim
-# sum of this conversation's already-recorded usage, never `persona` (which
-# must stay cacheable/turn-invariant), scoped by the request's own
-# `conversation_id` and excluding the in-flight turn.
+# Session-to-date cost (#610, extended with `session_cost_is_lower_bound`
+# by #613) — `lifeos_context.turn` carries the verbatim sum of this
+# conversation's already-recorded usage, never `persona` (which must stay
+# cacheable/turn-invariant), scoped by the request's own `conversation_id`
+# and excluding the in-flight turn.
 # ---------------------------------------------------------------------------
 
 async def test_session_cost_lands_in_turn_never_in_persona(proxy_client):
     """The cache-busting regression this issue exists to prevent: a
     cumulative, every-turn-changing figure in `persona` would invalidate a
-    consumer's prompt cache on every single turn."""
+    consumer's prompt cache on every single turn. `session_cost_is_lower_
+    bound` (#613) is exactly as turn-variant as the other session fields --
+    it's derived from the same per-conversation sum -- so it must land in
+    `turn` alongside them, never in `persona`."""
     resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
 
     assert "session_cost_usd" in ctx["turn"]
+    assert "session_cost_is_lower_bound" in ctx["turn"]
     for key in ("session_cost_usd", "session_turn_count",
-                "session_input_tokens", "session_output_tokens"):
+                "session_input_tokens", "session_output_tokens",
+                "session_cost_is_lower_bound"):
         assert key not in ctx["persona"]
 
 
@@ -499,6 +506,7 @@ async def test_session_cost_sums_prior_turns_and_excludes_the_in_flight_one(prox
     assert turn["session_input_tokens"] == 300
     assert turn["session_output_tokens"] == 130
     assert turn["session_turn_count"] == 2
+    assert turn["session_cost_is_lower_bound"] is False
 
 
 async def test_session_cost_fresh_conversation_is_zero_not_an_error(proxy_client):
@@ -513,14 +521,15 @@ async def test_session_cost_fresh_conversation_is_zero_not_an_error(proxy_client
     assert turn["session_turn_count"] == 0
     assert turn["session_input_tokens"] == 0
     assert turn["session_output_tokens"] == 0
+    assert turn["session_cost_is_lower_bound"] is False
 
 
 async def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(proxy_client):
-    """A conversation containing a turn recorded with cost_usd=0.0 (free or
-    simply unreported by its provider -- the store doesn't distinguish the
-    two, and this field must not pretend it does) must still report a
-    truthful sum and turn count for the whole conversation, rather than
-    erroring or silently dropping the zero-cost turn."""
+    """A conversation containing a turn recorded with cost_usd=0.0 and
+    unpriced=False (genuinely free) must still report a truthful sum and
+    turn count for the whole conversation, rather than erroring or
+    silently dropping the zero-cost turn -- and must not be flagged as a
+    lower bound, since nothing summed here is unpriced."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()
@@ -543,6 +552,35 @@ async def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(proxy_cl
     assert turn["session_input_tokens"] == 110
     assert turn["session_output_tokens"] == 60
     assert turn["session_turn_count"] == 2
+    assert turn["session_cost_is_lower_bound"] is False
+
+
+async def test_session_cost_unpriced_turn_marks_the_envelope_as_a_lower_bound(proxy_client):
+    """#613: a conversation containing a turn recorded `unpriced=True` (its
+    provider reported no cost) must surface `session_cost_is_lower_bound
+    =True` in the envelope -- the real per-conversation distinction this
+    field exists to carry to a consumer, replacing the unconditional-floor
+    wording #610 originally shipped with."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-unpriced", unpriced=False,
+    )
+    store.record_usage(
+        model="some-unrecognized-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-unpriced", unpriced=True,
+    )
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-unpriced"},
+    )
+    assert resp.status_code == 200
+    turn = json.loads(_received["body"])["lifeos_context"]["turn"]
+
+    assert turn["session_cost_usd"] == pytest.approx(0.002)
+    assert turn["session_cost_is_lower_bound"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1133,10 +1171,10 @@ async def test_usage_event_writes_a_row_with_verbatim_cost(usage_proxy_client, u
 
     with sqlite3.connect(usage_store.db_path) as conn:
         row = conn.execute(
-            "SELECT model, input_tokens, output_tokens, cost_usd, conversation_id FROM usage"
+            "SELECT model, input_tokens, output_tokens, cost_usd, conversation_id, unpriced FROM usage"
         ).fetchone()
     assert row is not None
-    model, input_tokens, output_tokens, cost_usd, conversation_id = row
+    model, input_tokens, output_tokens, cost_usd, conversation_id, unpriced = row
     assert model == "deepseek-v3-fireworks"
     assert input_tokens == 120
     assert output_tokens == 340
@@ -1144,6 +1182,8 @@ async def test_usage_event_writes_a_row_with_verbatim_cost(usage_proxy_client, u
     # comment above.
     assert cost_usd == pytest.approx(0.00087)
     assert conversation_id == "usage-conv-1"
+    # A real reported cost (#613) — not the "couldn't price this" case.
+    assert unpriced == 0
 
 
 stub_hermes_usage_no_cost = FastAPI()
@@ -1188,6 +1228,11 @@ async def test_usage_event_without_cost_records_zero(monkeypatch, hermes_store, 
     assert stats["total_input_tokens"] == 10
     assert stats["total_output_tokens"] == 5
     assert stats["total_cost"] == 0.0
+    # #613: the row is flagged `unpriced` -- the zero above is "unknown",
+    # not a real reported cost of zero.
+    with sqlite3.connect(usage_store.db_path) as conn:
+        (unpriced,) = conn.execute("SELECT unpriced FROM usage").fetchone()
+    assert unpriced == 1
 
 
 stub_hermes_malformed_usage = FastAPI()
@@ -1410,6 +1455,7 @@ class TestHermesTurnPersisterDirect:
             ("record_usage", {
                 "model": "m", "input_tokens": 1, "output_tokens": 2,
                 "cost_usd": 0.01, "conversation_id": "usage-track-1",
+                "unpriced": False,
             }),
         ]
 

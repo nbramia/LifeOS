@@ -21,6 +21,7 @@ _TURN_KEYS = {
     "existing_tags", "tags_instruction",
     "session_cost_usd", "session_turn_count",
     "session_input_tokens", "session_output_tokens",
+    "session_cost_is_lower_bound",
 }
 
 
@@ -54,6 +55,7 @@ def test_shape_and_literal_keys(client):
     assert body["session_turn_count"] == 0
     assert body["session_input_tokens"] == 0
     assert body["session_output_tokens"] == 0
+    assert body["session_cost_is_lower_bound"] is False
 
 
 def test_defaults_to_primary_persona(client):
@@ -212,6 +214,7 @@ def test_session_cost_sums_prior_turns_for_the_conversation_id(client):
     assert body["session_input_tokens"] == 150
     assert body["session_output_tokens"] == 75
     assert body["session_turn_count"] == 2
+    assert body["session_cost_is_lower_bound"] is False
 
 
 def test_session_cost_unknown_conversation_id_is_zero_not_an_error(client):
@@ -220,13 +223,14 @@ def test_session_cost_unknown_conversation_id_is_zero_not_an_error(client):
     body = resp.json()
     assert body["session_cost_usd"] == 0.0
     assert body["session_turn_count"] == 0
+    assert body["session_cost_is_lower_bound"] is False
 
 
 def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(client):
-    """A conversation containing a turn recorded with cost_usd=0.0 (free or
-    simply unreported by its provider -- the store doesn't distinguish the
-    two) must still report a truthful sum and turn count for the whole
-    conversation, not error or silently drop it."""
+    """A conversation containing a turn recorded with cost_usd=0.0 and
+    unpriced=False (genuinely free) must still report a truthful sum and
+    turn count for the whole conversation, not error or silently drop it
+    -- and must not be flagged as a lower bound."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()
@@ -245,3 +249,27 @@ def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(client):
     assert body["session_input_tokens"] == 110
     assert body["session_output_tokens"] == 60
     assert body["session_turn_count"] == 2
+    assert body["session_cost_is_lower_bound"] is False
+
+
+def test_session_cost_unpriced_turn_marks_the_response_as_a_lower_bound(client):
+    """#613: a conversation containing a turn recorded `unpriced=True`
+    (its provider reported no cost) must surface `session_cost_is_lower_
+    bound=True` in the standalone endpoint's response too, since it shares
+    `build_turn_context()` with the Hermes envelope."""
+    from api.services.usage_store import get_usage_store
+
+    store = get_usage_store()
+    store.record_usage(
+        model="claude-haiku-4-5", input_tokens=100, output_tokens=50,
+        cost_usd=0.002, conversation_id="conv-unpriced", unpriced=False,
+    )
+    store.record_usage(
+        model="some-unrecognized-model", input_tokens=10, output_tokens=10,
+        cost_usd=0.0, conversation_id="conv-unpriced", unpriced=True,
+    )
+
+    body = client.get("/api/chat/turn-context", params={"conversation_id": "conv-unpriced"}).json()
+
+    assert body["session_cost_usd"] == pytest.approx(0.002)
+    assert body["session_cost_is_lower_bound"] is True

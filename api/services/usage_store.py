@@ -55,13 +55,30 @@ class UsageStore:
                     input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL,
                     cost_usd REAL NOT NULL,
-                    conversation_id TEXT
+                    conversation_id TEXT,
+                    unpriced INTEGER NOT NULL DEFAULT 0
                 )
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_usage_timestamp
                 ON usage(timestamp)
             """)
+            # `unpriced` (#613) distinguishes a row whose upstream backend
+            # sent no `cost_usd` at all (an external-backend turn from a
+            # model the calculator doesn't price) from a row that reported
+            # a real cost of zero (a free local model). Both otherwise land
+            # in this table with cost_usd=0.0 (see
+            # `_HermesTurnPersister._handle_usage` in hermes_proxy.py —
+            # cost is still recorded verbatim, never invented), so without
+            # this flag the two are indistinguishable once persisted. Added
+            # via ALTER rather than in CREATE TABLE above so it lands on a
+            # pre-existing usage.db too; a row written before this column
+            # existed defaults to 0 (treated as priced) — that history is
+            # unrecoverable, not retroactively fixed.
+            try:
+                conn.execute("ALTER TABLE usage ADD COLUMN unpriced INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists (fresh db, or a prior run already migrated it)
             conn.commit()
 
     def record_usage(
@@ -70,7 +87,8 @@ class UsageStore:
         input_tokens: int,
         output_tokens: int,
         cost_usd: float,
-        conversation_id: str = None
+        conversation_id: str = None,
+        unpriced: bool = False,
     ) -> int:
         """
         Record a usage entry.
@@ -81,6 +99,11 @@ class UsageStore:
             output_tokens: Number of output tokens
             cost_usd: Cost in USD
             conversation_id: Optional conversation ID
+            unpriced: True when the caller has no real cost for this turn
+                (an external backend that sent no `cost_usd`) — `cost_usd`
+                is still stored as given (verbatim, never invented) but
+                marked so a later reader can tell it apart from a turn that
+                genuinely cost zero (#613).
 
         Returns:
             ID of the created record
@@ -90,61 +113,63 @@ class UsageStore:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO usage (timestamp, model, input_tokens, output_tokens, cost_usd, conversation_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO usage (timestamp, model, input_tokens, output_tokens, cost_usd, conversation_id, unpriced)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (now, model, input_tokens, output_tokens, cost_usd, conversation_id)
+                (now, model, input_tokens, output_tokens, cost_usd, conversation_id, int(unpriced))
             )
             conn.commit()
             return cursor.lastrowid
 
     def get_conversation_usage(self, conversation_id: Optional[str]) -> dict:
         """
-        Session-to-date usage for one conversation (#610): the sum of every
-        turn already recorded under `conversation_id`, for a caller that
-        wants to report "what has this conversation cost so far" without
-        recomputing anything.
+        Session-to-date usage for one conversation (#610, extended by #613):
+        the sum of every turn already recorded under `conversation_id`, for
+        a caller that wants to report "what has this conversation cost so
+        far" without recomputing anything.
 
         Deliberately excludes the turn currently being built: this reads
         only rows a prior call to `record_usage()` already wrote, and the
         in-flight turn's row (if any) isn't written until its own stream
         finishes.
 
-        Returns all-zero for a conversation with no recorded usage
-        (including `conversation_id=None`, e.g. the first turn of a
-        brand-new conversation) -- present and zero rather than raising,
-        since "no usage yet" is a normal state, not an error.
-
-        This is a **floor, not an exact total**: a turn whose provider
-        reported no cost is recorded as `cost_usd=0.0` repo-wide (see
-        `record_usage()` callers — there is no separate "unpriced" marker
-        anywhere in this store), so a summed `0.0` can mean either "these
-        turns were free" or "some of them were unpriced." Callers must
-        present the figure as a floor rather than implying precision either
-        way — see `build_turn_context()`'s `session_cost_usd` docstring.
+        Returns all-zero, `is_lower_bound=False`, for a conversation with no
+        recorded usage (including `conversation_id=None`, e.g. the first
+        turn of a brand-new conversation) -- present and zero rather than
+        raising, since "no usage yet" is a normal state, not an error.
 
         Returns:
-            Dict with cost_usd, input_tokens, output_tokens (verbatim sums)
-            and turn_count (how many recorded turns the sum covers).
+            Dict with cost_usd, input_tokens, output_tokens (verbatim
+            sums), turn_count (how many recorded turns the sum covers),
+            and is_lower_bound (True if any summed turn was `unpriced`,
+            i.e. some contributing row's cost is unknown rather than
+            genuinely zero -- see the `unpriced` column, #613. Rows written
+            before that column existed default to priced/`0`, since that
+            history can't be reclassified; a sum spanning any such row is
+            still a floor even when this flag reads False).
         """
         if not conversation_id:
-            return {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "turn_count": 0}
+            return {
+                "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0,
+                "turn_count": 0, "is_lower_bound": False,
+            }
 
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
                 """
-                SELECT SUM(cost_usd), SUM(input_tokens), SUM(output_tokens), COUNT(*)
+                SELECT SUM(cost_usd), SUM(input_tokens), SUM(output_tokens), COUNT(*), SUM(unpriced)
                 FROM usage WHERE conversation_id = ?
                 """,
                 (conversation_id,),
             ).fetchone()
 
-        cost, input_tokens, output_tokens, turn_count = row
+        cost, input_tokens, output_tokens, turn_count, unpriced_count = row
         return {
             "cost_usd": cost or 0.0,
             "input_tokens": input_tokens or 0,
             "output_tokens": output_tokens or 0,
             "turn_count": turn_count or 0,
+            "is_lower_bound": bool(unpriced_count),
         }
 
     def get_usage_stats(

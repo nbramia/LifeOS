@@ -267,7 +267,7 @@ class TagCount(BaseModel):
 
 
 class TurnContextResponse(BaseModel):
-    """Response for the per-turn context endpoint (#591, extended by #610)."""
+    """Response for the per-turn context endpoint (#591, extended by #610, #613)."""
     current_datetime: str
     current_datetime_iso: str
     timezone: str
@@ -279,6 +279,7 @@ class TurnContextResponse(BaseModel):
     session_turn_count: int
     session_input_tokens: int
     session_output_tokens: int
+    session_cost_is_lower_bound: bool
 
 
 @router.get("/chat/turn-context", response_model=TurnContextResponse)
@@ -300,8 +301,9 @@ async def turn_context(persona_id: str = "primary", modality: str = "text", conv
 
     `conversation_id` is optional — omitted (or a conversation with no
     recorded usage yet) reports the session-cost fields present and zero
-    rather than erroring or omitting them. `session_cost_usd` is a floor,
-    not an exact total — see `build_turn_context()`'s docstring.
+    rather than erroring or omitting them. `session_cost_is_lower_bound`
+    says whether `session_cost_usd` is a floor rather than an exact total
+    — see `build_turn_context()`'s docstring.
 
     400 if `persona_id` isn't a known persona.
     """

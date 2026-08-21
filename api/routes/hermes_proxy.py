@@ -219,6 +219,7 @@ class _HermesTurnPersister:
         self._usage_input_tokens = 0
         self._usage_output_tokens = 0
         self._usage_cost_usd = 0.0
+        self._usage_unpriced = False
         # #611: whether a `done` event was ever observed -- see the class
         # docstring's #611 paragraph. finalize() treats "never saw done" as
         # a genuine truncation, distinct from #592's disconnect-truncation
@@ -329,19 +330,28 @@ class _HermesTurnPersister:
         taken verbatim from upstream — never recomputed here — and a
         missing/non-numeric cost records as zero rather than a guess. A
         malformed or partial event (bad model or token counts) is dropped
-        silently; it must never raise or interrupt the relay."""
+        silently; it must never raise or interrupt the relay.
+
+        `unpriced` (#613) tracks *why* the recorded cost is zero: an absent
+        or non-numeric `cost_usd` (this upstream genuinely couldn't price
+        the turn) vs. a real reported `0` (a free model) — see the same
+        presence-and-type distinction #602 gives the live SSE display.
+        Persisted alongside the cost so a later reader can tell the two
+        apart, which the bare `cost_usd` column alone cannot."""
         model = event.get("model")
         input_tokens = _coerce_token_count(event.get("input_tokens"))
         output_tokens = _coerce_token_count(event.get("output_tokens"))
         if not isinstance(model, str) or not model or input_tokens is None or output_tokens is None:
             return
         cost = event.get("cost_usd")
-        cost_usd = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0.0
+        priced = isinstance(cost, (int, float)) and not isinstance(cost, bool)
+        cost_usd = float(cost) if priced else 0.0
         self._usage_captured = True
         self._usage_model = model
         self._usage_input_tokens = input_tokens
         self._usage_output_tokens = output_tokens
         self._usage_cost_usd = cost_usd
+        self._usage_unpriced = not priced
 
     def finalize(self) -> None:
         """Write this turn to the stores, once each. Runs after the pump has
@@ -388,6 +398,7 @@ class _HermesTurnPersister:
                     output_tokens=self._usage_output_tokens,
                     cost_usd=self._usage_cost_usd,
                     conversation_id=self._conversation_id,
+                    unpriced=self._usage_unpriced,
                 )
             except Exception:
                 logger.warning("hermes turn persistence: failed to record usage", exc_info=True)
