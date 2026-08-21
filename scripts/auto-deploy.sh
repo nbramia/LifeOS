@@ -158,8 +158,16 @@ if [ "$BRANCH" != "main" ]; then
     log "skip: on branch '$BRANCH', not main"
     exit 0
 fi
-if [ -n "$(git status --porcelain)" ]; then
-    log "skip: working tree dirty — not auto-deploying over local edits"
+# `--untracked-files=no` is deliberate (#634). The guard's purpose is to avoid
+# deploying over uncommitted *edits to tracked code*; an untracked file is not
+# that. Counting untracked paths made a single `.worktrees/` directory — the
+# conventional location for worktree-based development here, which the
+# post-commit hook already expects to exist — skip every tick silently and
+# indefinitely: 62 consecutive skips before this was found, during which the
+# drift check below never ran at all. `.worktrees/` is now gitignored too;
+# this is the class fix, so the next stray scratch file doesn't repeat it.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    log "skip: tracked files modified — not auto-deploying over local edits"
     exit 0
 fi
 

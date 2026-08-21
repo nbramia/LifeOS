@@ -151,3 +151,8 @@ scripts/clear-caches.sh
 # Code tooling may write at the repo root — the tracked root-level AGENTS.md
 # overrides this since gitignore doesn't apply to files already in the index.
 /AGENTS.md
+
+# Local git worktrees (agent/dev scratch). Never committed — and an untracked
+# .worktrees/ made `git status --porcelain` report dirty, which silently
+# disabled auto-deploy.sh for 62 consecutive ticks (#634).
+.worktrees/
