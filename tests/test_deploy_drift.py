@@ -32,7 +32,12 @@ from pathlib import Path
 
 import pytest
 
-from api.services.agent_worker.session_store import STATUS_CLAIMED, SessionStore
+from api.services.agent_worker.session_store import (
+    STATUS_CLAIMED,
+    STATUS_RUNNING,
+    STATUS_YIELDED,
+    SessionStore,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POST_COMMIT = REPO_ROOT / "scripts" / "post-commit"
@@ -352,8 +357,8 @@ def _venv_with_python(tmp_path: Path) -> Path:
 
 @pytest.mark.unit
 def test_worker_busy_true_when_non_terminal_session_exists(tmp_path: Path):
-    """Authoritative source of truth: SessionStore.list_non_terminal() — a
-    claimed/running/yielded row means busy."""
+    """Authoritative source of truth: the session store. A claimed or
+    running row means busy (yielded does not — see #636)."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     workdir = tmp_path / "work"
@@ -658,3 +663,58 @@ def test_main_still_skips_when_a_tracked_file_is_modified(tmp_path: Path):
     assert "not auto-deploying over local edits" in deploy_log, deploy_log
     restart_log = (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
     assert "restart lifeos-api" not in restart_log, restart_log
+
+
+def _worker_busy_rc(tmp_path: Path, statuses: list[str]) -> str:
+    """Run auto-deploy.sh's `worker_busy` against a store seeded with exactly
+    `statuses`. Returns the shell rc line ("rc=0" busy, "rc=1" idle)."""
+    workdir = tmp_path / f"work_{'_'.join(statuses) or 'empty'}"
+    (workdir / "data").mkdir(parents=True)
+    (workdir / "scripts").mkdir()
+    (workdir / "scripts" / "auto-deploy.sh").write_text(AUTO_DEPLOY.read_text(), encoding="utf-8")
+    store = SessionStore(db_path=workdir / "data" / "agent_sessions.db")
+    for i, st in enumerate(statuses):
+        store.create(task_id=f"t-{i}", session_id=f"s-{i}", status=st)
+    env = dict(os.environ)
+    env["LIFEOS_VENV"] = str(_venv_with_python(tmp_path))
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    result = subprocess.run(
+        ["bash", "-c", 'source scripts/auto-deploy.sh && worker_busy; echo "rc=$?"'],
+        cwd=workdir, env=env, capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout
+
+
+@pytest.mark.unit
+def test_worker_busy_excludes_yielded_sessions(tmp_path: Path):
+    """#636: a yielded session must NOT block a restart.
+
+    The worker's own recovery path skips yielded sessions ("Sleeping sessions
+    are healthy — main loop will wake them"), so a restart does not harm them.
+    Counting them meant one abandoned yielded session — 82 days old, on the
+    real host — deferred the worker on every tick forever, logging a deferral
+    each time and never updating. `list_non_terminal()` answers "which
+    sessions must I look at?", which is a wider set than "which would a
+    restart harm?".
+    """
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    assert "rc=1" in _worker_busy_rc(tmp_path, [STATUS_YIELDED])
+
+
+@pytest.mark.unit
+def test_worker_busy_still_true_for_a_running_session(tmp_path: Path):
+    """The narrowing must not become "never busy": genuinely-active work
+    still defers."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    assert "rc=0" in _worker_busy_rc(tmp_path, [STATUS_RUNNING])
+
+
+@pytest.mark.unit
+def test_worker_busy_true_when_active_work_sits_alongside_a_yielded_session(tmp_path: Path):
+    """The mixed case is the one a naive filter gets wrong: excluding yielded
+    must not cause a claimed session in the same store to be overlooked."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    assert "rc=0" in _worker_busy_rc(tmp_path, [STATUS_YIELDED, STATUS_CLAIMED])
