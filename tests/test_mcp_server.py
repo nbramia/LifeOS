@@ -696,14 +696,14 @@ def test_sync_trigger_downstream_non_2xx_is_an_error():
 
 @pytest.mark.unit
 def test_sync_trigger_2xx_with_embedded_error_sets_is_error():
-    """#609: `POST /api/admin/calendar/sync` and `POST /api/photos/sync`
-    report a failed sync as a 200 carrying a top-level `error` key rather
-    than a non-2xx (the request was served; the sync failed — see #614 for
-    whether that should change). `_handle_sync_trigger` passes a 2xx body
-    through unmodified, so it needs no source-specific handling for this —
-    but prove the full chain end to end rather than assuming: a 200 whose
-    body already carries `error` must still flip `dispatch()`'s `isError`,
-    exactly like `test_tools_call_sets_is_error_on_tool_failure` in
+    """Defense in depth, generically: even if some future sync source ever
+    reported a failure as a 200 carrying only a top-level `error` key (as
+    `POST /api/admin/calendar/sync` and `POST /api/photos/sync` did before
+    #614 additionally made a total failure non-2xx), `_handle_sync_trigger`
+    passes a 2xx body through unmodified and needs no source-specific
+    handling — a 200 whose body already carries `error` must still flip
+    `dispatch()`'s `isError`, exactly like
+    `test_tools_call_sets_is_error_on_tool_failure` in
     test_mcp_http_transport.py proves for the generic (non-sync-trigger)
     case."""
     import importlib.util
@@ -761,10 +761,10 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
 
     # No current exemptions: `POST /api/admin/calendar/sync` and
     # `POST /api/photos/sync` were fixed for #609 by adding a top-level
-    # `error` key to their failure body (see docs/specs/technical/
-    # architecture.md, "Write Endpoint Failure Contract") rather than
-    # changing their status code — whether a total sync failure should be
-    # non-2xx instead is a separate, deliberate question tracked as #614.
+    # `error` key to their failure body, and #614 additionally made a total
+    # failure return a non-2xx status (see docs/specs/technical/
+    # architecture.md, "Write Endpoint Failure Contract") — both signals are
+    # present now, which this scanner recognizes as safe either way.
     # Add an entry here (with a tracking issue and a doc note) only for a
     # deliberately accepted gap — never to silence a finding.
     _KNOWN_EXEMPTIONS: set[tuple[str, str]] = set()

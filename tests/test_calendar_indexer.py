@@ -203,19 +203,38 @@ class TestCalendarAdminEndpoints:
         assert data["events_indexed"] == 50
 
     def test_trigger_calendar_sync_failure_carries_top_level_error(self, client, mock_indexer):
-        """#609: a sync failure stays a 200 (the request WAS served — see
-        #614 for whether that should change) but must carry a top-level
-        `error` key, since `mcp_server.py: dispatch()` and the agent
-        worker's `ToolRegistry` both key off exactly that to flag a result
-        as failed. Without it, this failure was reported as success-shaped."""
+        """#609 made a total sync failure legible (top-level `error` key);
+        #614 decided a total failure must also report non-2xx, since
+        consumers that only check HTTP status (`raise_for_status()`) — per
+        #609's own audit — need correct behavior without knowing about the
+        body convention. 500 because this is an unhandled exception from
+        the sync call, not a classified upstream/dependency failure."""
         mock_indexer.sync.side_effect = RuntimeError("calendar API unreachable")
         response = client.post("/api/admin/calendar/sync")
 
-        assert response.status_code == 200
+        assert response.status_code == 500
         data = response.json()
         assert data["status"] == "error"
         assert "error" in data
         assert "calendar API unreachable" in data["error"]
+
+    def test_trigger_calendar_sync_partial_status_stays_200(self, client, mock_indexer):
+        """A `partial` outcome (some calendar accounts synced, one failed)
+        is a legitimate degraded-but-real result, not a total failure —
+        #614's non-2xx change must not collapse it into one."""
+        mock_indexer.sync.return_value = {
+            "status": "partial",
+            "events_indexed": 12,
+            "errors": ["Work calendar sync failed: timeout"],
+            "elapsed_seconds": 1.8,
+            "last_sync": "2025-01-15T10:00:00",
+        }
+        response = client.post("/api/admin/calendar/sync")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "partial"
+        assert "error" not in data
 
     def test_start_calendar_scheduler(self, client, mock_indexer):
         """Should start the calendar scheduler with time-based schedule by default."""
