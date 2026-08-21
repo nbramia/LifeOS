@@ -34,8 +34,25 @@ from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import get_turn_registry, TRUNCATION_MARKER, truncation_routing
+from api.services.llm_client import get_llm_registry
 
 logger = logging.getLogger(__name__)
+
+
+_EXPLICIT_MEMORY_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:remember\s+(?:that\s+)?|don't\s+forget\s+(?:that\s+)?|"
+    r"note\s+(?:that\s+)?|save\s+this\s+as\s+(?:a\s+)?memory\s*:\s*)(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _explicit_memory_content(question: str) -> str | None:
+    """Return content from an explicit remember request, if present.
+
+    Deliberately excludes ``remember to`` so reminders are not saved as memories.
+    """
+    match = _EXPLICIT_MEMORY_RE.match(question or "")
+    return match.group(1).strip() if match else None
 
 
 # =============================================================================
@@ -907,12 +924,15 @@ async def ask_stream(request: AskStreamRequest):
                                 effective_question = expanded
                                 print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
-            # The agent loop uses the orchestrator model configured by
-            # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
+            # The agent loop uses the provider/model registry, with legacy
+            # Anthropic settings as the fallback for older deployments.
             # The perf-trace field is still named `model_tier` because the column
             # in perf_traces.db is `model_tier` — but the value is now a model id
             # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
-            orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            _providers, _model_profiles = get_llm_registry()
+            _default_profile = _model_profiles["default"]
+            orchestrator_provider = _default_profile.provider
+            orchestrator_model = _default_profile.model
             # Escalation: pick a stronger model for this turn either because the
             # user explicitly asked ("escalate to opus", #305) or because the
             # prior turn refused and this message pushes back (#303). Anthropic
@@ -928,7 +948,7 @@ async def ask_stream(request: AskStreamRequest):
             # this turn to that cloud model. "auto"/unset falls through to the
             # normal Haiku + escalation path.
             _override = (request.model_override or "").strip().lower()
-            _backend_is_anthropic = getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
+            _backend_is_anthropic = orchestrator_provider == "anthropic"
             if _override == "remote" and not settings.remote_llm_configured:
                 # The picker hides this option when unconfigured, but an
                 # explicit-but-unusable pick from a raw API caller falls back
@@ -1046,6 +1066,27 @@ async def ask_stream(request: AskStreamRequest):
                 await turn.emit(f"data: {json.dumps({'type': 'error', 'message': 'Agent loop returned no result'})}\n\n")
                 await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
+
+            # An acknowledgement is not proof that save_memory was called.
+            # Persist explicit remember requests deterministically when the
+            # model skipped the tool, and tell the user what actually happened.
+            _memory_content = _explicit_memory_content(request.question)
+            _memory_tool_succeeded = any(
+                tc.get("tool") == "save_memory" and not tc.get("is_error")
+                for tc in agent_result.tool_calls_log
+            )
+            if _memory_content and not _memory_tool_succeeded:
+                from api.services.memory_store import get_memory_store
+                _saved_memory = get_memory_store().create_memory(_memory_content)
+                agent_result.tool_calls_log.append({
+                    "tool": "save_memory",
+                    "input": {"content": _memory_content},
+                    "result": f"Memory saved: {_saved_memory.id}",
+                    "is_error": False,
+                })
+                _notice = "\n\nSaved as persistent memory."
+                agent_result.full_text += _notice
+                await _content(_notice)
 
             # Record usage
             if agent_result.total_input_tokens > 0:
