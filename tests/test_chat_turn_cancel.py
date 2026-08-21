@@ -23,13 +23,6 @@ from api.services.conversation_store import ConversationStore
 pytestmark = pytest.mark.unit
 
 
-@pytest.fixture(autouse=True)
-def _fresh_turn_registry():
-    chat_turns.reset_turn_registry()
-    yield
-    chat_turns.reset_turn_registry()
-
-
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     s = ConversationStore(db_path=str(tmp_path / "conversations.db"))

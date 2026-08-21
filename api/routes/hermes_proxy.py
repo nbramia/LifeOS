@@ -36,6 +36,7 @@ from config.settings import settings  # noqa: F401
 from api.routes._proxy import TIMEOUT, make_backend_router
 from api.routes.chat import AskStreamRequest
 from api.services.agent_system_prompt import build_turn_context
+from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, truncation_routing
 from api.services.conversation_store import get_store
 from api.services.usage_store import get_usage_store
 
@@ -188,6 +189,20 @@ class _HermesTurnPersister:
     partial `usage` event (missing/wrong-typed model or token counts) is
     ignored rather than raised; a well-formed event with no `cost_usd` is
     recorded with a zero cost rather than an invented one.
+
+    #611: `_proxy.py`'s pump now runs as a detached, registry-owned
+    background task, so `finalize()` fires on the REAL end of the turn (the
+    upstream connection closing) rather than on an early client disconnect —
+    a disconnected browser no longer truncates what gets persisted here (see
+    `bind_turn()`). What can still genuinely truncate a Hermes turn is the
+    upstream connection itself ending before a `done` event ever arrived
+    (Hermes crashed, was killed, or the connection dropped mid-turn) — this
+    class can't tell that apart from an ordinary network hiccup on its own,
+    so it tracks only whether `done` was observed and lets `finalize()`
+    decide: seen it, persist verbatim (as always); never saw it, append
+    `TRUNCATION_MARKER` and mark `routing.truncated` — the same visible
+    signal the native path gives a cancelled/errored turn, via the same
+    `truncation_routing()` helper.
     """
 
     _FRAME_SEP = b"\n\n"
@@ -204,6 +219,31 @@ class _HermesTurnPersister:
         self._usage_input_tokens = 0
         self._usage_output_tokens = 0
         self._usage_cost_usd = 0.0
+        # #611: whether a `done` event was ever observed -- see the class
+        # docstring's #611 paragraph. finalize() treats "never saw done" as
+        # a genuine truncation, distinct from #592's disconnect-truncation
+        # (which #611 eliminated for this class).
+        self._done_seen = False
+        # #611: the ChatTurn this persister's turn is registered under, once
+        # `_proxy.py`'s detached pump has one to hand it (bind_turn() is
+        # called right after construction, before any observe()). Kept so
+        # `_handle_event` can register the turn's conversation id with the
+        # shared registry the moment it's observed -- the same "learn the id
+        # from the first SSE frame" pattern the native path uses for a
+        # brand-new conversation, just triggered by an observed frame here
+        # instead of a locally-created row.
+        self._turn = None
+
+    def bind_turn(self, turn) -> None:
+        """Hook `_proxy.py`'s detached pump calls once it creates this
+        turn's `ChatTurn` — see the class docstring. If a `conversation_id`
+        was somehow already observed before this call (shouldn't happen in
+        practice: bind_turn() runs immediately after construction, before
+        the pump's first `observe()`), bind it immediately rather than
+        waiting for a `conversation_id` event that will never arrive again."""
+        self._turn = turn
+        if self._conversation_id is not None:
+            get_turn_registry().bind(turn, self._conversation_id)
 
     def observe(self, chunk: bytes) -> None:
         """Non-blocking, in-memory-only frame reassembly — see the class
@@ -262,10 +302,21 @@ class _HermesTurnPersister:
                     )
                 else:
                     self._conversation_id = conv_id
+                    # #611: the turn becomes cancellable/supersedable by this
+                    # id the moment it's known -- before this, it exists
+                    # (the pump is already running) but isn't reachable by
+                    # conversation id yet, a sub-second window acceptable
+                    # per the #611 design.
+                    if self._turn is not None:
+                        get_turn_registry().bind(self._turn, conv_id)
         elif etype == "content":
             content = event.get("content")
             if isinstance(content, str):
                 self._content_parts.append(content)
+        elif etype == "done":
+            # #611: the backend's own signal that this turn ran to a normal
+            # completion -- see the class docstring's #611 paragraph.
+            self._done_seen = True
         elif etype == "usage" and not self._usage_captured:
             # Not "seen once" like conversation_id above: a malformed usage
             # event (below) leaves `_usage_captured` False, so a later
@@ -293,10 +344,10 @@ class _HermesTurnPersister:
         self._usage_cost_usd = cost_usd
 
     def finalize(self) -> None:
-        """Write this turn to the stores, once each. Runs after the relay
-        has already handed off every byte it's going to (normal completion
-        or an early client disconnect), so it's the only place in this
-        class a blocking store call is allowed to happen.
+        """Write this turn to the stores, once each. Runs after the pump has
+        drained upstream to its real end (#611 — no longer just "however far
+        the browser stuck around for"), so it's the only place in this class
+        a blocking store call is allowed to happen.
 
         Conversation persistence and usage persistence are independent: a
         turn with no `conversation_id`/content still records usage if a
@@ -304,6 +355,17 @@ class _HermesTurnPersister:
         """
         if self._conversation_id is not None and self._content_parts:
             conv_id = self._conversation_id
+            content = "".join(self._content_parts)
+            # #611: no `done` event ever arrived -- the upstream connection
+            # ended (or is still running when this fires, e.g. a
+            # cancellation) without confirming the turn actually finished.
+            # Mark it the same way the native path marks a cancelled/errored
+            # turn, so a genuinely truncated Hermes reply is never presented
+            # as if it were whole.
+            routing = None
+            if not self._done_seen:
+                content += TRUNCATION_MARKER
+                routing = truncation_routing("stream_error")
             try:
                 store = get_store()
                 store.create_conversation(
@@ -314,7 +376,7 @@ class _HermesTurnPersister:
                 logger.warning("hermes turn persistence: failed to create conversation %r", conv_id, exc_info=True)
             else:
                 try:
-                    store.add_message(conv_id, "assistant", "".join(self._content_parts))
+                    store.add_message(conv_id, "assistant", content, routing=routing)
                 except Exception:
                     logger.warning("hermes turn persistence: failed to save assistant reply", exc_info=True)
 

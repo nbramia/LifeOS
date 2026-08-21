@@ -24,16 +24,6 @@ from api.services.usage_store import UsageStore
 pytestmark = pytest.mark.unit
 
 
-@pytest.fixture(autouse=True)
-def _fresh_turn_registry():
-    """A real module-level singleton would otherwise leak in-flight turns
-    (and their background tasks) across tests — same isolation concern
-    conversation_store.reset_conversation_store() exists for."""
-    chat_turns.reset_turn_registry()
-    yield
-    chat_turns.reset_turn_registry()
-
-
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     s = ConversationStore(db_path=str(tmp_path / "conversations.db"))

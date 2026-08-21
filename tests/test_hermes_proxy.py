@@ -7,6 +7,7 @@ the proxy's httpx client through an in-process stub backend via ASGITransport
 (no sockets), so they're fast and deterministic.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -632,11 +633,17 @@ async def test_truncated_stream_still_persists_partial_content(monkeypatch, herm
     assert resp.status_code == 200
     assert resp.content == b"".join(_TRUNCATED_SSE_CHUNKS)
 
+    # #611: no `done` event ever arrived (the stub's stream just ends), so
+    # this is now flagged as a genuine truncation -- the marker and
+    # `routing.truncated` mean the browser can never mistake this cut-off
+    # reply for a whole one, the same guarantee the native path gives a
+    # cancelled/errored turn.
     messages = hermes_store.get_messages("trunc-1")
     assert [(m.role, m.content) for m in messages] == [
         ("user", "will this finish?"),
-        ("assistant", "partial reply"),
+        ("assistant", "partial reply\n\n_[cut off — the turn ended before it finished]_"),
     ]
+    assert messages[-1].routing == {"truncated": True, "truncation_reason": "stream_error"}
 
 
 stub_hermes_crlf = FastAPI()
@@ -649,6 +656,11 @@ stub_hermes_crlf = FastAPI()
 _CRLF_SSE_CHUNKS = [
     b'data: {"type": "conversation_id", "conversation_id": "crlf-1"}\r\n\r\n',
     b'data: {"type": "content", "content": "crlf reply"}\r\n\r\n',
+    # A `done` event (#611: its absence is now the truncation signal — see
+    # test_truncated_stream_still_persists_partial_content below) so this
+    # CRLF-framing test isn't mistaken for a genuinely truncated turn; this
+    # fixture predates #611 and was never about completion signaling.
+    b'data: {"type": "done"}\r\n\r\n',
 ]
 
 
@@ -691,15 +703,23 @@ async def test_crlf_framed_stream_still_persists(monkeypatch, hermes_store):
 
 
 async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, hermes_store):
-    """MAJOR (#592 review): `_proxy.py`'s relay loop used to call
-    `observer.observe(chunk)` *after* `yield chunk`. Closing the response
-    generator while it's suspended at that yield — exactly what an early
-    client disconnect does — raises `GeneratorExit` right there, which
-    skips any code written after the yield in that same loop iteration. The
-    chunk the relay had already handed off was silently never observed, so
-    a disconnect mid-turn lost the very content the partial-turn guarantee
-    (see `test_truncated_stream_still_persists_partial_content` above)
-    exists to keep.
+    """MAJOR (#592 review), STRENGTHENED by #611: `_proxy.py`'s relay loop
+    used to call `observer.observe(chunk)` *after* `yield chunk`. Closing
+    the response generator while it's suspended at that yield — exactly
+    what an early client disconnect does — raised `GeneratorExit` right
+    there, which skipped any code written after the yield in that same
+    loop iteration, so the chunk already handed off was silently never
+    observed. Fixed for #592 by observing before yielding.
+
+    #611 goes further: the upstream drain is no longer the response
+    generator's own loop at all. It's a registry-owned background pump
+    that keeps draining upstream regardless of what the browser does, so a
+    disconnect doesn't just fail to lose the LAST delivered chunk — it no
+    longer stops the turn early at all. The invariant this test now pins is
+    stronger: a disconnect never loses ANY observed chunk, including ones
+    that hadn't reached the browser yet when it disconnected. That's why
+    the persisted content below is the FULL relayed text ("first
+    chunknever requested"), not just "first chunk".
 
     Drives the endpoint's returned `StreamingResponse.body_iterator` by
     hand — pulling exactly one chunk, then closing it without ever asking
@@ -718,6 +738,12 @@ async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, herm
         b'data: {"type": "conversation_id", "conversation_id": "disco-1"}\n\n'
         b'data: {"type": "content", "content": "first chunk"}\n\n',
         b'data: {"type": "content", "content": "never requested"}\n\n',
+        # A `done` event (#611: its absence is now the "this turn was cut
+        # off" signal used by test_truncated_stream_still_persists_partial_content
+        # below) — the detached pump drains this fully regardless of what
+        # the reader below ever pulls, so this is what makes the persisted
+        # reply come out unmarked, matching a turn that actually finished.
+        b'data: {"type": "done"}\n\n',
     ]
 
     class _FakeUpstream:
@@ -778,16 +804,178 @@ async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, herm
 
     # Simulate the client vanishing right here: close the generator without
     # ever pulling the second chunk. This is exactly the "suspended at the
-    # yield" moment the finding describes.
+    # yield" moment the finding describes. Unlike before #611, this detaches
+    # the pump rather than stopping it -- await its turn's task to let it
+    # actually finish draining upstream before asserting on what's persisted.
     await gen.aclose()
+
+    from api.services.chat_turns import get_turn_registry
+    turn = get_turn_registry().get_by_conversation("disco-1")
+    assert turn is not None and turn.task is not None
+    await turn.task
 
     conv = hermes_store.get_conversation("disco-1")
     assert conv is not None
     messages = hermes_store.get_messages("disco-1")
     assert [(m.role, m.content) for m in messages] == [
         ("user", "will this survive a disconnect?"),
-        ("assistant", "first chunk"),
+        ("assistant", "first chunknever requested"),
     ]
+
+
+def _fake_upstream_and_client(gen_factory):
+    """A minimal fake httpx client/response pair (mirrors the `_FakeClient`/
+    `_FakeUpstream` pattern above and in test_agent_proxy.py) giving exact
+    control over the SSE chunks and their timing, for tests that need to
+    pause the upstream mid-turn to simulate a disconnect landing before it
+    finishes."""
+    class _FakeUpstream:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "text/event-stream"})
+
+        async def aiter_raw(self):
+            async for c in gen_factory():
+                yield c
+
+        async def aclose(self):
+            pass
+
+    class _FakeClient:
+        def build_request(self, *a, **k):
+            return object()
+
+        async def send(self, *a, **k):
+            return _FakeUpstream()
+
+        async def aclose(self):
+            pass
+
+    return _FakeClient
+
+
+def _manual_request(body: dict):
+    """A `Request` whose `receive()` delivers `body` once, then reports a
+    disconnect on every subsequent call -- the same manual ASGI-scope
+    construction `test_client_disconnect_still_persists_the_last_chunk`
+    above uses, factored out for the two tests below."""
+    raw_body = json.dumps(body).encode()
+    body_sent = False
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/hermes/ask/stream",
+        "raw_path": b"/api/hermes/ask/stream",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("testclient", 123),
+        "server": ("testserver", 80),
+        "http_version": "1.1",
+    }
+    return Request(scope, receive=receive)
+
+
+async def test_disconnect_then_completion_persists_full_reply_and_a_usage_row(
+    monkeypatch, hermes_store, usage_store,
+):
+    """#611: a Hermes turn that survives a disconnect (as above) also gets
+    its `usage` event captured once the pump finishes draining -- the
+    money side of "the turn runs to completion" holds too, not just the
+    text."""
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    hold = asyncio.Event()
+
+    async def gen():
+        yield b'data: {"type": "conversation_id", "conversation_id": "disco-usage-1"}\n\n'
+        yield b'data: {"type": "content", "content": "partial "}\n\n'
+        await hold.wait()
+        yield b'data: {"type": "content", "content": "rest"}\n\n'
+        yield b'data: {"type": "usage", "model": "m", "input_tokens": 5, "output_tokens": 7, "cost_usd": 0.002}\n\n'
+        yield b'data: {"type": "done"}\n\n'
+
+    monkeypatch.setattr(hp, "_client", lambda: _fake_upstream_and_client(gen)())
+
+    endpoint = next(r for r in hp.router.routes if r.path.endswith("/ask/stream")).endpoint
+    request = _manual_request({"question": "will usage survive a disconnect?"})
+
+    response = await endpoint(request)
+    gen_iter = response.body_iterator
+    await gen_iter.__anext__()  # conversation_id
+    await gen_iter.__anext__()  # "partial "
+
+    # Disconnect before "rest", the usage event, or done ever reach the browser.
+    await gen_iter.aclose()
+    hold.set()  # let the still-running pump past its pause
+
+    turn = hp.get_turn_registry().get_by_conversation("disco-usage-1")
+    assert turn is not None and turn.task is not None
+    await turn.task
+
+    messages = hermes_store.get_messages("disco-usage-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "will usage survive a disconnect?"),
+        ("assistant", "partial rest"),
+    ]
+    stats = usage_store.get_usage_stats()
+    assert stats["request_count"] == 1
+    assert stats["total_input_tokens"] == 5
+    assert stats["total_output_tokens"] == 7
+    assert stats["total_cost"] == pytest.approx(0.002)
+
+
+async def test_voice_modality_disconnect_cancels_the_pump_rather_than_detaching(
+    monkeypatch, hermes_store,
+):
+    """LEAD'S DECISION (#611), extended to the Hermes pump: a voice-modality
+    turn relayed through Hermes must also be cancelled by a disconnect
+    rather than surviving it -- whisper-relay's barge-in/hangup cancel
+    gesture is abandoning whatever LifeOS-speaking stream it's talking to,
+    native or Hermes-relayed alike."""
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+
+    never = asyncio.Event()
+
+    async def gen():
+        yield b'data: {"type": "conversation_id", "conversation_id": "voice-disco-1"}\n\n'
+        yield b'data: {"type": "content", "content": "Hello "}\n\n'
+        await never.wait()  # would hang forever if the pump weren't cancelled
+        yield b'data: {"type": "content", "content": "unreachable"}\n\n'
+
+    monkeypatch.setattr(hp, "_client", lambda: _fake_upstream_and_client(gen)())
+
+    endpoint = next(r for r in hp.router.routes if r.path.endswith("/ask/stream")).endpoint
+    request = _manual_request({"question": "hi", "modality": "voice"})
+
+    response = await endpoint(request)
+    gen_iter = response.body_iterator
+    await gen_iter.__anext__()  # conversation_id
+    await gen_iter.__anext__()  # "Hello "
+    await gen_iter.aclose()  # the barge-in/hangup disconnect
+
+    turn = hp.get_turn_registry().get_by_conversation("voice-disco-1")
+    assert turn is not None and turn.modality == "voice"
+    with pytest.raises(asyncio.CancelledError):
+        await turn.task
+    assert turn.task.cancelled()
+
+    messages = hermes_store.get_messages("voice-disco-1")
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "hi"),
+        ("assistant", "Hello " + hp.TRUNCATION_MARKER),
+    ]
+    assert messages[-1].routing == {"truncated": True, "truncation_reason": "stream_error"}
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1181,11 @@ class TestHermesTurnPersisterDirect:
         persister.observe(b'ersation_id": "split-1"}\n\n')
         persister.observe(b'data: {"type": "content", "content": "he')
         persister.observe(b'llo"}\n\n')
+        # A `done` event (#611: its absence is now the "this turn was cut
+        # off" signal — see test_truncated_stream_still_persists_partial_content
+        # below) so this frame-reassembly test isn't mistaken for a
+        # genuinely truncated turn; this fixture predates #611.
+        persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
 
         messages = hermes_store.get_messages("split-1")
@@ -1028,6 +1221,9 @@ class TestHermesTurnPersisterDirect:
         # Still mid-stream: nothing written to the store yet.
         assert calls == []
 
+        # A `done` event (#611) so this test isn't mistaken for a genuinely
+        # truncated turn — see test_truncated_stream_still_persists_partial_content.
+        persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
 
         assert calls == [
@@ -1050,6 +1246,9 @@ class TestHermesTurnPersisterDirect:
         persister = hp._HermesTurnPersister(question="second turn q", persona_id="primary")
         persister.observe(b'data: {"type": "conversation_id", "conversation_id": "existing-1"}\n\n')
         persister.observe(b'data: {"type": "content", "content": "second turn a"}\n\n')
+        # A `done` event (#611) so this test isn't mistaken for a genuinely
+        # truncated turn — see test_truncated_stream_still_persists_partial_content.
+        persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
 
         assert len(hermes_store.list_conversations()) == 1

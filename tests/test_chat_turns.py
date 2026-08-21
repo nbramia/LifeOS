@@ -16,13 +16,6 @@ from config.settings import settings
 pytestmark = pytest.mark.unit
 
 
-@pytest.fixture(autouse=True)
-def _fresh_registry():
-    chat_turns.reset_turn_registry()
-    yield
-    chat_turns.reset_turn_registry()
-
-
 def _spawn_turn(registry, conversation_id="conv-1", modality="text", body=None):
     """A ChatTurn with a real task running `body` (an awaitable), wired into
     the registry the same way ask_stream() wires a real one."""
