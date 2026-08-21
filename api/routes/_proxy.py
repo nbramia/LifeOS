@@ -43,8 +43,10 @@ def _sniff_modality(raw_body: bytes) -> str:
     """Best-effort read of the request's `modality` field (#611), straight
     off the same raw pre-transform body `transform_body`/`make_observer`
     already receive — generic across whatever backend uses this router, not
-    Hermes-specific. Used only to gate a relayed turn out of detachment the
-    same way the native path does (see ChatTurn.reader()'s voice gate);
+    Hermes-specific. Recorded on the `ChatTurn` for parity with the native
+    path's own turn (and, until #616, used to gate a relayed voice turn out
+    of detachment the same way ChatTurn.reader() gated the native path — that
+    gate is now lifted, so this no longer affects cancellation on its own);
     anything unparseable defaults to "text" rather than raising, since a
     malformed body is `transform_body`'s problem to reject, not this one's."""
     try:
