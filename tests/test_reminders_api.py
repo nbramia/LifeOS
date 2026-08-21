@@ -5,7 +5,7 @@ Tests CRUD endpoints with mocked store and Telegram.
 """
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 
 pytestmark = pytest.mark.unit
 
@@ -77,6 +77,23 @@ class TestRemindersAPI:
             "message_content": "Hi",
         })
         assert response.status_code == 400
+
+    def test_create_reminder_failure_is_never_success_shaped(self, mock_reminder_store):
+        """#609: a store write failure must be a non-2xx, never a 200 with
+        the created reminder's own shape."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_reminder_store.create.side_effect = OSError("disk write failed")
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/api/reminders", json={
+            "name": "Morning Briefing",
+            "schedule_type": "cron",
+            "schedule_value": "30 7 * * 1-5",
+            "message_type": "static",
+            "message_content": "hi",
+        })
+        assert not (200 <= response.status_code < 300)
 
     def test_list_reminders(self, client, mock_reminder_store):
         response = client.get("/api/reminders")

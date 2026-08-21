@@ -130,6 +130,36 @@ class TestMCPServerToolDiscovery:
         for expected in expected_tools:
             assert expected in tool_names, f"Missing tool: {expected}"
 
+    def test_task_create_tags_advertised_as_array(self, openapi_spec):
+        """Regression for #609: the incident that prompted this issue traced
+        back to `lifeos_task_create`'s `tags` field being advertised as
+        `"type": "string"` before #603's `_unwrap_optional` fix. A
+        schema-following model sent a string, the write 400'd, and (per the
+        incident) the failure wasn't surfaced as such. `_unwrap_optional` is
+        exactly the code that could regress and reintroduce the mistyping —
+        pin the schema shape directly so a regression is caught here instead
+        of by another incident.
+        """
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+            server = module.LifeOSMCPServer()
+        server.openapi_spec = openapi_spec
+        server._build_tools_from_spec()
+
+        task_create_tool = next(t for t in server.tools if t["name"] == "lifeos_task_create")
+        tags_schema = task_create_tool["inputSchema"]["properties"]["tags"]
+        assert tags_schema.get("type") == "array", (
+            f"lifeos_task_create's 'tags' field is advertised as "
+            f"{tags_schema.get('type')!r}, not 'array' — a schema-following "
+            f"model will send the wrong shape and the write will 400"
+        )
+        assert "items" in tags_schema, "'tags' array schema is missing 'items'"
+
 
 class TestMCPServerAPICalls:
     """Test that MCP server correctly calls the API."""
@@ -597,3 +627,306 @@ def test_investments_route_404_matches_mcp_not_synced_branch(tmp_path, monkeypat
     with pytest.raises(HTTPException) as ei:
         inv_route._load("summary.json")
     assert "not synced" in str(ei.value.detail).lower()
+
+
+# ---------------------------------------------------------------------------
+# _handle_sync_trigger (#609) — the custom_handler for lifeos_sync_trigger.
+# It bypasses the generic _call_api HTTP wrapper, so its own error-signaling
+# needs its own coverage rather than inheriting the generic tests above.
+# ---------------------------------------------------------------------------
+
+def _fresh_server():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.LifeOSMCPServer()
+
+
+@pytest.mark.unit
+def test_sync_trigger_missing_source_is_an_error():
+    result = _fresh_server()._handle_sync_trigger({})
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_sync_trigger_unknown_source_is_an_error():
+    result = _fresh_server()._handle_sync_trigger({"source": "not-a-real-source"})
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_sync_trigger_known_source_routes_to_the_right_endpoint():
+    from unittest.mock import MagicMock
+    server = _fresh_server()
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"status": "started"}
+    fake_response.raise_for_status = MagicMock()
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    result = server._handle_sync_trigger({"source": "vault"})
+    assert result == {"status": "started"}
+    called_url = fake.post.call_args[0][0]
+    assert called_url.endswith("/api/admin/reindex")
+
+
+@pytest.mark.unit
+def test_sync_trigger_downstream_non_2xx_is_an_error():
+    """A downstream route that correctly raises on failure (the safe
+    pattern every other curated write endpoint follows) must still surface
+    as {"error": ...} here — this is what lets dispatch() set `isError`
+    generically for every sync source without source-specific handling."""
+    import httpx
+    from unittest.mock import MagicMock
+    server = _fresh_server()
+    fake = MagicMock()
+    fake_response = MagicMock(status_code=500)
+    fake_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=fake_response
+    )
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    result = server._handle_sync_trigger({"source": "vault"})
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_sync_trigger_2xx_with_embedded_error_sets_is_error():
+    """#609: `POST /api/admin/calendar/sync` and `POST /api/photos/sync`
+    report a failed sync as a 200 carrying a top-level `error` key rather
+    than a non-2xx (the request was served; the sync failed — see #614 for
+    whether that should change). `_handle_sync_trigger` passes a 2xx body
+    through unmodified, so it needs no source-specific handling for this —
+    but prove the full chain end to end rather than assuming: a 200 whose
+    body already carries `error` must still flip `dispatch()`'s `isError`,
+    exactly like `test_tools_call_sets_is_error_on_tool_failure` in
+    test_mcp_http_transport.py proves for the generic (non-sync-trigger)
+    case."""
+    import importlib.util
+    from unittest.mock import MagicMock
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+    fake = MagicMock()
+    fake_response = MagicMock(status_code=200)
+    fake_response.raise_for_status = MagicMock()  # 2xx: does not raise
+    fake_response.json.return_value = {
+        "status": "error",
+        "events_indexed": 0,
+        "errors": ["calendar API unreachable"],
+        "elapsed_seconds": 0,
+        "last_sync": "",
+        "error": "calendar API unreachable",
+    }
+    fake.post.return_value = fake_response
+    server.client = fake
+
+    result = module.dispatch(
+        server,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lifeos_sync_trigger", "arguments": {"source": "calendar"}},
+        },
+    )
+    assert result["result"]["isError"] is True
+
+
+# ---------------------------------------------------------------------------
+# #609: generic, code-driven safety net over every curated write endpoint.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestWriteEndpointNeverReturnsSuccessShapedFailure:
+    """Enumerates write endpoints from the code — CURATED_ENDPOINTS plus the
+    sub-routes `_handle_sync_trigger` fans `lifeos_sync_trigger` out to,
+    since that tool has no direct path of its own — rather than hardcoding
+    today's list, so a newly added write endpoint that returns a failure
+    inside a 2xx gets caught here without needing a new test.
+
+    Flags any `except` block in a route handler that returns normally
+    (implicit or explicit 2xx) instead of raising or setting an explicit
+    non-2xx status — the exact shape #603 fixed in `fitness.py` and #609
+    found in two sync routes. This is a static approximation of the real
+    guarantee, not a substitute for the failure-injection tests elsewhere in
+    this suite (e.g. `test_create_task_failure_is_never_success_shaped`) —
+    it exists so *future* endpoints get some coverage by construction.
+    """
+
+    # No current exemptions: `POST /api/admin/calendar/sync` and
+    # `POST /api/photos/sync` were fixed for #609 by adding a top-level
+    # `error` key to their failure body (see docs/specs/technical/
+    # architecture.md, "Write Endpoint Failure Contract") rather than
+    # changing their status code — whether a total sync failure should be
+    # non-2xx instead is a separate, deliberate question tracked as #614.
+    # Add an entry here (with a tracking issue and a doc note) only for a
+    # deliberately accepted gap — never to silence a finding.
+    _KNOWN_EXEMPTIONS: set[tuple[str, str]] = set()
+
+    @staticmethod
+    def _load_mcp_module():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _curated_write_paths(self, module):
+        """(method, path) pairs for every write endpoint reachable through
+        the MCP surface."""
+        from unittest.mock import MagicMock
+
+        pairs = set()
+        for key, config in module.CURATED_ENDPOINTS.items():
+            if config["method"] == "GET" or config.get("custom_handler"):
+                continue
+            pairs.add((config["method"], config.get("path", key.split(":")[0])))
+
+        # lifeos_sync_trigger has no direct path — _handle_sync_trigger fans
+        # it out at runtime based on `source`. Drive the real routing logic
+        # for every valid source instead of re-typing its route_map, so a
+        # change there is picked up automatically.
+        server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+        for source in (
+            "vault", "calendar", "contacts", "slack", "photos",
+            "gmail", "imessage", "phone", "facetime", "linkedin",
+        ):
+            fake_client = MagicMock()
+            server.client = fake_client
+            server._handle_sync_trigger({"source": source})
+            url = fake_client.post.call_args[0][0]
+            path = "/" + url.split("://", 1)[-1].split("/", 1)[-1]
+            pairs.add(("POST", path))
+        return pairs
+
+    @staticmethod
+    def _resolve_route(method: str, curated_path: str):
+        """Find the FastAPI route matching `curated_path`, treating any
+        route path parameter as a wildcard — curated paths sometimes name a
+        param differently than the route itself (e.g. `{entity_id}` in
+        CURATED_ENDPOINTS vs `{person_id}` on the actual CRM route), and a
+        sync-trigger URL carries a concrete value (e.g. `gmail`) where the
+        route has a param (`{source_type}`)."""
+        from api.main import app
+
+        curated_segments = curated_path.strip("/").split("/")
+        for route in app.routes:
+            if method not in getattr(route, "methods", set()):
+                continue
+            route_segments = route.path.strip("/").split("/")
+            if len(route_segments) != len(curated_segments):
+                continue
+            if all(
+                a == b or b.startswith("{")
+                for a, b in zip(curated_segments, route_segments)
+            ):
+                return route
+        return None
+
+    @staticmethod
+    def _except_blocks_return_success_shaped(func) -> list[str]:
+        """Describe every `except` block in `func` that returns normally
+        without either raising, setting an explicit non-2xx status, or
+        carrying a top-level `error` key in the response body — the AC's
+        "non-2xx status *or* top-level error" (#609 review discussion),
+        which is what let #609 fix the two sync-trigger routes by adding an
+        additive `error` key instead of changing their status code."""
+        import ast
+        import inspect
+        import textwrap
+
+        src = textwrap.dedent(inspect.getsource(func))
+        func_node = ast.parse(src).body[0]
+
+        def is_explicit_error_status(value_node) -> bool:
+            if not isinstance(value_node, ast.Call):
+                return False
+            callee = value_node.func
+            name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
+            if name == "HTTPException":
+                return True
+            if name in ("JSONResponse", "Response", "PlainTextResponse", "ORJSONResponse"):
+                return any(kw.arg == "status_code" for kw in value_node.keywords)
+            return False
+
+        def dict_has_top_level_error_key(d) -> bool:
+            return isinstance(d, ast.Dict) and any(
+                isinstance(k, ast.Constant) and k.value == "error"
+                for k in d.keys if k is not None
+            )
+
+        def has_top_level_error_key(value_node) -> bool:
+            """True for a bare `{"error": ...}` dict literal, or one passed
+            as `content=`/positionally to a Response-constructing call (e.g.
+            `JSONResponse(content={"error": ..., ...})`). Deliberately
+            top-level only — a dict literal nested inside another kwarg
+            (e.g. the old `SyncResponse(stats={"error": ...})` shape) does
+            NOT count, since that key wasn't visible to a caller checking
+            the body's own top level."""
+            if dict_has_top_level_error_key(value_node):
+                return True
+            if isinstance(value_node, ast.Call):
+                candidates = list(value_node.args) + [
+                    kw.value for kw in value_node.keywords if kw.arg in (None, "content")
+                ]
+                return any(dict_has_top_level_error_key(c) for c in candidates)
+            return False
+
+        findings = []
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            if any(isinstance(n, ast.Raise) for n in ast.walk(node)):
+                continue  # some branch of this handler raises — treat as safe
+            for n in ast.walk(node):
+                if isinstance(n, ast.Return) and n.value is not None:
+                    if not is_explicit_error_status(n.value) and not has_top_level_error_key(n.value):
+                        findings.append(ast.dump(n.value)[:120])
+        return findings
+
+    def test_no_curated_write_endpoint_swallows_a_failure_into_a_2xx(self):
+        module = self._load_mcp_module()
+        pairs = self._curated_write_paths(module)
+        assert pairs, "no curated write endpoints discovered — enumeration is broken"
+
+        unexpected_unsafe = []
+        for method, path in pairs:
+            route = self._resolve_route(method, path)
+            if route is None:
+                continue
+            findings = self._except_blocks_return_success_shaped(route.endpoint)
+            if findings and (method, path) not in self._KNOWN_EXEMPTIONS \
+                    and (method, route.path) not in self._KNOWN_EXEMPTIONS:
+                unexpected_unsafe.append((method, route.path, findings))
+
+        assert not unexpected_unsafe, (
+            "curated write endpoint(s) return a failure inside a 2xx (the "
+            f"#603/#609 anti-pattern): {unexpected_unsafe}. If this is "
+            "intentional, add it to _KNOWN_EXEMPTIONS with a tracking issue "
+            "and document the exemption in "
+            "docs/specs/technical/architecture.md."
+        )
+
+    def test_known_exemptions_are_still_exempt_and_documented(self):
+        """Guards the exemption list itself: once a listed exemption's route
+        is fixed to raise instead of returning success-shaped, this fails —
+        so the entry (and the doc's exemption note) gets removed instead of
+        silently going stale."""
+        for method, path in self._KNOWN_EXEMPTIONS:
+            route = self._resolve_route(method, path)
+            assert route is not None, (
+                f"exempted route {method} {path} no longer exists — remove "
+                "the stale exemption"
+            )
+            findings = self._except_blocks_return_success_shaped(route.endpoint)
+            assert findings, (
+                f"{method} {path} no longer matches the exempted anti-pattern "
+                "— remove it from _KNOWN_EXEMPTIONS and its note in "
+                "docs/specs/technical/architecture.md"
+            )

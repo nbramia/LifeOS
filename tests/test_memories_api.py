@@ -82,6 +82,20 @@ class TestMemoriesAPI:
         # FastAPI returns 422 by default, but LifeOS validation error handler returns 400
         assert response.status_code == 400
 
+    def test_create_memory_failure_is_never_success_shaped(self, mock_memory_store):
+        """#609: a store write failure must be a non-2xx, never a 200 with
+        the created memory's own shape."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_memory_store.create_memory.side_effect = OSError("disk write failed")
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/api/memories",
+            json={"content": "Remember Erika spelling", "synthesize": False}
+        )
+        assert not (200 <= response.status_code < 300)
+
     def test_list_memories(self, client, mock_memory_store):
         """Should return list of memories."""
         from datetime import datetime

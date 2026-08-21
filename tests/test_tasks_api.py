@@ -85,6 +85,24 @@ class TestTasksAPI:
         })
         assert response.status_code in (400, 422)  # Validation error
 
+    def test_create_task_failure_is_never_success_shaped(self, mock_task_manager):
+        """#609: if the write itself fails (disk error, index corruption,
+        whatever `TaskManager.create` raises for), the caller must see a
+        non-2xx status — never a 200 with the created task's own shape,
+        which is the false-confirmation pattern this issue exists to close.
+
+        Uses `raise_server_exceptions=False` because this route has no
+        try/except of its own — it relies on FastAPI's default unhandled-
+        exception -> 500 behavior, which the default TestClient re-raises
+        into the test instead of returning, for debuggability."""
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        mock_task_manager.create.side_effect = OSError("disk write failed")
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/api/tasks", json={"description": "Pull 1099 from Schwab"})
+        assert not (200 <= response.status_code < 300)
+
     # --- DRY RUN (#138) ---
 
     def test_dry_run_with_agent_tag_returns_preflight_preview(self, client, mock_task_manager):
