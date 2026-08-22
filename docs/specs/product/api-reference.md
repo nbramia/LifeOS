@@ -126,16 +126,18 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 ```json
 {
   "personas": [
-    { "id": "primary", "label": "LifeOS", "capabilities": ["handoff", "agent"] },
-    { "id": "fitness", "label": "Fitness", "capabilities": [] },
-    { "id": "therapist", "label": "Therapist", "capabilities": [] }
+    { "id": "primary", "label": "LifeOS", "capabilities": ["handoff", "agent"], "orchestrates": false },
+    { "id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"], "orchestrates": true },
+    { "id": "fitness", "label": "Fitness", "capabilities": [], "orchestrates": false },
+    { "id": "therapist", "label": "Therapist", "capabilities": [], "orchestrates": false }
   ]
 }
 ```
 
 - `id` — pass as `persona_id` on [`POST /api/ask/stream`](#post-apiaskstream) and as the `persona_id` query param on [`GET /api/conversations`](#get-apiconversations).
 - `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
-- `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`.
+- `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`. Note that `capabilities` alone doesn't distinguish `primary` from an orchestrating bot — both carry `["handoff", "agent"]` — use `orchestrates` for that (#643).
+- `orchestrates` (#643) — whether this persona spawns a background Claude Code session on send (e.g. `doctor`) rather than answering inline, mirroring `settings.persona_orchestrates()` — the same check real routing (`api/routes/chat.py`, `api/routes/hermes_proxy.py`) applies. Always `false` for `primary`, which carries handoff/agent capabilities but answers inline itself.
 
 ### GET /api/chat/turn-context
 

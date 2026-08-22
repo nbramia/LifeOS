@@ -221,6 +221,7 @@ class PersonaInfoResponse(BaseModel):
     id: str
     label: str
     capabilities: list[str] = []
+    orchestrates: bool = False
 
 
 class PersonasResponse(BaseModel):
@@ -234,11 +235,18 @@ async def list_personas():
 
     Returns the primary persona plus each configured specialized bot. Adding a
     registry entry + its token env var surfaces a new persona after restart with
-    no code change. Only the primary advertises handoff/agent capabilities.
+    no code change. Only the primary and orchestrating bots advertise
+    handoff/agent capabilities. ``orchestrates`` (#643) is the server's own
+    `settings.persona_orchestrates()` verdict, so clients no longer have to
+    infer it from `capabilities` alone (which look identical for `primary` and
+    an orchestrating bot like `doctor`).
     """
     return PersonasResponse(
         personas=[
-            PersonaInfoResponse(id=p.id, label=p.label, capabilities=p.capabilities)
+            PersonaInfoResponse(
+                id=p.id, label=p.label, capabilities=p.capabilities,
+                orchestrates=p.orchestrates,
+            )
             for p in settings.list_http_personas()
         ]
     )

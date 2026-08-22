@@ -53,10 +53,12 @@ class TestListHttpPersonas:
         primary = personas[0]
         assert primary.label == "Primary"
         assert primary.capabilities == ["handoff", "agent"]
+        assert primary.orchestrates is False  # answers inline despite handoff/agent capabilities
 
         fitness = personas[1]
         assert fitness.label == "Fitness"  # capitalized default
         assert fitness.capabilities == []  # specialized bots are pure chat
+        assert fitness.orchestrates is False
 
     def test_unset_token_bot_omitted(self, tmp_path, monkeypatch):
         reg = _registry(tmp_path, [
@@ -107,6 +109,32 @@ class TestListHttpPersonas:
         by_id = {p.id: p for p in settings.list_http_personas()}
         assert by_id["doctor"].capabilities == ["handoff", "agent"]
         assert by_id["fitness"].capabilities == []
+        # #643: orchestrates is real, not inferred from capabilities — doctor
+        # and primary share identical capabilities but only doctor orchestrates.
+        assert by_id["doctor"].orchestrates is True
+        assert by_id["fitness"].orchestrates is False
+
+    def test_orchestrates_matches_persona_orchestrates_for_every_persona(self, tmp_path, monkeypatch):
+        """Drift guard for #643: list_http_personas()'s `orchestrates` must
+        never diverge from `settings.persona_orchestrates()`, which is what
+        real routing (api/routes/chat.py, api/routes/hermes_proxy.py) actually
+        checks. This is the test that couldn't exist before the field did —
+        there was nothing to compare the client's inference against."""
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_DOC", "orchestrates": True},
+            {"name": "fitness", "token_env": "TG_FIT"},
+            {"name": "therapist", "token_env": "TG_THER"},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_DOC", "tok")
+        monkeypatch.setenv("TG_FIT", "tok")
+        monkeypatch.setenv("TG_THER", "tok")
+        from config.settings import settings
+
+        personas = settings.list_http_personas()
+        assert [p.id for p in personas] == ["primary", "doctor", "fitness", "therapist"]
+        for p in personas:
+            assert p.orchestrates == settings.persona_orchestrates(p.id)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +535,29 @@ class TestPersonasEndpoint:
         assert [p["id"] for p in data["personas"]] == ["primary", "fitness"]
         assert data["personas"][0]["capabilities"] == ["handoff", "agent"]
         assert data["personas"][1]["capabilities"] == []
+        assert data["personas"][0]["orchestrates"] is False
+        assert data["personas"][1]["orchestrates"] is False
+
+    def test_orchestrates_field_matches_settings_for_every_persona(self, client, tmp_path, monkeypatch):
+        """Endpoint-level drift guard for #643: `GET /api/personas`'s
+        `orchestrates` must match `settings.persona_orchestrates()` for every
+        persona it returns — this is the actual public contract clients read,
+        not just the settings helper underneath it."""
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_DOC", "orchestrates": True},
+            {"name": "fitness", "token_env": "TG_FIT"},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_DOC", "tok")
+        monkeypatch.setenv("TG_FIT", "tok")
+        from config.settings import settings
+
+        resp = client.get("/api/personas")
+        assert resp.status_code == 200
+        personas = resp.json()["personas"]
+        assert [p["id"] for p in personas] == ["primary", "doctor", "fitness"]
+        for p in personas:
+            assert p["orchestrates"] == settings.persona_orchestrates(p["id"])
 
 
 # ---------------------------------------------------------------------------

@@ -255,9 +255,9 @@ class TestPersonaPickerAcrossBackends:
     hiding it from the picker."""
 
     _PERSONAS = [
-        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"]},
-        {"id": "fitness", "label": "Fitness", "capabilities": []},
-        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"]},
+        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
+        {"id": "fitness", "label": "Fitness", "capabilities": [], "orchestrates": False},
+        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"], "orchestrates": True},
     ]
 
     @staticmethod
@@ -288,9 +288,9 @@ class TestOrchestratingPersonaOnHermes:
     (no persona pass-through at all) is unaffected too."""
 
     _PERSONAS = [
-        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"]},
-        {"id": "fitness", "label": "Fitness", "capabilities": []},
-        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"]},
+        {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
+        {"id": "fitness", "label": "Fitness", "capabilities": [], "orchestrates": False},
+        {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"], "orchestrates": True},
     ]
 
     def test_orchestrating_persona_on_hermes_diverts_to_lifeos_endpoint(self, page: Page, chat_base_url):
@@ -332,6 +332,27 @@ class TestOrchestratingPersonaOnHermes:
         with page.expect_request("**/api/hermes/ask/stream") as req_info:
             page.locator("#sendBtn").click()
         body = json.loads(req_info.value.post_data)
+        assert "backend" not in body
+
+    def test_handoff_but_not_orchestrating_persona_on_hermes_still_posts_to_proxy(self, page: Page, chat_base_url):
+        # #643 regression guard: the case a capabilities-based inference gets
+        # wrong. A persona carrying `handoff` (like primary/doctor) but with
+        # `orchestrates: false` must NOT be diverted — only the server's own
+        # `orchestrates` flag decides that, not the `handoff` capability.
+        personas = self._PERSONAS + [
+            {"id": "scout", "label": "Scout", "capabilities": ["handoff", "agent"], "orchestrates": False},
+        ]
+        _open_chat(page, chat_base_url, hermes_available=True, personas=personas)
+        expect(page.locator("#backendHermes")).to_have_class("backend-option active")
+        page.locator("#personaPicker").select_option("scout")
+
+        page.locator("#inputField").fill("hello")
+        with page.expect_request("**/api/hermes/ask/stream") as req_info:
+            page.locator("#sendBtn").click()
+        body = json.loads(req_info.value.post_data)
+        assert body["persona_id"] == "scout"
+        # Never tagged — this turn was never diverted, so there's no LifeOS-
+        # native conversation to tag.
         assert "backend" not in body
 
     def test_orchestrating_persona_on_agent_is_not_diverted(self, page: Page, chat_base_url):

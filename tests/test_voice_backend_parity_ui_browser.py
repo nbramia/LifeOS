@@ -180,8 +180,9 @@ def _polled_conversation(page: Page, conv_id):
 
 
 # An orchestrating persona (e.g. doctor), matching personaOrchestrates()'s own
-# gate: non-primary + a persona carrying the `handoff` capability.
-_ORCHESTRATING_PERSONA = {"id": "doctor", "label": "Doctor", "capabilities": ["handoff"]}
+# gate: non-primary + a persona with `orchestrates: true` (#643 — the server's
+# own verdict, not inferred from `capabilities`).
+_ORCHESTRATING_PERSONA = {"id": "doctor", "label": "Doctor", "capabilities": ["handoff"], "orchestrates": True}
 
 
 class TestSpokenTurnFieldsAcrossBackends:
