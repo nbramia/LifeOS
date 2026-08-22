@@ -167,14 +167,22 @@ export function personaSupportsHandoff() {
 
 // True iff the selected persona is an *orchestrating* bot — one that spawns a
 // background Claude Code session on send (e.g. doctor) rather than answering
-// inline. Mirrors the server's `persona_orchestrates`: the `primary` persona is
-// the inline orchestrator (it carries handoff capability but never spawns), so
-// it is excluded; orchestrating bots are the non-primary personas that advertise
-// handoff. Used to decide whether a turn should poll for a `[CLARIFY]`/`[GOAL]`
-// on surfaces (voice) whose stream doesn't expose the `claude_code` routing the
-// text path keys off (#412), and (askStream, #596) whether a Hermes-selected
-// turn must be diverted to the LifeOS endpoint instead of the Hermes proxy —
-// the spawn path this gates is LifeOS-only, so Hermes no longer excludes it.
+// inline. Reads the server's own `orchestrates` flag (#643 — sourced from
+// `settings.persona_orchestrates()`) rather than inferring it from
+// `capabilities`, which look identical for `primary` and an orchestrating bot
+// like `doctor`. Used to decide whether a turn should poll for a
+// `[CLARIFY]`/`[GOAL]` on surfaces (voice) whose stream doesn't expose the
+// `claude_code` routing the text path keys off (#412), and (askStream, #596)
+// whether a Hermes-selected turn must be diverted to the LifeOS endpoint
+// instead of the Hermes proxy — the spawn path this gates is LifeOS-only, so
+// Hermes no longer excludes it.
+//
+// Before `/api/personas` resolves (or if discovery failed), `personas` is
+// empty and the lookup below finds nothing — this fails closed for every
+// persona, including a restored non-primary selection, which is the intended
+// load-window behavior. `primary` never orchestrates regardless (it answers
+// inline), so there's no separate "fail open" case needed here the way
+// `personaSupportsHandoff()` has one.
 export function personaOrchestrates() {
   const { personas, personaId } = config;
   // The agent backend has no persona pass-through at all (no persona_id is
@@ -185,5 +193,5 @@ export function personaOrchestrates() {
   if (config.backend === 'agent') return false;
   if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
   const p = personas && personas.find(x => x.id === personaId);
-  return !!(p && p.capabilities && p.capabilities.includes('handoff'));
+  return !!(p && p.orchestrates);
 }

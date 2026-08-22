@@ -126,16 +126,18 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 ```json
 {
   "personas": [
-    { "id": "primary", "label": "LifeOS", "capabilities": ["handoff", "agent"] },
-    { "id": "fitness", "label": "Fitness", "capabilities": [] },
-    { "id": "therapist", "label": "Therapist", "capabilities": [] }
+    { "id": "primary", "label": "LifeOS", "capabilities": ["handoff", "agent"], "orchestrates": false },
+    { "id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"], "orchestrates": true },
+    { "id": "fitness", "label": "Fitness", "capabilities": [], "orchestrates": false },
+    { "id": "therapist", "label": "Therapist", "capabilities": [], "orchestrates": false }
   ]
 }
 ```
 
 - `id` — pass as `persona_id` on [`POST /api/ask/stream`](#post-apiaskstream) and as the `persona_id` query param on [`GET /api/conversations`](#get-apiconversations).
 - `label` — display name; defaults to the capitalized id when the registry entry omits an explicit `label`.
-- `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`.
+- `capabilities` — `["handoff", "agent"]` (CLI engine handoff and `/agent` spawns) for the `primary` persona and any orchestrating bot (`orchestrates: true` in the registry, e.g. the doctor self-repair bot). Pure-chat specialized personas advertise `[]`. Note that `capabilities` alone doesn't distinguish `primary` from an orchestrating bot — both carry `["handoff", "agent"]` — use `orchestrates` for that (#643).
+- `orchestrates` (#643) — whether this persona spawns a background Claude Code session on send (e.g. `doctor`) rather than answering inline, mirroring `settings.persona_orchestrates()` — the same check real routing (`api/routes/chat.py`, `api/routes/hermes_proxy.py`) applies. Always `false` for `primary`, which carries handoff/agent capabilities but answers inline itself.
 
 ### GET /api/chat/turn-context
 
@@ -167,7 +169,7 @@ Read-only per-turn context: the current date/time, the relative-time-resolution 
 - `personal_context` is non-empty only for the `therapist` persona (and only once `LIFEOS_PARTNER_NAME`/`LIFEOS_THERAPIST_PATTERNS` are configured); empty string for every other persona.
 - `existing_tags` is `[]` when there are no tags or the task manager is unreachable — a normal degraded case, not an error.
 - `session_cost_usd`/`session_input_tokens`/`session_output_tokens` are the verbatim sum of every turn already recorded under `conversation_id`, excluding the turn currently being built; `session_turn_count` is how many recorded turns that sum covers. `session_cost_is_lower_bound` is `true` when any summed turn was recorded `unpriced` — its provider reported no cost, rather than a real zero (the `unpriced` column on the `usage` table). `false` means every row the sum touches was written with the real distinction available and none of them were unpriced — **except** for a sum spanning a row written before that column existed: that history can't be reclassified and always reads as priced, so such a sum is still only a floor even when this flag says `false`. See [client-surfaces.md](../technical/client-surfaces.md) § "Session-to-date cost" for the full contract, including that retroactive gap.
-- This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge.
+- This is the exact shape embedded as `lifeos_context.turn` in the Hermes envelope — see [client-surfaces.md](../technical/client-surfaces.md) § "The `lifeos_context` envelope" — both come from the same function call, so they cannot diverge for these fields. The one exception is `caller_session_id` (#640), added only to the Hermes envelope's `turn` (an agent-worker session identity this endpoint has no reason to hand out) — see § "Hermes agent-worker session identity".
 
 ### POST /api/chat/cancel
 

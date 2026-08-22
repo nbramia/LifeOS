@@ -53,10 +53,12 @@ class TestListHttpPersonas:
         primary = personas[0]
         assert primary.label == "Primary"
         assert primary.capabilities == ["handoff", "agent"]
+        assert primary.orchestrates is False  # answers inline despite handoff/agent capabilities
 
         fitness = personas[1]
         assert fitness.label == "Fitness"  # capitalized default
         assert fitness.capabilities == []  # specialized bots are pure chat
+        assert fitness.orchestrates is False
 
     def test_unset_token_bot_omitted(self, tmp_path, monkeypatch):
         reg = _registry(tmp_path, [
@@ -107,6 +109,32 @@ class TestListHttpPersonas:
         by_id = {p.id: p for p in settings.list_http_personas()}
         assert by_id["doctor"].capabilities == ["handoff", "agent"]
         assert by_id["fitness"].capabilities == []
+        # #643: orchestrates is real, not inferred from capabilities — doctor
+        # and primary share identical capabilities but only doctor orchestrates.
+        assert by_id["doctor"].orchestrates is True
+        assert by_id["fitness"].orchestrates is False
+
+    def test_orchestrates_matches_persona_orchestrates_for_every_persona(self, tmp_path, monkeypatch):
+        """Drift guard for #643: list_http_personas()'s `orchestrates` must
+        never diverge from `settings.persona_orchestrates()`, which is what
+        real routing (api/routes/chat.py, api/routes/hermes_proxy.py) actually
+        checks. This is the test that couldn't exist before the field did —
+        there was nothing to compare the client's inference against."""
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_DOC", "orchestrates": True},
+            {"name": "fitness", "token_env": "TG_FIT"},
+            {"name": "therapist", "token_env": "TG_THER"},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_DOC", "tok")
+        monkeypatch.setenv("TG_FIT", "tok")
+        monkeypatch.setenv("TG_THER", "tok")
+        from config.settings import settings
+
+        personas = settings.list_http_personas()
+        assert [p.id for p in personas] == ["primary", "doctor", "fitness", "therapist"]
+        for p in personas:
+            assert p.orchestrates == settings.persona_orchestrates(p.id)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +177,110 @@ class TestResolvePersona:
         # Same preamble the fitness Telegram bot uses (single registry source).
         assert settings.resolve_persona("fitness") == "FIT PERSONA"
         assert settings.resolve_persona("fitness") == settings.telegram_bots[0].persona
+
+
+# ---------------------------------------------------------------------------
+# Surface-specific persona variants (#641): doctor's execution model differs
+# on Hermes (MCP tools, no shell) from Telegram/web (a headless Claude Code
+# session) — resolve_persona(surface=...) picks a sibling `<stem>.<surface>
+# <suffix>` file when one exists and falls back to the default body otherwise.
+# ---------------------------------------------------------------------------
+
+class TestSurfaceVariantPersona:
+    def _doctor_registry(self, tmp_path, monkeypatch, *, token_env="TG_DOC"):
+        # Points at the real, committed persona files (not synthetic tmp_path
+        # copies) so this exercises the actual shipped doctor.md / doctor.hermes.md.
+        reg = _registry(tmp_path, [
+            {
+                "name": "doctor", "token_env": token_env,
+                "persona_file": "config/personas/doctor.md", "orchestrates": True,
+            },
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv(token_env, "tok")
+
+    def test_hermes_doctor_preamble_differs_from_default_and_is_shell_free(self, tmp_path, monkeypatch):
+        self._doctor_registry(tmp_path, monkeypatch)
+        from config.settings import settings
+
+        default_pre = settings.resolve_persona("doctor")
+        hermes_pre = settings.resolve_persona("doctor", surface="hermes")
+        assert default_pre and hermes_pre
+        assert hermes_pre != default_pre
+
+        # No Telegram-relay wrapper markers — the operator sees this text directly.
+        for marker in ("[NOTIFY]", "[CLARIFY]", "[GOAL]"):
+            assert marker not in hermes_pre, f"{marker} wrapper marker leaked into the Hermes preamble"
+
+        # No claim of shell/git/filesystem access (the false claim #641 fixes);
+        # it must instead plainly deny having it.
+        assert "full shell, git, `gh`, and filesystem access" not in hermes_pre
+        assert "no shell" in hermes_pre.lower()
+
+        # The default (Telegram/web) preamble is untouched and keeps its own claim.
+        assert "full shell, git, `gh`, and filesystem access" in default_pre
+
+    def test_telegram_resolution_is_byte_identical_to_before(self, tmp_path, monkeypatch):
+        # The hermes sibling existing alongside doctor.md must not change what
+        # the default (Telegram/web) surface resolves to, byte for byte.
+        self._doctor_registry(tmp_path, monkeypatch)
+        from config.settings import settings, _parse_persona
+
+        expected = _parse_persona(Path("config/personas/doctor.md").read_text(), "doctor")[0]
+        assert settings.resolve_persona("doctor") == expected
+        assert settings.resolve_persona("doctor", surface=None) == expected
+        # The raw TelegramBotConfig field the Telegram listener actually sends
+        # is a plain file read, untouched by the surface mechanism entirely.
+        assert settings.telegram_bots[0].persona == expected
+
+    def test_persona_without_variant_resolves_identically_on_any_surface(self, tmp_path, monkeypatch):
+        pf = tmp_path / "fitness.md"
+        pf.write_text("FIT PERSONA")
+        reg = _registry(tmp_path, [
+            {"name": "fitness", "token_env": "TG_FIT_SURF", "persona_file": str(pf)},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_SURF", "tok")
+        from config.settings import settings
+
+        assert settings.resolve_persona("fitness") == "FIT PERSONA"
+        assert settings.resolve_persona("fitness", surface="hermes") == "FIT PERSONA"
+        assert settings.resolve_persona("fitness", surface="some-future-surface") == "FIT PERSONA"
+
+    def test_mechanism_generalizes_to_a_second_persona_with_no_new_plumbing(self, tmp_path, monkeypatch):
+        # Dropping a sibling <stem>.<surface><suffix> file is the entire
+        # registration step — no code change needed for a second persona.
+        pf = tmp_path / "fitness.md"
+        pf.write_text("DEFAULT FITNESS BODY")
+        (tmp_path / "fitness.hermes.md").write_text("HERMES FITNESS BODY")
+        reg = _registry(tmp_path, [
+            {"name": "fitness", "token_env": "TG_FIT_SURF2", "persona_file": str(pf)},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_SURF2", "tok")
+        from config.settings import settings
+
+        assert settings.resolve_persona("fitness") == "DEFAULT FITNESS BODY"
+        assert settings.resolve_persona("fitness", surface="hermes") == "HERMES FITNESS BODY"
+
+    def test_primary_persona_supports_surface_variants_too(self, tmp_path, monkeypatch):
+        # The mechanism isn't doctor-only special-casing — primary.md goes
+        # through the same helper as every registry persona.
+        primary_file = tmp_path / "primary.md"
+        primary_file.write_text("DEFAULT PRIMARY BODY")
+        (tmp_path / "primary.hermes.md").write_text("HERMES PRIMARY BODY")
+        monkeypatch.setattr("config.settings._PRIMARY_PERSONA_FILE", primary_file)
+        from config.settings import settings, _load_primary_persona
+
+        assert _load_primary_persona()[0] == "DEFAULT PRIMARY BODY"
+        assert _load_primary_persona(surface="hermes")[0] == "HERMES PRIMARY BODY"
+        assert settings.resolve_persona("primary", surface="hermes") == "HERMES PRIMARY BODY"
+
+    def test_unknown_surface_variant_falls_back_to_default(self, tmp_path, monkeypatch):
+        self._doctor_registry(tmp_path, monkeypatch)
+        from config.settings import settings
+        assert settings.resolve_persona("doctor", surface="some-surface-with-no-file") == \
+            settings.resolve_persona("doctor")
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +639,29 @@ class TestPersonasEndpoint:
         assert [p["id"] for p in data["personas"]] == ["primary", "fitness"]
         assert data["personas"][0]["capabilities"] == ["handoff", "agent"]
         assert data["personas"][1]["capabilities"] == []
+        assert data["personas"][0]["orchestrates"] is False
+        assert data["personas"][1]["orchestrates"] is False
+
+    def test_orchestrates_field_matches_settings_for_every_persona(self, client, tmp_path, monkeypatch):
+        """Endpoint-level drift guard for #643: `GET /api/personas`'s
+        `orchestrates` must match `settings.persona_orchestrates()` for every
+        persona it returns — this is the actual public contract clients read,
+        not just the settings helper underneath it."""
+        reg = _registry(tmp_path, [
+            {"name": "doctor", "token_env": "TG_DOC", "orchestrates": True},
+            {"name": "fitness", "token_env": "TG_FIT"},
+        ])
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_DOC", "tok")
+        monkeypatch.setenv("TG_FIT", "tok")
+        from config.settings import settings
+
+        resp = client.get("/api/personas")
+        assert resp.status_code == 200
+        personas = resp.json()["personas"]
+        assert [p["id"] for p in personas] == ["primary", "doctor", "fitness"]
+        for p in personas:
+            assert p["orchestrates"] == settings.persona_orchestrates(p["id"])
 
 
 # ---------------------------------------------------------------------------
