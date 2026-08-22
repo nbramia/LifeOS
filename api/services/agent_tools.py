@@ -761,8 +761,30 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "description": "Maximum items to show (default 20)."},
+                "since_days": {"type": "integer", "description": "Only show captures from the last N days (default 7)."},
             },
             "required": [],
+        },
+    },
+    {
+        "name": "process_inbox_item",
+        "description": (
+            "Classify and close one raw Life Inbox item. Use the item's id from "
+            "review_inbox. For memory, save the content persistently; for other "
+            "categories, record the classification and keep the raw provenance."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "Inbox item id."},
+                "category": {
+                    "type": "string",
+                    "enum": ["memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"],
+                    "description": "The classification for this item.",
+                },
+                "content": {"type": "string", "description": "Optional cleaned content to save for a memory."},
+            },
+            "required": ["item_id", "category"],
         },
     },
     {
@@ -2512,13 +2534,42 @@ def _tool_review_inbox(inp: dict) -> str:
         limit = max(1, min(int(inp.get("limit", 20)), 100))
     except (TypeError, ValueError):
         limit = 20
-    items = list_items(limit=limit)
+    try:
+        since_days = max(0, min(int(inp.get("since_days", 7)), 3650))
+    except (TypeError, ValueError):
+        since_days = 7
+    items = list_items(limit=limit, since_days=since_days)
     if not items:
-        return "Life Inbox is empty — there are no unreviewed captures."
-    lines = [f"Unreviewed Life Inbox items ({len(items)}):"]
+        return f"Life Inbox has no unreviewed captures from the last {since_days} days."
+    lines = [f"Unreviewed Life Inbox items from the last {since_days} days ({len(items)}):"]
     for item in items:
-        lines.append(f"- [{item['created_at'][:10]}] {item['content']}")
+        lines.append(f"- id={item['id']} [{item['created_at'][:10]}] {item['content']}")
     return "\n".join(lines)
+
+
+async def _tool_process_inbox_item(inp: dict) -> str:
+    from api.services.inbox_store import list_items, update_item
+
+    item_id = str(inp.get("item_id", "")).strip()
+    category = str(inp.get("category", "")).strip().lower()
+    allowed = {"memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"}
+    if not item_id or category not in allowed:
+        return "Error: item_id and a valid category are required."
+    matches = [item for item in list_items(status=None, limit=1000) if item.get("id") == item_id]
+    if not matches:
+        return f"Error: Inbox item {item_id!r} was not found."
+    item = matches[0]
+    linked_id = ""
+    if category == "memory":
+        from api.routes.memories import synthesize_memory
+        from api.services.memory_store import get_memory_store
+        content = (inp.get("content") or item["content"]).strip()
+        memory = get_memory_store().create_memory(await synthesize_memory(content))
+        linked_id = memory.id
+    updated = update_item(item_id, status="dismissed" if category == "dismissed" else "processed", category=category, linked_id=linked_id)
+    if not updated:
+        return f"Error: Could not update Inbox item {item_id!r}."
+    return f"Inbox item classified as {category}." + (f" Memory saved with id {linked_id}." if linked_id else "")
 
 
 # Result cap for memory search. Exposed to the caller so a memory that missed on
@@ -3505,6 +3556,7 @@ _TOOL_HANDLERS = {
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
     "review_inbox": _tool_review_inbox,
+    "process_inbox_item": _tool_process_inbox_item,
     "search_memories": _tool_search_memories,
 }
 
@@ -3557,5 +3609,6 @@ TOOL_STATUS_MESSAGES = {
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
     "review_inbox": "Reviewing your Life Inbox...",
+    "process_inbox_item": "Processing Life Inbox item...",
     "search_memories": "Searching memories...",
 }
