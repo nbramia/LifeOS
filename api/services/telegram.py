@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import tempfile
 import threading
 import time
 from collections import deque
@@ -815,6 +816,7 @@ class TelegramBotListener:
             return
 
         text = message.get("text", "").strip()
+        voice = message.get("voice") or message.get("audio")
         chat_id = str(message["chat"]["id"])
 
         # Auth check first — don't let unauthorized chats pollute the dedup window
@@ -829,6 +831,41 @@ class TelegramBotListener:
             return
         if message_id:
             self._processed_ids.append(message_id)
+
+        if not text and voice:
+            await send_typing_indicator(chat_id)
+            try:
+                file_id = voice.get("file_id")
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    file_resp = await client.get(
+                        _telegram_url("getFile", self._token),
+                        params={"file_id": file_id},
+                    )
+                    file_resp.raise_for_status()
+                    file_path = file_resp.json().get("result", {}).get("file_path")
+                    if not file_path:
+                        raise RuntimeError("Telegram did not return an audio file path")
+                    audio_resp = await client.get(
+                        f"{TELEGRAM_API}/file/bot{self._token}/{file_path}"
+                    )
+                    audio_resp.raise_for_status()
+                with tempfile.NamedTemporaryFile(suffix=Path(file_path).suffix or ".ogg") as audio_file:
+                    audio_file.write(audio_resp.content)
+                    audio_file.flush()
+                    from api.services.telegram_transcription import transcribe
+                    text = await asyncio.to_thread(transcribe, audio_file.name)
+                if text:
+                    text = f"[Voice message transcription]\n{text}"
+                    logger.info("Transcribed Telegram voice message (%d chars)", len(text))
+                else:
+                    raise RuntimeError("The transcription was empty")
+            except Exception as exc:
+                logger.exception("Telegram voice transcription failed")
+                await send_message_async(
+                    "I received your voice message but couldn't transcribe it. "
+                    "Please try again or send it as text.", chat_id=chat_id,
+                )
+                return
 
         if not text:
             return
