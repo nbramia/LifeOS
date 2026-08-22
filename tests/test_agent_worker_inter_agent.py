@@ -987,6 +987,49 @@ def test_spawn_managed_child_rejected_from_cli_root(store, transcript, routing):
 
 
 @pytest.mark.unit
+def test_spawn_managed_child_rejected_from_hermes_root(store, transcript):
+    """Hermes (#640) is not a CLI routing — it never runs as a local
+    subprocess this worker manages — but it's billed exactly like one for
+    this purpose: an external, non-API-billed harness must not be able to
+    open the model="claude" side door either. See
+    `NON_API_BILLED_ROOT_ROUTINGS` in inter_agent.py."""
+    root = _cli_root(store, "hermes")
+
+    result = dispatch(_ctx_for(store, transcript, root), "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert not result["ok"]
+    assert result["error"] == "api_billing_blocked"
+    assert store.list_sessions(parent_session_id=root.session_id) == []
+
+
+@pytest.mark.unit
+def test_spawn_cli_child_allowed_from_hermes_root(store, transcript):
+    """The route left open to a Hermes lineage, same as a CLI one: a
+    subscription-billed CLI child, not the Anthropic API."""
+    root = _cli_root(store, "hermes")
+
+    result = dispatch(_ctx_for(store, transcript, root), "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude_code",
+    })
+
+    assert result["ok"], result
+    assert store.get_by_session_id(result["child_session_id"]).routing == "claude_code"
+
+
+@pytest.mark.unit
+def test_hermes_routing_is_not_a_valid_spawn_model():
+    """`NON_API_BILLED_ROOT_ROUTINGS` is deliberately a separate set from
+    `CLI_ROUTINGS` / `SPAWN_MODELS` (#640) — adding Hermes to the spend
+    guard must not also make "hermes" a valid `model=` value for spawn()
+    (there's no executor that would ever dispatch such a child)."""
+    assert "hermes" not in inter_agent.SPAWN_MODELS
+    assert "hermes" not in inter_agent.CLI_ROUTINGS
+    assert "hermes" in inter_agent.NON_API_BILLED_ROOT_ROUTINGS
+
+
+@pytest.mark.unit
 def test_spawn_managed_child_rejected_through_local_intermediary(store, transcript):
     """The check reads the ROOT's routing, so an intermediate child on another
     engine can't be used to launder the API-billed spawn."""

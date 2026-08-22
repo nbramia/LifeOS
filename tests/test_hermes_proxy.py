@@ -393,7 +393,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     ctx = json.loads(_received["body"])["lifeos_context"]
     turn = ctx["turn"]
     # Literal keys pinned by the cross-repo schema comment on #590, exactly —
-    # not a subset check.
+    # not a subset check. `caller_session_id` (#640) is the one key added
+    # here rather than by build_turn_context() itself — see hermes_proxy.py.
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
@@ -401,6 +402,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
         "session_cost_is_lower_bound",
+        "caller_session_id",
     }
     assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
     assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
@@ -409,9 +411,15 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert isinstance(turn["personal_context"], str)  # may be empty
     assert isinstance(turn["existing_tags"], list)
     assert isinstance(turn["tags_instruction"], str) and turn["tags_instruction"]
+    assert isinstance(turn["caller_session_id"], str) and turn["caller_session_id"]
     # `turn` and `persona` are siblings under `lifeos_context`, never merged
-    # into one object — each key set is disjoint from the other's.
+    # into one object — each key set is disjoint from the other's. This is
+    # the separation #640's caller_session_id must respect too: it lands in
+    # `turn` (per-turn, never prompt-cached), not `persona` (stable across a
+    # conversation, prompt-cacheable — a per-turn value there would bust
+    # that cache every request).
     assert set(turn.keys()).isdisjoint(set(ctx["persona"].keys()))
+    assert "caller_session_id" not in ctx["persona"]
 
 
 async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch):
@@ -448,7 +456,179 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     assert hermes_resp.status_code == 200
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
-    assert envelope_turn == endpoint_turn
+    # `caller_session_id` (#640) is the one deliberate difference: it's an
+    # agent-worker session identity Hermes needs and the plain turn-context
+    # endpoint has no reason to hand out (it creates nothing). Every other
+    # field must still come from the identical build_turn_context() call.
+    assert "caller_session_id" not in endpoint_turn
+    envelope_turn_without_session = dict(envelope_turn)
+    caller_session_id = envelope_turn_without_session.pop("caller_session_id")
+    assert isinstance(caller_session_id, str) and caller_session_id
+    assert envelope_turn_without_session == endpoint_turn
+
+
+# ---------------------------------------------------------------------------
+# `caller_session_id` lifecycle (#640) — a real agent-worker session backs
+# the id handed to Hermes, so `lifeos_agent_*` calls (which all require a
+# resolvable `caller_session_id`, see inter_agent.py) work from a Hermes
+# turn instead of failing with `no_caller`.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def agent_session_store(tmp_path, monkeypatch):
+    """A real SessionStore on a throwaway db, wired in place of the class
+    `hermes_proxy._resolve_caller_session_id` locally imports (#640) — same
+    isolation pattern as `hermes_store`/`usage_store` above, applied to the
+    class itself (rather than a module-level singleton) because
+    `_resolve_caller_session_id` constructs a fresh `SessionStore()` per
+    call, mirroring how every other API route touches this store."""
+    from api.services.agent_worker.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "agent_sessions.db"))
+    monkeypatch.setattr(
+        "api.services.agent_worker.session_store.SessionStore",
+        lambda *a, **kw: store,
+    )
+    return store
+
+
+async def test_caller_session_id_resolves_to_a_real_session(proxy_client, agent_session_store):
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    session = agent_session_store.get_by_session_id(caller_session_id)
+    assert session is not None
+    assert session.routing == "hermes"
+    assert session.origin == "hermes"
+
+
+async def test_caller_session_id_is_stable_across_turns_of_the_same_conversation(
+    proxy_client, agent_session_store,
+):
+    """Once a conversation has an id, every turn resolves to the SAME
+    session — the per-conversation lifecycle this module chose (see
+    hermes_session.py's module docstring) so a worker spawned on one turn
+    is still reachable, under the same lineage root, on a later one."""
+    payload = {"question": "hi", "conversation_id": "conv-stable-640"}
+    resp1 = await proxy_client.post("/api/hermes/ask/stream", json=payload)
+    caller_1 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    resp2 = await proxy_client.post("/api/hermes/ask/stream", json=payload)
+    caller_2 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    assert caller_1 == caller_2
+    # Exactly one row was created, not one per turn.
+    assert len(agent_session_store.list_sessions(routing="hermes")) == 1
+
+
+async def test_caller_session_id_differs_across_conversations(proxy_client, agent_session_store):
+    resp1 = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-a-640"},
+    )
+    caller_a = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    resp2 = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-b-640"},
+    )
+    caller_b = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    assert caller_a != caller_b
+
+
+async def test_spawn_succeeds_from_a_hermes_turns_caller_session_id(proxy_client, agent_session_store, tmp_path):
+    """Acceptance criterion: a Hermes turn's caller_session_id can spawn —
+    the exact call that returned `no_caller` before #640, since Hermes had
+    no session at all."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-spawn-640"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    ctx = inter_agent.InterAgentContext(
+        session_store=agent_session_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        caller_session_id=caller_session_id,
+        caps=inter_agent.Caps(),
+    )
+    result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "look something up", "model": "claude_code",
+    })
+
+    assert result["ok"] is True, result
+
+
+async def test_spawn_model_claude_blocked_from_a_hermes_root(proxy_client, agent_session_store, tmp_path):
+    """The spend guard (#640, extending #578/ADR-018): a Hermes-rooted
+    session is not API-billed, so it may not open the model="claude" side
+    door any more than a claude_code/codex root can."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-blocked-640"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    ctx = inter_agent.InterAgentContext(
+        session_store=agent_session_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        caller_session_id=caller_session_id,
+        caps=inter_agent.Caps(),
+    )
+    result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert result["ok"] is False
+    assert result["error"] == "api_billing_blocked"
+
+
+async def test_worker_spawned_on_one_turn_resolves_via_check_on_a_later_turn(
+    proxy_client, agent_session_store, tmp_path,
+):
+    """Acceptance criterion: a session Hermes spawns doesn't vanish once its
+    spawning turn ends — a later turn's lifeos_agent_check still finds it."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    transcript = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    conv_payload = {"question": "spawn a worker", "conversation_id": "conv-later-640"}
+
+    # Turn 1: resolve identity and spawn a child.
+    resp1 = await proxy_client.post("/api/hermes/ask/stream", json=conv_payload)
+    assert resp1.status_code == 200
+    caller_turn_1 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    ctx_turn_1 = inter_agent.InterAgentContext(
+        session_store=agent_session_store, transcript_store=transcript,
+        caller_session_id=caller_turn_1, caps=inter_agent.Caps(),
+    )
+    spawn_result = inter_agent.dispatch(ctx_turn_1, "lifeos_agent_spawn", {
+        "prompt": "background task", "model": "claude_code",
+    })
+    assert spawn_result["ok"] is True, spawn_result
+    child_session_id = spawn_result["child_session_id"]
+
+    # Turn 2: same conversation, later request — same caller identity.
+    resp2 = await proxy_client.post("/api/hermes/ask/stream", json=conv_payload)
+    assert resp2.status_code == 200
+    caller_turn_2 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    assert caller_turn_2 == caller_turn_1
+
+    ctx_turn_2 = inter_agent.InterAgentContext(
+        session_store=agent_session_store, transcript_store=transcript,
+        caller_session_id=caller_turn_2, caps=inter_agent.Caps(),
+    )
+    check_result = inter_agent.dispatch(ctx_turn_2, "lifeos_agent_check", {
+        "session_id": child_session_id,
+    })
+    assert check_result["ok"] is True
+    assert check_result["session_id"] == child_session_id
 
 
 # ---------------------------------------------------------------------------
