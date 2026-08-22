@@ -37,3 +37,13 @@ The frontmatter is parsed and stripped; the body becomes the system-prompt pream
 - `model` is **reserved** — stored but not read by any code path yet (see the field table above).
 
 Beyond the registry personas, `primary.md` carries the primary persona's personality, and a resolved **personal-context block** (partner / therapists / inner circle / folders, drawn from existing config — never hardcoded here) is composed for personas that need it. The schema's main open extension point is a hard tool allow-list (`tools:`), which is not parsed yet.
+
+## Surface-specific variants
+
+A persona's *personality* is usually surface-independent, but its **execution model** sometimes isn't — `doctor` drives a headless Claude Code session (shell, git, `gh`) on Telegram and web, but on Hermes it has only MCP tools (`lifeos_agent_spawn` and friends) and no shell. Rather than branch on surface inside one file, drop a sibling file named `<stem>.<surface><suffix>` next to the default one — e.g. `doctor.md` + `doctor.hermes.md`. `settings.resolve_persona(persona_id, surface=...)` checks for that sibling and falls back to the default file when it's absent, so:
+
+- A persona with no sibling for a given surface resolves identically everywhere — adding the mechanism costs nothing until it's used.
+- A new surface-specific persona needs no code change: the file's existence is the whole registration.
+- The default file (and everything that reads it without passing `surface`, e.g. the Telegram bot) is completely unaffected by adding a variant elsewhere.
+
+A variant file is a plain body — no frontmatter — since `voice`/`model`/`id` still come from the default file; `resolve_persona` only asks the variant for its prose. Write it as its own complete persona (same philosophy, different mechanics), not a diff against the default.
