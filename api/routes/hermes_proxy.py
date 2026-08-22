@@ -65,6 +65,20 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=TIMEOUT)
 
 
+def _resolve_caller_session_id(conversation_id: Optional[str]) -> str:
+    """Hermes's `lifeos_agent_*` identity for this turn (#640).
+
+    `SessionStore` is imported locally (not at module top) so tests can
+    patch `api.services.agent_worker.session_store.SessionStore` in place —
+    the same isolation pattern `api/routes/conversations.py` uses for the
+    same class.
+    """
+    from api.services.agent_worker.hermes_session import resolve_hermes_caller_session_id
+    from api.services.agent_worker.session_store import SessionStore
+
+    return resolve_hermes_caller_session_id(SessionStore(), conversation_id)
+
+
 def _build_envelope(raw_body: bytes) -> bytes:
     """Attach `lifeos_context` to the forwarded body, resolving the persona.
 
@@ -123,6 +137,21 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # that already passed validation.
     label = next(p.label for p in settings.list_http_personas() if p.id == persona_id)
 
+    turn = build_turn_context(persona_id, parsed.conversation_id)
+    # `caller_session_id` (#640) is added here, on the envelope's copy of
+    # `turn`, rather than folded into `build_turn_context()` itself —
+    # that function is shared with the plain `GET /api/chat/turn-context`
+    # endpoint, which has no agent-worker session to hand out and must stay
+    # untouched. It belongs in `turn`, never `persona`: `persona` is stable
+    # across a conversation and prompt-cacheable, and while this value IS
+    # stable across a conversation's turns (see hermes_session.py), putting
+    # a session-identity concern in the cacheable half would still be the
+    # wrong layering — `persona` describes the bot, `turn` describes this
+    # request. Additive at schema_version 1 (no version bump): a consumer
+    # that doesn't know this key ignores it exactly as it would any other
+    # unrecognized field.
+    turn["caller_session_id"] = _resolve_caller_session_id(parsed.conversation_id)
+
     data["lifeos_context"] = {
         "schema_version": 1,
         "modality": modality,
@@ -147,7 +176,7 @@ def _build_envelope(raw_body: bytes) -> bytes:
         # from `persona_id` alone, unlike the native path's Telegram-preamble
         # reverse lookup above — Hermes turns always carry a persona_id (or
         # default to "primary"), so that reverse lookup doesn't apply here.
-        "turn": build_turn_context(persona_id, parsed.conversation_id),
+        "turn": turn,
     }
     return json.dumps(data).encode("utf-8")
 
