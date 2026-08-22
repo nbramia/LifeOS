@@ -24,7 +24,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INDEX_PATH = Path("data/task_index.json")
+DEFAULT_INDEX_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "task_index.json"
 
 # Status ↔ checkbox symbol mapping
 STATUS_TO_SYMBOL = {

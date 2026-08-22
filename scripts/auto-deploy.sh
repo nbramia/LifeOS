@@ -116,8 +116,15 @@ service_active_since_epoch() {
 #
 # Any failure to ask (missing venv, locked DB, import error) is still treated
 # as busy: killing live work is worse than one more 10-minute stale tick.
+#
+# LIFEOS_AGENT_SESSIONS_DB is test-only: unset in production, so SessionStore()
+# always resolves its own repo-root-anchored default there (unchanged
+# behavior). Tests source this script from a sandbox cwd and need worker_busy
+# to read a seeded throwaway store instead of the real one — the same problem
+# solved for the venv itself via $LIFEOS_VENV above.
 worker_busy() {
     "$VENV_DIR/bin/python" -c "
+import os
 import sys
 try:
     from api.services.agent_worker.session_store import (
@@ -126,7 +133,9 @@ try:
         SessionStore,
     )
     active = {STATUS_CLAIMED, STATUS_RUNNING}
-    busy = [s for s in SessionStore().list_non_terminal() if s.status in active]
+    db_path = os.environ.get('LIFEOS_AGENT_SESSIONS_DB')
+    store = SessionStore(db_path=db_path) if db_path else SessionStore()
+    busy = [s for s in store.list_non_terminal() if s.status in active]
     sys.exit(0 if busy else 2)
 except Exception as e:
     print(f'worker_busy check failed: {e}', file=sys.stderr)

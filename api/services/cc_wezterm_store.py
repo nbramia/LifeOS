@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 
-DEFAULT_DB_PATH = Path("data/cc_wezterm.db")
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "cc_wezterm.db"
 
 
 _SCHEMA = """
