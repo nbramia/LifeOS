@@ -99,12 +99,17 @@ relevant.
 
 **review_inbox:**
 Reviews raw messages captured for later classification. Use this for weekly
-reviews or when the user asks what still needs to be processed.
+reviews or when the user asks what still needs to be processed. After reviewing,
+continue processing the obvious items: save durable memories and classify ideas,
+projects, relationships, sources, knowledge, preferences, and noise without
+asking permission. Ask before creating tasks/reminders or taking consequential
+actions, but still record the item as a proposed task/reminder when appropriate.
 
 **process_inbox_item:**
 Classifies one inbox item as a memory, idea, project, task, reminder,
 relationship, source, knowledge, preference, or dismissed, while preserving its
-original capture and provenance.
+original capture and provenance. During a weekly review, use this for every
+clear item rather than merely describing the item and stopping.
 
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
