@@ -393,6 +393,95 @@ def _isolate_usage_store_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_session_store_db(tmp_path, monkeypatch):
+    """Stop tests from opening (and writing to) the production agent-session
+    store (#652).
+
+    Unlike ``ConversationStore`` (which resolves its default path by calling
+    ``get_conversation_db_path()`` fresh on every construction, so patching
+    that resolver is enough), ``SessionStore``'s default ``db_path`` is a
+    plain default argument bound to ``DEFAULT_DB_PATH`` once, when
+    ``session_store.py`` is imported — reassigning the module-level
+    ``DEFAULT_DB_PATH`` constant afterward has no effect on later bare
+    ``SessionStore()`` calls. So instead of patching the path, patch the
+    class itself: every call site except a couple of always-overridden ones
+    (``Worker.__init__``'s ``session_store or SessionStore()`` fallback,
+    never hit because every test constructs ``Worker(session_store=...)``
+    explicitly; ``api/routes/agents.py``'s lazy singleton, always
+    monkeypatched directly by the handful of tests that touch it) imports
+    ``SessionStore`` LOCALLY, inside the function that uses it, specifically
+    so tests can replace the class in place —
+    ``api/routes/hermes_proxy.py::_resolve_caller_session_id`` documents this
+    explicitly. #640 added a caller-session lookup to that function's
+    caller, ``_build_envelope()``; ``tests/test_hermes_proxy.py`` sandboxes
+    its own tests with a per-test fixture doing exactly this, but every
+    *other* test that reaches the Hermes envelope path had no such
+    protection and wrote real rows into the operator's live
+    ``data/agent_sessions.db``.
+
+    Tests that construct ``SessionStore(db_path=...)`` directly are
+    unaffected two ways over: most import the real class at module
+    collection time, before this fixture ever runs, so patching the name
+    afterward doesn't touch their already-bound reference; and for the local-
+    import call sites that DO pass an explicit path (e.g.
+    ``tests/test_agent_worker_mcp_exposure.py``'s
+    ``SessionStore(db_path=mcp_server.AGENT_SESSIONS_DB)``), the replacement
+    below is a subclass that only substitutes the tmp path for the *default*
+    argument — an explicit ``db_path`` still passes straight through, same
+    as the real class. (A lambda that ignored its arguments and always
+    returned one shared instance — the shape ``test_hermes_proxy.py``'s own
+    narrower fixture below uses, safely, because the one call site it
+    targets never passes an explicit path — would break every explicit-path
+    call site an autouse, suite-wide version of it touches.)
+    ``tests/test_hermes_proxy.py``'s own ``agent_session_store`` fixture
+    composes cleanly for the same reason this file's other isolation
+    fixtures do: autouse fixtures set up before a test's explicitly-requested
+    ones in the same scope, so its later ``monkeypatch.setattr`` on this same
+    class name simply overrides this default for that test.
+    """
+    import api.services.agent_worker.session_store as session_store_mod
+
+    _RealSessionStore = session_store_mod.SessionStore
+    _default_path = tmp_path / "agent_sessions.db"
+
+    class _TestSessionStore(_RealSessionStore):
+        def __init__(self, db_path=_default_path):
+            super().__init__(db_path)
+
+    monkeypatch.setattr(session_store_mod, "SessionStore", _TestSessionStore)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_transcript_store_dir(tmp_path, monkeypatch):
+    """Stop tests from touching the production agent-transcript directory
+    (#652 follow-up).
+
+    ``TranscriptStore`` has the identical bound-at-import-time default-
+    argument shape as ``SessionStore`` above (``#640`` anchored both the
+    same way), so it needs the same class-patching treatment rather than a
+    ``DEFAULT_TRANSCRIPTS_DIR`` reassignment. Nothing on the Hermes envelope
+    path that motivated #652 touches ``TranscriptStore`` — only
+    ``agent_viz_summary_prefetch.py``'s (disabled-by-default-in-tests) busy
+    check and ``api/routes/agents.py``'s lazy singleton (already
+    monkeypatched directly by the tests that use it) construct a bare one —
+    but it's the same bug shape, so it gets the same blanket default rather
+    than waiting for a second incident to prove it's needed. Same subclass
+    trick as ``_isolate_session_store_db`` above — only the default argument
+    is replaced, so an explicit ``transcripts_dir`` still passes through.
+    """
+    import api.services.agent_worker.transcript_store as transcript_store_mod
+
+    _RealTranscriptStore = transcript_store_mod.TranscriptStore
+    _default_dir = tmp_path / "agent_transcripts"
+
+    class _TestTranscriptStore(_RealTranscriptStore):
+        def __init__(self, transcripts_dir=_default_dir):
+            super().__init__(transcripts_dir)
+
+    monkeypatch.setattr(transcript_store_mod, "TranscriptStore", _TestTranscriptStore)
+
+
+@pytest.fixture(autouse=True)
 def _reset_turn_registry():
     """Reset the #611 chat-turn registry (`api/services/chat_turns.py`)
     before and after every test.
