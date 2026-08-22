@@ -575,11 +575,17 @@ class TestOrchestratingPersonaSpawn:
         assert spawned.get("called")  # voice doctor spawns too (gate keys on persona_id)
 
     def test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes(self, client, tmp_path, monkeypatch):
-        """A doctor turn sent with `backend: "hermes"` (the client diverting an
-        orchestrating persona's Hermes-selected turn to this LifeOS endpoint,
-        #596) spawns exactly as it does natively, and the conversation it
-        creates is tagged "hermes" so it stays in the sidebar the user started
-        it in — not silently reclassified as a lifeos thread."""
+        """A doctor turn sent directly to this LifeOS endpoint with
+        `backend: "hermes"` spawns exactly as it does natively, and the
+        conversation it creates is tagged "hermes" rather than silently
+        reclassified as a lifeos thread. Through #641 this exact request
+        shape was what the client sent when diverting an orchestrating
+        persona's Hermes-selected turn here (#596); #642 removed that divert
+        (an orchestrating persona's Hermes turn now reaches the Hermes proxy
+        instead, see tests/test_hermes_proxy.py), so the first-party client
+        no longer constructs this request — but `backend` stays a generic,
+        supported field on this endpoint (client-surfaces.md), and this spawn
+        + tagging behavior is unchanged for any caller that still sends it."""
         import re
         import api.services.agent_worker.claude_code_spawn as ccs
         self._doctor_registry(tmp_path, monkeypatch)

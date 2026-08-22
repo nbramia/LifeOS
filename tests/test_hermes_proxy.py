@@ -297,7 +297,15 @@ async def test_unknown_persona_400_and_not_forwarded(proxy_client):
     assert _received == {}  # rejected before the upstream backend was ever called
 
 
-async def test_orchestrating_persona_400_and_not_forwarded(proxy_client, tmp_path, monkeypatch):
+async def test_orchestrating_persona_no_longer_rejected(proxy_client, tmp_path, monkeypatch):
+    # #642: this used to be a 400 (test_orchestrating_persona_400_and_not_
+    # forwarded) — Hermes had no way to drive a background Claude Code
+    # session, so an orchestrating persona reaching this route was treated as
+    # a routing bug. #640 gave Hermes that capability, so the persona now
+    # reaches Hermes like any other: forwarded, 200, with `orchestrates: true`
+    # in the envelope (see test_orchestrates_field_is_derived_not_hardcoded
+    # and test_orchestrates_true_uses_hermes_surface_preamble for the rest of
+    # what changed alongside this).
     persona_file = tmp_path / "doctor.md"
     persona_file.write_text("DOCTOR PERSONA BODY")
     reg = _registry(tmp_path, [
@@ -309,24 +317,49 @@ async def test_orchestrating_persona_400_and_not_forwarded(proxy_client, tmp_pat
     resp = await proxy_client.post(
         "/api/hermes/ask/stream", json={"question": "hi", "persona_id": "doctor"},
     )
-    assert resp.status_code == 400
-    assert "doctor" in resp.json()["detail"]
-    assert _received == {}  # a routing failure, so this must never reach hermes
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["id"] == "doctor"
+    assert ctx["persona"]["orchestrates"] is True
+    assert ctx["persona"]["preamble"] == "DOCTOR PERSONA BODY"
+
+
+async def test_orchestrates_true_uses_hermes_surface_preamble(proxy_client, tmp_path, monkeypatch):
+    # #642: the envelope resolves persona_id with surface="hermes" so an
+    # orchestrating persona with a Hermes-specific variant (e.g.
+    # config/personas/doctor.hermes.md, #641) gets that body instead of the
+    # plain one — which claims shell/filesystem access Hermes doesn't have.
+    # A sibling `<stem>.hermes<suffix>` file next to persona_file (the naming
+    # rule _surface_variant_body uses) proves the surface parameter is
+    # actually threaded through, not just accepted and ignored.
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("PLAIN DOCTOR BODY (claims shell access)")
+    (tmp_path / "doctor.hermes.md").write_text("HERMES DOCTOR BODY (drives lifeos_agent_spawn)")
+    reg = _registry(tmp_path, [
+        {"name": "doctor", "token_env": "TG_DOC", "persona_file": str(persona_file), "orchestrates": True},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_DOC", "tok")
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "persona_id": "doctor"},
+    )
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["preamble"] == "HERMES DOCTOR BODY (drives lifeos_agent_spawn)"
 
 
 async def test_orchestrates_field_is_derived_not_hardcoded(proxy_client, monkeypatch):
-    # Guards against a regression to a literal `"orchestrates": False` in the
-    # envelope. Both the pre-stream guard and the envelope call
-    # settings.persona_orchestrates(persona_id); a spy returns False on the
-    # first call (so the guard lets the turn through, as it would for any
-    # ordinary persona) and True on every call after. A hardcoded literal
-    # would report False here regardless of what the guard saw — only a real
-    # second call to persona_orchestrates() can surface True.
+    # Guards against a regression to a literal `"orchestrates": False` (or,
+    # since #642 removed the guard that used to make every real call False in
+    # practice, a literal `True`) in the envelope. A spy that always returns
+    # True proves the field reflects a real call to
+    # settings.persona_orchestrates(), not a hardcoded literal.
     calls = {"n": 0}
 
     def _spy(self, persona_id):
         calls["n"] += 1
-        return calls["n"] > 1
+        return True
 
     # settings is a pydantic model instance — arbitrary attributes can't be
     # set on it directly (only declared fields), so the method is patched on
@@ -337,7 +370,7 @@ async def test_orchestrates_field_is_derived_not_hardcoded(proxy_client, monkeyp
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
     assert ctx["persona"]["orchestrates"] is True
-    assert calls["n"] >= 2
+    assert calls["n"] >= 1
 
 
 async def test_malformed_json_400_and_not_forwarded(proxy_client):

@@ -260,11 +260,14 @@ class TestStatusTextPerBackend:
 
 class TestOrchestratingPersonaPollingGate:
     """AC: an orchestrating persona's spoken turn on the Hermes backend must
-    not start pending-question polling. Unlike the text path (#596), voice
-    has no client-side diversion of a Hermes-selected orchestrating turn back
-    to lifeos -- such a persona_id reaching the Hermes proxy is rejected
-    there with a 400 (hermes_proxy.py) rather than spawning anything, so
-    there is never a session to poll for."""
+    not start pending-question polling. Voice never had a client-side
+    diversion of a Hermes-selected orchestrating turn back to lifeos the way
+    the (now also removed, #642) text-path diversion did (#596) -- such a
+    persona_id reaching the Hermes proxy used to be rejected there with a 400
+    (hermes_proxy.py). Since #642 Hermes drives that persona itself instead
+    (lifeos_agent_spawn, #640) rather than rejecting it, but that's still not
+    a LifeOS-linked session -- there is still nothing here for this client to
+    poll for on that backend."""
 
     def test_lifeos_backend_starts_polling(self, page: Page, chat_base_url):
         """Positive control: the gate isn't just always-false."""

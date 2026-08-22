@@ -398,11 +398,15 @@ class AskStreamRequest(BaseModel):
     # (whisper-relay) on spoken turns; omitted for text.
     modality: Optional[str] = None
     # Text backend the client had selected, used SOLELY to tag a newly created
-    # conversation for sidebar filtering (#596) — e.g. an orchestrating
-    # persona's turn, diverted here from a Hermes-selected composer because
-    # this handler is where its spawn path lives. Never used to route,
-    # resolve a persona, or pick a model; omitted (the default) reproduces
-    # today's tagging ("lifeos") exactly.
+    # conversation for sidebar filtering (#596). Through #641 the web client
+    # sent this when diverting an orchestrating persona's turn here from a
+    # Hermes-selected composer, because this handler was where its spawn path
+    # lived and Hermes had no equivalent; #642 gave Hermes its own way to
+    # drive that persona and removed the divert, so the web client no longer
+    # sends this field on any turn. Kept as a generic, supported field on
+    # this request for any other caller. Never used to route, resolve a
+    # persona, or pick a model; omitted (the default) reproduces today's
+    # tagging ("lifeos") exactly.
     backend: Optional[str] = None
     # Opaque, client-generated turn key (#611 review). `conversation_id`
     # alone can't cancel a turn before its first SSE frame ever arrives —
@@ -636,9 +640,11 @@ async def ask_stream(request: AskStreamRequest):
             if not conversation_id:
                 # Create new conversation, tagged with the selected persona so
                 # persona-scoped listing (e.g. the voice sidebar) can filter it,
-                # and with the selected backend (default "lifeos") so a turn
-                # diverted here from Hermes (#596) stays visible in the sidebar
-                # the user started it in rather than vanishing into "lifeos".
+                # and with the selected backend (default "lifeos") — the
+                # `backend` field's only purpose (#596; no longer set by the
+                # first-party client since #642 removed its one use case, the
+                # Hermes-orchestrating-persona divert, but still a generic,
+                # supported field on this request for any other caller).
                 conv = store.create_conversation(
                     persona_id=new_conversation_persona_id,
                     backend=request.backend or "lifeos",

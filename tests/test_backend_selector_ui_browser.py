@@ -249,10 +249,10 @@ class TestBackendModeUi:
 class TestPersonaPickerAcrossBackends:
     """AC (#590): 'The persona picker's contents shall not change based on
     the selected backend' — every persona, orchestrating or not, stays
-    selectable on Hermes. The proxy rejects an orchestrating persona's turn
-    server-side (api/routes/hermes_proxy.py, test_orchestrating_persona_400_
-    and_not_forwarded in tests/test_hermes_proxy.py) rather than the client
-    hiding it from the picker."""
+    selectable on Hermes. An orchestrating persona's turn reaches the Hermes
+    proxy like any other (api/routes/hermes_proxy.py; see
+    test_orchestrating_persona_no_longer_rejected in tests/test_hermes_proxy.py,
+    #642) rather than the client hiding it from the picker."""
 
     _PERSONAS = [
         {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
@@ -281,11 +281,15 @@ class TestPersonaPickerAcrossBackends:
 
 
 class TestOrchestratingPersonaOnHermes:
-    """#596: an orchestrating persona (e.g. doctor) always runs on LifeOS,
-    even with Hermes selected — the spawn path has no Hermes equivalent, so
-    the composer diverts its turn to `/api/ask/stream` instead of the Hermes
-    proxy. A non-orchestrating persona is unaffected, and the agent backend
-    (no persona pass-through at all) is unaffected too."""
+    """Through #641, an orchestrating persona (e.g. doctor) always ran on
+    LifeOS, even with Hermes selected — the spawn path had no Hermes
+    equivalent, so the composer diverted its turn to `/api/ask/stream`
+    instead of the Hermes proxy. #642 gave Hermes its own way to drive that
+    persona (lifeos_agent_spawn, #640) and removed the divert: an
+    orchestrating persona's Hermes turn now posts to the Hermes proxy like
+    any other persona's. A non-orchestrating persona was already unaffected
+    by the old divert, and the agent backend (no persona pass-through at
+    all) is unaffected by any of this."""
 
     _PERSONAS = [
         {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
@@ -293,19 +297,24 @@ class TestOrchestratingPersonaOnHermes:
         {"id": "doctor", "label": "Doctor", "capabilities": ["handoff", "agent"], "orchestrates": True},
     ]
 
-    def test_orchestrating_persona_on_hermes_diverts_to_lifeos_endpoint(self, page: Page, chat_base_url):
+    def test_orchestrating_persona_on_hermes_posts_to_hermes_proxy(self, page: Page, chat_base_url):
+        # #642: was test_orchestrating_persona_on_hermes_diverts_to_lifeos_
+        # endpoint, asserting the opposite — a POST to /api/ask/stream tagged
+        # body["backend"] == "hermes". Now there is no divert at all: doctor
+        # on Hermes reaches the Hermes proxy exactly like a non-orchestrating
+        # persona (test_non_orchestrating_persona_on_hermes_still_posts_to_
+        # proxy, below), and carries no `backend` tag — nothing to divert
+        # means nothing to tag either.
         _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
         expect(page.locator("#backendHermes")).to_have_class("backend-option active")
         page.locator("#personaPicker").select_option("doctor")
 
         page.locator("#inputField").fill("fix it")
-        with page.expect_request("**/api/ask/stream") as req_info:
+        with page.expect_request("**/api/hermes/ask/stream") as req_info:
             page.locator("#sendBtn").click()
         body = json.loads(req_info.value.post_data)
         assert body["persona_id"] == "doctor"
-        # Tagged with the backend actually selected, so the conversation this
-        # diverted turn creates stays visible in the Hermes-filtered sidebar.
-        assert body["backend"] == "hermes"
+        assert "backend" not in body
 
     def test_non_orchestrating_persona_on_hermes_still_posts_to_proxy(self, page: Page, chat_base_url):
         _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
@@ -335,10 +344,15 @@ class TestOrchestratingPersonaOnHermes:
         assert "backend" not in body
 
     def test_handoff_but_not_orchestrating_persona_on_hermes_still_posts_to_proxy(self, page: Page, chat_base_url):
-        # #643 regression guard: the case a capabilities-based inference gets
-        # wrong. A persona carrying `handoff` (like primary/doctor) but with
-        # `orchestrates: false` must NOT be diverted — only the server's own
-        # `orchestrates` flag decides that, not the `handoff` capability.
+        # #643 regression guard, weakened by #642: this used to guard against
+        # a capabilities-based inference wrongly diverting a persona carrying
+        # `handoff` (like primary/doctor) but `orchestrates: false`. #642
+        # removed the divert mechanism entirely, so there's no longer a
+        # diversion decision here to get wrong either way — this now just
+        # pins the same "reaches the proxy untagged" outcome as
+        # test_non_orchestrating_persona_on_hermes_still_posts_to_proxy for a
+        # persona with handoff-like capabilities specifically. Kept rather
+        # than deleted in case a diversion-style mechanism is ever reintroduced.
         personas = self._PERSONAS + [
             {"id": "scout", "label": "Scout", "capabilities": ["handoff", "agent"], "orchestrates": False},
         ]
@@ -397,10 +411,15 @@ class TestOrchestratingPersonaOnHermes:
         assert page.evaluate("window.lifeChat.config.personaId") == "doctor"
 
     def test_orchestrates_truth_table_across_backends(self, page: Page, chat_base_url):
-        """personaOrchestrates()/personaSupportsHandoff() (#596): orchestration
-        is restored on Hermes but handoff is not — they are separate
-        mechanisms, and only orchestration has a LifeOS-side diversion to run
-        on. The agent backend gets neither (no persona pass-through)."""
+        """personaOrchestrates()/personaSupportsHandoff(): neither is ever
+        true on Hermes or Agent — only the LifeOS backend actually starts a
+        session this client tracks. Through #641, orchestration (not
+        handoff) was also true on Hermes because an orchestrating persona's
+        turn was diverted back to LifeOS; #642 removed that divert, so
+        Hermes now matches Agent here even though the persona itself still
+        orchestrates server-side (Hermes just drives it itself, via
+        lifeos_agent_spawn, rather than this client tracking a LifeOS-linked
+        session for it)."""
         _open_chat(
             page, chat_base_url, agent_available=True, hermes_available=True,
             personas=self._PERSONAS,
@@ -417,7 +436,7 @@ class TestOrchestratingPersonaOnHermes:
         assert truth() == [True, True]  # lifeos: doctor orchestrates AND has handoff
 
         page.locator("#backendHermes").click()
-        assert truth() == [True, False]  # hermes: orchestration restored, handoff still not
+        assert truth() == [False, False]  # hermes (#642): Hermes drives it itself now, not this client
 
         page.locator("#backendAgent").click()
         assert truth() == [False, False]  # agent: neither — no persona pass-through at all
@@ -425,7 +444,12 @@ class TestOrchestratingPersonaOnHermes:
         page.locator("#backendLifeos").click()
         assert truth() == [True, True]  # back to lifeos, unchanged
 
-    def test_orchestrates_badge_visible_on_lifeos_and_hermes_not_agent(self, page: Page, chat_base_url):
+    def test_orchestrates_badge_visible_on_lifeos_only(self, page: Page, chat_base_url):
+        # #642: was test_orchestrates_badge_visible_on_lifeos_and_hermes_not_
+        # agent, which asserted the badge stayed visible on Hermes too
+        # ("still runs on LifeOS, regardless of backend") — no longer true,
+        # since a Hermes-selected orchestrating persona no longer runs on
+        # LifeOS at all.
         _open_chat(
             page, chat_base_url, agent_available=True, hermes_available=True,
             personas=self._PERSONAS, session_items={"lifeos:chat:backend_mode": "lifeos"},
@@ -434,10 +458,10 @@ class TestOrchestratingPersonaOnHermes:
         expect(badge).to_be_hidden()  # primary (default persona) never orchestrates
 
         page.locator("#personaPicker").select_option("doctor")
-        expect(badge).to_be_visible()
+        expect(badge).to_be_visible()  # lifeos: this turn really does run on LifeOS
 
         page.locator("#backendHermes").click()
-        expect(badge).to_be_visible()  # still runs on LifeOS, regardless of backend
+        expect(badge).to_be_hidden()  # hermes (#642): Hermes drives it itself now, not LifeOS
 
         page.locator("#backendAgent").click()
         expect(badge).to_be_hidden()  # agent has no persona pass-through at all
