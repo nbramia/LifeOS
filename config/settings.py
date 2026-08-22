@@ -141,6 +141,7 @@ class PersonaInfo:
     id: str
     label: str
     capabilities: list = field(default_factory=list)
+    orchestrates: bool = False
 
 
 class Settings(BaseSettings):
@@ -1100,11 +1101,17 @@ class Settings(BaseSettings):
         bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
         bots advertise none. Adding a registry entry + its token env var surfaces
         a new persona on the next restart with no code change.
+
+        ``orchestrates`` is sourced from ``persona_orchestrates()`` — the same
+        check real routing (chat.py, hermes_proxy.py) uses — rather than
+        derived from ``capabilities``, which happen to be identical for
+        ``primary`` and an orchestrating bot like ``doctor`` (#643).
         """
         personas = [PersonaInfo(
             id="primary",
             label="Primary",
             capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
+            orchestrates=self.persona_orchestrates("primary"),
         )]
         for bot in self.telegram_bots:
             personas.append(PersonaInfo(
@@ -1113,6 +1120,7 @@ class Settings(BaseSettings):
                 capabilities=(
                     list(ORCHESTRATOR_PERSONA_CAPABILITIES) if bot.orchestrates else []
                 ),
+                orchestrates=self.persona_orchestrates(bot.name),
             ))
         return personas
 
