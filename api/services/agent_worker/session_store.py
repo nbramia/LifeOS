@@ -15,7 +15,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_DB_PATH = Path("data/agent_sessions.db")
+# Anchored to the repo root (this file's own location), NOT the caller's
+# cwd (#640 review). A bare relative `Path("data/agent_sessions.db")`
+# resolves against whatever process opens it — fine for the API and worker,
+# which both run from the repo root, but Hermes runs `mcp_server.py` as a
+# stdio child from ITS OWN cwd (`~/.hermes`), so a caller relying on this
+# default would silently create and read an empty sibling DB there instead
+# of the real one, defeating the whole point of a shared caller_session_id.
+# Same fix, same reason, as `load_dotenv()` in `api/main.py` (#598) and
+# `job_queue.py`'s `_DEFAULT_DB_PATH` — anchor to `__file__`, not cwd. Only
+# the DEFAULT changes: a caller that passes its own (even relative) db_path
+# explicitly still resolves that path against its own cwd, unchanged.
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent.parent / "data" / "agent_sessions.db"
 
 
 # Status vocabulary used across the agent worker. Kept here so other modules

@@ -366,12 +366,14 @@ def test_worker_busy_true_when_non_terminal_session_exists(tmp_path: Path):
     (workdir / "scripts").mkdir()
     (workdir / "scripts" / "auto-deploy.sh").write_text(AUTO_DEPLOY.read_text(), encoding="utf-8")
 
-    store = SessionStore(db_path=workdir / "data" / "agent_sessions.db")
+    db_path = workdir / "data" / "agent_sessions.db"
+    store = SessionStore(db_path=db_path)
     store.create(task_id="t-1", session_id="s-1", status=STATUS_CLAIMED)
 
     venv = _venv_with_python(tmp_path)
     env = dict(os.environ)
     env["LIFEOS_VENV"] = str(venv)
+    env["LIFEOS_AGENT_SESSIONS_DB"] = str(db_path)
     env["PYTHONPATH"] = str(REPO_ROOT)
     result = subprocess.run(
         ["bash", "-c", 'source scripts/auto-deploy.sh && worker_busy; echo "rc=$?"'],
@@ -389,11 +391,13 @@ def test_worker_busy_false_when_no_sessions(tmp_path: Path):
     (workdir / "scripts").mkdir()
     (workdir / "scripts" / "auto-deploy.sh").write_text(AUTO_DEPLOY.read_text(), encoding="utf-8")
     # Create the store (and its schema) with zero sessions.
-    SessionStore(db_path=workdir / "data" / "agent_sessions.db")
+    db_path = workdir / "data" / "agent_sessions.db"
+    SessionStore(db_path=db_path)
 
     venv = _venv_with_python(tmp_path)
     env = dict(os.environ)
     env["LIFEOS_VENV"] = str(venv)
+    env["LIFEOS_AGENT_SESSIONS_DB"] = str(db_path)
     env["PYTHONPATH"] = str(REPO_ROOT)
     result = subprocess.run(
         ["bash", "-c", 'source scripts/auto-deploy.sh && worker_busy; echo "rc=$?"'],
@@ -536,6 +540,7 @@ def _run_main(repo: Path, state: Path, venv: Path) -> subprocess.CompletedProces
     env["PATH"] = f"{_write_policy_stubs(state)}:{env['PATH']}"
     env["LIFEOS_TEST_STATE"] = str(state)
     env["LIFEOS_VENV"] = str(venv)
+    env["LIFEOS_AGENT_SESSIONS_DB"] = str(repo / "data" / "agent_sessions.db")
     env["PYTHONPATH"] = str(REPO_ROOT)
     return subprocess.run(
         ["bash", "-c", "source scripts/auto-deploy.sh && main"],
@@ -672,11 +677,13 @@ def _worker_busy_rc(tmp_path: Path, statuses: list[str]) -> str:
     (workdir / "data").mkdir(parents=True)
     (workdir / "scripts").mkdir()
     (workdir / "scripts" / "auto-deploy.sh").write_text(AUTO_DEPLOY.read_text(), encoding="utf-8")
-    store = SessionStore(db_path=workdir / "data" / "agent_sessions.db")
+    db_path = workdir / "data" / "agent_sessions.db"
+    store = SessionStore(db_path=db_path)
     for i, st in enumerate(statuses):
         store.create(task_id=f"t-{i}", session_id=f"s-{i}", status=st)
     env = dict(os.environ)
     env["LIFEOS_VENV"] = str(_venv_with_python(tmp_path))
+    env["LIFEOS_AGENT_SESSIONS_DB"] = str(db_path)
     env["PYTHONPATH"] = str(REPO_ROOT)
     result = subprocess.run(
         ["bash", "-c", 'source scripts/auto-deploy.sh && worker_busy; echo "rc=$?"'],

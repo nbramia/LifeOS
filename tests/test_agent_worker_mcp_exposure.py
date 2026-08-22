@@ -19,9 +19,14 @@ def server(monkeypatch, tmp_path: Path):
 
     `_handle_inter_agent` anchors its SessionStore/TranscriptStore to the
     repo-root constants (`AGENT_SESSIONS_DB` / `AGENT_TRANSCRIPTS_DIR`) so it
-    works regardless of the cwd the MCP server was spawned with. We point those
-    constants at the sandbox, and also chdir so a bare `SessionStore()` in a
-    test resolves to the same place.
+    works regardless of the cwd the MCP server was spawned with. We point
+    those constants at the sandbox. The chdir is defense in depth, not load-
+    bearing for `_handle_inter_agent` itself (which never looks at cwd) — a
+    test that also wants a bare `SessionStore()`/`TranscriptStore()` to land
+    in this sandbox must still pass the monkeypatched constant explicitly
+    (see `test_call_api_dispatches_to_inter_agent_handler`), since both
+    classes' own defaults are now repo-root-anchored too (#640 review), not
+    cwd-relative.
     """
     monkeypatch.setenv("LIFEOS_AGENT_VAULT_ID", "")
     monkeypatch.chdir(tmp_path)
@@ -84,13 +89,17 @@ def test_call_api_missing_caller_returns_error(server):
 @pytest.mark.unit
 def test_call_api_dispatches_to_inter_agent_handler(server):
     """End-to-end MCP → inter_agent.dispatch path."""
-    # SessionStore() uses the default relative path; the server fixture
-    # chdir'd into tmp_path so this is sandboxed.
+    # Must point at the SAME db `_handle_inter_agent` resolves to -- the
+    # fixture's monkeypatched `mcp_server.AGENT_SESSIONS_DB`, not a bare
+    # `SessionStore()`. `SessionStore`'s own default is now repo-root-anchored
+    # (#640 review), so a bare default here would (correctly) resolve to the
+    # real repo db regardless of the fixture's `monkeypatch.chdir(tmp_path)`,
+    # missing the session this test just created.
     from api.services.agent_worker.session_store import (
         STATUS_RUNNING,
         SessionStore,
     )
-    store = SessionStore()
+    store = SessionStore(db_path=mcp_server.AGENT_SESSIONS_DB)
     sess = store.create(
         task_id="t_mcp", status=STATUS_RUNNING, routing="claude",
         budget={"max_dollars": 5.0, "wall_seconds": 60, "max_tokens": 1000},

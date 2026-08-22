@@ -220,22 +220,24 @@ Because Hermes has no way to resolve a LifeOS persona id or the current per-turn
       "session_turn_count": 2,
       "session_input_tokens": 300,
       "session_output_tokens": 130,
-      "session_cost_is_lower_bound": false
+      "session_cost_is_lower_bound": false,
+      "caller_session_id": "sess_herm3f9a2b7c1d4e5f60"
     }
   }
 }
 ```
 
-- `schema_version` is currently `1`.
+- `schema_version` is currently `1`. `caller_session_id` (#640) was added without a version bump — it's purely additive, so a consumer validating `schema_version == 1` and ignoring unrecognized keys is unaffected.
 - `modality` duplicates the request's `modality` (`"voice"` or `"text"`) so the envelope is self-contained.
 - `persona.id` defaults to `primary` when the client sends no `persona_id`; `preamble` is the persona's markdown body verbatim (may be empty); `voice_rules` is populated only on voice turns, matching the `modality == "voice"` gate `ask_stream` in `api/routes/chat.py` uses for the native path; `orchestrates` is always `false` here — an orchestrating persona (`doctor`) never reaches this envelope, because the route rejects it with a 400 first (see below).
-- `turn` (#591) is a **sibling** of `persona`, resolved by `build_turn_context()` in `api/services/agent_system_prompt.py` — the same function [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) returns, so the two shapes can never drift apart. **Never merge `turn` into `persona`** — `persona` is stable across a whole conversation (cacheable), `turn` changes every turn; merging them would invalidate a consumer's prompt cache on every turn. The `session_*` fields (#610, below) are exactly why: a cumulative cost changes on every turn by definition, so it belongs here and must never move to `persona`.
+- `turn` (#591) is a **sibling** of `persona`, resolved by `build_turn_context()` in `api/services/agent_system_prompt.py` — the same function [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) returns, so every field *except* `caller_session_id` can never drift apart between the two. **Never merge `turn` into `persona`** — `persona` is stable across a whole conversation (cacheable), `turn` changes every turn (or, for `caller_session_id`, at least *could*); merging either into `persona` would invalidate a consumer's prompt cache on every turn. The `session_*` fields (#610) are exactly why a cumulative cost belongs here and not in `persona`; `caller_session_id` belongs here for the same layering reason even though its value is often stable across a conversation's turns (see below) — it's still a per-request concern, not a fact about the persona.
+- `caller_session_id` (#640) is Hermes's identity for the `lifeos_agent_*` tool family (`lifeos_agent_spawn`/`check`/`send`/`kill`/`yield_until`/`transcript_read`/`sessions_list`/`user_ask` — see `api/services/agent_worker/inter_agent.py`), which `mcp_server.py` already advertises to Hermes over stdio MCP. Every one of those tools requires a `caller_session_id` argument that resolves to a real row in LifeOS's agent-worker `SessionStore`; without this field Hermes had none, and every call failed with `no_caller`. Hermes should copy this value verbatim into that argument on every `lifeos_agent_*` call it makes during the turn. **Present only in the Hermes envelope** — `GET /api/chat/turn-context` has no session to hand out and does not return this field.
 
 **Validation and rejection**, in order, before any upstream request is made: malformed JSON → 400; unknown `persona_id` → 400 naming the id; a known but *orchestrating* `persona_id` → 400. That last case is a **backstop, not the user-facing path**: the client-side diversion (#596, above) is what's supposed to route an orchestrating persona's turn to `POST /api/ask/stream` instead of here, so this 400 firing means that diversion didn't happen — a bug, not a normal outcome. The persona itself stays selectable on the Hermes backend regardless (a routing guard, not a picker exclusion). Attachment size/type caps are enforced via the same `AskStreamRequest` model the native endpoint uses, so the limits can't drift between the two paths.
 
 #### Turn-context payload
 
-The `turn` object above — identical in shape to the response body of [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context), since both come from the same `build_turn_context()` call:
+The `turn` object above — identical in shape to the response body of [`GET /api/chat/turn-context`](../product/api-reference.md#get-apichatturn-context) for every field except `caller_session_id`, since all the others come from the same `build_turn_context()` call:
 
 | Field | Type | Presence | Meaning |
 |---|---|---|---|
@@ -251,6 +253,16 @@ The `turn` object above — identical in shape to the response body of [`GET /ap
 | `session_input_tokens` | integer | always | Sum of `input_tokens` across the same already-recorded turns. |
 | `session_output_tokens` | integer | always | Sum of `output_tokens` across the same already-recorded turns. |
 | `session_cost_is_lower_bound` | boolean | always | `true` when any turn summed into `session_cost_usd` is `unpriced` (#613) — the provider reported no cost for it, recorded as `cost_usd=0.0` alongside the flag rather than as a real zero. `false` means every *recorded* turn in the sum was either genuinely priced or genuinely free — but see the retroactive-gap note below; it does not mean the figure is guaranteed exact. |
+| `caller_session_id` | string | always, Hermes envelope only | Hermes's `lifeos_agent_*` identity for this turn (#640) — see "Hermes agent-worker session identity" below. Not part of `build_turn_context()`; not returned by `GET /api/chat/turn-context`. |
+
+#### Hermes agent-worker session identity (#640)
+
+`caller_session_id` is a real row LifeOS creates in the agent worker's `SessionStore` (`api/services/agent_worker/session_store.py`; the same store `/agents` reads and `lifeos_agent_*` operates on), keyed to the Hermes **conversation**, not the turn:
+
+- **Per-conversation, not per-turn.** A session Hermes spawns with `lifeos_agent_spawn` can easily outlive the turn that created it (the operator may not check back in for several turns), and the spend caps in `inter_agent.py` (`max_spawn_depth`, `max_descendants_per_root`) are scoped to a lineage root — a fresh root every turn would silently reset those caps each time. The id is a deterministic hash of `conversation_id`, so the same conversation always resolves to the same session with no separate lookup table, and later turns can `lifeos_agent_check`/`kill`/`yield_until` a session a much earlier turn spawned.
+- **The one gap: turn 1 of a brand-new conversation.** The request that starts a new conversation carries no `conversation_id` yet (Hermes mints it; LifeOS only learns it afterward, from the `conversation_id` SSE event) — nothing to hash. That turn gets its own one-off session instead of the conversation's longer-lived one. Anything it spawns is still fully usable from a later turn (`lifeos_agent_check` has no lineage restriction), it just isn't threaded into the stable per-conversation root that exists from turn 2 onward.
+- **Inert by design.** The session is never dispatched or executed by the worker — it exists purely so `lifeos_agent_*` calls have something to resolve. It never appears as a running task and never sends its own Telegram notifications.
+- **Spend guard.** A Hermes-rooted session is treated as a non-API-billed lineage, the same as a `claude_code`/`codex` root: `lifeos_agent_spawn(model="claude")` from it (or from any descendant of it) is refused with `api_billing_blocked`, because that model routes through the Anthropic API rather than a subscription (ADR-018). `model="claude_code"`, `"codex"`, and `"local"` are unaffected.
 
 #### Session-to-date cost (#610, `is_lower_bound` added by #613)
 
