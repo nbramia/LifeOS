@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from api.services.person_entity import PersonEntityStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,7 +183,9 @@ def _update_timestamps(entity, person_ids, int_conn) -> bool:
     # Get timestamp range from source_entities across the same variants
     # (source_entities.canonical_person_id may also still carry legacy IDs
     # if a merge happened without backfilling that column).
-    crm_db = Path("data/crm.db")
+    # Same physical database as PersonEntityStore's default — reuse its anchored
+    # constant rather than a second cwd-relative literal for the same file.
+    crm_db = Path(PersonEntityStore.CRM_DB_PATH)
     source_first = None
     source_last = None
     if crm_db.exists():

@@ -12,7 +12,7 @@ Features:
 """
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -22,8 +22,6 @@ from api.services.slack_integration import (
     SlackChannel,
     SlackUser,
     get_slack_client,
-    get_workspace_id,
-    is_slack_enabled,
     SLACK_TEAM_ID,
 )
 from api.services.vectorstore import VectorStore
@@ -61,7 +59,7 @@ class SlackIndexer:
         self._client = client
         self._user_cache: dict[str, SlackUser] = {}
         self._channel_cache: dict[str, SlackChannel] = {}
-        self._ts_db_path = Path("data/slack_sync_timestamps.db")
+        self._ts_db_path = Path(__file__).resolve().parent.parent.parent / "data" / "slack_sync_timestamps.db"
         self._init_timestamp_db()
 
     def _init_timestamp_db(self):
