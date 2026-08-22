@@ -49,7 +49,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INDEX_PATH = Path("data/scheduler_index.json")
+DEFAULT_INDEX_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "scheduler_index.json"
 
 SCHEDULER_FOLDER = "LifeOS/Scheduler"
 INBOX_FILE = "Inbox.md"
