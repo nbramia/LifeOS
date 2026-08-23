@@ -648,8 +648,8 @@ def test_update_session_4xx_surfaces_response_body(caplog):
 @pytest.mark.unit
 def test_managed_session_cost_includes_overhead():
     cost = managed_session_cost("claude-opus-4-7", 1000, 1000, wall_seconds=3600)
-    # 1k input ($0.015) + 1k output ($0.075) + 1 hr * $0.08
-    expected = 0.015 + 0.075 + MANAGED_SESSION_HOUR_OVERHEAD
+    # 1k input ($0.005) + 1k output ($0.025) + 1 hr * $0.08
+    expected = 0.005 + 0.025 + MANAGED_SESSION_HOUR_OVERHEAD
     assert cost == pytest.approx(expected)
 
 

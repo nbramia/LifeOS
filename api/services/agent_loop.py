@@ -248,7 +248,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
 _MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5",
     "sonnet": "claude-sonnet-5",
-    "opus": "claude-opus-4-8",
+    "opus": "claude-opus-5",
 }
 # A directive verb immediately followed by a tier word: "escalate to opus",
 # "use sonnet", "with claude opus", "switch to haiku", "retry on opus".
