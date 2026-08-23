@@ -40,9 +40,9 @@ def test_record_usage_stores_cost_verbatim(store):
 
 def test_summary_totals_include_a_non_anthropic_model(store):
     """A row recorded under a model name the cost calculator
-    (`api/services/cost_tracker.py`) doesn't recognize contributes to
-    `get_summary()`'s totals exactly like a native one -- the store has no
-    per-model branching that could exclude it."""
+    (`agent_worker/pricing.py`'s `cost_for`, #656) doesn't recognize
+    contributes to `get_summary()`'s totals exactly like a native one -- the
+    store has no per-model branching that could exclude it."""
     store.record_usage(model="claude-haiku-4-5", input_tokens=100, output_tokens=50, cost_usd=0.001)
     store.record_usage(
         model="deepseek-v3-fireworks", input_tokens=120, output_tokens=340, cost_usd=0.00087,

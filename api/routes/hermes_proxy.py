@@ -240,11 +240,11 @@ class _HermesTurnPersister:
     Usage capture (#595) shares this same observer rather than adding a
     second one over the same stream: the `usage` event's cost is recorded
     **verbatim**, never recomputed from the token counts — the cost
-    calculator (`api/services/cost_tracker.py`) only knows Anthropic pricing
-    and would misprice a non-Anthropic upstream model badly. A malformed or
-    partial `usage` event (missing/wrong-typed model or token counts) is
-    ignored rather than raised; a well-formed event with no `cost_usd` is
-    recorded with a zero cost rather than an invented one.
+    calculator (`agent_worker/pricing.py`'s `cost_for`, #656) only knows
+    Anthropic pricing and would misprice a non-Anthropic upstream model
+    badly. A malformed or partial `usage` event (missing/wrong-typed model or
+    token counts) is ignored rather than raised; a well-formed event with no
+    `cost_usd` is recorded with a zero cost rather than an invented one.
 
     #611: `_proxy.py`'s pump now runs as a detached, registry-owned
     background task, so `finalize()` fires on the REAL end of the turn (the
