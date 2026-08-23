@@ -130,7 +130,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - Session cost displayed in header
 - Per-conversation cost tracking
 - Historical cost viewing
-- Stored in `data/cost_tracker.db`
+- Stored in `data/usage.db` (`api/services/usage_store.py`)
 
 ---
 
