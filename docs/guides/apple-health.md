@@ -156,3 +156,4 @@ metrics and Apple workouts live in `data/fitness.db` alongside your manual log.
 - [apple/HealthBridge/README.md](../../apple/HealthBridge/README.md) — Build/sign/run the app
 - [ADR-010 — Apple Data Agent](../adr/010-apple-data-agent.md)
 - [guides/scheduler.md](scheduler.md) — proactive check-ins (e.g. morning weight)
+- [guides/journal-ring-ingest.md](journal-ring-ingest.md) — another external capture device following this same dedicated-bearer-token ingest pattern
