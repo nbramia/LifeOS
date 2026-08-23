@@ -286,6 +286,17 @@ class LocalLLMClient:
         self._sync_client: httpx.Client | None = None
 
     @property
+    def model(self) -> str:
+        """The model identifier a usage-recording caller should attribute
+        this client's turns to (#661). llama-server is configured with a
+        single model at process start, not chosen per-request, and the
+        pricing table keys the free local rate under the literal "local"
+        (see agent_worker/pricing.py) rather than under a specific model
+        name -- so that sentinel, not the underlying gguf, is what callers
+        need here."""
+        return "local"
+
+    @property
     def async_client(self) -> httpx.AsyncClient:
         if self._async_client is None or self._async_client.is_closed:
             self._async_client = httpx.AsyncClient(
@@ -713,6 +724,15 @@ class AnthropicLLMClient:
         self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
+
+    @property
+    def model(self) -> str:
+        """The model id this client actually sends on every request (#661)
+        -- the resolved default (`settings.anthropic_model`) or the
+        per-turn override passed to `__init__` (escalation, an explicit
+        picker choice). A usage-recording caller needs this, not a
+        construction-time guess, to attribute a turn's real cost."""
+        return self._model
 
     def _prepare_system(self, system: str | list | None) -> str | list | None:
         """Return the ``system`` value for the Anthropic SDK unchanged.

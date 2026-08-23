@@ -1033,6 +1033,7 @@ async def ask_stream(request: AskStreamRequest):
                     output_tokens=agent_result.total_output_tokens,
                     cost_usd=agent_result.total_cost_usd,
                     conversation_id=conversation_id,
+                    unpriced=getattr(agent_result, "unpriced", False),
                 )
                 usage_recorded = True  # #615: the cancel/deadline handler must not double-write this
                 await turn.emit(f"data: {json.dumps({'type': 'usage', 'input_tokens': agent_result.total_input_tokens, 'output_tokens': agent_result.total_output_tokens, 'cost_usd': agent_result.total_cost_usd, 'model': agent_result.model})}\n\n")
@@ -1152,6 +1153,7 @@ async def ask_stream(request: AskStreamRequest):
                         output_tokens=cancelled_output_tokens,
                         cost_usd=live_result.total_cost_usd,
                         conversation_id=conversation_id,
+                        unpriced=getattr(live_result, "unpriced", False),
                     )
                     usage_recorded = True
             finish_trace()
