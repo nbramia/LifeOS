@@ -588,6 +588,84 @@ class TestCreateReasoningControl:
         assert payload["reasoning_effort"] == "high"
 
 
+class TestRemoteProviderConfig:
+    """LocalLLMClient is generic OpenAI-compatible plumbing, not
+    llama-server-specific (#654): a configured `model`/`api_key` reach the
+    wire, while every default reproduces the exact llama-server behavior
+    this class had before those parameters existed."""
+
+    def _fake_sync_client(self):
+        from unittest.mock import MagicMock
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [], "model": "local"}
+        fake_sync_client = MagicMock(is_closed=False)
+        fake_sync_client.post.return_value = fake_resp
+        return fake_sync_client
+
+    def test_default_model_is_local(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080")
+        assert client.model == "local"
+
+    def test_default_has_no_auth_header(self):
+        """The llama-server path (no api_key given) gets no Authorization
+        header at all — not an empty one — same as before this parameter
+        existed."""
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080")
+        assert "authorization" not in client.sync_client.headers
+        assert "authorization" not in client.async_client.headers
+
+    def test_api_key_sends_bearer_auth_header(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080", api_key="fw_test_key")
+        assert client.sync_client.headers["authorization"] == "Bearer fw_test_key"
+        assert client.async_client.headers["authorization"] == "Bearer fw_test_key"
+
+    def test_create_sends_configured_model(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080", model="accounts/fireworks/models/x")
+        client._sync_client = self._fake_sync_client()
+
+        client.create([{"role": "user", "content": "hi"}])
+
+        payload = client._sync_client.post.call_args.kwargs["json"]
+        assert payload["model"] == "accounts/fireworks/models/x"
+
+    @pytest.mark.asyncio
+    async def test_acreate_sends_configured_model(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080", model="accounts/fireworks/models/x")
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [], "model": "accounts/fireworks/models/x"}
+        fake_async_client = MagicMock(is_closed=False)
+        fake_async_client.post = AsyncMock(return_value=fake_resp)
+        client._async_client = fake_async_client
+
+        await client.acreate([{"role": "user", "content": "hi"}])
+
+        payload = fake_async_client.post.call_args.kwargs["json"]
+        assert payload["model"] == "accounts/fireworks/models/x"
+
+    @pytest.mark.asyncio
+    async def test_astream_sends_configured_model(self):
+        from api.services.llm_client import LocalLLMClient
+        client = LocalLLMClient(base_url="http://fake:8080", model="accounts/fireworks/models/x")
+        captured = {}
+
+        class _CapturingAsyncClient(_FakeAsyncClient):
+            def stream(self, method, url, **kwargs):
+                captured["kwargs"] = kwargs
+                return super().stream(method, url, **kwargs)
+
+        client._async_client = _CapturingAsyncClient(_FakeSSEResponse([_done_chunk()]))
+
+        _ = [e async for e in client.astream([{"role": "user", "content": "hi"}])]
+
+        assert captured["kwargs"]["json"]["model"] == "accounts/fireworks/models/x"
+
+
 class TestAStreamReasoningControl:
     """astream() forwards reasoning control the same way create()/acreate() do."""
 
