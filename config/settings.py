@@ -408,6 +408,60 @@ class Settings(BaseSettings):
         """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
         return self.local_routing_llm_url or self.local_llm_url
 
+    # Paid OpenAI-compatible remote provider (#654) — e.g. Fireworks running
+    # DeepSeek/Qwen/etc. An explicit per-turn model pick (like "gemma"/local),
+    # never something the escalation ladder can reach on its own (ADR-018):
+    # NON_API_RUNGS in agent_loop.py already filters any non-local rung out
+    # of an operator-configured ladder, so naming this provider there is a
+    # no-op, not a bypass. Configured as provider + model + key + rates here
+    # so swapping the upstream model is a settings change, not a code change.
+    remote_llm_base_url: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_URL",
+        description="Base URL of an OpenAI-compatible remote provider "
+                    "(e.g. https://api.fireworks.ai/inference/v1). Empty "
+                    "(default) disables the provider entirely — it's hidden "
+                    "from the chat model picker and model_override=\"remote\" "
+                    "is ignored."
+    )
+    remote_llm_model: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_MODEL",
+        description="Model id to send in the request body, e.g. "
+                    "accounts/fireworks/models/deepseek-v4-flash-0731."
+    )
+    remote_llm_api_key: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_API_KEY",
+        description="Bearer token for the remote provider."
+    )
+    remote_llm_label: str = Field(
+        default="Remote", alias="LIFEOS_REMOTE_LLM_LABEL",
+        description="Display label for the chat model picker option."
+    )
+    remote_llm_timeout: int = Field(
+        default=90, alias="LIFEOS_REMOTE_LLM_TIMEOUT",
+        description="Request timeout (seconds) for the remote provider."
+    )
+    remote_llm_input_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK",
+        description="USD per million input tokens. Unset (default, distinct "
+                    "from 0.0) means the rate isn't known — a turn on this "
+                    "provider then records as unpriced rather than a guess, "
+                    "the same 'we don't know, don't invent' convention #613 "
+                    "gave the usage store an unpriced column for."
+    )
+    remote_llm_output_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK",
+        description="USD per million output tokens. See "
+                    "remote_llm_input_price_per_mtok for the unset/0.0 distinction."
+    )
+
+    @property
+    def remote_llm_configured(self) -> bool:
+        """True once there's enough to actually run a turn: URL, model, and
+        key. Pricing is independent — an operator can wire up the endpoint
+        before rates are known; such a turn still runs, it just records as
+        unpriced (see remote_llm_input_price_per_mtok)."""
+        return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
+
     # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
     mcp_http_port: int = Field(
         default=8765,

@@ -70,8 +70,12 @@ class TestCostCalculation:
         # Should use sonnet pricing
         assert abs(cost - 0.0105) < 0.0001
 
-    def test_unknown_model_defaults_to_sonnet(self):
-        """Unknown model should use sonnet pricing."""
+    def test_unknown_model_returns_none_not_sonnet(self):
+        """(#654) An unrecognized model used to silently default to Sonnet
+        pricing -- wrong in the expensive direction for any non-Anthropic
+        model (e.g. a Fireworks turn). This table only knows Claude tiers, so
+        it now reports "I don't know" (None) instead of guessing Sonnet;
+        the caller records that as unpriced rather than a fabricated cost."""
         from api.services.cost_tracker import calculate_cost
 
         cost = calculate_cost(
@@ -80,8 +84,7 @@ class TestCostCalculation:
             output_tokens=500
         )
 
-        # Should use sonnet pricing
-        assert abs(cost - 0.0105) < 0.0001
+        assert cost is None
 
     def test_zero_tokens_returns_zero_cost(self):
         """Zero tokens should return zero cost."""
@@ -153,7 +156,7 @@ class TestCostTrackerStorage:
         """CostTracker should initialize and create table."""
         from api.services.cost_tracker import CostTracker
 
-        tracker = CostTracker(db_path=temp_db)
+        CostTracker(db_path=temp_db)  # side effect under test: creates the table
 
         # Verify table exists
         import sqlite3

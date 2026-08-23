@@ -261,10 +261,19 @@ async def chat_config():
     a one-tap escape when the mic is blocked by an insecure context (#516).
     Trailing slash stripped so clients can append a path directly; "" when unset,
     in which case the client just reports the insecure context without a link.
+
+    `remote_model_available`/`remote_model_label` (#654) tell the model
+    picker whether to show its "Remote" option — a paid OpenAI-compatible
+    provider (e.g. Fireworks) that only exists as an explicit per-turn pick,
+    never auto-escalated to. Unconfigured (no base URL/model/key) means
+    `remote_model_available` is False and `remote_model_label` is "" — the
+    picker hides the option and every existing path is unaffected.
     """
     return {
         "default_voice": bool(settings.chat_default_voice),
         "secure_url": (settings.tailnet_https_url or "").rstrip("/"),
+        "remote_model_available": settings.remote_llm_configured,
+        "remote_model_label": settings.remote_llm_label if settings.remote_llm_configured else "",
     }
 
 
@@ -910,15 +919,28 @@ async def ask_stream(request: AskStreamRequest):
             # backend only — the local backend can't honor a per-turn model.
             escalated = False
             force_local = False
+            force_remote = False
             # Per-turn model picker: an explicit pick wins over auto-escalation.
-            # "gemma"/"local" → run this turn on the local backend; a tier word
-            # or model id → pin this turn to that cloud model. "auto"/unset falls
-            # through to the normal Haiku + escalation path.
+            # "gemma"/"local" → run this turn on the local backend; "remote"
+            # (#654) → the configured paid OpenAI-compatible provider, an
+            # explicit pick only — never reachable from auto-escalation (see
+            # NON_API_RUNGS in agent_loop.py); a tier word or model id → pin
+            # this turn to that cloud model. "auto"/unset falls through to the
+            # normal Haiku + escalation path.
             _override = (request.model_override or "").strip().lower()
             _backend_is_anthropic = getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
+            if _override == "remote" and not settings.remote_llm_configured:
+                # The picker hides this option when unconfigured, but an
+                # explicit-but-unusable pick from a raw API caller falls back
+                # to auto rather than being treated as an Anthropic model id
+                # named "remote" (which would 404).
+                _override = "auto"
             if _override in ("gemma", "local"):
                 force_local = True
                 orchestrator_model = "local"
+            elif _override == "remote":
+                force_remote = True
+                orchestrator_model = settings.remote_llm_model
             elif _override and _override != "auto" and _backend_is_anthropic:
                 from api.services.agent_loop import resolve_model_alias
                 picked = resolve_model_alias(_override)
@@ -997,6 +1019,7 @@ async def ask_stream(request: AskStreamRequest):
                 voice_rules=voice_rules,
                 personal_context=personal_context,
                 force_local=force_local,
+                force_remote=force_remote,
             ):
                 if event["type"] == "turn_state":
                     # #615: live, mutable AgentResult -- see the comment by
@@ -1026,6 +1049,9 @@ async def ask_stream(request: AskStreamRequest):
 
             # Record usage
             if agent_result.total_input_tokens > 0:
+                # getattr tolerates an agent_result predating #654 (e.g. a
+                # test double) that has no unpriced field at all.
+                _unpriced = getattr(agent_result, "unpriced", False)
                 usage_store = get_usage_store()
                 usage_store.record_usage(
                     model=agent_result.model,
@@ -1033,9 +1059,23 @@ async def ask_stream(request: AskStreamRequest):
                     output_tokens=agent_result.total_output_tokens,
                     cost_usd=agent_result.total_cost_usd,
                     conversation_id=conversation_id,
+                    unpriced=_unpriced,
                 )
                 usage_recorded = True  # #615: the cancel/deadline handler must not double-write this
-                await turn.emit(f"data: {json.dumps({'type': 'usage', 'input_tokens': agent_result.total_input_tokens, 'output_tokens': agent_result.total_output_tokens, 'cost_usd': agent_result.total_cost_usd, 'model': agent_result.model})}\n\n")
+                # #654: an unpriced turn (a remote pick with no configured
+                # rate) sends no cost_usd at all rather than a confident free
+                # 0 -- the same three-state contract Hermes turns already use
+                # (docs/specs/technical/client-surfaces.md's "Usage and cost
+                # reporting" section); ask-stream.js already parses it.
+                _usage_event = {
+                    'type': 'usage',
+                    'input_tokens': agent_result.total_input_tokens,
+                    'output_tokens': agent_result.total_output_tokens,
+                    'model': agent_result.model,
+                }
+                if not _unpriced:
+                    _usage_event['cost_usd'] = agent_result.total_cost_usd
+                await turn.emit(f"data: {json.dumps(_usage_event)}\n\n")
 
             # Build source list from tool calls
             sources = []
@@ -1152,6 +1192,9 @@ async def ask_stream(request: AskStreamRequest):
                         output_tokens=cancelled_output_tokens,
                         cost_usd=live_result.total_cost_usd,
                         conversation_id=conversation_id,
+                        # getattr tolerates a live_result predating #654 (or a
+                        # test double) that has no unpriced field at all.
+                        unpriced=getattr(live_result, "unpriced", False),
                     )
                     usage_recorded = True
             finish_trace()

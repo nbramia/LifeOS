@@ -6,7 +6,7 @@ Tracks token usage and calculates costs for Claude API calls.
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -24,7 +24,7 @@ MODEL_PRICING = {
 DEFAULT_DB_PATH = Path.home() / ".lifeos" / "cost_tracking.db"
 
 
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> Optional[float]:
     """
     Calculate the cost for a Claude API call.
 
@@ -34,7 +34,14 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         output_tokens: Number of output tokens
 
     Returns:
-        Cost in USD
+        Cost in USD, or None when `model` isn't a recognized Claude tier.
+        (#654) This used to default an unrecognized model to Sonnet pricing —
+        silently mispricing anything this table doesn't know about (e.g. a
+        non-Anthropic model) at $3/$15 per Mtok, wrong in the expensive
+        direction. This table only ever knew Claude pricing, so guessing
+        Sonnet for "anything else" was never a real fallback, just a
+        confident wrong answer. Returning None lets the caller record the
+        turn as unpriced instead.
     """
     # Normalize model name
     model_lower = model.lower()
@@ -42,9 +49,10 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
         pricing = MODEL_PRICING["haiku"]
     elif "opus" in model_lower:
         pricing = MODEL_PRICING["opus"]
-    else:
-        # Default to sonnet for any other model
+    elif "sonnet" in model_lower:
         pricing = MODEL_PRICING["sonnet"]
+    else:
+        return None
 
     # Calculate cost (price is per million tokens)
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
@@ -148,6 +156,10 @@ class CostTracker:
         Returns:
             UsageRecord with calculated cost
         """
+        # This module has no `unpriced` flag of its own (unlike usage_store's
+        # #613 column) -- an unrecognized model's cost is stored as 0.0, same
+        # as before #654, but no longer guessed as Sonnet's price first.
+        cost = calculate_cost(model, input_tokens, output_tokens)
         record = UsageRecord(
             id=str(uuid.uuid4()),
             conversation_id=conversation_id,
@@ -155,7 +167,7 @@ class CostTracker:
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_usd=calculate_cost(model, input_tokens, output_tokens),
+            cost_usd=cost if cost is not None else 0.0,
             created_at=datetime.now()
         )
 

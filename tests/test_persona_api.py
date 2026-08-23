@@ -676,13 +676,18 @@ class TestPersonasEndpoint:
 
 class TestChatConfigEndpoint:
     def test_default_voice_reflects_setting(self, client, monkeypatch):
+        # remote_llm_* left at their unconfigured defaults (#654) — this test
+        # only cares about default_voice/secure_url.
         monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
+        monkeypatch.setattr("api.routes.chat.settings.remote_llm_base_url", "", raising=False)
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", False, raising=False)
         assert client.get("/api/chat/config").json() == {
-            "default_voice": False, "secure_url": ""}
+            "default_voice": False, "secure_url": "",
+            "remote_model_available": False, "remote_model_label": ""}
         monkeypatch.setattr("api.routes.chat.settings.chat_default_voice", True, raising=False)
         assert client.get("/api/chat/config").json() == {
-            "default_voice": True, "secure_url": ""}
+            "default_voice": True, "secure_url": "",
+            "remote_model_available": False, "remote_model_label": ""}
 
     # secure_url is the web client's one-tap escape from an insecure context to
     # the HTTPS origin the mic needs (#516).

@@ -313,3 +313,103 @@ class TestHandoffEndpoint:
         ):
             r = client.post("/api/chat/handoff", json={"engine": "codex", "task": "do a thing"})
         assert r.status_code == 500
+
+
+class TestAskStreamRemoteModelOverride:
+    """model_override="remote" (#654): dispatches to the configured paid
+    OpenAI-compatible provider only when it's actually configured -- the
+    picker hides the option otherwise, but a raw API caller could still send
+    it, and an unconfigured pick must fall back to auto rather than being
+    sent to Anthropic as a model literally named "remote" (which would 404)."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    @staticmethod
+    def _fake_loop(captured):
+        from types import SimpleNamespace
+
+        async def fake_loop(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            yield {"type": "result", "result": SimpleNamespace(
+                total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
+                unpriced=False, model="m", tool_calls_log=[], full_text="ok")}
+        return fake_loop
+
+    @staticmethod
+    async def _fake_classify(*a, **k):
+        return None
+
+    def test_configured_remote_pick_dispatches_force_remote(self, client, monkeypatch):
+        import api.services.agent_loop as agent_loop_mod
+        from config.settings import settings
+
+        captured = {}
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", self._fake_loop(captured))
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", self._fake_classify)
+        monkeypatch.setattr(settings, "remote_llm_base_url", "http://fake-remote", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/x", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_api_key", "fw_key", raising=False)
+
+        r = client.post("/api/ask/stream", json={"question": "hi", "model_override": "remote"})
+
+        assert r.status_code == 200
+        assert captured.get("force_remote") is True
+        assert captured.get("force_local") is False
+
+    def test_unconfigured_remote_pick_falls_back_to_auto(self, client, monkeypatch):
+        """Not the picker's normal path (it hides the option), but a direct
+        API call naming an unconfigured provider must not be mistaken for an
+        Anthropic model id."""
+        import api.services.agent_loop as agent_loop_mod
+        from config.settings import settings
+
+        captured = {}
+        monkeypatch.setattr(agent_loop_mod, "run_agent_loop", self._fake_loop(captured))
+        monkeypatch.setattr("api.routes.chat.classify_action_intent", self._fake_classify)
+        monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+        r = client.post("/api/ask/stream", json={"question": "hi", "model_override": "remote"})
+
+        assert r.status_code == 200
+        assert captured.get("force_remote") is False
+        assert captured.get("force_local") is False
+        assert captured.get("model") != "remote"
+
+
+class TestChatConfigRemoteFields:
+    """GET /api/chat/config (#654): reports whether the remote provider is
+    configured, so the picker can hide the option on a fresh clone."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    def test_unconfigured_reports_unavailable(self, client, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+        r = client.get("/api/chat/config")
+
+        assert r.status_code == 200
+        assert r.json()["remote_model_available"] is False
+        assert r.json()["remote_model_label"] == ""
+
+    def test_configured_reports_available_with_label(self, client, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setattr(settings, "remote_llm_base_url", "http://fake-remote", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/x", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_api_key", "fw_key", raising=False)
+        monkeypatch.setattr(settings, "remote_llm_label", "Fireworks", raising=False)
+
+        r = client.get("/api/chat/config")
+
+        assert r.status_code == 200
+        assert r.json()["remote_model_available"] is True
+        assert r.json()["remote_model_label"] == "Fireworks"
