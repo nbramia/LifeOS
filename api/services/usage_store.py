@@ -81,6 +81,17 @@ class UsageStore:
                 pass  # column already exists (fresh db, or a prior run already migrated it)
             conn.commit()
 
+    # Cutover note (#661, 2026-08-23): every native `/chat` turn recorded
+    # before this date has model="local" and cost_usd=0.0 regardless of
+    # which backend actually served it -- run_agent_loop hardcoded the model
+    # at construction and zeroed the cost unconditionally in _track_usage.
+    # Both bugs are fixed as of this date; rows written after it carry the
+    # real served model and a cost derived from pricing.cost_for. The
+    # pre-cutover rows are NOT backfilled: the true model was never stored,
+    # so any reconstruction would be invention, not recovery. A query over
+    # historical model or cost needs to account for this discontinuity
+    # rather than trust every row equally.
+
     def record_usage(
         self,
         model: str,

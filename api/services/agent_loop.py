@@ -25,6 +25,7 @@ from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, exe
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
+from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.resilience import is_retryable_api_error
 from config.settings import settings
 
@@ -449,6 +450,10 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
+    # (#661) True when `model` has no known rate in pricing.PRICING -- the
+    # dollar figure in total_cost_usd is then a placeholder 0.0, not a
+    # claim that the turn was actually free. See _track_usage.
+    unpriced: bool = False
     # (#629) the current in-flight round's cumulative usage-so-far, from
     # AnthropicLLMClient.astream's "usage_update" event. Only that backend
     # emits it -- LocalLLMClient.astream never does (its protocol has no
@@ -506,6 +511,14 @@ async def run_agent_loop(
         "status", or "result".
     """
     client = _select_client(model, force_local=force_local)
+    # (#661) The turn's actual served model -- LocalLLMClient.model is always
+    # "local"; AnthropicLLMClient.model is the resolved default
+    # (settings.anthropic_model) or the per-turn override above (escalation,
+    # an explicit picker choice). `getattr(..., "local")` tolerates a test
+    # double that predates this property (several unit tests patch
+    # _select_client with a bare fake astream() object) by falling back to
+    # the same default this used to be hardcoded to.
+    resolved_model = getattr(client, "model", "local")
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
                                         voice_rules=voice_rules, personal_context=personal_context)
 
@@ -560,7 +573,7 @@ async def run_agent_loop(
     user_content = build_message_content(question, attachments)
     messages.append({"role": "user", "content": user_content})
 
-    result = AgentResult(full_text="", model="local")
+    result = AgentResult(full_text="", model=resolved_model)
     # #615: hand the caller a live reference to `result` before the loop does
     # any work. `_track_usage` below mutates it in place every round, so a
     # caller that stashes this object can read accrued usage at any point --
@@ -574,8 +587,29 @@ async def run_agent_loop(
         result.total_output_tokens += usage.output_tokens
         result.total_cache_read_tokens += usage.cache_read_input_tokens
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
-        # Local model has no cost
-        result.total_cost_usd = 0.0
+        # (#661) Derive cost from the model that actually served the turn,
+        # recomputed from the running totals each round (mirrors the
+        # accumulation above -- cost_for is cheap and this keeps
+        # total_cost_usd correct if a caller reads it mid-loop via the
+        # turn_state reference). "local" is priced at $0 in PRICING, so a
+        # genuinely local turn still lands on 0.0 here -- as a result of
+        # pricing a free model, not an unconditional assignment. A model
+        # with no known rate is left at 0.0 too, but flagged `unpriced`
+        # rather than asserted free -- see pricing.is_known_model's
+        # docstring for why this caller doesn't want cost_for's
+        # budget-enforcement Opus-rate fallback.
+        if is_known_model(result.model):
+            result.total_cost_usd = cost_for(
+                result.model,
+                result.total_input_tokens,
+                result.total_output_tokens,
+                result.total_cache_creation_tokens,
+                result.total_cache_read_tokens,
+            )
+            result.unpriced = False
+        else:
+            result.total_cost_usd = 0.0
+            result.unpriced = True
         # (#629) this round's usage is now folded into the totals above --
         # clear the provisional (in-flight) figures so a caller that adds
         # provisional_* to total_* (chat.py's cancel handler) doesn't

@@ -71,6 +71,22 @@ CACHE_CREATION_RATE_MULTIPLIER: float = 1.25
 CACHE_READ_RATE_MULTIPLIER: float = 0.10
 
 
+def is_known_model(model: str) -> bool:
+    """True when `model` (or its bare tier, stripping a dated snapshot
+    suffix) has a rate in PRICING.
+
+    Exists for a caller that must distinguish "this model is genuinely
+    free" from "this model's rate is unknown" (#661) — `cost_for` collapses
+    that distinction into a conservative Opus-rate estimate, which is the
+    right call for its existing budget-enforcement callers (an
+    underestimate there could blow past a spend cap) but wrong for a usage
+    reader deciding whether to mark a row `unpriced`: silently billing an
+    unrecognized model at Opus rates would misrepresent the actual (unknown)
+    cost just as much as recording it as free.
+    """
+    return model in PRICING or _DATED_SNAPSHOT_SUFFIX.sub("", model) in PRICING
+
+
 def cost_for(
     model: str,
     tokens_in: int,
