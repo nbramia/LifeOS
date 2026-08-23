@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-08-09
+> **Last Updated:** 2026-08-23
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -119,6 +119,75 @@ systemctl list-timers lifeos-autodeploy.timer
 **Watch it:** `tail -f logs/auto-deploy.log`. Failures (fetch, diverged pull, pip, restart, or `/health` not recovering post-deploy) send a Telegram alert.
 
 **Caveat:** it deploys whatever lands on `main` *without* re-running the test suite — safe only because merged `main` is expected to be green. It does not gate on tests by design (running the suite would take the API down and thrash the shared server).
+
+---
+
+## Shared Credentials Across Tools (#658)
+
+LifeOS sometimes shares a paid provider account with another tool running on the
+same box (e.g. `LIFEOS_REMOTE_LLM_API_KEY` in `config/settings.py` — a vendor-neutral
+credential for whichever OpenAI-compatible remote provider is configured, #654).
+When another local tool authenticates to that *same* provider account, the two
+tools end up with two independent copies of one secret: two rotation targets,
+and two places that silently drift when only one gets updated.
+
+**The fix is never a config-sharing mechanism between the two codebases** —
+LifeOS reading the other tool's config file (or vice versa) creates exactly the
+kind of cross-repo coupling and stale-snapshot risk this section exists to avoid
+(see the model readout below for what that failure mode looks like in practice).
+Instead: store the literal secret in exactly **one** file, outside either tool's
+own config tree (e.g. `~/.credentials/<provider>.env`, mode 600), and have each
+tool's own config *reference* that file rather than embed the value:
+
+- If a tool's env-loading already supports `${VAR}` expansion against the
+  process environment (LifeOS's own `.env` does, via `python-dotenv`/
+  `pydantic-settings` — confirmed: `dotenv_values()` resolves `${OTHER_VAR}`
+  against anything already in `os.environ` when it parses a file), export the
+  one shared variable into the environment ahead of that tool's own env-file
+  load (e.g. a systemd `EnvironmentFile=` pointed at the shared file), then
+  have each tool's own `.env` set its own variable name to `${THE_SHARED_VAR}`.
+- If a tool's env-loading is a plain line-by-line reader with no expansion
+  support, this trick doesn't work for it — check before relying on it. The
+  fallback for such a tool is whatever file-reference mechanism its own config
+  format supports (an `api_key_file`-style setting, systemd's own
+  `EnvironmentFile=`, etc.); embedding the literal value is what this section
+  is trying to eliminate.
+
+Either way, each tool keeps its own variable name — there's no requirement (or
+benefit) to renaming across tools, only to stop duplicating the value.
+
+## Model Readout (#658)
+
+`GET /health/full` includes a `models` key reporting, per chat surface, which
+model is **actually serving it right now** — `api/services/model_readout.py`.
+This exists because a configured value and a live value can silently diverge
+(a local LLM server restarted against a different model than its own config
+still names; an external tool's config snapshot going stale relative to its
+running process). The readout never re-reads a config file to answer "what's
+live" — each surface uses whichever live signal actually exists for it:
+
+- **LifeOS native picker:** in-memory settings for the Anthropic backend
+  (that setting IS the live value — nothing else can run a different
+  Anthropic model out from under it), or a live `/v1/models` probe against
+  the local backend's llama-server.
+- **Hermes chat:** observed from the last real turn's own `usage` event,
+  not probed. `LIFEOS_HERMES_BACKEND_URL` points at LifeOS's own adapter in
+  front of the Hermes gateway, which has no capability endpoint to probe —
+  and even a live probe against the gateway itself would answer "what
+  could serve a turn," not "what did," since the adapter can pick a
+  different model per turn. Reports `"unknown"` until this process has
+  relayed at least one Hermes chat turn.
+- **Hermes Telegram:** Hermes's Telegram bot talks to the gateway directly,
+  bypassing LifeOS by design (its independence from LifeOS uptime is a
+  property worth keeping — see client-surfaces.md), so LifeOS has no
+  channel to observe or probe it at all. Reports `"not_observable"` — a
+  status distinct from `"unknown"` (an attempt that failed) — and is never
+  assumed to match Hermes chat's observed value, since the two can
+  genuinely be answered by different models per turn.
+
+A surface that can't be confirmed reports `"status": "unknown"` (or
+`"not_observable"` where there's no attempt to make) — never the configured
+value dressed up as confirmed-live.
 
 ---
 
