@@ -393,6 +393,26 @@ def _isolate_usage_store_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_hermes_persona_thread_store_db(tmp_path, monkeypatch):
+    """Stop tests from opening (and writing to) the production Hermes-
+    Telegram reply-thread persona mapping (#644 follow-up).
+
+    ``HermesPersonaThreadStore`` is a process-wide singleton
+    (``get_persona_thread_store()``) keyed off ``settings.chroma_path`` —
+    the real ``data/hermes_persona_threads.db`` on whatever machine runs the
+    suite. Redirect the shared singleton itself to a per-test tmp instance,
+    mirroring ``_isolate_usage_store_db`` above.
+    """
+    import api.services.hermes_persona_thread_store as thread_store_mod
+
+    monkeypatch.setattr(
+        thread_store_mod,
+        "_persona_thread_store",
+        thread_store_mod.HermesPersonaThreadStore(str(tmp_path / "hermes_persona_threads.db")),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production agent-session
     store (#652).
