@@ -24,5 +24,11 @@
     "token_env": "TELEGRAM_FINANCE_BOT_TOKEN",
     "chat_id_env": "TELEGRAM_FINANCE_CHAT_ID",
     "persona_file": "config/personas/finance.md"
+  },
+  {
+    "name": "journal",
+    "token_env": "TELEGRAM_JOURNAL_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_JOURNAL_CHAT_ID",
+    "persona_file": "config/personas/journal.md"
   }
 ]
