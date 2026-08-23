@@ -1192,8 +1192,8 @@ async def ask_stream(request: AskStreamRequest):
                         output_tokens=cancelled_output_tokens,
                         cost_usd=live_result.total_cost_usd,
                         conversation_id=conversation_id,
-                        # getattr tolerates a live_result predating #654 (or a
-                        # test double) that has no unpriced field at all.
+                        # getattr tolerates a live_result predating #654/#661
+                        # (or a test double) that has no unpriced field at all.
                         unpriced=getattr(live_result, "unpriced", False),
                     )
                     usage_recorded = True

@@ -25,6 +25,7 @@ from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, exe
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
+from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.resilience import is_retryable_api_error
 from config.settings import settings
 
@@ -462,13 +463,11 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
-    # True when this turn ran on a backend that reports real usage but has no
-    # configured price for it (#654 — a remote provider picked without rates
-    # set). Distinct from a genuinely free local turn: total_cost_usd is 0.0
-    # in both cases, but this flag says the zero is "unknown", not "free", so
-    # a caller can record it as unpriced (usage_store's #613 column) instead
-    # of a confidently wrong free turn. False for every other path — no
-    # existing caller needs to touch this.
+    # (#661) True when `model` has no known rate -- either no entry in
+    # pricing.PRICING, or (#654) the configured remote provider with no
+    # configured per-token rate. The dollar figure in total_cost_usd is then
+    # a placeholder 0.0, not a claim that the turn was actually free. See
+    # _track_usage.
     unpriced: bool = False
     # (#629) the current in-flight round's cumulative usage-so-far, from
     # AnthropicLLMClient.astream's "usage_update" event. Only that backend
@@ -534,6 +533,16 @@ async def run_agent_loop(
         "status", or "result".
     """
     client = _select_client(model, force_local=force_local, force_remote=force_remote)
+    # (#661) The turn's actual served model -- LocalLLMClient.model is
+    # "local" by default or the configured remote provider's id when
+    # force_remote built it (#654, LocalLLMClient.model docstring);
+    # AnthropicLLMClient.model is the resolved default
+    # (settings.anthropic_model) or the per-turn override above (escalation,
+    # an explicit picker choice). `getattr(..., "local")` tolerates a test
+    # double that predates this property (several unit tests patch
+    # _select_client with a bare fake astream() object) by falling back to
+    # the same default this used to be hardcoded to.
+    resolved_model = getattr(client, "model", "local")
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
                                         voice_rules=voice_rules, personal_context=personal_context)
 
@@ -592,13 +601,7 @@ async def run_agent_loop(
     user_content = build_message_content(question, attachments)
     messages.append({"role": "user", "content": user_content})
 
-    # model="local" is the pre-#654 constant for every non-remote turn on
-    # this native path (Anthropic included — see module notes; that gap is
-    # pre-existing and untouched here). The remote provider (#654) is the one
-    # case where the real model id is known up front, so it's set at
-    # construction rather than left for _track_usage to patch in later —
-    # a cancellation before any round completes still reports it correctly.
-    result = AgentResult(full_text="", model=(settings.remote_llm_model if force_remote else "local"))
+    result = AgentResult(full_text="", model=resolved_model)
     # #615: hand the caller a live reference to `result` before the loop does
     # any work. `_track_usage` below mutates it in place every round, so a
     # caller that stashes this object can read accrued usage at any point --
@@ -612,25 +615,51 @@ async def run_agent_loop(
         result.total_output_tokens += usage.output_tokens
         result.total_cache_read_tokens += usage.cache_read_input_tokens
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
+        # (#661) Derive cost from the model that actually served the turn,
+        # recomputed from the running totals each round (mirrors the
+        # accumulation above -- cost_for is cheap and this keeps
+        # total_cost_usd correct if a caller reads it mid-loop via the
+        # turn_state reference). "local" is priced at $0 in PRICING, so a
+        # genuinely local turn still lands on 0.0 here -- as a result of
+        # pricing a free model, not an unconditional assignment. A model
+        # with no known rate is left at 0.0 too, but flagged `unpriced`
+        # rather than asserted free -- see pricing.is_known_model's
+        # docstring for why this caller doesn't want cost_for's
+        # budget-enforcement Opus-rate fallback.
+        #
+        # (#654) The one exception: the configured remote provider's rates
+        # come from settings, not pricing.PRICING. The whole point of that
+        # slot is an operator-flippable model id (Fireworks today, anything
+        # OpenAI-compatible tomorrow) -- a static dict keyed by literal model
+        # id would need a code change on every flip, which is exactly what
+        # the picker was built to avoid. Gated on force_remote (not just
+        # "is this model in PRICING") so an upstream model id that happens
+        # to collide with a first-party key can't accidentally borrow that
+        # key's rate.
         if force_remote:
-            # Paid remote provider (#654): unlike every other path here, this
-            # one has a real, non-zero cost — accumulated across rounds from
-            # the configured per-token rates. No configured rate means no
-            # honest number to report: mark unpriced (usage_store's #613
-            # column) rather than defaulting to a guess (the exact hazard
-            # cost_tracker.calculate_cost's old Sonnet fall-through created).
             input_price = settings.remote_llm_input_price_per_mtok
             output_price = settings.remote_llm_output_price_per_mtok
             if input_price is None or output_price is None:
+                result.total_cost_usd = 0.0
                 result.unpriced = True
             else:
-                result.total_cost_usd += (
-                    (usage.input_tokens / 1_000_000) * input_price
-                    + (usage.output_tokens / 1_000_000) * output_price
+                result.total_cost_usd = (
+                    (result.total_input_tokens / 1_000_000) * input_price
+                    + (result.total_output_tokens / 1_000_000) * output_price
                 )
+                result.unpriced = False
+        elif is_known_model(result.model):
+            result.total_cost_usd = cost_for(
+                result.model,
+                result.total_input_tokens,
+                result.total_output_tokens,
+                result.total_cache_creation_tokens,
+                result.total_cache_read_tokens,
+            )
+            result.unpriced = False
         else:
-            # Local model has no cost
             result.total_cost_usd = 0.0
+            result.unpriced = True
         # (#629) this round's usage is now folded into the totals above --
         # clear the provisional (in-flight) figures so a caller that adds
         # provisional_* to total_* (chat.py's cancel handler) doesn't
