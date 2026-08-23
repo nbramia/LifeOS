@@ -1388,12 +1388,13 @@ async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_fir
 
 stub_hermes_usage = FastAPI()
 
-# cost_usd (0.00087) is deliberately *not* what Anthropic sonnet-fallback
-# pricing (api/services/cost_tracker.py's MODEL_PRICING, the price any
-# non-haiku/opus model falls through to) would compute for these same token
-# counts: (120/1e6)*3.0 + (340/1e6)*15.0 = 0.00546. Recording the wrong,
-# upstream-reported number rather than that recomputed one is exactly the
-# behavior under test — proof the store isn't quietly recalculating it.
+# cost_usd (0.00087) is deliberately *not* what the live pricing table
+# (agent_worker/pricing.py's cost_for, #656) would compute for this
+# unrecognized model -- its conservative Opus-rate fallback for these same
+# token counts: (120/1e6)*15.0 + (340/1e6)*75.0 = 0.0273. Recording the
+# wrong, upstream-reported number rather than that recomputed one is
+# exactly the behavior under test — proof the store isn't quietly
+# recalculating it.
 _USAGE_SSE_CHUNKS = [
     b'data: {"type": "conversation_id", "conversation_id": "usage-conv-1"}\n\n',
     b'data: {"type": "content", "content": "here is your answer"}\n\n',
