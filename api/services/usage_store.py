@@ -108,7 +108,8 @@ class UsageStore:
             model: Model name used
             input_tokens: Number of input tokens
             output_tokens: Number of output tokens
-            cost_usd: Cost in USD
+            cost_usd: Cost in USD. A negative value is clamped to 0.0 and
+                logged loudly (#657) -- see below.
             conversation_id: Optional conversation ID
             unpriced: True when the caller has no real cost for this turn
                 (an external backend that sent no `cost_usd`) — `cost_usd`
@@ -119,6 +120,26 @@ class UsageStore:
         Returns:
             ID of the created record
         """
+        # A negative cost is never legitimate -- money spent can't be less
+        # than zero -- and it silently shrinks every SUM(cost_usd) it feeds
+        # (GET /api/admin/usage, session-cost totals). #657 traced one
+        # historical cause (a cache-token accounting bug in a long-gone
+        # version of agent_loop.py that subtracted cache tokens from an
+        # already-non-cached input_tokens count), but this guard is a
+        # backstop against *any* upstream miscalculation, not just that one.
+        # Clamp rather than reject so the call still succeeds and the
+        # (accurate) token counts are still recorded -- but log loudly so a
+        # recurrence is visible instead of silently absorbed.
+        if cost_usd < 0:
+            logger.error(
+                "record_usage: negative cost_usd=%r for model=%s "
+                "(input_tokens=%d, output_tokens=%d, conversation_id=%s) -- "
+                "clamping to 0.0. Cost cannot be negative; this indicates a "
+                "bug in whatever computed it.",
+                cost_usd, model, input_tokens, output_tokens, conversation_id,
+            )
+            cost_usd = 0.0
+
         now = datetime.now().isoformat()
 
         with sqlite3.connect(self.db_path) as conn:
