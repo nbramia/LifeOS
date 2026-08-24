@@ -629,6 +629,14 @@ async def full_health_check():
         "GET", "/api/imessage/statistics",
     )
 
+    # 12. Model readout (#658) — which model is actually serving each chat
+    # surface right now. Informational, not a pass/fail check: kept out of
+    # `results["checks"]` (and its "ok"/"error" degraded/unhealthy counting
+    # below) because an "unknown" Hermes readout doesn't mean LifeOS itself
+    # is unhealthy. See api/services/model_readout.py.
+    from api.services.model_readout import get_model_readout
+    results["models"] = await get_model_readout()
+
     # Set overall status
     failed = [k for k, v in results["checks"].items() if v["status"] == "error"]
     if failed:
