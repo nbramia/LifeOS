@@ -792,6 +792,33 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "process_inbox_items",
+        "description": (
+            "Process multiple Life Inbox items in one review. Use after review_inbox "
+            "to classify every clear item in the returned list. Include one object "
+            "per item with item_id, category, and optional cleaned memory content."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string"},
+                            "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"]},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["item_id", "category"],
+                    },
+                    "description": "Inbox classifications to apply, maximum 50.",
+                },
+            },
+            "required": ["items"],
+        },
+    },
+    {
         "name": "search_memories",
         "description": (
             "Search saved memories by wording and meaning. Use to recall previously saved "
@@ -2585,6 +2612,19 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     return f"Inbox item classified as {category}." + (f" Memory saved with id {linked_id}." if linked_id else "")
 
 
+async def _tool_process_inbox_items(inp: dict) -> str:
+    entries = inp.get("items") or []
+    if not isinstance(entries, list) or not entries:
+        return "Error: items must be a non-empty list."
+    results = []
+    for entry in entries[:50]:
+        if isinstance(entry, dict):
+            results.append(await _tool_process_inbox_item(entry))
+    return f"Processed {len(results)} Life Inbox items.\n" + "\n".join(
+        f"- {result}" for result in results
+    )
+
+
 # Result cap for memory search. Exposed to the caller so a memory that missed on
 # wording can be reached by widening; also the truncation yardstick, so it has to
 # be a usable positive int however the model fills it in.
@@ -3570,6 +3610,7 @@ _TOOL_HANDLERS = {
     "save_memory": _tool_save_memory,
     "review_inbox": _tool_review_inbox,
     "process_inbox_item": _tool_process_inbox_item,
+    "process_inbox_items": _tool_process_inbox_items,
     "search_memories": _tool_search_memories,
 }
 
@@ -3623,5 +3664,6 @@ TOOL_STATUS_MESSAGES = {
     "save_memory": "Saving memory...",
     "review_inbox": "Reviewing your Life Inbox...",
     "process_inbox_item": "Processing Life Inbox item...",
+    "process_inbox_items": "Processing Life Inbox items...",
     "search_memories": "Searching memories...",
 }

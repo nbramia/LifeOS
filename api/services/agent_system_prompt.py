@@ -111,6 +111,12 @@ relationship, source, knowledge, preference, or dismissed, while preserving its
 original capture and provenance. During a weekly review, use this for every
 clear item rather than merely describing the item and stopping.
 
+**process_inbox_items:**
+Classifies many inbox items in one operation. Prefer this during weekly reviews
+so the review is completed in one pass instead of stopping after one or two
+items. Process clear low-risk items automatically; keep tasks and reminders as
+proposals until the user confirms them.
+
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
 
