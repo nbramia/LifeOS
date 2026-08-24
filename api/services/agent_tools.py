@@ -2291,8 +2291,31 @@ def _tool_manage_tasks(inp: dict):
 
 # -- Reminder helpers --
 
+def _validate_future_once(schedule_type: str, schedule_value: str) -> str | None:
+    """Reject user-created one-off reminders that can never fire."""
+    if schedule_type != "once":
+        return None
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from config.settings import settings
+    try:
+        when = datetime.fromisoformat(schedule_value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=ZoneInfo(settings.timezone))
+        if when.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return (
+                f"The requested one-time time ({schedule_value}) is already in the past. "
+                "No reminder was created; choose a future date/time."
+            )
+    except (TypeError, ValueError, KeyError):
+        return f"Invalid one-time schedule datetime: {schedule_value!r}. No reminder was created."
+    return None
+
 def _reminder_create(inp: dict) -> str:
     from api.services.reminder_store import get_reminder_store
+    invalid = _validate_future_once(inp["schedule_type"], inp["schedule_value"])
+    if invalid:
+        return f"Error: {invalid}"
     store = get_reminder_store()
     reminder = store.create(
         name=inp["name"],
@@ -2331,6 +2354,9 @@ def _tool_manage_reminders(inp: dict):
 
 def _schedule_create(inp: dict) -> str:
     from api.services.scheduler_store import get_scheduler_store
+    invalid = _validate_future_once(inp["schedule_type"], inp["schedule_value"])
+    if invalid:
+        return f"Error: {invalid}"
     store = get_scheduler_store()
     # `action` is the manage_schedules operation (create/list); the schedule's
     # own action is passed as `schedule_action`.
