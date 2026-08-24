@@ -109,6 +109,39 @@ def _capture_candidate(question: str) -> str | None:
     return None
 
 
+def _extract_commitment_candidate(question: str) -> dict | None:
+    """Extract only unambiguous promise phrasing for deterministic fallback."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    match = re.match(
+        r"^I\s+promised\s+([A-Z][\w'-]{1,30})(?:\s+that\s+I\s+would|\s+to)\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return {
+            "direction": "owed_by_me",
+            "person_name": match.group(1),
+            "content": match.group(2).strip(),
+        }
+    match = re.match(
+        r"^([A-Z][\w'-]{1,30})\s+promised\s+me(?:\s+that\s+they\s+would|\s+to)?\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return {
+            "direction": "owed_to_me",
+            "person_name": match.group(1),
+            "content": match.group(2).strip(),
+        }
+    return None
+
+
 def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) -> None:
     """Close the raw transport capture once this turn has been interpreted.
 
@@ -1221,6 +1254,31 @@ async def ask_stream(request: AskStreamRequest):
                     "is_error": False,
                 })
                 _notice = "\n\nSaved as persistent memory."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _commitment_candidate = _extract_commitment_candidate(request.question)
+            _commitment_tool_succeeded = any(
+                tc.get("tool") == "manage_commitments"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "create"
+                for tc in agent_result.tool_calls_log
+            )
+            if _commitment_candidate and not _commitment_tool_succeeded:
+                from api.services.commitment_store import create_commitment
+                _commitment = create_commitment(
+                    _commitment_candidate["content"],
+                    direction=_commitment_candidate["direction"],
+                    person_name=_commitment_candidate["person_name"],
+                    source=request.source or {"type": "chat"},
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_commitments",
+                    "input": {"action": "create", **_commitment_candidate},
+                    "result": f"Commitment recorded (id: {_commitment['id']})",
+                    "is_error": False,
+                })
+                _notice = "\n\nI tracked that commitment."
                 agent_result.full_text += _notice
                 await _content(_notice)
 

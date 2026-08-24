@@ -295,7 +295,7 @@ class MemoryStore:
         for existing in self._memories.values():
             if existing.is_active and " ".join(existing.content.split()).casefold() == normalized_content:
                 if source:
-                    self.update_source(existing.id, source)
+                    return self.update_source(existing.id, source) or existing
                 return existing
 
         memory = Memory(
