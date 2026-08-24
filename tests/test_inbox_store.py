@@ -47,7 +47,12 @@ def test_review_inbox_auto_files_clear_items(tmp_path, monkeypatch):
 
 def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkeypatch):
     monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
-    from api.routes.chat import _close_chat_inbox_item, _capture_candidate, _extract_commitment_candidate
+    from api.routes.chat import (
+        _close_chat_inbox_item,
+        _capture_candidate,
+        _extract_commitment_candidate,
+        _requested_life_review_mode,
+    )
 
     assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
     assert _extract_commitment_candidate("I promised John to send him the deck") == {
@@ -55,6 +60,8 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         "person_name": "John",
         "content": "send him the deck",
     }
+    assert _requested_life_review_mode("What should I do today?") == "today"
+    assert _requested_life_review_mode("Which projects am I neglecting?") == "neglected"
     item = inbox_store.add_item("I want to build a cafe AI product")
     _close_chat_inbox_item(
         item["id"],

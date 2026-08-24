@@ -142,6 +142,36 @@ def _extract_commitment_candidate(question: str) -> dict | None:
     return None
 
 
+def _requested_life_review_mode(question: str) -> str | None:
+    text = (question or "").strip().lower()
+    if re.search(r"\b(what should i do today|what are my priorities today|what am i forgetting)\b", text):
+        return "today"
+    if re.search(r"\b(which goals|which projects|what goals|what projects).{0,40}\b(neglect|neglected|neglecting|stuck|forgotten)\b", text):
+        return "neglected"
+    if re.search(r"\b(weekly life review|review my week|review my life)\b", text):
+        return "weekly"
+    return None
+
+
+def _commitment_query_person(question: str) -> str:
+    text = question or ""
+    match = re.search(r"\bwhat\s+does\s+([A-Z][\w'-]{1,30})\s+owe\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\bwhat\s+did\s+([A-Z][\w'-]{1,30})\s+promise\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\bwhat\s+did\s+i\s+promise\s+([A-Z][\w'-]{1,30})\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(
+        r"\b(?:promise|promised|owe|owes|owed)\b(?:\s+(?:to|me|from))?\s+([A-Z][\w'-]{1,30})",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
 def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) -> None:
     """Close the raw transport capture once this turn has been interpreted.
 
@@ -1279,6 +1309,52 @@ async def ask_stream(request: AskStreamRequest):
                     "is_error": False,
                 })
                 _notice = "\n\nI tracked that commitment."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _review_mode = _requested_life_review_mode(request.question)
+            _review_tool_succeeded = any(
+                tc.get("tool") == "life_review" and not tc.get("is_error")
+                for tc in agent_result.tool_calls_log
+            )
+            if _review_mode and not _review_tool_succeeded:
+                from api.services.agent_tools import _tool_life_review
+                _review = _tool_life_review({"mode": _review_mode})
+                agent_result.tool_calls_log.append({
+                    "tool": "life_review",
+                    "input": {"mode": _review_mode},
+                    "result": _review,
+                    "is_error": False,
+                })
+                _notice = "\n\nHere is the current record-based review:\n\n" + _review
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _commitment_query = bool(re.search(
+                r"\b(what did i promise|what do i owe|what does \w+ owe|what did \w+ promise)",
+                request.question or "",
+                re.IGNORECASE,
+            ))
+            _commitment_query_tool_succeeded = any(
+                tc.get("tool") == "manage_commitments"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "list"
+                for tc in agent_result.tool_calls_log
+            )
+            if _commitment_query and not _commitment_query_tool_succeeded:
+                from api.services.agent_tools import _tool_manage_commitments
+                _person = _commitment_query_person(request.question)
+                _commitment_result = _tool_manage_commitments({
+                    "action": "list",
+                    "person_name": _person,
+                })
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_commitments",
+                    "input": {"action": "list", "person_name": _person},
+                    "result": _commitment_result,
+                    "is_error": False,
+                })
+                _notice = "\n\nI checked your recorded commitments:\n\n" + _commitment_result
                 agent_result.full_text += _notice
                 await _content(_notice)
 
