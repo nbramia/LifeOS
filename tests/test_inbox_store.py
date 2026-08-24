@@ -51,6 +51,7 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         _close_chat_inbox_item,
         _capture_candidate,
         _life_model_candidate,
+        _project_candidate,
         _extract_commitment_candidate,
         _requested_life_review_mode,
         _source_capture_candidate,
@@ -67,6 +68,8 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         "ideal_state", "calm and meaningful"
     )
     assert _life_model_candidate("Maybe I should learn Japanese") is None
+    assert _project_candidate("I am building an AI product for cafes")["status"] == "active"
+    assert _project_candidate("Maybe I should learn Japanese") is None
     assert _extract_commitment_candidate("I promised John to send him the deck") == {
         "direction": "owed_by_me",
         "person_name": "John",

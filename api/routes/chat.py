@@ -141,6 +141,30 @@ def _life_model_candidate(question: str) -> tuple[str, str] | None:
     return None
 
 
+def _project_candidate(question: str) -> dict | None:
+    """Extract a clear project transition for the deterministic fallback."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    patterns = (
+        (r"^(?:i(?:'m|\s+am)\s+)?working\s+on\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?building\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?developing\s+(.+?)\.?$", "active"),
+        (r"^(?:i\s+)?want\s+to\s+(?:build|create|develop)\s+(.+?)\.?$", "potential"),
+        (r"^(?:my\s+)?project\s+(?:is|:|-)\s*(.+?)\.?$", "active"),
+    )
+    for pattern, status in patterns:
+        match = re.match(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            name = match.group(1).strip().rstrip(".").strip()
+            if len(name) >= 4 and "?" not in name:
+                return {"name": name, "status": status, "summary": text}
+    return None
+
+
 def _extract_commitment_candidate(question: str) -> dict | None:
     """Extract only unambiguous promise phrasing for deterministic fallback."""
     text = re.sub(
@@ -1420,6 +1444,32 @@ async def ask_stream(request: AskStreamRequest):
                 agent_result.full_text += _notice
                 await _content(_notice)
 
+            _project_candidate_value = _project_candidate(request.question)
+            _project_tool_succeeded = any(
+                tc.get("tool") == "manage_projects"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") in {"upsert", "archive"}
+                for tc in agent_result.tool_calls_log
+            )
+            if _project_candidate_value and not _project_tool_succeeded:
+                from api.services.project_store import upsert as upsert_project
+                _project = upsert_project(
+                    _project_candidate_value["name"],
+                    status=_project_candidate_value["status"],
+                    summary=_project_candidate_value["summary"],
+                    source=request.source or {"type": "chat"},
+                    evidence_type="explicit",
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_projects",
+                    "input": {"action": "upsert", **_project_candidate_value},
+                    "result": f"Project updated: {_project['id']}",
+                    "is_error": False,
+                })
+                _notice = f"\n\nI added that to your projects as {_project['name']}."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
             _source_capture = _source_capture_candidate(request.question, request.source)
             if _source_capture and not _memory_tool_succeeded:
                 from api.services.memory_store import get_memory_store
@@ -1553,6 +1603,19 @@ async def ask_stream(request: AskStreamRequest):
                                 from api.services.life_model_store import update_source
                                 uuid.UUID(_life_model_match.group(1))
                                 update_source(_life_model_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_projects":
+                        _project_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _project_match:
+                            try:
+                                from api.services.project_store import update_source
+                                uuid.UUID(_project_match.group(1))
+                                update_source(_project_match.group(1), request.source)
                             except ValueError:
                                 pass
 

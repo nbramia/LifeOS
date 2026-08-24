@@ -801,6 +801,32 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "manage_projects",
+        "description": (
+            "Read or update the current state of a project. Use upsert when the user "
+            "explicitly starts, changes, pauses, or completes a project. Preserve a "
+            "short summary, current next action, priority, and provenance. Do not turn "
+            "an idea into an active project unless the user indicates that transition."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "get", "upsert", "archive"]},
+                "project_id": {"type": "string"},
+                "name": {"type": "string", "description": "Stable human-readable project name."},
+                "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                "summary": {"type": "string"},
+                "next_action": {"type": "string"},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
+                "evidence_type": {"type": "string", "enum": ["explicit", "inference"]},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+                "limit": {"type": "integer"},
+                "include_archived": {"type": "boolean"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "manage_commitments",
         "description": (
             "Track promises and commitments with provenance. Use create when the user "
@@ -1077,7 +1103,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "manage_projects", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -2397,6 +2423,7 @@ def _tool_life_review(inp: dict) -> str:
     from api.services.scheduler_store import get_scheduler_store
     from api.services.task_manager import get_task_manager
     from api.services.life_model_store import list_records
+    from api.services.project_store import list_projects
 
     mode = str(inp.get("mode", "today") or "today").strip().lower()
     if mode not in {"today", "weekly", "neglected"}:
@@ -2587,6 +2614,21 @@ def _tool_life_review(inp: dict) -> str:
             lines.append("- No goals or projects have been inactive for at least 14 days on record.")
         else:
             lines.append("- No goals or projects are recorded in the current memory set.")
+
+    current_projects = list_projects(limit=limit)
+    lines.append("\n## Current projects")
+    if current_projects:
+        for project in current_projects:
+            if project.get("status") == "completed" and mode == "today":
+                continue
+            next_action = f"; next: {project['next_action']}" if project.get("next_action") else ""
+            priority = f"; priority: {project['priority']}" if project.get("priority") else ""
+            lines.append(
+                f"- {project['name']} [{project['status']}{priority}]{next_action}"
+                f" — {project.get('summary') or 'no summary recorded'}"
+            )
+    else:
+        lines.append("- No structured project records are recorded.")
 
     if mode != "neglected":
         ideas = [memory for memory in memories if memory.category == "ideas"]
@@ -2959,6 +3001,64 @@ def _tool_manage_life_model(inp: dict) -> str:
                 lines.extend(f"- {row['content']} [{row.get('evidence_type', 'explicit')}]" for row in rows)
         return "\n".join(lines) if any_records else "No structured life model records are recorded yet."
     return "Error: action must be get or record."
+
+
+def _tool_manage_projects(inp: dict) -> str:
+    from api.services.project_store import get_project, list_projects, upsert
+
+    action = str(inp.get("action", "list")).strip().lower()
+    if action == "list":
+        rows = list_projects(
+            include_archived=bool(inp.get("include_archived", False)),
+            limit=int(inp.get("limit", 20) or 20),
+        )
+        if not rows:
+            return "No project records are recorded."
+        lines = ["Projects:"]
+        for item in rows:
+            next_action = f"; next: {item['next_action']}" if item.get("next_action") else ""
+            priority = f"; priority: {item['priority']}" if item.get("priority") else ""
+            lines.append(f"- {item['name']} [{item['status']}{priority}]{next_action}")
+        return "\n".join(lines)
+    if action == "get":
+        item = get_project(str(inp.get("project_id", "")), str(inp.get("name", "")))
+        if not item:
+            return "No matching project record is recorded."
+        lines = [
+            f"Project: {item['name']} [{item['status']}]",
+            f"Summary: {item.get('summary') or 'No summary recorded.'}",
+            f"Next action: {item.get('next_action') or 'No next action recorded.'}",
+            f"Evidence: {item.get('evidence_type', 'explicit')}",
+        ]
+        if item.get("history"):
+            lines.append(f"History entries: {len(item['history'])}")
+        return "\n".join(lines)
+    name = str(inp.get("name", "")).strip()
+    if not name and action != "archive":
+        return "Error: name is required."
+    if action == "archive":
+        item = get_project(str(inp.get("project_id", "")), name)
+        if not item:
+            return "Error: project not found."
+        name = item["name"]
+        status = "archived"
+    elif action == "upsert":
+        status = inp.get("status", "active")
+    else:
+        return "Error: action must be list, get, upsert, or archive."
+    try:
+        item = upsert(
+            name,
+            status=status,
+            summary=str(inp.get("summary", "")),
+            next_action=str(inp.get("next_action", "")),
+            priority=str(inp.get("priority", "")),
+            source=inp.get("source") or {"type": "conversation"},
+            evidence_type=inp.get("evidence_type", "explicit"),
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return f"Project updated: {item['name']} [{item['status']}] (id: {item['id']})"
 
 
 def _tool_manage_commitments(inp: dict) -> str:
@@ -4291,6 +4391,7 @@ _TOOL_HANDLERS = {
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
     "life_review": _tool_life_review,
+    "manage_projects": _tool_manage_projects,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
     "manage_workouts": _tool_manage_workouts,
@@ -4326,6 +4427,7 @@ TOOL_STATUS_MESSAGES = {
     "person_info.briefing": "Generating briefing...",
     "manage_tasks": "Managing tasks...",
     "life_review": "Reviewing your priorities...",
+    "manage_projects": "Updating project state...",
     "manage_life_model": "Updating your life model...",
     "manage_tasks.create": "Creating task...",
     "manage_tasks.list": "Loading tasks...",
