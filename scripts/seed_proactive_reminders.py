@@ -6,7 +6,7 @@ Creates four prompt-type reminders:
 1. Pre-meeting prep (every 15 min on weekdays, checks for upcoming meetings)
 2. Morning briefing (daily at 6:30 AM in the configured LifeOS timezone)
 3. Weekly communication gap digest (Sundays at 10 AM in the configured timezone)
-4. Weekly Life Inbox review (Sundays at 11 AM in the configured timezone)
+4. Weekly Life Inbox review (Sundays at 10 AM in the configured timezone)
 
 Usage:
     ~/.venvs/lifeos/bin/python scripts/seed_proactive_reminders.py [--dry-run] [--only NAME]
@@ -154,9 +154,9 @@ REMINDERS = [
         "timezone": _TZ,
     },
     {
-        "name": "Weekly Life Inbox Review",
+        "name": "Weekly Life Inbox review",
         "schedule_type": "cron",
-        "schedule_value": "0 11 * * 0",  # Sundays at 11:00 AM
+        "schedule_value": "0 10 * * 0",  # Sundays at 10:00 AM
         "message_type": "prompt",
         "message_content": LIFE_INBOX_REVIEW_PROMPT,
         "enabled": True,
