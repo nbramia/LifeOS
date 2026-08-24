@@ -43,6 +43,15 @@ MEMORY_SEARCH_CORPUS_LIMIT = 1000
 
 # Memory categories and their trigger patterns
 CATEGORY_PATTERNS = {
+    "goals": [
+        r"\b(?:I|Amir)\s+(?:want|plan|hope|aim|intend)\s+to\b",
+        r"\btop\s+priorit(?:y|ies)\b",
+        r"\b(?:my\s+)?(?:goal|vision)\s+(?:is|:)",
+    ],
+    "projects": [
+        r"\b(?:project|product)\b",
+        r"\b(?:build|building|develop|developing|working\s+on)\b",
+    ],
     "people": [
         r"\b(he|she|they)\s+(prefers?|likes?|wants?)",
         r"\b[A-Z][a-z]+\s+(prefers?|likes?|wants?|needs?|is|has)",
