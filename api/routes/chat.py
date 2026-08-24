@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 import re
+import uuid
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -1127,6 +1128,23 @@ async def ask_stream(request: AskStreamRequest):
                 _notice = "\n\nSaved as persistent memory."
                 agent_result.full_text += _notice
                 await _content(_notice)
+
+            # Tool calls created inside the model loop do not know the transport
+            # identity. Backfill the exact Telegram/API source onto any memory
+            # id returned by save_memory.
+            if request.source:
+                from api.services.memory_store import get_memory_store
+                _memory_store = get_memory_store()
+                for _tool_call in agent_result.tool_calls_log:
+                    if _tool_call.get("tool") != "save_memory" or _tool_call.get("is_error"):
+                        continue
+                    _match = re.search(r"id:\s*([0-9a-f-]{36})", str(_tool_call.get("result", "")), re.I)
+                    if _match:
+                        try:
+                            uuid.UUID(_match.group(1))
+                            _memory_store.update_source(_match.group(1), request.source)
+                        except ValueError:
+                            pass
 
             # Record usage
             if agent_result.total_input_tokens > 0:

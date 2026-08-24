@@ -323,6 +323,25 @@ class MemoryStore:
             return memory
         return None
 
+    def update_source(self, memory_id: str, source: dict) -> Optional[Memory]:
+        """Attach or correct provenance without changing memory content."""
+        memory = self._memories.get(memory_id)
+        if not memory or not memory.is_active:
+            return None
+        updated = Memory(
+            id=memory.id,
+            content=memory.content,
+            category=memory.category,
+            keywords=memory.keywords,
+            created_at=memory.created_at,
+            updated_at=datetime.now(),
+            is_active=True,
+            source=source,
+        )
+        self._memories[memory_id] = updated
+        self._save()
+        return updated
+
     def list_memories(self, category: str = None, limit: int = 100) -> list[Memory]:
         """
         List all active memories.
