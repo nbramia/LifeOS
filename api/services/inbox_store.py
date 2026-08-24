@@ -25,6 +25,20 @@ def add_item(content: str, *, conversation_id: str = "", source: str | dict = "c
             data = json.loads(path.read_text()) if path.exists() else {"items": []}
         except (OSError, json.JSONDecodeError):
             data = {"items": []}
+        # Telegram and webhook transports may retry delivery. A stable source
+        # identity is stronger than content equality: the same text in two
+        # different messages is still two captures, while one message should
+        # never become duplicate Inbox records.
+        if isinstance(source, dict) and source.get("type") and source.get("message_id") is not None:
+            for existing in data.get("items", []):
+                existing_source = existing.get("source")
+                if (
+                    isinstance(existing_source, dict)
+                    and existing_source.get("type") == source.get("type")
+                    and existing_source.get("chat_id") == source.get("chat_id")
+                    and existing_source.get("message_id") == source.get("message_id")
+                ):
+                    return existing
         item = {
             "id": str(uuid.uuid4()),
             "content": content,

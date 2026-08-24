@@ -32,6 +32,20 @@ def test_update_item_retains_pending_proposal(tmp_path, monkeypatch):
     assert persisted["items"][0]["proposal"]["type"] == "reminder"
 
 
+def test_add_item_deduplicates_same_source_identity(tmp_path, monkeypatch):
+    path = tmp_path / "inbox.json"
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(path))
+    source = {"type": "telegram", "chat_id": "1", "message_id": 42}
+
+    first = inbox_store.add_item("same message", source=source)
+    retry = inbox_store.add_item("same message", source=source)
+    different_message = inbox_store.add_item("same message", source={**source, "message_id": 43})
+
+    assert retry["id"] == first["id"]
+    assert different_message["id"] != first["id"]
+    assert len(inbox_store.list_items(status=None)) == 2
+
+
 def test_list_inbox_proposals_returns_confirmation_work(tmp_path, monkeypatch):
     path = tmp_path / "inbox.json"
     monkeypatch.setenv("LIFEOS_INBOX_PATH", str(path))
