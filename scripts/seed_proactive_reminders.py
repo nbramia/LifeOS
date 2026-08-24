@@ -24,8 +24,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.reminder_store import get_reminder_store
+from config.settings import settings
 
-_TZ = os.environ.get("LIFEOS_TIMEZONE", "America/New_York")
+# Use the same resolved timezone as the running LifeOS service.  Importing the
+# settings object also loads the repository .env for manual CLI runs, so a
+# seed command cannot silently fall back to a different machine timezone.
+_TZ = settings.timezone
 
 # ---------------------------------------------------------------------------
 # Prompt definitions
