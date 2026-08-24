@@ -22,6 +22,7 @@ class CreateMemoryRequest(BaseModel):
     """Request to create a new memory."""
     content: str = Field(..., min_length=1, description="Memory content (can be casual/natural language)")
     synthesize: bool = Field(default=True, description="Whether to use Claude to format the memory")
+    source: dict | None = Field(default=None, description="Source/provenance metadata for this memory")
 
 
 class UpdateMemoryRequest(BaseModel):
@@ -37,6 +38,7 @@ class MemoryResponse(BaseModel):
     keywords: list[str]
     created_at: str
     updated_at: str
+    source: dict | None = None
 
     @classmethod
     def from_memory(cls, memory: Memory) -> "MemoryResponse":
@@ -47,6 +49,7 @@ class MemoryResponse(BaseModel):
             keywords=memory.keywords,
             created_at=memory.created_at.isoformat() if memory.created_at else "",
             updated_at=memory.updated_at.isoformat() if memory.updated_at else "",
+            source=memory.source,
         )
 
 
@@ -123,7 +126,7 @@ async def create_memory(request: CreateMemoryRequest):
         content = await synthesize_memory(request.content)
         logger.info(f"Synthesized memory: {content[:100]}...")
 
-    memory = store.create_memory(content)
+    memory = store.create_memory(content, source=request.source or {"type": "api"})
 
     return MemoryResponse.from_memory(memory)
 
