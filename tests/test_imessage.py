@@ -1,8 +1,12 @@
 """
 Tests for iMessage integration.
 """
+import os
 import pytest
+import resource
+import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -439,3 +443,170 @@ class TestExtractTextFromAttributedBody:
         blob = "streamtyped\x00\x00Hello café world!\x00NSString".encode("utf-8")
         result = extract_text_from_attributed_body(blob)
         assert result == "Hello café world!"
+
+
+# Enough messages to span ~30 of the export's 1000-row batches.
+SOURCE_MESSAGE_COUNT = 30_000
+
+
+def _count_open_fds() -> int:
+    """Number of file descriptors this process currently holds open."""
+    proc_fds = Path("/proc/self/fd")
+    if proc_fds.is_dir():  # Linux
+        return len(os.listdir(proc_fds))
+
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)  # macOS/BSD
+    ceiling = 4096 if soft == resource.RLIM_INFINITY else min(soft, 4096)
+    open_fds = 0
+    for fd in range(ceiling):
+        try:
+            os.fstat(fd)
+        except OSError:
+            continue
+        open_fds += 1
+    return open_fds
+
+
+def _make_synthetic_chat_db(path: Path, message_count: int) -> None:
+    """Build a chat.db-shaped source database with obviously synthetic messages."""
+    # 2024-06-15T12:00:00Z in Apple's nanoseconds-since-2001 epoch.
+    apple_ts = datetime_to_apple_timestamp(datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc))
+
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+            CREATE TABLE message (
+                ROWID INTEGER PRIMARY KEY,
+                text TEXT,
+                attributedBody BLOB,
+                date INTEGER,
+                is_from_me INTEGER,
+                handle_id INTEGER,
+                service TEXT
+            );
+        """)
+        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+15550001111')")
+        conn.executemany(
+            "INSERT INTO message (ROWID, text, attributedBody, date, is_from_me, handle_id, service)"
+            " VALUES (?, ?, NULL, ?, ?, 1, 'iMessage')",
+            [
+                (rowid, f"synthetic message {rowid}", apple_ts, rowid % 2)
+                for rowid in range(1, message_count + 1)
+            ],
+        )
+
+
+class TestExportConnectionLifecycle:
+    """Regression tests for the file-descriptor leak in the export path (#647).
+
+    `with sqlite3.connect(...)` is a *transaction* context manager, not a
+    closing one: it commits but leaves the connection (and its fds) open. One
+    connection per batch exhausted the default macOS `ulimit -n` of 256 partway
+    through a first full export, and the resulting OperationalError on the
+    *destination* database was reported as missing Full Disk Access on the
+    *source*.
+    """
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = IMessageStore(f.name)
+            yield store
+            for suffix in ("", "-wal", "-shm"):
+                Path(f.name + suffix).unlink(missing_ok=True)
+
+    @pytest.fixture
+    def synthetic_source(self, tmp_path):
+        """A chat.db stand-in with enough rows to span many 1000-row batches.
+
+        The count matters: it has to exceed the fd headroom the low-limit test
+        allows, so a per-batch connection actually exhausts the limit.
+        """
+        source = tmp_path / "chat.db"
+        _make_synthetic_chat_db(source, message_count=SOURCE_MESSAGE_COUNT)
+        return source
+
+    def test_insert_batch_does_not_leak_fds(self, temp_store):
+        """200 batches must not accumulate 200 connections."""
+        now = datetime.now(timezone.utc).isoformat()
+        temp_store._insert_batch(
+            [(0, "warmup", now, 0, "+15550001111", "+15550001111", "iMessage")]
+        )
+
+        before = _count_open_fds()
+        for rowid in range(1, 201):
+            temp_store._insert_batch(
+                [(rowid, f"synthetic {rowid}", now, rowid % 2, "+15550001111", "+15550001111", "iMessage")]
+            )
+        leaked = _count_open_fds() - before
+
+        assert leaked <= 2, f"{leaked} file descriptors leaked across 200 batches"
+
+    def test_clear_data_does_not_leak_fds(self, temp_store):
+        temp_store._clear_data()  # warm up any lazily-created WAL sidecar files
+
+        before = _count_open_fds()
+        for _ in range(50):
+            temp_store._clear_data()
+        leaked = _count_open_fds() - before
+
+        assert leaked <= 2, f"{leaked} file descriptors leaked across 50 _clear_data calls"
+
+    def test_full_export_does_not_leak_fds(self, temp_store, synthetic_source):
+        """A multi-batch export holds one destination connection, not one per batch."""
+        temp_store.SOURCE_DB_PATH = synthetic_source
+
+        before = _count_open_fds()
+        stats = temp_store.export_from_source()
+        leaked = _count_open_fds() - before
+
+        assert stats["messages_exported"] == SOURCE_MESSAGE_COUNT
+        assert stats["new_last_rowid"] == SOURCE_MESSAGE_COUNT
+        assert leaked <= 2, f"{leaked} file descriptors leaked across a multi-batch export"
+
+    def test_full_export_survives_a_low_fd_limit(self, temp_store, synthetic_source):
+        """The real failure mode: a full export under a tight `ulimit -n`."""
+        temp_store.SOURCE_DB_PATH = synthetic_source
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        headroom = _count_open_fds() + 24
+        if soft != resource.RLIM_INFINITY and soft <= headroom:
+            pytest.skip("fd limit already tighter than the test's headroom")
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (headroom, hard))
+        try:
+            stats = temp_store.export_from_source()
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+        assert stats["messages_exported"] == SOURCE_MESSAGE_COUNT
+
+    def test_destination_failure_is_not_reported_as_full_disk_access(
+        self, temp_store, synthetic_source
+    ):
+        """An OperationalError while writing must surface as itself, not as FDA."""
+        temp_store.SOURCE_DB_PATH = synthetic_source
+
+        def failing_insert(batch, conn=None):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        temp_store._insert_batch = failing_insert
+
+        with pytest.raises(sqlite3.OperationalError, match="unable to open database file"):
+            temp_store.export_from_source()
+
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root bypasses file permissions, so the source cannot be made unreadable",
+    )
+    def test_unreadable_source_still_reports_full_disk_access(
+        self, temp_store, synthetic_source
+    ):
+        """FDA guidance is still given when the source database is genuinely unreadable."""
+        temp_store.SOURCE_DB_PATH = synthetic_source
+        synthetic_source.chmod(0o000)
+        try:
+            with pytest.raises(PermissionError, match="Full Disk Access"):
+                temp_store.export_from_source()
+        finally:
+            synthetic_source.chmod(0o600)

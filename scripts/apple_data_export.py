@@ -403,8 +403,8 @@ def export_imessage(dry_run: bool = False) -> dict:
     except FileNotFoundError:
         logger.warning("Apple Messages database not found — skipping iMessage export")
         return {"status": "skipped", "reason": "Messages.db not found"}
-    except PermissionError:
-        logger.warning("Cannot access Messages.db — grant Full Disk Access to Terminal")
+    except PermissionError as e:
+        logger.warning(f"Cannot access Messages.db — grant Full Disk Access to Terminal: {e}")
         return {"status": "skipped", "reason": "Full Disk Access required"}
 
     if not imessage_db.exists():
