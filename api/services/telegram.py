@@ -9,8 +9,10 @@ Three capabilities:
 Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.
 """
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import tempfile
 import threading
@@ -33,6 +35,7 @@ MAX_MESSAGE_LENGTH = 4096
 # would cut off the bullet a follow-up question is asking about (#435).
 MAX_QUOTED_REPLY_CHARS = 1500
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+MAX_PERSISTED_MEDIA_BYTES = 20 * 1024 * 1024
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -43,6 +46,50 @@ def _extract_urls(text: str) -> list[str]:
         if url and url not in urls:
             urls.append(url)
     return urls[:20]
+
+
+async def _persist_telegram_media(
+    file_id: str | None, chat_id: str, message_id: int | None, media_type: str,
+    token: str,
+) -> dict:
+    """Persist a Telegram attachment locally and return provenance metadata."""
+    if not file_id:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            file_resp = await client.get(
+                _telegram_url("getFile", token), params={"file_id": file_id}
+            )
+            file_resp.raise_for_status()
+            file_path = file_resp.json().get("result", {}).get("file_path")
+            if not file_path:
+                return {}
+            media_resp = await client.get(
+                f"{TELEGRAM_API}/file/bot{token}/{file_path}"
+            )
+            media_resp.raise_for_status()
+            data = media_resp.content
+        if len(data) > MAX_PERSISTED_MEDIA_BYTES:
+            logger.warning("Skipping Telegram %s: attachment exceeds %d bytes", media_type, MAX_PERSISTED_MEDIA_BYTES)
+            return {"persist_error": "attachment_too_large"}
+        digest = hashlib.sha256(data).hexdigest()
+        directory = Path(os.getenv("LIFEOS_TELEGRAM_MEDIA_DIR", str(Path.home() / ".lifeos" / "telegram_media")))
+        directory.mkdir(parents=True, exist_ok=True)
+        suffix = Path(file_path).suffix.lower() or ".bin"
+        safe_chat = re.sub(r"[^0-9A-Za-z_-]", "_", str(chat_id))
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", str(message_id or "unknown"))
+        destination = directory / f"telegram_{safe_chat}_{safe_id}_{media_type}{suffix}"
+        if not destination.exists():
+            destination.write_bytes(data)
+        return {
+            "attachment_path": str(destination),
+            "sha256": digest,
+            "size_bytes": len(data),
+            "telegram_file_path": file_path,
+        }
+    except Exception as exc:
+        logger.warning("Could not persist Telegram %s attachment: %s", media_type, exc)
+        return {"persist_error": "download_failed"}
 
 # The bot token for the message currently being handled. A listener sets this
 # once at the top of _handle_update so every outbound send during that update —
@@ -987,6 +1034,9 @@ class TelegramBotListener:
                     if isinstance(media_payload, dict) else None,
                     "forwarded": bool(message.get("forward_origin") or message.get("forward_from")),
                 })
+                source.update(await _persist_telegram_media(
+                    source.get("file_id"), chat_id, message_id, media_type, self._token,
+                ))
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
                 result = await chat_via_api(

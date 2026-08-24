@@ -364,6 +364,7 @@ class TestMediaCapture:
         with patch("api.services.telegram.settings") as mock_settings, \
              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram._persist_telegram_media", new_callable=AsyncMock, return_value={}), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             mock_settings.telegram_chat_id = "123"
             mock_chat.return_value = {"answer": "saved", "conversation_id": "c1", "claude_intent": False}
@@ -390,6 +391,7 @@ class TestMediaCapture:
         with patch("api.services.telegram.settings") as mock_settings, \
              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram._persist_telegram_media", new_callable=AsyncMock, return_value={}), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             mock_settings.telegram_chat_id = "123"
             mock_chat.return_value = {"answer": "received", "conversation_id": "c1", "claude_intent": False}
