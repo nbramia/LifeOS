@@ -76,8 +76,10 @@ For provider-independent deployments, set `LIFEOS_LLM_PROVIDERS` and
 `LIFEOS_LLM_MODELS` to JSON objects. A provider references its credential with
 `api_key_env`; personal data and memories are not stored in this registry. A
 `default` model profile selects the normal chat provider, while `fast`,
-`specialist`, `reasoning`, and other profiles can be assigned per operation as
-the application grows. Supported provider types are `anthropic` and
+`specialist`, `reasoning`, and other profiles can be assigned per operation or
+selected for an individual turn. In Telegram or chat, an explicit directive
+such as `Use Gemini for this` or `Use the strongest model for this turn` selects
+the matching configured profile (`gemini` or `reasoning`). Supported provider types are `anthropic` and
 `openai_compatible` (including OpenAI, Gemini, DeepSeek, OpenRouter, and local
 servers that expose the OpenAI chat-completions API).
 

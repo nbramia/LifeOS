@@ -460,9 +460,10 @@ class AskStreamRequest(BaseModel):
     # turn to that cloud model; "gemma"/"local" runs this turn on the local
     # llama-server; "claude_code" hands the turn off to a background Claude Code
     # worker session instead of answering inline (see the handoff short-circuit
-    # in stream_response). The model picks are honored only on the Anthropic
-    # backend (the local backend is already local); the "claude_code" handoff
-    # works on any backend. Unknown values fall back to auto.
+    # in stream_response). Named registry profiles (for example "gemini" or
+    # "reasoning") work across Anthropic/OpenAI-compatible backends. Natural
+    # Telegram directives such as "Use Gemini for this" resolve the same
+    # profiles. Unknown values fall back to auto.
     model_override: Optional[str] = None
     # Response modality. "voice" tells the orchestrator this turn will be read
     # aloud, so the selected persona's `voice` rules are appended to the system
