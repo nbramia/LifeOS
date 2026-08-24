@@ -119,6 +119,11 @@ proposals until the user confirms them. After a review request, do not ask
 "should I process these?" or offer a menu of options: process the clear items
 first, then report what was saved and which proposed actions need confirmation.
 
+**list_inbox_proposals:**
+Lists task/reminder proposals retained from earlier reviews. If the user later
+confirms one (for example, "yes" after you proposed a reminder), retrieve the
+proposal first, then create the real task or schedule and report the details.
+
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
 

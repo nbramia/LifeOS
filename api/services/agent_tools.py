@@ -819,6 +819,22 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "list_inbox_proposals",
+        "description": (
+            "List task and reminder proposals saved during Life Inbox review. "
+            "Use this when the user confirms a previously proposed action or asks "
+            "what pending actions still need confirmation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum proposals to return (default 20)."},
+                "since_days": {"type": "integer", "description": "Only proposals from the last N days (default 30)."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "search_memories",
         "description": (
             "Search saved memories by wording and meaning. Use to recall previously saved "
@@ -2682,6 +2698,33 @@ async def _tool_process_inbox_items(inp: dict) -> str:
     )
 
 
+def _tool_list_inbox_proposals(inp: dict) -> str:
+    from api.services.inbox_store import list_items
+
+    try:
+        limit = max(1, min(int(inp.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        since_days = max(0, min(int(inp.get("since_days", 30)), 3650))
+    except (TypeError, ValueError):
+        since_days = 30
+    items = [
+        item for item in list_items(status="processed", limit=1000, since_days=since_days)
+        if item.get("proposal")
+    ][:limit]
+    if not items:
+        return f"There are no pending Life Inbox proposals from the last {since_days} days."
+    lines = [f"Pending Life Inbox proposals ({len(items)}):"]
+    for item in items:
+        proposal = item["proposal"]
+        lines.append(
+            f"- id={item['id']} type={proposal.get('type', item.get('category', 'action'))} "
+            f"[{item.get('created_at', '')[:10]}] {proposal.get('content', item.get('content', ''))}"
+        )
+    return "\n".join(lines)
+
+
 # Result cap for memory search. Exposed to the caller so a memory that missed on
 # wording can be reached by widening; also the truncation yardstick, so it has to
 # be a usable positive int however the model fills it in.
@@ -3668,6 +3711,7 @@ _TOOL_HANDLERS = {
     "review_inbox": _tool_review_inbox,
     "process_inbox_item": _tool_process_inbox_item,
     "process_inbox_items": _tool_process_inbox_items,
+    "list_inbox_proposals": _tool_list_inbox_proposals,
     "search_memories": _tool_search_memories,
 }
 
@@ -3722,5 +3766,6 @@ TOOL_STATUS_MESSAGES = {
     "review_inbox": "Reviewing your Life Inbox...",
     "process_inbox_item": "Processing Life Inbox item...",
     "process_inbox_items": "Processing Life Inbox items...",
+    "list_inbox_proposals": "Loading pending Life Inbox proposals...",
     "search_memories": "Searching memories...",
 }
