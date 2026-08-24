@@ -850,6 +850,28 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "manage_followups",
+        "description": (
+            "Track a conditional follow-up such as 'if I have not heard back from Sarah "
+            "in a week'. Create records only when the user explicitly requests the "
+            "condition. A scheduled check verifies recorded interactions before notifying; "
+            "complete or cancel it when the condition is resolved."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "complete", "cancel"]},
+                "followup_id": {"type": "string"},
+                "person_name": {"type": "string"},
+                "subject": {"type": "string", "description": "What you are waiting to hear back about."},
+                "wait_days": {"type": "integer", "description": "Days to wait before checking; default 7."},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "review_inbox",
         "description": (
             "Review raw Life Inbox captures that may not yet have been classified "
@@ -2418,6 +2440,7 @@ def _tool_life_review(inp: dict) -> str:
     """Return a deterministic, evidence-backed personal action review."""
     from datetime import date, datetime, timezone
     from api.services.commitment_store import list_commitments
+    from api.services.followup_store import list_followups
     from api.services.inbox_store import list_items
     from api.services.memory_store import get_memory_store
     from api.services.scheduler_store import get_scheduler_store
@@ -2527,6 +2550,16 @@ def _tool_life_review(inp: dict) -> str:
                     lines.append(f"- Follow up with {person}: {item['content']}")
         else:
             lines.append("- No open commitments are recorded.")
+
+        conditional_followups = list_followups(limit=limit)
+        lines.append("\n## Conditional follow-ups")
+        if conditional_followups:
+            for item in conditional_followups:
+                lines.append(
+                    f"- {item['person_name']}: {item['subject']} — check at {item['check_at']}"
+                )
+        else:
+            lines.append("- No open conditional follow-ups are recorded.")
 
         lines.append("\n## Relationship follow-ups")
         relationship_gaps = []
@@ -3110,6 +3143,73 @@ def _tool_manage_commitments(inp: dict) -> str:
             if item else "Error: commitment not found."
         )
     return f"Error: Unknown commitment action '{action}'."
+
+
+def _tool_manage_followups(inp: dict) -> str:
+    from api.services.followup_store import create, list_followups, update_status
+
+    action = str(inp.get("action", "list")).strip().lower()
+    if action == "list":
+        rows = list_followups(limit=int(inp.get("limit", 50) or 50))
+        if not rows:
+            return "No open conditional follow-ups are recorded."
+        return "\n".join(
+            f"- {item['person_name']}: {item['subject']} (check at {item['check_at']}; status {item['status']})"
+            for item in rows
+        )
+    followup_id = str(inp.get("followup_id", "")).strip()
+    if action in {"complete", "cancel"}:
+        if not followup_id:
+            return "Error: followup_id is required."
+        item = update_status(followup_id, "completed" if action == "complete" else "cancelled")
+        if not item:
+            return "Error: follow-up not found."
+        schedule_id = item.get("schedule_id")
+        if schedule_id:
+            try:
+                from api.services.scheduler_store import get_scheduler_store
+                get_scheduler_store().delete(schedule_id)
+            except Exception:
+                logger.warning("Could not remove follow-up schedule %s", schedule_id, exc_info=True)
+        return f"Conditional follow-up {action}d: {item['person_name']} — {item['subject']}"
+    if action != "create":
+        return "Error: action must be create, list, complete, or cancel."
+    try:
+        item = create(
+            str(inp.get("person_name", "")),
+            str(inp.get("subject", "")),
+            wait_days=int(inp.get("wait_days", 7) or 7),
+            source=inp.get("source") or {"type": "conversation"},
+        )
+    except (TypeError, ValueError) as exc:
+        return f"Error: {exc}"
+    if not item.get("schedule_id"):
+        try:
+            from api.services.scheduler_store import get_scheduler_store
+            schedule = get_scheduler_store().create(
+                name=f"Follow up with {item['person_name']}",
+                schedule_type="once",
+                schedule_value=item["check_at"],
+                action="prompt",
+                message_type="prompt",
+                message_content=(
+                    f"Conditional follow-up check (id: {item['id']}): Check whether I have heard "
+                    f"back from {item['person_name']} about {item['subject']} since "
+                    f"{item['created_at']}. Use person_info and message history or other recorded "
+                    "sources. If there is evidence of a response, call manage_followups with "
+                    f"action=complete and followup_id={item['id']}, then reply exactly NO_ACTION. "
+                    "If there is no response, tell me briefly that I should follow up. Do not "
+                    "invent a response or claim a source was checked if it was not available."
+                ),
+            )
+            from api.services.followup_store import attach_schedule
+            item = attach_schedule(item["id"], schedule.id) or item
+        except Exception as exc:
+            logger.warning("Could not schedule conditional follow-up: %s", exc, exc_info=True)
+    return (
+        f"Conditional follow-up recorded for {item['person_name']}: {item['subject']} "
+        f"(check at {item['check_at']}; id: {item['id']})"
+    )
 
 
 def _auto_inbox_category(content: str) -> str | None:
@@ -4408,6 +4508,7 @@ _TOOL_HANDLERS = {
     "save_memory": _tool_save_memory,
     "manage_life_model": _tool_manage_life_model,
     "manage_commitments": _tool_manage_commitments,
+    "manage_followups": _tool_manage_followups,
     "review_inbox": _tool_review_inbox,
     "process_inbox_item": _tool_process_inbox_item,
     "process_inbox_items": _tool_process_inbox_items,
@@ -4468,6 +4569,7 @@ TOOL_STATUS_MESSAGES = {
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
     "manage_commitments": "Updating commitments...",
+    "manage_followups": "Tracking conditional follow-up...",
     "review_inbox": "Reviewing your Life Inbox...",
     "process_inbox_item": "Processing Life Inbox item...",
     "process_inbox_items": "Processing Life Inbox items...",
