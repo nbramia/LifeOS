@@ -2458,9 +2458,12 @@ def _tool_life_review(inp: dict) -> str:
         lines.append("\n## Life direction")
         for label, rows in model_rows:
             if rows:
-                latest = rows[-1]
-                evidence = latest.get("evidence_type", "explicit")
-                lines.append(f"- {label}: {latest.get('content', '')} [{evidence}]")
+                # Direction is cumulative: a new current-state update should
+                # not erase an earlier, still-relevant state. Keep the most
+                # recent bounded records and preserve their evidence labels.
+                for item in rows[-limit:]:
+                    evidence = item.get("evidence_type", "explicit")
+                    lines.append(f"- {label}: {item.get('content', '')} [{evidence}]")
     if mode != "neglected":
         lines.append("\n## Next actions")
         if tasks:

@@ -45,6 +45,19 @@ def test_life_review_combines_recorded_sources(monkeypatch):
         "api.services.memory_store.get_memory_store",
         lambda: SimpleNamespace(list_memories=lambda **_kwargs: [memory]),
     )
+    monkeypatch.setattr(
+        "api.services.life_model_store.list_records",
+        lambda: {
+            "identity": [],
+            "values": [],
+            "current_state": [
+                {"content": "Building the cafe AI product", "evidence_type": "explicit"},
+                {"content": "Repairing the car is a top priority", "evidence_type": "explicit"},
+            ],
+            "ideal_state": [],
+            "philosophy": [],
+        },
+    )
 
     result = agent_tools._tool_life_review({"mode": "today"})
 
@@ -55,3 +68,5 @@ def test_life_review_combines_recorded_sources(monkeypatch):
     assert "Unresolved capture" in result
     assert "Build the cafe AI product" in result
     assert "days since update" in result
+    assert "Building the cafe AI product" in result
+    assert "Repairing the car is a top priority" in result
