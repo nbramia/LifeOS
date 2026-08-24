@@ -109,6 +109,36 @@ def _capture_candidate(question: str) -> str | None:
     return None
 
 
+def _life_model_candidate(question: str) -> tuple[str, str] | None:
+    """Extract only explicit statements about the user's life direction.
+
+    This intentionally recognizes declarative language, not broad first-person
+    text. A model may still use ``manage_life_model`` when context makes a
+    statement clear, but this fallback keeps the core capture behavior working
+    when a provider stops after replying.
+    """
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    patterns = (
+        ("values", r"^(?:what matters to me is|i value|my values are)\s+(.+?)\.?$"),
+        ("philosophy", r"^(?:my philosophy is|i believe that|i believe)\s+(.+?)\.?$"),
+        ("ideal_state", r"^(?:my ideal (?:life|state) is|i want my life to|i want to become)\s+(.+?)\.?$"),
+        ("current_state", r"^(?:right now i am|currently i am|at the moment i am|my current state is)\s+(.+?)\.?$"),
+        ("identity", r"^(?:i am a|i am an|my identity is)\s+(.+?)\.?$"),
+    )
+    for section, pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            content = match.group(1).strip().rstrip(".").strip()
+            if len(content) >= 3 and "?" not in content:
+                return section, content
+    return None
+
+
 def _extract_commitment_candidate(question: str) -> dict | None:
     """Extract only unambiguous promise phrasing for deterministic fallback."""
     text = re.sub(
@@ -1343,6 +1373,43 @@ async def ask_stream(request: AskStreamRequest):
                     partial_text = ""
                     await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
                     await _content(_cleaned_capture_text)
+
+            # Keep explicit direction statements in the structured life model
+            # even when a provider replies conversationally without calling the
+            # optional tool. This is deliberately narrower than ordinary
+            # memory capture: only declarative identity/value/state/philosophy
+            # language qualifies.
+            _life_model_candidate_value = _life_model_candidate(request.question)
+            _life_model_tool_succeeded = any(
+                tc.get("tool") == "manage_life_model"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "record"
+                for tc in agent_result.tool_calls_log
+            )
+            if _life_model_candidate_value and not _life_model_tool_succeeded:
+                from api.services.life_model_store import record as record_life_model
+                _life_model_section, _life_model_content = _life_model_candidate_value
+                _life_model_item = record_life_model(
+                    _life_model_section,
+                    _life_model_content,
+                    source=request.source or {"type": "chat"},
+                    evidence_type="explicit",
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_life_model",
+                    "input": {
+                        "action": "record",
+                        "section": _life_model_section,
+                        "content": _life_model_content,
+                    },
+                    "result": f"Life model updated: {_life_model_item['id']}",
+                    "is_error": False,
+                })
+                _notice = (
+                    f"\n\nI added that to your {_life_model_section.replace('_', ' ')}."
+                )
+                agent_result.full_text += _notice
+                await _content(_notice)
 
             _source_capture = _source_capture_candidate(request.question, request.source)
             if _source_capture and not _memory_tool_succeeded:

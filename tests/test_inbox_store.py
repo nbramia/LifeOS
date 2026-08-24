@@ -50,6 +50,7 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
     from api.routes.chat import (
         _close_chat_inbox_item,
         _capture_candidate,
+        _life_model_candidate,
         _extract_commitment_candidate,
         _requested_life_review_mode,
         _source_capture_candidate,
@@ -57,6 +58,13 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
     )
 
     assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
+    assert _life_model_candidate("I value having time for family") == (
+        "values", "having time for family"
+    )
+    assert _life_model_candidate("My ideal life is calm and meaningful") == (
+        "ideal_state", "calm and meaningful"
+    )
+    assert _life_model_candidate("Maybe I should learn Japanese") is None
     assert _extract_commitment_candidate("I promised John to send him the deck") == {
         "direction": "owed_by_me",
         "person_name": "John",
