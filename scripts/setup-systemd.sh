@@ -61,6 +61,14 @@ MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
 
+# Google sync is useful only after at least the personal OAuth client file has
+# been installed. Keep the timer off on a fresh VPS rather than scheduling a
+# job that can only fail and misleadingly report an empty relationship graph.
+GOOGLE_SYNC_CONFIGURED="false"
+if [ -f "$PROJECT_DIR/config/credentials-personal.json" ]; then
+    GOOGLE_SYNC_CONFIGURED="true"
+fi
+
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) LLM_AUTOSTART="true" ;;
@@ -121,6 +129,7 @@ else
 fi
 echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
 echo "  Auto-Deploy:  $AUTODEPLOY_ENABLED"
+echo "  Google Sync:  $GOOGLE_SYNC_CONFIGURED"
 echo ""
 
 # Install unit files with variable substitution
@@ -176,8 +185,14 @@ echo "  lifeos-gpu-watchdog.timer: $(systemctl is-active lifeos-gpu-watchdog.tim
 systemctl enable --now lifeos-network-watchdog.timer
 echo "  lifeos-network-watchdog.timer: $(systemctl is-active lifeos-network-watchdog.timer)"
 
-systemctl enable --now lifeos-sync.timer
-echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
+if [ "$GOOGLE_SYNC_CONFIGURED" = "true" ]; then
+    systemctl enable --now lifeos-sync.timer
+    echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
+else
+    systemctl disable lifeos-sync.timer 2>/dev/null || true
+    systemctl stop lifeos-sync.timer 2>/dev/null || true
+    echo "  lifeos-sync.timer: disabled (add config/credentials-personal.json, then re-run setup)"
+fi
 
 # MCP HTTP transport is only enabled when a bearer token is configured.
 # The systemd unit reads the live .env at runtime; we check the token here

@@ -20,6 +20,8 @@ retain their original source and confidence.
 - [[LifeOS/Scheduler/Inbox]] — scheduling captures awaiting processing
 - `~/.lifeos/inbox.json` — raw Life Inbox captures, review status, proposals, and provenance
 - `~/.lifeos/life_model.json` — structured identity, values, current state, ideal state, and philosophy records
+- `~/.lifeos/projects.json` — current project state, status history, priorities, next actions, and provenance
+- `~/.lifeos/followups.json` — conditional follow-ups such as no-response checks and their provenance
 - [[Personal/Identity]] — identity, values, philosophy, and preferences
 - [[Personal/Goals]] — goals and ideal-state direction
 - [[Personal/Projects]] — active and potential projects
@@ -40,6 +42,8 @@ retain their original source and confidence.
    Telegram deployment runs this review every Sunday at 10:00 in its configured timezone.
 6. Keep explicit statements about identity and direction in the structured life model;
    label inferences as inferences and preserve their source.
+7. Treat missing source integrations as missing evidence: do not infer that a
+   relationship has no gaps when Gmail, Calendar, or messaging history is not synced.
 
 ## Provider independence
 

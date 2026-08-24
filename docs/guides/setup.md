@@ -326,6 +326,16 @@ sudo ./scripts/setup-systemd.sh
 systemctl status lifeos-api lifeos-chromadb
 ```
 
+The systemd setup installs and enables the nightly `lifeos-sync.timer` only
+after `config/credentials-personal.json` exists. This prevents a fresh VPS
+from running a guaranteed failing sync job. After completing Google OAuth,
+re-run `setup-systemd.sh` to activate Gmail/Calendar relationship history.
+
+```bash
+systemctl list-timers lifeos-sync.timer
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
+```
+
 ### macOS (launchd)
 
 > **Note:** launchd is macOS-only and superseded by systemd on Linux — see
