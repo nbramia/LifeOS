@@ -291,6 +291,13 @@ class MemoryStore:
         Returns:
             Created Memory object
         """
+        normalized_content = " ".join(content.split()).casefold()
+        for existing in self._memories.values():
+            if existing.is_active and " ".join(existing.content.split()).casefold() == normalized_content:
+                if source:
+                    self.update_source(existing.id, source)
+                return existing
+
         memory = Memory(
             id=str(uuid.uuid4()),
             content=content,
@@ -324,10 +331,22 @@ class MemoryStore:
         return None
 
     def update_source(self, memory_id: str, source: dict) -> Optional[Memory]:
-        """Attach or correct provenance without changing memory content."""
+        """Attach provenance without changing memory content.
+
+        The original ``source`` remains the primary citation for compatibility;
+        additional equivalent captures are retained in ``related_sources``.
+        """
         memory = self._memories.get(memory_id)
         if not memory or not memory.is_active:
             return None
+        merged_source = source
+        if isinstance(memory.source, dict) and isinstance(source, dict):
+            merged_source = dict(memory.source)
+            related = list(merged_source.get("related_sources", []))
+            if source != memory.source and source not in related:
+                related.append(source)
+            if related:
+                merged_source["related_sources"] = related
         updated = Memory(
             id=memory.id,
             content=memory.content,
@@ -336,7 +355,7 @@ class MemoryStore:
             created_at=memory.created_at,
             updated_at=datetime.now(),
             is_active=True,
-            source=source,
+            source=merged_source,
         )
         self._memories[memory_id] = updated
         self._save()
