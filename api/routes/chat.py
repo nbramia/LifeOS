@@ -327,6 +327,15 @@ def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) 
         if name == "manage_commitments" and args.get("action") == "create":
             category = "commitment"
             break
+        if name == "manage_followups" and args.get("action") == "create":
+            category = "reminder"
+            break
+        if name == "manage_projects" and args.get("action") in {"upsert", "archive"}:
+            category = "project"
+            break
+        if name == "manage_life_model" and args.get("action") == "record":
+            category = "memory"
+            break
         if name in {"manage_reminders", "manage_schedules"} and args.get("action") == "create":
             category = "reminder"
             break
@@ -1674,6 +1683,18 @@ async def ask_stream(request: AskStreamRequest):
                                 from api.services.project_store import update_source
                                 uuid.UUID(_project_match.group(1))
                                 update_source(_project_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_followups":
+                        _followup_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{20,})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _followup_match:
+                            try:
+                                from api.services.followup_store import update_source
+                                update_source(_followup_match.group(1), request.source)
                             except ValueError:
                                 pass
 

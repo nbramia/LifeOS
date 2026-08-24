@@ -102,6 +102,19 @@ def attach_schedule(followup_id: str, schedule_id: str) -> dict | None:
     return None
 
 
+def update_source(followup_id: str, source: dict) -> bool:
+    if not followup_id or not isinstance(source, dict) or not source:
+        return False
+    with _LOCK:
+        data = _read()
+        for item in data["followups"]:
+            if item.get("id") == followup_id:
+                item["source"] = source
+                _write(data)
+                return True
+    return False
+
+
 def list_followups(*, status: str = "open", limit: int = 50) -> list[dict]:
     with _LOCK:
         rows = list(_read()["followups"])
