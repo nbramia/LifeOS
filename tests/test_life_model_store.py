@@ -30,3 +30,11 @@ def test_life_model_rejects_unknown_sections(tmp_path, monkeypatch):
         assert "section" in str(exc)
     else:
         raise AssertionError("unknown section should be rejected")
+
+
+def test_life_model_source_can_be_attached_after_transport_is_known(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_LIFE_MODEL_PATH", str(tmp_path / "life_model.json"))
+    item = life_model_store.record("identity", "a software builder")
+    source = {"type": "telegram", "chat_id": "42", "message_id": "9"}
+    assert life_model_store.update_source(item["id"], source)
+    assert life_model_store.list_records("identity")[0]["sources"] == [source]

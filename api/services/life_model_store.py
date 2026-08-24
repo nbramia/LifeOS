@@ -107,6 +107,26 @@ def list_records(section: str | None = None) -> dict | list:
     return data
 
 
+def update_source(record_id: str, source: dict) -> bool:
+    """Attach transport provenance to a record created during a chat turn."""
+    if not record_id or not isinstance(source, dict) or not source:
+        return False
+    with _LOCK:
+        data = _read()
+        for rows in data.values():
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if item.get("id") != record_id:
+                    continue
+                sources = item.setdefault("sources", [])
+                if source not in sources:
+                    sources.append(source)
+                    _write(data)
+                return True
+    return False
+
+
 def clear() -> None:
     """Test helper; production callers should never need to delete the model."""
     with _LOCK:

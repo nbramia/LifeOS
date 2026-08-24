@@ -1533,6 +1533,19 @@ async def ask_stream(request: AskStreamRequest):
                                 update_source(_commitment_match.group(1), request.source)
                             except ValueError:
                                 pass
+                    elif _tool_call.get("tool") == "manage_life_model":
+                        _life_model_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _life_model_match:
+                            try:
+                                from api.services.life_model_store import update_source
+                                uuid.UUID(_life_model_match.group(1))
+                                update_source(_life_model_match.group(1), request.source)
+                            except ValueError:
+                                pass
 
             # The raw capture is a safety net, not a second task list. Once
             # this turn has successfully been interpreted, close that exact

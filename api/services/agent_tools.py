@@ -2917,7 +2917,7 @@ def _tool_manage_life_model(inp: dict) -> str:
         except ValueError as exc:
             return f"Error: {exc}"
         label = section.replace("_", " ")
-        return f"Life model updated ({label}): \"{item['content']}\" [{item['evidence_type']}]"
+        return f"Life model updated ({label}): \"{item['content']}\" [{item['evidence_type']}] (id: {item['id']})"
     if action == "get":
         try:
             data = list_records(section or None)
