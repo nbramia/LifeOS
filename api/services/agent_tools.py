@@ -8,8 +8,10 @@ import asyncio
 import contextvars
 import logging
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -2495,6 +2497,7 @@ def _tool_life_review(inp: dict) -> str:
     ))
 
     lines = [f"Life review ({mode}) — based on recorded information as of {today}."]
+    lines.extend(_life_review_source_coverage())
     life_model = list_records()
     model_sections = {
         "identity": "Identity",
@@ -2690,6 +2693,50 @@ def _tool_life_review(inp: dict) -> str:
 
     lines.append("\nThis is a record-based review; it does not prove that an item is unimportant or forgotten when no record exists.")
     return "\n".join(lines)
+
+
+def _life_review_source_coverage() -> list[str]:
+    """Describe connected evidence sources without inferring missing facts.
+
+    A relationship graph with zero rows is ambiguous to a user: it can mean
+    either that nobody is known or that Gmail/Calendar have never been
+    connected. Make that distinction explicit in reviews. This is read-only
+    and deliberately checks files/SQLite directly without triggering OAuth or
+    creating a new database.
+    """
+    lines = ["\n## Source coverage"]
+    project_root = Path(__file__).resolve().parents[2]
+    config_dir = project_root / "config"
+    credentials = config_dir / "credentials-personal.json"
+    token = config_dir / "token-personal.json"
+    if credentials.exists() and token.exists():
+        lines.append("- Google personal: connected")
+    elif credentials.exists():
+        lines.append("- Google personal: OAuth client installed; authentication is not complete")
+    else:
+        lines.append("- Google personal: not connected")
+
+    db_path = Path(settings.chroma_path).parent / "interactions.db"
+    if not db_path.exists():
+        lines.append("- Relationship interactions: no records available")
+        lines.append("- Relationship answers may be incomplete until a source is connected and synced.")
+        return lines
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0]
+            rows = conn.execute(
+                "SELECT source_type, COUNT(*) FROM interactions GROUP BY source_type ORDER BY source_type"
+            ).fetchall()
+        if not total:
+            lines.append("- Relationship interactions: no records available")
+            lines.append("- Relationship answers may be incomplete until a source is connected and synced.")
+        else:
+            breakdown = ", ".join(f"{source} ({count})" for source, count in rows)
+            lines.append(f"- Relationship interactions: {total} records ({breakdown})")
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Could not read interaction coverage for life review: %s", exc)
+        lines.append("- Relationship interactions: coverage could not be read")
+    return lines
 def _tool_manage_tasks(inp: dict):
     action = inp["action"]
     if action == "create":
