@@ -152,6 +152,7 @@ class Memory:
     created_at: datetime
     updated_at: datetime
     is_active: bool = True
+    source: dict | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -163,6 +164,7 @@ class Memory:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "is_active": self.is_active,
+            "source": self.source,
         }
 
 
@@ -265,10 +267,11 @@ class MemoryStore:
             keywords=data.get("keywords") or extract_keywords(data["content"]),
             created_at=created_at or datetime.now(),
             updated_at=updated_at or datetime.now(),
-            is_active=data.get("is_active", True)
+            is_active=data.get("is_active", True),
+            source=data.get("source"),
         )
 
-    def create_memory(self, content: str, category: str = None) -> Memory:
+    def create_memory(self, content: str, category: str = None, source: dict | None = None) -> Memory:
         """
         Create a new memory.
 
@@ -286,7 +289,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=source,
         )
 
         self._memories[memory.id] = memory
@@ -354,7 +358,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=memory.source,
         )
 
         self._memories[memory_id] = updated
@@ -384,7 +389,8 @@ class MemoryStore:
             keywords=memory.keywords,
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=False
+            is_active=False,
+            source=memory.source,
         )
 
         self._memories[memory_id] = deactivated

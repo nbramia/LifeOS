@@ -428,6 +428,7 @@ class Attachment(BaseModel):
 class AskStreamRequest(BaseModel):
     """Request for streaming ask endpoint."""
     question: str
+    source: Optional[dict] = None
     include_sources: bool = True
     conversation_id: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
@@ -729,7 +730,7 @@ async def ask_stream(request: AskStreamRequest):
             add_inbox_item(
                 request.question,
                 conversation_id=conversation_id,
-                source=request.persona_id or "chat",
+                source=request.source or {"type": "chat"},
             )
 
             # `/agent [local|claude] <task>` — spawn an operator agent on demand
@@ -1114,7 +1115,9 @@ async def ask_stream(request: AskStreamRequest):
             )
             if _memory_content and not _memory_tool_succeeded:
                 from api.services.memory_store import get_memory_store
-                _saved_memory = get_memory_store().create_memory(_memory_content)
+                _saved_memory = get_memory_store().create_memory(
+                    _memory_content, source=request.source or {"type": "chat"}
+                )
                 agent_result.tool_calls_log.append({
                     "tool": "save_memory",
                     "input": {"content": _memory_content},

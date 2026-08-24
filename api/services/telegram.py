@@ -335,7 +335,12 @@ async def send_message_async(text: str, chat_id: str = None, bot: str = None) ->
 # Internal chat client (consumes SSE from /api/ask/stream)
 # ---------------------------------------------------------------------------
 
-async def chat_via_api(question: str, conversation_id: str = None, persona: str = None) -> dict:
+async def chat_via_api(
+    question: str,
+    conversation_id: str = None,
+    persona: str = None,
+    source: dict | None = None,
+) -> dict:
     """
     Run a question through the full LifeOS chat pipeline (non-streaming).
 
@@ -354,6 +359,8 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
         body["conversation_id"] = conversation_id
     if persona:
         body["persona"] = persona
+    if source:
+        body["source"] = source
 
     full_text = ""
     conv_id = conversation_id
@@ -934,7 +941,16 @@ class TelegramBotListener:
         try:
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
-                result = await chat_via_api(effective_text, conversation_id=conv_id, persona=self._persona)
+                result = await chat_via_api(
+                    effective_text,
+                    conversation_id=conv_id,
+                    persona=self._persona,
+                    source={
+                        "type": "telegram",
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                    },
+                )
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 

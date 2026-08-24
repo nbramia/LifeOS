@@ -16,7 +16,7 @@ def _path() -> Path:
     return Path(os.getenv("LIFEOS_INBOX_PATH", str(DEFAULT_INBOX_PATH)))
 
 
-def add_item(content: str, *, conversation_id: str = "", source: str = "chat") -> dict:
+def add_item(content: str, *, conversation_id: str = "", source: str | dict = "chat") -> dict:
     """Append a raw capture before model interpretation can lose it."""
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)

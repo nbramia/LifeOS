@@ -746,6 +746,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "The memory to save (natural language).",
                 },
+                "source": {
+                    "type": "object",
+                    "description": "Optional provenance metadata for the capture.",
+                },
             },
             "required": ["content"],
         },
@@ -2523,7 +2527,9 @@ async def _tool_save_memory(inp: dict) -> str:
 
     content = await synthesize_memory(inp["content"])
     store = get_memory_store()
-    memory = store.create_memory(content)
+    memory = store.create_memory(
+        content, source=inp.get("source") or {"type": "conversation"}
+    )
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
@@ -2564,7 +2570,14 @@ async def _tool_process_inbox_item(inp: dict) -> str:
         from api.routes.memories import synthesize_memory
         from api.services.memory_store import get_memory_store
         content = (inp.get("content") or item["content"]).strip()
-        memory = get_memory_store().create_memory(await synthesize_memory(content))
+        memory = get_memory_store().create_memory(
+            await synthesize_memory(content),
+            source={
+                "type": "life_inbox",
+                "inbox_item_id": item_id,
+                "original_source": item.get("source"),
+            },
+        )
         linked_id = memory.id
     updated = update_item(item_id, status="dismissed" if category == "dismissed" else "processed", category=category, linked_id=linked_id)
     if not updated:
