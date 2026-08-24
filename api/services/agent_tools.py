@@ -443,7 +443,8 @@ TOOL_DEFINITIONS = [
             "Build a source-backed personal review. Use for what should I do today, "
             "what am I forgetting, which goals/projects are neglected, or a weekly "
             "life review. It combines open tasks, overdue work, commitments, inbox "
-            "items, schedules, and aging project memories; it does not invent priorities."
+            "items, schedules, aging project memories, and high-confidence relationship "
+            "gaps; it does not invent priorities."
         ),
         "input_schema": {
             "type": "object",
@@ -2395,6 +2396,11 @@ def _tool_life_review(inp: dict) -> str:
         markers = {"checked", "fixed", "done", "completed", "finished", "resolved", "sent"}
         for memory in memories:
             content = memory.content or ""
+            memory_stamp = memory.updated_at or memory.created_at
+            task_created_date = getattr(task, "created_date", "")
+            if task_created_date and memory_stamp is not None:
+                if memory_stamp.date().isoformat() < task_created_date:
+                    continue
             lower = content.lower()
             if task_words.intersection(re.findall(r"[a-z]{4,}", lower)) and markers.intersection(
                 re.findall(r"[a-z]{4,}", lower)
