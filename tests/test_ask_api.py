@@ -169,6 +169,20 @@ class TestPromptConstruction:
 class TestSynthesizerService:
     """Test the synthesizer service."""
 
+    def test_synthesizer_uses_fast_registry_profile(self, monkeypatch):
+        """Configured operation profiles route synthesis independently of chat."""
+        from api.services import synthesizer
+
+        fast_client = MagicMock()
+        monkeypatch.setattr(synthesizer.settings, "llm_models_json", '{"fast":{"provider":"local","model":"small"}}')
+        get_llm = MagicMock(return_value=fast_client)
+        monkeypatch.setattr(synthesizer, "get_llm", get_llm)
+
+        client = synthesizer.Synthesizer().client
+
+        assert client is fast_client
+        get_llm.assert_called_once_with("fast")
+
     def test_synthesizer_calls_llm(self):
         """Should call local LLM with constructed prompt."""
         mock_response = MagicMock()

@@ -12,10 +12,22 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from config.settings import settings
-from api.services.llm_client import get_local_llm
+from api.services.llm_client import get_llm, get_local_llm
 from api.services.resilience import is_retryable_api_error
 
 logger = logging.getLogger(__name__)
+
+
+def _get_synthesis_llm():
+    """Select the operation-specific synthesis profile when configured.
+
+    The named registry is optional. Without it, retain the historical backend
+    selection and the existing test/integration seams through ``get_local_llm``.
+    """
+    configured_profiles = getattr(settings, "llm_models_json", "")
+    if isinstance(configured_profiles, str) and configured_profiles.strip():
+        return get_llm("fast")
+    return get_local_llm()
 
 
 def build_message_content(prompt: str, attachments: list[dict] = None) -> str | list:
@@ -96,7 +108,7 @@ class Synthesizer:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            self._client = get_local_llm()
+            self._client = _get_synthesis_llm()
         return self._client
 
     def synthesize(
