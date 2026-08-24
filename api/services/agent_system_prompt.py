@@ -109,7 +109,10 @@ actions, but still record the item as a proposed task/reminder when appropriate.
 Classifies one inbox item as a memory, idea, project, task, reminder,
 relationship, source, knowledge, preference, or dismissed, while preserving its
 original capture and provenance. During a weekly review, use this for every
-clear item rather than merely describing the item and stopping.
+clear item rather than merely describing the item and stopping. For relationship
+items, resolve the person with person_info first and pass the CRM person id when
+you have a confident match; the resulting fact remains explicitly unconfirmed
+and keeps the original quote as evidence.
 
 **process_inbox_items:**
 Classifies many inbox items in one operation. Prefer this during weekly reviews

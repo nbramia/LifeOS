@@ -787,6 +787,7 @@ TOOL_DEFINITIONS = [
                     "description": "The classification for this item.",
                 },
                 "content": {"type": "string", "description": "Optional cleaned content to save for a memory."},
+                "person_id": {"type": "string", "description": "Resolved CRM person id for a relationship fact, when available."},
             },
             "required": ["item_id", "category"],
         },
@@ -809,6 +810,7 @@ TOOL_DEFINITIONS = [
                             "item_id": {"type": "string"},
                             "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"]},
                             "content": {"type": "string"},
+                            "person_id": {"type": "string"},
                         },
                         "required": ["item_id", "category"],
                     },
@@ -2658,6 +2660,7 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     if item.get("status") != "unreviewed":
         return f"Inbox item {item_id!r} was already processed; no duplicate was created."
     linked_id = ""
+    person_fact_id = ""
     proposal = None
     # Inbox classifications are broader than the memory store's retrieval
     # categories. Safe knowledge becomes durable while the inbox category and
@@ -2685,6 +2688,28 @@ async def _tool_process_inbox_item(inp: dict) -> str:
             },
         )
         linked_id = memory.id
+        if category == "relationship" and inp.get("person_id"):
+            import hashlib
+            from api.services.person_facts import PersonFact, get_person_fact_store
+
+            raw_source = item.get("source")
+            source_link = None
+            if isinstance(raw_source, dict) and raw_source.get("type") == "telegram":
+                source_link = (
+                    f"telegram://{raw_source.get('chat_id', '')}/"
+                    f"{raw_source.get('message_id', '')}"
+                )
+            fact = PersonFact(
+                person_id=str(inp["person_id"]),
+                category="background",
+                key="inbox_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                value=content,
+                confidence=0.75,
+                source_quote=item.get("content", content),
+                source_link=source_link,
+                confirmed_by_user=False,
+            )
+            person_fact_id = get_person_fact_store().upsert(fact).id
     elif category in {"task", "reminder"}:
         proposal = {
             "type": category,
@@ -2697,6 +2722,7 @@ async def _tool_process_inbox_item(inp: dict) -> str:
         category=category,
         linked_id=linked_id,
         proposal=proposal,
+        person_fact_id=person_fact_id,
     )
     if not updated:
         return f"Error: Could not update Inbox item {item_id!r}."

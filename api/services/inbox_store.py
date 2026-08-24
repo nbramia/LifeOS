@@ -67,6 +67,7 @@ def update_item(
     category: str = "",
     linked_id: str = "",
     proposal: dict | None = None,
+    person_fact_id: str = "",
 ) -> dict | None:
     """Mark an inbox item as reviewed while retaining its raw content."""
     path = _path()
@@ -84,6 +85,8 @@ def update_item(
                     item["linked_id"] = linked_id
                 if proposal is not None:
                     item["proposal"] = proposal
+                if person_fact_id:
+                    item["person_fact_id"] = person_fact_id
                 item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
                 path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
                 return item
