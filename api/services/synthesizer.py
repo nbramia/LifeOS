@@ -59,9 +59,15 @@ def build_message_content(
             filename = att["filename"]
             data = att["data"]
             if media_type.startswith("image/"):
-                notes.append(f"[Image attached: {filename}; this model cannot inspect images]")
+                notes.append(
+                    f"[Image attached: {filename}] "
+                    "(this model cannot inspect images)"
+                )
             elif media_type == "application/pdf":
-                notes.append(f"[PDF attached: {filename}; this model cannot inspect documents]")
+                notes.append(
+                    f"[PDF attached: {filename}] "
+                    "(this model cannot inspect documents)"
+                )
             elif media_type.startswith("text/") or media_type == "application/json":
                 try:
                     text_content = base64.b64decode(data).decode("utf-8")
