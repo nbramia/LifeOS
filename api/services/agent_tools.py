@@ -835,6 +835,27 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "confirm_inbox_proposal",
+        "description": (
+            "Confirm one pending Life Inbox task/reminder proposal and create the "
+            "native task or schedule. Use only after the user explicitly approves "
+            "the proposal. For reminders, provide a resolved future schedule_type "
+            "and schedule_value. Confirmation is idempotent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Inbox item id from list_inbox_proposals."},
+                "name": {"type": "string", "description": "Optional short name for a reminder."},
+                "schedule_type": {"type": "string", "enum": ["once", "cron"], "description": "Required for reminders."},
+                "schedule_value": {"type": "string", "description": "Future ISO datetime or cron expression for reminders."},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""], "description": "Optional task priority."},
+                "due_date": {"type": "string", "description": "Optional task due date (YYYY-MM-DD)."},
+            },
+            "required": ["proposal_id"],
+        },
+    },
+    {
         "name": "search_memories",
         "description": (
             "Search saved memories by wording and meaning. Use to recall previously saved "
@@ -2725,6 +2746,56 @@ def _tool_list_inbox_proposals(inp: dict) -> str:
     return "\n".join(lines)
 
 
+def _tool_confirm_inbox_proposal(inp: dict) -> str:
+    from datetime import datetime, timezone
+    from api.services.inbox_store import list_items, update_item
+
+    proposal_id = str(inp.get("proposal_id", "")).strip()
+    if not proposal_id:
+        return "Error: proposal_id is required."
+    item = next(
+        (candidate for candidate in list_items(status="processed", limit=1000)
+         if candidate.get("id") == proposal_id and candidate.get("proposal")),
+        None,
+    )
+    if not item:
+        return f"Error: pending proposal {proposal_id!r} was not found."
+    proposal = dict(item["proposal"])
+    if proposal.get("confirmed_at"):
+        return f"Proposal {proposal_id} was already confirmed: {proposal.get('confirmed_result', 'no duplicate created')}."
+    proposal_type = proposal.get("type")
+    content = str(proposal.get("content") or item.get("content") or "").strip()
+    if proposal_type == "task":
+        from api.services.task_manager import get_task_manager
+        task = get_task_manager().create(
+            description=content,
+            priority=inp.get("priority", ""),
+            due_date=inp.get("due_date"),
+        )
+        result = f"Task created: \"{task.description}\" (id: {task.id})"
+    elif proposal_type == "reminder":
+        schedule_type = inp.get("schedule_type")
+        schedule_value = inp.get("schedule_value")
+        if schedule_type not in {"once", "cron"} or not schedule_value:
+            return "Error: confirming a reminder requires schedule_type and a resolved future schedule_value."
+        result = _schedule_create({
+            "name": inp.get("name") or content[:80],
+            "schedule_type": schedule_type,
+            "schedule_value": schedule_value,
+            "schedule_action": "notify",
+            "message_type": "static",
+            "message_content": content,
+        })
+        if result.startswith("Error:"):
+            return result
+    else:
+        return f"Error: proposal {proposal_id!r} has unsupported type {proposal_type!r}."
+    proposal["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    proposal["confirmed_result"] = result
+    update_item(item["id"], status="processed", category=item.get("category", proposal_type), linked_id=item.get("linked_id", ""), proposal=proposal)
+    return result
+
+
 # Result cap for memory search. Exposed to the caller so a memory that missed on
 # wording can be reached by widening; also the truncation yardstick, so it has to
 # be a usable positive int however the model fills it in.
@@ -3712,6 +3783,7 @@ _TOOL_HANDLERS = {
     "process_inbox_item": _tool_process_inbox_item,
     "process_inbox_items": _tool_process_inbox_items,
     "list_inbox_proposals": _tool_list_inbox_proposals,
+    "confirm_inbox_proposal": _tool_confirm_inbox_proposal,
     "search_memories": _tool_search_memories,
 }
 
@@ -3767,5 +3839,6 @@ TOOL_STATUS_MESSAGES = {
     "process_inbox_item": "Processing Life Inbox item...",
     "process_inbox_items": "Processing Life Inbox items...",
     "list_inbox_proposals": "Loading pending Life Inbox proposals...",
+    "confirm_inbox_proposal": "Confirming Life Inbox proposal...",
     "search_memories": "Searching memories...",
 }

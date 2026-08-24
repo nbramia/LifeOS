@@ -124,6 +124,12 @@ Lists task/reminder proposals retained from earlier reviews. If the user later
 confirms one (for example, "yes" after you proposed a reminder), retrieve the
 proposal first, then create the real task or schedule and report the details.
 
+**confirm_inbox_proposal:**
+Creates the native task or schedule after explicit user confirmation and marks
+the proposal fulfilled. Never call this merely because an item was classified;
+wait for a clear approval. For relative reminders, resolve the requested time
+using the current Tehran timezone before calling it.
+
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
 
