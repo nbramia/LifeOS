@@ -327,9 +327,11 @@ systemctl status lifeos-api lifeos-chromadb
 ```
 
 The systemd setup installs and enables the nightly `lifeos-sync.timer` only
-after `config/credentials-personal.json` exists. This prevents a fresh VPS
-from running a guaranteed failing sync job. After completing Google OAuth,
-re-run `setup-systemd.sh` to activate Gmail/Calendar relationship history.
+after both `config/credentials-personal.json` and the authenticated
+`config/token-personal.json` exist. This prevents a fresh VPS from running a
+guaranteed failing sync job. After completing Google OAuth with
+`scripts/google_auth.py --account personal`, re-run `setup-systemd.sh` to
+activate Gmail/Calendar relationship history.
 
 ```bash
 systemctl list-timers lifeos-sync.timer

@@ -61,12 +61,16 @@ MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
 
-# Google sync is useful only after at least the personal OAuth client file has
-# been installed. Keep the timer off on a fresh VPS rather than scheduling a
-# job that can only fail and misleadingly report an empty relationship graph.
+# Google sync is useful only after the personal OAuth client and an
+# authenticated token have been installed. Keep the timer off until a
+# headless sync can actually authenticate instead of reporting an empty graph.
 GOOGLE_SYNC_CONFIGURED="false"
-if [ -f "$PROJECT_DIR/config/credentials-personal.json" ]; then
+GOOGLE_SYNC_REASON="add config/credentials-personal.json and authenticate Google"
+if [ -f "$PROJECT_DIR/config/credentials-personal.json" ] && [ -f "$PROJECT_DIR/config/token-personal.json" ]; then
     GOOGLE_SYNC_CONFIGURED="true"
+    GOOGLE_SYNC_REASON=""
+elif [ -f "$PROJECT_DIR/config/credentials-personal.json" ]; then
+    GOOGLE_SYNC_REASON="run scripts/google_auth.py --account personal, then re-run setup"
 fi
 
 # Normalize boolean
@@ -191,7 +195,7 @@ if [ "$GOOGLE_SYNC_CONFIGURED" = "true" ]; then
 else
     systemctl disable lifeos-sync.timer 2>/dev/null || true
     systemctl stop lifeos-sync.timer 2>/dev/null || true
-    echo "  lifeos-sync.timer: disabled (add config/credentials-personal.json, then re-run setup)"
+    echo "  lifeos-sync.timer: disabled ($GOOGLE_SYNC_REASON)"
 fi
 
 # MCP HTTP transport is only enabled when a bearer token is configured.
