@@ -195,12 +195,24 @@ class TestNoUnrelatedChange:
         for expected in ("lifeos_task_create", "lifeos_calendar_upcoming", "lifeos_monarch_accounts"):
             assert expected in names
 
-    def test_agentic_loop_tool_count_unchanged(self):
-        """manage_workouts already existed in the native agentic-loop tool
-        set (#320) — this PR only adds an MCP-side route to it, so the
-        agentic-loop tool count must not move."""
+    def test_agentic_loop_tool_set_includes_life_assistant_additions(self):
+        """The integrated Life Assistant branch deliberately extends the
+        native tool set; pin both its total and the new functional surface."""
         from api.services.agent_tools import TOOL_DEFINITIONS
-        assert len(TOOL_DEFINITIONS) == 21
+        names = {tool["name"] for tool in TOOL_DEFINITIONS}
+        assert len(TOOL_DEFINITIONS) == 31
+        assert {
+            "life_review",
+            "manage_life_model",
+            "manage_projects",
+            "manage_commitments",
+            "manage_followups",
+            "review_inbox",
+            "process_inbox_item",
+            "process_inbox_items",
+            "list_inbox_proposals",
+            "confirm_inbox_proposal",
+        } <= names
 
 
 # ---------------------------------------------------------------------------

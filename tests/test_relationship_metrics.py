@@ -10,6 +10,7 @@ from api.services.relationship_metrics import (
     RECENCY_WINDOW_DAYS,
     FREQUENCY_TARGET,
 )
+from config.relationship_weights import get_interaction_weight
 
 
 class TestRecencyScore:
@@ -60,6 +61,9 @@ class TestRecencyScore:
 
 class TestFrequencyScore:
     """Tests for frequency score calculation."""
+
+    def test_telegram_uses_direct_message_weight(self):
+        assert get_interaction_weight("telegram") == get_interaction_weight("whatsapp") == 1.5
 
     def test_zero_interactions(self):
         """Test with no interactions."""

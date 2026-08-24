@@ -238,7 +238,7 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     - gmail -> email_count
     - calendar -> meeting_count
     - vault, granola -> mention_count
-    - imessage, whatsapp, phone, slack -> message_count
+    - imessage, whatsapp, telegram, phone, slack -> message_count
     - photos -> photo_count
 
     Note: slack_message_count is managed separately by slack_sync.py
@@ -250,6 +250,7 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     entity.message_count = (
         counts.get('imessage', 0) +
         counts.get('whatsapp', 0) +
+        counts.get('telegram', 0) +
         counts.get('phone', 0) +
         counts.get('slack', 0)
     )
@@ -314,6 +315,7 @@ def verify_person_stats(fix: bool = False) -> dict:
         computed_message = (
             counts.get('imessage', 0) +
             counts.get('whatsapp', 0) +
+            counts.get('telegram', 0) +
             counts.get('phone', 0) +
             counts.get('slack', 0)
         )

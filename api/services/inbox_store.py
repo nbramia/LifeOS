@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,15 +17,38 @@ def _path() -> Path:
     return Path(os.getenv("LIFEOS_INBOX_PATH", str(DEFAULT_INBOX_PATH)))
 
 
+def _read(path: Path) -> dict:
+    if not path.exists():
+        return {"items": []}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise ValueError(f"Invalid Life Inbox structure in {path}")
+    return data
+
+
+def _write(path: Path, data: dict) -> None:
+    """Atomically replace the Inbox so an interrupted write cannot corrupt it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="inbox-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def add_item(content: str, *, conversation_id: str = "", source: str | dict = "chat") -> dict:
     """Append a raw capture before model interpretation can lose it."""
     path = _path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     with _LOCK:
-        try:
-            data = json.loads(path.read_text()) if path.exists() else {"items": []}
-        except (OSError, json.JSONDecodeError):
-            data = {"items": []}
+        data = _read(path)
         # Telegram and webhook transports may retry delivery. A stable source
         # identity is stronger than content equality: the same text in two
         # different messages is still two captures, while one message should
@@ -48,7 +72,7 @@ def add_item(content: str, *, conversation_id: str = "", source: str | dict = "c
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         data.setdefault("items", []).append(item)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        _write(path, data)
     return item
 
 
@@ -58,10 +82,10 @@ def list_items(
     since_days: int | None = None,
 ) -> list[dict]:
     path = _path()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
+    # Missing is a genuinely empty Inbox; unreadable or malformed is not.
+    # Let those failures reach the tool boundary so a review cannot report a
+    # confident "nothing unresolved" after silently discarding its evidence.
+    data = _read(path)
     items = data.get("items", [])
     if status:
         items = [item for item in items if item.get("status") == status]
@@ -87,8 +111,8 @@ def update_item(
     path = _path()
     with _LOCK:
         try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            data = _read(path)
+        except (OSError, ValueError, json.JSONDecodeError):
             return None
         for item in data.get("items", []):
             if item.get("id") == item_id:
@@ -102,6 +126,6 @@ def update_item(
                 if person_fact_id:
                     item["person_fact_id"] = person_fact_id
                 item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
-                path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                _write(path, data)
                 return item
     return None

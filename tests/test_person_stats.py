@@ -299,6 +299,14 @@ class TestApplyCountsToEntity:
         assert entity.message_count == 10
         assert entity.slack_message_count == 0  # Not touched by _apply_counts
 
+    def test_telegram_maps_to_message_count(self):
+        entity = PersonEntity(canonical_name="Test")
+
+        _apply_counts_to_entity(entity, {"telegram": 6})
+
+        assert entity.message_count == 6
+        assert "telegram" in entity.sources
+
     def test_photos_maps_to_photo_count(self):
         """Verify 'photos' maps to photo_count."""
         entity = PersonEntity(canonical_name="Test")

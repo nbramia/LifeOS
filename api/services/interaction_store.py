@@ -1009,7 +1009,7 @@ class InteractionStore:
         """
         Get messages surrounding an interaction in the same conversation.
 
-        For message-based interactions (iMessage, WhatsApp, Slack), this returns
+        For message-based interactions (iMessage, WhatsApp, Telegram, Slack), this returns
         neighboring messages to provide context for fact extraction.
 
         Args:
@@ -1021,7 +1021,7 @@ class InteractionStore:
             List of interactions: [N before] + [target] + [N after], sorted by timestamp
         """
         # Message-based source types that benefit from context
-        MESSAGE_SOURCES = {"imessage", "whatsapp", "slack"}
+        MESSAGE_SOURCES = {"imessage", "whatsapp", "telegram", "slack"}
 
         conn = self._get_connection()
         try:
@@ -1102,7 +1102,7 @@ class InteractionStore:
         """
         Enrich a list of interactions with conversation context.
 
-        For message-based interactions (iMessage, WhatsApp, Slack), adds
+        For message-based interactions (iMessage, WhatsApp, Telegram, Slack), adds
         surrounding messages to provide better context for fact extraction.
 
         Args:
@@ -1112,7 +1112,7 @@ class InteractionStore:
         Returns:
             Enriched list where message-based interactions include 'context' field
         """
-        MESSAGE_SOURCES = {"imessage", "whatsapp", "slack"}
+        MESSAGE_SOURCES = {"imessage", "whatsapp", "telegram", "slack"}
 
         enriched = []
         seen_context_ids = set()

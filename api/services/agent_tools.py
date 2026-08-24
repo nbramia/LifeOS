@@ -906,6 +906,11 @@ TOOL_DEFINITIONS = [
                     "description": "The classification for this item.",
                 },
                 "content": {"type": "string", "description": "Optional cleaned content to save for a memory."},
+                "name": {"type": "string", "description": "Stable project name; required for project classifications."},
+                "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                "summary": {"type": "string", "description": "Optional current project summary."},
+                "next_action": {"type": "string", "description": "Optional concrete next project action."},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
                 "person_id": {"type": "string", "description": "Resolved CRM person id for a relationship fact, when available."},
                 "person_name": {"type": "string", "description": "Person connected to a commitment."},
                 "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
@@ -932,6 +937,11 @@ TOOL_DEFINITIONS = [
                             "item_id": {"type": "string"},
                             "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"]},
                             "content": {"type": "string"},
+                            "name": {"type": "string", "description": "Stable project name; required for project classifications."},
+                            "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                            "summary": {"type": "string"},
+                            "next_action": {"type": "string"},
+                            "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
                             "person_id": {"type": "string"},
                             "person_name": {"type": "string"},
                             "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
@@ -3300,6 +3310,25 @@ def _auto_inbox_category(content: str) -> str | None:
     return None
 
 
+def _auto_inbox_project(content: str) -> dict | None:
+    """Extract project state from text already deemed safe to auto-file."""
+    text = " ".join((content or "").split()).strip()
+    patterns = (
+        (r"^(?:i(?:'m|\s+am)\s+)?working\s+on\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?building\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?developing\s+(.+?)\.?$", "active"),
+        (r"^(?:i\s+)?want\s+to\s+(?:build|create|develop)\s+(.+?)\.?$", "potential"),
+        (r"^(?:my\s+)?project\s+(?:is|:|-)\s*(.+?)\.?$", "active"),
+    )
+    for pattern, status in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().rstrip(".").strip()
+            if len(name) >= 4:
+                return {"name": name, "status": status, "summary": text}
+    return None
+
+
 def _auto_relationship_person_id(content: str) -> str | None:
     """Resolve a leading person name only when the existing graph is confident."""
     match = re.match(
@@ -3333,6 +3362,7 @@ async def _tool_review_inbox(inp: dict) -> str:
     if not items:
         return f"Life Inbox has no unreviewed captures from the last {since_days} days."
     auto_processed = []
+    auto_failures = []
     for item in items:
         category = _auto_inbox_category(item.get("content", ""))
         if category is None:
@@ -3348,8 +3378,18 @@ async def _tool_review_inbox(inp: dict) -> str:
                 # useful evidence but should wait for focused resolution.
                 continue
             process_input["person_id"] = person_id
+        elif category == "project":
+            project = _auto_inbox_project(item.get("content", ""))
+            if not project:
+                # Do not invent a project name or state merely because broad
+                # project language was detected. Leave it for focused review.
+                continue
+            process_input.update(project)
         result = await _tool_process_inbox_item(process_input)
-        auto_processed.append((item, category, result))
+        if result.startswith("Error:"):
+            auto_failures.append((item, result))
+        else:
+            auto_processed.append((item, category, result))
 
     remaining = list_items(limit=limit, since_days=since_days)
     proposals = [
@@ -3362,6 +3402,10 @@ async def _tool_review_inbox(inp: dict) -> str:
     ]
     for item, category, _result in auto_processed[:limit]:
         lines.append(f"- filed as {category}: {item.get('content', '')}")
+    if auto_failures:
+        lines.append(f"{len(auto_failures)} clear item(s) could not be filed and remain unresolved:")
+        for item, error in auto_failures[:limit]:
+            lines.append(f"- id={item['id']} {item.get('content', '')}: {error}")
     if proposals:
         lines.append(f"{len(proposals)} task/reminder proposal(s) still need confirmation.")
         for item in proposals[:limit]:
@@ -3427,6 +3471,14 @@ async def _tool_process_inbox_item(inp: dict) -> str:
         from api.routes.memories import synthesize_memory
         from api.services.memory_store import get_memory_store
         content = (inp.get("content") or item["content"]).strip()
+        project_name = str(inp.get("name", "")).strip() if category == "project" else ""
+        if category == "project" and not project_name:
+            return "Error: project classification requires a project name."
+        project_status = str(inp.get("status") or "potential").strip().lower()
+        if category == "project" and project_status not in {
+            "potential", "active", "paused", "completed", "archived",
+        }:
+            return "Error: project status must be potential, active, paused, completed, or archived."
         memory = get_memory_store().create_memory(
             await synthesize_memory(content),
             category=memory_categories[category],
@@ -3437,6 +3489,23 @@ async def _tool_process_inbox_item(inp: dict) -> str:
             },
         )
         linked_id = memory.id
+        if category == "project":
+            from api.services.project_store import upsert as upsert_project
+
+            project = upsert_project(
+                project_name,
+                status=project_status,
+                summary=str(inp.get("summary") or content),
+                next_action=str(inp.get("next_action", "")),
+                priority=str(inp.get("priority", "")),
+                source={
+                    "type": "life_inbox",
+                    "inbox_item_id": item_id,
+                    "original_source": item.get("source"),
+                },
+                evidence_type="explicit",
+            )
+            linked_id = project["id"]
         if category == "relationship" and inp.get("person_id"):
             import hashlib
             from api.services.person_facts import PersonFact, get_person_fact_store
@@ -3478,6 +3547,8 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     suffix = (
         f" Commitment recorded with id {linked_id}."
         if linked_id and category == "commitment"
+        else f" Project recorded with id {linked_id}."
+        if linked_id and category == "project"
         else f" Memory saved with id {linked_id}." if linked_id else ""
     )
     if proposal:
@@ -3490,11 +3561,21 @@ async def _tool_process_inbox_items(inp: dict) -> str:
     if not isinstance(entries, list) or not entries:
         return "Error: items must be a non-empty list."
     results = []
+    invalid_entries = 0
     for entry in entries[:50]:
         if isinstance(entry, dict):
             results.append(await _tool_process_inbox_item(entry))
-    return f"Processed {len(results)} Life Inbox items.\n" + "\n".join(
-        f"- {result}" for result in results
+        else:
+            invalid_entries += 1
+    failures = sum(result.startswith("Error:") for result in results) + invalid_entries
+    applied = len(results) - sum(result.startswith("Error:") for result in results)
+    summary = f"Applied {applied} Life Inbox classification(s)"
+    if failures:
+        summary += f"; {failures} failed"
+    details = [f"- {result}" for result in results]
+    details.extend("- Error: each batch entry must be an object." for _ in range(invalid_entries))
+    return summary + ".\n" + "\n".join(
+        details
     )
 
 
