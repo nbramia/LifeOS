@@ -2457,15 +2457,31 @@ def _tool_life_review(inp: dict) -> str:
             stamp = stamp.replace(tzinfo=timezone.utc)
         age_days = max(0, (now - stamp).days)
         project_rows.append((age_days, memory))
-    project_rows.sort(key=lambda row: row[0], reverse=True)
+    # A project can be mentioned many times as its state changes. Keep the raw
+    # memories intact, but present one current row per clearly named subject so
+    # a review does not mistake seven car updates for seven neglected projects.
+    grouped_projects = {}
+    for age_days, memory in project_rows:
+        leading_name = re.match(r"^\s*([A-Z][\w-]{2,})\b", memory.content or "")
+        key = leading_name.group(1).casefold() if leading_name else memory.id
+        if key in {"i", "we", "my", "the"}:
+            key = memory.id
+        existing = grouped_projects.get(key)
+        if existing is None or age_days < existing[0]:
+            grouped_projects[key] = [age_days, memory, 1 if existing is None else existing[2] + 1]
+        else:
+            existing[2] += 1
+    project_rows = list(grouped_projects.values())
     if mode == "neglected":
         project_rows = [row for row in project_rows if row[0] >= 14]
+    project_rows.sort(key=lambda row: row[0], reverse=True)
     lines.append("\n## Aging goals/projects")
     if project_rows:
-        for age_days, memory in project_rows[:limit]:
+        for age_days, memory, update_count in project_rows[:limit]:
             stamp = (memory.updated_at or memory.created_at).date().isoformat()
             freshness = f"; {age_days} days since update"
-            lines.append(f"- last recorded {stamp}{freshness}: {memory.content}")
+            history = f"; {update_count} related updates" if update_count > 1 else ""
+            lines.append(f"- last recorded {stamp}{freshness}{history}: {memory.content}")
     else:
         if mode == "neglected":
             lines.append("- No goals or projects have been inactive for at least 14 days on record.")
