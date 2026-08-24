@@ -165,6 +165,39 @@ def _project_candidate(question: str) -> dict | None:
     return None
 
 
+def _conditional_followup_candidate(question: str) -> dict | None:
+    """Extract the unambiguous no-response follow-up form."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    match = re.match(
+        r"^(?:remind me\s+)?if\s+i\s+(?:haven't|have not)\s+heard\s+back\s+from\s+"
+        r"([A-Z][\w'-]{1,30})(?:\s+about\s+(.+?))?\s+in\s+"
+        r"(a\s+day|a\s+week|a\s+month|\d+\s+days?)\.?$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    wait_text = match.group(3).lower()
+    if wait_text == "a day":
+        wait_days = 1
+    elif wait_text == "a week":
+        wait_days = 7
+    elif wait_text == "a month":
+        wait_days = 30
+    else:
+        wait_days = int(re.search(r"\d+", wait_text).group())
+    return {
+        "person_name": match.group(1),
+        "subject": (match.group(2) or "the pending conversation").strip().rstrip("."),
+        "wait_days": wait_days,
+    }
+
+
 def _extract_commitment_candidate(question: str) -> dict | None:
     """Extract only unambiguous promise phrasing for deterministic fallback."""
     text = re.sub(
@@ -1516,6 +1549,31 @@ async def ask_stream(request: AskStreamRequest):
                 _notice = "\n\nI tracked that commitment."
                 agent_result.full_text += _notice
                 await _content(_notice)
+
+            _conditional_followup = _conditional_followup_candidate(request.question)
+            _followup_tool_succeeded = any(
+                tc.get("tool") == "manage_followups"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "create"
+                for tc in agent_result.tool_calls_log
+            )
+            if _conditional_followup and not _followup_tool_succeeded:
+                from api.services.agent_tools import _tool_manage_followups
+                _followup_result = _tool_manage_followups({
+                    "action": "create",
+                    **_conditional_followup,
+                    "source": request.source or {"type": "chat"},
+                })
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_followups",
+                    "input": {"action": "create", **_conditional_followup},
+                    "result": _followup_result,
+                    "is_error": _followup_result.startswith("Error:"),
+                })
+                if not _followup_result.startswith("Error:"):
+                    _notice = "\n\nI will check whether you hear back and remind you if needed."
+                    agent_result.full_text += _notice
+                    await _content(_notice)
 
             _review_mode = _requested_life_review_mode(request.question)
             _review_tool_succeeded = any(
