@@ -683,6 +683,45 @@ def test_poll_persists_cache_creation_and_cache_read_deltas(stores):
 
 
 @pytest.mark.unit
+def test_poll_unknown_model_still_uses_fallback_rate_not_unpriced(stores):
+    """This is a budget-kill **estimate** path (#669), not a record path: an
+    unrecognized configured model must keep using cost_for's conservative
+    fallback (priciest) rate so an operator can't accidentally blow past a
+    dollar budget on a typo'd model id — it must NOT regress to $0/unpriced,
+    which is the record-path behavior added for local_executor and Claude
+    Code ingest."""
+    from api.services.agent_worker.pricing import cost_for, fallback_rates
+
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[
+        ManagedSessionState(
+            session_id="sess_remote", status="running", last_event_id="evt_1",
+            new_events=[{"id": "evt_1", "type": "x"}],
+            total_input_tokens=10,
+            total_output_tokens=5,
+            total_cache_creation_tokens=0,
+            total_cache_read_tokens=0,
+        ),
+    ])
+    executor = _make_executor(store, transcript, driver, model="typoed-model")
+    executor.poll(session)
+    refreshed = store.get("t1")
+    # Session-hour overhead also accrues during poll() (test wall time is
+    # small but nonzero), so bound rather than assert exact equality —
+    # mirrors test_poll_persists_cache_creation_and_cache_read_deltas above.
+    expected_token_dollars = cost_for("typoed-model", 10, 5)
+    assert expected_token_dollars == pytest.approx(
+        10 * fallback_rates()["input"] + 5 * fallback_rates()["output"]
+    )
+    overhead_upper_bound = 60.0 / 3600.0 * 0.08  # 60s wall = generous
+    assert expected_token_dollars <= refreshed.total_dollars <= expected_token_dollars + overhead_upper_bound
+    assert refreshed.total_dollars > 0.0
+    assert refreshed.unpriced is False
+
+
+@pytest.mark.unit
 def test_poll_computes_cache_token_deltas_against_prior_state(stores):
     """Token totals are absolute remote counts; record_spend gets deltas only."""
     store, session, transcript = stores
