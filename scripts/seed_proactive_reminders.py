@@ -4,9 +4,9 @@ Seed proactive intelligence reminders for LifeOS.
 
 Creates four prompt-type reminders:
 1. Pre-meeting prep (every 15 min on weekdays, checks for upcoming meetings)
-2. Morning briefing (daily at 6:30 AM ET)
-3. Weekly communication gap digest (Sundays at 10 AM ET)
-4. Weekly Life Inbox review (Sundays at 11 AM ET)
+2. Morning briefing (daily at 6:30 AM in the configured LifeOS timezone)
+3. Weekly communication gap digest (Sundays at 10 AM in the configured timezone)
+4. Weekly Life Inbox review (Sundays at 11 AM in the configured timezone)
 
 Usage:
     ~/.venvs/lifeos/bin/python scripts/seed_proactive_reminders.py [--dry-run] [--only NAME]
