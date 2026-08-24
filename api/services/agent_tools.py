@@ -3080,7 +3080,8 @@ def _tool_manage_projects(inp: dict) -> str:
         name = item["name"]
         status = "archived"
     elif action == "upsert":
-        status = inp.get("status", "active")
+        existing = get_project(name=name)
+        status = inp.get("status") or (existing.get("status") if existing else "active")
     else:
         return "Error: action must be list, get, upsert, or archive."
     try:
