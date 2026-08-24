@@ -1,6 +1,6 @@
 # ADR-021: Provider and Model Registry
 
-**Status:** Accepted  
+**Status:** Accepted
 **Date:** 2026-08-21
 
 ## Context
