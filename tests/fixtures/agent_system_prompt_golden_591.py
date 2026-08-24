@@ -59,32 +59,32 @@ STATIC_TEXT = 'You are LifeOS, Test User\'s personal knowledge assistant.\n\nYou
 # static prompt. Apply those additions here so this extraction test continues
 # to pin the current prompt rather than a stale historical string.
 STATIC_TEXT = STATIC_TEXT.replace(
-    "tentative thought into a firm commitment.\\n\\n## Conversation context",
-    "tentative thought into a firm commitment.\\n\\n"
-    "When a message contains a promise, an obligation, or something the user or\\n"
-    "another person owes, use **manage_commitments** as well as any ordinary memory\\n"
-    "capture. Distinguish `owed_by_me` from `owed_to_me`, preserve the person's name,\\n"
-    "and keep the original wording as evidence.\\n\\n## Conversation context",
+    "tentative thought into a firm commitment.\n\n## Conversation context",
+    "tentative thought into a firm commitment.\n\n"
+    "When a message contains a promise, an obligation, or something the user or\n"
+    "another person owes, use **manage_commitments** as well as any ordinary memory\n"
+    "capture. Distinguish `owed_by_me` from `owed_to_me`, preserve the person's name,\n"
+    "and keep the original wording as evidence.\n\n## Conversation context",
 )
 STATIC_TEXT = STATIC_TEXT.replace(
-    "**manage_tasks (action: create/list/complete):**\\nCreate, list, or complete Obsidian tasks. When tagging a task and an existing-tags list is provided below this prompt, prefer a tag that already exists over inventing a near-duplicate.\\n\\n**manage_reminders (action: create/list):**",
-    "**manage_tasks (action: create/list/complete):**\\nCreate, list, or complete Obsidian tasks. When tagging a task and an existing-tags list is provided below this prompt, prefer a tag that already exists over inventing a near-duplicate.\\n\\n"
-    "**life_review (mode: today/weekly/neglected):**\\nUse this for \"what should I do today?\", \"what am I forgetting?\", \"which goals\\n"
-    "are neglected?\", or a broad life review. It combines recorded tasks,\\n"
-    "commitments, unresolved inbox items, schedules, and aging goal/project memories.\\n"
-    "Treat it as evidence, not as permission to invent priorities or claim that an\\n"
-    "unrecorded task does not exist.\\n\\n"
+    "**manage_tasks (action: create/list/complete):**\nCreate, list, or complete Obsidian tasks. When tagging a task and an existing-tags list is provided below this prompt, prefer a tag that already exists over inventing a near-duplicate.\n\n**manage_reminders (action: create/list):**",
+    "**manage_tasks (action: create/list/complete):**\nCreate, list, or complete Obsidian tasks. When tagging a task and an existing-tags list is provided below this prompt, prefer a tag that already exists over inventing a near-duplicate.\n\n"
+    "**life_review (mode: today/weekly/neglected):**\nUse this for \"what should I do today?\", \"what am I forgetting?\", \"which goals\n"
+    "are neglected?\", or a broad life review. It combines recorded tasks,\n"
+    "commitments, unresolved inbox items, schedules, and aging goal/project memories.\n"
+    "Treat it as evidence, not as permission to invent priorities or claim that an\n"
+    "unrecorded task does not exist.\n\n"
     "**manage_reminders (action: create/list):**",
 )
 STATIC_TEXT = STATIC_TEXT.replace(
-    "Create or list timed Telegram notification reminders.\\n\\n**search_finances",
-    "Create or list timed Telegram notification reminders.\\n\\n"
-    "**manage_commitments (action: create/list/complete):**\\n"
-    "Track evidence-backed promises and obligations separately from ordinary tasks.\\n"
-    "When the user says they promised to do something for someone, create an\\n"
-    "`owed_by_me` commitment; when someone promised the user, create `owed_to_me`.\\n"
-    "Include the person, due date when known, and the original conversation source.\\n"
-    "Use list to answer what the user promised or what someone owes them.\\n\\n"
+    "Create or list timed Telegram notification reminders.\n\n**search_finances",
+    "Create or list timed Telegram notification reminders.\n\n"
+    "**manage_commitments (action: create/list/complete):**\n"
+    "Track evidence-backed promises and obligations separately from ordinary tasks.\n"
+    "When the user says they promised to do something for someone, create an\n"
+    "`owed_by_me` commitment; when someone promised the user, create `owed_to_me`.\n"
+    "Include the person, due date when known, and the original conversation source.\n"
+    "Use list to answer what the user promised or what someone owes them.\n\n"
     "**search_finances",
 )
 STATIC_TEXT = STATIC_TEXT.replace(
