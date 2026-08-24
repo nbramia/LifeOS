@@ -60,7 +60,14 @@ def list_items(
     return list(reversed(items[-limit:]))
 
 
-def update_item(item_id: str, *, status: str, category: str = "", linked_id: str = "") -> dict | None:
+def update_item(
+    item_id: str,
+    *,
+    status: str,
+    category: str = "",
+    linked_id: str = "",
+    proposal: dict | None = None,
+) -> dict | None:
     """Mark an inbox item as reviewed while retaining its raw content."""
     path = _path()
     with _LOCK:
@@ -75,6 +82,8 @@ def update_item(item_id: str, *, status: str, category: str = "", linked_id: str
                     item["category"] = category
                 if linked_id:
                     item["linked_id"] = linked_id
+                if proposal is not None:
+                    item["proposal"] = proposal
                 item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
                 path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
                 return item

@@ -2618,13 +2618,29 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     if not matches:
         return f"Error: Inbox item {item_id!r} was not found."
     item = matches[0]
+    if item.get("status") != "unreviewed":
+        return f"Inbox item {item_id!r} was already processed; no duplicate was created."
     linked_id = ""
-    if category == "memory":
+    proposal = None
+    # Inbox classifications are broader than the memory store's retrieval
+    # categories. Safe knowledge becomes durable while the inbox category and
+    # original provenance remain available for review.
+    memory_categories = {
+        "memory": None,
+        "idea": "context",
+        "project": "projects",
+        "relationship": "people",
+        "source": "context",
+        "knowledge": "context",
+        "preference": "preferences",
+    }
+    if category in memory_categories:
         from api.routes.memories import synthesize_memory
         from api.services.memory_store import get_memory_store
         content = (inp.get("content") or item["content"]).strip()
         memory = get_memory_store().create_memory(
             await synthesize_memory(content),
+            category=memory_categories[category],
             source={
                 "type": "life_inbox",
                 "inbox_item_id": item_id,
@@ -2632,10 +2648,25 @@ async def _tool_process_inbox_item(inp: dict) -> str:
             },
         )
         linked_id = memory.id
-    updated = update_item(item_id, status="dismissed" if category == "dismissed" else "processed", category=category, linked_id=linked_id)
+    elif category in {"task", "reminder"}:
+        proposal = {
+            "type": category,
+            "content": (inp.get("content") or item["content"]).strip(),
+            "requires_confirmation": True,
+        }
+    updated = update_item(
+        item_id,
+        status="dismissed" if category == "dismissed" else "processed",
+        category=category,
+        linked_id=linked_id,
+        proposal=proposal,
+    )
     if not updated:
         return f"Error: Could not update Inbox item {item_id!r}."
-    return f"Inbox item classified as {category}." + (f" Memory saved with id {linked_id}." if linked_id else "")
+    suffix = f" Memory saved with id {linked_id}." if linked_id else ""
+    if proposal:
+        suffix = " Saved as a proposed action pending user confirmation."
+    return f"Inbox item classified as {category}." + suffix
 
 
 async def _tool_process_inbox_items(inp: dict) -> str:

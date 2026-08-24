@@ -115,7 +115,9 @@ clear item rather than merely describing the item and stopping.
 Classifies many inbox items in one operation. Prefer this during weekly reviews
 so the review is completed in one pass instead of stopping after one or two
 items. Process clear low-risk items automatically; keep tasks and reminders as
-proposals until the user confirms them.
+proposals until the user confirms them. After a review request, do not ask
+"should I process these?" or offer a menu of options: process the clear items
+first, then report what was saved and which proposed actions need confirmation.
 
 **search_memories:**
 Searches saved memories by wording and meaning. Use to recall previously saved information or check if a memory already exists. A relevance threshold applies: if the result says candidates scored below the threshold, retry with different wording (or a higher `limit`) before telling the user nothing was saved.
