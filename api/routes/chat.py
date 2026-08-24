@@ -47,6 +47,8 @@ _EXPLICIT_MEMORY_RE = re.compile(
 )
 _IMPLICIT_CAPTURE_RE = re.compile(
     r"^\s*(?:i\s+(?:want|would\s+like|plan|hope|intend|need|am\s+going)\s+to\b|"
+    r"i\s+(?:think\s+i\s+might|might|may|am\s+considering)\s+\b|"
+    r"maybe\s+i\s+should\s+\b|"
     r"i(?:'m|\s+am)\s+(?:building|working\s+on|creating|developing)\b|"
     r"(?:my\s+)?(?:goal|project|idea|plan|vision)\s*(?:is|:|-)\b)",
     re.IGNORECASE,

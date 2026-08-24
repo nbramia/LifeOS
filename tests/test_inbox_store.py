@@ -58,6 +58,8 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
     )
 
     assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
+    assert _capture_candidate("I think I might want to learn Japanese")
+    assert _capture_candidate("Maybe I should start writing every morning")
     assert _life_model_candidate("I value having time for family") == (
         "values", "having time for family"
     )
