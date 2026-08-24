@@ -832,6 +832,13 @@ async def ask_stream(request: AskStreamRequest):
     if _effective_pid is None and request.persona:
         _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
     personal_context = settings.personal_context(_effective_pid or "")
+    from api.services.life_model_store import context_text as life_model_context
+    _life_direction_context = life_model_context()
+    if _life_direction_context:
+        personal_context = (
+            f"{personal_context}\n\n{_life_direction_context}".strip()
+            if personal_context else _life_direction_context
+        )
 
     # #611: the turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving

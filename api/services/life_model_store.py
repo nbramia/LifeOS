@@ -127,6 +127,34 @@ def update_source(record_id: str, source: dict) -> bool:
     return False
 
 
+def context_text(limit_per_section: int = 3) -> str:
+    """Return a compact, human-readable direction block for agent context."""
+    data = list_records()
+    labels = {
+        "identity": "Identity",
+        "values": "Values",
+        "current_state": "Current state",
+        "ideal_state": "Ideal state",
+        "philosophy": "Philosophy",
+    }
+    lines = []
+    for section, label in labels.items():
+        rows = data.get(section, [])[-max(1, limit_per_section):]
+        if rows:
+            lines.append(f"### {label}")
+            for item in rows:
+                evidence = item.get("evidence_type", "explicit")
+                lines.append(f"- {item.get('content', '')} [{evidence}]")
+    if not lines:
+        return ""
+    return (
+        "## Recorded life direction\n\n"
+        + "\n".join(lines)
+        + "\n\nTreat this as source-backed personal context. Do not turn it into a task "
+        "or claim an inference is explicit."
+    )
+
+
 def clear() -> None:
     """Test helper; production callers should never need to delete the model."""
     with _LOCK:
