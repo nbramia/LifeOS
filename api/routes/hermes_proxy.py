@@ -66,6 +66,7 @@ from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, truncation_routing
 from api.services.conversation_store import get_store
 from api.services.hermes_persona_thread_store import get_persona_thread_store
+from api.services.model_readout import record_hermes_chat_turn_model
 from api.services.usage_store import get_usage_store
 
 logger = logging.getLogger(__name__)
@@ -456,6 +457,10 @@ class _HermesTurnPersister:
         self._usage_output_tokens = output_tokens
         self._usage_cost_usd = cost_usd
         self._usage_unpriced = not priced
+        # #658: the model that actually answered this turn, per Hermes's own
+        # report — see model_readout.py's module docstring for why this is
+        # the only trustworthy live signal for the "hermes_chat" surface.
+        record_hermes_chat_turn_model(model)
 
     def finalize(self) -> None:
         """Write this turn to the stores, once each. Runs after the pump has

@@ -16,7 +16,7 @@ from api.services.agent_worker.local_executor import (
     LocalExecutor,
     _system_prompt,
 )
-from api.services.agent_worker.pricing import cost_for
+from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
@@ -457,18 +457,66 @@ def test_pricing_table_local_is_free():
 
 @pytest.mark.unit
 def test_pricing_table_opus_uses_correct_rates():
-    # 1k input + 1k output of Opus = $0.015 + $0.075 = $0.09
+    # 1k input + 1k output of Opus = $0.005 + $0.025 = $0.03
     cost = cost_for("claude-opus-4-7", 1000, 1000)
-    assert cost == pytest.approx(0.015 + 0.075)
+    assert cost == pytest.approx(0.005 + 0.025)
 
 
 @pytest.mark.unit
-def test_pricing_unknown_model_falls_through_to_opus_rate():
+def test_pricing_table_opus_5_uses_verified_rate():
+    """Claude Opus 5's rate is $5/$25 per Mtok — verified against
+    https://platform.claude.com/docs/en/about-claude/pricing (2026-08-23),
+    same tier price as Opus 4.5/4.6/4.7/4.8 (#655)."""
+    cost = cost_for("claude-opus-5", 1000, 1000)
+    assert cost == pytest.approx(0.005 + 0.025)
+
+
+@pytest.mark.unit
+def test_pricing_unknown_model_falls_through_to_priciest_rate():
     """Conservative: unknown model = highest plausible price (so budgets stay
-    enforced rather than silently suppressed by a typo)."""
+    enforced rather than silently suppressed by a typo). Fable 5 / Mythos 5
+    are the priciest tier as of #655 (Opus was, before they were added)."""
     unknown = cost_for("typoed-model", 1000, 1000)
-    opus = cost_for("claude-opus-4-7", 1000, 1000)
-    assert unknown == pytest.approx(opus)
+    priciest = cost_for("claude-fable-5", 1000, 1000)
+    assert unknown == pytest.approx(priciest)
+
+
+@pytest.mark.unit
+def test_pricing_fallback_does_not_hardcode_a_specific_model_id():
+    """The unknown-model fallback must track whichever tier is priciest,
+    not a specific superseded id (#655) — so it can't itself go stale the
+    next time a new top-tier model ships."""
+    from api.services.agent_worker.pricing import PRICING, fallback_rates
+
+    priciest_output_rate = max(
+        rates["output"] for name, rates in PRICING.items() if name != "local"
+    )
+    assert fallback_rates()["output"] == pytest.approx(priciest_output_rate)
+
+
+@pytest.mark.unit
+def test_pricing_historical_dated_snapshot_ids_still_resolve():
+    """Real usage rows record the exact dated snapshot id the API echoed
+    back (e.g. Claude Code sessions), not the bare tier alias — these must
+    keep pricing correctly (#656)."""
+    assert cost_for("claude-sonnet-4-5-20250929", 1000, 1000) == pytest.approx(
+        cost_for("claude-sonnet-4-5", 1000, 1000)
+    )
+    assert cost_for("claude-sonnet-4-20250514", 1000, 1000) == pytest.approx(
+        cost_for("claude-sonnet-4", 1000, 1000)
+    )
+
+
+@pytest.mark.unit
+def test_is_known_model_true_for_dated_snapshot_of_a_priced_tier():
+    assert is_known_model("claude-sonnet-4-5-20250929") is True
+
+
+@pytest.mark.unit
+def test_is_known_model_false_for_unrecognized_id():
+    """An unrecognized model records as unpriced (#661) rather than being
+    silently priced at the (expensive) Opus fallback rate."""
+    assert is_known_model("typoed-model") is False
 
 
 @pytest.mark.unit

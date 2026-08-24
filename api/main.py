@@ -49,7 +49,7 @@ from fastapi.exceptions import RequestValidationError
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest
 from api.services.log_redaction import configure_telegram_log_redaction
 from config.settings import settings
 
@@ -322,6 +322,7 @@ app.include_router(agent_proxy.router)
 app.include_router(hermes_proxy.router)
 app.include_router(journal.router)
 app.include_router(journal_trends.router)
+app.include_router(journal_ingest.router)
 
 # Serve static files
 web_dir = Path(__file__).parent.parent / "web"
@@ -628,6 +629,14 @@ async def full_health_check():
         "imessage_stats",
         "GET", "/api/imessage/statistics",
     )
+
+    # 12. Model readout (#658) — which model is actually serving each chat
+    # surface right now. Informational, not a pass/fail check: kept out of
+    # `results["checks"]` (and its "ok"/"error" degraded/unhealthy counting
+    # below) because an "unknown" Hermes readout doesn't mean LifeOS itself
+    # is unhealthy. See api/services/model_readout.py.
+    from api.services.model_readout import get_model_readout
+    results["models"] = await get_model_readout()
 
     # Set overall status
     failed = [k for k, v in results["checks"].items() if v["status"] == "error"]

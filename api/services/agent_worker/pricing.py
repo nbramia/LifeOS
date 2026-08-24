@@ -1,7 +1,9 @@
 """Per-model pricing for budget enforcement.
 
 Prices are dollars per token. The Anthropic figures match
-https://platform.claude.com/docs/en/about-claude/pricing as verified 2026-08-23.
+https://platform.claude.com/docs/en/about-claude/pricing as verified 2026-08-23
+(#655 — this pass also caught the Opus 4.6/4.7/4.8 and Sonnet 5 entries
+below being wrong; see the inline notes).
 Update when models change.
 
 This is the **only** live pricing table in LifeOS — `cost_for()` below is
@@ -36,11 +38,25 @@ MANAGED_SESSION_HOUR_OVERHEAD: float = 0.08
 # Dollars per token. Keys match the model id strings used by the routers.
 # Verified 2026-08-23 against https://platform.claude.com/docs/en/about-claude/pricing.
 PRICING: dict[str, dict[str, float]] = {
-    # Claude 4.8 / 4.7 / 4.6 / 4.5 share the same prices per their respective tiers.
-    "claude-opus-4-8":   {"input": 15.0e-6, "output": 75.0e-6},
-    "claude-opus-4-7":   {"input": 15.0e-6, "output": 75.0e-6},
-    "claude-opus-4-6":   {"input": 15.0e-6, "output": 75.0e-6},
-    "claude-sonnet-5":   {"input":  3.0e-6, "output": 15.0e-6},
+    # Fable 5 / Mythos 5 (limited availability / Project Glasswing) — the
+    # most expensive tier Anthropic currently serves, at $10/$50 per Mtok.
+    # Not routed to by any LifeOS alias today, but listed here so a usage
+    # row naming either (e.g. a manually-configured escalation model)
+    # prices correctly instead of falling through to fallback_rates() (#655).
+    "claude-fable-5":    {"input": 10.0e-6, "output": 50.0e-6},
+    "claude-mythos-5":   {"input": 10.0e-6, "output": 50.0e-6},
+    # Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 all share the same $5/$25-per-Mtok rate.
+    # 4.8/4.7/4.6 were incorrectly 15.0e-6/75.0e-6 (Opus 4/4.1's retired
+    # rate) until #655.
+    "claude-opus-5":     {"input":  5.0e-6, "output": 25.0e-6},
+    "claude-opus-4-8":   {"input":  5.0e-6, "output": 25.0e-6},
+    "claude-opus-4-7":   {"input":  5.0e-6, "output": 25.0e-6},
+    "claude-opus-4-6":   {"input":  5.0e-6, "output": 25.0e-6},
+    "claude-opus-4-5":   {"input":  5.0e-6, "output": 25.0e-6},
+    # $2.00/$10.00 per Mtok — Sonnet 5's launch "introductory" rate became
+    # the permanent rate (Anthropic cancelled the scheduled 2026-09-01
+    # increase to $3/$15). Was incorrectly 3.0e-6/15.0e-6 until #655.
+    "claude-sonnet-5":   {"input":  2.0e-6, "output": 10.0e-6},
     "claude-sonnet-4-6": {"input":  3.0e-6, "output": 15.0e-6},
     "claude-sonnet-4-5": {"input":  3.0e-6, "output": 15.0e-6},
     # Retired but still referenced by historical usage rows (#656) — same
@@ -87,6 +103,19 @@ def is_known_model(model: str) -> bool:
     return model in PRICING or _DATED_SNAPSHOT_SUFFIX.sub("", model) in PRICING
 
 
+def fallback_rates() -> dict[str, float]:
+    """Rates for an unrecognized model id: the priciest tier in PRICING.
+
+    Computed from the table rather than naming a specific model id, so this
+    doesn't itself go stale the next time a new top-tier model ships (as
+    happened across Opus 4.6/4.7/4.8 before #655).
+    """
+    return max(
+        (rates for name, rates in PRICING.items() if name != "local"),
+        key=lambda rates: rates["output"],
+    )
+
+
 def cost_for(
     model: str,
     tokens_in: int,
@@ -107,14 +136,14 @@ def cost_for(
     Cache buckets default to zero so existing two-arg call sites keep
     working. A dated snapshot id (e.g. "claude-sonnet-4-5-20250929") that
     isn't itself a key resolves to its bare tier if that tier is priced.
-    Anything still unresolved falls through to a conservative Opus-rate
-    estimate so a typo can't accidentally suppress budget enforcement.
+    Anything still unresolved falls through to the priciest known tier's
+    rate so a typo can't accidentally suppress budget enforcement.
     """
     rates = PRICING.get(model)
     if rates is None:
         rates = PRICING.get(_DATED_SNAPSHOT_SUFFIX.sub("", model))
     if rates is None:
-        rates = PRICING["claude-opus-4-7"]
+        rates = fallback_rates()
     input_rate = rates["input"]
     return (
         tokens_in * input_rate

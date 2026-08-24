@@ -453,11 +453,12 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
         CACHE_CREATION_RATE_MULTIPLIER,
         MANAGED_SESSION_HOUR_OVERHEAD,
         PRICING,
+        fallback_rates,
     )
     from api.services.agent_worker.tool_filter import estimated_cache_creation_tokens
 
     model = result.model or MODEL_SONNET
-    rates = PRICING.get(model) or PRICING["claude-opus-4-7"]
+    rates = PRICING.get(model) or fallback_rates()
     cache_tokens = estimated_cache_creation_tokens(result.preset_class)
     cache_cold_dollars = cache_tokens * rates["input"] * CACHE_CREATION_RATE_MULTIPLIER
     # Add session-hour overhead as a small floor so estimates align with

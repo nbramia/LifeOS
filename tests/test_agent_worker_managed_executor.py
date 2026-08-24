@@ -729,12 +729,12 @@ def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
     )
     store.set_managed_session_id("t1", "sess_remote")
     session = store.get("t1")
-    # 100 input tokens * Opus rate ($15/M) = $0.0015 — just over $0.001 cap.
+    # 300 input tokens * Opus rate ($5/M) = $0.0015 — just over $0.001 cap.
     driver = _FakeDriver(state_responses=[
         ManagedSessionState(
             session_id="sess_remote", status="running", last_event_id="evt_x",
             new_events=[],
-            total_input_tokens=100, total_output_tokens=0,
+            total_input_tokens=300, total_output_tokens=0,
         ),
     ])
     executor = _make_executor(store, transcript, driver, model="claude-opus-4-7")

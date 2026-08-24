@@ -166,10 +166,10 @@ def test_resolve_no_escalation_when_not_triggered():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("question, expected", [
-    ("escalate to opus", "claude-opus-4-8"),
-    ("use opus please", "claude-opus-4-8"),
-    ("with claude opus", "claude-opus-4-8"),
-    ("retry on opus", "claude-opus-4-8"),
+    ("escalate to opus", "claude-opus-5"),
+    ("use opus please", "claude-opus-5"),
+    ("with claude opus", "claude-opus-5"),
+    ("retry on opus", "claude-opus-5"),
     ("use sonnet", "claude-sonnet-5"),
     ("switch to sonnet", "claude-sonnet-5"),
     ("use haiku for this", "claude-haiku-4-5"),
@@ -187,7 +187,7 @@ def test_named_tier_works_without_escalation_model_configured():
     model, escalated = resolve_orchestrator_model(
         [], "use opus", base_model="claude-haiku-4-5", escalation_model=""
     )
-    assert (model, escalated) == ("claude-opus-4-8", True)
+    assert (model, escalated) == ("claude-opus-5", True)
 
 
 @pytest.mark.parametrize("question", [
@@ -252,7 +252,7 @@ def test_directive_beats_auto_heuristic_without_refusal():
         "actually, use opus",
         base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
     )
-    assert (model, escalated) == ("claude-opus-4-8", True)
+    assert (model, escalated) == ("claude-opus-5", True)
 
 
 @pytest.mark.parametrize("question", [
@@ -565,9 +565,9 @@ def test_select_client_ignores_model_on_local_backend(monkeypatch):
 @pytest.mark.parametrize("name,expected", [
     ("haiku", "claude-haiku-4-5"),
     ("sonnet", "claude-sonnet-5"),
-    ("opus", "claude-opus-4-8"),
-    ("Opus", "claude-opus-4-8"),            # case-insensitive
-    ("claude-opus-4-8", "claude-opus-4-8"),  # a full id passes through
+    ("opus", "claude-opus-5"),
+    ("Opus", "claude-opus-5"),              # case-insensitive
+    ("claude-opus-4-8", "claude-opus-4-8"),  # a full id passes through unchanged, even a superseded one
     ("", ""),
 ])
 def test_resolve_model_alias(name, expected):
