@@ -153,6 +153,18 @@ def _requested_life_review_mode(question: str) -> str | None:
     return None
 
 
+def _source_capture_candidate(question: str, source: dict | None) -> str | None:
+    """Return a source capture when a transport carries a durable reference."""
+    if not isinstance(source, dict):
+        return None
+    urls = source.get("urls") or []
+    if urls:
+        return (question or "").strip()
+    if source.get("media_type") and "without caption" not in (question or "").lower():
+        return (question or "").strip()
+    return None
+
+
 def _commitment_query_person(question: str) -> str:
     text = question or ""
     match = re.search(r"\bwhat\s+does\s+([A-Z][\w'-]{1,30})\s+owe\b", text, re.IGNORECASE)
@@ -1283,7 +1295,30 @@ async def ask_stream(request: AskStreamRequest):
                     "result": f"Memory saved: {_saved_memory.id}",
                     "is_error": False,
                 })
+                _memory_tool_succeeded = True
                 _notice = "\n\nSaved as persistent memory."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _source_capture = _source_capture_candidate(request.question, request.source)
+            if _source_capture and not _memory_tool_succeeded:
+                from api.services.memory_store import get_memory_store
+                _source_memory = get_memory_store().create_memory(
+                    _source_capture,
+                    category="context",
+                    source={
+                        **(request.source or {}),
+                        "content_type": "source_capture",
+                    },
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "save_memory",
+                    "input": {"content": _source_capture},
+                    "result": f"Memory saved: {_source_memory.id}",
+                    "is_error": False,
+                })
+                _memory_tool_succeeded = True
+                _notice = "\n\nI kept that source for later."
                 agent_result.full_text += _notice
                 await _content(_notice)
 

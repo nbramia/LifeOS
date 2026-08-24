@@ -52,6 +52,7 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         _capture_candidate,
         _extract_commitment_candidate,
         _requested_life_review_mode,
+        _source_capture_candidate,
     )
 
     assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
@@ -62,6 +63,10 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
     }
     assert _requested_life_review_mode("What should I do today?") == "today"
     assert _requested_life_review_mode("Which projects am I neglecting?") == "neglected"
+    assert _source_capture_candidate(
+        "Interesting video https://youtube.com/watch?v=abc",
+        {"type": "telegram", "urls": ["https://youtube.com/watch?v=abc"]},
+    ) == "Interesting video https://youtube.com/watch?v=abc"
     item = inbox_store.add_item("I want to build a cafe AI product")
     _close_chat_inbox_item(
         item["id"],
