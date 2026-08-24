@@ -2448,6 +2448,32 @@ def _tool_life_review(inp: dict) -> str:
         else:
             lines.append("- No open commitments are recorded.")
 
+        lines.append("\n## Relationship follow-ups")
+        relationship_gaps = []
+        try:
+            from api.services.person_entity import get_person_entity_store
+            from api.services.relationship_summary import get_relationship_summary
+            for person in get_person_entity_store().get_all():
+                if person.hidden or person.is_peripheral_contact:
+                    continue
+                summary = get_relationship_summary(person.id)
+                if not summary or not summary.contact_on_record:
+                    continue
+                threshold = 14 if person.category == "family" else 30
+                if summary.days_since_contact >= threshold and summary.relationship_strength > 0:
+                    relationship_gaps.append((summary.relationship_strength, summary.days_since_contact, summary))
+        except Exception as exc:
+            logger.warning("Life review could not compute relationship gaps: %s", exc)
+        relationship_gaps.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        if relationship_gaps:
+            for strength, days_since, summary in relationship_gaps[:limit]:
+                lines.append(
+                    f"- Consider reconnecting with {summary.person_name}: "
+                    f"{days_since} days since contact; relationship strength {strength:.0f}/100"
+                )
+        else:
+            lines.append("- No high-confidence relationship gaps meet the configured thresholds.")
+
         pending = list_items(limit=limit, since_days=7)
         lines.append("\n## Unresolved inbox")
         if pending:
