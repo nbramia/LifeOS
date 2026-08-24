@@ -2,13 +2,14 @@
 """
 Seed proactive intelligence reminders for LifeOS.
 
-Creates three prompt-type reminders:
+Creates four prompt-type reminders:
 1. Pre-meeting prep (every 15 min on weekdays, checks for upcoming meetings)
 2. Morning briefing (daily at 6:30 AM ET)
 3. Weekly communication gap digest (Sundays at 10 AM ET)
+4. Weekly Life Inbox review (Sundays at 11 AM ET)
 
 Usage:
-    ~/.venvs/lifeos/bin/python scripts/seed_proactive_reminders.py [--dry-run]
+    ~/.venvs/lifeos/bin/python scripts/seed_proactive_reminders.py [--dry-run] [--only NAME]
 
 Each module is a standard prompt-type reminder — no new infrastructure.
 Delete any reminder via the API to disable it.
@@ -102,6 +103,20 @@ Limit to 5-7 people maximum. \
 If there are no significant gaps, say "All relationships are current — no action needed."\
 """
 
+LIFE_INBOX_REVIEW_PROMPT = """\
+Review my Life Inbox from the last 7 days.
+
+Process every clear, low-risk capture automatically: save durable memories,
+ideas, projects, relationships, sources, knowledge, and preferences with their
+original evidence. Dismiss ordinary acknowledgements and conversational noise.
+Keep tasks and reminders as proposals unless I explicitly approved creating
+them. Do not ask whether you should process the inbox after you have reviewed
+it. Report a concise summary of what was filed, which proposals need my
+approval, and which ambiguous items remain.
+
+If there is nothing unresolved, reply with exactly NOTHING_TO_REPORT.
+"""
+
 # ---------------------------------------------------------------------------
 # Reminder definitions
 # ---------------------------------------------------------------------------
@@ -134,6 +149,15 @@ REMINDERS = [
         "enabled": True,
         "timezone": _TZ,
     },
+    {
+        "name": "Weekly Life Inbox Review",
+        "schedule_type": "cron",
+        "schedule_value": "0 11 * * 0",  # Sundays at 11:00 AM
+        "message_type": "prompt",
+        "message_content": LIFE_INBOX_REVIEW_PROMPT,
+        "enabled": True,
+        "timezone": _TZ,
+    },
 ]
 
 
@@ -141,7 +165,23 @@ def main():
     parser = argparse.ArgumentParser(description="Seed proactive intelligence reminders")
     parser.add_argument("--dry-run", action="store_true", help="Print reminders without creating them")
     parser.add_argument("--force", action="store_true", help="Create even if reminders with same names exist")
+    parser.add_argument(
+        "--only",
+        action="append",
+        dest="only",
+        metavar="NAME",
+        help="Seed only the named reminder; may be passed more than once.",
+    )
     args = parser.parse_args()
+
+    selected = set(args.only or [])
+    definitions = [
+        reminder_def for reminder_def in REMINDERS
+        if not selected or reminder_def["name"] in selected
+    ]
+    unknown = selected - {reminder_def["name"] for reminder_def in REMINDERS}
+    if unknown:
+        parser.error("unknown reminder name(s): " + ", ".join(sorted(unknown)))
 
     store = get_reminder_store()
     existing = {r.name for r in store.list_all()}
@@ -149,7 +189,7 @@ def main():
     created = 0
     skipped = 0
 
-    for reminder_def in REMINDERS:
+    for reminder_def in definitions:
         name = reminder_def["name"]
 
         if name in existing and not args.force:
@@ -169,7 +209,7 @@ def main():
 
     print()
     if args.dry_run:
-        print(f"Dry run: {len(REMINDERS)} reminders would be created, {skipped} skipped")
+        print(f"Dry run: {len(definitions)} reminders would be created, {skipped} skipped")
     else:
         print(f"Created {created} reminders, skipped {skipped}")
 
