@@ -2,13 +2,13 @@
 Relationship Insights Service for LifeOS CRM.
 
 Extracts and stores relationship insights from therapy notes, Omi recordings,
-and other personal sources using Claude Sonnet. Focused on couples therapy
+and other personal sources using the configured reasoning model. Focused on couples therapy
 insights for tracking relationship health and growth.
 
 Key features:
 - Reads vault notes from therapy path
 - Parses date from note TITLE (yyyymmdd format) for recency
-- Uses Claude Sonnet for insight extraction
+- Uses the provider/model registry for insight extraction
 - Confirm/dismiss functionality like person_facts
 - Recency bias: last 3 months weighted 3x
 """
@@ -301,10 +301,11 @@ class RelationshipInsightStore:
 
 class RelationshipInsightGenerator:
     """
-    Generates relationship insights from therapy notes using Claude.
+    Generates relationship insights from therapy notes using the configured
+    reasoning model.
 
     Reads vault notes from the therapy path, filters to couples therapy notes,
-    and uses Claude Sonnet to extract actionable insights.
+    and uses the provider/model registry to extract actionable insights.
     """
 
     def __init__(self, store: Optional[RelationshipInsightStore] = None):
@@ -316,8 +317,8 @@ class RelationshipInsightGenerator:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            from api.services.llm_client import get_anthropic_llm
-            self._client = get_anthropic_llm()
+            from api.services.llm_client import get_llm
+            self._client = get_llm("reasoning")
         return self._client
 
     def _parse_date_from_title(self, title: str) -> Optional[datetime]:
