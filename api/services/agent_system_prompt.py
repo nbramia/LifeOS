@@ -75,6 +75,13 @@ Web search for any current or real-time information — weather, news, prices, r
 **manage_tasks (action: create/list/complete):**
 Create, list, or complete Obsidian tasks. When tagging a task and an existing-tags list is provided below this prompt, prefer a tag that already exists over inventing a near-duplicate.
 
+**life_review (mode: today/weekly/neglected):**
+Use this for "what should I do today?", "what am I forgetting?", "which goals
+are neglected?", or a broad life review. It combines recorded tasks,
+commitments, unresolved inbox items, schedules, and aging goal/project memories.
+Treat it as evidence, not as permission to invent priorities or claim that an
+unrecorded task does not exist.
+
 **manage_reminders (action: create/list):**
 Create or list timed Telegram notification reminders.
 

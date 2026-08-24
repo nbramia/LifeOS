@@ -438,6 +438,27 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "life_review",
+        "description": (
+            "Build a source-backed personal review. Use for what should I do today, "
+            "what am I forgetting, which goals/projects are neglected, or a weekly "
+            "life review. It combines open tasks, overdue work, commitments, inbox "
+            "items, schedules, and aging project memories; it does not invent priorities."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["today", "weekly", "neglected"],
+                    "description": "today for immediate action, weekly for a broad review, neglected for stale goals/projects.",
+                },
+                "limit": {"type": "integer", "description": "Maximum items per section (default 10)."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "manage_reminders",
         "description": "DEPRECATED — use manage_schedules. Manage timed reminders: create or list.",
         "input_schema": {
@@ -2343,6 +2364,93 @@ def _task_tags(_inp: dict) -> str:
     return "\n".join(f"#{row['tag']} ({row['count']})" for row in rows)
 
 
+def _tool_life_review(inp: dict) -> str:
+    """Return a deterministic, evidence-backed personal action review."""
+    from datetime import date
+    from api.services.commitment_store import list_commitments
+    from api.services.inbox_store import list_items
+    from api.services.memory_store import get_memory_store
+    from api.services.scheduler_store import get_scheduler_store
+    from api.services.task_manager import get_task_manager
+
+    mode = str(inp.get("mode", "today") or "today").strip().lower()
+    if mode not in {"today", "weekly", "neglected"}:
+        mode = "today"
+    try:
+        limit = max(1, min(int(inp.get("limit", 10) or 10), 50))
+    except (TypeError, ValueError):
+        limit = 10
+
+    today = date.today().isoformat()
+    tasks = [
+        task for task in get_task_manager().list_tasks()
+        if task.status in {"todo", "in_progress", "blocked", "urgent", "deferred"}
+    ]
+    priority_rank = {"high": 0, "medium": 1, "low": 2, "": 3}
+    tasks.sort(key=lambda task: (
+        0 if task.due_date and task.due_date < today else 1,
+        0 if task.due_date and task.due_date <= today else 1,
+        priority_rank.get(task.priority, 3),
+        task.due_date or "9999-12-31",
+    ))
+
+    lines = [f"Life review ({mode}) — based on recorded information as of {today}."]
+    if mode != "neglected":
+        lines.append("\n## Next actions")
+        if tasks:
+            for task in tasks[:limit]:
+                due = f"; due {task.due_date}" if task.due_date else ""
+                priority = f"; priority {task.priority}" if task.priority else ""
+                lines.append(f"- {task.status}: {task.description}{due}{priority}")
+        else:
+            lines.append("- No open tasks are recorded.")
+
+        commitments = list_commitments(limit=limit)
+        lines.append("\n## Open commitments")
+        if commitments:
+            for item in commitments:
+                person = f" ({item['person_name']})" if item.get("person_name") else ""
+                due = f"; due {item['due_at']}" if item.get("due_at") else ""
+                lines.append(f"- {item['direction']}{person}: {item['content']}{due}")
+        else:
+            lines.append("- No open commitments are recorded.")
+
+        pending = list_items(limit=limit, since_days=7)
+        lines.append("\n## Unresolved inbox")
+        if pending:
+            for item in pending:
+                lines.append(f"- {item['content']}")
+        else:
+            lines.append("- No unresolved captures from the last week.")
+
+        schedules = [
+            entry for entry in get_scheduler_store().list_all()
+            if entry.enabled and entry.next_trigger_at
+        ]
+        schedules.sort(key=lambda entry: entry.next_trigger_at or "")
+        lines.append("\n## Upcoming scheduled items")
+        if schedules:
+            for entry in schedules[:limit]:
+                lines.append(f"- {entry.name}: {entry.next_trigger_at}")
+        else:
+            lines.append("- No upcoming scheduled items are recorded.")
+
+    memories = get_memory_store().list_memories(limit=1000)
+    projects = [
+        memory for memory in memories
+        if memory.category in {"projects", "goals"}
+    ]
+    projects.sort(key=lambda memory: memory.updated_at or memory.created_at)
+    lines.append("\n## Aging goals/projects")
+    if projects:
+        for memory in projects[:limit]:
+            stamp = (memory.updated_at or memory.created_at).date().isoformat()
+            lines.append(f"- last recorded {stamp}: {memory.content}")
+    else:
+        lines.append("- No goals or projects are recorded in the current memory set.")
+
+    lines.append("\nThis is a record-based review; it does not prove that an item is unimportant or forgotten when no record exists.")
+    return "\n".join(lines)
 def _tool_manage_tasks(inp: dict):
     action = inp["action"]
     if action == "create":
@@ -3984,6 +4092,7 @@ _TOOL_HANDLERS = {
     "get_message_history": _tool_get_message_history,
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
+    "life_review": _tool_life_review,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
     "manage_workouts": _tool_manage_workouts,
@@ -4017,6 +4126,7 @@ TOOL_STATUS_MESSAGES = {
     "person_info.lookup": "Looking up person...",
     "person_info.briefing": "Generating briefing...",
     "manage_tasks": "Managing tasks...",
+    "life_review": "Reviewing your priorities...",
     "manage_tasks.create": "Creating task...",
     "manage_tasks.list": "Loading tasks...",
     "manage_tasks.complete": "Completing task...",
