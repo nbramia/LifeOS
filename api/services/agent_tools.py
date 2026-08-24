@@ -2796,6 +2796,8 @@ async def _tool_review_inbox(inp: dict) -> str:
         f"Life Inbox review completed for the last {since_days} days.",
         f"Automatically filed {len(auto_processed)} clear item(s).",
     ]
+    for item, category, _result in auto_processed[:limit]:
+        lines.append(f"- filed as {category}: {item.get('content', '')}")
     if proposals:
         lines.append(f"{len(proposals)} task/reminder proposal(s) still need confirmation.")
         for item in proposals[:limit]:
