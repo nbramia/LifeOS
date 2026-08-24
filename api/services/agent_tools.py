@@ -2648,7 +2648,7 @@ def _auto_inbox_category(content: str) -> str | None:
     if re.search(r"\b(youtube|video|x post|tweet|forwarded|source|link)\b", lower):
         return "source"
     if re.search(r"\b(my goal|top priority|i want to|i'd like to|i am working on|i'm working on|my project|i had an accident|my car)\b", lower):
-        if re.search(r"\b(project|building|working on|creating|developing)\b", lower):
+        if re.search(r"\b(project|product|building|working on|creating|developing)\b", lower):
             return "project"
         if re.search(r"\b(maybe|idea|might want)\b", lower):
             return "idea"
