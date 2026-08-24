@@ -53,6 +53,7 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         _extract_commitment_candidate,
         _requested_life_review_mode,
         _source_capture_candidate,
+        _remove_capture_permission_prompt,
     )
 
     assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
@@ -67,6 +68,10 @@ def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkey
         "Interesting video https://youtube.com/watch?v=abc",
         {"type": "telegram", "urls": ["https://youtube.com/watch?v=abc"]},
     ) == "Interesting video https://youtube.com/watch?v=abc"
+    cleaned = _remove_capture_permission_prompt(
+        "I captured the idea.\nWant me to save this as a product note?"
+    )
+    assert cleaned == "I captured the idea."
     item = inbox_store.add_item("I want to build a cafe AI product")
     _close_chat_inbox_item(
         item["id"],

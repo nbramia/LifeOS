@@ -165,6 +165,20 @@ def _source_capture_candidate(question: str, source: dict | None) -> str | None:
     return None
 
 
+_CAPTURE_PERMISSION_RE = re.compile(
+    r"(?im)^.*?(?:want me to|would you like me to|do you want me to|should i)"
+    r"[^\n]*(?:save|store|remember|note|capture|add this)[^\n]*[?!.]?\s*$"
+)
+
+
+def _remove_capture_permission_prompt(text: str) -> str:
+    """Remove stale permission questions after a capture was already saved."""
+    if not text:
+        return text
+    cleaned = _CAPTURE_PERMISSION_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def _commitment_query_person(question: str) -> str:
     text = question or ""
     match = re.search(r"\bwhat\s+does\s+([A-Z][\w'-]{1,30})\s+owe\b", text, re.IGNORECASE)
@@ -1315,6 +1329,20 @@ async def ask_stream(request: AskStreamRequest):
                 _notice = "\n\nSaved as persistent memory."
                 agent_result.full_text += _notice
                 await _content(_notice)
+
+            # A weaker model may stream a permission question even though the
+            # fallback above (or its own save_memory call) has already made the
+            # write. Replace that stale text in the streamed conversation so
+            # Telegram does not show both "want me to save?" and "saved".
+            if _memory_content and _memory_tool_succeeded:
+                _cleaned_capture_text = _remove_capture_permission_prompt(
+                    agent_result.full_text
+                )
+                if _cleaned_capture_text != agent_result.full_text:
+                    agent_result.full_text = _cleaned_capture_text
+                    partial_text = ""
+                    await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
+                    await _content(_cleaned_capture_text)
 
             _source_capture = _source_capture_candidate(request.question, request.source)
             if _source_capture and not _memory_tool_succeeded:
