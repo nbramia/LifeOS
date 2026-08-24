@@ -1164,7 +1164,11 @@ def get_anthropic_llm() -> AnthropicLLMClient:
     """
     global _anthropic_client
     providers, models = get_llm_registry()
-    specialist = models.get("specialist")
+    specialist = (
+        models.get("specialist")
+        or models.get("default")
+        or models.get("fast")
+    )
     if specialist and specialist.provider != "anthropic":
         # Keep the historical function name for callers while allowing
         # specialist operations to follow the configured provider profile.
