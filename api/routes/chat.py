@@ -57,6 +57,22 @@ _SIGNIFICANT_CAPTURE_RE = re.compile(
 )
 
 
+def _requested_model_profile(question: str, profiles: dict) -> str | None:
+    """Resolve an explicit natural-language named profile for this turn."""
+    text = (question or "").strip().lower()
+    match = re.match(
+        r"^(?:please\s+)?use\s+(?:the\s+)?([a-z0-9_-]+)"
+        r"(?:\s+model)?\s+for\s+(?:this|this\s+turn)\b",
+        text,
+    )
+    candidate = match.group(1) if match else ""
+    if not candidate and re.match(r"^(?:please\s+)?use\s+the\s+strongest\s+model\b", text):
+        candidate = "reasoning"
+    if not candidate:
+        return None
+    return {name.lower(): name for name in profiles}.get(candidate)
+
+
 def _explicit_memory_content(question: str) -> str | None:
     """Return content from an explicit remember request, if present.
 
@@ -987,14 +1003,31 @@ async def ask_stream(request: AskStreamRequest):
             # this turn to that cloud model. "auto"/unset falls through to the
             # normal Haiku + escalation path.
             _override = (request.model_override or "").strip().lower()
+            if not _override or _override == "auto":
+                _natural_profile = _requested_model_profile(request.question, _model_profiles)
+                if _natural_profile:
+                    _override = _natural_profile.lower()
             _backend_is_anthropic = orchestrator_provider == "anthropic"
+            model_profile = ""
+            _profile_name = next(
+                (name for name in _model_profiles if name.lower() == _override),
+                None,
+            ) if _override else None
+            if _profile_name:
+                selected_profile = _model_profiles[_profile_name]
+                model_profile = _profile_name
+                orchestrator_provider = selected_profile.provider
+                orchestrator_model = selected_profile.model
+                escalated = True
             if _override == "remote" and not settings.remote_llm_configured:
                 # The picker hides this option when unconfigured, but an
                 # explicit-but-unusable pick from a raw API caller falls back
                 # to auto rather than being treated as an Anthropic model id
                 # named "remote" (which would 404).
                 _override = "auto"
-            if _override in ("gemma", "local"):
+            if model_profile:
+                pass
+            elif _override in ("gemma", "local"):
                 force_local = True
                 orchestrator_model = "local"
             elif _override == "remote":
@@ -1079,6 +1112,7 @@ async def ask_stream(request: AskStreamRequest):
                 personal_context=personal_context,
                 force_local=force_local,
                 force_remote=force_remote,
+                model_profile=model_profile,
             ):
                 if event["type"] == "turn_state":
                     # #615: live, mutable AgentResult -- see the comment by
