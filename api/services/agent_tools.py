@@ -2493,19 +2493,23 @@ def _tool_life_review(inp: dict) -> str:
                     lines.append(f"- {label}: {item.get('content', '')} [{evidence}]")
     if mode != "neglected":
         lines.append("\n## Next actions")
+        reconciliations = []
         if tasks:
             for task in tasks[:limit]:
                 due = f"; due {task.due_date}" if task.due_date else ""
                 priority = f"; priority {task.priority}" if task.priority else ""
                 evidence = completion_evidence(task)
                 if evidence:
-                    lines.append(
-                        f"- review: {task.description}{due}{priority} — a later record may indicate this is complete: {evidence[:180]}"
+                    reconciliations.append(
+                        f"- {task.description}{due}{priority} — later record: {evidence[:180]}"
                     )
                 else:
                     lines.append(f"- {task.status}: {task.description}{due}{priority}")
         else:
             lines.append("- No open tasks are recorded.")
+        if reconciliations:
+            lines.append("\n## Completed evidence to reconcile")
+            lines.extend(reconciliations)
 
         commitments = list_commitments(limit=limit)
         lines.append("\n## Open commitments")
