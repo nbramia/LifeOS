@@ -13,6 +13,7 @@ per-turn model pick, configured entirely in config/settings.py.
 """
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
@@ -22,6 +23,78 @@ import httpx
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LLMProviderConfig:
+    """Provider connection details, independent of a selected model."""
+
+    name: str
+    type: str
+    base_url: str = ""
+    api_key: str = ""
+
+
+@dataclass(frozen=True)
+class LLMModelConfig:
+    """Named model profile used by an operation or chat turn."""
+
+    name: str
+    provider: str
+    model: str
+
+
+def _json_setting(value: str, setting_name: str) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Ignoring invalid %s", setting_name)
+        return {}
+
+
+def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModelConfig]]:
+    """Resolve named providers and profiles, retaining legacy fallbacks."""
+    providers = {
+        "anthropic": LLMProviderConfig(
+            name="anthropic", type="anthropic", api_key=settings.anthropic_api_key,
+        ),
+        "local": LLMProviderConfig(
+            name="local", type="openai_compatible", base_url=settings.local_llm_url,
+        ),
+    }
+    for name, raw in _json_setting(settings.llm_providers_json, "LIFEOS_LLM_PROVIDERS").items():
+        if not isinstance(raw, dict):
+            continue
+        key_env = str(raw.get("api_key_env", "") or "")
+        providers[str(name)] = LLMProviderConfig(
+            name=str(name),
+            type=str(raw.get("type", "openai_compatible")),
+            base_url=str(raw.get("base_url", "") or ""),
+            api_key=os.environ.get(key_env, "") if key_env else str(raw.get("api_key", "") or ""),
+        )
+
+    models = {}
+    for name, raw in _json_setting(settings.llm_models_json, "LIFEOS_LLM_MODELS").items():
+        if isinstance(raw, dict) and raw.get("provider") and raw.get("model"):
+            models[str(name)] = LLMModelConfig(str(name), str(raw["provider"]), str(raw["model"]))
+    if "default" not in models:
+        backend = settings.llm_backend.lower()
+        models["default"] = LLMModelConfig(
+            "default", "anthropic" if backend == "anthropic" else "local",
+            settings.anthropic_model if backend == "anthropic" else settings.local_llm_model,
+        )
+    if "fast" not in models:
+        models["fast"] = models["default"]
+    if "specialist" not in models:
+        default = models["default"]
+        models["specialist"] = LLMModelConfig(
+            "specialist", default.provider,
+            settings.anthropic_specialist_model if default.provider == "anthropic" else default.model,
+        )
+    return providers, models
 
 
 @dataclass
@@ -1000,6 +1073,41 @@ class AnthropicLLMClient:
         return bool(self._api_key)
 
 
+# Any OpenAI-compatible provider uses the same wire client. The named class
+# makes provider selection explicit to callers and tests without duplicating
+# transport logic.
+class OpenAICompatibleLLMClient(LocalLLMClient):
+    pass
+
+
+def get_llm(
+    profile: str = "default",
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> LocalLLMClient | AnthropicLLMClient:
+    """Build a client from a provider-independent named model profile."""
+    providers, models = get_llm_registry()
+    selected = models.get(profile) or models["default"]
+    provider_name = provider or selected.provider
+    model_name = model or selected.model
+    config = providers.get(provider_name)
+    if config is None:
+        raise ValueError(f"Unknown LLM provider {provider_name!r}")
+    if config.type == "anthropic":
+        return AnthropicLLMClient(api_key=config.api_key, model=model_name)
+    if config.type in ("openai", "openai_compatible", "local"):
+        # LocalLLMClient appends /v1 to the request path. Accept both the
+        # provider root and a conventional OpenAI base URL in configuration.
+        base_url = config.base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3].rstrip("/")
+        return OpenAICompatibleLLMClient(
+            base_url=base_url, model=model_name, api_key=config.api_key,
+        )
+    raise ValueError(f"Unsupported LLM provider type {config.type!r}")
+
+
 # --- Singleton ---
 
 _llm_client: LocalLLMClient | AnthropicLLMClient | None = None
@@ -1013,6 +1121,11 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     """
     global _llm_client
     if _llm_client is None:
+        _providers, _models = get_llm_registry()
+        if settings.llm_models_json:
+            logger.info("Using configured LLM provider/model registry")
+            _llm_client = get_llm("default")
+            return _llm_client
         backend = getattr(settings, "llm_backend", "anthropic").lower()
         if backend == "anthropic":
             logger.info("Using Anthropic LLM backend")
@@ -1039,6 +1152,12 @@ def get_anthropic_llm() -> AnthropicLLMClient:
     claude-sonnet-4-20250514, which retired and 404'd every caller (#470).
     """
     global _anthropic_client
+    providers, models = get_llm_registry()
+    specialist = models.get("specialist")
+    if specialist and specialist.provider != "anthropic":
+        # Keep the historical function name for callers while allowing
+        # specialist operations to follow the configured provider profile.
+        return get_llm("specialist")  # type: ignore[return-value]
     if _anthropic_client is None:
         model = settings.anthropic_specialist_model
         _anthropic_client = AnthropicLLMClient(model=model)
