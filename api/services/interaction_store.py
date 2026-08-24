@@ -31,7 +31,7 @@ TEMP_PREFIXES = ('/tmp', '/private/var/folders', '/var/folders')
 # Valid source types for interactions
 VALID_SOURCE_TYPES = frozenset({
     "gmail", "calendar", "vault", "granola", "imessage",
-    "whatsapp", "contacts", "phone", "photos", "slack",
+    "whatsapp", "contacts", "phone", "photos", "slack", "telegram",
 })
 
 # Reasonable timestamp bounds
@@ -172,6 +172,7 @@ class Interaction:
             "contacts": "📇",
             "phone": "📞",
             "photos": "📷",
+            "telegram": "💬",
         }
         return badges.get(self.source_type, "📄")
 

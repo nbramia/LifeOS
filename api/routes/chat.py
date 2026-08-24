@@ -1143,6 +1143,22 @@ async def ask_stream(request: AskStreamRequest):
                 _natural_profile = _requested_model_profile(request.question, _model_profiles)
                 if _natural_profile:
                     _override = _natural_profile.lower()
+            # Images should be understood when the deployment provides a named
+            # vision profile, without forcing every normal turn onto an
+            # expensive multimodal model. Text-only providers still receive a
+            # durable placeholder through the provider adapter.
+            _has_visual_attachment = any(
+                (getattr(att, "media_type", "") or "").startswith("image/")
+                or (getattr(att, "media_type", "") or "") == "application/pdf"
+                for att in (request.attachments or [])
+            )
+            if (
+                not _override
+                and _has_visual_attachment
+                and "vision" in _model_profiles
+                and not _providers.get(_model_profiles["default"].provider, None).supports_vision
+            ):
+                _override = "vision"
             _backend_is_anthropic = orchestrator_provider == "anthropic"
             model_profile = ""
             _profile_name = next(

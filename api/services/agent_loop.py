@@ -614,7 +614,11 @@ async def run_agent_loop(
                 messages.append({"role": msg.role, "content": msg.content})
 
     # Add current user message (with attachments if any)
-    user_content = build_message_content(question, attachments)
+    user_content = build_message_content(
+        question,
+        attachments,
+        provider_supports_vision=bool(getattr(client, "supports_vision", False)),
+    )
     messages.append({"role": "user", "content": user_content})
 
     result = AgentResult(full_text="", model=resolved_model)

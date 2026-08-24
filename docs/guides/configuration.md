@@ -85,13 +85,17 @@ servers that expose the OpenAI chat-completions API).
 
 ```dotenv
 DEEPSEEK_API_KEY=sk-...
-LIFEOS_LLM_PROVIDERS='{"deepseek":{"type":"openai_compatible","base_url":"https://api.deepseek.com","api_key_env":"DEEPSEEK_API_KEY"},"local":{"type":"openai_compatible","base_url":"http://localhost:8080"}}'
+LIFEOS_LLM_PROVIDERS='{"deepseek":{"type":"openai_compatible","base_url":"https://api.deepseek.com","api_key_env":"DEEPSEEK_API_KEY","supports_vision":false},"local":{"type":"openai_compatible","base_url":"http://localhost:8080","supports_vision":false}}'
 LIFEOS_LLM_MODELS='{"default":{"provider":"deepseek","model":"deepseek-chat"},"fast":{"provider":"deepseek","model":"deepseek-chat"},"private":{"provider":"local","model":"local"}}'
 ```
 
 The OpenAI-compatible client appends `/v1/chat/completions`; base URLs may
 include or omit a trailing `/v1`. Switching profiles changes only the model
 transport; memories, conversations, and the local data layer remain unchanged.
+Set `supports_vision: true` only for a configured model that actually accepts
+image input. If a `vision` profile exists, image turns select it automatically;
+otherwise text-only providers retain the attachment provenance without
+pretending they inspected the file.
 
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 

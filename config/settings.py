@@ -459,7 +459,7 @@ class Settings(BaseSettings):
     # profile should be used by each operation.
     llm_providers_json: str = Field(
         default="", alias="LIFEOS_LLM_PROVIDERS",
-        description="JSON map of named Anthropic/OpenAI-compatible providers.",
+        description="JSON map of named Anthropic/OpenAI-compatible providers; providers may declare supports_vision.",
     )
     llm_models_json: str = Field(
         default="", alias="LIFEOS_LLM_MODELS",

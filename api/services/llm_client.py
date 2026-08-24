@@ -33,6 +33,7 @@ class LLMProviderConfig:
     type: str
     base_url: str = ""
     api_key: str = ""
+    supports_vision: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModel
     providers = {
         "anthropic": LLMProviderConfig(
             name="anthropic", type="anthropic", api_key=settings.anthropic_api_key,
+            supports_vision=True,
         ),
         "local": LLMProviderConfig(
             name="local", type="openai_compatible", base_url=settings.local_llm_url,
@@ -80,6 +82,7 @@ def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModel
             type=str(raw.get("type", "openai_compatible")),
             base_url=str(raw.get("base_url", "") or ""),
             api_key=os.environ.get(key_env, "") if key_env else str(raw.get("api_key", "") or ""),
+            supports_vision=bool(raw.get("supports_vision", False)),
         )
 
     models = {}
@@ -381,11 +384,13 @@ class LocalLLMClient:
         timeout: float | None = None,
         model: str = "local",
         api_key: str | None = None,
+        supports_vision: bool = False,
     ):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
         self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
         self._model = model
         self._api_key = api_key
+        self.supports_vision = supports_vision
         self._async_client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
 
@@ -456,14 +461,37 @@ class LocalLLMClient:
             if has_tool_use:
                 return self._convert_assistant_with_tools(content)
 
-            # Regular content blocks — extract text
+            # Regular content blocks — preserve images for capable providers;
+            # text-only providers receive an explicit provenance placeholder.
             parts = []
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
                         parts.append(block.get("text", ""))
-                    elif block.get("type") in ("image", "document"):
-                        parts.append("[attachment]")
+                    elif block.get("type") == "image":
+                        source = block.get("source", {})
+                        if self.supports_vision and source.get("type") == "base64":
+                            parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": (
+                                        f"data:{source.get('media_type', 'image/jpeg')}"
+                                        f";base64,{source.get('data', '')}"
+                                    )
+                                },
+                            })
+                        else:
+                            parts.append("[image attachment saved; this model cannot inspect images]")
+                    elif block.get("type") == "document":
+                        parts.append("[document attachment saved; document inspection is unavailable for this model]")
+            if any(isinstance(part, dict) for part in parts):
+                return {
+                    "role": role,
+                    "content": [
+                        part if isinstance(part, dict) else {"type": "text", "text": part}
+                        for part in parts
+                    ],
+                }
             return {"role": role, "content": "\n".join(parts) if parts else ""}
 
         return {"role": role, "content": str(content)}
@@ -841,6 +869,7 @@ class AnthropicLLMClient:
         self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
+        self.supports_vision = True
 
     @property
     def model(self) -> str:
@@ -1114,6 +1143,7 @@ def get_llm(
             base_url = base_url[:-3].rstrip("/")
         return OpenAICompatibleLLMClient(
             base_url=base_url, model=model_name, api_key=config.api_key,
+            supports_vision=config.supports_vision,
         )
     raise ValueError(f"Unsupported LLM provider type {config.type!r}")
 

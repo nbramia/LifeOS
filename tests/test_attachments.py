@@ -225,6 +225,33 @@ class TestBuildMessageContent:
         assert "[Image attached: img2.jpg]" in result
         assert "Compare these images" in result
 
+    def test_vision_provider_gets_native_image_block(self):
+        data = base64.b64encode(b"fake image").decode()
+        result = build_message_content(
+            "Describe this",
+            [{"filename": "photo.png", "media_type": "image/png", "data": data}],
+            provider_supports_vision=True,
+        )
+        assert isinstance(result, list)
+        assert result[0] == {"type": "text", "text": "Describe this"}
+        assert result[1]["type"] == "image"
+        assert result[1]["source"]["data"] == data
+
+    def test_openai_compatible_vision_conversion(self):
+        from api.services.llm_client import LocalLLMClient
+
+        data = base64.b64encode(b"fake image").decode()
+        client = LocalLLMClient(supports_vision=True)
+        result = client._convert_message({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": data},
+            }],
+        })
+        assert result["content"][0]["type"] == "image_url"
+        assert result["content"][0]["image_url"]["url"].endswith(data)
+
 
 class TestAllowedMediaTypes:
     """Tests for media type configuration."""
