@@ -7,6 +7,7 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import contextvars
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -2625,7 +2626,41 @@ async def _tool_save_memory(inp: dict) -> str:
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
-def _tool_review_inbox(inp: dict) -> str:
+def _auto_inbox_category(content: str) -> str | None:
+    """Return only conservative, low-risk classifications for review.
+
+    This is deliberately narrower than an LLM classifier. It exists so a
+    scheduled review makes progress even when the model stops after listing
+    the inbox; uncertain material remains available for the model/user.
+    """
+    text = " ".join((content or "").split())
+    lower = text.lower()
+    if not text:
+        return "dismissed"
+    if re.fullmatch(r"(?:yes|yeah|yep|ok|okay|sure|thanks|thank you|hi|hello|hey|a|b|test)", lower):
+        return "dismissed"
+    if lower.startswith(("what ", "when ", "where ", "who ", "why ", "how ")):
+        return "dismissed"
+    if any(marker in lower for marker in ("didn't remind", "did not remind", "what timezone")):
+        return "dismissed"
+    if re.search(r"\b(remind me|reminder|follow up|follow-up|daily update|weekly review)\b", lower):
+        return "reminder"
+    if re.search(r"\b(youtube|video|x post|tweet|forwarded|source|link)\b", lower):
+        return "source"
+    if re.search(r"\b(my goal|top priority|i want to|i'd like to|i am working on|i'm working on|my project|i had an accident|my car)\b", lower):
+        if re.search(r"\b(project|building|working on|creating|developing)\b", lower):
+            return "project"
+        if re.search(r"\b(maybe|idea|might want)\b", lower):
+            return "idea"
+        return "memory"
+    # A compact factual relationship statement is safe to preserve as a
+    # relationship item, while person resolution remains a separate step.
+    if re.match(r"^[A-Z][\w'-]{1,30}\s+(?:is|works|lives|moved|moving|said|told|offered|promised)\b", text):
+        return "relationship"
+    return None
+
+
+async def _tool_review_inbox(inp: dict) -> str:
     from api.services.inbox_store import list_items
 
     try:
@@ -2639,9 +2674,37 @@ def _tool_review_inbox(inp: dict) -> str:
     items = list_items(limit=limit, since_days=since_days)
     if not items:
         return f"Life Inbox has no unreviewed captures from the last {since_days} days."
-    lines = [f"Unreviewed Life Inbox items from the last {since_days} days ({len(items)}):"]
+    auto_processed = []
     for item in items:
-        lines.append(f"- id={item['id']} [{item['created_at'][:10]}] {item['content']}")
+        category = _auto_inbox_category(item.get("content", ""))
+        if category is None:
+            continue
+        result = await _tool_process_inbox_item({
+            "item_id": item["id"],
+            "category": category,
+        })
+        auto_processed.append((item, category, result))
+
+    remaining = list_items(limit=limit, since_days=since_days)
+    proposals = [
+        item for item in list_items(status="processed", limit=1000, since_days=since_days)
+        if item.get("proposal")
+    ]
+    lines = [
+        f"Life Inbox review completed for the last {since_days} days.",
+        f"Automatically filed {len(auto_processed)} clear item(s).",
+    ]
+    if proposals:
+        lines.append(f"{len(proposals)} task/reminder proposal(s) still need confirmation.")
+        for item in proposals[:limit]:
+            proposal = item["proposal"]
+            lines.append(f"- proposal id={item['id']} {proposal.get('content', item.get('content', ''))}")
+    if remaining:
+        lines.append(f"{len(remaining)} uncertain item(s) remain for focused review:")
+        for item in remaining:
+            lines.append(f"- id={item['id']} [{item['created_at'][:10]}] {item['content']}")
+    else:
+        lines.append("No unresolved inbox items remain in this period.")
     return "\n".join(lines)
 
 

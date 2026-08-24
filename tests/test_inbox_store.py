@@ -9,6 +9,79 @@ from api.services.agent_tools import (
 )
 
 
+def test_auto_inbox_classifier_is_conservative():
+    from api.services.agent_tools import _auto_inbox_category
+
+    assert _auto_inbox_category("yes") == "dismissed"
+    assert _auto_inbox_category("Remind me to call John next week") == "reminder"
+    assert _auto_inbox_category("I want to build an AI product for cafes") == "project"
+    assert _auto_inbox_category("John is moving to Berlin") == "relationship"
+    assert _auto_inbox_category("Something I am not sure how to classify") is None
+
+
+def test_review_inbox_auto_files_clear_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
+    from api.services import agent_tools
+
+    memory = inbox_store.add_item("I want to build an AI product for cafes")
+    noise = inbox_store.add_item("yes")
+    unknown = inbox_store.add_item("Something I am not sure how to classify")
+
+    async def fake_process(inp):
+        category = inp["category"]
+        inbox_store.update_item(
+            inp["item_id"],
+            status="dismissed" if category == "dismissed" else "processed",
+            category=category,
+        )
+        return f"classified as {category}"
+
+    monkeypatch.setattr(agent_tools, "_tool_process_inbox_item", fake_process)
+    result = asyncio.run(agent_tools._tool_review_inbox({"since_days": 7}))
+
+    assert "Automatically filed 2 clear item(s)" in result
+    assert inbox_store.list_items(status="processed")[0]["id"] == memory["id"]
+    assert inbox_store.list_items(status="dismissed")[0]["id"] == noise["id"]
+    assert inbox_store.list_items(status="unreviewed")[0]["id"] == unknown["id"]
+
+
+def test_chat_capture_is_closed_after_successful_interpretation(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
+    from api.routes.chat import _close_chat_inbox_item, _capture_candidate
+
+    assert _capture_candidate("[Voice message transcription]\nI want to build a cafe AI product")
+    item = inbox_store.add_item("I want to build a cafe AI product")
+    _close_chat_inbox_item(
+        item["id"],
+        item["content"],
+        [{"tool": "save_memory", "input": {"content": item["content"]}, "is_error": False}],
+    )
+
+    saved = inbox_store.list_items(status="processed")
+    assert saved[0]["category"] == "memory"
+
+
+def test_chat_capture_closes_transient_conversation_as_dismissed(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
+    from api.routes.chat import _close_chat_inbox_item
+
+    item = inbox_store.add_item("hello there")
+    _close_chat_inbox_item(item["id"], item["content"], [])
+
+    dismissed = inbox_store.list_items(status="dismissed")
+    assert dismissed[0]["category"] == "dismissed"
+
+
+def test_uncaptioned_media_remains_open_for_future_understanding(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
+    from api.routes.chat import _close_chat_inbox_item
+
+    item = inbox_store.add_item("[Telegram photo without caption]")
+    _close_chat_inbox_item(item["id"], item["content"], [])
+
+    assert inbox_store.list_items(status="unreviewed")[0]["id"] == item["id"]
+
+
 def test_update_item_retains_pending_proposal(tmp_path, monkeypatch):
     path = tmp_path / "inbox.json"
     monkeypatch.setenv("LIFEOS_INBOX_PATH", str(path))

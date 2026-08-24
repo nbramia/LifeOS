@@ -93,11 +93,68 @@ def _capture_candidate(question: str) -> str | None:
     if explicit:
         return explicit
     text = (question or "").strip()
+    # Telegram voice/media transports add a descriptive preamble before the
+    # user's actual words. Do not let that wrapper prevent the deterministic
+    # fallback from recognizing a meaningful capture.
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
     if text and "?" not in text and (
         _IMPLICIT_CAPTURE_RE.search(text) or _SIGNIFICANT_CAPTURE_RE.search(text)
     ):
         return text
     return None
+
+
+def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) -> None:
+    """Close the raw transport capture once this turn has been interpreted.
+
+    Every incoming message is written to the Life Inbox first so a failed model
+    turn cannot lose it. Successful memory/action turns should not then appear
+    as duplicate work in the next weekly review; ordinary conversational noise
+    is retained as dismissed evidence. Attachments without usable text remain
+    open for a future media-understanding pass.
+    """
+    if not item_id:
+        return
+    media_only = bool(re.match(
+        r"^\[Telegram (?:photo|video|document|animation|video_note|sticker) without caption\]$",
+        (question or "").strip(),
+        re.IGNORECASE,
+    ))
+    if media_only:
+        return
+
+    successful = [
+        call for call in (tool_calls or [])
+        if isinstance(call, dict) and not call.get("is_error")
+    ]
+    category = "dismissed"
+    for call in successful:
+        name = call.get("tool")
+        args = call.get("input") or {}
+        if name == "save_memory":
+            category = "memory"
+            break
+        if name in {"process_inbox_item", "process_inbox_items"}:
+            # Those tools close their own referenced items. The current raw
+            # capture is only the review request itself.
+            continue
+        if name == "manage_tasks" and args.get("action") == "create":
+            category = "task"
+            break
+        if name in {"manage_reminders", "manage_schedules"} and args.get("action") == "create":
+            category = "reminder"
+            break
+
+    try:
+        from api.services.inbox_store import update_item
+        update_item(item_id, status="processed" if category != "dismissed" else "dismissed", category=category)
+    except Exception:
+        logger.exception("Failed to close chat inbox capture %s", item_id)
 
 
 # =============================================================================
@@ -745,7 +802,7 @@ async def ask_stream(request: AskStreamRequest):
             # message. This is the recovery/review path when classification or
             # tool calling is incomplete.
             from api.services.inbox_store import add_item as add_inbox_item
-            add_inbox_item(
+            inbox_item = add_inbox_item(
                 request.question,
                 conversation_id=conversation_id,
                 source=request.source or {"type": "chat"},
@@ -1180,6 +1237,15 @@ async def ask_stream(request: AskStreamRequest):
                             _memory_store.update_source(_match.group(1), request.source)
                         except ValueError:
                             pass
+
+            # The raw capture is a safety net, not a second task list. Once
+            # this turn has successfully been interpreted, close that exact
+            # capture so weekly reviews contain only unresolved work.
+            _close_chat_inbox_item(
+                inbox_item.get("id", ""),
+                request.question,
+                agent_result.tool_calls_log,
+            )
 
             # Record usage
             if agent_result.total_input_tokens > 0:
