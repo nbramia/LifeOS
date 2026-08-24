@@ -1012,6 +1012,17 @@ class Settings(BaseSettings):
                     "Generate with `openssl rand -hex 32`."
     )
 
+    # Journal ring ingest (#660) — a wearable (e.g. the Pebble Index ring) posts
+    # transcribed fragments here from outside the tailnet.
+    journal_ingest_token: str = Field(
+        default="",
+        alias="LIFEOS_JOURNAL_INGEST_TOKEN",
+        description="Bearer token for POST /api/journal/ingest (transcription webhook "
+                    "for a capture device, e.g. the Pebble Index ring). Empty disables "
+                    "the endpoint (503). Generate with `openssl rand -hex 32`. Dedicated "
+                    "token, separate from LIFEOS_MCP_BEARER_TOKEN/LIFEOS_HEALTH_INGEST_TOKEN."
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

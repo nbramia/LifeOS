@@ -272,6 +272,14 @@ Apple Health/Fitness ingestion. See [apple-health.md](apple-health.md) for the e
 | `LIFEOS_HEALTH_INGEST_TOKEN` | str | — | Bearer token for `POST /api/fitness/health/ingest` (the HealthBridge app's POST delivery mode). Empty disables the endpoint (503). Generate with `openssl rand -hex 32`. |
 | `LIFEOS_FITNESS_SHEET_ID` | str | — | Google Sheet ID to mirror the workout log into (optional; mirror is off if unset). Requires the read-write Sheets OAuth scope — re-run the Google auth flow after enabling. |
 
+## Journal Ring Ingest
+
+A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [journal-ring-ingest.md](journal-ring-ingest.md) for the endpoint contract.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_JOURNAL_INGEST_TOKEN` | str | — | Bearer token for `POST /api/journal/ingest` (a capture device's transcription webhook). Empty disables the endpoint (503). Generate with `openssl rand -hex 32`. |
+
 ## Notifications
 
 | Variable | Type | Default | Sets |
@@ -398,6 +406,7 @@ LIFEOS_ALERT_EMAIL=you@example.com
 - [Voice Setup](voice-setup.md) — The `/chat` Agent/Hermes text-backend toggle and voice dock that the vars above configure.
 - [Agent Worker Setup](agent-worker-setup.md) — Operator setup for the `#agent` worker; references many of the `LIFEOS_AGENT_*` vars above in operator-flow context.
 - [Claude Code Orchestration](claude-code-orchestration.md) — `/claude` setup; references the `LIFEOS_CLAUDE_*` vars in operator-flow context.
+- [Journal Ring Ingest](journal-ring-ingest.md) — `LIFEOS_JOURNAL_INGEST_TOKEN` in operator-flow context.
 - [Doctor Bot](doctor-bot.md) — The self-repair orchestration bot; setup of its `TELEGRAM_DOCTOR_*` vars and the repair flow.
 - [ADR-009: LIFEOS_LLM_BACKEND toggle](../adr/009-llm-backend-toggle.md) — Why the synthesis backend is operator-configurable.
 - [ADR-019: A Turn's Lifetime Is Owned by the Server](../adr/019-turn-owned-by-server.md) — Why `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` exists.

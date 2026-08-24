@@ -69,6 +69,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
 | How do I import Apple Health/Fitness data? | [guides/apple-health.md](docs/guides/apple-health.md) |
+| How do I configure a capture device (e.g. the Pebble Index ring) to feed the journal persona? | [guides/journal-ring-ingest.md](docs/guides/journal-ring-ingest.md) |
 | How do I run the Apple Data Agent / re-auth Monarch / check alerting? | [guides/operations.md](docs/guides/operations.md) |
 | What does `/agents` show? | [specs/product/agent-viz.md](docs/specs/product/agent-viz.md) |
 | How does the `/agents` page work internally? | [specs/technical/agent-viz.md](docs/specs/technical/agent-viz.md) |
