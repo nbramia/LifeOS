@@ -341,13 +341,21 @@ class TestMediaCapture:
         listener._chat_id = "123"
         return listener
 
+    def test_extract_urls_preserves_source_links(self):
+        from api.services.telegram import _extract_urls
+
+        assert _extract_urls("Watch https://youtube.com/watch?v=abc. and https://x.com/a") == [
+            "https://youtube.com/watch?v=abc",
+            "https://x.com/a",
+        ]
+
     @pytest.mark.asyncio
     async def test_captioned_forward_uses_caption_and_preserves_media_source(self, tmp_path):
         listener = self._make_listener(tmp_path)
         update = {
             "message": {
                 "message_id": 20,
-                "caption": "Interesting cafe operations video",
+                "caption": "Interesting cafe operations video https://youtube.com/watch?v=abc",
                 "photo": [{"file_id": "small"}, {"file_id": "large"}],
                 "forward_origin": {"type": "channel"},
                 "chat": {"id": "123"},
@@ -363,10 +371,11 @@ class TestMediaCapture:
 
         request = mock_chat.await_args.args[0]
         source = mock_chat.await_args.kwargs["source"]
-        assert request == "[Telegram photo]\nInteresting cafe operations video"
+        assert request == "[Telegram photo]\nInteresting cafe operations video https://youtube.com/watch?v=abc"
         assert source["media_type"] == "photo"
         assert source["file_id"] == "large"
         assert source["forwarded"] is True
+        assert source["urls"] == ["https://youtube.com/watch?v=abc"]
 
     @pytest.mark.asyncio
     async def test_uncaptioned_media_is_not_silently_dropped(self, tmp_path):

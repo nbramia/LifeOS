@@ -32,6 +32,17 @@ MAX_MESSAGE_LENGTH = 4096
 # full nightly priorities summary (~1,000 chars) intact — truncating below that
 # would cut off the bullet a follow-up question is asking about (#435).
 MAX_QUOTED_REPLY_CHARS = 1500
+_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract source URLs without asking the model to preserve them."""
+    urls = []
+    for raw in _URL_RE.findall(text or ""):
+        url = raw.rstrip(".,;:!?)]}>")
+        if url and url not in urls:
+            urls.append(url)
+    return urls[:20]
 
 # The bot token for the message currently being handled. A listener sets this
 # once at the top of _handle_update so every outbound send during that update —
@@ -961,23 +972,28 @@ class TelegramBotListener:
 
         # Send through chat pipeline (intent classification happens there)
         try:
+            source = {
+                "type": "telegram",
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+            urls = _extract_urls(effective_text)
+            if urls:
+                source["urls"] = urls
+            if media_type:
+                source.update({
+                    "media_type": media_type,
+                    "file_id": media_payload.get("file_id")
+                    if isinstance(media_payload, dict) else None,
+                    "forwarded": bool(message.get("forward_origin") or message.get("forward_from")),
+                })
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
                 result = await chat_via_api(
                     effective_text,
                     conversation_id=conv_id,
                     persona=self._persona,
-                    source={
-                        "type": "telegram",
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    **({
-                        "media_type": media_type,
-                        "file_id": media_payload.get("file_id")
-                        if isinstance(media_payload, dict) else None,
-                        "forwarded": bool(message.get("forward_origin") or message.get("forward_from")),
-                    } if media_type else {}),
-                },
+                    source=source,
                 )
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
