@@ -19,6 +19,7 @@ retain their original source and confidence.
 - [[LifeOS/Scheduler/Dashboard]] — reminders and scheduled follow-ups
 - [[LifeOS/Scheduler/Inbox]] — scheduling captures awaiting processing
 - `~/.lifeos/inbox.json` — raw Life Inbox captures, review status, proposals, and provenance
+- `~/.lifeos/life_model.json` — structured identity, values, current state, ideal state, and philosophy records
 - [[Personal/Identity]] — identity, values, philosophy, and preferences
 - [[Personal/Goals]] — goals and ideal-state direction
 - [[Personal/Projects]] — active and potential projects
@@ -37,6 +38,8 @@ retain their original source and confidence.
 4. Do not turn a tentative thought into a commitment without evidence.
 5. Review the Life Inbox weekly and either process or dismiss each item. The configured
    Telegram deployment runs this review every Sunday at 10:00 in its configured timezone.
+6. Keep explicit statements about identity and direction in the structured life model;
+   label inferences as inferences and preserve their source.
 
 ## Provider independence
 

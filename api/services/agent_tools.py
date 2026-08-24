@@ -778,6 +778,29 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "manage_life_model",
+        "description": (
+            "Read or update the structured model of the user's life direction. Use record when "
+            "the user explicitly states identity, values, current state, ideal state, or philosophy. "
+            "Do not infer these as facts; use evidence_type=inference only when clearly labeling an "
+            "inference. This is separate from ordinary memories and does not create a task."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "record"]},
+                "section": {
+                    "type": "string",
+                    "enum": ["identity", "values", "current_state", "ideal_state", "philosophy"],
+                },
+                "content": {"type": "string", "description": "The explicit statement to preserve."},
+                "evidence_type": {"type": "string", "enum": ["explicit", "inference"]},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "manage_commitments",
         "description": (
             "Track promises and commitments with provenance. Use create when the user "
@@ -2373,6 +2396,7 @@ def _tool_life_review(inp: dict) -> str:
     from api.services.memory_store import get_memory_store
     from api.services.scheduler_store import get_scheduler_store
     from api.services.task_manager import get_task_manager
+    from api.services.life_model_store import list_records
 
     mode = str(inp.get("mode", "today") or "today").strip().lower()
     if mode not in {"today", "weekly", "neglected"}:
@@ -2421,6 +2445,22 @@ def _tool_life_review(inp: dict) -> str:
     ))
 
     lines = [f"Life review ({mode}) — based on recorded information as of {today}."]
+    life_model = list_records()
+    model_sections = {
+        "identity": "Identity",
+        "values": "Values",
+        "current_state": "Current state",
+        "ideal_state": "Ideal state",
+        "philosophy": "Philosophy",
+    }
+    model_rows = [(label, life_model.get(section, [])) for section, label in model_sections.items()]
+    if any(rows for _, rows in model_rows):
+        lines.append("\n## Life direction")
+        for label, rows in model_rows:
+            if rows:
+                latest = rows[-1]
+                evidence = latest.get("evidence_type", "explicit")
+                lines.append(f"- {label}: {latest.get('content', '')} [{evidence}]")
     if mode != "neglected":
         lines.append("\n## Next actions")
         if tasks:
@@ -2857,6 +2897,50 @@ async def _tool_save_memory(inp: dict) -> str:
         content, source=inp.get("source") or {"type": "conversation"}
     )
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
+
+
+def _tool_manage_life_model(inp: dict) -> str:
+    from api.services.life_model_store import SECTIONS, list_records, record
+
+    action = str(inp.get("action", "get")).strip().lower()
+    section = str(inp.get("section", "")).strip().lower()
+    if action == "record":
+        if not section or not inp.get("content"):
+            return "Error: record requires section and content."
+        try:
+            item = record(
+                section,
+                inp["content"],
+                source=inp.get("source") or {"type": "conversation"},
+                evidence_type=inp.get("evidence_type", "explicit"),
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        label = section.replace("_", " ")
+        return f"Life model updated ({label}): \"{item['content']}\" [{item['evidence_type']}]"
+    if action == "get":
+        try:
+            data = list_records(section or None)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if section:
+            rows = data
+            if not rows:
+                return f"No {section.replace('_', ' ')} records are recorded."
+            return "\n".join(
+                f"- {row['content']} [{row.get('evidence_type', 'explicit')}]"
+                for row in rows
+            )
+        lines = ["Structured life model:"]
+        any_records = False
+        for name in SECTIONS:
+            rows = data[name]
+            if rows:
+                any_records = True
+                lines.append(f"\n## {name.replace('_', ' ').title()}")
+                lines.extend(f"- {row['content']} [{row.get('evidence_type', 'explicit')}]" for row in rows)
+        return "\n".join(lines) if any_records else "No structured life model records are recorded yet."
+    return "Error: action must be get or record."
 
 
 def _tool_manage_commitments(inp: dict) -> str:
@@ -4199,6 +4283,7 @@ _TOOL_HANDLERS = {
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
+    "manage_life_model": _tool_manage_life_model,
     "manage_commitments": _tool_manage_commitments,
     "review_inbox": _tool_review_inbox,
     "process_inbox_item": _tool_process_inbox_item,
@@ -4223,6 +4308,7 @@ TOOL_STATUS_MESSAGES = {
     "person_info.briefing": "Generating briefing...",
     "manage_tasks": "Managing tasks...",
     "life_review": "Reviewing your priorities...",
+    "manage_life_model": "Updating your life model...",
     "manage_tasks.create": "Creating task...",
     "manage_tasks.list": "Loading tasks...",
     "manage_tasks.complete": "Completing task...",
