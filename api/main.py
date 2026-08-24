@@ -130,16 +130,33 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to check for incomplete merges: {e}")
 
-    # Startup: Initialize and start Calendar indexer at specific times (Eastern)
+    # Startup: Initialize and start Calendar indexer at specific times. A
+    # headless VPS cannot authenticate Google by itself, so don't start a
+    # scheduler that will repeatedly emit credential failures until both the
+    # OAuth client and authenticated token exist.
     try:
-        from api.services.calendar_indexer import get_calendar_indexer
-        _calendar_indexer = get_calendar_indexer()
-        # Sync at 8 AM, noon, and 3 PM Eastern
-        _calendar_indexer.start_time_scheduler(
-            schedule_times=[(8, 0), (12, 0), (15, 0)],
-            timezone=settings.timezone
+        from pathlib import Path
+        project_root = Path(__file__).resolve().parent.parent
+        google_ready = all(
+            (project_root / "config" / filename).exists()
+            for filename in ("credentials-personal.json", "token-personal.json")
         )
-        logger.info("Calendar indexer scheduler started (8:00, 12:00, 15:00 Eastern)")
+        if google_ready:
+            from api.services.calendar_indexer import get_calendar_indexer
+            _calendar_indexer = get_calendar_indexer()
+            # Sync at 8 AM, noon, and 3 PM in the configured LifeOS timezone.
+            _calendar_indexer.start_time_scheduler(
+                schedule_times=[(8, 0), (12, 0), (15, 0)],
+                timezone=settings.timezone
+            )
+            logger.info(
+                "Calendar indexer scheduler started (8:00, 12:00, 15:00 %s)",
+                settings.timezone,
+            )
+        else:
+            logger.info(
+                "Calendar indexer scheduler not started: Google OAuth is not configured"
+            )
     except Exception as e:
         logger.error(f"Failed to start Calendar indexer: {e}")
 
