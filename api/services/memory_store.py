@@ -76,8 +76,8 @@ CATEGORY_PATTERNS = {
         r"\b(todo|to.?do)\b",
     ],
     "projects": [
-        r"\b(?:project|product)\b",
-        r"\b(?:build|building|develop|developing|working\s+on)\b",
+        r"\b(?:I|Amir)\s+(?:am\s+)?(?:building|developing|working\s+on)\b",
+        r"\b(?:my|a)\s+(?:project|product)\s+(?:is|to)\b",
     ],
 }
 
