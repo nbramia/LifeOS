@@ -188,7 +188,69 @@ The native orchestrator (`POST /api/ask/stream`, documented above and in [api-re
 
 ### Hermes
 
-`hermes` is an agent harness reached as a gateway (#587), at `LIFEOS_HERMES_BACKEND_URL` (optional bearer token), proxied at `POST /api/hermes/ask/stream` with the same server-side bearer injection and a `GET /api/hermes/status` availability check. Both proxies are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Hermes has **no handoff** either — but unlike Agent, it keeps the persona picker visible, carries spoken-style rules on voice turns, receives the orchestrator's auto-injected turn context, and its history **is** LifeOS-owned. Its route (`api/routes/hermes_proxy.py`) buffers the request body (`transform_body`) to resolve the selected persona and attach it as the `lifeos_context` envelope below — the only text-backend proxy that does. **Orchestrating personas reach this route like any other, since #642** — resolved with `surface="hermes"` so a persona with a Hermes-specific variant (`config/personas/doctor.hermes.md`, #641) gets that body instead of the plain one; see "Orchestrating personas on Hermes vs. LifeOS" in the Persona contract above for what changed and why, and the envelope section below for the `orchestrates` field's revised contract.
+`hermes` is an agent harness reached as a gateway (#587), at `LIFEOS_HERMES_BACKEND_URL` (optional bearer token), proxied at `POST /api/hermes/ask/stream` with the same server-side bearer injection and a `GET /api/hermes/status` availability check. Both proxies are built by the same `make_backend_router()` factory in `api/routes/_proxy.py`; `agent_proxy.py` and `hermes_proxy.py` each just name their own settings fields and `_client()` test seam. Hermes has **no handoff** either — but unlike Agent, it keeps the persona picker visible, carries spoken-style rules on voice turns, receives the orchestrator's auto-injected turn context, and its history **is** LifeOS-owned. Its route (`api/routes/hermes_proxy.py`) buffers the request body (`transform_body`) to resolve the selected persona and attach it as the `lifeos_context` envelope below — the only text-backend proxy that does. **Orchestrating personas reach this route like any other, since #642** — resolved with `surface="hermes"` so a persona with a Hermes-specific variant (`config/personas/doctor.hermes.md`, #641) gets that body instead of the plain one; see "Orchestrating personas on Hermes vs. LifeOS" in the Persona contract above for what changed and why, and the envelope section below for the `orchestrates` field's revised contract. **This section describes `/chat`'s Hermes backend specifically — Hermes's own Telegram front door is a separate integration, covered in "Hermes-Telegram persona selection (#644)" below.**
+
+#### Hermes-Telegram persona selection (#644)
+
+The `/api/hermes/ask/stream` proxy above only ever sees a turn that `/chat` (browser or the voice gateway) already sent to LifeOS. Hermes's **own** Telegram bot is a separate front door — Hermes's own `state/config.yaml`, no LifeOS involvement — and until #644 it received no persona context at all, so asking it to "act as the doctor persona" was prompt-level roleplay with no real preamble, voice rules, or turn context behind it.
+
+**Direction (decided, not re-open-able): Hermes fetches persona context *from* LifeOS; it is not proxied.** The Hermes-Telegram path does **not** route through `/api/hermes/ask/stream` — that would couple its availability to LifeOS being reachable, which #658's accepted criteria require it to survive without. Instead, Hermes calls a dedicated resolution endpoint, `POST /api/hermes/resolve-persona`, before it ever talks to its own backend LLM, and folds the response into its own request the way it sees fit.
+
+**Selection mechanism (Nathan's decision): a per-message `@name` prefix, plus reply-thread inheritance.** Resolution is an ordered rule, not a single check:
+
+1. An explicit `@persona` prefix on this message wins, always — even inside an existing persona thread, so replying with a new tag switches personas mid-thread.
+2. Else, if this message is a Telegram native reply to a message whose persona is known, inherit it — no re-tagging needed to keep talking to the same persona.
+3. Else, no persona — byte-identical to today.
+
+There is still no `/persona` command and no per-chat setting: a message with neither a tag of its own nor an inheritable reply-to is evaluated exactly as if this feature didn't exist. The prefix grammar itself lives in LifeOS (`_parse_persona_tag()` in `api/routes/hermes_proxy.py`), not in Hermes — Hermes stays a transport, sending the **raw, unparsed** message text and letting LifeOS decide what's a tag: a tag is recognized only when it opens the message, the character right after `@` is a letter, and it's immediately followed by whitespace or the end of the message. This is deliberately narrower than "starts with `@`" — a bare `@`, `@3pm meeting`, or `@doctor,` (punctuation glued to the tag) are not tag attempts, since no persona id is digit-led and the one supported form is `@name <message>`.
+
+**Reply-thread inheritance needs a small amount of state, and it lives on the LifeOS side, not Hermes's.** Putting a message-id → persona mapping in Hermes would make persona resolution two-sourced again, which the AC forbids. `HermesPersonaThreadStore` (`api/services/hermes_persona_thread_store.py`) is a `(chat_id, message_id) -> persona_id` table — nothing else, no message content — scoped per chat (Telegram message ids are unique only within a chat) and bounded: rows expire after 7 days and the table is capped at 20,000 rows, oldest evicted first. Every message this endpoint resolves a persona for — whether from an explicit tag or an inherited one — is itself recorded under that persona, which is what makes a reply-to-a-reply chain inherit transitively with no special case: each link becomes a valid anchor for the next.
+
+**Endpoint contract — `POST /api/hermes/resolve-persona`:**
+
+```json
+// Request
+{
+  "text": "@doctor the sync timer looks wedged",
+  "modality": "text",
+  "conversation_id": "...",
+  "chat_id": "12345",
+  "message_id": "987",
+  "reply_to_message_id": "986"
+}
+
+// Response (tag recognized, or inherited from reply_to_message_id)
+{
+  "persona_id": "doctor",
+  "text": "the sync timer looks wedged",
+  "lifeos_context": { "schema_version": 1, "modality": "text", "persona": { "...": "..." }, "turn": { "...": "..." } }
+}
+
+// Response (no tag, and no inheritable reply) — for a request of { "text": "what's on my calendar today" }
+{ "persona_id": null, "text": "what's on my calendar today", "lifeos_context": null }
+```
+
+`modality`/`conversation_id` are optional, mirroring the same fields on `/api/hermes/ask/stream`. `chat_id`/`message_id`/`reply_to_message_id` are opaque strings (Hermes stringifies Telegram's integer ids, the same convention `conversation_id` already uses) and are also optional — omitting all three degrades to the base, non-threaded contract (tag or nothing). `lifeos_context` — when present — is byte-for-byte the same shape the envelope section below documents, built by the identical `_resolve_lifeos_context()` helper both entry points share (the AC's "persona resolution shall have exactly one source of truth"): the resolved preamble for a resolved persona (tagged or inherited) is guaranteed identical to what `/chat` would use for that same persona.
+
+- **No tag and no inheritable reply → unchanged from today, by construction.** `persona_id` and `lifeos_context` are both `null`, and `text` is returned exactly as sent. Hermes needs nothing from this response in that case and should proceed exactly as it did before this endpoint existed — no LifeOS-derived preamble, no envelope, no dependency on LifeOS being reachable.
+- **An unrecognized `@tag` is a 400, not a silent no-persona.** `@nonsense do a thing` matches the tag grammar (starts with a letter, ends at whitespace) but doesn't match any configured persona id — this is rejected with `400 Unknown persona_id: 'nonsense'` rather than falling back to `persona_id: null`. Deliberately: a typo that silently became "no persona selected" would look like it worked, when the user's actual intent (routing to a specific persona) was dropped on the floor.
+- **An unrecognized or expired `reply_to_message_id` is NOT an error.** A miss (never recorded, expired, cross-chat, or a thread that predates this feature) falls through to rule 3 exactly as if no `reply_to_message_id` had been sent at all — a pruned mapping degrading safely is the whole point of bounding it.
+- **Voice applies the same gate `/chat` uses.** `modality: "voice"` on a resolved persona populates `persona.voice_rules` exactly as a voice turn on `/api/hermes/ask/stream` would for the same persona_id — see the envelope section below.
+- **Auth reuses the existing Hermes bearer, in the reverse direction.** `hermes_backend_token` (`LIFEOS_HERMES_BACKEND_TOKEN`) already authenticates LifeOS's outbound calls *to* Hermes; this endpoint requires the same token on Hermes's inbound calls *to* LifeOS (`Authorization: Bearer <token>`, checked with a constant-time compare) rather than introducing a second shared secret. An unset token disables the endpoint (`503`), matching the closed-by-default posture `api/routes/fitness.py`'s health-ingest endpoint uses for the same reason: this accepts input from the network, so a fresh clone must not expose it unauthenticated.
+
+**Endpoint contract — `POST /api/hermes/register-persona-message`:** anchors a message Hermes itself authored — its reply, sent under a resolved persona — to that persona, so a later reply threaded off the **bot's** message inherits too, not just one threaded off the user's original tagged message. This has to be a second call, after the fact: the bot's reply doesn't have a message id until Telegram has accepted it, which is necessarily after `/resolve-persona` already returned.
+
+```json
+// Request
+{ "chat_id": "12345", "message_id": "988", "persona_id": "doctor" }
+
+// Response
+{ "ok": true }
+```
+
+Same auth as `/resolve-persona`. `persona_id` must be a currently-configured persona (`400` otherwise) — defense in depth, since in practice Hermes only ever passes back an id this same service handed it moments earlier.
+
+**The honest boundary of "independent of LifeOS":** a Telegram message that needs LifeOS to resolve its persona — whether via an explicit `@tag` or by inheriting one from its reply-to — genuinely needs LifeOS reachable, while a message with neither does not and behaves exactly as if #644 had never shipped. #658's "keeps working when LifeOS is down" guarantee therefore applies only to that untagged, non-inheriting path; a persona-tagged or persona-inheriting message during a LifeOS outage should fail (or fall back to no-persona) rather than silently pretend to apply a preamble it couldn't fetch — that failure mode is Hermes's call to make, not LifeOS's, since Hermes owns what happens when either endpoint above is unreachable.
 
 #### Hermes turn persistence (#592, survives disconnect since #611) and usage capture (#595)
 
@@ -354,4 +416,5 @@ Since #592, `restoreBackendConversation()` renders the stored conversation on a 
 - [Conversations route](../../api/routes/conversations.py) — List/detail handlers
 - [Proxy factory](../../api/routes/_proxy.py) — Shared status/ask-stream plumbing for the Agent and Hermes backends
 - [Agent proxy](../../api/routes/agent_proxy.py) — Agent text-backend routes
-- [Hermes proxy](../../api/routes/hermes_proxy.py) — Hermes text-backend routes, `lifeos_context` envelope, turn persistence
+- [Hermes proxy](../../api/routes/hermes_proxy.py) — Hermes text-backend routes, `lifeos_context` envelope, turn persistence, and `POST /api/hermes/resolve-persona` / `POST /api/hermes/register-persona-message` (#644, Hermes-Telegram persona selection + reply-thread inheritance)
+- [Hermes persona thread store](../../api/services/hermes_persona_thread_store.py) — the `(chat_id, message_id) -> persona_id` mapping behind reply-thread inheritance (#644 follow-up)

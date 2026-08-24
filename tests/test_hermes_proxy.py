@@ -1798,3 +1798,458 @@ class TestMakePersister:
     def test_returns_none_when_question_is_missing_or_wrong_type(self):
         assert hp._make_persister(json.dumps({}).encode()) is None
         assert hp._make_persister(json.dumps({"question": 5}).encode()) is None
+
+
+# ---------------------------------------------------------------------------
+# `POST /api/hermes/resolve-persona` (#644) — persona selection for Hermes's
+# own Telegram front door, which never passes through the proxy above. Grammar
+# tests exercise `_parse_persona_tag()` directly; endpoint tests exercise auth,
+# the untagged/tagged/unrecognized-tag response contract, voice gating, and
+# parity with `/api/hermes/ask/stream`'s envelope for the same persona.
+# ---------------------------------------------------------------------------
+
+class TestParsePersonaTag:
+    """Grammar for the per-message `@name` prefix (Nathan's decision, no
+    persisted state) — see the comment above `_PERSONA_TAG_RE` in
+    hermes_proxy.py for the full rationale."""
+
+    def test_recognizes_a_simple_tag(self):
+        assert hp._parse_persona_tag("@doctor the sync timer looks wedged") == (
+            "doctor", "the sync timer looks wedged",
+        )
+
+    def test_lowercases_the_tag(self):
+        assert hp._parse_persona_tag("@DOCTOR hi") == ("doctor", "hi")
+
+    def test_tag_with_no_trailing_text(self):
+        assert hp._parse_persona_tag("@doctor") == ("doctor", "")
+
+    def test_collapses_extra_whitespace_after_the_tag(self):
+        assert hp._parse_persona_tag("@doctor   hi there") == ("doctor", "hi there")
+
+    def test_plain_message_has_no_tag(self):
+        assert hp._parse_persona_tag("just a normal message") == (None, "just a normal message")
+
+    def test_leading_at_digit_is_not_a_tag(self):
+        # "a message that merely begins with an @ is not necessarily a
+        # persona tag" — no configured persona id starts with a digit.
+        assert hp._parse_persona_tag("@3pm meeting reminder") == (None, "@3pm meeting reminder")
+
+    def test_bare_at_with_space_is_not_a_tag(self):
+        assert hp._parse_persona_tag("@ what's up") == (None, "@ what's up")
+
+    def test_punctuation_glued_to_tag_is_not_a_tag(self):
+        # Only the documented `@name <message>` form is recognized —
+        # "@doctor," (no space before the comma) doesn't match it.
+        assert hp._parse_persona_tag("@doctor, please check") == (None, "@doctor, please check")
+
+    def test_unknown_tag_shaped_prefix_is_still_returned(self):
+        # Deliberately NOT (None, text) — the caller must see this as an
+        # attempted-but-unrecognized tag, not "no tag at all".
+        assert hp._parse_persona_tag("@nonsense do a thing") == ("nonsense", "do a thing")
+
+
+@pytest.fixture
+def resolve_client(monkeypatch):
+    """Same auth token as `proxy_client`, but only the resolve-persona route
+    is needed — no upstream Hermes stub."""
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "secret-token")
+    app = FastAPI()
+    app.include_router(hp.router)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+async def test_resolve_persona_503_when_token_not_configured(monkeypatch):
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post(
+            "/api/hermes/resolve-persona", json={"text": "hi"},
+            headers={"Authorization": "Bearer whatever"},
+        )
+    assert resp.status_code == 503
+
+
+async def test_resolve_persona_401_when_missing_bearer(resolve_client):
+    resp = await resolve_client.post("/api/hermes/resolve-persona", json={"text": "hi"})
+    assert resp.status_code == 401
+
+
+async def test_resolve_persona_401_when_wrong_bearer(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", json={"text": "hi"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status_code == 401
+
+
+def _auth(token="secret-token"):
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_resolve_persona_untagged_is_unchanged(resolve_client):
+    # "Given no persona selected, then behavior shall be unchanged from
+    # today" (#644 AC) — text passes through byte-identical and there is no
+    # envelope for Hermes to apply.
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", json={"text": "what's on my calendar today"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "persona_id": None,
+        "text": "what's on my calendar today",
+        "lifeos_context": None,
+    }
+
+
+async def test_resolve_persona_unrecognized_tag_is_a_400_not_silent(resolve_client):
+    # A typo'd/unknown tag must be a deliberate error, never silently treated
+    # as "no persona selected" (which would make the typo look like it worked).
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", json={"text": "@nonsense do a thing"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 400
+    assert "nonsense" in resp.json()["detail"]
+
+
+async def test_resolve_persona_tagged_resolves_and_strips_prefix(resolve_client, tmp_path, monkeypatch):
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FITNESS PERSONA BODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "label": "Fitness Coach", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", json={"text": "@fitness what's my workout today"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["persona_id"] == "fitness"
+    assert body["text"] == "what's my workout today"
+    ctx = body["lifeos_context"]
+    # Same preamble /chat (via resolve_persona) would use for this persona —
+    # the #644 AC in a nutshell.
+    assert ctx["persona"]["id"] == "fitness"
+    assert ctx["persona"]["label"] == "Fitness Coach"
+    assert ctx["persona"]["preamble"] == "FITNESS PERSONA BODY"
+    assert ctx["persona"]["preamble"] == hp.settings.resolve_persona("fitness", surface="hermes")
+
+
+async def test_resolve_persona_matches_ask_stream_envelope_for_same_persona(
+    resolve_client, proxy_client, tmp_path, monkeypatch,
+):
+    """The two entry points into persona resolution (`/resolve-persona` for
+    Hermes-Telegram, `/ask/stream`'s envelope for the browser/voice-selected
+    persona) must produce an IDENTICAL envelope for the same persona and
+    conversation — proof they share `_resolve_lifeos_context()` rather than
+    two implementations that happen to agree today."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from api.services import agent_system_prompt as asp
+
+    fixed_now = datetime(2026, 8, 19, 9, 14, 22, tzinfo=ZoneInfo("America/New_York"))
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(asp, "datetime", _Frozen)
+
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("---\nid: fitness\nvoice:\n  - terse\n---\n\nFITNESS BODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+    conv_id = "11111111-1111-1111-1111-111111111111"
+
+    resolve_resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness ready for today", "modality": "voice", "conversation_id": conv_id},
+        headers=_auth(),
+    )
+    assert resolve_resp.status_code == 200
+    resolved_ctx = resolve_resp.json()["lifeos_context"]
+
+    ask_resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "ready for today", "persona_id": "fitness", "modality": "voice", "conversation_id": conv_id},
+    )
+    assert ask_resp.status_code == 200
+    ask_ctx = json.loads(_received["body"])["lifeos_context"]
+
+    assert resolved_ctx == ask_ctx
+
+
+async def test_resolve_persona_voice_modality_applies_voice_rules(resolve_client, tmp_path, monkeypatch):
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("---\nid: fitness\nvoice:\n  - terse\n  - no emoji\n---\n\nBODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness plan", "modality": "voice"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["lifeos_context"]["persona"]["voice_rules"] == ["terse", "no emoji"]
+
+
+async def test_resolve_persona_text_modality_gives_empty_voice_rules(resolve_client, tmp_path, monkeypatch):
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("---\nid: fitness\nvoice:\n  - terse\n---\n\nBODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", json={"text": "@fitness plan"}, headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["lifeos_context"]["persona"]["voice_rules"] == []
+
+
+async def test_resolve_persona_missing_text_field_is_400(resolve_client):
+    resp = await resolve_client.post("/api/hermes/resolve-persona", json={}, headers=_auth())
+    assert resp.status_code == 400
+
+
+async def test_resolve_persona_malformed_json_400(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona", content=b"{not valid json",
+        headers={**_auth(), "content-type": "application/json"},
+    )
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Reply-thread persona inheritance (#644 follow-up) — the ordered rule:
+# explicit @tag > inherited from reply-to > nothing. `resolve_client`,
+# `_registry`, and `_auth` above are reused unchanged.
+# ---------------------------------------------------------------------------
+
+def _setup_fitness_persona(tmp_path, monkeypatch):
+    persona_file = tmp_path / "fitness.md"
+    persona_file.write_text("FITNESS PERSONA BODY")
+    reg = _registry(tmp_path, [
+        {"name": "fitness", "label": "Fitness Coach", "token_env": "TG_FIT", "persona_file": str(persona_file)},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_FIT", "tok")
+
+
+def _setup_doctor_persona(tmp_path, monkeypatch):
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("DOCTOR PERSONA BODY")
+    reg = _registry(tmp_path, [
+        {"name": "doctor", "token_env": "TG_DOC", "persona_file": str(persona_file), "orchestrates": True},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_DOC", "tok")
+
+
+async def test_reply_inherits_persona_from_tagged_message(resolve_client, tmp_path, monkeypatch):
+    _setup_fitness_persona(tmp_path, monkeypatch)
+
+    # First message tags fitness explicitly and is recorded under its own id.
+    first = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness plan for today", "chat_id": "chat-1", "message_id": "msg-1"},
+        headers=_auth(),
+    )
+    assert first.status_code == 200
+    assert first.json()["persona_id"] == "fitness"
+
+    # A reply to msg-1 with no tag inherits fitness -- text is untouched,
+    # there was no prefix to strip.
+    reply = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "what about tomorrow", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "msg-1",
+        },
+        headers=_auth(),
+    )
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["persona_id"] == "fitness"
+    assert body["text"] == "what about tomorrow"
+    assert body["lifeos_context"]["persona"]["id"] == "fitness"
+
+
+async def test_explicit_tag_overrides_inherited_persona(resolve_client, tmp_path, monkeypatch):
+    _setup_fitness_persona(tmp_path, monkeypatch)
+    _setup_doctor_persona(tmp_path, monkeypatch)
+
+    await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness plan for today", "chat_id": "chat-1", "message_id": "msg-1"},
+        headers=_auth(),
+    )
+
+    # A reply that carries its OWN tag switches personas mid-thread rather
+    # than inheriting fitness from msg-1.
+    reply = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "@doctor unrelated question", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "msg-1",
+        },
+        headers=_auth(),
+    )
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["persona_id"] == "doctor"
+    assert body["text"] == "unrelated question"
+
+
+async def test_unknown_reply_to_id_falls_back_to_no_persona(resolve_client):
+    # Never recorded (old thread, pruned mapping, predates this feature) --
+    # not an error, just today's behavior.
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "continuing our chat", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "never-seen",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"persona_id": None, "text": "continuing our chat", "lifeos_context": None}
+
+
+async def test_expired_reply_to_id_falls_back_to_no_persona(resolve_client, tmp_path, monkeypatch):
+    _setup_fitness_persona(tmp_path, monkeypatch)
+    import api.services.hermes_persona_thread_store as thread_store_mod
+
+    fake_time = [1_000_000.0]
+    monkeypatch.setattr(thread_store_mod.time, "time", lambda: fake_time[0])
+
+    await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness plan", "chat_id": "chat-1", "message_id": "msg-1"},
+        headers=_auth(),
+    )
+    fake_time[0] += thread_store_mod._TTL_SECONDS + 1
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "still there?", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "msg-1",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"persona_id": None, "text": "still there?", "lifeos_context": None}
+
+
+async def test_reply_to_id_from_a_different_chat_does_not_collide(resolve_client, tmp_path, monkeypatch):
+    _setup_fitness_persona(tmp_path, monkeypatch)
+
+    await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@fitness plan", "chat_id": "chat-1", "message_id": "msg-1"},
+        headers=_auth(),
+    )
+    # Same message_id, different chat -- must not inherit fitness from chat-1's msg-1.
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "hi there", "chat_id": "chat-2",
+            "message_id": "msg-2", "reply_to_message_id": "msg-1",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persona_id"] is None
+
+
+async def test_reply_to_a_reply_inherits_transitively(resolve_client, tmp_path, monkeypatch):
+    # A reply to a reply in a doctor thread is still doctor -- no special
+    # case needed since every resolved message (tag or inherited) is
+    # recorded under its own id.
+    _setup_doctor_persona(tmp_path, monkeypatch)
+
+    await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@doctor is the sync timer wedged", "chat_id": "chat-1", "message_id": "msg-1"},
+        headers=_auth(),
+    )
+    await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "any update", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "msg-1",
+        },
+        headers=_auth(),
+    )
+    third = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "still nothing?", "chat_id": "chat-1",
+            "message_id": "msg-3", "reply_to_message_id": "msg-2",
+        },
+        headers=_auth(),
+    )
+    assert third.status_code == 200
+    assert third.json()["persona_id"] == "doctor"
+
+
+async def test_reply_to_a_bot_authored_message_inherits(resolve_client, tmp_path, monkeypatch):
+    # The thread anchor doesn't have to be a message this endpoint resolved
+    # -- a bot reply registered via /register-persona-message works too.
+    _setup_fitness_persona(tmp_path, monkeypatch)
+
+    reg_resp = await resolve_client.post(
+        "/api/hermes/register-persona-message",
+        json={"chat_id": "chat-1", "message_id": "bot-msg-1", "persona_id": "fitness"},
+        headers=_auth(),
+    )
+    assert reg_resp.status_code == 200
+    assert reg_resp.json() == {"ok": True}
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "one more thing", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "bot-msg-1",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persona_id"] == "fitness"
+
+
+async def test_register_persona_message_rejects_unknown_persona(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/register-persona-message",
+        json={"chat_id": "chat-1", "message_id": "bot-msg-1", "persona_id": "ghost"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 400
+
+
+async def test_register_persona_message_requires_auth(resolve_client):
+    resp = await resolve_client.post(
+        "/api/hermes/register-persona-message",
+        json={"chat_id": "chat-1", "message_id": "bot-msg-1", "persona_id": "primary"},
+    )
+    assert resp.status_code == 401

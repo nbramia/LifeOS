@@ -18,6 +18,18 @@ only place that happens among the text-backend proxies. The status/
 bearer-injection/streaming-response logic is otherwise shared with the Agent
 backend via `make_backend_router()` in `_proxy.py`.
 
+#644: `POST /api/hermes/resolve-persona`, at the bottom of this module, is a
+second, standalone entry point into the same persona resolution — for
+Hermes's own Telegram front door, which never passes through the proxy above
+(that would couple its Telegram availability to LifeOS being reachable).
+Hermes calls it directly with the raw message text; both entry points share
+`_resolve_lifeos_context()` so persona/voice/turn resolution has exactly one
+implementation. See that section for the request/response contract, the
+`@persona` selection grammar, and (a #644 follow-up) reply-thread persona
+inheritance via `HermesPersonaThreadStore`
+(`api/services/hermes_persona_thread_store.py`) and its companion
+`POST /api/hermes/register-persona-message`.
+
 #642 CROSS-REPO CONTRACT CHANGE: `lifeos_context.persona.orchestrates` can now
 be `true` (previously always `false` — see `_build_envelope`'s comment on that
 field). Its meaning has changed too: no longer "a LifeOS bug leaked an
@@ -32,13 +44,15 @@ and deploying first**; landing this side alone would 500 every doctor turn on
 Hermes rather than run one.
 """
 
+import hmac
 import json
 import logging
+import re
 from typing import Optional
 
 import httpx
-from fastapi import HTTPException
-from pydantic import ValidationError
+from fastapi import HTTPException, Request
+from pydantic import BaseModel, ValidationError
 
 # Imported (not just re-exported through _proxy.py) so tests can monkeypatch
 # `hermes_proxy.settings.hermes_backend_url` / `hermes_backend_token` directly —
@@ -51,6 +65,7 @@ from api.routes.chat import AskStreamRequest
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, truncation_routing
 from api.services.conversation_store import get_store
+from api.services.hermes_persona_thread_store import get_persona_thread_store
 from api.services.model_readout import record_hermes_chat_turn_model
 from api.services.usage_store import get_usage_store
 
@@ -93,33 +108,31 @@ def _resolve_caller_session_id(conversation_id: Optional[str]) -> str:
     return resolve_hermes_caller_session_id(SessionStore(), conversation_id)
 
 
-def _build_envelope(raw_body: bytes) -> bytes:
-    """Attach `lifeos_context` to the forwarded body, resolving the persona.
+def _resolve_lifeos_context(
+    persona_id: str, *, modality: str, conversation_id: Optional[str], apply_voice_rules: bool,
+) -> dict:
+    """Resolve one persona id into the `lifeos_context` envelope's contents.
 
-    Runs before the request reaches httpx, so a malformed body or a bad
-    persona is a clean 400 — mirroring the ordering `ask_stream` in
-    `api/routes/chat.py` uses for the native path (resolve persona before the
-    stream opens). Every field the browser sent is preserved untouched; this
-    adds exactly one top-level key.
+    This is the ONE place persona/voice/turn-context resolution happens for
+    Hermes (#644's AC: "Persona resolution shall have exactly one source of
+    truth") — extracted out of `_build_envelope` (the `/api/hermes/ask/stream`
+    proxy, browser/voice-selected persona) so `resolve_persona_from_text`
+    below (the Hermes-Telegram `@tag` path) can share it verbatim instead of
+    re-implementing preamble/voice/label/turn lookups a second time. Purely
+    extracted — every line below is unchanged from `_build_envelope`'s
+    previous inline body, so the existing proxy path's behavior is untouched.
+
+    `apply_voice_rules` is passed in rather than derived from `modality` here
+    because the two callers gate it differently: `_build_envelope` mirrors
+    `ask_stream`'s `modality == "voice" and request.persona_id` gate (a voice
+    turn that omitted persona_id and fell back to "primary" gets no voice
+    rules, even if primary's file defines some); `resolve_persona_from_text`
+    only ever calls this with an explicitly-tagged persona_id, so for it
+    `apply_voice_rules` is simply `modality == "voice"`.
+
+    Raises `HTTPException(400)` for an unknown `persona_id` — the same
+    contract `_build_envelope` documented inline before this extraction.
     """
-    try:
-        data = json.loads(raw_body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}")
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-
-    # Reuse the native request model's validation (attachment size/type caps,
-    # persona length bound) rather than reimplementing it — see AskStreamRequest
-    # in api/routes/chat.py.
-    try:
-        parsed = AskStreamRequest.model_validate(data)
-    except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
-
-    # Same registry-backed resolution the native /api/ask/stream uses, and the
-    # same default-to-primary behavior when no persona_id is sent.
-    persona_id = parsed.persona_id or "primary"
     # surface="hermes" (#642): an orchestrating persona (e.g. doctor) has a
     # Hermes-specific preamble (config/personas/doctor.hermes.md, #641)
     # describing a Claude Code worker driven via lifeos_agent_spawn, not the
@@ -138,17 +151,7 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # the surface-specific preamble resolved above is what actually tells it
     # to spawn and supervise a worker instead of answering inline.
 
-    # Spoken-style rules apply only on voice turns, matching the exact gate
-    # ask_stream() uses in api/routes/chat.py: `modality == "voice" and
-    # request.persona_id`. Gating on the *raw* parsed.persona_id (not the
-    # primary-defaulted `persona_id` above) matters: a voice turn that omits
-    # persona_id entirely gets no voice rules natively, even though primary's
-    # own persona file could define some — mirror that rather than inventing
-    # a rule for the omitted-persona case.
-    modality = "voice" if (parsed.modality or "").strip().lower() == "voice" else "text"
-    voice_rules = (
-        list(settings.persona_voice(persona_id)) if modality == "voice" and parsed.persona_id else []
-    )
+    voice_rules = list(settings.persona_voice(persona_id)) if apply_voice_rules else []
 
     # No fallback: list_http_personas() draws "primary" plus every entry in
     # the same settings.telegram_bots registry resolve_persona() just matched
@@ -156,7 +159,7 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # that already passed validation.
     label = next(p.label for p in settings.list_http_personas() if p.id == persona_id)
 
-    turn = build_turn_context(persona_id, parsed.conversation_id)
+    turn = build_turn_context(persona_id, conversation_id)
     # `caller_session_id` (#640) is added here, on the envelope's copy of
     # `turn`, rather than folded into `build_turn_context()` itself —
     # that function is shared with the plain `GET /api/chat/turn-context`
@@ -169,9 +172,9 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # request. Additive at schema_version 1 (no version bump): a consumer
     # that doesn't know this key ignores it exactly as it would any other
     # unrecognized field.
-    turn["caller_session_id"] = _resolve_caller_session_id(parsed.conversation_id)
+    turn["caller_session_id"] = _resolve_caller_session_id(conversation_id)
 
-    data["lifeos_context"] = {
+    return {
         "schema_version": 1,
         "modality": modality,
         "persona": {
@@ -206,6 +209,51 @@ def _build_envelope(raw_body: bytes) -> bytes:
         # default to "primary"), so that reverse lookup doesn't apply here.
         "turn": turn,
     }
+
+
+def _build_envelope(raw_body: bytes) -> bytes:
+    """Attach `lifeos_context` to the forwarded body, resolving the persona.
+
+    Runs before the request reaches httpx, so a malformed body or a bad
+    persona is a clean 400 — mirroring the ordering `ask_stream` in
+    `api/routes/chat.py` uses for the native path (resolve persona before the
+    stream opens). Every field the browser sent is preserved untouched; this
+    adds exactly one top-level key.
+    """
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    # Reuse the native request model's validation (attachment size/type caps,
+    # persona length bound) rather than reimplementing it — see AskStreamRequest
+    # in api/routes/chat.py.
+    try:
+        parsed = AskStreamRequest.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
+
+    # Same registry-backed resolution the native /api/ask/stream uses, and the
+    # same default-to-primary behavior when no persona_id is sent.
+    persona_id = parsed.persona_id or "primary"
+    modality = "voice" if (parsed.modality or "").strip().lower() == "voice" else "text"
+    # Spoken-style rules apply only on voice turns, matching the exact gate
+    # ask_stream() uses in api/routes/chat.py: `modality == "voice" and
+    # request.persona_id`. Gating on the *raw* parsed.persona_id (not the
+    # primary-defaulted `persona_id` above) matters: a voice turn that omits
+    # persona_id entirely gets no voice rules natively, even though primary's
+    # own persona file could define some — mirror that rather than inventing
+    # a rule for the omitted-persona case.
+    apply_voice_rules = modality == "voice" and bool(parsed.persona_id)
+
+    data["lifeos_context"] = _resolve_lifeos_context(
+        persona_id,
+        modality=modality,
+        conversation_id=parsed.conversation_id,
+        apply_voice_rules=apply_voice_rules,
+    )
     return json.dumps(data).encode("utf-8")
 
 
@@ -497,3 +545,237 @@ router = make_backend_router(
     transform_body=_build_envelope,
     make_observer=_make_persister,
 )
+
+
+# ---------------------------------------------------------------------------
+# `POST /api/hermes/resolve-persona` (#644) — persona selection for Hermes's
+# own Telegram front door, which never passes through the proxy above (that
+# would couple its availability to LifeOS being up — see #658/#644's "two
+# decisions already made"). Hermes instead calls this endpoint directly with
+# the raw message text; the response tells it which persona (if any) was
+# selected, the text with the selector stripped, and the same
+# `lifeos_context` envelope `_build_envelope` above would attach for that
+# persona — computed by the SAME `_resolve_lifeos_context` helper, so this
+# and the proxy path can never resolve a persona differently.
+#
+# Resolution is an ORDERED rule, not a single check (#644 follow-up — reply-
+# thread persona inheritance):
+#   1. An explicit `@persona` prefix on this message wins, always — even
+#      inside an existing persona thread, so replying with a new tag switches
+#      personas mid-thread.
+#   2. Else, if this message is a reply (Telegram's native reply-to) to a
+#      message whose persona is known, inherit it.
+#   3. Else, no persona — byte-identical to today.
+# The mapping behind rule 2 (`HermesPersonaThreadStore`,
+# api/services/hermes_persona_thread_store.py) is the one place that state
+# lives, deliberately on the LifeOS side: putting it in Hermes would make
+# persona resolution two-sourced again. `POST /api/hermes/register-persona-
+# message`, below `resolve_persona_from_text`, is how Hermes anchors its OWN
+# reply's message id to the same persona — needed because that id isn't
+# known until after Hermes has already sent the reply to Telegram, which is
+# necessarily after this endpoint already returned.
+# ---------------------------------------------------------------------------
+
+# Selection mechanism (Nathan's decision, documented in
+# docs/specs/technical/client-surfaces.md): a per-message `@name` prefix, no
+# persisted state — every message is judged independently. A tag is
+# recognized only when it opens the message, the character right after `@`
+# is a letter, and it's immediately followed by whitespace or the end of the
+# message. Every configured persona id is `[a-z0-9_-]+` and, in practice,
+# always letter-led (`_BOT_NAME_RE` in config/settings.py permits more, but
+# no persona is actually named e.g. "123") — requiring a leading letter is a
+# deliberate heuristic, not a hard technical constraint, chosen so an
+# ordinary message that merely *starts* with `@` (a bare "@", "@3pm meeting",
+# "@ what's up") is never mistaken for a tag attempt. Punctuation glued
+# directly onto the tag (`@doctor,`) is likewise not recognized — the
+# grammar matches the one documented form (`@doctor <message>`) rather than
+# guessing at variants.
+_PERSONA_TAG_RE = re.compile(r"^@([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.*))?$", re.DOTALL)
+
+
+def _parse_persona_tag(text: str) -> tuple[Optional[str], str]:
+    """Split a raw Hermes-Telegram message into an optional persona tag
+    (lowercased) and the remaining text — see the prefix-grammar comment
+    above `_PERSONA_TAG_RE`.
+
+    Returns `(None, text)` unchanged when no tag-shaped prefix is present.
+    A tag-shaped prefix that doesn't match any *configured* persona is still
+    returned here (lowercased, not discarded) — `resolve_persona_from_text`
+    below is responsible for treating that as a deliberate error rather than
+    silently falling back to "no persona selected", which would make a typo
+    indistinguishable from working.
+    """
+    match = _PERSONA_TAG_RE.match(text)
+    if not match:
+        return None, text
+    tag = match.group(1).lower()
+    remainder = (match.group(2) or "").strip()
+    return tag, remainder
+
+
+class HermesPersonaResolveRequest(BaseModel):
+    """Body for `POST /api/hermes/resolve-persona` — a raw, not-yet-split
+    Hermes-Telegram message. `text` stands in for `AskStreamRequest.question`:
+    no question is being answered here, only a persona (if any) resolved.
+
+    `chat_id`/`message_id`/`reply_to_message_id` are opaque string ids
+    (Hermes stringifies Telegram's integer ids the same way `conversation_id`
+    is already an opaque string elsewhere on this contract) used only for
+    reply-thread persona inheritance (#644 follow-up):
+    - `reply_to_message_id`, when this message is a Telegram reply, is looked
+      up in `HermesPersonaThreadStore` (scoped to `chat_id`) to inherit a
+      persona when this message carries no explicit `@tag` of its own.
+    - `chat_id` + `message_id` (THIS message's own id) are where the
+      resolved persona, if any, gets recorded — so a later reply to *this*
+      message can itself inherit. All three are optional: omitting them
+      degrades to the base (non-threaded) contract, tag or nothing.
+    """
+    text: str
+    modality: Optional[str] = None
+    conversation_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    message_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
+
+
+def _check_hermes_inbound_auth(request: Request) -> None:
+    """Bearer-token gate for the inbound Hermes-to-LifeOS direction, shared
+    by `/resolve-persona` and `/register-persona-message`.
+
+    Reuses `hermes_backend_token` — the same shared secret already
+    authenticating the outbound LifeOS-to-Hermes call `_build_envelope`'s
+    proxy makes — rather than inventing a second Hermes-specific token for
+    the reverse direction. Disabled (503) until a token is configured,
+    mirroring `api/routes/fitness.py`'s `_check_ingest_auth`: a fresh clone
+    has these endpoints closed until an operator deliberately sets one, since
+    unlike the outbound direction (where an empty token just means "send no
+    auth to a backend I trust"), an empty token here would mean "accept
+    unauthenticated input from the network."
+    """
+    expected = settings.hermes_backend_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Hermes persona resolution disabled: set LIFEOS_HERMES_BACKEND_TOKEN to enable.",
+        )
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
+
+
+@router.post("/resolve-persona")
+async def resolve_persona_from_text(request: Request):
+    """Resolve a Hermes-Telegram message's persona: explicit `@tag` first,
+    then reply-thread inheritance, then nothing — see the ordered-rule
+    comment above this section.
+
+    Response shape: `{"persona_id": str | None, "text": str, "lifeos_context":
+    dict | None}`. Neither a tag nor an inheritable reply -> `persona_id`/
+    `lifeos_context` are both `None` and `text` is returned byte-identical to
+    the input `text` field — Hermes's untagged path needs nothing from this
+    endpoint and should behave exactly as it did before this endpoint
+    existed. A resolved persona (tag or inherited) resolves `lifeos_context`
+    via `_resolve_lifeos_context` (the same helper `_build_envelope` uses for
+    `/api/hermes/ask/stream`); a tag also strips itself from `text`, while an
+    inherited persona leaves `text` untouched (there was no prefix to strip).
+    An `@`-prefixed token that isn't a known persona id is a 400, not a
+    silent fall-through to "no persona" — a typo must not look like it
+    worked. An unknown or expired `reply_to_message_id` is NOT an error —
+    silently falls through to "no persona", the same as a thread that
+    started before this feature existed.
+    """
+    _check_hermes_inbound_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    try:
+        parsed = HermesPersonaResolveRequest.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
+
+    tag, remainder = _parse_persona_tag(parsed.text)
+    if tag is not None:
+        # Rule 1: an explicit tag always wins, even over an inheritable
+        # reply — this is how a thread switches personas mid-stream.
+        persona_id = tag
+        resolved_text = remainder
+    elif parsed.reply_to_message_id and parsed.chat_id:
+        # Rule 2: inherit the replied-to message's persona, if LifeOS still
+        # has it on record. A miss (unknown id, expired, cross-chat, or a
+        # thread from before this feature shipped) is not an error — it's
+        # rule 3, indistinguishable from "no tag at all".
+        persona_id = get_persona_thread_store().lookup(parsed.chat_id, parsed.reply_to_message_id)
+        resolved_text = parsed.text
+    else:
+        persona_id = None
+        resolved_text = parsed.text
+
+    if persona_id is None:
+        # Rule 3.
+        return {"persona_id": None, "text": parsed.text, "lifeos_context": None}
+
+    modality = "voice" if (parsed.modality or "").strip().lower() == "voice" else "text"
+    # A resolved persona — tag or inherited — is always the "chose a
+    # persona" case for this endpoint, unlike `_build_envelope`'s
+    # default-to-primary path, so there's no "omitted persona_id" ambiguity
+    # to gate voice_rules on here.
+    context = _resolve_lifeos_context(
+        persona_id, modality=modality, conversation_id=parsed.conversation_id, apply_voice_rules=(modality == "voice"),
+    )
+
+    # Anchor THIS message under its resolved persona too, so a later reply to
+    # it — whether it arrived via an explicit tag or by inheriting one —
+    # itself becomes a valid inheritance target. This is what makes a
+    # reply-to-a-reply chain inherit transitively with no special case: every
+    # link records itself the same way.
+    if parsed.chat_id and parsed.message_id:
+        get_persona_thread_store().record(parsed.chat_id, parsed.message_id, persona_id)
+
+    return {"persona_id": persona_id, "text": resolved_text, "lifeos_context": context}
+
+
+class HermesRegisterPersonaMessageRequest(BaseModel):
+    """Body for `POST /api/hermes/register-persona-message` — anchors a
+    message Hermes itself authored (its reply to a resolved persona turn) to
+    that persona, so a later reply threaded off the BOT's message inherits
+    too, not just one threaded off the user's original tagged message.
+
+    Needed as a second call, after the fact: the bot reply's own message id
+    isn't known until Telegram has accepted it, which is necessarily after
+    `/resolve-persona` already returned.
+    """
+    chat_id: str
+    message_id: str
+    persona_id: str
+
+
+@router.post("/register-persona-message")
+async def register_persona_message(request: Request):
+    """Anchor a Hermes-authored message id to the persona it was sent under.
+
+    `persona_id` must be a currently-configured persona (the same check
+    `_resolve_lifeos_context` applies) — defense in depth against a stale or
+    malformed id polluting the thread table, even though in practice Hermes
+    only ever passes back an id this same service handed it moments earlier
+    from `/resolve-persona`.
+    """
+    _check_hermes_inbound_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    try:
+        parsed = HermesRegisterPersonaMessageRequest.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {exc}")
+
+    if settings.resolve_persona(parsed.persona_id, surface="hermes") is None:
+        raise HTTPException(status_code=400, detail=f"Unknown persona_id: {parsed.persona_id!r}")
+
+    get_persona_thread_store().record(parsed.chat_id, parsed.message_id, parsed.persona_id)
+    return {"ok": True}

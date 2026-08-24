@@ -202,7 +202,10 @@ class Settings(BaseSettings):
     hermes_backend_token: str = Field(
         default="",
         alias="LIFEOS_HERMES_BACKEND_TOKEN",
-        description="Optional bearer token for the Hermes text backend"
+        description="Bearer token shared with Hermes. Sent by LifeOS on outbound calls to "
+                    "the Hermes text backend (optional there — Hermes may not require one), "
+                    "and required from Hermes on inbound calls to "
+                    "POST /api/hermes/resolve-persona (#644) — empty disables that endpoint."
     )
 
     # Bounded lifetime for a chat turn that has detached from its client (#611):
