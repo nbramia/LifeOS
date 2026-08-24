@@ -146,6 +146,9 @@ def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) 
         if name == "manage_tasks" and args.get("action") == "create":
             category = "task"
             break
+        if name == "manage_commitments" and args.get("action") == "create":
+            category = "commitment"
+            break
         if name in {"manage_reminders", "manage_schedules"} and args.get("action") == "create":
             category = "reminder"
             break
