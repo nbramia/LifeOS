@@ -2366,7 +2366,7 @@ def _task_tags(_inp: dict) -> str:
 
 def _tool_life_review(inp: dict) -> str:
     """Return a deterministic, evidence-backed personal action review."""
-    from datetime import date
+    from datetime import date, datetime, timezone
     from api.services.commitment_store import list_commitments
     from api.services.inbox_store import list_items
     from api.services.memory_store import get_memory_store
@@ -2412,6 +2412,13 @@ def _tool_life_review(inp: dict) -> str:
                 person = f" ({item['person_name']})" if item.get("person_name") else ""
                 due = f"; due {item['due_at']}" if item.get("due_at") else ""
                 lines.append(f"- {item['direction']}{person}: {item['content']}{due}")
+            lines.append("\n## Follow-ups")
+            for item in commitments[:limit]:
+                person = item.get("person_name") or "someone"
+                if item.get("direction") == "owed_by_me":
+                    lines.append(f"- You owe {person}: {item['content']}")
+                else:
+                    lines.append(f"- Follow up with {person}: {item['content']}")
         else:
             lines.append("- No open commitments are recorded.")
 
@@ -2440,14 +2447,30 @@ def _tool_life_review(inp: dict) -> str:
         memory for memory in memories
         if memory.category in {"projects", "goals"}
     ]
-    projects.sort(key=lambda memory: memory.updated_at or memory.created_at)
+    now = datetime.now(timezone.utc)
+    project_rows = []
+    for memory in projects:
+        stamp = memory.updated_at or memory.created_at
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age_days = max(0, (now - stamp).days)
+        project_rows.append((age_days, memory))
+    project_rows.sort(key=lambda row: row[0], reverse=True)
+    if mode == "neglected":
+        project_rows = [row for row in project_rows if row[0] >= 14]
     lines.append("\n## Aging goals/projects")
-    if projects:
-        for memory in projects[:limit]:
+    if project_rows:
+        for age_days, memory in project_rows[:limit]:
             stamp = (memory.updated_at or memory.created_at).date().isoformat()
-            lines.append(f"- last recorded {stamp}: {memory.content}")
+            freshness = f"; {age_days} days since update"
+            lines.append(f"- last recorded {stamp}{freshness}: {memory.content}")
     else:
-        lines.append("- No goals or projects are recorded in the current memory set.")
+        if mode == "neglected":
+            lines.append("- No goals or projects have been inactive for at least 14 days on record.")
+        else:
+            lines.append("- No goals or projects are recorded in the current memory set.")
 
     lines.append("\nThis is a record-based review; it does not prove that an item is unimportant or forgotten when no record exists.")
     return "\n".join(lines)

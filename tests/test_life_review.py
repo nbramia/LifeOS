@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,7 +22,7 @@ def test_life_review_combines_recorded_sources(monkeypatch):
     memory = SimpleNamespace(
         category="projects",
         content="Build the cafe AI product",
-        updated_at=SimpleNamespace(date=lambda: SimpleNamespace(isoformat=lambda: "2026-08-01")),
+        updated_at=datetime.now(timezone.utc) - timedelta(days=21),
         created_at=None,
     )
     monkeypatch.setattr(
@@ -49,5 +50,8 @@ def test_life_review_combines_recorded_sources(monkeypatch):
 
     assert "Send the deck" in result
     assert "John" in result
+    assert "Follow-ups" in result
+    assert "You owe John" in result
     assert "Unresolved capture" in result
     assert "Build the cafe AI product" in result
+    assert "days since update" in result
