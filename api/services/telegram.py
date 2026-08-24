@@ -822,8 +822,19 @@ class TelegramBotListener:
         if not message:
             return
 
-        text = message.get("text", "").strip()
+        text = (message.get("text") or message.get("caption") or "").strip()
         voice = message.get("voice") or message.get("audio")
+        media_type = next(
+            (
+                kind for kind in (
+                    "photo", "video", "document", "animation", "video_note", "sticker",
+                ) if message.get(kind)
+            ),
+            None,
+        )
+        media_payload = message.get(media_type) if media_type else None
+        if isinstance(media_payload, list):
+            media_payload = media_payload[-1] if media_payload else None
         chat_id = str(message["chat"]["id"])
 
         # Auth check first — don't let unauthorized chats pollute the dedup window
@@ -873,6 +884,17 @@ class TelegramBotListener:
                     "Please try again or send it as text.", chat_id=chat_id,
                 )
                 return
+
+        # Telegram puts text accompanying media in ``caption`` rather than
+        # ``text``. Preserve captioned forwards/attachments as normal inbox
+        # input, and acknowledge uncaptioned media instead of silently
+        # dropping the update. The file is not downloaded or interpreted yet;
+        # its Telegram file_id and message provenance travel with the request.
+        if media_type and not voice:
+            if text:
+                text = f"[Telegram {media_type}]\n{text}"
+            else:
+                text = f"[Telegram {media_type} without caption]"
 
         if not text:
             return
@@ -947,9 +969,15 @@ class TelegramBotListener:
                     persona=self._persona,
                     source={
                         "type": "telegram",
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                    },
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    **({
+                        "media_type": media_type,
+                        "file_id": media_payload.get("file_id")
+                        if isinstance(media_payload, dict) else None,
+                        "forwarded": bool(message.get("forward_origin") or message.get("forward_from")),
+                    } if media_type else {}),
+                },
                 )
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result

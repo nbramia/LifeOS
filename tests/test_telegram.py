@@ -331,6 +331,65 @@ class TestMessageDedup:
         assert TelegramBotListener._DEDUP_WINDOW in listener._processed_ids
 
 
+class TestMediaCapture:
+    """Captions and media updates must reach the capture/chat pipeline."""
+
+    def _make_listener(self, tmp_path):
+        from api.services.telegram import TelegramBotListener
+        with patch.object(TelegramBotListener, "_STATE_FILE", tmp_path / "telegram_state.json"):
+            listener = TelegramBotListener()
+        listener._chat_id = "123"
+        return listener
+
+    @pytest.mark.asyncio
+    async def test_captioned_forward_uses_caption_and_preserves_media_source(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        update = {
+            "message": {
+                "message_id": 20,
+                "caption": "Interesting cafe operations video",
+                "photo": [{"file_id": "small"}, {"file_id": "large"}],
+                "forward_origin": {"type": "channel"},
+                "chat": {"id": "123"},
+            }
+        }
+        with patch("api.services.telegram.settings") as mock_settings, \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_settings.telegram_chat_id = "123"
+            mock_chat.return_value = {"answer": "saved", "conversation_id": "c1", "claude_intent": False}
+            await listener._handle_update(update)
+
+        request = mock_chat.await_args.args[0]
+        source = mock_chat.await_args.kwargs["source"]
+        assert request == "[Telegram photo]\nInteresting cafe operations video"
+        assert source["media_type"] == "photo"
+        assert source["file_id"] == "large"
+        assert source["forwarded"] is True
+
+    @pytest.mark.asyncio
+    async def test_uncaptioned_media_is_not_silently_dropped(self, tmp_path):
+        listener = self._make_listener(tmp_path)
+        update = {
+            "message": {
+                "message_id": 21,
+                "video": {"file_id": "vid-1"},
+                "chat": {"id": "123"},
+            }
+        }
+        with patch("api.services.telegram.settings") as mock_settings, \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_settings.telegram_chat_id = "123"
+            mock_chat.return_value = {"answer": "received", "conversation_id": "c1", "claude_intent": False}
+            await listener._handle_update(update)
+
+        assert mock_chat.await_args.args[0] == "[Telegram video without caption]"
+        assert mock_chat.await_args.kwargs["source"]["file_id"] == "vid-1"
+
+
 # =============================================================================
 # Plain messages never implicitly resume an agent thread (regression)
 # =============================================================================
