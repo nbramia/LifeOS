@@ -5,7 +5,7 @@ Extracts and stores interesting facts about contacts using a multi-stage LLM pip
 Facts are stored in SQLite and can be displayed in the CRM UI.
 
 Pipeline Architecture (v3):
-- Stage 1: Extract candidate facts using Claude (natural sentence values, no keys)
+- Stage 1: Extract candidate facts using the configured model (natural sentence values, no keys)
 - Stage 2: Batched validation + dedup using single Ollama call (quality, attribution, dedup)
 - Stage 3: Semantic dedup via second Ollama call (catches remaining duplicates)
 
@@ -506,23 +506,24 @@ class PersonFactStore:
 
 class PersonFactExtractor:
     """
-    Extracts facts from interactions using Claude.
+    Extracts facts from interactions using the configured fast model.
 
     Simple pipeline:
     1. Strategic sampling for large interaction sets
     2. Enrich message-based interactions with conversation context
-    3. Single Claude call to extract facts with calibrated confidence
+    3. Single provider-independent call to extract facts with calibrated confidence
     4. Save facts
 
     Key features:
     - Focus on MEMORABLE facts, not obvious professional info
     - Confidence calibrated based on evidence strength in prompt
     - Message context windows for conversation-based sources
-    - Supports both Sonnet (more accurate) and Haiku (cheaper/faster)
+    - Uses the named provider/model registry, so the backend can be changed without
+      changing stored facts
     """
 
     # Sampling configuration - tuned for ~20-30 second extraction
-    # Target: 1 extraction batch + 1 summary = 2 Claude calls = ~20-25 seconds
+    # Target: 1 extraction batch + 1 summary = 2 model calls = ~20-25 seconds
     MAX_INTERACTIONS_PER_BATCH = 300  # Single batch for most people
 
     # High-value sources get priority allocation in budget distribution
@@ -543,8 +544,8 @@ class PersonFactExtractor:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            from api.services.llm_client import get_anthropic_llm
-            self._client = get_anthropic_llm()
+            from api.services.llm_client import get_llm
+            self._client = get_llm("fast")
         return self._client
 
     def _generate_fact_key(self, category: str, value: str) -> str:
@@ -561,12 +562,12 @@ class PersonFactExtractor:
         model: Optional[str] = None,
     ) -> list[PersonFact]:
         """
-        Extract facts from a person's interactions using Claude.
+        Extract facts from a person's interactions using the configured model.
 
         Simple pipeline:
         1. Strategic sampling for large interaction sets
         2. Enrich message-based interactions with conversation context
-        3. Single Claude call to extract facts with confidence
+        3. Single provider-independent call to extract facts with confidence
         4. Save facts
 
         Args:
@@ -836,7 +837,7 @@ class PersonFactExtractor:
         model: str,
     ) -> list[PersonFact]:
         """
-        Extract facts using Claude with calibrated confidence.
+        Extract facts using the configured model with calibrated confidence.
 
         Focuses on MEMORABLE personal details that help with recall,
         not obvious professional information.

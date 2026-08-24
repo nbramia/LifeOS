@@ -235,6 +235,19 @@ def mock_settings(test_vault_path, test_data_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_life_inbox(tmp_path, monkeypatch):
+    """Keep chat/inbox tests from appending synthetic captures to production.
+
+    The Telegram/chat pipeline intentionally writes every incoming message to
+    the durable Life Inbox. Tests exercise that pipeline with phrases such as
+    ``hello there`` and ``first question``; without an explicit path those
+    captures land in the operator's real ``~/.lifeos/inbox.json`` when the
+    suite runs on a configured host.
+    """
+    monkeypatch.setenv("LIFEOS_INBOX_PATH", str(tmp_path / "inbox.json"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
     """Stop tests from wiping the production vault index.
 

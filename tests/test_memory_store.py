@@ -176,6 +176,10 @@ class TestCategorizeMemory:
         result = categorize_memory("The weather was nice today")
         assert result == "context"
 
+    def test_categorize_tentative_idea(self):
+        result = categorize_memory("I think I might want to learn Japanese")
+        assert result == "ideas"
+
 
 # =============================================================================
 # extract_keywords Tests
@@ -361,6 +365,21 @@ class TestMemoryStoreCreate:
         """Test creating memory with explicit category."""
         memory = store.create_memory("Some content", category="custom")
         assert memory.category == "custom"
+
+    def test_exact_duplicate_merges_provenance(self, store):
+        first = store.create_memory(
+            "John is moving to Berlin",
+            source={"type": "telegram", "message_id": 1},
+        )
+        second = store.create_memory(
+            "  John   is moving to Berlin ",
+            source={"type": "gmail", "message_id": "m-1"},
+        )
+
+        assert second.id == first.id
+        saved = store.get_memory(first.id)
+        assert saved.source["type"] == "telegram"
+        assert saved.source["related_sources"] == [{"type": "gmail", "message_id": "m-1"}]
 
     def test_create_memory_persists(self, store, temp_json_file):
         """Test that created memory is saved to file."""

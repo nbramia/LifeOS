@@ -25,6 +25,7 @@ pulls, or restarts anything for real).
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -351,7 +352,17 @@ def test_service_active_since_epoch_parses_systemd_timestamp(tmp_path: Path):
 def _venv_with_python(tmp_path: Path) -> Path:
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(sys.executable)
+    # A symlink changes how Python discovers its virtualenv prefix: following
+    # ``tmp/venv/bin/python -> real-venv/bin/python -> system-python`` can make
+    # the child interpreter fall out of the real environment and lose project
+    # dependencies. Use a tiny exec wrapper so sys.executable remains the
+    # authoritative interpreter under test.
+    python = venv / "bin" / "python"
+    python.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
     return venv
 
 

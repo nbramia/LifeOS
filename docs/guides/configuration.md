@@ -70,6 +70,33 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
 | `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
 
+### Provider and model registry
+
+For provider-independent deployments, set `LIFEOS_LLM_PROVIDERS` and
+`LIFEOS_LLM_MODELS` to JSON objects. A provider references its credential with
+`api_key_env`; personal data and memories are not stored in this registry. A
+`default` model profile selects the normal chat provider, while `fast`,
+`specialist`, `reasoning`, and other profiles can be assigned per operation or
+selected for an individual turn. In Telegram or chat, an explicit directive
+such as `Use Gemini for this` or `Use the strongest model for this turn` selects
+the matching configured profile (`gemini` or `reasoning`). Supported provider types are `anthropic` and
+`openai_compatible` (including OpenAI, Gemini, DeepSeek, OpenRouter, and local
+servers that expose the OpenAI chat-completions API).
+
+```dotenv
+DEEPSEEK_API_KEY=sk-...
+LIFEOS_LLM_PROVIDERS='{"deepseek":{"type":"openai_compatible","base_url":"https://api.deepseek.com","api_key_env":"DEEPSEEK_API_KEY","supports_vision":false},"local":{"type":"openai_compatible","base_url":"http://localhost:8080","supports_vision":false}}'
+LIFEOS_LLM_MODELS='{"default":{"provider":"deepseek","model":"deepseek-chat"},"fast":{"provider":"deepseek","model":"deepseek-chat"},"private":{"provider":"local","model":"local"}}'
+```
+
+The OpenAI-compatible client appends `/v1/chat/completions`; base URLs may
+include or omit a trailing `/v1`. Switching profiles changes only the model
+transport; memories, conversations, and the local data layer remain unchanged.
+Set `supports_vision: true` only for a configured model that actually accepts
+image input. If a `vision` profile exists, image turns select it automatically;
+otherwise text-only providers retain the attachment provenance without
+pretending they inspected the file.
+
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 
 ### Routing Target and Reasoning Control (#566)

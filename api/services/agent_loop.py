@@ -417,7 +417,12 @@ def resolve_model_alias(name: str) -> str:
     return _MODEL_ALIASES.get((name or "").strip().lower(), name)
 
 
-def _select_client(model: str = "", force_local: bool = False, force_remote: bool = False):
+def _select_client(
+    model: str = "",
+    model_profile: str = "",
+    force_local: bool = False,
+    force_remote: bool = False,
+):
     """Pick the LLM client for a turn.
 
     - `force_remote` (#654): build a per-turn client for the configured paid
@@ -433,6 +438,9 @@ def _select_client(model: str = "", force_local: bool = False, force_remote: boo
     - a per-turn `model` on the Anthropic backend (escalation, #303) builds a
       dedicated client for that model; otherwise the shared singleton is used.
     """
+    if model_profile:
+        from api.services.llm_client import get_llm
+        return get_llm(profile=model_profile)
     if force_remote:
         from api.services.llm_client import LocalLLMClient
         return LocalLLMClient(
@@ -489,6 +497,7 @@ async def run_agent_loop(
     model_tier: str = "sonnet",
     max_tool_rounds: int = 5,
     model: str = "",
+    model_profile: str = "",
     persona: str = "",
     voice_rules: tuple = (),
     personal_context: str = "",
@@ -510,6 +519,8 @@ async def run_agent_loop(
             When set on the Anthropic backend, the turn runs on a dedicated
             AnthropicLLMClient with this model instead of the default singleton.
             Ignored on the local backend.
+        model_profile: Optional named provider/model profile from the LLM registry.
+            This is the provider-independent per-turn selection path.
         persona: Optional per-bot system-prompt preamble (e.g. the fitness bot).
             Empty for the default chat surface.
         voice_rules: The selected persona's spoken-response rules, appended to the
@@ -532,7 +543,12 @@ async def run_agent_loop(
         provisional_input_tokens/provisional_output_tokens), "text",
         "status", or "result".
     """
-    client = _select_client(model, force_local=force_local, force_remote=force_remote)
+    client = _select_client(
+        model,
+        model_profile=model_profile,
+        force_local=force_local,
+        force_remote=force_remote,
+    )
     # (#661) The turn's actual served model -- LocalLLMClient.model is
     # "local" by default or the configured remote provider's id when
     # force_remote built it (#654, LocalLLMClient.model docstring);
@@ -598,7 +614,11 @@ async def run_agent_loop(
                 messages.append({"role": msg.role, "content": msg.content})
 
     # Add current user message (with attachments if any)
-    user_content = build_message_content(question, attachments)
+    user_content = build_message_content(
+        question,
+        attachments,
+        provider_supports_vision=bool(getattr(client, "supports_vision", False)),
+    )
     messages.append({"role": "user", "content": user_content})
 
     result = AgentResult(full_text="", model=resolved_model)

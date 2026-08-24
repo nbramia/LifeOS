@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 import re
+import uuid
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -34,8 +35,316 @@ from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import get_turn_registry, TRUNCATION_MARKER, truncation_routing
+from api.services.llm_client import get_llm_registry
 
 logger = logging.getLogger(__name__)
+
+
+_EXPLICIT_MEMORY_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:remember\s+(?:that\s+)?|don't\s+forget\s+(?:that\s+)?|"
+    r"note\s+(?:that\s+)?|save\s+this\s+as\s+(?:a\s+)?memory\s*:\s*)(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_IMPLICIT_CAPTURE_RE = re.compile(
+    r"^\s*(?:i\s+(?:want|would\s+like|plan|hope|intend|need|am\s+going)\s+to\b|"
+    r"i\s+(?:think\s+i\s+might|might|may|am\s+considering)\s+\b|"
+    r"maybe\s+i\s+should\s+\b|"
+    r"i(?:'m|\s+am)\s+(?:building|working\s+on|creating|developing)\b|"
+    r"(?:my\s+)?(?:goal|project|idea|plan|vision)\s*(?:is|:|-)\b)",
+    re.IGNORECASE,
+)
+_SIGNIFICANT_CAPTURE_RE = re.compile(
+    r"\b(?:top\s+priorit(?:y|ies)|working\s+on|had\s+an?\s+accident|my\s+car)\b",
+    re.IGNORECASE,
+)
+
+
+def _requested_model_profile(question: str, profiles: dict) -> str | None:
+    """Resolve an explicit natural-language named profile for this turn."""
+    text = (question or "").strip().lower()
+    match = re.match(
+        r"^(?:please\s+)?use\s+(?:the\s+)?([a-z0-9_-]+)"
+        r"(?:\s+model)?\s+for\s+(?:this|this\s+turn)\b",
+        text,
+    )
+    candidate = match.group(1) if match else ""
+    if candidate == "strongest" or re.match(r"^(?:please\s+)?use\s+the\s+strongest\s+model\b", text):
+        candidate = "reasoning"
+    if not candidate:
+        return None
+    return {name.lower(): name for name in profiles}.get(candidate)
+
+
+def _explicit_memory_content(question: str) -> str | None:
+    """Return content from an explicit remember request, if present.
+
+    Deliberately excludes ``remember to`` so reminders are not saved as memories.
+    """
+    match = _EXPLICIT_MEMORY_RE.match(question or "")
+    return match.group(1).strip() if match else None
+
+
+def _capture_candidate(question: str) -> str | None:
+    """Return meaningful personal capture text without requiring a command.
+
+    Explicit remember requests always qualify. Common first-person goal/idea
+    statements qualify as inbox captures; reminders (``remember to``) do not.
+    Other conversation remains conversational unless the model chooses a tool.
+    """
+    explicit = _explicit_memory_content(question)
+    if explicit:
+        return explicit
+    text = (question or "").strip()
+    # Telegram voice/media transports add a descriptive preamble before the
+    # user's actual words. Do not let that wrapper prevent the deterministic
+    # fallback from recognizing a meaningful capture.
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    if text and "?" not in text and (
+        _IMPLICIT_CAPTURE_RE.search(text) or _SIGNIFICANT_CAPTURE_RE.search(text)
+    ):
+        return text
+    return None
+
+
+def _life_model_candidate(question: str) -> tuple[str, str] | None:
+    """Extract only explicit statements about the user's life direction.
+
+    This intentionally recognizes declarative language, not broad first-person
+    text. A model may still use ``manage_life_model`` when context makes a
+    statement clear, but this fallback keeps the core capture behavior working
+    when a provider stops after replying.
+    """
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    patterns = (
+        ("values", r"^(?:what matters to me is|i value|my values are)\s+(.+?)\.?$"),
+        ("philosophy", r"^(?:my philosophy is|i believe that|i believe)\s+(.+?)\.?$"),
+        ("ideal_state", r"^(?:my ideal (?:life|state) is|i want my life to|i want to become)\s+(.+?)\.?$"),
+        ("current_state", r"^(?:right now i am|currently i am|at the moment i am|my current state is)\s+(.+?)\.?$"),
+        ("identity", r"^(?:i am a|i am an|my identity is)\s+(.+?)\.?$"),
+    )
+    for section, pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            content = match.group(1).strip().rstrip(".").strip()
+            if len(content) >= 3 and "?" not in content:
+                return section, content
+    return None
+
+
+def _project_candidate(question: str) -> dict | None:
+    """Extract a clear project transition for the deterministic fallback."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    patterns = (
+        (r"^(?:i(?:'m|\s+am)\s+)?working\s+on\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?building\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?developing\s+(.+?)\.?$", "active"),
+        (r"^(?:i\s+)?want\s+to\s+(?:build|create|develop)\s+(.+?)\.?$", "potential"),
+        (r"^(?:my\s+)?project\s+(?:is|:|-)\s*(.+?)\.?$", "active"),
+    )
+    for pattern, status in patterns:
+        match = re.match(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            name = match.group(1).strip().rstrip(".").strip()
+            if len(name) >= 4 and "?" not in name:
+                return {"name": name, "status": status, "summary": text}
+    return None
+
+
+def _conditional_followup_candidate(question: str) -> dict | None:
+    """Extract the unambiguous no-response follow-up form."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    match = re.match(
+        r"^(?:remind me\s+)?if\s+i\s+(?:haven't|have not)\s+heard\s+back\s+from\s+"
+        r"([A-Z][\w'-]{1,30})(?:\s+about\s+(.+?))?\s+in\s+"
+        r"(a\s+day|a\s+week|a\s+month|\d+\s+days?)\.?$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    wait_text = match.group(3).lower()
+    if wait_text == "a day":
+        wait_days = 1
+    elif wait_text == "a week":
+        wait_days = 7
+    elif wait_text == "a month":
+        wait_days = 30
+    else:
+        wait_days = int(re.search(r"\d+", wait_text).group())
+    return {
+        "person_name": match.group(1),
+        "subject": (match.group(2) or "the pending conversation").strip().rstrip("."),
+        "wait_days": wait_days,
+    }
+
+
+def _extract_commitment_candidate(question: str) -> dict | None:
+    """Extract only unambiguous promise phrasing for deterministic fallback."""
+    text = re.sub(
+        r"^\[(?:Voice message transcription|Telegram [^\]]+)\]\s*\n?",
+        "",
+        (question or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    match = re.match(
+        r"^I\s+promised\s+([A-Z][\w'-]{1,30})(?:\s+that\s+I\s+would|\s+to)\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return {
+            "direction": "owed_by_me",
+            "person_name": match.group(1),
+            "content": match.group(2).strip(),
+        }
+    match = re.match(
+        r"^([A-Z][\w'-]{1,30})\s+promised\s+me(?:\s+that\s+they\s+would|\s+to)?\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return {
+            "direction": "owed_to_me",
+            "person_name": match.group(1),
+            "content": match.group(2).strip(),
+        }
+    return None
+
+
+def _requested_life_review_mode(question: str) -> str | None:
+    text = (question or "").strip().lower()
+    if re.search(r"\b(what should i do today|what are my priorities today|what am i forgetting)\b", text):
+        return "today"
+    if re.search(r"\b(which goals|which projects|what goals|what projects).{0,40}\b(neglect|neglected|neglecting|stuck|forgotten)\b", text):
+        return "neglected"
+    if re.search(r"\b(weekly life review|review my week|review my life)\b", text):
+        return "weekly"
+    return None
+
+
+def _source_capture_candidate(question: str, source: dict | None) -> str | None:
+    """Return a source capture when a transport carries a durable reference."""
+    if not isinstance(source, dict):
+        return None
+    urls = source.get("urls") or []
+    if urls:
+        return (question or "").strip()
+    if source.get("media_type") and "without caption" not in (question or "").lower():
+        return (question or "").strip()
+    return None
+
+
+_CAPTURE_PERMISSION_RE = re.compile(
+    r"(?im)^.*?(?:want me to|would you like me to|do you want me to|should i)"
+    r"[^\n]*(?:save|store|remember|note|capture|add this)[^\n]*[?!.]?\s*$"
+)
+
+
+def _remove_capture_permission_prompt(text: str) -> str:
+    """Remove stale permission questions after a capture was already saved."""
+    if not text:
+        return text
+    cleaned = _CAPTURE_PERMISSION_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _commitment_query_person(question: str) -> str:
+    text = question or ""
+    match = re.search(r"\bwhat\s+does\s+([A-Z][\w'-]{1,30})\s+owe\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\bwhat\s+did\s+([A-Z][\w'-]{1,30})\s+promise\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\bwhat\s+did\s+i\s+promise\s+([A-Z][\w'-]{1,30})\b", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(
+        r"\b(?:promise|promised|owe|owes|owed)\b(?:\s+(?:to|me|from))?\s+([A-Z][\w'-]{1,30})",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
+def _close_chat_inbox_item(item_id: str, question: str, tool_calls: list[dict]) -> None:
+    """Close the raw transport capture once this turn has been interpreted.
+
+    Every incoming message is written to the Life Inbox first so a failed model
+    turn cannot lose it. Successful memory/action turns should not then appear
+    as duplicate work in the next weekly review; ordinary conversational noise
+    is retained as dismissed evidence. Attachments without usable text remain
+    open for a future media-understanding pass.
+    """
+    if not item_id:
+        return
+    media_only = bool(re.match(
+        r"^\[Telegram (?:photo|video|document|animation|video_note|sticker) without caption\]$",
+        (question or "").strip(),
+        re.IGNORECASE,
+    ))
+    if media_only:
+        return
+
+    successful = [
+        call for call in (tool_calls or [])
+        if isinstance(call, dict) and not call.get("is_error")
+    ]
+    category = "dismissed"
+    for call in successful:
+        name = call.get("tool")
+        args = call.get("input") or {}
+        if name == "save_memory":
+            category = "memory"
+            break
+        if name in {"process_inbox_item", "process_inbox_items"}:
+            # Those tools close their own referenced items. The current raw
+            # capture is only the review request itself.
+            continue
+        if name == "manage_tasks" and args.get("action") == "create":
+            category = "task"
+            break
+        if name == "manage_commitments" and args.get("action") == "create":
+            category = "commitment"
+            break
+        if name == "manage_followups" and args.get("action") == "create":
+            category = "reminder"
+            break
+        if name == "manage_projects" and args.get("action") in {"upsert", "archive"}:
+            category = "project"
+            break
+        if name == "manage_life_model" and args.get("action") == "record":
+            category = "memory"
+            break
+        if name in {"manage_reminders", "manage_schedules"} and args.get("action") == "create":
+            category = "reminder"
+            break
+
+    try:
+        from api.services.inbox_store import update_item
+        update_item(item_id, status="processed" if category != "dismissed" else "dismissed", category=category)
+    except Exception:
+        logger.exception("Failed to close chat inbox capture %s", item_id)
 
 
 # =============================================================================
@@ -383,6 +692,7 @@ class Attachment(BaseModel):
 class AskStreamRequest(BaseModel):
     """Request for streaming ask endpoint."""
     question: str
+    source: Optional[dict] = None
     include_sources: bool = True
     conversation_id: Optional[str] = None
     attachments: Optional[list[Attachment]] = None
@@ -397,9 +707,10 @@ class AskStreamRequest(BaseModel):
     # turn to that cloud model; "gemma"/"local" runs this turn on the local
     # llama-server; "claude_code" hands the turn off to a background Claude Code
     # worker session instead of answering inline (see the handoff short-circuit
-    # in stream_response). The model picks are honored only on the Anthropic
-    # backend (the local backend is already local); the "claude_code" handoff
-    # works on any backend. Unknown values fall back to auto.
+    # in stream_response). Named registry profiles (for example "gemini" or
+    # "reasoning") work across Anthropic/OpenAI-compatible backends. Natural
+    # Telegram directives such as "Use Gemini for this" resolve the same
+    # profiles. Unknown values fall back to auto.
     model_override: Optional[str] = None
     # Response modality. "voice" tells the orchestrator this turn will be read
     # aloud, so the selected persona's `voice` rules are appended to the system
@@ -587,6 +898,13 @@ async def ask_stream(request: AskStreamRequest):
     if _effective_pid is None and request.persona:
         _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
     personal_context = settings.personal_context(_effective_pid or "")
+    from api.services.life_model_store import context_text as life_model_context
+    _life_direction_context = life_model_context()
+    if _life_direction_context:
+        personal_context = (
+            f"{personal_context}\n\n{_life_direction_context}".strip()
+            if personal_context else _life_direction_context
+        )
 
     # #611: the turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving
@@ -677,6 +995,26 @@ async def ask_stream(request: AskStreamRequest):
 
             # Save user message
             store.add_message(conversation_id, "user", request.question)
+            # Keep a durable raw inbox copy before the model interprets the
+            # message. This is the recovery/review path when classification or
+            # tool calling is incomplete.
+            from api.services.inbox_store import add_item as add_inbox_item
+            # Scheduled prompts are internal control-plane work, not user
+            # captures. Keeping their instruction text out of the Life Inbox
+            # prevents a weekly review from re-classifying its own prompt as a
+            # new reminder. The resulting memories/actions still receive the
+            # scheduler provenance through request.source.
+            _source = request.source or {"type": "chat"}
+            _internal_prompt = isinstance(_source, dict) and _source.get("type") == "scheduler"
+            inbox_item = (
+                {"id": ""}
+                if _internal_prompt
+                else add_inbox_item(
+                    request.question,
+                    conversation_id=conversation_id,
+                    source=_source,
+                )
+            )
 
             # `/agent [local|claude] <task>` — spawn an operator agent on demand
             # (#235). Equivalent affordance to Telegram's /agent command, calling
@@ -907,12 +1245,15 @@ async def ask_stream(request: AskStreamRequest):
                                 effective_question = expanded
                                 print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
-            # The agent loop uses the orchestrator model configured by
-            # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
+            # The agent loop uses the provider/model registry, with legacy
+            # Anthropic settings as the fallback for older deployments.
             # The perf-trace field is still named `model_tier` because the column
             # in perf_traces.db is `model_tier` — but the value is now a model id
             # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
-            orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            _providers, _model_profiles = get_llm_registry()
+            _default_profile = _model_profiles["default"]
+            orchestrator_provider = _default_profile.provider
+            orchestrator_model = _default_profile.model
             # Escalation: pick a stronger model for this turn either because the
             # user explicitly asked ("escalate to opus", #305) or because the
             # prior turn refused and this message pushes back (#303). Anthropic
@@ -928,14 +1269,47 @@ async def ask_stream(request: AskStreamRequest):
             # this turn to that cloud model. "auto"/unset falls through to the
             # normal Haiku + escalation path.
             _override = (request.model_override or "").strip().lower()
-            _backend_is_anthropic = getattr(settings, "llm_backend", "anthropic").lower() == "anthropic"
+            if not _override or _override == "auto":
+                _natural_profile = _requested_model_profile(request.question, _model_profiles)
+                if _natural_profile:
+                    _override = _natural_profile.lower()
+            # Images should be understood when the deployment provides a named
+            # vision profile, without forcing every normal turn onto an
+            # expensive multimodal model. Text-only providers still receive a
+            # durable placeholder through the provider adapter.
+            _has_visual_attachment = any(
+                (getattr(att, "media_type", "") or "").startswith("image/")
+                or (getattr(att, "media_type", "") or "") == "application/pdf"
+                for att in (request.attachments or [])
+            )
+            if (
+                not _override
+                and _has_visual_attachment
+                and "vision" in _model_profiles
+                and not _providers.get(_model_profiles["default"].provider, None).supports_vision
+            ):
+                _override = "vision"
+            _backend_is_anthropic = orchestrator_provider == "anthropic"
+            model_profile = ""
+            _profile_name = next(
+                (name for name in _model_profiles if name.lower() == _override),
+                None,
+            ) if _override else None
+            if _profile_name:
+                selected_profile = _model_profiles[_profile_name]
+                model_profile = _profile_name
+                orchestrator_provider = selected_profile.provider
+                orchestrator_model = selected_profile.model
+                escalated = True
             if _override == "remote" and not settings.remote_llm_configured:
                 # The picker hides this option when unconfigured, but an
                 # explicit-but-unusable pick from a raw API caller falls back
                 # to auto rather than being treated as an Anthropic model id
                 # named "remote" (which would 404).
                 _override = "auto"
-            if _override in ("gemma", "local"):
+            if model_profile:
+                pass
+            elif _override in ("gemma", "local"):
                 force_local = True
                 orchestrator_model = "local"
             elif _override == "remote":
@@ -1020,6 +1394,7 @@ async def ask_stream(request: AskStreamRequest):
                 personal_context=personal_context,
                 force_local=force_local,
                 force_remote=force_remote,
+                model_profile=model_profile,
             ):
                 if event["type"] == "turn_state":
                     # #615: live, mutable AgentResult -- see the comment by
@@ -1046,6 +1421,302 @@ async def ask_stream(request: AskStreamRequest):
                 await turn.emit(f"data: {json.dumps({'type': 'error', 'message': 'Agent loop returned no result'})}\n\n")
                 await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
+
+            # An acknowledgement is not proof that save_memory was called.
+            # Persist explicit remember requests deterministically when the
+            # model skipped the tool, and tell the user what actually happened.
+            _memory_content = _capture_candidate(request.question)
+            _memory_tool_succeeded = any(
+                tc.get("tool") == "save_memory" and not tc.get("is_error")
+                for tc in agent_result.tool_calls_log
+            )
+            if _memory_content and not _memory_tool_succeeded:
+                from api.services.memory_store import get_memory_store
+                _saved_memory = get_memory_store().create_memory(
+                    _memory_content, source=request.source or {"type": "chat"}
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "save_memory",
+                    "input": {"content": _memory_content},
+                    "result": f"Memory saved: {_saved_memory.id}",
+                    "is_error": False,
+                })
+                _memory_tool_succeeded = True
+                _notice = "\n\nSaved as persistent memory."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            # A weaker model may stream a permission question even though the
+            # fallback above (or its own save_memory call) has already made the
+            # write. Replace that stale text in the streamed conversation so
+            # Telegram does not show both "want me to save?" and "saved".
+            if _memory_content and _memory_tool_succeeded:
+                _cleaned_capture_text = _remove_capture_permission_prompt(
+                    agent_result.full_text
+                )
+                if _cleaned_capture_text != agent_result.full_text:
+                    agent_result.full_text = _cleaned_capture_text
+                    partial_text = ""
+                    await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
+                    await _content(_cleaned_capture_text)
+
+            # Keep explicit direction statements in the structured life model
+            # even when a provider replies conversationally without calling the
+            # optional tool. This is deliberately narrower than ordinary
+            # memory capture: only declarative identity/value/state/philosophy
+            # language qualifies.
+            _life_model_candidate_value = _life_model_candidate(request.question)
+            _life_model_tool_succeeded = any(
+                tc.get("tool") == "manage_life_model"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "record"
+                for tc in agent_result.tool_calls_log
+            )
+            if _life_model_candidate_value and not _life_model_tool_succeeded:
+                from api.services.life_model_store import record as record_life_model
+                _life_model_section, _life_model_content = _life_model_candidate_value
+                _life_model_item = record_life_model(
+                    _life_model_section,
+                    _life_model_content,
+                    source=request.source or {"type": "chat"},
+                    evidence_type="explicit",
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_life_model",
+                    "input": {
+                        "action": "record",
+                        "section": _life_model_section,
+                        "content": _life_model_content,
+                    },
+                    "result": f"Life model updated: {_life_model_item['id']}",
+                    "is_error": False,
+                })
+                _notice = (
+                    f"\n\nI added that to your {_life_model_section.replace('_', ' ')}."
+                )
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _project_candidate_value = _project_candidate(request.question)
+            _project_tool_succeeded = any(
+                tc.get("tool") == "manage_projects"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") in {"upsert", "archive"}
+                for tc in agent_result.tool_calls_log
+            )
+            if _project_candidate_value and not _project_tool_succeeded:
+                from api.services.project_store import upsert as upsert_project
+                _project = upsert_project(
+                    _project_candidate_value["name"],
+                    status=_project_candidate_value["status"],
+                    summary=_project_candidate_value["summary"],
+                    source=request.source or {"type": "chat"},
+                    evidence_type="explicit",
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_projects",
+                    "input": {"action": "upsert", **_project_candidate_value},
+                    "result": f"Project updated: {_project['id']}",
+                    "is_error": False,
+                })
+                _notice = f"\n\nI added that to your projects as {_project['name']}."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _source_capture = _source_capture_candidate(request.question, request.source)
+            if _source_capture and not _memory_tool_succeeded:
+                from api.services.memory_store import get_memory_store
+                _source_memory = get_memory_store().create_memory(
+                    _source_capture,
+                    category="context",
+                    source={
+                        **(request.source or {}),
+                        "content_type": "source_capture",
+                    },
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "save_memory",
+                    "input": {"content": _source_capture},
+                    "result": f"Memory saved: {_source_memory.id}",
+                    "is_error": False,
+                })
+                _memory_tool_succeeded = True
+                _notice = "\n\nI kept that source for later."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _commitment_candidate = _extract_commitment_candidate(request.question)
+            _commitment_tool_succeeded = any(
+                tc.get("tool") == "manage_commitments"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "create"
+                for tc in agent_result.tool_calls_log
+            )
+            if _commitment_candidate and not _commitment_tool_succeeded:
+                from api.services.commitment_store import create_commitment
+                _commitment = create_commitment(
+                    _commitment_candidate["content"],
+                    direction=_commitment_candidate["direction"],
+                    person_name=_commitment_candidate["person_name"],
+                    source=request.source or {"type": "chat"},
+                )
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_commitments",
+                    "input": {"action": "create", **_commitment_candidate},
+                    "result": f"Commitment recorded (id: {_commitment['id']})",
+                    "is_error": False,
+                })
+                _notice = "\n\nI tracked that commitment."
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _conditional_followup = _conditional_followup_candidate(request.question)
+            _followup_tool_succeeded = any(
+                tc.get("tool") == "manage_followups"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "create"
+                for tc in agent_result.tool_calls_log
+            )
+            if _conditional_followup and not _followup_tool_succeeded:
+                from api.services.agent_tools import _tool_manage_followups
+                _followup_result = _tool_manage_followups({
+                    "action": "create",
+                    **_conditional_followup,
+                    "source": request.source or {"type": "chat"},
+                })
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_followups",
+                    "input": {"action": "create", **_conditional_followup},
+                    "result": _followup_result,
+                    "is_error": _followup_result.startswith("Error:"),
+                })
+                if not _followup_result.startswith("Error:"):
+                    _notice = "\n\nI will check whether you hear back and remind you if needed."
+                    agent_result.full_text += _notice
+                    await _content(_notice)
+
+            _review_mode = _requested_life_review_mode(request.question)
+            _review_tool_succeeded = any(
+                tc.get("tool") == "life_review" and not tc.get("is_error")
+                for tc in agent_result.tool_calls_log
+            )
+            if _review_mode and not _review_tool_succeeded:
+                from api.services.agent_tools import _tool_life_review
+                _review = _tool_life_review({"mode": _review_mode})
+                agent_result.tool_calls_log.append({
+                    "tool": "life_review",
+                    "input": {"mode": _review_mode},
+                    "result": _review,
+                    "is_error": False,
+                })
+                _notice = "\n\nHere is the current record-based review:\n\n" + _review
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            _commitment_query = bool(re.search(
+                r"\b(what did i promise|what do i owe|what does \w+ owe|what did \w+ promise)",
+                request.question or "",
+                re.IGNORECASE,
+            ))
+            _commitment_query_tool_succeeded = any(
+                tc.get("tool") == "manage_commitments"
+                and not tc.get("is_error")
+                and (tc.get("input") or {}).get("action") == "list"
+                for tc in agent_result.tool_calls_log
+            )
+            if _commitment_query and not _commitment_query_tool_succeeded:
+                from api.services.agent_tools import _tool_manage_commitments
+                _person = _commitment_query_person(request.question)
+                _commitment_result = _tool_manage_commitments({
+                    "action": "list",
+                    "person_name": _person,
+                })
+                agent_result.tool_calls_log.append({
+                    "tool": "manage_commitments",
+                    "input": {"action": "list", "person_name": _person},
+                    "result": _commitment_result,
+                    "is_error": False,
+                })
+                _notice = "\n\nI checked your recorded commitments:\n\n" + _commitment_result
+                agent_result.full_text += _notice
+                await _content(_notice)
+
+            # Tool calls created inside the model loop do not know the transport
+            # identity. Backfill the exact Telegram/API source onto any memory
+            # id returned by save_memory.
+            if request.source:
+                from api.services.memory_store import get_memory_store
+                _memory_store = get_memory_store()
+                for _tool_call in agent_result.tool_calls_log:
+                    if _tool_call.get("is_error"):
+                        continue
+                    if _tool_call.get("tool") == "save_memory":
+                        _match = re.search(r"id:\s*([0-9a-f-]{36})", str(_tool_call.get("result", "")), re.I)
+                        if _match:
+                            try:
+                                uuid.UUID(_match.group(1))
+                                _memory_store.update_source(_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_commitments":
+                        _commitment_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _commitment_match:
+                            try:
+                                from api.services.commitment_store import update_source
+                                update_source(_commitment_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_life_model":
+                        _life_model_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _life_model_match:
+                            try:
+                                from api.services.life_model_store import update_source
+                                uuid.UUID(_life_model_match.group(1))
+                                update_source(_life_model_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_projects":
+                        _project_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _project_match:
+                            try:
+                                from api.services.project_store import update_source
+                                uuid.UUID(_project_match.group(1))
+                                update_source(_project_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_followups":
+                        _followup_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{20,})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _followup_match:
+                            try:
+                                from api.services.followup_store import update_source
+                                update_source(_followup_match.group(1), request.source)
+                            except ValueError:
+                                pass
+
+            # The raw capture is a safety net, not a second task list. Once
+            # this turn has successfully been interpreted, close that exact
+            # capture so weekly reviews contain only unresolved work.
+            _close_chat_inbox_item(
+                inbox_item.get("id", ""),
+                request.question,
+                agent_result.tool_calls_log,
+            )
 
             # Record usage
             if agent_result.total_input_tokens > 0:

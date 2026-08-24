@@ -7,8 +7,11 @@ tool-use schema. execute_tool() dispatches by name and returns a string result.
 import asyncio
 import contextvars
 import logging
+import re
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -437,6 +440,28 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "life_review",
+        "description": (
+            "Build a source-backed personal review. Use for what should I do today, "
+            "what am I forgetting, which goals/projects are neglected, or a weekly "
+            "life review. It combines open tasks, overdue work, commitments, inbox "
+            "items, schedules, aging project memories, and high-confidence relationship "
+            "gaps; it does not invent priorities."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["today", "weekly", "neglected"],
+                    "description": "today for immediate action, weekly for a broad review, neglected for stale goals/projects.",
+                },
+                "limit": {"type": "integer", "description": "Maximum items per section (default 10)."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "manage_reminders",
         "description": "DEPRECATED — use manage_schedules. Manage timed reminders: create or list.",
         "input_schema": {
@@ -746,8 +771,225 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "The memory to save (natural language).",
                 },
+                "source": {
+                    "type": "object",
+                    "description": "Optional provenance metadata for the capture.",
+                },
             },
             "required": ["content"],
+        },
+    },
+    {
+        "name": "manage_life_model",
+        "description": (
+            "Read or update the structured model of the user's life direction. Use record when "
+            "the user explicitly states identity, values, current state, ideal state, or philosophy. "
+            "Do not infer these as facts; use evidence_type=inference only when clearly labeling an "
+            "inference. This is separate from ordinary memories and does not create a task."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "record"]},
+                "section": {
+                    "type": "string",
+                    "enum": ["identity", "values", "current_state", "ideal_state", "philosophy"],
+                },
+                "content": {"type": "string", "description": "The explicit statement to preserve."},
+                "evidence_type": {"type": "string", "enum": ["explicit", "inference"]},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_projects",
+        "description": (
+            "Read or update the current state of a project. Use upsert when the user "
+            "explicitly starts, changes, pauses, or completes a project. Preserve a "
+            "short summary, current next action, priority, and provenance. Do not turn "
+            "an idea into an active project unless the user indicates that transition."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "get", "upsert", "archive"]},
+                "project_id": {"type": "string"},
+                "name": {"type": "string", "description": "Stable human-readable project name."},
+                "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                "summary": {"type": "string"},
+                "next_action": {"type": "string"},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
+                "evidence_type": {"type": "string", "enum": ["explicit", "inference"]},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+                "limit": {"type": "integer"},
+                "include_archived": {"type": "boolean"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_commitments",
+        "description": (
+            "Track promises and commitments with provenance. Use create when the user "
+            "promises to do something for someone or someone promises the user; use "
+            "list to answer what is owed/open, and complete when the user confirms it is done."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "complete"]},
+                "content": {"type": "string", "description": "The specific promised action or obligation."},
+                "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                "person_name": {"type": "string"},
+                "person_id": {"type": "string"},
+                "due_at": {"type": "string", "description": "Optional ISO date/time or natural due date resolved by the model."},
+                "commitment_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "completed"]},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_followups",
+        "description": (
+            "Track a conditional follow-up such as 'if I have not heard back from Sarah "
+            "in a week'. Create records only when the user explicitly requests the "
+            "condition. A scheduled check verifies recorded interactions before notifying; "
+            "complete or cancel it when the condition is resolved."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "complete", "cancel"]},
+                "followup_id": {"type": "string"},
+                "person_name": {"type": "string"},
+                "subject": {"type": "string", "description": "What you are waiting to hear back about."},
+                "wait_days": {"type": "integer", "description": "Days to wait before checking; default 7."},
+                "source": {"type": "object", "description": "Optional provenance metadata."},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "review_inbox",
+        "description": (
+            "Review raw Life Inbox captures that may not yet have been classified "
+            "as memories, ideas, tasks, or reminders. Use when the user asks what "
+            "was captured, what needs review, or wants a weekly inbox review."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum items to show (default 20)."},
+                "since_days": {"type": "integer", "description": "Only show captures from the last N days (default 7)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "process_inbox_item",
+        "description": (
+            "Classify and close one raw Life Inbox item. Use the item's id from "
+            "review_inbox. For memory, save the content persistently; for other "
+            "categories, record the classification and keep the raw provenance."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "Inbox item id."},
+                "category": {
+                    "type": "string",
+                    "enum": ["memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"],
+                    "description": "The classification for this item.",
+                },
+                "content": {"type": "string", "description": "Optional cleaned content to save for a memory."},
+                "name": {"type": "string", "description": "Stable project name; required for project classifications."},
+                "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                "summary": {"type": "string", "description": "Optional current project summary."},
+                "next_action": {"type": "string", "description": "Optional concrete next project action."},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
+                "person_id": {"type": "string", "description": "Resolved CRM person id for a relationship fact, when available."},
+                "person_name": {"type": "string", "description": "Person connected to a commitment."},
+                "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                "due_at": {"type": "string"},
+            },
+            "required": ["item_id", "category"],
+        },
+    },
+    {
+        "name": "process_inbox_items",
+        "description": (
+            "Process multiple Life Inbox items in one review. Use after review_inbox "
+            "to classify every clear item in the returned list. Include one object "
+            "per item with item_id, category, and optional cleaned memory content."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string"},
+                            "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"]},
+                            "content": {"type": "string"},
+                            "name": {"type": "string", "description": "Stable project name; required for project classifications."},
+                            "status": {"type": "string", "enum": ["potential", "active", "paused", "completed", "archived"]},
+                            "summary": {"type": "string"},
+                            "next_action": {"type": "string"},
+                            "priority": {"type": "string", "enum": ["high", "medium", "low", ""]},
+                            "person_id": {"type": "string"},
+                            "person_name": {"type": "string"},
+                            "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                            "due_at": {"type": "string"},
+                        },
+                        "required": ["item_id", "category"],
+                    },
+                    "description": "Inbox classifications to apply, maximum 50.",
+                },
+            },
+            "required": ["items"],
+        },
+    },
+    {
+        "name": "list_inbox_proposals",
+        "description": (
+            "List task and reminder proposals saved during Life Inbox review. "
+            "Use this when the user confirms a previously proposed action or asks "
+            "what pending actions still need confirmation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum proposals to return (default 20)."},
+                "since_days": {"type": "integer", "description": "Only proposals from the last N days (default 30)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "confirm_inbox_proposal",
+        "description": (
+            "Confirm one pending Life Inbox task/reminder proposal and create the "
+            "native task or schedule. Use only after the user explicitly approves "
+            "the proposal. For reminders, provide a resolved future schedule_type "
+            "and schedule_value. Confirmation is idempotent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Inbox item id from list_inbox_proposals."},
+                "name": {"type": "string", "description": "Optional short name for a reminder."},
+                "schedule_type": {"type": "string", "enum": ["once", "cron"], "description": "Required for reminders."},
+                "schedule_value": {"type": "string", "description": "Future ISO datetime or cron expression for reminders."},
+                "priority": {"type": "string", "enum": ["high", "medium", "low", ""], "description": "Optional task priority."},
+                "due_date": {"type": "string", "description": "Optional task due date (YYYY-MM-DD)."},
+            },
+            "required": ["proposal_id"],
         },
     },
     {
@@ -895,7 +1137,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_reminders", "manage_schedules", "manage_projects", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 async def execute_tool_parallel(name: str, tool_input: dict) -> str:
@@ -2206,6 +2448,305 @@ def _task_tags(_inp: dict) -> str:
     return "\n".join(f"#{row['tag']} ({row['count']})" for row in rows)
 
 
+def _tool_life_review(inp: dict) -> str:
+    """Return a deterministic, evidence-backed personal action review."""
+    from datetime import date, datetime, timezone
+    from api.services.commitment_store import list_commitments
+    from api.services.followup_store import list_followups
+    from api.services.inbox_store import list_items
+    from api.services.memory_store import get_memory_store
+    from api.services.scheduler_store import get_scheduler_store
+    from api.services.task_manager import get_task_manager
+    from api.services.life_model_store import list_records
+    from api.services.project_store import list_projects
+
+    mode = str(inp.get("mode", "today") or "today").strip().lower()
+    if mode not in {"today", "weekly", "neglected"}:
+        mode = "today"
+    try:
+        limit = max(1, min(int(inp.get("limit", 10) or 10), 50))
+    except (TypeError, ValueError):
+        limit = 10
+
+    today = date.today().isoformat()
+    memories = get_memory_store().list_memories(limit=1000)
+
+    def completion_evidence(task):
+        """Find later recorded language that may supersede an open task."""
+        task_words = {
+            word for word in re.findall(r"[a-z]{4,}", task.description.lower())
+            if word not in {"check", "call", "send", "make", "update", "with", "from"}
+        }
+        if not task_words:
+            return None
+        markers = {"checked", "fixed", "done", "completed", "finished", "resolved", "sent"}
+        for memory in memories:
+            content = memory.content or ""
+            memory_stamp = memory.updated_at or memory.created_at
+            task_created_date = getattr(task, "created_date", "")
+            if task_created_date and memory_stamp is not None:
+                if memory_stamp.date().isoformat() < task_created_date:
+                    continue
+            lower = content.lower()
+            if task_words.intersection(re.findall(r"[a-z]{4,}", lower)) and markers.intersection(
+                re.findall(r"[a-z]{4,}", lower)
+            ):
+                return content
+        return None
+
+    tasks = [
+        task for task in get_task_manager().list_tasks()
+        if task.status in {"todo", "in_progress", "blocked", "urgent", "deferred"}
+    ]
+    priority_rank = {"high": 0, "medium": 1, "low": 2, "": 3}
+    tasks.sort(key=lambda task: (
+        0 if task.due_date and task.due_date < today else 1,
+        0 if task.due_date and task.due_date <= today else 1,
+        priority_rank.get(task.priority, 3),
+        task.due_date or "9999-12-31",
+    ))
+
+    lines = [f"Life review ({mode}) — based on recorded information as of {today}."]
+    lines.extend(_life_review_source_coverage())
+    life_model = list_records()
+    model_sections = {
+        "identity": "Identity",
+        "values": "Values",
+        "current_state": "Current state",
+        "ideal_state": "Ideal state",
+        "philosophy": "Philosophy",
+    }
+    model_rows = [(label, life_model.get(section, [])) for section, label in model_sections.items()]
+    if any(rows for _, rows in model_rows):
+        lines.append("\n## Life direction")
+        for label, rows in model_rows:
+            if rows:
+                # Direction is cumulative: a new current-state update should
+                # not erase an earlier, still-relevant state. Keep the most
+                # recent bounded records and preserve their evidence labels.
+                for item in rows[-limit:]:
+                    evidence = item.get("evidence_type", "explicit")
+                    lines.append(f"- {label}: {item.get('content', '')} [{evidence}]")
+    if mode != "neglected":
+        lines.append("\n## Next actions")
+        reconciliations = []
+        if tasks:
+            for task in tasks[:limit]:
+                due = f"; due {task.due_date}" if task.due_date else ""
+                priority = f"; priority {task.priority}" if task.priority else ""
+                evidence = completion_evidence(task)
+                if evidence:
+                    reconciliations.append(
+                        f"- {task.description}{due}{priority} — later record: {evidence[:180]}"
+                    )
+                else:
+                    lines.append(f"- {task.status}: {task.description}{due}{priority}")
+        else:
+            lines.append("- No open tasks are recorded.")
+        if reconciliations:
+            lines.append("\n## Completed evidence to reconcile")
+            lines.extend(reconciliations)
+
+        commitments = list_commitments(limit=limit)
+        lines.append("\n## Open commitments")
+        if commitments:
+            for item in commitments:
+                person = f" ({item['person_name']})" if item.get("person_name") else ""
+                due = f"; due {item['due_at']}" if item.get("due_at") else ""
+                lines.append(f"- {item['direction']}{person}: {item['content']}{due}")
+            lines.append("\n## Follow-ups")
+            for item in commitments[:limit]:
+                person = item.get("person_name") or "someone"
+                if item.get("direction") == "owed_by_me":
+                    lines.append(f"- You owe {person}: {item['content']}")
+                else:
+                    lines.append(f"- Follow up with {person}: {item['content']}")
+        else:
+            lines.append("- No open commitments are recorded.")
+
+        conditional_followups = list_followups(limit=limit)
+        lines.append("\n## Conditional follow-ups")
+        if conditional_followups:
+            for item in conditional_followups:
+                lines.append(
+                    f"- {item['person_name']}: {item['subject']} — check at {item['check_at']}"
+                )
+        else:
+            lines.append("- No open conditional follow-ups are recorded.")
+
+        lines.append("\n## Relationship follow-ups")
+        relationship_gaps = []
+        relationship_records = 0
+        try:
+            from api.services.person_entity import get_person_entity_store
+            from api.services.relationship_summary import get_relationship_summary
+            for person in get_person_entity_store().get_all():
+                if person.hidden or person.is_peripheral_contact:
+                    continue
+                summary = get_relationship_summary(person.id)
+                if not summary or not summary.contact_on_record:
+                    continue
+                relationship_records += 1
+                threshold = 14 if person.category == "family" else 30
+                if summary.days_since_contact >= threshold and summary.relationship_strength > 0:
+                    relationship_gaps.append((summary.relationship_strength, summary.days_since_contact, summary))
+        except Exception as exc:
+            logger.warning("Life review could not compute relationship gaps: %s", exc)
+        relationship_gaps.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        if relationship_gaps:
+            for strength, days_since, summary in relationship_gaps[:limit]:
+                lines.append(
+                    f"- Consider reconnecting with {summary.person_name}: "
+                    f"{days_since} days since contact; relationship strength {strength:.0f}/100"
+                )
+        elif relationship_records:
+            lines.append("- No high-confidence relationship gaps meet the configured thresholds.")
+        else:
+            lines.append(
+                "- Relationship interaction data is not populated enough to assess follow-up gaps."
+            )
+
+        pending = list_items(limit=limit, since_days=7)
+        lines.append("\n## Unresolved inbox")
+        if pending:
+            for item in pending:
+                lines.append(f"- {item['content']}")
+        else:
+            lines.append("- No unresolved captures from the last week.")
+
+        schedules = [
+            entry for entry in get_scheduler_store().list_all()
+            if entry.enabled and entry.next_trigger_at
+        ]
+        schedules.sort(key=lambda entry: entry.next_trigger_at or "")
+        lines.append("\n## Upcoming scheduled items")
+        if schedules:
+            for entry in schedules[:limit]:
+                lines.append(f"- {entry.name}: {entry.next_trigger_at}")
+        else:
+            lines.append("- No upcoming scheduled items are recorded.")
+
+    projects = [
+        memory for memory in memories
+        if memory.category in {"projects", "goals"}
+    ]
+    now = datetime.now(timezone.utc)
+    project_rows = []
+    for memory in projects:
+        stamp = memory.updated_at or memory.created_at
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age_days = max(0, (now - stamp).days)
+        project_rows.append((age_days, memory, stamp))
+    # A project can be mentioned many times as its state changes. Keep the raw
+    # memories intact, but present one current row per clearly named subject so
+    # a review does not mistake seven car updates for seven neglected projects.
+    grouped_projects = {}
+    for age_days, memory, stamp in project_rows:
+        leading_name = re.match(r"^\s*([A-Z][\w-]{2,})\b", memory.content or "")
+        key = leading_name.group(1).casefold() if leading_name else memory.id
+        if key in {"i", "we", "my", "the"}:
+            key = memory.id
+        existing = grouped_projects.get(key)
+        if existing is None or stamp > existing[2]:
+            grouped_projects[key] = [age_days, memory, stamp, 1 if existing is None else existing[3] + 1]
+        else:
+            existing[3] += 1
+    project_rows = list(grouped_projects.values())
+    if mode == "neglected":
+        project_rows = [row for row in project_rows if row[0] >= 14]
+    project_rows.sort(key=lambda row: row[0], reverse=True)
+    lines.append("\n## Aging goals/projects")
+    if project_rows:
+        for age_days, memory, _stamp, update_count in project_rows[:limit]:
+            stamp = (memory.updated_at or memory.created_at).date().isoformat()
+            freshness = f"; {age_days} days since update"
+            history = f"; {update_count} related updates" if update_count > 1 else ""
+            lines.append(f"- last recorded {stamp}{freshness}{history}: {memory.content}")
+    else:
+        if mode == "neglected":
+            lines.append("- No goals or projects have been inactive for at least 14 days on record.")
+        else:
+            lines.append("- No goals or projects are recorded in the current memory set.")
+
+    current_projects = list_projects(limit=limit)
+    lines.append("\n## Current projects")
+    if current_projects:
+        for project in current_projects:
+            if project.get("status") == "completed" and mode == "today":
+                continue
+            next_action = f"; next: {project['next_action']}" if project.get("next_action") else ""
+            priority = f"; priority: {project['priority']}" if project.get("priority") else ""
+            lines.append(
+                f"- {project['name']} [{project['status']}{priority}]{next_action}"
+                f" — {project.get('summary') or 'no summary recorded'}"
+            )
+    else:
+        lines.append("- No structured project records are recorded.")
+
+    if mode != "neglected":
+        ideas = [memory for memory in memories if memory.category == "ideas"]
+        def _idea_sort_key(memory):
+            stamp = memory.updated_at or memory.created_at
+            return stamp.timestamp() if stamp else 0
+        ideas.sort(
+            key=_idea_sort_key,
+            reverse=True,
+        )
+        lines.append("\n## Recent ideas")
+        if ideas:
+            lines.extend(f"- {memory.content}" for memory in ideas[:limit])
+        else:
+            lines.append("- No ideas are recorded in the current memory set.")
+
+    lines.append("\nThis is a record-based review; it does not prove that an item is unimportant or forgotten when no record exists.")
+    return "\n".join(lines)
+
+
+def _life_review_source_coverage() -> list[str]:
+    """Describe connected evidence sources without inferring missing facts.
+
+    A relationship graph with zero rows is ambiguous to a user: it can mean
+    either that nobody is known or that Gmail/Calendar have never been
+    connected. Make that distinction explicit in reviews. This is read-only
+    and deliberately checks files/SQLite directly without triggering OAuth or
+    creating a new database.
+    """
+    lines = ["\n## Source coverage"]
+    project_root = Path(__file__).resolve().parents[2]
+    config_dir = project_root / "config"
+    credentials = config_dir / "credentials-personal.json"
+    token = config_dir / "token-personal.json"
+    if credentials.exists() and token.exists():
+        lines.append("- Google personal: connected")
+    elif credentials.exists():
+        lines.append("- Google personal: OAuth client installed; authentication is not complete")
+    else:
+        lines.append("- Google personal: not connected")
+
+    db_path = Path(settings.chroma_path).parent / "interactions.db"
+    if not db_path.exists():
+        lines.append("- Relationship interactions: no records available")
+        lines.append("- Relationship answers may be incomplete until a source is connected and synced.")
+        return lines
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0]
+            rows = conn.execute(
+                "SELECT source_type, COUNT(*) FROM interactions GROUP BY source_type ORDER BY source_type"
+            ).fetchall()
+        if not total:
+            lines.append("- Relationship interactions: no records available")
+            lines.append("- Relationship answers may be incomplete until a source is connected and synced.")
+        else:
+            breakdown = ", ".join(f"{source} ({count})" for source, count in rows)
+            lines.append(f"- Relationship interactions: {total} records ({breakdown})")
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Could not read interaction coverage for life review: %s", exc)
+        lines.append("- Relationship interactions: coverage could not be read")
+    return lines
 def _tool_manage_tasks(inp: dict):
     action = inp["action"]
     if action == "create":
@@ -2223,8 +2764,31 @@ def _tool_manage_tasks(inp: dict):
 
 # -- Reminder helpers --
 
+def _validate_future_once(schedule_type: str, schedule_value: str) -> str | None:
+    """Reject user-created one-off reminders that can never fire."""
+    if schedule_type != "once":
+        return None
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from config.settings import settings
+    try:
+        when = datetime.fromisoformat(schedule_value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=ZoneInfo(settings.timezone))
+        if when.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return (
+                f"The requested one-time time ({schedule_value}) is already in the past. "
+                "No reminder was created; choose a future date/time."
+            )
+    except (TypeError, ValueError, KeyError):
+        return f"Invalid one-time schedule datetime: {schedule_value!r}. No reminder was created."
+    return None
+
 def _reminder_create(inp: dict) -> str:
     from api.services.reminder_store import get_reminder_store
+    invalid = _validate_future_once(inp["schedule_type"], inp["schedule_value"])
+    if invalid:
+        return f"Error: {invalid}"
     store = get_reminder_store()
     reminder = store.create(
         name=inp["name"],
@@ -2263,6 +2827,9 @@ def _tool_manage_reminders(inp: dict):
 
 def _schedule_create(inp: dict) -> str:
     from api.services.scheduler_store import get_scheduler_store
+    invalid = _validate_future_once(inp["schedule_type"], inp["schedule_value"])
+    if invalid:
+        return f"Error: {invalid}"
     store = get_scheduler_store()
     # `action` is the manage_schedules operation (create/list); the schedule's
     # own action is passed as `schedule_action`.
@@ -2486,8 +3053,607 @@ async def _tool_save_memory(inp: dict) -> str:
 
     content = await synthesize_memory(inp["content"])
     store = get_memory_store()
-    memory = store.create_memory(content)
+    memory = store.create_memory(
+        content, source=inp.get("source") or {"type": "conversation"}
+    )
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
+
+
+def _tool_manage_life_model(inp: dict) -> str:
+    from api.services.life_model_store import SECTIONS, list_records, record
+
+    action = str(inp.get("action", "get")).strip().lower()
+    section = str(inp.get("section", "")).strip().lower()
+    if action == "record":
+        if not section or not inp.get("content"):
+            return "Error: record requires section and content."
+        try:
+            item = record(
+                section,
+                inp["content"],
+                source=inp.get("source") or {"type": "conversation"},
+                evidence_type=inp.get("evidence_type", "explicit"),
+            )
+        except ValueError as exc:
+            return f"Error: {exc}"
+        label = section.replace("_", " ")
+        return f"Life model updated ({label}): \"{item['content']}\" [{item['evidence_type']}] (id: {item['id']})"
+    if action == "get":
+        try:
+            data = list_records(section or None)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if section:
+            rows = data
+            if not rows:
+                return f"No {section.replace('_', ' ')} records are recorded."
+            return "\n".join(
+                f"- {row['content']} [{row.get('evidence_type', 'explicit')}]"
+                for row in rows
+            )
+        lines = ["Structured life model:"]
+        any_records = False
+        for name in SECTIONS:
+            rows = data[name]
+            if rows:
+                any_records = True
+                lines.append(f"\n## {name.replace('_', ' ').title()}")
+                lines.extend(f"- {row['content']} [{row.get('evidence_type', 'explicit')}]" for row in rows)
+        return "\n".join(lines) if any_records else "No structured life model records are recorded yet."
+    return "Error: action must be get or record."
+
+
+def _tool_manage_projects(inp: dict) -> str:
+    from api.services.project_store import get_project, list_projects, upsert
+
+    action = str(inp.get("action", "list")).strip().lower()
+    if action == "list":
+        rows = list_projects(
+            include_archived=bool(inp.get("include_archived", False)),
+            limit=int(inp.get("limit", 20) or 20),
+        )
+        if not rows:
+            return "No project records are recorded."
+        lines = ["Projects:"]
+        for item in rows:
+            next_action = f"; next: {item['next_action']}" if item.get("next_action") else ""
+            priority = f"; priority: {item['priority']}" if item.get("priority") else ""
+            lines.append(f"- {item['name']} [{item['status']}{priority}]{next_action}")
+        return "\n".join(lines)
+    if action == "get":
+        item = get_project(str(inp.get("project_id", "")), str(inp.get("name", "")))
+        if not item:
+            return "No matching project record is recorded."
+        lines = [
+            f"Project: {item['name']} [{item['status']}]",
+            f"Summary: {item.get('summary') or 'No summary recorded.'}",
+            f"Next action: {item.get('next_action') or 'No next action recorded.'}",
+            f"Evidence: {item.get('evidence_type', 'explicit')}",
+        ]
+        if item.get("history"):
+            lines.append(f"History entries: {len(item['history'])}")
+        return "\n".join(lines)
+    name = str(inp.get("name", "")).strip()
+    if not name and action != "archive":
+        return "Error: name is required."
+    if action == "archive":
+        item = get_project(str(inp.get("project_id", "")), name)
+        if not item:
+            return "Error: project not found."
+        name = item["name"]
+        status = "archived"
+    elif action == "upsert":
+        existing = get_project(name=name)
+        status = inp.get("status") or (existing.get("status") if existing else "active")
+    else:
+        return "Error: action must be list, get, upsert, or archive."
+    try:
+        item = upsert(
+            name,
+            status=status,
+            summary=str(inp.get("summary", "")),
+            next_action=str(inp.get("next_action", "")),
+            priority=str(inp.get("priority", "")),
+            source=inp.get("source") or {"type": "conversation"},
+            evidence_type=inp.get("evidence_type", "explicit"),
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return f"Project updated: {item['name']} [{item['status']}] (id: {item['id']})"
+
+
+def _tool_manage_commitments(inp: dict) -> str:
+    from api.services.commitment_store import (
+        complete_commitment,
+        create_commitment,
+        list_commitments,
+    )
+
+    action = str(inp.get("action", "")).strip().lower()
+    if action == "create":
+        content = str(inp.get("content", "")).strip()
+        direction = str(inp.get("direction", "")).strip().lower()
+        if not content or direction not in {"owed_by_me", "owed_to_me"}:
+            return "Error: create requires content and direction (owed_by_me or owed_to_me)."
+        item = create_commitment(
+            content,
+            direction=direction,
+            person_name=str(inp.get("person_name", "")),
+            person_id=str(inp.get("person_id", "")),
+            due_at=str(inp.get("due_at", "")),
+            source=inp.get("source") or {"type": "conversation"},
+        )
+        owner = item.get("person_name") or "someone"
+        direction_text = "you owe" if direction == "owed_by_me" else f"{owner} owes you"
+        return f"Commitment recorded: {direction_text} {owner}: \"{content}\" (id: {item['id']})"
+    if action == "list":
+        items = list_commitments(
+            person_name=str(inp.get("person_name", "")),
+            direction=str(inp.get("direction", "")),
+            status=str(inp.get("status", "open")),
+            limit=int(inp.get("limit", 50) or 50),
+        )
+        if not items:
+            return "No matching open commitments are recorded."
+        lines = [f"Commitments ({len(items)}):"]
+        for item in items:
+            who = f" with {item['person_name']}" if item.get("person_name") else ""
+            lines.append(f"- {item['id']}: {item['direction']}{who} — {item['content']}")
+        return "\n".join(lines)
+    if action == "complete":
+        item = complete_commitment(str(inp.get("commitment_id", "")))
+        return (
+            f"Commitment completed: \"{item['content']}\""
+            if item else "Error: commitment not found."
+        )
+    return f"Error: Unknown commitment action '{action}'."
+
+
+def _tool_manage_followups(inp: dict) -> str:
+    from api.services.followup_store import create, list_followups, update_status
+
+    action = str(inp.get("action", "list")).strip().lower()
+    if action == "list":
+        rows = list_followups(limit=int(inp.get("limit", 50) or 50))
+        if not rows:
+            return "No open conditional follow-ups are recorded."
+        return "\n".join(
+            f"- {item['person_name']}: {item['subject']} (check at {item['check_at']}; status {item['status']})"
+            for item in rows
+        )
+    followup_id = str(inp.get("followup_id", "")).strip()
+    if action in {"complete", "cancel"}:
+        if not followup_id:
+            return "Error: followup_id is required."
+        item = update_status(followup_id, "completed" if action == "complete" else "cancelled")
+        if not item:
+            return "Error: follow-up not found."
+        schedule_id = item.get("schedule_id")
+        if schedule_id:
+            try:
+                from api.services.scheduler_store import get_scheduler_store
+                get_scheduler_store().delete(schedule_id)
+            except Exception:
+                logger.warning("Could not remove follow-up schedule %s", schedule_id, exc_info=True)
+        return f"Conditional follow-up {action}d: {item['person_name']} — {item['subject']}"
+    if action != "create":
+        return "Error: action must be create, list, complete, or cancel."
+    try:
+        item = create(
+            str(inp.get("person_name", "")),
+            str(inp.get("subject", "")),
+            wait_days=int(inp.get("wait_days", 7) or 7),
+            source=inp.get("source") or {"type": "conversation"},
+        )
+    except (TypeError, ValueError) as exc:
+        return f"Error: {exc}"
+    if not item.get("schedule_id"):
+        try:
+            from api.services.scheduler_store import get_scheduler_store
+            schedule = get_scheduler_store().create(
+                name=f"Follow up with {item['person_name']}",
+                schedule_type="once",
+                schedule_value=item["check_at"],
+                action="prompt",
+                message_type="prompt",
+                message_content=(
+                    f"Conditional follow-up check (id: {item['id']}): Check whether I have heard "
+                    f"back from {item['person_name']} about {item['subject']} since "
+                    f"{item['created_at']}. Use person_info and message history or other recorded "
+                    "sources. If there is evidence of a response, call manage_followups with "
+                    f"action=complete and followup_id={item['id']}, then reply exactly NO_ACTION. "
+                    "If there is no response, tell me briefly that I should follow up. Do not "
+                    "invent a response or claim a source was checked if it was not available."
+                ),
+            )
+            from api.services.followup_store import attach_schedule
+            item = attach_schedule(item["id"], schedule.id) or item
+        except Exception as exc:
+            logger.warning("Could not schedule conditional follow-up: %s", exc, exc_info=True)
+    return (
+        f"Conditional follow-up recorded for {item['person_name']}: {item['subject']} "
+        f"(check at {item['check_at']}; id: {item['id']})"
+    )
+
+
+def _auto_inbox_category(content: str) -> str | None:
+    """Return only conservative, low-risk classifications for review.
+
+    This is deliberately narrower than an LLM classifier. It exists so a
+    scheduled review makes progress even when the model stops after listing
+    the inbox; uncertain material remains available for the model/user.
+    """
+    text = " ".join((content or "").split())
+    lower = text.lower()
+    if not text:
+        return "dismissed"
+    if re.fullmatch(r"(?:yes|yeah|yep|ok|okay|sure|thanks|thank you|hi|hello|hey|a|b|test)", lower):
+        return "dismissed"
+    if lower.startswith(("what ", "when ", "where ", "who ", "why ", "how ")):
+        return "dismissed"
+    if any(marker in lower for marker in ("didn't remind", "did not remind", "what timezone")):
+        return "dismissed"
+    if re.search(r"\b(remind me|reminder|follow up|follow-up|daily update|weekly review)\b", lower):
+        return "reminder"
+    if re.search(r"\b(youtube|video|x post|tweet|forwarded|source|link)\b", lower):
+        return "source"
+    if re.search(r"\b(my goal|top priority|i want to|i'd like to|i am working on|i'm working on|my project|i had an accident|my car)\b", lower):
+        if re.search(r"\b(project|product|building|working on|creating|developing)\b", lower):
+            return "project"
+        if re.search(r"\b(maybe|idea|might want)\b", lower):
+            return "idea"
+        return "memory"
+    # A compact factual relationship statement is safe to preserve as a
+    # relationship item, while person resolution remains a separate step.
+    if re.match(r"^[A-Z][\w'-]{1,30}\s+(?:is|works|lives|moved|moving|said|told|offered|promised)\b", text):
+        return "relationship"
+    return None
+
+
+def _auto_inbox_project(content: str) -> dict | None:
+    """Extract project state from text already deemed safe to auto-file."""
+    text = " ".join((content or "").split()).strip()
+    patterns = (
+        (r"^(?:i(?:'m|\s+am)\s+)?working\s+on\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?building\s+(.+?)\.?$", "active"),
+        (r"^(?:i(?:'m|\s+am)\s+)?developing\s+(.+?)\.?$", "active"),
+        (r"^(?:i\s+)?want\s+to\s+(?:build|create|develop)\s+(.+?)\.?$", "potential"),
+        (r"^(?:my\s+)?project\s+(?:is|:|-)\s*(.+?)\.?$", "active"),
+    )
+    for pattern, status in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip().rstrip(".").strip()
+            if len(name) >= 4:
+                return {"name": name, "status": status, "summary": text}
+    return None
+
+
+def _auto_relationship_person_id(content: str) -> str | None:
+    """Resolve a leading person name only when the existing graph is confident."""
+    match = re.match(
+        r"^([A-Z][\w'-]{1,30}(?:\s+[A-Z][\w'-]{1,30})?)\s+(?:is|works|lives|moved|moving|said|told|offered|promised)\b",
+        " ".join((content or "").split()),
+    )
+    if not match:
+        return None
+    try:
+        from api.services.entity_resolver import get_entity_resolver
+        resolved = get_entity_resolver().resolve(name=match.group(1))
+        if resolved and resolved.entity and (resolved.confidence or 0) >= 0.8:
+            return resolved.entity.id
+    except Exception:
+        logger.debug("Could not resolve inbox relationship", exc_info=True)
+    return None
+
+
+async def _tool_review_inbox(inp: dict) -> str:
+    from api.services.inbox_store import list_items
+
+    try:
+        limit = max(1, min(int(inp.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        since_days = max(0, min(int(inp.get("since_days", 7)), 3650))
+    except (TypeError, ValueError):
+        since_days = 7
+    items = list_items(limit=limit, since_days=since_days)
+    if not items:
+        return f"Life Inbox has no unreviewed captures from the last {since_days} days."
+    auto_processed = []
+    auto_failures = []
+    for item in items:
+        category = _auto_inbox_category(item.get("content", ""))
+        if category is None:
+            continue
+        process_input = {
+            "item_id": item["id"],
+            "category": category,
+        }
+        if category == "relationship":
+            person_id = _auto_relationship_person_id(item.get("content", ""))
+            if not person_id:
+                # A relationship fact without a confident entity match is
+                # useful evidence but should wait for focused resolution.
+                continue
+            process_input["person_id"] = person_id
+        elif category == "project":
+            project = _auto_inbox_project(item.get("content", ""))
+            if not project:
+                # Do not invent a project name or state merely because broad
+                # project language was detected. Leave it for focused review.
+                continue
+            process_input.update(project)
+        result = await _tool_process_inbox_item(process_input)
+        if result.startswith("Error:"):
+            auto_failures.append((item, result))
+        else:
+            auto_processed.append((item, category, result))
+
+    remaining = list_items(limit=limit, since_days=since_days)
+    proposals = [
+        item for item in list_items(status="processed", limit=1000, since_days=since_days)
+        if item.get("proposal")
+    ]
+    lines = [
+        f"Life Inbox review completed for the last {since_days} days.",
+        f"Automatically filed {len(auto_processed)} clear item(s).",
+    ]
+    for item, category, _result in auto_processed[:limit]:
+        lines.append(f"- filed as {category}: {item.get('content', '')}")
+    if auto_failures:
+        lines.append(f"{len(auto_failures)} clear item(s) could not be filed and remain unresolved:")
+        for item, error in auto_failures[:limit]:
+            lines.append(f"- id={item['id']} {item.get('content', '')}: {error}")
+    if proposals:
+        lines.append(f"{len(proposals)} task/reminder proposal(s) still need confirmation.")
+        for item in proposals[:limit]:
+            proposal = item["proposal"]
+            lines.append(f"- proposal id={item['id']} {proposal.get('content', item.get('content', ''))}")
+    if remaining:
+        lines.append(f"{len(remaining)} uncertain item(s) remain for focused review:")
+        for item in remaining:
+            lines.append(f"- id={item['id']} [{item['created_at'][:10]}] {item['content']}")
+    else:
+        lines.append("No unresolved inbox items remain in this period.")
+    return "\n".join(lines)
+
+
+async def _tool_process_inbox_item(inp: dict) -> str:
+    from api.services.inbox_store import list_items, update_item
+
+    item_id = str(inp.get("item_id", "")).strip()
+    category = str(inp.get("category", "")).strip().lower()
+    allowed = {"memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"}
+    if not item_id or category not in allowed:
+        return "Error: item_id and a valid category are required."
+    matches = [item for item in list_items(status=None, limit=1000) if item.get("id") == item_id]
+    if not matches:
+        return f"Error: Inbox item {item_id!r} was not found."
+    item = matches[0]
+    if item.get("status") != "unreviewed":
+        return f"Inbox item {item_id!r} was already processed; no duplicate was created."
+    linked_id = ""
+    person_fact_id = ""
+    proposal = None
+    # Inbox classifications are broader than the memory store's retrieval
+    # categories. Safe knowledge becomes durable while the inbox category and
+    # original provenance remain available for review.
+    memory_categories = {
+        "memory": None,
+        "idea": "ideas",
+        "project": "projects",
+        "relationship": "people",
+        "source": "context",
+        "knowledge": "context",
+        "preference": "preferences",
+    }
+    if category == "commitment":
+        from api.services.commitment_store import create_commitment
+        direction = str(inp.get("direction", "")).strip().lower()
+        if direction not in {"owed_by_me", "owed_to_me"}:
+            return "Error: commitment classification requires direction (owed_by_me or owed_to_me)."
+        commitment = create_commitment(
+            (inp.get("content") or item["content"]).strip(),
+            direction=direction,
+            person_name=str(inp.get("person_name", "")),
+            person_id=str(inp.get("person_id", "")),
+            due_at=str(inp.get("due_at", "")),
+            source={
+                "type": "life_inbox",
+                "inbox_item_id": item_id,
+                "original_source": item.get("source"),
+            },
+        )
+        linked_id = commitment["id"]
+    elif category in memory_categories:
+        from api.routes.memories import synthesize_memory
+        from api.services.memory_store import get_memory_store
+        content = (inp.get("content") or item["content"]).strip()
+        project_name = str(inp.get("name", "")).strip() if category == "project" else ""
+        if category == "project" and not project_name:
+            return "Error: project classification requires a project name."
+        project_status = str(inp.get("status") or "potential").strip().lower()
+        if category == "project" and project_status not in {
+            "potential", "active", "paused", "completed", "archived",
+        }:
+            return "Error: project status must be potential, active, paused, completed, or archived."
+        memory = get_memory_store().create_memory(
+            await synthesize_memory(content),
+            category=memory_categories[category],
+            source={
+                "type": "life_inbox",
+                "inbox_item_id": item_id,
+                "original_source": item.get("source"),
+            },
+        )
+        linked_id = memory.id
+        if category == "project":
+            from api.services.project_store import upsert as upsert_project
+
+            project = upsert_project(
+                project_name,
+                status=project_status,
+                summary=str(inp.get("summary") or content),
+                next_action=str(inp.get("next_action", "")),
+                priority=str(inp.get("priority", "")),
+                source={
+                    "type": "life_inbox",
+                    "inbox_item_id": item_id,
+                    "original_source": item.get("source"),
+                },
+                evidence_type="explicit",
+            )
+            linked_id = project["id"]
+        if category == "relationship" and inp.get("person_id"):
+            import hashlib
+            from api.services.person_facts import PersonFact, get_person_fact_store
+
+            raw_source = item.get("source")
+            source_link = None
+            if isinstance(raw_source, dict) and raw_source.get("type") == "telegram":
+                source_link = (
+                    f"telegram://{raw_source.get('chat_id', '')}/"
+                    f"{raw_source.get('message_id', '')}"
+                )
+            fact = PersonFact(
+                person_id=str(inp["person_id"]),
+                category="background",
+                key="inbox_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                value=content,
+                confidence=0.75,
+                source_quote=item.get("content", content),
+                source_link=source_link,
+                confirmed_by_user=False,
+            )
+            person_fact_id = get_person_fact_store().upsert(fact).id
+    elif category in {"task", "reminder"}:
+        proposal = {
+            "type": category,
+            "content": (inp.get("content") or item["content"]).strip(),
+            "requires_confirmation": True,
+        }
+    updated = update_item(
+        item_id,
+        status="dismissed" if category == "dismissed" else "processed",
+        category=category,
+        linked_id=linked_id,
+        proposal=proposal,
+        person_fact_id=person_fact_id,
+    )
+    if not updated:
+        return f"Error: Could not update Inbox item {item_id!r}."
+    suffix = (
+        f" Commitment recorded with id {linked_id}."
+        if linked_id and category == "commitment"
+        else f" Project recorded with id {linked_id}."
+        if linked_id and category == "project"
+        else f" Memory saved with id {linked_id}." if linked_id else ""
+    )
+    if proposal:
+        suffix = " Saved as a proposed action pending user confirmation."
+    return f"Inbox item classified as {category}." + suffix
+
+
+async def _tool_process_inbox_items(inp: dict) -> str:
+    entries = inp.get("items") or []
+    if not isinstance(entries, list) or not entries:
+        return "Error: items must be a non-empty list."
+    results = []
+    invalid_entries = 0
+    for entry in entries[:50]:
+        if isinstance(entry, dict):
+            results.append(await _tool_process_inbox_item(entry))
+        else:
+            invalid_entries += 1
+    failures = sum(result.startswith("Error:") for result in results) + invalid_entries
+    applied = len(results) - sum(result.startswith("Error:") for result in results)
+    summary = f"Applied {applied} Life Inbox classification(s)"
+    if failures:
+        summary += f"; {failures} failed"
+    details = [f"- {result}" for result in results]
+    details.extend("- Error: each batch entry must be an object." for _ in range(invalid_entries))
+    return summary + ".\n" + "\n".join(
+        details
+    )
+
+
+def _tool_list_inbox_proposals(inp: dict) -> str:
+    from api.services.inbox_store import list_items
+
+    try:
+        limit = max(1, min(int(inp.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        since_days = max(0, min(int(inp.get("since_days", 30)), 3650))
+    except (TypeError, ValueError):
+        since_days = 30
+    items = [
+        item for item in list_items(status="processed", limit=1000, since_days=since_days)
+        if item.get("proposal")
+    ][:limit]
+    if not items:
+        return f"There are no pending Life Inbox proposals from the last {since_days} days."
+    lines = [f"Pending Life Inbox proposals ({len(items)}):"]
+    for item in items:
+        proposal = item["proposal"]
+        lines.append(
+            f"- id={item['id']} type={proposal.get('type', item.get('category', 'action'))} "
+            f"[{item.get('created_at', '')[:10]}] {proposal.get('content', item.get('content', ''))}"
+        )
+    return "\n".join(lines)
+
+
+def _tool_confirm_inbox_proposal(inp: dict) -> str:
+    from datetime import datetime, timezone
+    from api.services.inbox_store import list_items, update_item
+
+    proposal_id = str(inp.get("proposal_id", "")).strip()
+    if not proposal_id:
+        return "Error: proposal_id is required."
+    item = next(
+        (candidate for candidate in list_items(status="processed", limit=1000)
+         if candidate.get("id") == proposal_id and candidate.get("proposal")),
+        None,
+    )
+    if not item:
+        return f"Error: pending proposal {proposal_id!r} was not found."
+    proposal = dict(item["proposal"])
+    if proposal.get("confirmed_at"):
+        return f"Proposal {proposal_id} was already confirmed: {proposal.get('confirmed_result', 'no duplicate created')}."
+    proposal_type = proposal.get("type")
+    content = str(proposal.get("content") or item.get("content") or "").strip()
+    if proposal_type == "task":
+        from api.services.task_manager import get_task_manager
+        task = get_task_manager().create(
+            description=content,
+            priority=inp.get("priority", ""),
+            due_date=inp.get("due_date"),
+        )
+        result = f"Task created: \"{task.description}\" (id: {task.id})"
+    elif proposal_type == "reminder":
+        schedule_type = inp.get("schedule_type")
+        schedule_value = inp.get("schedule_value")
+        if schedule_type not in {"once", "cron"} or not schedule_value:
+            return "Error: confirming a reminder requires schedule_type and a resolved future schedule_value."
+        result = _schedule_create({
+            "name": inp.get("name") or content[:80],
+            "schedule_type": schedule_type,
+            "schedule_value": schedule_value,
+            "schedule_action": "notify",
+            "message_type": "static",
+            "message_content": content,
+        })
+        if result.startswith("Error:"):
+            return result
+    else:
+        return f"Error: proposal {proposal_id!r} has unsupported type {proposal_type!r}."
+    proposal["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    proposal["confirmed_result"] = result
+    update_item(item["id"], status="processed", category=item.get("category", proposal_type), linked_id=item.get("linked_id", ""), proposal=proposal)
+    return result
 
 
 # Result cap for memory search. Exposed to the caller so a memory that missed on
@@ -3463,6 +4629,8 @@ _TOOL_HANDLERS = {
     "get_message_history": _tool_get_message_history,
     "person_info": _tool_person_info,
     "manage_tasks": _tool_manage_tasks,
+    "life_review": _tool_life_review,
+    "manage_projects": _tool_manage_projects,
     "manage_reminders": _tool_manage_reminders,
     "manage_schedules": _tool_manage_schedules,
     "manage_workouts": _tool_manage_workouts,
@@ -3473,6 +4641,14 @@ _TOOL_HANDLERS = {
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
+    "manage_life_model": _tool_manage_life_model,
+    "manage_commitments": _tool_manage_commitments,
+    "manage_followups": _tool_manage_followups,
+    "review_inbox": _tool_review_inbox,
+    "process_inbox_item": _tool_process_inbox_item,
+    "process_inbox_items": _tool_process_inbox_items,
+    "list_inbox_proposals": _tool_list_inbox_proposals,
+    "confirm_inbox_proposal": _tool_confirm_inbox_proposal,
     "search_memories": _tool_search_memories,
 }
 
@@ -3490,6 +4666,9 @@ TOOL_STATUS_MESSAGES = {
     "person_info.lookup": "Looking up person...",
     "person_info.briefing": "Generating briefing...",
     "manage_tasks": "Managing tasks...",
+    "life_review": "Reviewing your priorities...",
+    "manage_projects": "Updating project state...",
+    "manage_life_model": "Updating your life model...",
     "manage_tasks.create": "Creating task...",
     "manage_tasks.list": "Loading tasks...",
     "manage_tasks.complete": "Completing task...",
@@ -3524,5 +4703,12 @@ TOOL_STATUS_MESSAGES = {
     "update_calendar_event": "Updating calendar event...",
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
+    "manage_commitments": "Updating commitments...",
+    "manage_followups": "Tracking conditional follow-up...",
+    "review_inbox": "Reviewing your Life Inbox...",
+    "process_inbox_item": "Processing Life Inbox item...",
+    "process_inbox_items": "Processing Life Inbox items...",
+    "list_inbox_proposals": "Loading pending Life Inbox proposals...",
+    "confirm_inbox_proposal": "Confirming Life Inbox proposal...",
     "search_memories": "Searching memories...",
 }

@@ -12,13 +12,29 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from config.settings import settings
-from api.services.llm_client import get_local_llm
+from api.services.llm_client import get_llm, get_local_llm
 from api.services.resilience import is_retryable_api_error
 
 logger = logging.getLogger(__name__)
 
 
-def build_message_content(prompt: str, attachments: list[dict] = None) -> str | list:
+def _get_synthesis_llm():
+    """Select the operation-specific synthesis profile when configured.
+
+    The named registry is optional. Without it, retain the historical backend
+    selection and the existing test/integration seams through ``get_local_llm``.
+    """
+    configured_profiles = getattr(settings, "llm_models_json", "")
+    if isinstance(configured_profiles, str) and configured_profiles.strip():
+        return get_llm("fast")
+    return get_local_llm()
+
+
+def build_message_content(
+    prompt: str,
+    attachments: list[dict] = None,
+    provider_supports_vision: bool = False,
+) -> str | list:
     """
     Build message content, handling multi-modal if needed.
 
@@ -35,7 +51,36 @@ def build_message_content(prompt: str, attachments: list[dict] = None) -> str | 
     if not attachments:
         return prompt  # Simple text message (backwards compatible)
 
-    content = []
+    if not provider_supports_vision:
+        notes = []
+        text_file_contents = []
+        for att in attachments:
+            media_type = att["media_type"]
+            filename = att["filename"]
+            data = att["data"]
+            if media_type.startswith("image/"):
+                notes.append(
+                    f"[Image attached: {filename}] "
+                    "(this model cannot inspect images)"
+                )
+            elif media_type == "application/pdf":
+                notes.append(
+                    f"[PDF attached: {filename}] "
+                    "(this model cannot inspect documents)"
+                )
+            elif media_type.startswith("text/") or media_type == "application/json":
+                try:
+                    text_content = base64.b64decode(data).decode("utf-8")
+                    text_file_contents.append(
+                        f"\n\n--- Attached File: {filename} ---\n{text_content}\n--- End of {filename} ---"
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to decode text attachment %s: %s", filename, exc)
+        return "\n".join(notes) + ("\n\n" if notes else "") + prompt + "".join(text_file_contents)
+
+    # Keep Anthropic's native block shape internally. The provider adapter
+    # converts image blocks to OpenAI image_url blocks when supported.
+    content = [{"type": "text", "text": prompt}]
     text_file_contents = []
 
     # Process attachments by type
@@ -45,15 +90,18 @@ def build_message_content(prompt: str, attachments: list[dict] = None) -> str | 
         data = att["data"]
 
         if media_type.startswith("image/"):
-            # Image attachments — local model can't process images directly,
-            # so we note their presence in the prompt
-            content.append(f"[Image attached: {filename}]")
-            logger.debug(f"Image attachment noted: {filename} (not processed by local model)")
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            })
+            logger.debug("Image attachment added for provider negotiation: %s", filename)
 
         elif media_type == "application/pdf":
-            # PDF attachments — similarly just noted
-            content.append(f"[PDF attached: {filename}]")
-            logger.debug(f"PDF attachment noted: {filename}")
+            content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            })
+            logger.debug("PDF attachment added for provider negotiation: %s", filename)
 
         elif media_type.startswith("text/") or media_type == "application/json":
             # Text file attachments - decode and include in prompt
@@ -68,13 +116,9 @@ def build_message_content(prompt: str, attachments: list[dict] = None) -> str | 
 
     # Append text file contents to prompt
     if text_file_contents:
-        prompt = prompt + "".join(text_file_contents)
+        content[0]["text"] += "".join(text_file_contents)
 
-    # For local model, flatten everything into a single string
-    if content:
-        prefix = "\n".join(content) + "\n\n"
-        return prefix + prompt
-    return prompt
+    return content
 
 # Default model tier (kept for API compatibility)
 DEFAULT_MODEL_TIER = "sonnet"
@@ -96,7 +140,7 @@ class Synthesizer:
     def client(self):
         """Lazy-load the LLM client."""
         if self._client is None:
-            self._client = get_local_llm()
+            self._client = _get_synthesis_llm()
         return self._client
 
     def synthesize(

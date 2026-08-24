@@ -486,7 +486,14 @@ class TestPromptExecution:
         assert answer == "You have 3 meetings today."
         assert exec_log["tool_calls"] == 1
         assert exec_log["attempt"] == 1
-        mock_chat.assert_called_once_with("What meetings do I have today?")
+        mock_chat.assert_called_once_with(
+            "What meetings do I have today?",
+            source={
+                "type": "scheduler",
+                "schedule_id": prompt_entry.id,
+                "schedule_name": "Test Prompt",
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_retry_on_empty(self, scheduler, prompt_entry):

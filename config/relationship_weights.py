@@ -102,6 +102,7 @@ INTERACTION_TYPE_WEIGHTS: dict[str, float] = {
     # Direct messaging (high intimacy, intentional contact)
     "imessage": 1.5,          # Personal text message
     "whatsapp": 1.5,          # Personal messaging app
+    "telegram": 1.5,          # Personal/forwarded Telegram message
     "signal": 1.5,            # Secure personal messaging
     "slack": 0.3,             # Work DM (less personal, often noisy)
 

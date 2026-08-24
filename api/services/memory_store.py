@@ -43,6 +43,14 @@ MEMORY_SEARCH_CORPUS_LIMIT = 1000
 
 # Memory categories and their trigger patterns
 CATEGORY_PATTERNS = {
+    "ideas": [
+        r"\b(?:maybe|perhaps|idea|i\s+think\s+i\s+might|i\s+might|i\s+may|i(?:'m|\s+am)\s+considering)\b",
+    ],
+    "goals": [
+        r"\b(?:I|Amir)\s+(?:want|wants|plan|plans|hope|hopes|aim|aims|intend|intends)\s+to\b",
+        r"\btop\s+priorit(?:y|ies)\b",
+        r"\b(?:my\s+)?(?:goal|vision)\s+(?:is|:)",
+    ],
     "people": [
         r"\b(he|she|they)\s+(prefers?|likes?|wants?)",
         r"\b[A-Z][a-z]+\s+(prefers?|likes?|wants?|needs?|is|has)",
@@ -69,6 +77,10 @@ CATEGORY_PATTERNS = {
         r"\b(remember|don't forget|make sure)",
         r"\bfollow.?up\b",
         r"\b(todo|to.?do)\b",
+    ],
+    "projects": [
+        r"\b(?:I|Amir)\s+(?:am\s+)?(?:building|developing|working\s+on)\b",
+        r"\b(?:my|a)\s+(?:project|product)\s+(?:is|to)\b",
     ],
 }
 
@@ -152,6 +164,7 @@ class Memory:
     created_at: datetime
     updated_at: datetime
     is_active: bool = True
+    source: dict | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -163,6 +176,7 @@ class Memory:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "is_active": self.is_active,
+            "source": self.source,
         }
 
 
@@ -265,10 +279,11 @@ class MemoryStore:
             keywords=data.get("keywords") or extract_keywords(data["content"]),
             created_at=created_at or datetime.now(),
             updated_at=updated_at or datetime.now(),
-            is_active=data.get("is_active", True)
+            is_active=data.get("is_active", True),
+            source=data.get("source"),
         )
 
-    def create_memory(self, content: str, category: str = None) -> Memory:
+    def create_memory(self, content: str, category: str = None, source: dict | None = None) -> Memory:
         """
         Create a new memory.
 
@@ -279,6 +294,13 @@ class MemoryStore:
         Returns:
             Created Memory object
         """
+        normalized_content = " ".join(content.split()).casefold()
+        for existing in self._memories.values():
+            if existing.is_active and " ".join(existing.content.split()).casefold() == normalized_content:
+                if source:
+                    return self.update_source(existing.id, source) or existing
+                return existing
+
         memory = Memory(
             id=str(uuid.uuid4()),
             content=content,
@@ -286,7 +308,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=source,
         )
 
         self._memories[memory.id] = memory
@@ -309,6 +332,37 @@ class MemoryStore:
         if memory and memory.is_active:
             return memory
         return None
+
+    def update_source(self, memory_id: str, source: dict) -> Optional[Memory]:
+        """Attach provenance without changing memory content.
+
+        The original ``source`` remains the primary citation for compatibility;
+        additional equivalent captures are retained in ``related_sources``.
+        """
+        memory = self._memories.get(memory_id)
+        if not memory or not memory.is_active:
+            return None
+        merged_source = source
+        if isinstance(memory.source, dict) and isinstance(source, dict):
+            merged_source = dict(memory.source)
+            related = list(merged_source.get("related_sources", []))
+            if source != memory.source and source not in related:
+                related.append(source)
+            if related:
+                merged_source["related_sources"] = related
+        updated = Memory(
+            id=memory.id,
+            content=memory.content,
+            category=memory.category,
+            keywords=memory.keywords,
+            created_at=memory.created_at,
+            updated_at=datetime.now(),
+            is_active=True,
+            source=merged_source,
+        )
+        self._memories[memory_id] = updated
+        self._save()
+        return updated
 
     def list_memories(self, category: str = None, limit: int = 100) -> list[Memory]:
         """
@@ -354,7 +408,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=memory.source,
         )
 
         self._memories[memory_id] = updated
@@ -384,7 +439,8 @@ class MemoryStore:
             keywords=memory.keywords,
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=False
+            is_active=False,
+            source=memory.source,
         )
 
         self._memories[memory_id] = deactivated

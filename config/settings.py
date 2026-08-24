@@ -457,6 +457,18 @@ class Settings(BaseSettings):
                     "remote_llm_input_price_per_mtok for the unset/0.0 distinction."
     )
 
+    # Named provider/model registry. Credentials stay in environment variables;
+    # this registry only describes how a provider is reached and which model
+    # profile should be used by each operation.
+    llm_providers_json: str = Field(
+        default="", alias="LIFEOS_LLM_PROVIDERS",
+        description="JSON map of named Anthropic/OpenAI-compatible providers; providers may declare supports_vision.",
+    )
+    llm_models_json: str = Field(
+        default="", alias="LIFEOS_LLM_MODELS",
+        description="JSON map of named model profiles to provider/model pairs.",
+    )
+
     @property
     def remote_llm_configured(self) -> bool:
         """True once there's enough to actually run a turn: URL, model, and

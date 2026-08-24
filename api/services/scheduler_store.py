@@ -1075,7 +1075,14 @@ class SchedulerScheduler:
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                result = await chat_via_api_with_log(entry.message_content)
+                result = await chat_via_api_with_log(
+                    entry.message_content,
+                    source={
+                        "type": "scheduler",
+                        "schedule_id": entry.id,
+                        "schedule_name": entry.name,
+                    },
+                )
                 answer = result.get("answer", "").strip()
                 exec_log = {
                     "tool_calls": len(result.get("tool_statuses", [])),

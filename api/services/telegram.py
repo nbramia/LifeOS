@@ -9,13 +9,18 @@ Three capabilities:
 Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.
 """
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from collections import deque
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +36,159 @@ MAX_MESSAGE_LENGTH = 4096
 # full nightly priorities summary (~1,000 chars) intact — truncating below that
 # would cut off the bullet a follow-up question is asking about (#435).
 MAX_QUOTED_REPLY_CHARS = 1500
+_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+MAX_PERSISTED_MEDIA_BYTES = 20 * 1024 * 1024
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extract source URLs without asking the model to preserve them."""
+    urls = []
+    for raw in _URL_RE.findall(text or ""):
+        url = raw.rstrip(".,;:!?)]}>")
+        if url and url not in urls:
+            urls.append(url)
+    return urls[:20]
+
+
+async def _persist_telegram_media(
+    file_id: str | None, chat_id: str, message_id: int | None, media_type: str,
+    token: str,
+) -> dict:
+    """Persist a Telegram attachment locally and return provenance metadata."""
+    if not file_id:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            file_resp = await client.get(
+                _telegram_url("getFile", token), params={"file_id": file_id}
+            )
+            file_resp.raise_for_status()
+            file_path = file_resp.json().get("result", {}).get("file_path")
+            if not file_path:
+                return {}
+            media_resp = await client.get(
+                f"{TELEGRAM_API}/file/bot{token}/{file_path}"
+            )
+            media_resp.raise_for_status()
+            data = media_resp.content
+        if len(data) > MAX_PERSISTED_MEDIA_BYTES:
+            logger.warning("Skipping Telegram %s: attachment exceeds %d bytes", media_type, MAX_PERSISTED_MEDIA_BYTES)
+            return {"persist_error": "attachment_too_large"}
+        digest = hashlib.sha256(data).hexdigest()
+        directory = Path(os.getenv("LIFEOS_TELEGRAM_MEDIA_DIR", str(Path.home() / ".lifeos" / "telegram_media")))
+        directory.mkdir(parents=True, exist_ok=True)
+        suffix = Path(file_path).suffix.lower() or ".bin"
+        safe_chat = re.sub(r"[^0-9A-Za-z_-]", "_", str(chat_id))
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", str(message_id or "unknown"))
+        destination = directory / f"telegram_{safe_chat}_{safe_id}_{media_type}{suffix}"
+        if not destination.exists():
+            destination.write_bytes(data)
+        return {
+            "attachment_path": str(destination),
+            "sha256": digest,
+            "size_bytes": len(data),
+            "telegram_file_path": file_path,
+        }
+    except Exception as exc:
+        logger.warning("Could not persist Telegram %s attachment: %s", media_type, exc)
+        return {"persist_error": "download_failed"}
+
+
+def _llm_attachment_from_telegram_source(source: dict) -> dict | None:
+    """Turn a persisted Telegram file into the chat API attachment shape.
+
+    Only formats already accepted by ``AskStreamRequest`` are forwarded to an
+    LLM. Other media remains durable source evidence and is not silently
+    discarded. The 5 MB cap matches the API image limit and avoids turning a
+    Telegram update into an unexpectedly large model request.
+    """
+    path = source.get("attachment_path")
+    if not path:
+        return None
+    try:
+        file_path = Path(path)
+        if not file_path.is_file() or file_path.stat().st_size > 5 * 1024 * 1024:
+            return None
+        media_type = source.get("media_type")
+        if media_type == "photo":
+            mime_type = "image/jpeg"
+        elif media_type == "document":
+            mime_type = source.get("mime_type") or "application/octet-stream"
+        else:
+            return None
+        allowed = {
+            "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp",
+            "application/pdf", "text/plain", "text/markdown", "text/csv",
+            "application/json",
+        }
+        if mime_type not in allowed:
+            return None
+        return {
+            "filename": source.get("file_name") or file_path.name,
+            "media_type": mime_type,
+            "data": base64.b64encode(file_path.read_bytes()).decode("ascii"),
+        }
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not prepare Telegram attachment for the model: %s", exc)
+        return None
+
+
+def _forwarded_sender(message: dict) -> dict | None:
+    """Return a modern or legacy Telegram forwarded-sender identity."""
+    origin = message.get("forward_origin") or {}
+    sender = origin.get("sender_user") if isinstance(origin, dict) else None
+    sender = sender or message.get("forward_from")
+    if not isinstance(sender, dict):
+        return None
+    name = " ".join(
+        part.strip() for part in (
+            sender.get("first_name", ""), sender.get("last_name", "")
+        ) if part and part.strip()
+    ).strip()
+    if not name and sender.get("username"):
+        name = str(sender["username"])
+    return {
+        "name": name,
+        "username": sender.get("username"),
+        "id": sender.get("id"),
+    } if name else None
+
+
+def _record_forwarded_interaction(message: dict, source: dict, text: str) -> None:
+    """Link a forwarded message to an existing person when identity is clear.
+
+    This intentionally never creates a new person from a Telegram forward.
+    A name-only fuzzy match must be high-confidence and exact enough to avoid
+    poisoning relationship history; otherwise the source remains in the inbox.
+    """
+    sender = _forwarded_sender(message)
+    if not sender or not sender.get("name"):
+        return
+    try:
+        from api.services.entity_resolver import EntityResolver
+        resolution = EntityResolver().resolve_by_name(sender["name"], create_if_missing=False)
+        if not resolution or resolution.confidence < 0.9 or resolution.is_new:
+            return
+        from api.services.interaction_store import Interaction, get_interaction_store
+        timestamp = datetime.fromtimestamp(
+            int(message.get("date") or time.time()), tz=timezone.utc
+        )
+        source_id = f"{source.get('chat_id')}:{source.get('message_id')}"
+        interaction = Interaction(
+            id=f"telegram-{source_id}",
+            person_id=resolution.entity.id,
+            timestamp=timestamp,
+            source_type="telegram",
+            title=f"Telegram message from {sender['name']}",
+            snippet=(text or "").replace("\n", " ")[:500],
+            source_link=f"telegram://{source.get('chat_id')}/{source.get('message_id')}",
+            source_id=source_id,
+        )
+        get_interaction_store().add_if_not_exists(interaction)
+        source["interaction_person_id"] = resolution.entity.id
+        source["interaction_person_name"] = resolution.entity.canonical_name
+    except Exception as exc:
+        logger.warning("Could not link forwarded Telegram message to a person: %s", exc)
 
 # The bot token for the message currently being handled. A listener sets this
 # once at the top of _handle_update so every outbound send during that update —
@@ -334,7 +492,13 @@ async def send_message_async(text: str, chat_id: str = None, bot: str = None) ->
 # Internal chat client (consumes SSE from /api/ask/stream)
 # ---------------------------------------------------------------------------
 
-async def chat_via_api(question: str, conversation_id: str = None, persona: str = None) -> dict:
+async def chat_via_api(
+    question: str,
+    conversation_id: str = None,
+    persona: str = None,
+    source: dict | None = None,
+    attachments: list[dict] | None = None,
+) -> dict:
     """
     Run a question through the full LifeOS chat pipeline (non-streaming).
 
@@ -353,6 +517,10 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
         body["conversation_id"] = conversation_id
     if persona:
         body["persona"] = persona
+    if source:
+        body["source"] = source
+    if attachments:
+        body["attachments"] = attachments
 
     full_text = ""
     conv_id = conversation_id
@@ -413,7 +581,7 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
     }
 
 
-async def chat_via_api_with_log(question: str) -> dict:
+async def chat_via_api_with_log(question: str, source: dict | None = None) -> dict:
     """Run a question through the chat pipeline and capture execution metadata.
 
     Like chat_via_api() but also returns tool_statuses, token usage, and cost
@@ -425,6 +593,8 @@ async def chat_via_api_with_log(question: str) -> dict:
     """
     port = settings.port
     body: dict = {"question": question}
+    if source:
+        body["source"] = source
 
     full_text = ""
     conv_id = None
@@ -814,7 +984,19 @@ class TelegramBotListener:
         if not message:
             return
 
-        text = message.get("text", "").strip()
+        text = (message.get("text") or message.get("caption") or "").strip()
+        voice = message.get("voice") or message.get("audio")
+        media_type = next(
+            (
+                kind for kind in (
+                    "photo", "video", "document", "animation", "video_note", "sticker",
+                ) if message.get(kind)
+            ),
+            None,
+        )
+        media_payload = message.get(media_type) if media_type else None
+        if isinstance(media_payload, list):
+            media_payload = media_payload[-1] if media_payload else None
         chat_id = str(message["chat"]["id"])
 
         # Auth check first — don't let unauthorized chats pollute the dedup window
@@ -829,6 +1011,52 @@ class TelegramBotListener:
             return
         if message_id:
             self._processed_ids.append(message_id)
+
+        if not text and voice:
+            await send_typing_indicator(chat_id)
+            try:
+                file_id = voice.get("file_id")
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    file_resp = await client.get(
+                        _telegram_url("getFile", self._token),
+                        params={"file_id": file_id},
+                    )
+                    file_resp.raise_for_status()
+                    file_path = file_resp.json().get("result", {}).get("file_path")
+                    if not file_path:
+                        raise RuntimeError("Telegram did not return an audio file path")
+                    audio_resp = await client.get(
+                        f"{TELEGRAM_API}/file/bot{self._token}/{file_path}"
+                    )
+                    audio_resp.raise_for_status()
+                with tempfile.NamedTemporaryFile(suffix=Path(file_path).suffix or ".ogg") as audio_file:
+                    audio_file.write(audio_resp.content)
+                    audio_file.flush()
+                    from api.services.telegram_transcription import transcribe
+                    text = await asyncio.to_thread(transcribe, audio_file.name)
+                if text:
+                    text = f"[Voice message transcription]\n{text}"
+                    logger.info("Transcribed Telegram voice message (%d chars)", len(text))
+                else:
+                    raise RuntimeError("The transcription was empty")
+            except Exception as exc:
+                logger.exception("Telegram voice transcription failed")
+                await send_message_async(
+                    "I received your voice message but couldn't transcribe it. "
+                    "Please try again or send it as text.", chat_id=chat_id,
+                )
+                return
+
+        # Telegram puts text accompanying media in ``caption`` rather than
+        # ``text``. Preserve captioned forwards/attachments as normal inbox
+        # input, and acknowledge uncaptioned media instead of silently
+        # dropping the update. The file is not downloaded or interpreted yet;
+        # its Telegram file_id and message provenance travel with the request.
+        if media_type and not voice:
+            if text:
+                text = f"[Telegram {media_type}]\n{text}"
+            else:
+                text = f"[Telegram {media_type} without caption]"
 
         if not text:
             return
@@ -895,9 +1123,42 @@ class TelegramBotListener:
 
         # Send through chat pipeline (intent classification happens there)
         try:
+            source = {
+                "type": "telegram",
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+            urls = _extract_urls(effective_text)
+            if urls:
+                source["urls"] = urls
+            if media_type:
+                source.update({
+                    "media_type": media_type,
+                    "file_id": media_payload.get("file_id")
+                    if isinstance(media_payload, dict) else None,
+                    "mime_type": media_payload.get("mime_type")
+                    if isinstance(media_payload, dict) else None,
+                    "file_name": media_payload.get("file_name")
+                    if isinstance(media_payload, dict) else None,
+                    "forwarded": bool(message.get("forward_origin") or message.get("forward_from")),
+                })
+                source.update(await _persist_telegram_media(
+                    source.get("file_id"), chat_id, message_id, media_type, self._token,
+                ))
+            forwarded_sender = _forwarded_sender(message)
+            if forwarded_sender:
+                source["forwarded_from"] = forwarded_sender
+                _record_forwarded_interaction(message, source, effective_text)
+            llm_attachment = _llm_attachment_from_telegram_source(source)
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
-                result = await chat_via_api(effective_text, conversation_id=conv_id, persona=self._persona)
+                result = await chat_via_api(
+                    effective_text,
+                    conversation_id=conv_id,
+                    persona=self._persona,
+                    source=source,
+                    attachments=[llm_attachment] if llm_attachment else None,
+                )
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 

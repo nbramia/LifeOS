@@ -102,8 +102,10 @@ class TestReminderPipelineE2E:
         """When first chat_via_api_with_log call fails, retries and succeeds."""
         call_count = [0]
 
-        async def flaky_chat(question):
+        async def flaky_chat(question, *, source=None):
             call_count[0] += 1
+            assert source and source["type"] == "scheduler"
+            assert source["schedule_id"] == prompt_reminder.id
             if call_count[0] == 1:
                 raise ConnectionError("API temporarily unavailable")
             return {
@@ -403,8 +405,8 @@ class TestJobQueueE2E:
 class TestProactiveIntelligence:
     """Test that the seed script creates correct reminders with valid prompts."""
 
-    def test_seed_script_creates_three_reminders(self, tmp_path):
-        """Seed script should create exactly 3 reminders."""
+    def test_seed_script_creates_all_reminders(self, tmp_path):
+        """Seed script should create every configured proactive reminder."""
         from api.services.reminder_store import ReminderStore
 
         # Monkey-patch the store to use temp file
@@ -417,7 +419,7 @@ class TestProactiveIntelligence:
             store.create(**reminder_def)
 
         reminders = store.list_all()
-        assert len(reminders) == 3
+        assert len(reminders) == len(REMINDERS) == 4
 
     def test_meeting_prep_prompt_is_well_formed(self):
         """Meeting prep prompt should contain expected keywords."""
@@ -445,6 +447,13 @@ class TestProactiveIntelligence:
         assert len(COMMUNICATION_GAPS_PROMPT) > 100
         assert "14 days" in COMMUNICATION_GAPS_PROMPT
         assert "30 days" in COMMUNICATION_GAPS_PROMPT
+
+    def test_life_inbox_review_prompt_preserves_confirmation_boundary(self):
+        from scripts.seed_proactive_reminders import LIFE_INBOX_REVIEW_PROMPT
+
+        assert "Process every clear, low-risk capture automatically" in LIFE_INBOX_REVIEW_PROMPT
+        assert "tasks and reminders as proposals" in LIFE_INBOX_REVIEW_PROMPT
+        assert "original evidence" in LIFE_INBOX_REVIEW_PROMPT
 
     def test_cron_schedules_are_valid(self):
         """All cron schedules should be parseable by croniter."""
@@ -493,7 +502,7 @@ class TestProactiveIntelligence:
                 created_count += 1
 
         assert created_count == 0
-        assert len(store.list_all()) == 3
+        assert len(store.list_all()) == len(REMINDERS) == 4
 
 
 # ---------------------------------------------------------------------------
