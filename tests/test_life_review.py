@@ -46,6 +46,10 @@ def test_life_review_combines_recorded_sources(monkeypatch):
         lambda: SimpleNamespace(list_memories=lambda **_kwargs: [memory]),
     )
     monkeypatch.setattr(
+        "api.services.person_entity.get_person_entity_store",
+        lambda: SimpleNamespace(get_all=lambda: []),
+    )
+    monkeypatch.setattr(
         "api.services.life_model_store.list_records",
         lambda: {
             "identity": [],
@@ -70,3 +74,4 @@ def test_life_review_combines_recorded_sources(monkeypatch):
     assert "days since update" in result
     assert "Building the cafe AI product" in result
     assert "Repairing the car is a top priority" in result
+    assert "Relationship interaction data is not populated enough" in result

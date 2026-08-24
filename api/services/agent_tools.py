@@ -2563,6 +2563,7 @@ def _tool_life_review(inp: dict) -> str:
 
         lines.append("\n## Relationship follow-ups")
         relationship_gaps = []
+        relationship_records = 0
         try:
             from api.services.person_entity import get_person_entity_store
             from api.services.relationship_summary import get_relationship_summary
@@ -2572,6 +2573,7 @@ def _tool_life_review(inp: dict) -> str:
                 summary = get_relationship_summary(person.id)
                 if not summary or not summary.contact_on_record:
                     continue
+                relationship_records += 1
                 threshold = 14 if person.category == "family" else 30
                 if summary.days_since_contact >= threshold and summary.relationship_strength > 0:
                     relationship_gaps.append((summary.relationship_strength, summary.days_since_contact, summary))
@@ -2584,8 +2586,12 @@ def _tool_life_review(inp: dict) -> str:
                     f"- Consider reconnecting with {summary.person_name}: "
                     f"{days_since} days since contact; relationship strength {strength:.0f}/100"
                 )
-        else:
+        elif relationship_records:
             lines.append("- No high-confidence relationship gaps meet the configured thresholds.")
+        else:
+            lines.append(
+                "- Relationship interaction data is not populated enough to assess follow-up gaps."
+            )
 
         pending = list_items(limit=limit, since_days=7)
         lines.append("\n## Unresolved inbox")
