@@ -453,6 +453,22 @@ class IMessageStore:
         with closing(sqlite3.connect(self.storage_path)) as own_conn, own_conn:
             own_conn.executemany(sql, batch)
 
+    def checkpoint(self) -> None:
+        """Fold the write-ahead log back into the main database file.
+
+        The store runs in WAL mode, so recent writes live in a ``-wal`` sidecar
+        until a checkpoint. Anything that copies ``storage_path`` as a single
+        file — the Apple export does — silently ships a stale database unless
+        the WAL has been folded in first (#647).
+
+        SQLite checkpoints automatically when the last connection closes, but
+        that is skipped whenever any other connection is still open, which
+        fails silently. Callers that are about to copy the file should ask for
+        a checkpoint explicitly rather than rely on that.
+        """
+        with closing(sqlite3.connect(self.storage_path)) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def _clear_data(self) -> None:
         """Clear all exported data (for full resync)."""
         with closing(sqlite3.connect(self.storage_path)) as conn, conn:

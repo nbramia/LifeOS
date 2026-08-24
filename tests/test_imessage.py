@@ -4,6 +4,7 @@ Tests for iMessage integration.
 import os
 import pytest
 import resource
+import shutil
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -610,3 +611,34 @@ class TestExportConnectionLifecycle:
                 temp_store.export_from_source()
         finally:
             synthetic_source.chmod(0o600)
+
+    def test_checkpoint_flushes_wal_so_a_file_copy_is_complete(
+        self, temp_store, synthetic_source, tmp_path
+    ):
+        """A single-file copy of the store must not drop freshly exported rows.
+
+        The store runs in WAL mode, so an export's writes can still be sitting
+        in the -wal sidecar. `shutil.copy2` takes only the main database file,
+        which is how the Apple export shipped a database missing its newest
+        messages (#647).
+
+        SQLite checkpoints on its own when the *last* connection closes, so the
+        gap only opens when something else holds the database open — the API
+        server, say. This test pins that case open deliberately; without it the
+        implicit checkpoint would mask the bug.
+        """
+        temp_store.SOURCE_DB_PATH = synthetic_source
+
+        with closing(sqlite3.connect(temp_store.storage_path)) as bystander:
+            bystander.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+            temp_store.export_from_source()
+            temp_store.checkpoint()
+
+            copied = tmp_path / "copy-of-imessage.db"
+            shutil.copy2(temp_store.storage_path, copied)  # main file only, no -wal
+
+        with closing(sqlite3.connect(copied)) as conn:
+            copied_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+        assert copied_count == SOURCE_MESSAGE_COUNT
