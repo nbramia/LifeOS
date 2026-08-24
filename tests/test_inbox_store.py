@@ -82,6 +82,26 @@ def test_uncaptioned_media_remains_open_for_future_understanding(tmp_path, monke
     assert inbox_store.list_items(status="unreviewed")[0]["id"] == item["id"]
 
 
+def test_commitments_are_persistent_and_queryable(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFEOS_COMMITMENTS_PATH", str(tmp_path / "commitments.json"))
+    from api.services.agent_tools import _tool_manage_commitments
+
+    created = _tool_manage_commitments({
+        "action": "create",
+        "content": "Send John the deck",
+        "direction": "owed_by_me",
+        "person_name": "John",
+        "source": {"type": "telegram", "chat_id": "1", "message_id": 7},
+    })
+    assert "Commitment recorded" in created
+    listed = _tool_manage_commitments({"action": "list", "person_name": "John"})
+    assert "Send John the deck" in listed
+
+    commitment_id = listed.split("- ", 1)[1].split(":", 1)[0]
+    completed = _tool_manage_commitments({"action": "complete", "commitment_id": commitment_id})
+    assert "Commitment completed" in completed
+
+
 def test_update_item_retains_pending_proposal(tmp_path, monkeypatch):
     path = tmp_path / "inbox.json"
     monkeypatch.setenv("LIFEOS_INBOX_PATH", str(path))

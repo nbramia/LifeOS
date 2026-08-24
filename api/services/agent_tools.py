@@ -756,6 +756,29 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "manage_commitments",
+        "description": (
+            "Track promises and commitments with provenance. Use create when the user "
+            "promises to do something for someone or someone promises the user; use "
+            "list to answer what is owed/open, and complete when the user confirms it is done."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "complete"]},
+                "content": {"type": "string", "description": "The specific promised action or obligation."},
+                "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                "person_name": {"type": "string"},
+                "person_id": {"type": "string"},
+                "due_at": {"type": "string", "description": "Optional ISO date/time or natural due date resolved by the model."},
+                "commitment_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["open", "completed"]},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "review_inbox",
         "description": (
             "Review raw Life Inbox captures that may not yet have been classified "
@@ -784,11 +807,14 @@ TOOL_DEFINITIONS = [
                 "item_id": {"type": "string", "description": "Inbox item id."},
                 "category": {
                     "type": "string",
-                    "enum": ["memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"],
+                    "enum": ["memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"],
                     "description": "The classification for this item.",
                 },
                 "content": {"type": "string", "description": "Optional cleaned content to save for a memory."},
                 "person_id": {"type": "string", "description": "Resolved CRM person id for a relationship fact, when available."},
+                "person_name": {"type": "string", "description": "Person connected to a commitment."},
+                "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                "due_at": {"type": "string"},
             },
             "required": ["item_id", "category"],
         },
@@ -809,9 +835,12 @@ TOOL_DEFINITIONS = [
                         "type": "object",
                         "properties": {
                             "item_id": {"type": "string"},
-                            "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"]},
+                            "category": {"type": "string", "enum": ["memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"]},
                             "content": {"type": "string"},
                             "person_id": {"type": "string"},
+                            "person_name": {"type": "string"},
+                            "direction": {"type": "string", "enum": ["owed_by_me", "owed_to_me"]},
+                            "due_at": {"type": "string"},
                         },
                         "required": ["item_id", "category"],
                     },
@@ -2626,6 +2655,53 @@ async def _tool_save_memory(inp: dict) -> str:
     return f"Memory saved: \"{memory.content}\" (id: {memory.id}, category: {memory.category})"
 
 
+def _tool_manage_commitments(inp: dict) -> str:
+    from api.services.commitment_store import (
+        complete_commitment,
+        create_commitment,
+        list_commitments,
+    )
+
+    action = str(inp.get("action", "")).strip().lower()
+    if action == "create":
+        content = str(inp.get("content", "")).strip()
+        direction = str(inp.get("direction", "")).strip().lower()
+        if not content or direction not in {"owed_by_me", "owed_to_me"}:
+            return "Error: create requires content and direction (owed_by_me or owed_to_me)."
+        item = create_commitment(
+            content,
+            direction=direction,
+            person_name=str(inp.get("person_name", "")),
+            person_id=str(inp.get("person_id", "")),
+            due_at=str(inp.get("due_at", "")),
+            source=inp.get("source") or {"type": "conversation"},
+        )
+        owner = item.get("person_name") or "someone"
+        direction_text = "you owe" if direction == "owed_by_me" else f"{owner} owes you"
+        return f"Commitment recorded: {direction_text} {owner}: \"{content}\" (id: {item['id']})"
+    if action == "list":
+        items = list_commitments(
+            person_name=str(inp.get("person_name", "")),
+            direction=str(inp.get("direction", "")),
+            status=str(inp.get("status", "open")),
+            limit=int(inp.get("limit", 50) or 50),
+        )
+        if not items:
+            return "No matching open commitments are recorded."
+        lines = [f"Commitments ({len(items)}):"]
+        for item in items:
+            who = f" with {item['person_name']}" if item.get("person_name") else ""
+            lines.append(f"- {item['id']}: {item['direction']}{who} — {item['content']}")
+        return "\n".join(lines)
+    if action == "complete":
+        item = complete_commitment(str(inp.get("commitment_id", "")))
+        return (
+            f"Commitment completed: \"{item['content']}\""
+            if item else "Error: commitment not found."
+        )
+    return f"Error: Unknown commitment action '{action}'."
+
+
 def _auto_inbox_category(content: str) -> str | None:
     """Return only conservative, low-risk classifications for review.
 
@@ -2660,6 +2736,24 @@ def _auto_inbox_category(content: str) -> str | None:
     return None
 
 
+def _auto_relationship_person_id(content: str) -> str | None:
+    """Resolve a leading person name only when the existing graph is confident."""
+    match = re.match(
+        r"^([A-Z][\w'-]{1,30}(?:\s+[A-Z][\w'-]{1,30})?)\s+(?:is|works|lives|moved|moving|said|told|offered|promised)\b",
+        " ".join((content or "").split()),
+    )
+    if not match:
+        return None
+    try:
+        from api.services.entity_resolver import get_entity_resolver
+        resolved = get_entity_resolver().resolve(name=match.group(1))
+        if resolved and resolved.entity and (resolved.confidence or 0) >= 0.8:
+            return resolved.entity.id
+    except Exception:
+        logger.debug("Could not resolve inbox relationship", exc_info=True)
+    return None
+
+
 async def _tool_review_inbox(inp: dict) -> str:
     from api.services.inbox_store import list_items
 
@@ -2679,10 +2773,18 @@ async def _tool_review_inbox(inp: dict) -> str:
         category = _auto_inbox_category(item.get("content", ""))
         if category is None:
             continue
-        result = await _tool_process_inbox_item({
+        process_input = {
             "item_id": item["id"],
             "category": category,
-        })
+        }
+        if category == "relationship":
+            person_id = _auto_relationship_person_id(item.get("content", ""))
+            if not person_id:
+                # A relationship fact without a confident entity match is
+                # useful evidence but should wait for focused resolution.
+                continue
+            process_input["person_id"] = person_id
+        result = await _tool_process_inbox_item(process_input)
         auto_processed.append((item, category, result))
 
     remaining = list_items(limit=limit, since_days=since_days)
@@ -2713,7 +2815,7 @@ async def _tool_process_inbox_item(inp: dict) -> str:
 
     item_id = str(inp.get("item_id", "")).strip()
     category = str(inp.get("category", "")).strip().lower()
-    allowed = {"memory", "idea", "project", "task", "reminder", "relationship", "source", "knowledge", "preference", "dismissed"}
+    allowed = {"memory", "idea", "project", "task", "reminder", "commitment", "relationship", "source", "knowledge", "preference", "dismissed"}
     if not item_id or category not in allowed:
         return "Error: item_id and a valid category are required."
     matches = [item for item in list_items(status=None, limit=1000) if item.get("id") == item_id]
@@ -2737,7 +2839,25 @@ async def _tool_process_inbox_item(inp: dict) -> str:
         "knowledge": "context",
         "preference": "preferences",
     }
-    if category in memory_categories:
+    if category == "commitment":
+        from api.services.commitment_store import create_commitment
+        direction = str(inp.get("direction", "")).strip().lower()
+        if direction not in {"owed_by_me", "owed_to_me"}:
+            return "Error: commitment classification requires direction (owed_by_me or owed_to_me)."
+        commitment = create_commitment(
+            (inp.get("content") or item["content"]).strip(),
+            direction=direction,
+            person_name=str(inp.get("person_name", "")),
+            person_id=str(inp.get("person_id", "")),
+            due_at=str(inp.get("due_at", "")),
+            source={
+                "type": "life_inbox",
+                "inbox_item_id": item_id,
+                "original_source": item.get("source"),
+            },
+        )
+        linked_id = commitment["id"]
+    elif category in memory_categories:
         from api.routes.memories import synthesize_memory
         from api.services.memory_store import get_memory_store
         content = (inp.get("content") or item["content"]).strip()
@@ -2789,7 +2909,11 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     )
     if not updated:
         return f"Error: Could not update Inbox item {item_id!r}."
-    suffix = f" Memory saved with id {linked_id}." if linked_id else ""
+    suffix = (
+        f" Commitment recorded with id {linked_id}."
+        if linked_id and category == "commitment"
+        else f" Memory saved with id {linked_id}." if linked_id else ""
+    )
     if proposal:
         suffix = " Saved as a proposed action pending user confirmation."
     return f"Inbox item classified as {category}." + suffix
@@ -3868,6 +3992,7 @@ _TOOL_HANDLERS = {
     "update_calendar_event": _tool_update_calendar_event,
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
+    "manage_commitments": _tool_manage_commitments,
     "review_inbox": _tool_review_inbox,
     "process_inbox_item": _tool_process_inbox_item,
     "process_inbox_items": _tool_process_inbox_items,
@@ -3924,6 +4049,7 @@ TOOL_STATUS_MESSAGES = {
     "update_calendar_event": "Updating calendar event...",
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
+    "manage_commitments": "Updating commitments...",
     "review_inbox": "Reviewing your Life Inbox...",
     "process_inbox_item": "Processing Life Inbox item...",
     "process_inbox_items": "Processing Life Inbox items...",

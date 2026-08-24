@@ -1228,15 +1228,28 @@ async def ask_stream(request: AskStreamRequest):
                 from api.services.memory_store import get_memory_store
                 _memory_store = get_memory_store()
                 for _tool_call in agent_result.tool_calls_log:
-                    if _tool_call.get("tool") != "save_memory" or _tool_call.get("is_error"):
+                    if _tool_call.get("is_error"):
                         continue
-                    _match = re.search(r"id:\s*([0-9a-f-]{36})", str(_tool_call.get("result", "")), re.I)
-                    if _match:
-                        try:
-                            uuid.UUID(_match.group(1))
-                            _memory_store.update_source(_match.group(1), request.source)
-                        except ValueError:
-                            pass
+                    if _tool_call.get("tool") == "save_memory":
+                        _match = re.search(r"id:\s*([0-9a-f-]{36})", str(_tool_call.get("result", "")), re.I)
+                        if _match:
+                            try:
+                                uuid.UUID(_match.group(1))
+                                _memory_store.update_source(_match.group(1), request.source)
+                            except ValueError:
+                                pass
+                    elif _tool_call.get("tool") == "manage_commitments":
+                        _commitment_match = re.search(
+                            r"(?:id|ID):\s*([0-9a-f-]{36})",
+                            str(_tool_call.get("result", "")),
+                            re.I,
+                        )
+                        if _commitment_match:
+                            try:
+                                from api.services.commitment_store import update_source
+                                update_source(_commitment_match.group(1), request.source)
+                            except ValueError:
+                                pass
 
             # The raw capture is a safety net, not a second task list. Once
             # this turn has successfully been interpreted, close that exact
