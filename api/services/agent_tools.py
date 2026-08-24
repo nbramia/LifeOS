@@ -2382,6 +2382,26 @@ def _tool_life_review(inp: dict) -> str:
         limit = 10
 
     today = date.today().isoformat()
+    memories = get_memory_store().list_memories(limit=1000)
+
+    def completion_evidence(task):
+        """Find later recorded language that may supersede an open task."""
+        task_words = {
+            word for word in re.findall(r"[a-z]{4,}", task.description.lower())
+            if word not in {"check", "call", "send", "make", "update", "with", "from"}
+        }
+        if not task_words:
+            return None
+        markers = {"checked", "fixed", "done", "completed", "finished", "resolved", "sent"}
+        for memory in memories:
+            content = memory.content or ""
+            lower = content.lower()
+            if task_words.intersection(re.findall(r"[a-z]{4,}", lower)) and markers.intersection(
+                re.findall(r"[a-z]{4,}", lower)
+            ):
+                return content
+        return None
+
     tasks = [
         task for task in get_task_manager().list_tasks()
         if task.status in {"todo", "in_progress", "blocked", "urgent", "deferred"}
@@ -2401,7 +2421,13 @@ def _tool_life_review(inp: dict) -> str:
             for task in tasks[:limit]:
                 due = f"; due {task.due_date}" if task.due_date else ""
                 priority = f"; priority {task.priority}" if task.priority else ""
-                lines.append(f"- {task.status}: {task.description}{due}{priority}")
+                evidence = completion_evidence(task)
+                if evidence:
+                    lines.append(
+                        f"- review: {task.description}{due}{priority} — a later record may indicate this is complete: {evidence[:180]}"
+                    )
+                else:
+                    lines.append(f"- {task.status}: {task.description}{due}{priority}")
         else:
             lines.append("- No open tasks are recorded.")
 
@@ -2442,7 +2468,6 @@ def _tool_life_review(inp: dict) -> str:
         else:
             lines.append("- No upcoming scheduled items are recorded.")
 
-    memories = get_memory_store().list_memories(limit=1000)
     projects = [
         memory for memory in memories
         if memory.category in {"projects", "goals"}
@@ -2456,28 +2481,28 @@ def _tool_life_review(inp: dict) -> str:
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         age_days = max(0, (now - stamp).days)
-        project_rows.append((age_days, memory))
+        project_rows.append((age_days, memory, stamp))
     # A project can be mentioned many times as its state changes. Keep the raw
     # memories intact, but present one current row per clearly named subject so
     # a review does not mistake seven car updates for seven neglected projects.
     grouped_projects = {}
-    for age_days, memory in project_rows:
+    for age_days, memory, stamp in project_rows:
         leading_name = re.match(r"^\s*([A-Z][\w-]{2,})\b", memory.content or "")
         key = leading_name.group(1).casefold() if leading_name else memory.id
         if key in {"i", "we", "my", "the"}:
             key = memory.id
         existing = grouped_projects.get(key)
-        if existing is None or age_days < existing[0]:
-            grouped_projects[key] = [age_days, memory, 1 if existing is None else existing[2] + 1]
+        if existing is None or stamp > existing[2]:
+            grouped_projects[key] = [age_days, memory, stamp, 1 if existing is None else existing[3] + 1]
         else:
-            existing[2] += 1
+            existing[3] += 1
     project_rows = list(grouped_projects.values())
     if mode == "neglected":
         project_rows = [row for row in project_rows if row[0] >= 14]
     project_rows.sort(key=lambda row: row[0], reverse=True)
     lines.append("\n## Aging goals/projects")
     if project_rows:
-        for age_days, memory, update_count in project_rows[:limit]:
+        for age_days, memory, _stamp, update_count in project_rows[:limit]:
             stamp = (memory.updated_at or memory.created_at).date().isoformat()
             freshness = f"; {age_days} days since update"
             history = f"; {update_count} related updates" if update_count > 1 else ""
