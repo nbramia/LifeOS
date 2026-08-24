@@ -268,12 +268,26 @@ PreflightCaller = Callable[[str], str]
 
 
 def _default_llm_caller(prompt: str) -> str:
-    """Production caller: hit the Anthropic API via the existing llm_client."""
-    # Import inside the function so tests that monkeypatch run_preflight don't
-    # need the Anthropic SDK installed.
-    from api.services.llm_client import AnthropicLLMClient
+    """Production caller using the configured provider/model registry."""
+    # Keep imports inside the function so parser tests do not require a live
+    # provider. The registry makes worker preflight follow the same replaceable
+    # model infrastructure as interactive chat; legacy installs retain their
+    # historical Anthropic/local behavior.
+    from api.services.llm_client import (
+        AnthropicLLMClient,
+        get_llm,
+        get_llm_registry,
+        get_local_llm,
+    )
 
-    client = AnthropicLLMClient(model=settings.agent_preflight_model)
+    _providers, models = get_llm_registry()
+    if models:
+        profile = "fast" if "fast" in models else "default"
+        client = get_llm(profile)
+    elif getattr(settings, "llm_backend", "anthropic").lower() == "local":
+        client = get_local_llm()
+    else:
+        client = AnthropicLLMClient(model=settings.agent_preflight_model)
     response = client.create(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1024,

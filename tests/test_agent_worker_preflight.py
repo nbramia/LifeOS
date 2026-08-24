@@ -6,6 +6,8 @@ canned LLM replies. The real Haiku call is mocked via the `caller` parameter.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -30,6 +32,21 @@ def _golden_reply(**overrides) -> str:
     }
     base.update(overrides)
     return json.dumps(base)
+
+
+@pytest.mark.unit
+def test_default_caller_uses_configured_fast_profile(monkeypatch):
+    from api.services import llm_client
+
+    client = Mock()
+    client.create.return_value = SimpleNamespace(text='{"routing":"local"}')
+    monkeypatch.setattr(llm_client, "get_llm_registry", lambda: ({"deepseek": object()}, {"fast": object()}))
+    monkeypatch.setattr(llm_client, "get_llm", lambda profile: client)
+
+    result = pf._default_llm_caller("classify this")
+
+    assert result == '{"routing":"local"}'
+    client.create.assert_called_once()
 
 
 @pytest.mark.unit
