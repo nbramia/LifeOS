@@ -65,7 +65,13 @@ def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModel
             name="local", type="openai_compatible", base_url=settings.local_llm_url,
         ),
     }
-    for name, raw in _json_setting(settings.llm_providers_json, "LIFEOS_LLM_PROVIDERS").items():
+    providers_json = getattr(settings, "llm_providers_json", "")
+    models_json = getattr(settings, "llm_models_json", "")
+    if not isinstance(providers_json, str):
+        providers_json = ""
+    if not isinstance(models_json, str):
+        models_json = ""
+    for name, raw in _json_setting(providers_json, "LIFEOS_LLM_PROVIDERS").items():
         if not isinstance(raw, dict):
             continue
         key_env = str(raw.get("api_key_env", "") or "")
@@ -77,14 +83,17 @@ def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModel
         )
 
     models = {}
-    for name, raw in _json_setting(settings.llm_models_json, "LIFEOS_LLM_MODELS").items():
+    for name, raw in _json_setting(models_json, "LIFEOS_LLM_MODELS").items():
         if isinstance(raw, dict) and raw.get("provider") and raw.get("model"):
             models[str(name)] = LLMModelConfig(str(name), str(raw["provider"]), str(raw["model"]))
     if "default" not in models:
-        backend = settings.llm_backend.lower()
+        backend_value = getattr(settings, "llm_backend", "anthropic")
+        backend = backend_value.lower() if isinstance(backend_value, str) else "anthropic"
         models["default"] = LLMModelConfig(
             "default", "anthropic" if backend == "anthropic" else "local",
-            settings.anthropic_model if backend == "anthropic" else settings.local_llm_model,
+            getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            if backend == "anthropic"
+            else getattr(settings, "local_llm_model", "local"),
         )
     if "fast" not in models:
         models["fast"] = models["default"]
@@ -92,7 +101,8 @@ def get_llm_registry() -> tuple[dict[str, LLMProviderConfig], dict[str, LLMModel
         default = models["default"]
         models["specialist"] = LLMModelConfig(
             "specialist", default.provider,
-            settings.anthropic_specialist_model if default.provider == "anthropic" else default.model,
+            getattr(settings, "anthropic_specialist_model", default.model)
+            if default.provider == "anthropic" else default.model,
         )
     return providers, models
 
@@ -1122,7 +1132,8 @@ def get_local_llm() -> LocalLLMClient | AnthropicLLMClient:
     global _llm_client
     if _llm_client is None:
         _providers, _models = get_llm_registry()
-        if settings.llm_models_json:
+        models_json = getattr(settings, "llm_models_json", "")
+        if isinstance(models_json, str) and models_json.strip():
             logger.info("Using configured LLM provider/model registry")
             _llm_client = get_llm("default")
             return _llm_client
