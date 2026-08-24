@@ -140,7 +140,8 @@ async def list_memories(
     **List stored memories** to see what the system remembers about the user.
 
     Use this to review saved memories before adding new ones.
-    Filter by category: people, preferences, facts, decisions, reminders, context.
+    Filter by category: ideas, goals, projects, people, preferences, facts,
+    decisions, reminders, context.
     """
     store = get_memory_store()
     memories = store.list_memories(category=category, limit=limit)

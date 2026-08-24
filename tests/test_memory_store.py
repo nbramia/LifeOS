@@ -176,6 +176,10 @@ class TestCategorizeMemory:
         result = categorize_memory("The weather was nice today")
         assert result == "context"
 
+    def test_categorize_tentative_idea(self):
+        result = categorize_memory("I think I might want to learn Japanese")
+        assert result == "ideas"
+
 
 # =============================================================================
 # extract_keywords Tests

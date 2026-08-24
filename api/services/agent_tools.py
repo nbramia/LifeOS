@@ -2588,6 +2588,21 @@ def _tool_life_review(inp: dict) -> str:
         else:
             lines.append("- No goals or projects are recorded in the current memory set.")
 
+    if mode != "neglected":
+        ideas = [memory for memory in memories if memory.category == "ideas"]
+        def _idea_sort_key(memory):
+            stamp = memory.updated_at or memory.created_at
+            return stamp.timestamp() if stamp else 0
+        ideas.sort(
+            key=_idea_sort_key,
+            reverse=True,
+        )
+        lines.append("\n## Recent ideas")
+        if ideas:
+            lines.extend(f"- {memory.content}" for memory in ideas[:limit])
+        else:
+            lines.append("- No ideas are recorded in the current memory set.")
+
     lines.append("\nThis is a record-based review; it does not prove that an item is unimportant or forgotten when no record exists.")
     return "\n".join(lines)
 def _tool_manage_tasks(inp: dict):
@@ -3125,7 +3140,7 @@ async def _tool_process_inbox_item(inp: dict) -> str:
     # original provenance remain available for review.
     memory_categories = {
         "memory": None,
-        "idea": "context",
+        "idea": "ideas",
         "project": "projects",
         "relationship": "people",
         "source": "context",
