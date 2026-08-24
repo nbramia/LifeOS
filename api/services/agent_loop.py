@@ -25,6 +25,7 @@ from api.services.agent_tools import TOOL_DEFINITIONS, TOOL_STATUS_MESSAGES, exe
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
+from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.resilience import is_retryable_api_error
 from config.settings import settings
 
@@ -416,9 +417,14 @@ def resolve_model_alias(name: str) -> str:
     return _MODEL_ALIASES.get((name or "").strip().lower(), name)
 
 
-def _select_client(model: str = "", force_local: bool = False):
+def _select_client(model: str = "", force_local: bool = False, force_remote: bool = False):
     """Pick the LLM client for a turn.
 
+    - `force_remote` (#654): build a per-turn client for the configured paid
+      OpenAI-compatible remote provider (e.g. Fireworks) — the chat model
+      picker's explicit "Remote" option. Checked before `force_local` since
+      both are per-turn backend switches and can't both be requested; callers
+      (chat.py) only ever set one.
     - `force_local`: build a per-turn local (llama-server / Gemma) client even
       when the global backend is Anthropic — the chat model picker's "Gemma"
       option. Context is preserved the same way as any per-turn switch: the full
@@ -427,6 +433,14 @@ def _select_client(model: str = "", force_local: bool = False):
     - a per-turn `model` on the Anthropic backend (escalation, #303) builds a
       dedicated client for that model; otherwise the shared singleton is used.
     """
+    if force_remote:
+        from api.services.llm_client import LocalLLMClient
+        return LocalLLMClient(
+            base_url=settings.remote_llm_base_url,
+            model=settings.remote_llm_model,
+            api_key=settings.remote_llm_api_key,
+            timeout=settings.remote_llm_timeout,
+        )
     if force_local:
         if getattr(settings, "llm_backend", "anthropic").lower() != "anthropic":
             return get_local_llm()  # already local — reuse the singleton
@@ -449,6 +463,12 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
+    # (#661) True when `model` has no known rate -- either no entry in
+    # pricing.PRICING, or (#654) the configured remote provider with no
+    # configured per-token rate. The dollar figure in total_cost_usd is then
+    # a placeholder 0.0, not a claim that the turn was actually free. See
+    # _track_usage.
+    unpriced: bool = False
     # (#629) the current in-flight round's cumulative usage-so-far, from
     # AnthropicLLMClient.astream's "usage_update" event. Only that backend
     # emits it -- LocalLLMClient.astream never does (its protocol has no
@@ -473,6 +493,7 @@ async def run_agent_loop(
     voice_rules: tuple = (),
     personal_context: str = "",
     force_local: bool = False,
+    force_remote: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -496,6 +517,12 @@ async def run_agent_loop(
         force_local: Run this turn on the local (llama-server / Gemma) backend
             even when the global backend is Anthropic — the chat model picker's
             "Gemma (local)" option. Builds a per-turn LocalLLMClient.
+        force_remote: Run this turn on the configured paid OpenAI-compatible
+            remote provider (#654) — the chat model picker's explicit "Remote"
+            option. Builds a per-turn LocalLLMClient pointed at
+            settings.remote_llm_*. Usage is priced from the configured rates
+            (or marked unpriced if none are set) instead of the free-local
+            assumption the rest of this module makes.
 
     Yields:
         Dicts with "type" key: "turn_state" (first event, #615 -- a live
@@ -505,7 +532,17 @@ async def run_agent_loop(
         provisional_input_tokens/provisional_output_tokens), "text",
         "status", or "result".
     """
-    client = _select_client(model, force_local=force_local)
+    client = _select_client(model, force_local=force_local, force_remote=force_remote)
+    # (#661) The turn's actual served model -- LocalLLMClient.model is
+    # "local" by default or the configured remote provider's id when
+    # force_remote built it (#654, LocalLLMClient.model docstring);
+    # AnthropicLLMClient.model is the resolved default
+    # (settings.anthropic_model) or the per-turn override above (escalation,
+    # an explicit picker choice). `getattr(..., "local")` tolerates a test
+    # double that predates this property (several unit tests patch
+    # _select_client with a bare fake astream() object) by falling back to
+    # the same default this used to be hardcoded to.
+    resolved_model = getattr(client, "model", "local")
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
                                         voice_rules=voice_rules, personal_context=personal_context)
 
@@ -518,8 +555,12 @@ async def run_agent_loop(
     # a single kwarg on a two-class module. settings.local_agent_enable_thinking
     # defaults True (current behaviour) -> mapped to None so the request body
     # stays byte-identical until an operator opts out.
+    # `not force_remote` (#654): the remote provider is also a LocalLLMClient
+    # instance (same OpenAI-compatible plumbing) but isn't llama-server —
+    # it doesn't understand llama-server's chat_template_kwargs switch, so
+    # this local-only knob must never reach it regardless of the setting.
     astream_kwargs: dict = {}
-    if isinstance(client, LocalLLMClient):
+    if isinstance(client, LocalLLMClient) and not force_remote:
         astream_kwargs["enable_thinking"] = None if settings.local_agent_enable_thinking else False
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
@@ -560,7 +601,7 @@ async def run_agent_loop(
     user_content = build_message_content(question, attachments)
     messages.append({"role": "user", "content": user_content})
 
-    result = AgentResult(full_text="", model="local")
+    result = AgentResult(full_text="", model=resolved_model)
     # #615: hand the caller a live reference to `result` before the loop does
     # any work. `_track_usage` below mutates it in place every round, so a
     # caller that stashes this object can read accrued usage at any point --
@@ -574,8 +615,51 @@ async def run_agent_loop(
         result.total_output_tokens += usage.output_tokens
         result.total_cache_read_tokens += usage.cache_read_input_tokens
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
-        # Local model has no cost
-        result.total_cost_usd = 0.0
+        # (#661) Derive cost from the model that actually served the turn,
+        # recomputed from the running totals each round (mirrors the
+        # accumulation above -- cost_for is cheap and this keeps
+        # total_cost_usd correct if a caller reads it mid-loop via the
+        # turn_state reference). "local" is priced at $0 in PRICING, so a
+        # genuinely local turn still lands on 0.0 here -- as a result of
+        # pricing a free model, not an unconditional assignment. A model
+        # with no known rate is left at 0.0 too, but flagged `unpriced`
+        # rather than asserted free -- see pricing.is_known_model's
+        # docstring for why this caller doesn't want cost_for's
+        # budget-enforcement Opus-rate fallback.
+        #
+        # (#654) The one exception: the configured remote provider's rates
+        # come from settings, not pricing.PRICING. The whole point of that
+        # slot is an operator-flippable model id (Fireworks today, anything
+        # OpenAI-compatible tomorrow) -- a static dict keyed by literal model
+        # id would need a code change on every flip, which is exactly what
+        # the picker was built to avoid. Gated on force_remote (not just
+        # "is this model in PRICING") so an upstream model id that happens
+        # to collide with a first-party key can't accidentally borrow that
+        # key's rate.
+        if force_remote:
+            input_price = settings.remote_llm_input_price_per_mtok
+            output_price = settings.remote_llm_output_price_per_mtok
+            if input_price is None or output_price is None:
+                result.total_cost_usd = 0.0
+                result.unpriced = True
+            else:
+                result.total_cost_usd = (
+                    (result.total_input_tokens / 1_000_000) * input_price
+                    + (result.total_output_tokens / 1_000_000) * output_price
+                )
+                result.unpriced = False
+        elif is_known_model(result.model):
+            result.total_cost_usd = cost_for(
+                result.model,
+                result.total_input_tokens,
+                result.total_output_tokens,
+                result.total_cache_creation_tokens,
+                result.total_cache_read_tokens,
+            )
+            result.unpriced = False
+        else:
+            result.total_cost_usd = 0.0
+            result.unpriced = True
         # (#629) this round's usage is now folded into the totals above --
         # clear the provisional (in-flight) figures so a caller that adds
         # provisional_* to total_* (chat.py's cancel handler) doesn't

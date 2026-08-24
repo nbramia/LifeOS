@@ -49,8 +49,10 @@ SLACK_SCOPES = [
     "search:read",          # search.messages (day-pull endpoint — issue #441)
 ]
 
-# Token storage path
-SLACK_TOKEN_PATH = Path("data/slack_tokens.json")
+# Token storage path (anchored to the repo root — see AGENTS.md's data-path idiom
+# — so a process whose cwd isn't the repo doesn't silently look for credentials
+# in the wrong place).
+SLACK_TOKEN_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "slack_tokens.json"
 
 # Channel system-message subtypes skipped during bulk history fetch (sync path).
 # These are membership/metadata noise ("X has joined the channel") that would

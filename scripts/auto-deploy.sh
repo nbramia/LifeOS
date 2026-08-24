@@ -101,19 +101,42 @@ service_active_since_epoch() {
     date -d "$raw" +%s 2>/dev/null
 }
 
-# Authoritative "is the worker mid-session" check (#631 gap 3). Queries the
-# same SQLite session store the worker itself consults on restart —
-# SessionStore.list_non_terminal(), the "sessions the worker may still need to
-# act on" set (claimed/running/yielded) — rather than guessing from process
-# CPU or log recency. Any failure to ask it (missing venv, locked DB, import
-# error) is treated as busy: killing an in-flight #agent session is worse than
-# leaving the worker one more 10-minute tick stale.
+# Authoritative "is the worker mid-session" check (#631 gap 3, narrowed by
+# #636). Queries the SQLite session store rather than guessing from process
+# CPU or log recency.
+#
+# Busy means genuinely-active work only: claimed or running. `yielded` is
+# deliberately excluded (#636) — the worker's own recovery path skips yielded
+# sessions with "Sleeping sessions are healthy — main loop will wake them",
+# so a restart does not harm them. `list_non_terminal()` (which includes
+# yielded) answers "which sessions must I look at?", not "which would a
+# restart harm?" — a wider set, and using it meant one abandoned yielded
+# session pinned the worker on stale code on every tick forever. One such
+# session, 82 days old, was doing exactly that when this was found.
+#
+# Any failure to ask (missing venv, locked DB, import error) is still treated
+# as busy: killing live work is worse than one more 10-minute stale tick.
+#
+# LIFEOS_AGENT_SESSIONS_DB is test-only: unset in production, so SessionStore()
+# always resolves its own repo-root-anchored default there (unchanged
+# behavior). Tests source this script from a sandbox cwd and need worker_busy
+# to read a seeded throwaway store instead of the real one — the same problem
+# solved for the venv itself via $LIFEOS_VENV above.
 worker_busy() {
     "$VENV_DIR/bin/python" -c "
+import os
 import sys
 try:
-    from api.services.agent_worker.session_store import SessionStore
-    sys.exit(0 if SessionStore().list_non_terminal() else 2)
+    from api.services.agent_worker.session_store import (
+        STATUS_CLAIMED,
+        STATUS_RUNNING,
+        SessionStore,
+    )
+    active = {STATUS_CLAIMED, STATUS_RUNNING}
+    db_path = os.environ.get('LIFEOS_AGENT_SESSIONS_DB')
+    store = SessionStore(db_path=db_path) if db_path else SessionStore()
+    busy = [s for s in store.list_non_terminal() if s.status in active]
+    sys.exit(0 if busy else 2)
 except Exception as e:
     print(f'worker_busy check failed: {e}', file=sys.stderr)
     sys.exit(3)

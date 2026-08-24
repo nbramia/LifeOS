@@ -88,6 +88,7 @@ Beyond the primary bot you can run **persona bots** — separate `@BotFather` bo
 |---|---|---|
 | `fitness` | `TELEGRAM_FITNESS_BOT_TOKEN` / `TELEGRAM_FITNESS_CHAT_ID` | Pure chat — training and nutrition surface. |
 | `therapist` | `TELEGRAM_THERAPIST_BOT_TOKEN` / `TELEGRAM_THERAPIST_CHAT_ID` | Pure chat — advice-oriented surface. |
+| `journal` | `TELEGRAM_JOURNAL_BOT_TOKEN` / `TELEGRAM_JOURNAL_CHAT_ID` | Pure chat — disjointed-fragment capture into `Personal/Log/`. |
 | `doctor` | `TELEGRAM_DOCTOR_BOT_TOKEN` / `TELEGRAM_DOCTOR_CHAT_ID` | Orchestration — self-repair surface that files an issue and ships a fix. |
 
 To add one:

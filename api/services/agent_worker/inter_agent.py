@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from api.services.agent_worker.hermes_session import HERMES_ROUTING
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
@@ -61,6 +62,18 @@ logger = logging.getLogger(__name__)
 # and reuse the managed concurrency cap.
 CLI_ROUTINGS = ("claude_code", "codex")
 SPAWN_MODELS = ("claude", "local", *CLI_ROUTINGS)
+
+# Root routings that must never be allowed to spawn an API-billed
+# (`model="claude"`) child — see the `model == "claude"` guard in `spawn()`
+# below. This is deliberately a SEPARATE set from `CLI_ROUTINGS`: that one
+# also gates behavior specific to an actual CLI subprocess (spawn's own
+# dollar-ceiling skip, `send()`'s reopen-on-send, `kill()`'s local-subprocess
+# teardown) that doesn't apply to Hermes — Hermes is an external agent
+# harness, not a CLI child this worker manages. Hermes belongs here for the
+# same reason claude_code/codex do: it's not billed via the Anthropic API,
+# so a Hermes-rooted lineage opening `model="claude"` would be an
+# undisclosed API-billed side door (#640, extending #578 / ADR-018).
+NON_API_BILLED_ROOT_ROUTINGS = CLI_ROUTINGS + (HERMES_ROUTING,)
 
 
 # Caps enforced on spawn. Operator overrides via settings (see `Caps` dataclass).
@@ -260,7 +273,7 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         root_session = ctx.session_store.get_by_session_id(
             caller.root_session_id or caller.session_id
         ) or caller
-        if root_session.routing in CLI_ROUTINGS:
+        if root_session.routing in NON_API_BILLED_ROOT_ROUTINGS:
             return _err(
                 f"this lineage is subscription-billed (root session routing="
                 f"{root_session.routing}); model='claude' would bill the "

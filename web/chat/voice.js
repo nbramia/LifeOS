@@ -963,11 +963,13 @@ export async function submitTurn({ blob, mime, transcript } = {}) {
       // doctor) spawns a session that can ask. Poll the linked conversation so
       // a `[CLARIFY]`/`[GOAL]` can be answered here without Telegram.
       // Also gated on the lifeos backend specifically (#593): the spawn is
-      // LifeOS-native, and unlike the text path (#596) voice has no
-      // client-side diversion of a Hermes-selected orchestrating turn back
-      // to LifeOS — an orchestrating persona_id sent to the Hermes proxy is
-      // rejected there with a 400 (hermes_proxy.py) rather than spawning
-      // anything, so a Hermes-backend turn never has a session to poll for.
+      // LifeOS-native. An orchestrating persona_id sent to the Hermes proxy
+      // used to be rejected there with a 400 (hermes_proxy.py), so a
+      // Hermes-backend turn never had a session to poll for; since #642
+      // Hermes drives that persona itself (lifeos_agent_spawn) instead of
+      // 400ing, but that's still not a LifeOS-linked session this client can
+      // poll, so the gate stays lifeos-only (personaOrchestrates() is false
+      // for hermes now too, #642 — see persona.js).
       if (mode === 'lifeos' && personaOrchestrates()) {
         startPendingQuestionPolling(data.conversation_id);
       }

@@ -339,6 +339,7 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 | `TELEGRAM_THERAPIST_BOT_TOKEN` / `TELEGRAM_THERAPIST_CHAT_ID` | `therapist` | Pure chat — advice-oriented surface grounded in therapy notes. |
 | `TELEGRAM_DOCTOR_BOT_TOKEN` / `TELEGRAM_DOCTOR_CHAT_ID` | `doctor` | **Orchestration** — self-repair surface that files an issue and ships a fix. See [doctor-bot.md](doctor-bot.md). |
 | `TELEGRAM_FINANCE_BOT_TOKEN` / `TELEGRAM_FINANCE_CHAT_ID` | `finance` | Pure chat — financial-planning surface grounded in the investments snapshot + Monarch. |
+| `TELEGRAM_JOURNAL_BOT_TOKEN` / `TELEGRAM_JOURNAL_CHAT_ID` | `journal` | Pure chat — captures disjointed fragments into `Personal/Log/`, never `Personal/Journal/`. |
 
 ### Monarch Money
 

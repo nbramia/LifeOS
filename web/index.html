@@ -511,9 +511,11 @@
         .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
 
         /* "Runs on LifeOS" toolbar badge (#596): shown whenever the selected
-           persona orchestrates (spawns a background Claude Code session),
-           regardless of which text backend is selected — that spawn path has
-           no Hermes/Agent equivalent, so the turn always lands on LifeOS. */
+           persona orchestrates on the LifeOS backend specifically (spawns a
+           background Claude Code session). Since #642, Hermes drives an
+           orchestrating persona itself (lifeos_agent_spawn) instead of having
+           its turn diverted to LifeOS, so the badge no longer shows there —
+           only on lifeos. Agent has no persona pass-through at all. */
         .orchestrates-badge:not([hidden]) {
             display: inline-flex;
             align-items: center;
@@ -2874,12 +2876,13 @@
         <!-- Top-of-chat selector toolbar (#361 UI): persona + routing + backend -->
         <div class="chat-toolbar">
             <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
-            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona always runs on the LifeOS backend, no matter which backend is selected">⚙️ Runs on LifeOS</span>
+            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona runs on LifeOS as a background Claude Code session">⚙️ Runs on LifeOS</span>
             <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
                 <option value="auto">🤖 Auto</option>
                 <option value="sonnet">Sonnet</option>
                 <option value="opus">Opus</option>
                 <option value="gemma">Gemma (local)</option>
+                <option value="remote" id="modelOptionRemote" hidden>Remote</option>
                 <option value="claude_code">💻 Claude Code</option>
             </select>
             <div class="backend-toggle" role="group" aria-label="Text backend">

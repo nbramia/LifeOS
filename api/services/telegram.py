@@ -491,7 +491,7 @@ class TelegramBotListener:
     Forwards messages through the LifeOS chat pipeline and sends responses back.
     """
 
-    _STATE_FILE = Path("data/telegram_state.json")
+    _STATE_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "telegram_state.json"
     _DEDUP_WINDOW = 1000  # Track last N message IDs for deduplication
 
     def __init__(self, bot: Optional[TelegramBotConfig] = None):

@@ -48,6 +48,11 @@ class TelegramBotConfig:
     # per-turn escalation, so setting a persona `model` is currently a no-op.
     voice: tuple[str, ...] = ()
     model: str = ""
+    # The registry's `persona_file` path, kept alongside the already-parsed
+    # `persona` body so `resolve_persona(surface=...)` can look for a sibling
+    # surface-variant file (see `_surface_variant_body`) without re-reading
+    # the registry. Empty when the bot has no persona_file, matching `persona`.
+    persona_file: str = ""
 
 
 def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], str]":
@@ -80,16 +85,48 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     return post.content.strip(), voice, model
 
 
-def _load_primary_persona() -> "tuple[str, tuple[str, ...], str]":
+def _surface_variant_body(persona_file: str, default_body: str, surface: "str | None", name: str) -> str:
+    """The persona body for ``surface``, falling back to ``default_body``.
+
+    General mechanism for a persona whose execution model genuinely differs
+    by surface (e.g. `doctor` on Telegram/web, which drives a headless Claude
+    Code session with a shell, vs. on Hermes, which has MCP tools and no
+    shell — see #641). ``surface=None`` — every call site before this existed,
+    and every call site that hasn't opted in — always returns ``default_body``
+    untouched, with no extra filesystem access: byte-identical to before this
+    existed. A named surface checks for a sibling ``<stem>.<surface><suffix>``
+    file next to ``persona_file`` (e.g. ``config/personas/doctor.md`` ->
+    ``config/personas/doctor.hermes.md``); if it exists, its body (parsed the
+    same way, frontmatter stripped) replaces the default one. A persona with
+    no such sibling — the common case — resolves identically on every
+    surface, so adding a variant for one persona never affects any other, and
+    a new persona gains the mechanism for free just by dropping the file in.
+    """
+    if not surface or not persona_file:
+        return default_body
+    pf = Path(persona_file)
+    variant_path = pf.parent / f"{pf.stem}.{surface}{pf.suffix}"
+    if not variant_path.exists():
+        return default_body
+    try:
+        return _parse_persona(variant_path.read_text(), f"{name} ({surface})")[0]
+    except OSError as e:
+        logger.warning(f"persona {name!r}: could not read surface variant {variant_path}: {e}")
+        return default_body
+
+
+def _load_primary_persona(surface: "str | None" = None) -> "tuple[str, tuple[str, ...], str]":
     """Load the primary persona from ``config/personas/primary.md`` if present.
 
     Primary has no registry entry, so its preamble (and ``voice``/``model``) come
     from this file directly. An absent file → no preamble, the historical default.
+    ``surface`` behaves as in ``resolve_persona`` — see ``_surface_variant_body``.
     """
     try:
-        return _parse_persona(_PRIMARY_PERSONA_FILE.read_text(), "primary")
+        body, voice, model = _parse_persona(_PRIMARY_PERSONA_FILE.read_text(), "primary")
     except OSError:
         return "", (), ""
+    return _surface_variant_body(str(_PRIMARY_PERSONA_FILE), body, surface, "primary"), voice, model
 
 
 # Capabilities advertised to HTTP clients. The primary persona and any
@@ -104,6 +141,7 @@ class PersonaInfo:
     id: str
     label: str
     capabilities: list = field(default_factory=list)
+    orchestrates: bool = False
 
 
 class Settings(BaseSettings):
@@ -384,6 +422,60 @@ class Settings(BaseSettings):
     def routing_llm_url(self) -> str:
         """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
         return self.local_routing_llm_url or self.local_llm_url
+
+    # Paid OpenAI-compatible remote provider (#654) — e.g. Fireworks running
+    # DeepSeek/Qwen/etc. An explicit per-turn model pick (like "gemma"/local),
+    # never something the escalation ladder can reach on its own (ADR-018):
+    # NON_API_RUNGS in agent_loop.py already filters any non-local rung out
+    # of an operator-configured ladder, so naming this provider there is a
+    # no-op, not a bypass. Configured as provider + model + key + rates here
+    # so swapping the upstream model is a settings change, not a code change.
+    remote_llm_base_url: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_URL",
+        description="Base URL of an OpenAI-compatible remote provider "
+                    "(e.g. https://api.fireworks.ai/inference/v1). Empty "
+                    "(default) disables the provider entirely — it's hidden "
+                    "from the chat model picker and model_override=\"remote\" "
+                    "is ignored."
+    )
+    remote_llm_model: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_MODEL",
+        description="Model id to send in the request body, e.g. "
+                    "accounts/fireworks/models/deepseek-v4-flash-0731."
+    )
+    remote_llm_api_key: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_API_KEY",
+        description="Bearer token for the remote provider."
+    )
+    remote_llm_label: str = Field(
+        default="Remote", alias="LIFEOS_REMOTE_LLM_LABEL",
+        description="Display label for the chat model picker option."
+    )
+    remote_llm_timeout: int = Field(
+        default=90, alias="LIFEOS_REMOTE_LLM_TIMEOUT",
+        description="Request timeout (seconds) for the remote provider."
+    )
+    remote_llm_input_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK",
+        description="USD per million input tokens. Unset (default, distinct "
+                    "from 0.0) means the rate isn't known — a turn on this "
+                    "provider then records as unpriced rather than a guess, "
+                    "the same 'we don't know, don't invent' convention #613 "
+                    "gave the usage store an unpriced column for."
+    )
+    remote_llm_output_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK",
+        description="USD per million output tokens. See "
+                    "remote_llm_input_price_per_mtok for the unset/0.0 distinction."
+    )
+
+    @property
+    def remote_llm_configured(self) -> bool:
+        """True once there's enough to actually run a turn: URL, model, and
+        key. Pricing is independent — an operator can wire up the endpoint
+        before rates are known; such a turn still runs, it just records as
+        unpriced (see remote_llm_input_price_per_mtok)."""
+        return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
 
     # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
     mcp_http_port: int = Field(
@@ -1064,7 +1156,7 @@ class Settings(BaseSettings):
             bots.append(TelegramBotConfig(
                 name=name, token=token, chat_id=chat_id, persona=persona, label=label,
                 orchestrates=bool(entry.get("orchestrates", False)),
-                voice=voice, model=model,
+                voice=voice, model=model, persona_file=persona_file or "",
             ))
         return bots
 
@@ -1078,11 +1170,17 @@ class Settings(BaseSettings):
         bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
         bots advertise none. Adding a registry entry + its token env var surfaces
         a new persona on the next restart with no code change.
+
+        ``orchestrates`` is sourced from ``persona_orchestrates()`` — the same
+        check real routing (chat.py, hermes_proxy.py) uses — rather than
+        derived from ``capabilities``, which happen to be identical for
+        ``primary`` and an orchestrating bot like ``doctor`` (#643).
         """
         personas = [PersonaInfo(
             id="primary",
             label="Primary",
             capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
+            orchestrates=self.persona_orchestrates("primary"),
         )]
         for bot in self.telegram_bots:
             personas.append(PersonaInfo(
@@ -1091,22 +1189,32 @@ class Settings(BaseSettings):
                 capabilities=(
                     list(ORCHESTRATOR_PERSONA_CAPABILITIES) if bot.orchestrates else []
                 ),
+                orchestrates=self.persona_orchestrates(bot.name),
             ))
         return personas
 
-    def resolve_persona(self, persona_id: str) -> "str | None":
+    def resolve_persona(self, persona_id: str, surface: "str | None" = None) -> "str | None":
         """Resolve a persona id to its system-prompt preamble for HTTP clients.
 
         Same registry source as Telegram, so ``persona_id="fitness"`` yields the
         exact preamble the fitness Telegram bot uses. ``"primary"`` resolves to
         an empty preamble (the default, no persona). Returns ``None`` for an
         unknown id so the caller can reject it with HTTP 400.
+
+        ``surface`` selects a surface-specific variant of the body when one
+        exists — e.g. ``surface="hermes"`` for a persona whose execution model
+        differs on the Hermes harness (MCP tools, no shell) from Telegram/web
+        (a headless Claude Code session). See ``_surface_variant_body``.
+        Omitted (the default, ``None``), every caller — including every one
+        that predates this parameter — gets exactly today's body; a persona
+        with no variant for the requested surface also gets exactly today's
+        body, so this is additive until a variant file exists.
         """
         if persona_id == "primary":
-            return _load_primary_persona()[0]
+            return _load_primary_persona(surface)[0]
         for bot in self.telegram_bots:
             if bot.name == persona_id:
-                return bot.persona
+                return _surface_variant_body(bot.persona_file, bot.persona, surface, persona_id)
         return None
 
     def persona_voice(self, persona_id: str) -> "tuple[str, ...]":

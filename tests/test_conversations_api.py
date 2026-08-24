@@ -560,11 +560,12 @@ class TestAnswerInConversation:
         mock_store.add_message.assert_called_once()
 
     def test_answer_reaches_session_from_a_hermes_tagged_conversation(self, client, mock_store):
-        """#596: a session spawned from a Hermes-selected turn links to its
-        conversation exactly as on lifeos (test_persona_api.py's
-        test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes) — this
-        endpoint doesn't branch on `backend` at all, so the answer path must
-        work unchanged regardless of which backend tagged the thread."""
+        """#596: a LifeOS-spawned session whose conversation happens to be
+        tagged "hermes" (test_persona_api.py's
+        test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes) links
+        exactly as one tagged "lifeos" — this endpoint doesn't branch on
+        `backend` at all, so the answer path must work unchanged regardless of
+        which backend tagged the thread."""
         now = datetime.now()
         hermes_conv = Conversation(
             id="conv-403", title="Doctor session", created_at=now, updated_at=now,

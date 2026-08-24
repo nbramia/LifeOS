@@ -297,7 +297,15 @@ async def test_unknown_persona_400_and_not_forwarded(proxy_client):
     assert _received == {}  # rejected before the upstream backend was ever called
 
 
-async def test_orchestrating_persona_400_and_not_forwarded(proxy_client, tmp_path, monkeypatch):
+async def test_orchestrating_persona_no_longer_rejected(proxy_client, tmp_path, monkeypatch):
+    # #642: this used to be a 400 (test_orchestrating_persona_400_and_not_
+    # forwarded) — Hermes had no way to drive a background Claude Code
+    # session, so an orchestrating persona reaching this route was treated as
+    # a routing bug. #640 gave Hermes that capability, so the persona now
+    # reaches Hermes like any other: forwarded, 200, with `orchestrates: true`
+    # in the envelope (see test_orchestrates_field_is_derived_not_hardcoded
+    # and test_orchestrates_true_uses_hermes_surface_preamble for the rest of
+    # what changed alongside this).
     persona_file = tmp_path / "doctor.md"
     persona_file.write_text("DOCTOR PERSONA BODY")
     reg = _registry(tmp_path, [
@@ -309,24 +317,49 @@ async def test_orchestrating_persona_400_and_not_forwarded(proxy_client, tmp_pat
     resp = await proxy_client.post(
         "/api/hermes/ask/stream", json={"question": "hi", "persona_id": "doctor"},
     )
-    assert resp.status_code == 400
-    assert "doctor" in resp.json()["detail"]
-    assert _received == {}  # a routing failure, so this must never reach hermes
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["id"] == "doctor"
+    assert ctx["persona"]["orchestrates"] is True
+    assert ctx["persona"]["preamble"] == "DOCTOR PERSONA BODY"
+
+
+async def test_orchestrates_true_uses_hermes_surface_preamble(proxy_client, tmp_path, monkeypatch):
+    # #642: the envelope resolves persona_id with surface="hermes" so an
+    # orchestrating persona with a Hermes-specific variant (e.g.
+    # config/personas/doctor.hermes.md, #641) gets that body instead of the
+    # plain one — which claims shell/filesystem access Hermes doesn't have.
+    # A sibling `<stem>.hermes<suffix>` file next to persona_file (the naming
+    # rule _surface_variant_body uses) proves the surface parameter is
+    # actually threaded through, not just accepted and ignored.
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("PLAIN DOCTOR BODY (claims shell access)")
+    (tmp_path / "doctor.hermes.md").write_text("HERMES DOCTOR BODY (drives lifeos_agent_spawn)")
+    reg = _registry(tmp_path, [
+        {"name": "doctor", "token_env": "TG_DOC", "persona_file": str(persona_file), "orchestrates": True},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_DOC", "tok")
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "persona_id": "doctor"},
+    )
+    assert resp.status_code == 200
+    ctx = json.loads(_received["body"])["lifeos_context"]
+    assert ctx["persona"]["preamble"] == "HERMES DOCTOR BODY (drives lifeos_agent_spawn)"
 
 
 async def test_orchestrates_field_is_derived_not_hardcoded(proxy_client, monkeypatch):
-    # Guards against a regression to a literal `"orchestrates": False` in the
-    # envelope. Both the pre-stream guard and the envelope call
-    # settings.persona_orchestrates(persona_id); a spy returns False on the
-    # first call (so the guard lets the turn through, as it would for any
-    # ordinary persona) and True on every call after. A hardcoded literal
-    # would report False here regardless of what the guard saw — only a real
-    # second call to persona_orchestrates() can surface True.
+    # Guards against a regression to a literal `"orchestrates": False` (or,
+    # since #642 removed the guard that used to make every real call False in
+    # practice, a literal `True`) in the envelope. A spy that always returns
+    # True proves the field reflects a real call to
+    # settings.persona_orchestrates(), not a hardcoded literal.
     calls = {"n": 0}
 
     def _spy(self, persona_id):
         calls["n"] += 1
-        return calls["n"] > 1
+        return True
 
     # settings is a pydantic model instance — arbitrary attributes can't be
     # set on it directly (only declared fields), so the method is patched on
@@ -337,7 +370,7 @@ async def test_orchestrates_field_is_derived_not_hardcoded(proxy_client, monkeyp
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
     assert ctx["persona"]["orchestrates"] is True
-    assert calls["n"] >= 2
+    assert calls["n"] >= 1
 
 
 async def test_malformed_json_400_and_not_forwarded(proxy_client):
@@ -393,7 +426,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     ctx = json.loads(_received["body"])["lifeos_context"]
     turn = ctx["turn"]
     # Literal keys pinned by the cross-repo schema comment on #590, exactly —
-    # not a subset check.
+    # not a subset check. `caller_session_id` (#640) is the one key added
+    # here rather than by build_turn_context() itself — see hermes_proxy.py.
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
@@ -401,6 +435,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
         "session_cost_is_lower_bound",
+        "caller_session_id",
     }
     assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
     assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
@@ -409,9 +444,15 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert isinstance(turn["personal_context"], str)  # may be empty
     assert isinstance(turn["existing_tags"], list)
     assert isinstance(turn["tags_instruction"], str) and turn["tags_instruction"]
+    assert isinstance(turn["caller_session_id"], str) and turn["caller_session_id"]
     # `turn` and `persona` are siblings under `lifeos_context`, never merged
-    # into one object — each key set is disjoint from the other's.
+    # into one object — each key set is disjoint from the other's. This is
+    # the separation #640's caller_session_id must respect too: it lands in
+    # `turn` (per-turn, never prompt-cached), not `persona` (stable across a
+    # conversation, prompt-cacheable — a per-turn value there would bust
+    # that cache every request).
     assert set(turn.keys()).isdisjoint(set(ctx["persona"].keys()))
+    assert "caller_session_id" not in ctx["persona"]
 
 
 async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch):
@@ -448,7 +489,179 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     assert hermes_resp.status_code == 200
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
-    assert envelope_turn == endpoint_turn
+    # `caller_session_id` (#640) is the one deliberate difference: it's an
+    # agent-worker session identity Hermes needs and the plain turn-context
+    # endpoint has no reason to hand out (it creates nothing). Every other
+    # field must still come from the identical build_turn_context() call.
+    assert "caller_session_id" not in endpoint_turn
+    envelope_turn_without_session = dict(envelope_turn)
+    caller_session_id = envelope_turn_without_session.pop("caller_session_id")
+    assert isinstance(caller_session_id, str) and caller_session_id
+    assert envelope_turn_without_session == endpoint_turn
+
+
+# ---------------------------------------------------------------------------
+# `caller_session_id` lifecycle (#640) — a real agent-worker session backs
+# the id handed to Hermes, so `lifeos_agent_*` calls (which all require a
+# resolvable `caller_session_id`, see inter_agent.py) work from a Hermes
+# turn instead of failing with `no_caller`.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def agent_session_store(tmp_path, monkeypatch):
+    """A real SessionStore on a throwaway db, wired in place of the class
+    `hermes_proxy._resolve_caller_session_id` locally imports (#640) — same
+    isolation pattern as `hermes_store`/`usage_store` above, applied to the
+    class itself (rather than a module-level singleton) because
+    `_resolve_caller_session_id` constructs a fresh `SessionStore()` per
+    call, mirroring how every other API route touches this store."""
+    from api.services.agent_worker.session_store import SessionStore
+
+    store = SessionStore(str(tmp_path / "agent_sessions.db"))
+    monkeypatch.setattr(
+        "api.services.agent_worker.session_store.SessionStore",
+        lambda *a, **kw: store,
+    )
+    return store
+
+
+async def test_caller_session_id_resolves_to_a_real_session(proxy_client, agent_session_store):
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    session = agent_session_store.get_by_session_id(caller_session_id)
+    assert session is not None
+    assert session.routing == "hermes"
+    assert session.origin == "hermes"
+
+
+async def test_caller_session_id_is_stable_across_turns_of_the_same_conversation(
+    proxy_client, agent_session_store,
+):
+    """Once a conversation has an id, every turn resolves to the SAME
+    session — the per-conversation lifecycle this module chose (see
+    hermes_session.py's module docstring) so a worker spawned on one turn
+    is still reachable, under the same lineage root, on a later one."""
+    payload = {"question": "hi", "conversation_id": "conv-stable-640"}
+    resp1 = await proxy_client.post("/api/hermes/ask/stream", json=payload)
+    caller_1 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    resp2 = await proxy_client.post("/api/hermes/ask/stream", json=payload)
+    caller_2 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    assert caller_1 == caller_2
+    # Exactly one row was created, not one per turn.
+    assert len(agent_session_store.list_sessions(routing="hermes")) == 1
+
+
+async def test_caller_session_id_differs_across_conversations(proxy_client, agent_session_store):
+    resp1 = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-a-640"},
+    )
+    caller_a = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    resp2 = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-b-640"},
+    )
+    caller_b = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    assert caller_a != caller_b
+
+
+async def test_spawn_succeeds_from_a_hermes_turns_caller_session_id(proxy_client, agent_session_store, tmp_path):
+    """Acceptance criterion: a Hermes turn's caller_session_id can spawn —
+    the exact call that returned `no_caller` before #640, since Hermes had
+    no session at all."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-spawn-640"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    ctx = inter_agent.InterAgentContext(
+        session_store=agent_session_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        caller_session_id=caller_session_id,
+        caps=inter_agent.Caps(),
+    )
+    result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "look something up", "model": "claude_code",
+    })
+
+    assert result["ok"] is True, result
+
+
+async def test_spawn_model_claude_blocked_from_a_hermes_root(proxy_client, agent_session_store, tmp_path):
+    """The spend guard (#640, extending #578/ADR-018): a Hermes-rooted
+    session is not API-billed, so it may not open the model="claude" side
+    door any more than a claude_code/codex root can."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "conversation_id": "conv-blocked-640"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    ctx = inter_agent.InterAgentContext(
+        session_store=agent_session_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        caller_session_id=caller_session_id,
+        caps=inter_agent.Caps(),
+    )
+    result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "do some background work", "model": "claude",
+    })
+
+    assert result["ok"] is False
+    assert result["error"] == "api_billing_blocked"
+
+
+async def test_worker_spawned_on_one_turn_resolves_via_check_on_a_later_turn(
+    proxy_client, agent_session_store, tmp_path,
+):
+    """Acceptance criterion: a session Hermes spawns doesn't vanish once its
+    spawning turn ends — a later turn's lifeos_agent_check still finds it."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    transcript = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    conv_payload = {"question": "spawn a worker", "conversation_id": "conv-later-640"}
+
+    # Turn 1: resolve identity and spawn a child.
+    resp1 = await proxy_client.post("/api/hermes/ask/stream", json=conv_payload)
+    assert resp1.status_code == 200
+    caller_turn_1 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    ctx_turn_1 = inter_agent.InterAgentContext(
+        session_store=agent_session_store, transcript_store=transcript,
+        caller_session_id=caller_turn_1, caps=inter_agent.Caps(),
+    )
+    spawn_result = inter_agent.dispatch(ctx_turn_1, "lifeos_agent_spawn", {
+        "prompt": "background task", "model": "claude_code",
+    })
+    assert spawn_result["ok"] is True, spawn_result
+    child_session_id = spawn_result["child_session_id"]
+
+    # Turn 2: same conversation, later request — same caller identity.
+    resp2 = await proxy_client.post("/api/hermes/ask/stream", json=conv_payload)
+    assert resp2.status_code == 200
+    caller_turn_2 = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    assert caller_turn_2 == caller_turn_1
+
+    ctx_turn_2 = inter_agent.InterAgentContext(
+        session_store=agent_session_store, transcript_store=transcript,
+        caller_session_id=caller_turn_2, caps=inter_agent.Caps(),
+    )
+    check_result = inter_agent.dispatch(ctx_turn_2, "lifeos_agent_check", {
+        "session_id": child_session_id,
+    })
+    assert check_result["ok"] is True
+    assert check_result["session_id"] == child_session_id
 
 
 # ---------------------------------------------------------------------------
@@ -1175,12 +1388,13 @@ async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_fir
 
 stub_hermes_usage = FastAPI()
 
-# cost_usd (0.00087) is deliberately *not* what Anthropic sonnet-fallback
-# pricing (api/services/cost_tracker.py's MODEL_PRICING, the price any
-# non-haiku/opus model falls through to) would compute for these same token
-# counts: (120/1e6)*3.0 + (340/1e6)*15.0 = 0.00546. Recording the wrong,
-# upstream-reported number rather than that recomputed one is exactly the
-# behavior under test — proof the store isn't quietly recalculating it.
+# cost_usd (0.00087) is deliberately *not* what the live pricing table
+# (agent_worker/pricing.py's cost_for, #656) would compute for this
+# unrecognized model -- its conservative Opus-rate fallback for these same
+# token counts: (120/1e6)*15.0 + (340/1e6)*75.0 = 0.0273. Recording the
+# wrong, upstream-reported number rather than that recomputed one is
+# exactly the behavior under test — proof the store isn't quietly
+# recalculating it.
 _USAGE_SSE_CHUNKS = [
     b'data: {"type": "conversation_id", "conversation_id": "usage-conv-1"}\n\n',
     b'data: {"type": "content", "content": "here is your answer"}\n\n',

@@ -17,6 +17,19 @@ route buffers the request body instead of streaming it straight through — the
 only place that happens among the text-backend proxies. The status/
 bearer-injection/streaming-response logic is otherwise shared with the Agent
 backend via `make_backend_router()` in `_proxy.py`.
+
+#642 CROSS-REPO CONTRACT CHANGE: `lifeos_context.persona.orchestrates` can now
+be `true` (previously always `false` — see `_build_envelope`'s comment on that
+field). Its meaning has changed too: no longer "a LifeOS bug leaked an
+orchestrating persona through, fail loudly" (the #590 contract's original
+reading, back when the guard below made `true` impossible in practice) but
+"this persona supervises workers through tools" — the intended path now that
+#640 gives Hermes a real way to act on it. As of this writing, Hermes's
+`lifeos_adapter/envelope.py` still raises `OrchestratingPersonaError` on
+`true` (a fatal exception, not a warning) — tracked as `nbramia/hermes#57` to
+make that informational instead. **This merge is gated on hermes#57 shipping
+and deploying first**; landing this side alone would 500 every doctor turn on
+Hermes rather than run one.
 """
 
 import json
@@ -65,6 +78,20 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=TIMEOUT)
 
 
+def _resolve_caller_session_id(conversation_id: Optional[str]) -> str:
+    """Hermes's `lifeos_agent_*` identity for this turn (#640).
+
+    `SessionStore` is imported locally (not at module top) so tests can
+    patch `api.services.agent_worker.session_store.SessionStore` in place —
+    the same isolation pattern `api/routes/conversations.py` uses for the
+    same class.
+    """
+    from api.services.agent_worker.hermes_session import resolve_hermes_caller_session_id
+    from api.services.agent_worker.session_store import SessionStore
+
+    return resolve_hermes_caller_session_id(SessionStore(), conversation_id)
+
+
 def _build_envelope(raw_body: bytes) -> bytes:
     """Attach `lifeos_context` to the forwarded body, resolving the persona.
 
@@ -92,18 +119,23 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # Same registry-backed resolution the native /api/ask/stream uses, and the
     # same default-to-primary behavior when no persona_id is sent.
     persona_id = parsed.persona_id or "primary"
-    preamble = settings.resolve_persona(persona_id)
+    # surface="hermes" (#642): an orchestrating persona (e.g. doctor) has a
+    # Hermes-specific preamble (config/personas/doctor.hermes.md, #641)
+    # describing a Claude Code worker driven via lifeos_agent_spawn, not the
+    # plain Telegram/web body's "you have shell access" framing — Hermes has
+    # neither a shell nor that tool under the plain framing. A persona with no
+    # `.hermes.md` variant (the common case) resolves to exactly the body this
+    # returned before this parameter existed.
+    preamble = settings.resolve_persona(persona_id, surface="hermes")
     if preamble is None:
         raise HTTPException(status_code=400, detail=f"Unknown persona_id: {persona_id!r}")
-    if settings.persona_orchestrates(persona_id):
-        # Orchestrating personas (e.g. doctor) drive a background Claude Code
-        # session — a LifeOS-native capability Hermes doesn't have. Routing
-        # those turns to LifeOS instead is a client-side decision (#596); this
-        # persona reaching the proxy means that routing didn't happen.
-        raise HTTPException(
-            status_code=400,
-            detail=f"persona_id {persona_id!r} orchestrates and cannot be forwarded to the hermes backend",
-        )
+    # #642: an orchestrating persona used to be rejected here with a 400 —
+    # Hermes had no way to drive a background Claude Code session, so routing
+    # one to LifeOS instead was a client-side decision (#596). #640 gave
+    # Hermes that capability (lifeos_agent_spawn + a per-conversation
+    # caller_session_id), so the persona now reaches Hermes like any other;
+    # the surface-specific preamble resolved above is what actually tells it
+    # to spawn and supervise a worker instead of answering inline.
 
     # Spoken-style rules apply only on voice turns, matching the exact gate
     # ask_stream() uses in api/routes/chat.py: `modality == "voice" and
@@ -123,6 +155,21 @@ def _build_envelope(raw_body: bytes) -> bytes:
     # that already passed validation.
     label = next(p.label for p in settings.list_http_personas() if p.id == persona_id)
 
+    turn = build_turn_context(persona_id, parsed.conversation_id)
+    # `caller_session_id` (#640) is added here, on the envelope's copy of
+    # `turn`, rather than folded into `build_turn_context()` itself —
+    # that function is shared with the plain `GET /api/chat/turn-context`
+    # endpoint, which has no agent-worker session to hand out and must stay
+    # untouched. It belongs in `turn`, never `persona`: `persona` is stable
+    # across a conversation and prompt-cacheable, and while this value IS
+    # stable across a conversation's turns (see hermes_session.py), putting
+    # a session-identity concern in the cacheable half would still be the
+    # wrong layering — `persona` describes the bot, `turn` describes this
+    # request. Additive at schema_version 1 (no version bump): a consumer
+    # that doesn't know this key ignores it exactly as it would any other
+    # unrecognized field.
+    turn["caller_session_id"] = _resolve_caller_session_id(parsed.conversation_id)
+
     data["lifeos_context"] = {
         "schema_version": 1,
         "modality": modality,
@@ -131,13 +178,22 @@ def _build_envelope(raw_body: bytes) -> bytes:
             "label": label,
             "preamble": preamble,
             "voice_rules": voice_rules,
-            # Derived, not hardcoded: the guard above already rejects an
-            # orchestrating persona with a 400 before this point, so this is
-            # always False in practice today. But the pinned contract tells
-            # Hermes to fail loudly if it ever sees `true` here — a hardcoded
-            # False would lie to that check if the guard above ever moved,
-            # weakened, or got reordered. Deriving costs nothing and keeps
-            # this field honest regardless.
+            # #642 CROSS-REPO CONTRACT CHANGE: this can now be `true` (e.g.
+            # doctor). The #590 contract told Hermes to fail loudly if it ever
+            # saw `true` here, back when the 400 guard above made that
+            # impossible in practice — `true` meant "a LifeOS bug leaked an
+            # orchestrating persona through," so refusing was correct. That
+            # guard is gone: #640 gave Hermes its own way to drive a
+            # background Claude Code session (lifeos_agent_spawn), so `true`
+            # now means "this persona supervises workers through tools" — the
+            # intended path, not a bug. Sent as `true` deliberately (not
+            # hardcoded `false` to keep the old tripwire quiet) precisely
+            # because the field is derived and honest: doctor genuinely
+            # orchestrates, and that's the entire point of routing it here.
+            # Hermes's `lifeos_adapter/envelope.py` still raises
+            # `OrchestratingPersonaError` (fatal) on `true` as of this
+            # writing — `nbramia/hermes#57` makes that informational instead.
+            # THIS MERGE IS GATED ON hermes#57 shipping and deploying first.
             "orchestrates": settings.persona_orchestrates(persona_id),
         },
         # A sibling of `persona`, never merged into it (#591) — `persona` is
@@ -147,7 +203,7 @@ def _build_envelope(raw_body: bytes) -> bytes:
         # from `persona_id` alone, unlike the native path's Telegram-preamble
         # reverse lookup above — Hermes turns always carry a persona_id (or
         # default to "primary"), so that reverse lookup doesn't apply here.
-        "turn": build_turn_context(persona_id, parsed.conversation_id),
+        "turn": turn,
     }
     return json.dumps(data).encode("utf-8")
 
@@ -184,11 +240,11 @@ class _HermesTurnPersister:
     Usage capture (#595) shares this same observer rather than adding a
     second one over the same stream: the `usage` event's cost is recorded
     **verbatim**, never recomputed from the token counts — the cost
-    calculator (`api/services/cost_tracker.py`) only knows Anthropic pricing
-    and would misprice a non-Anthropic upstream model badly. A malformed or
-    partial `usage` event (missing/wrong-typed model or token counts) is
-    ignored rather than raised; a well-formed event with no `cost_usd` is
-    recorded with a zero cost rather than an invented one.
+    calculator (`agent_worker/pricing.py`'s `cost_for`, #656) only knows
+    Anthropic pricing and would misprice a non-Anthropic upstream model
+    badly. A malformed or partial `usage` event (missing/wrong-typed model or
+    token counts) is ignored rather than raised; a well-formed event with no
+    `cost_usd` is recorded with a zero cost rather than an invented one.
 
     #611: `_proxy.py`'s pump now runs as a detached, registry-owned
     background task, so `finalize()` fires on the REAL end of the turn (the
@@ -407,8 +463,9 @@ class _HermesTurnPersister:
 def _make_persister(raw_body: bytes) -> Optional[_HermesTurnPersister]:
     """Build this turn's persistence tee (#592) from the same raw, pre-
     transform body `_build_envelope` already validated — a malformed body or
-    an unknown/orchestrating persona 400s there before this is ever reached,
-    so only minimal reparsing (question text + persona id) is needed here.
+    an unknown persona 400s there before this is ever reached (an
+    orchestrating persona no longer does, #642), so only minimal reparsing
+    (question text + persona id) is needed here.
     """
     try:
         data = json.loads(raw_body)

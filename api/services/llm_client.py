@@ -387,26 +387,57 @@ def _consume_think_stream(buffer: str, phase: str) -> tuple[str, str, str]:
 
 
 class LocalLLMClient:
-    """Client for the local OpenAI-compatible LLM server (llama-server)."""
+    """Client for an OpenAI-compatible chat-completions server.
 
+    Not llama-server-specific despite the name (kept for the common case —
+    most callers still mean "the local llama-server"): `base_url`, `model`,
+    and `api_key` are all constructor overrides, so the same class also
+    drives a paid OpenAI-compatible remote (e.g. Fireworks, #654) by
+    pointing it at that provider's URL/model and passing an API key. Every
+    default (`model="local"`, `api_key=None` — no auth header) reproduces
+    the exact llama-server behavior this class had before those parameters
+    existed, so an existing local-only call site is unaffected.
+    """
     def __init__(
         self,
         base_url: str | None = None,
         timeout: float | None = None,
         *,
         model: str = "local",
-        api_key: str = "",
+        api_key: str | None = None,
         headers: dict[str, str] | None = None,
     ):
         self.base_url = (base_url or getattr(settings, "local_llm_url", None) or "http://localhost:8080").rstrip("/")
         self.timeout = timeout or getattr(settings, "local_llm_timeout", 90)
-        self.model = model
-        self.api_key = api_key
+        self._model = model
+        self._api_key = api_key
         self.headers = dict(headers or {})
-        if self.api_key:
-            self.headers.setdefault("Authorization", f"Bearer {self.api_key}")
+        if self._api_key:
+            self.headers.setdefault("Authorization", f"Bearer {self._api_key}")
         self._async_client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
+
+    def _auth_headers(self) -> dict[str, str]:
+        """`Authorization: Bearer <key>` when an API key was given, else no
+        extra headers at all — llama-server needs no auth, and adding an
+        empty/None header would change the request from what it is today."""
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+
+    @property
+    def model(self) -> str:
+        """The model identifier a usage-recording caller should attribute
+        this client's turns to (#661), and what's actually sent on the wire.
+
+        For plain llama-server usage this is the constructor default,
+        "local" — llama-server is configured with a single model at process
+        start, not chosen per-request, and the pricing table keys the free
+        local rate under that literal sentinel (see agent_worker/pricing.py)
+        rather than under a specific gguf name. A configured remote provider
+        (#654) passes its real model id at construction instead, since there
+        the id both goes on the wire and is what a caller needs to price
+        and attribute the turn correctly — read-only so nothing downstream
+        of construction can drift it out of sync with what was sent."""
+        return self._model
 
     @property
     def async_client(self) -> httpx.AsyncClient:
@@ -838,6 +869,15 @@ class AnthropicLLMClient:
         self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
+
+    @property
+    def model(self) -> str:
+        """The model id this client actually sends on every request (#661)
+        -- the resolved default (`settings.anthropic_model`) or the
+        per-turn override passed to `__init__` (escalation, an explicit
+        picker choice). A usage-recording caller needs this, not a
+        construction-time guess, to attribute a turn's real cost."""
+        return self._model
 
     def _prepare_system(self, system: str | list | None) -> str | list | None:
         """Return the ``system`` value for the Anthropic SDK unchanged.

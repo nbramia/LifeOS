@@ -430,6 +430,43 @@ def test_local_is_a_legal_rung(monkeypatch):
     assert (model, escalated) == ("local", True)
 
 
+def test_remote_is_never_a_legal_escalation_rung(monkeypatch):
+    """(#654) The remote provider is a paid engine, same category as an
+    Anthropic model id — it must never be reachable from auto-escalation,
+    even if an operator mistakenly names it in LIFEOS_AGENT_ESCALATION_LADDER.
+    NON_API_RUNGS filters it out exactly like it would filter "claude-opus-4-8"
+    (ADR-018: no API spend without explicit operator intent)."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "remote,claude_code", raising=False,
+    )
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(1), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
+    )
+    assert (model, escalated) == ("claude_code", True)
+
+
+def test_remote_alone_in_ladder_leaves_nothing_to_climb(monkeypatch):
+    """Mirrors test_api_rungs_are_filtered_out_of_a_configured_ladder: an
+    all-remote ladder is exactly as inert as an all-API one."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.agent_escalation_ladder",
+        "remote", raising=False,
+    )
+    model, escalated = resolve_orchestrator_model(
+        _refusal_history(3), _PUSHBACK,
+        base_model="claude-haiku-4-5", escalation_model="claude-sonnet-5",
+    )
+    assert (model, escalated) == ("claude-haiku-4-5", False)
+
+
+def test_remote_not_in_non_api_rungs():
+    """Direct regression guard on the source of truth itself."""
+    from api.services.agent_loop import NON_API_RUNGS
+    assert "remote" not in NON_API_RUNGS
+
+
 # ---------------------------------------------------------------------------
 # engine handoff directives (#305 part b)
 # ---------------------------------------------------------------------------
@@ -552,3 +589,44 @@ def test_force_local_reuses_singleton_on_local_backend(monkeypatch):
     monkeypatch.setattr("api.services.agent_loop.get_local_llm", lambda: sentinel)
     # Already local — reuse the singleton rather than build another client.
     assert _select_client("", force_local=True) is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Model picker: per-turn remote provider ("Remote", #654)
+# ---------------------------------------------------------------------------
+
+def test_force_remote_builds_client_from_settings(monkeypatch):
+    """The "Remote" picker option builds a LocalLLMClient (same class Gemma
+    uses) pointed at whatever the operator configured — provider swap is a
+    settings change, never a code change."""
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.remote_llm_base_url",
+        "https://api.fireworks.ai/inference/v1", raising=False,
+    )
+    monkeypatch.setattr(
+        "api.services.agent_loop.settings.remote_llm_model",
+        "accounts/fireworks/models/deepseek-v4-flash-0731", raising=False,
+    )
+    monkeypatch.setattr("api.services.agent_loop.settings.remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr("api.services.agent_loop.settings.remote_llm_timeout", 42, raising=False)
+
+    client = _select_client("", force_remote=True)
+
+    from api.services.llm_client import LocalLLMClient
+    assert isinstance(client, LocalLLMClient)
+    assert client.base_url == "https://api.fireworks.ai/inference/v1"
+    assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert client._api_key == "fw_test_key"
+    assert client.timeout == 42
+
+
+def test_force_remote_takes_precedence_over_force_local(monkeypatch):
+    """chat.py's dispatch only ever sets one of these, but force_remote is
+    the more specific per-turn switch and must win if both were ever set."""
+    monkeypatch.setattr("api.services.agent_loop.settings.remote_llm_base_url", "http://remote-fake", raising=False)
+    monkeypatch.setattr("api.services.agent_loop.settings.remote_llm_model", "m", raising=False)
+    monkeypatch.setattr("api.services.agent_loop.settings.remote_llm_api_key", "k", raising=False)
+
+    client = _select_client("", force_local=True, force_remote=True)
+
+    assert client.base_url == "http://remote-fake"
