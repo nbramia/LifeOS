@@ -44,7 +44,7 @@ MEMORY_SEARCH_CORPUS_LIMIT = 1000
 # Memory categories and their trigger patterns
 CATEGORY_PATTERNS = {
     "goals": [
-        r"\b(?:I|Amir)\s+(?:want|plan|hope|aim|intend)\s+to\b",
+        r"\b(?:I|Amir)\s+(?:want|wants|plan|plans|hope|hopes|aim|aims|intend|intends)\s+to\b",
         r"\btop\s+priorit(?:y|ies)\b",
         r"\b(?:my\s+)?(?:goal|vision)\s+(?:is|:)",
     ],
