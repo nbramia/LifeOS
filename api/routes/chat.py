@@ -66,7 +66,7 @@ def _requested_model_profile(question: str, profiles: dict) -> str | None:
         text,
     )
     candidate = match.group(1) if match else ""
-    if not candidate and re.match(r"^(?:please\s+)?use\s+the\s+strongest\s+model\b", text):
+    if candidate == "strongest" or re.match(r"^(?:please\s+)?use\s+the\s+strongest\s+model\b", text):
         candidate = "reasoning"
     if not candidate:
         return None
