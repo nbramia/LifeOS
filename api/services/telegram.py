@@ -581,7 +581,7 @@ async def chat_via_api(
     }
 
 
-async def chat_via_api_with_log(question: str) -> dict:
+async def chat_via_api_with_log(question: str, source: dict | None = None) -> dict:
     """Run a question through the chat pipeline and capture execution metadata.
 
     Like chat_via_api() but also returns tool_statuses, token usage, and cost
@@ -593,6 +593,8 @@ async def chat_via_api_with_log(question: str) -> dict:
     """
     port = settings.port
     body: dict = {"question": question}
+    if source:
+        body["source"] = source
 
     full_text = ""
     conv_id = None

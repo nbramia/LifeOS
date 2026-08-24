@@ -999,10 +999,21 @@ async def ask_stream(request: AskStreamRequest):
             # message. This is the recovery/review path when classification or
             # tool calling is incomplete.
             from api.services.inbox_store import add_item as add_inbox_item
-            inbox_item = add_inbox_item(
-                request.question,
-                conversation_id=conversation_id,
-                source=request.source or {"type": "chat"},
+            # Scheduled prompts are internal control-plane work, not user
+            # captures. Keeping their instruction text out of the Life Inbox
+            # prevents a weekly review from re-classifying its own prompt as a
+            # new reminder. The resulting memories/actions still receive the
+            # scheduler provenance through request.source.
+            _source = request.source or {"type": "chat"}
+            _internal_prompt = isinstance(_source, dict) and _source.get("type") == "scheduler"
+            inbox_item = (
+                {"id": ""}
+                if _internal_prompt
+                else add_inbox_item(
+                    request.question,
+                    conversation_id=conversation_id,
+                    source=_source,
+                )
             )
 
             # `/agent [local|claude] <task>` — spawn an operator agent on demand
