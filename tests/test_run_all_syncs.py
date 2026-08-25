@@ -1182,3 +1182,74 @@ class TestBackupRetentionGating:
 
         backup_mock.assert_called_once()
         prune_mock.assert_not_called()
+
+
+class TestPersonalGoogleGating:
+    """Direct tests of get_disabled_work_sources()'s personal-Google gating
+    (issue #687). Personal has no explicit on/off toggle like work/work2 --
+    "configured" means its OAuth credentials file exists. These call the
+    real function (unlike the higher-level run_all_syncs() tests above,
+    which patch it away entirely) so the settings-driven logic itself is
+    pinned.
+    """
+
+    def test_personal_disabled_when_no_credentials_file(self, monkeypatch):
+        from scripts.run_all_syncs import get_disabled_work_sources
+
+        monkeypatch.setattr(
+            "scripts.run_all_syncs._personal_google_credentials_exist", lambda: False
+        )
+        disabled = get_disabled_work_sources()
+        assert "gmail_personal" in disabled
+        assert "calendar_personal" in disabled
+
+    def test_personal_not_disabled_when_credentials_file_present(self, monkeypatch):
+        """Behavior-neutrality: a configured install (credentials file
+        present, exactly today's status quo) must see no change."""
+        from scripts.run_all_syncs import get_disabled_work_sources
+
+        monkeypatch.setattr(
+            "scripts.run_all_syncs._personal_google_credentials_exist", lambda: True
+        )
+        disabled = get_disabled_work_sources()
+        assert "gmail_personal" not in disabled
+        assert "calendar_personal" not in disabled
+
+    def test_personal_gating_independent_of_work_toggles(self, monkeypatch):
+        """Configured personal + unconfigured work must not cross-contaminate."""
+        from config.settings import settings
+        from scripts.run_all_syncs import get_disabled_work_sources
+
+        monkeypatch.setattr(
+            "scripts.run_all_syncs._personal_google_credentials_exist", lambda: True
+        )
+        monkeypatch.setattr(settings, "sync_work_gmail", False)
+        monkeypatch.setattr(settings, "work_email_domain", "")
+        disabled = get_disabled_work_sources()
+        assert "gmail_personal" not in disabled
+        assert "gmail_work" in disabled
+
+    def test_disabled_personal_source_has_distinct_reason(self):
+        """End-to-end through run_all_syncs(): a disabled personal source
+        must report reason='google_account_not_configured', not
+        'work_integration_disabled' -- it isn't a work integration, and
+        conflating the two would misreport why the source is quiet."""
+        from scripts.run_all_syncs import run_all_syncs
+
+        sync_sources = {
+            "gmail_personal": {"description": "Personal Gmail", "phase": 1, "frequency": "daily"},
+        }
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", sync_sources),
+            patch("scripts.run_all_syncs.SYNC_ORDER", ["gmail_personal"]),
+            patch("scripts.run_all_syncs.run_sync", MagicMock()),
+            patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+            patch(
+                "scripts.run_all_syncs.get_disabled_work_sources",
+                return_value={"gmail_personal"},
+            ),
+            patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        ):
+            result = run_all_syncs(dry_run=True)
+
+        assert result["results"]["gmail_personal"]["reason"] == "google_account_not_configured"
