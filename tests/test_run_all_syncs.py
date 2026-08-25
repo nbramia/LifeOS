@@ -149,6 +149,88 @@ class TestDependencySkip:
             assert stats.get("reason") != "dependency_failed"
 
 
+class TestRepeatedYieldExcludedFromNewRecords:
+    """Issue #646 acceptance criterion: the nightly summary must distinguish
+    'N new records' from 'N records re-written from an unchanged upstream
+    file' — a stale-input run must not report new interactions."""
+
+    def test_repeated_yield_source_excluded_from_aggregate_counts(self):
+        from scripts.run_all_syncs import run_all_syncs
+
+        def side_effect(source, dry_run=False):
+            if source == "source_a":
+                return True, {
+                    "interactions_created": 1294,
+                    "repeated_yield": {"repeated_value": 1294, "consecutive_runs": 10},
+                }
+            return True, {"interactions_created": 5}
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", TEST_SYNC_SOURCES),
+            patch("scripts.run_all_syncs.SYNC_ORDER", TEST_SYNC_ORDER),
+            patch("scripts.run_all_syncs.run_sync", MagicMock(side_effect=side_effect)),
+            patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+            patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+            patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        ):
+            result = run_all_syncs(dry_run=True)
+
+        assert result["repeated_yield_sources"] == ["source_a"]
+        # The flagged source's count must not appear in the "new" breakdown...
+        assert "source_a" not in result["interactions_by_source"]
+        # ...nor be folded into the aggregate total the Telegram/markdown
+        # "New Interactions" line reports — only the 7 other sources' real
+        # counts (5 each) should be there.
+        assert result["interactions_created"] == 35
+
+
+def test_run_all_syncs_surfaces_apple_agent_sha_drift():
+    """run_all_syncs() reads the SHA-drift signal directly from the Apple
+    import manifest (independent of the apple_import subprocess) and puts
+    it on the result dict so the Telegram/markdown summary can show it."""
+    from scripts.run_all_syncs import run_all_syncs
+
+    drifted_manifest = {
+        "exported_at": "2026-08-20T00:00:00+00:00",
+        "_agent_sha_drift_message": (
+            "Apple Data Agent exported from b347e1f, which differs from this "
+            "host's main (c13ba77) — its self-update may have failed."
+        ),
+    }
+
+    with (
+        patch("scripts.run_all_syncs.SYNC_SOURCES", TEST_SYNC_SOURCES),
+        patch("scripts.run_all_syncs.SYNC_ORDER", TEST_SYNC_ORDER),
+        patch("scripts.run_all_syncs.run_sync", MagicMock(side_effect=_make_run_sync_side_effect(set()))),
+        patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+        patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+        patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        patch("scripts.apple_data_import.check_manifest", return_value=drifted_manifest),
+    ):
+        result = run_all_syncs(dry_run=True)
+
+    assert result["apple_agent_sha_drift"] == drifted_manifest["_agent_sha_drift_message"]
+
+
+def test_run_all_syncs_sha_drift_absent_when_no_manifest():
+    """No Apple import configured (fresh clone, no manifest.json) must not
+    surface a drift warning or raise."""
+    from scripts.run_all_syncs import run_all_syncs
+
+    with (
+        patch("scripts.run_all_syncs.SYNC_SOURCES", TEST_SYNC_SOURCES),
+        patch("scripts.run_all_syncs.SYNC_ORDER", TEST_SYNC_ORDER),
+        patch("scripts.run_all_syncs.run_sync", MagicMock(side_effect=_make_run_sync_side_effect(set()))),
+        patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+        patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+        patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+        patch("scripts.apple_data_import.check_manifest", return_value=None),
+    ):
+        result = run_all_syncs(dry_run=True)
+
+    assert result["apple_agent_sha_drift"] is None
+
+
 # =============================================================================
 # LLM Memory Gating Tests
 # =============================================================================
@@ -673,6 +755,120 @@ def test_sync_summary_omits_investments_when_fresh():
     assert message.startswith("✅")
 
 
+def test_sync_summary_surfaces_apple_agent_sha_drift():
+    """A silently-broken Mac Mini self-update must reach the nightly
+    Telegram summary — a bare logger.warning feeds no batched report (#646,
+    same lesson as #448's investments_stale)."""
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "results": {}, "duration_seconds": 12,
+        "apple_agent_sha_drift": (
+            "Apple Data Agent exported from b347e1f, which differs from this "
+            "host's main (c13ba77) — its self-update may have failed."
+        ),
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "SHA drift" in message
+    assert "self-update" in message
+    assert message.startswith("⚠️")
+
+
+def test_sync_summary_omits_sha_drift_when_absent():
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "results": {}, "duration_seconds": 12, "apple_agent_sha_drift": None,
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "SHA drift" not in message
+    assert message.startswith("✅")
+
+
+def test_sync_summary_surfaces_repeated_yield_sources():
+    """A source stuck reporting the same non-zero count must be called out
+    in the nightly summary and flip the status away from a clean ✅ (#646)."""
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12,
+        "repeated_yield_sources": ["apple_import"],
+        "results": {
+            "apple_import": {
+                "success": True,
+                "repeated_yield": {"repeated_value": 1294, "consecutive_runs": 10},
+            }
+        },
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "apple_import" in message
+    assert "1294" in message
+    assert "not counted as new" in message
+    assert message.startswith("⚠️")
+
+
+def test_sync_summary_omits_repeated_yield_section_when_clean():
+    from scripts.run_all_syncs import send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12, "repeated_yield_sources": [], "results": {},
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "not counted as new" not in message
+    assert message.startswith("✅")
+
+
+def test_markdown_summary_surfaces_repeated_yield_and_sha_drift():
+    """Same distinction (#646) must land in the markdown log, not just
+    Telegram — sync_errors.md is the other half of "the nightly summary"."""
+    from scripts.run_all_syncs import log_sync_summary_to_markdown
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12,
+        "repeated_yield_sources": ["apple_import"],
+        "apple_agent_sha_drift": "Apple Data Agent exported from b347e1f, self-update may have failed.",
+        "results": {
+            "apple_import": {
+                "success": True,
+                "repeated_yield": {"repeated_value": 1294, "consecutive_runs": 10},
+            }
+        },
+    }
+    with patch("scripts.run_all_syncs._write_to_markdown_log") as write_mock:
+        log_sync_summary_to_markdown(result, trigger="test")
+
+    entry = write_mock.call_args[0][0]
+    assert "apple_import" in entry
+    assert "1294" in entry
+    assert "not counted as new" in entry
+    assert "SHA drift" in entry
+    assert "self-update may have failed" in entry
+
+
+def test_markdown_summary_omits_sections_when_clean():
+    from scripts.run_all_syncs import log_sync_summary_to_markdown
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12,
+        "repeated_yield_sources": [], "apple_agent_sha_drift": None,
+        "results": {},
+    }
+    with patch("scripts.run_all_syncs._write_to_markdown_log") as write_mock:
+        log_sync_summary_to_markdown(result, trigger="test")
+
+    entry = write_mock.call_args[0][0]
+    assert "not counted as new" not in entry
+    assert "SHA drift" not in entry
+
+
 class TestYieldCollapse:
     """Yield-based no-op detection (#494).
 
@@ -722,6 +918,47 @@ class TestYieldCollapse:
 
         with patch("scripts.run_all_syncs.get_typical_yield", side_effect=RuntimeError("db gone")):
             assert _detect_yield_collapse("slack", {"created": 0}) is None
+
+
+class TestRepeatedYield:
+    """Repeated-identical-yield detection (#646).
+
+    Distinct from yield collapse (which only fires on zero output): a source
+    re-importing the same unchanged upstream file reports the same non-zero
+    count every run. Zero output is invisible to it; identical non-zero
+    output for several runs in a row is the signature.
+    """
+
+    def test_detects_repeated_identical_yield(self):
+        from scripts.run_all_syncs import _detect_repeated_yield
+
+        with patch("scripts.run_all_syncs.get_repeated_yield_streak", return_value=9):
+            info = _detect_repeated_yield("apple_import", {"created": 1294})
+
+        assert info is not None
+        assert info["repeated_value"] == 1294
+        assert info["consecutive_runs"] == 10  # +1 for the run in flight
+
+    def test_zero_yield_never_flagged(self):
+        """Zero output is yield_collapse's job, not this detector's."""
+        from scripts.run_all_syncs import _detect_repeated_yield
+
+        with patch("scripts.run_all_syncs.get_repeated_yield_streak", return_value=50):
+            assert _detect_repeated_yield("entity_cleanup", {"created": 0}) is None
+
+    def test_below_minimum_streak_not_flagged(self):
+        """A single repeat (this run matching just the last one) is normal —
+        only a real streak is suspicious."""
+        from scripts.run_all_syncs import _detect_repeated_yield
+
+        with patch("scripts.run_all_syncs.get_repeated_yield_streak", return_value=1):
+            assert _detect_repeated_yield("gmail_work", {"created": 42}) is None
+
+    def test_db_error_never_raises(self):
+        from scripts.run_all_syncs import _detect_repeated_yield
+
+        with patch("scripts.run_all_syncs.get_repeated_yield_streak", side_effect=RuntimeError("db gone")):
+            assert _detect_repeated_yield("slack", {"created": 42}) is None
 
 
 class TestNeverYielded:
@@ -832,6 +1069,7 @@ class TestNeverYieldedDamping:
             patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_never_yielded", return_value=never_yielded_info),
+            patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
             patch("scripts.run_all_syncs._recently_warned_never_yielded", return_value=True),
         ):
             success, stats = run_sync(source, dry_run=False)
@@ -860,6 +1098,7 @@ class TestNeverYieldedDamping:
             patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_never_yielded", return_value=never_yielded_info),
+            patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
             patch("scripts.run_all_syncs._recently_warned_never_yielded", return_value=False),
         ):
             success, stats = run_sync(source, dry_run=False)

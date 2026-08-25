@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Contacts plist parsing
@@ -838,6 +840,57 @@ class TestStalenessAlerting:
         assert any(r.levelno >= logging.CRITICAL for r in caplog.records)
         assert any("10 days old" in r.message for r in caplog.records)
 
+    def test_stale_7d_critical_sets_structured_message(self, tmp_path, caplog):
+        """Issue #646 regression guard: the staleness signal must be readable
+        from check_manifest()'s return value, not just the log stream. A
+        CRITICAL log line lands in the sync log file fine, but it doesn't
+        drive record_failure/the run status/the nightly summary — only the
+        subprocess exit code does, and a prose-only CRITICAL (the pre-fix
+        behavior) never touches that. This test fails against that pre-fix
+        behavior: caplog would still show the CRITICAL, but
+        manifest["_staleness_critical_message"] wouldn't exist."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        self._write_manifest(import_dir, very_stale.isoformat())
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.DEBUG):
+                result = check_manifest()
+
+        assert result is not None
+        assert "10 days old" in result.get("_staleness_critical_message", "")
+
+    def test_fresh_data_no_structured_staleness_message(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._write_manifest(import_dir, fresh.isoformat())
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.INFO):
+                result = check_manifest()
+
+        assert result is not None
+        assert "_staleness_critical_message" not in result
+
+    def test_stale_48h_no_structured_critical_message(self, tmp_path, caplog):
+        """The 48h WARNING tier must not set the critical-only flag."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        stale = datetime.now(timezone.utc) - timedelta(hours=50)
+        self._write_manifest(import_dir, stale.isoformat())
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert "_staleness_critical_message" not in result
+
     def test_missing_manifest(self, tmp_path, caplog):
         from scripts.apple_data_import import check_manifest
 
@@ -1030,6 +1083,38 @@ class TestAgentShaImport:
             r.levelno == logging.WARNING and "differs from" in r.message
             for r in caplog.records
         )
+
+    def test_mismatched_sha_sets_structured_message(self, tmp_path, caplog):
+        """Issue #646: run_all_syncs.py reads this drift signal directly off
+        the manifest dict (not the subprocess log stream) so it can surface
+        in the nightly Telegram/markdown summary — this must be readable
+        from the return value, not just caplog."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="def5678"):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert "differs from" in result.get("_agent_sha_drift_message", "")
+
+    def test_matching_sha_no_structured_message(self, tmp_path, caplog):
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        self._write_manifest(import_dir, agent_sha="abc1234")
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir), \
+                patch("scripts.apple_data_import._get_local_main_sha", return_value="abc1234"):
+            with caplog.at_level(logging.WARNING):
+                result = check_manifest()
+
+        assert result is not None
+        assert "_agent_sha_drift_message" not in result
 
     def test_missing_agent_sha_handled_silently(self, tmp_path, caplog):
         """Manifests written before this change have no agent_sha — must not
@@ -1305,3 +1390,266 @@ class TestPhoneImport:
         assert result["imported"] == 0
         assert result["unresolved"] == 1
         mock_resolver.resolve_by_phone.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# main() — critical staleness must fail the run (issue #646)
+# ---------------------------------------------------------------------------
+
+class TestManifestStalenessFailsRun:
+    """Regression for issue #646's headline defect: a manifest whose every
+    source reports ok, but whose exported_at is older than
+    STALENESS_CRITICAL_HOURS, must fail the run — not just log a CRITICAL
+    that lands in the sync log file but never drives record_failure, the
+    run status, or the nightly summary (only the subprocess exit code
+    does). This is the exact "27/27 succeeded" scenario from the linked
+    outage: a dead Mac Mini export agent left a stale-but-formally-healthy
+    manifest in place for 10 nights."""
+
+    def _stub_source(self, dry_run=False, **kwargs):
+        return {"status": "ok", "created": 0}
+
+    def test_stale_manifest_with_all_sources_ok_exits_nonzero(self, tmp_path, monkeypatch, capsys):
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        very_stale = datetime.now(timezone.utc) - timedelta(days=10)
+        manifest = {
+            "exported_at": very_stale.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "contacts": {"status": "ok"},
+                "imessage": {"status": "ok"},
+                "phone": {"status": "ok"},
+                "photos": {"status": "ok"},
+                "whatsapp": {"status": "ok"},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+        for name in (
+            "import_contacts", "import_imessage", "import_phone_calls",
+            "import_photos_faces", "import_whatsapp", "import_health",
+        ):
+            monkeypatch.setattr(import_mod, name, self._stub_source)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            import_mod.main()
+
+        assert exc_info.value.code == 1
+        # The failure must be visible in the printed results, not just logs —
+        # this is what run_all_syncs.py's caller sees on top of the exit code.
+        printed = capsys.readouterr().out
+        assert "manifest_staleness" in printed
+
+    def test_fresh_manifest_with_all_sources_ok_does_not_exit(self, tmp_path, monkeypatch):
+        """Sanity check: the new staleness gate must not false-positive on a
+        healthy, fresh export."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "contacts": {"status": "ok"},
+                "imessage": {"status": "ok"},
+                "phone": {"status": "ok"},
+                "photos": {"status": "ok"},
+                "whatsapp": {"status": "ok"},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+        for name in (
+            "import_contacts", "import_imessage", "import_phone_calls",
+            "import_photos_faces", "import_whatsapp", "import_health",
+        ):
+            monkeypatch.setattr(import_mod, name, self._stub_source)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        # main() calls sys.exit(1) only on error; a clean run falls off the
+        # end of the function without exiting, so no SystemExit is raised.
+        import_mod.main()
+
+    def test_per_source_error_still_fails_run_alongside_fresh_staleness(self, tmp_path, monkeypatch):
+        """Keep the existing per-source status=='error' behaviour working
+        unchanged (issue #646 acceptance criteria: don't regress it while
+        fixing staleness)."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "whatsapp": {"status": "error", "reason": "wacli not installed"},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        def _erroring_whatsapp(dry_run=False, **kwargs):
+            return {"status": "error", "reason": "wacli not installed"}
+
+        monkeypatch.setattr(import_mod, "import_contacts", self._stub_source)
+        monkeypatch.setattr(import_mod, "import_imessage", self._stub_source)
+        monkeypatch.setattr(import_mod, "import_phone_calls", self._stub_source)
+        monkeypatch.setattr(import_mod, "import_photos_faces", self._stub_source)
+        monkeypatch.setattr(import_mod, "import_whatsapp", _erroring_whatsapp)
+        monkeypatch.setattr(import_mod, "import_health", self._stub_source)
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            import_mod.main()
+
+        assert exc_info.value.code == 1
+
+
+class TestManifestErrorOverridesLocalSuccess:
+    """Issue #646 follow-up: import_contacts/import_whatsapp check the
+    manifest internally (_manifest_source_errored) and already report
+    "error" themselves when the Mac-side export failed. imessage, phone,
+    photos, and health do NOT — they only look at whether their input file
+    exists. If a stale file from a prior successful export is still on
+    disk, the local import happily reprocesses it and reports "ok",
+    silently masking a Mac-side export failure that check_manifest()'s
+    per-source walk only logs (never structurally surfaced before this
+    fix). main() must override that back to "error" and still fail the
+    run — the exact same "logged but not structured" trap as staleness,
+    just for a different signal."""
+
+    def _run_with_manifest_error(self, tmp_path, monkeypatch, source_name, stub_result):
+        import scripts.apple_data_import as import_mod
+
+        # Subdirectory keyed by source_name so a test iterating over
+        # multiple sources (each calling this helper against the same
+        # tmp_path) doesn't collide on an already-existing import_dir.
+        import_dir = tmp_path / source_name / "apple-imports"
+        import_dir.mkdir(parents=True)
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                source_name: {"status": "error", "reason": "export tool crashed"},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+
+        func_names = {
+            "contacts": "import_contacts",
+            "imessage": "import_imessage",
+            "phone": "import_phone_calls",
+            "photos": "import_photos_faces",
+            "whatsapp": "import_whatsapp",
+            "health": "import_health",
+        }
+        for name, func_name in func_names.items():
+            if name == source_name:
+                monkeypatch.setattr(
+                    import_mod, func_name,
+                    lambda dry_run=False, **kw: dict(stub_result),
+                )
+            else:
+                monkeypatch.setattr(
+                    import_mod, func_name,
+                    lambda dry_run=False, **kw: {"status": "ok"},
+                )
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute"])
+        return import_mod
+
+    def test_stale_imessage_db_reported_ok_still_fails_run(self, tmp_path, monkeypatch):
+        """imessage isn't manifest-aware — a stale imessage.db copy would
+        otherwise report 'ok' and mask the Mac-side failure entirely."""
+        import_mod = self._run_with_manifest_error(
+            tmp_path, monkeypatch, "imessage", {"status": "ok", "size_mb": 12.0},
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            import_mod.main()
+
+        assert exc_info.value.code == 1
+
+    def test_photos_and_health_also_covered(self, tmp_path, monkeypatch):
+        for source_name in ("photos", "health"):
+            import_mod = self._run_with_manifest_error(
+                tmp_path, monkeypatch, source_name, {"status": "ok"},
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                import_mod.main()
+            assert exc_info.value.code == 1
+
+    def test_override_preserves_stat_keys_unit_level(self):
+        """Unit-level check of the override behavior itself: status flips
+        to error, reason is set, and any stat keys the local import
+        produced (e.g. "imported") survive rather than being discarded —
+        mirrors import_contacts/import_whatsapp's own established pattern
+        of overriding status while keeping the stats."""
+        results = {"phone": {"status": "ok", "imported": 5, "source_entities_created": 2}}
+        manifest_results = {"phone": {"status": "error", "reason": "export tool crashed"}}
+
+        # Reproduce main()'s override loop in isolation.
+        for name in results:
+            manifest_entry = manifest_results.get(name)
+            if not isinstance(manifest_entry, dict) or manifest_entry.get("status") != "error":
+                continue
+            existing = results.get(name)
+            if isinstance(existing, dict) and existing.get("status") == "error":
+                continue
+            reason = manifest_entry.get("reason") or "Mac export reported error"
+            if isinstance(existing, dict):
+                existing["status"] = "error"
+                existing["reason"] = reason
+            else:
+                results[name] = {"status": "error", "reason": reason}
+
+        assert results["phone"]["status"] == "error"
+        assert results["phone"]["reason"] == "export tool crashed"
+        assert results["phone"]["imported"] == 5
+        assert results["phone"]["source_entities_created"] == 2
+
+    def test_no_override_when_source_not_attempted_this_run(self, tmp_path, monkeypatch):
+        """--source contacts must not spuriously fail on an unrelated
+        manifest-reported phone error (existing behavior, unchanged)."""
+        import scripts.apple_data_import as import_mod
+
+        import_dir = tmp_path / "apple-imports"
+        import_dir.mkdir(parents=True)
+        fresh = datetime.now(timezone.utc) - timedelta(hours=1)
+        manifest = {
+            "exported_at": fresh.isoformat(),
+            "hostname": "test-host",
+            "results": {
+                "phone": {"status": "error", "reason": "export tool crashed"},
+                "contacts": {"status": "ok"},
+            },
+        }
+        with open(import_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f)
+
+        monkeypatch.setattr(import_mod, "IMPORT_DIR", import_dir)
+        monkeypatch.setattr(
+            import_mod, "import_contacts",
+            lambda dry_run=False, **kw: {"status": "ok", "created": 1},
+        )
+        monkeypatch.setattr(import_mod.sys, "argv", ["apple_data_import.py", "--execute", "--source", "contacts"])
+
+        # Must not raise — only "contacts" was selected, "phone"'s manifest
+        # error is out of scope for this invocation.
+        import_mod.main()
