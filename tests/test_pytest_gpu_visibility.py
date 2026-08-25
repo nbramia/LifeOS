@@ -11,6 +11,10 @@ overwrite).
 """
 import os
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 _GPU_VISIBILITY_VARS = ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
 
 

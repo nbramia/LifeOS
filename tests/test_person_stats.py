@@ -4,11 +4,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from api.services.person_entity import PersonEntity
 from api.services.person_stats import (
     refresh_person_stats,
     _apply_counts_to_entity,
 )
+
+pytestmark = pytest.mark.unit
 
 
 def _create_interaction_db(db_path: str, interactions: list[tuple]) -> None:

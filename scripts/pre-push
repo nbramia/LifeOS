@@ -112,6 +112,15 @@ fail() {
 
 echo -n "Running unit tests... "
 
+# #682: this scope (`-m "unit and not slow"`) and scripts/test.sh's unit
+# scope (the negative filter over browser/requires_server/integration/slow)
+# are meant to agree, and after the #682 marker triage they collect the
+# identical set (verified via --collect-only on both filters). Getting there
+# required removing a conftest.py auto-marker that used to tag any test whose
+# *name* contained "real_" or "integration" with `integration` on top of
+# whatever marker it already carried — see tests/conftest.py's
+# pytest_collection_modifyitems for the full story.
+#
 # Parallelize across all cores via pytest-xdist (-n auto). --ff runs
 # previously-failed tests first, so a repeat failure surfaces in seconds
 # without narrowing what actually runs.

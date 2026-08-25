@@ -11,6 +11,10 @@ Tests are organized by endpoint group:
 import pytest
 from fastapi.testclient import TestClient
 
+# In-process TestClient against real production data (no mocks) — needs a
+# populated CRM DB, so this is integration, not unit (#682).
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture(scope="module")
 def client():

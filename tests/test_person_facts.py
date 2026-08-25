@@ -21,6 +21,8 @@ from api.services.person_facts import (
     get_person_fact_store,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestMakeAware:
     """Tests for timezone awareness helper."""

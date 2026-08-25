@@ -16,6 +16,8 @@ from api.services.slack_integration import (
     SOURCE_SLACK,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestSlackUser:
     """Tests for SlackUser dataclass."""

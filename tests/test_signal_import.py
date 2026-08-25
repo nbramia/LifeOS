@@ -11,6 +11,8 @@ from api.services.signal_import import (
     _parse_timestamp,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestParseSignalExport:
     """Tests for parse_signal_export function."""

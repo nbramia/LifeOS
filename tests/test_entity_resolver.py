@@ -9,6 +9,11 @@ from api.services.entity_resolver import (
     EntityResolver,
 )
 
+# #682: marked per-class/per-function rather than module-level, because
+# TestResolveByName::test_create_with_context_inference needs a real
+# configured settings.current_work_path (see its own marker below) while
+# every other test in this file is fully isolated (temp_store/tmp_path).
+
 
 # Module-level fixtures available to all test classes
 @pytest.fixture
@@ -74,6 +79,7 @@ def populated_resolver(temp_store):
     return EntityResolver(temp_store)
 
 
+@pytest.mark.unit
 class TestResolveByEmail:
     """Tests for Pass 1: Email anchoring."""
 
@@ -100,6 +106,7 @@ class TestResolveByEmail:
         assert populated_resolver.resolve_by_email(None) is None
 
 
+@pytest.mark.unit
 class TestResolveByPhone:
     """Tests for phone number anchoring."""
 
@@ -123,6 +130,7 @@ class TestResolveByPhone:
 class TestResolveByName:
     """Tests for Pass 2 & 3: Fuzzy name matching."""
 
+    @pytest.mark.unit
     def test_exact_name_match(self, populated_resolver):
         """Test exact name match."""
         result = populated_resolver.resolve_by_name("Alex Johnson")
@@ -130,12 +138,14 @@ class TestResolveByName:
         assert result.entity.canonical_name == "Alex Johnson"
         assert result.confidence >= 0.9
 
+    @pytest.mark.unit
     def test_alias_match(self, populated_resolver):
         """Test matching by alias."""
         result = populated_resolver.resolve_by_name("Alex")
         assert result is not None
         assert result.entity.canonical_name == "Alex Johnson"
 
+    @pytest.mark.unit
     def test_fuzzy_match(self, populated_resolver):
         """Test fuzzy name matching."""
         # Slight variation - "J" initial matches "Johnson"
@@ -143,6 +153,7 @@ class TestResolveByName:
         assert result is not None
         assert result.entity.canonical_name == "Alex Johnson"
 
+    @pytest.mark.unit
     def test_context_boost_same_context(self, populated_resolver):
         """Test context boost helps disambiguation."""
         # "Sarah" appears in two contexts
@@ -153,6 +164,7 @@ class TestResolveByName:
         assert result is not None
         assert result.entity.canonical_name == "Sarah Chen"
 
+    @pytest.mark.unit
     def test_context_boost_murm_context(self, populated_resolver):
         """Test context boost for Old Corp context."""
         # With Murm context, should prefer Sarah Miller
@@ -162,11 +174,13 @@ class TestResolveByName:
         assert result is not None
         assert result.entity.canonical_name == "Sarah Miller"
 
+    @pytest.mark.unit
     def test_unknown_name_no_create(self, populated_resolver):
         """Test unknown name returns None when create_if_missing=False."""
         result = populated_resolver.resolve_by_name("Unknown Person")
         assert result is None
 
+    @pytest.mark.unit
     def test_unknown_name_with_create(self, populated_resolver):
         """Test unknown name creates entity when create_if_missing=True."""
         result = populated_resolver.resolve_by_name(
@@ -176,8 +190,15 @@ class TestResolveByName:
         assert result.is_new is True
         assert result.entity.canonical_name == "New Person"
 
+    @pytest.mark.integration
     def test_create_with_context_inference(self, populated_resolver):
-        """Test new entity gets context from path."""
+        """Test new entity gets context from path.
+
+        #682: _infer_vault_contexts checks settings.current_work_path first,
+        which is real per-operator config (e.g. "Work/ML/"). Unconfigured on
+        a clean checkout, it falls through to the generic "Work/" branch —
+        so this needs a real configured settings.current_work_path.
+        """
         # Use Work/ML path which is a known context pattern
         result = populated_resolver.resolve_by_name(
             "New Colleague",
@@ -191,6 +212,7 @@ class TestResolveByName:
         assert result.entity.category == "work"
 
 
+@pytest.mark.unit
 class TestResolveMain:
     """Tests for main resolve() method."""
 
@@ -263,6 +285,7 @@ class TestResolveMain:
         assert "+15550001234" in result.entity.phone_numbers
 
 
+@pytest.mark.unit
 class TestResolveFromLinkedIn:
     """Tests for LinkedIn-specific resolution."""
 
@@ -317,6 +340,7 @@ class TestResolveFromLinkedIn:
         assert result.entity.company == "Example Corp"
 
 
+@pytest.mark.unit
 class TestEdgeCases:
     """Tests for edge cases and special scenarios."""
 
@@ -387,6 +411,7 @@ class TestEdgeCases:
         assert result.entity.canonical_name == "Jdoe"
 
 
+@pytest.mark.unit
 class TestParseName:
     """Tests for the parse_name helper function."""
 
@@ -486,6 +511,7 @@ class TestParseName:
         assert result.last == "Wilhelm"
 
 
+@pytest.mark.unit
 class TestSingleLetterFirstNameEntity:
     """
     An entity whose first name is a single letter must not swallow every query
@@ -530,6 +556,7 @@ class TestSingleLetterFirstNameEntity:
         assert resolver.resolve_by_name("John Walker") is None
 
 
+@pytest.mark.unit
 class TestStructuredNameMatching:
     """Tests for the new structured name matching in _score_candidates."""
 

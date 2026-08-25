@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from api.services.briefings import BriefingsService, BriefingContext
 
 
+@pytest.mark.unit
 class TestBriefingContext:
     """Test BriefingContext dataclass."""
 
@@ -53,6 +54,7 @@ class TestBriefingContext:
         assert context.last_interaction.year == 2023
 
 
+@pytest.mark.unit
 class TestBriefingsService:
     """Test BriefingsService."""
 
@@ -105,7 +107,6 @@ class TestBriefingsService:
     def test_gather_context_includes_entity_data(self, service, mock_entity_resolver):
         """Should include data from entity resolver."""
         from api.services.person_entity import PersonEntity
-        from datetime import datetime
 
         mock_entity = PersonEntity(
             id="test-123",

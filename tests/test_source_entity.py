@@ -15,6 +15,8 @@ from api.services.source_entity import (
     create_imessage_source_entity,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def temp_db():

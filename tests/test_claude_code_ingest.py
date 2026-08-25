@@ -357,6 +357,7 @@ def test_retired_models_price_correctly_not_fallback(tmp_path: Path, model, inpu
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.unit
 def test_label_prefers_custom_title_from_rename(tmp_path: Path):
     """A user `/rename` (custom-title record) wins over ai-title and prompt."""
     proj = tmp_path / "-home-syn-Code-A"
@@ -370,6 +371,7 @@ def test_label_prefers_custom_title_from_rename(tmp_path: Path):
     assert meta.label == "chat-integration"
 
 
+@pytest.mark.unit
 def test_label_falls_back_to_ai_title(tmp_path: Path):
     """With no /rename, the CLI's ai-title beats the raw last prompt."""
     proj = tmp_path / "-home-syn-Code-A"
@@ -382,6 +384,7 @@ def test_label_falls_back_to_ai_title(tmp_path: Path):
     assert meta.label == "Payment webhook debugging"
 
 
+@pytest.mark.unit
 def test_label_latest_custom_title_wins(tmp_path: Path):
     """A later /rename overrides an earlier one."""
     proj = tmp_path / "-home-syn-Code-A"
@@ -395,6 +398,7 @@ def test_label_latest_custom_title_wins(tmp_path: Path):
     assert meta.label == "second name"
 
 
+@pytest.mark.unit
 def test_label_falls_back_to_last_prompt_without_titles(tmp_path: Path):
     """Unchanged behavior when there are no title records."""
     proj = tmp_path / "-home-syn-Code-A"

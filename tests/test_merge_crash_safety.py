@@ -10,6 +10,8 @@ import pytest
 from unittest.mock import patch
 from datetime import datetime, timezone
 
+pytestmark = pytest.mark.unit
+
 
 # ---------------------------------------------------------------------------
 # Helpers to create temp databases matching production schemas

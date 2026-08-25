@@ -2,6 +2,8 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def sync_with_mocks(monkeypatch):

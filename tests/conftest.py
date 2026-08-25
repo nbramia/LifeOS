@@ -81,6 +81,29 @@ def pytest_configure(config):
 
 
 # ---------------------------------------------------------------------------
+# Unmarked-test guard (#682)
+#
+# The pre-push hook and scripts/test.sh both select tests by marker
+# expression (`-m "unit and not slow"` / the negative filter). A test file
+# that carries none of the recognized category markers is silently deselected
+# from BOTH — it still collects and "exists", so nothing in CI or on push
+# reports it as missing. That's exactly how #646 and #677's regression guards
+# in tests/test_apple_pipeline.py went unmarked and unrun on push for months.
+#
+# tryfirst=True so this sees every collected item before pytest's own -m
+# deselection hook removes anything — a brand-new unmarked file must fail
+# collection even when the current invocation is filtering to `-m unit`.
+# ---------------------------------------------------------------------------
+
+_RECOGNIZED_TEST_MARKERS = ("unit", "browser", "integration", "slow", "requires_server")
+
+# The actual hook implementation lives below, merged into the pre-existing
+# pytest_collection_modifyitems (search "Parallel execution configuration") —
+# a module can only bind one function under that name, so this can't be a
+# second top-level def.
+
+
+# ---------------------------------------------------------------------------
 # Anthropic API call guard (#138)
 #
 # Bleeds happen when a test forgets to mock the LLM client and silently makes
@@ -536,6 +559,19 @@ def embedding_service():
 
 
 # Parallel execution configuration
+#
+# Also the unmarked-test guard (#682): the pre-push hook and scripts/test.sh
+# both select tests by marker expression (`-m "unit and not slow"` / the
+# negative filter). A test file that carries none of the recognized category
+# markers is silently deselected from BOTH — it still collects and "exists",
+# so nothing in CI or on push reports it as missing. That's exactly how #646
+# and #677's regression guards in tests/test_apple_pipeline.py went unmarked
+# and unrun on push for months.
+#
+# tryfirst=True so the guard below sees every collected item before pytest's
+# own -m deselection hook removes anything — a brand-new unmarked file must
+# fail collection even when the current invocation is filtering to `-m unit`.
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     """
     Auto-mark tests based on location/name for better organization.
@@ -548,9 +584,44 @@ def pytest_collection_modifyitems(config, items):
         if "browser" in item.name or "playwright" in str(item.fspath):
             item.add_marker(pytest.mark.browser)
 
-        # Integration tests (those that hit real servers)
-        if "integration" in item.name or "real_" in item.name:
-            item.add_marker(pytest.mark.integration)
+        # #682: the equivalent "integration" name-substring auto-mark used to
+        # live here too (`"integration" in item.name or "real_" in item.name`)
+        # and is why the pre-push (`-m "unit and not slow"`) and test.sh
+        # scopes disagreed by 29 tests — it silently added `integration` to
+        # any test merely *named* things like test_real_dns_failed_..., which
+        # then carried both `unit` (explicit, correct) and `integration`
+        # (false positive from the name match), landing it in the push gate
+        # but not test.sh's negative filter. Every test now carries an
+        # explicit, correct marker (enforced by the guard below), so this
+        # heuristic add is pure liability with no remaining upside. Removed
+        # rather than special-cased per file.
+
+    unmarked = [
+        item.nodeid
+        for item in items
+        if not any(item.get_closest_marker(name) for name in _RECOGNIZED_TEST_MARKERS)
+    ]
+    if not unmarked:
+        return
+
+    preview = "\n".join(f"  {nodeid}" for nodeid in unmarked[:20])
+    if len(unmarked) > 20:
+        preview += f"\n  ...and {len(unmarked) - 20} more"
+
+    raise pytest.UsageError(
+        f"{len(unmarked)} test(s) carry none of the recognized category markers "
+        f"({', '.join(_RECOGNIZED_TEST_MARKERS)}) and would be silently excluded "
+        "from both the pre-push gate (`-m \"unit and not slow\"`) and "
+        "`scripts/test.sh`'s default scope. Add exactly one, either as a "
+        "decorator or a module-level `pytestmark = pytest.mark.<name>` if it "
+        "applies to the whole file:\n"
+        "  @pytest.mark.unit            - fast, fully isolated (no real data or live services)\n"
+        "  @pytest.mark.integration     - needs real production data or a live external service\n"
+        "  @pytest.mark.requires_server - needs the LifeOS API server running on localhost:8000\n"
+        "  @pytest.mark.slow            - loads real ML models / ChromaDB / other heavy processing\n"
+        "  @pytest.mark.browser         - Playwright browser test\n\n"
+        f"Unmarked test(s):\n{preview}"
+    )
 
 
 @pytest.fixture

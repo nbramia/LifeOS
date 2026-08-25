@@ -8,9 +8,10 @@ Tests cover:
 """
 import pytest
 import sqlite3
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone
+
+pytestmark = pytest.mark.unit
 
 
 class TestRecalculatePersonStats:

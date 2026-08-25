@@ -1,17 +1,15 @@
 """
 Tests for PersonEntity model and PersonEntityStore.
 """
-import json
 import pytest
-import tempfile
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 
 from api.services.person_entity import (
     PersonEntity,
     PersonEntityStore,
-    get_person_entity_store,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestPersonEntity:

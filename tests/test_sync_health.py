@@ -32,6 +32,8 @@ from api.services.sync_health import (
     detect_silent_source_entity_drift,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def temp_db(tmp_path):

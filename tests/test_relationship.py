@@ -8,8 +8,9 @@ from api.services.relationship import (
     RelationshipStore,
     TYPE_COWORKER,
     TYPE_FRIEND,
-    TYPE_INFERRED,
 )
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture

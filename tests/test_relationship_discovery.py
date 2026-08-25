@@ -8,16 +8,14 @@ Tests cover:
 - Suggested connections and overlap analysis
 """
 import pytest
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, PropertyMock
-from collections import defaultdict
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 from api.services.relationship_discovery import (
     _ensure_tz_aware,
     _datetime_lt,
     _datetime_gt,
     DISCOVERY_WINDOW_DAYS,
-    discover_from_calendar,
     discover_from_calendar_direct,
     discover_from_imessage_direct,
     discover_from_whatsapp_direct,
@@ -29,6 +27,8 @@ from api.services.relationship_discovery import (
 )
 from api.services.relationship import Relationship
 from api.services.person_entity import PersonEntity
+
+pytestmark = pytest.mark.unit
 
 
 class TestTimezoneHelpers:

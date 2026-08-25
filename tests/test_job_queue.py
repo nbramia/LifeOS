@@ -1,11 +1,12 @@
 """Tests for the SQLite-backed job queue."""
 import time
-import threading
 import pytest
 from api.services.job_queue import (
     JobQueue, register_job_handler, _JOB_HANDLERS,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
 )
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
@@ -37,7 +38,7 @@ class TestJobQueue:
 
     def test_enqueue_custom_priority(self, queue):
         id_low = queue.enqueue("a", priority=1)
-        id_high = queue.enqueue("b", priority=20)
+        queue.enqueue("b", priority=20)
         # Lower priority number = higher priority, claimed first
         job = queue._claim_next()
         assert job.id == id_low
@@ -73,7 +74,7 @@ class TestJobQueue:
 
     def test_claim_next_fifo(self, queue):
         id1 = queue.enqueue("a", priority=10)
-        id2 = queue.enqueue("b", priority=10)
+        queue.enqueue("b", priority=10)
         job = queue._claim_next()
         assert job.id == id1
 

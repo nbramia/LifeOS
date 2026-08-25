@@ -42,6 +42,7 @@ def openapi_spec():
     return app.openapi()
 
 
+@pytest.mark.requires_server
 class TestOpenAPIAvailability:
     """Test that OpenAPI spec is available and valid."""
 
@@ -69,6 +70,7 @@ class TestOpenAPIAvailability:
             assert path in paths, f"Missing endpoint: {path}"
 
 
+@pytest.mark.unit
 class TestMCPServerToolDiscovery:
     """Test that MCP server correctly discovers tools from OpenAPI."""
 
@@ -161,6 +163,7 @@ class TestMCPServerToolDiscovery:
         assert "items" in tags_schema, "'tags' array schema is missing 'items'"
 
 
+@pytest.mark.requires_server
 class TestMCPServerAPICalls:
     """Test that MCP server correctly calls the API."""
 
@@ -221,6 +224,7 @@ class TestMCPServerAPICalls:
             assert "results" in result
 
 
+@pytest.mark.unit
 class TestMCPProtocol:
     """Test MCP protocol compliance."""
 
@@ -261,6 +265,7 @@ class TestMCPProtocol:
         assert "Test answer" in formatted
 
 
+@pytest.mark.unit
 class TestAPIOpenAPISync:
     """Test that MCP server stays in sync with API changes."""
 

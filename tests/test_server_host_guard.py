@@ -14,6 +14,8 @@ import pytest
 import api.main as main
 from config.settings import settings
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture(autouse=True)
 def _restore_server_hostname():

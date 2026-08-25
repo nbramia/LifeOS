@@ -7,12 +7,16 @@ turn — enforcing "draft → confirm → send" structurally, not just via the p
 """
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from api.services.agent_tools import (
     begin_email_send_turn,
     _tool_create_email_draft,
     _tool_send_email_draft,
 )
 from api.services.gmail import DraftMessage
+
+pytestmark = pytest.mark.unit
 
 
 def _mock_gmail(draft_id="d1", message_id="sent-1"):

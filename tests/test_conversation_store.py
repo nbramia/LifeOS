@@ -908,6 +908,7 @@ class TestConversationWorkflow:
 # Agent-session reverse lookup (#311)
 # =============================================================================
 
+@pytest.mark.unit
 class TestAgentSessionReverseLookup:
     """get_conversation_id_by_agent_session_id — the worker resolves a spawned
     session back to the web/voice conversation that started it, so it can mirror

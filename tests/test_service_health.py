@@ -23,6 +23,8 @@ from api.services.service_health import (
     mark_service_failed,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def fresh_registry():

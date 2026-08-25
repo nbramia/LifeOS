@@ -1,4 +1,7 @@
 """Tests for configuration settings."""
+import pytest
+
+pytestmark = pytest.mark.unit
 
 
 def test_chroma_url_setting():

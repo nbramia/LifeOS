@@ -1,12 +1,12 @@
 """Tests for post-sync consistency verification (Phase 7)."""
-import json
 import sqlite3
-import tempfile
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from api.services.person_entity import PersonEntity
+
+pytestmark = pytest.mark.unit
 
 
 def _create_interaction_db(db_path: str, interactions: list[tuple]) -> None:
@@ -181,8 +181,6 @@ class TestDetectsOrphanedInteractions:
             ("i2", "p_gone", "2024-01-01", "gmail", "Orphan1", "", "", "src2", "2024-01-01"),
             ("i3", "p_gone2", "2024-01-01", "calendar", "Orphan2", "", "", "src3", "2024-01-01"),
         ])
-
-        mock_store = _mock_store([_make_person("p1", "Alice")])
 
         with patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db):
             from scripts.sync_consistency_verify import _check_orphaned_interactions

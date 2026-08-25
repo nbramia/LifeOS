@@ -10,11 +10,17 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from api.services.briefings import (
     BriefingsService,
     BriefingContext,
-    get_briefings_service,
 )
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from api.services.interaction_store import InteractionStore, Interaction
 from api.services.entity_resolver import EntityResolver
+
+# Marked per-class below, not at module level: TestBriefingContext is a plain
+# dataclass test (unit); the require_db classes construct BriefingsService()
+# with its default (real, unmocked) entity_resolver/interaction_store
+# singletons rather than isolated fixtures — they happen to tolerate an
+# empty DB gracefully in this worktree, but they're not isolated, so
+# `integration` is the accurate label (#682).
 
 
 @pytest.fixture
@@ -92,6 +98,7 @@ def populated_interaction_store(temp_interaction_store):
     return temp_interaction_store
 
 
+@pytest.mark.unit
 class TestBriefingContext:
     """Tests for BriefingContext dataclass."""
 
@@ -129,9 +136,12 @@ class TestBriefingsServiceV2Integration:
     """Tests for v2 entity resolver and interaction store integration.
 
     NOTE: These tests require database access and will be skipped if
-    the server is running (database locked).
+    the server is running (database locked). Only test_service_has_v2_properties
+    below actually touches the real default entity_resolver/interaction_store —
+    the rest inject temp-store fixtures and are genuinely isolated (#682).
     """
 
+    @pytest.mark.integration
     def test_service_has_v2_properties(self):
         """Test that service exposes v2 properties."""
         service = BriefingsService()
@@ -139,6 +149,7 @@ class TestBriefingsServiceV2Integration:
         _ = service.entity_resolver
         _ = service.interaction_store
 
+    @pytest.mark.unit
     def test_gather_context_uses_entity_resolver(
         self,
         populated_entity_store,
@@ -176,6 +187,7 @@ class TestBriefingsServiceV2Integration:
         assert context.interaction_history != ""
         assert "interactions" in context.interaction_history.lower()
 
+    @pytest.mark.unit
     def test_gather_context_handles_unknown_person(self, temp_entity_store):
         """Test handling of unknown person (not found in entity store)."""
         resolver = EntityResolver(temp_entity_store)  # Empty store
@@ -199,6 +211,7 @@ class TestBriefingsServiceV2Integration:
         assert context.resolved_name == "Unknown Person"
         assert context.entity_id is None
 
+    @pytest.mark.unit
     def test_gather_context_with_email_parameter(
         self,
         populated_entity_store,
@@ -228,12 +241,14 @@ class TestBriefingsServiceV2Integration:
         assert context.resolved_name == "Alex Johnson"
 
 
+@pytest.mark.unit
 @pytest.mark.usefixtures("require_db")
 class TestBriefingsServiceGenerateBriefing:
     """Tests for generate_briefing method.
 
-    NOTE: These tests require database access and will be skipped if
-    the server is running (database locked).
+    NOTE: usefixtures("require_db") is inherited from the sibling classes'
+    convention, but both methods here inject temp-store fixtures and mock the
+    synthesizer — genuinely isolated, so `unit` (#682).
     """
 
     @pytest.mark.asyncio
@@ -304,6 +319,7 @@ class TestBriefingsServiceGenerateBriefing:
         assert result["person_name"] == "Alex Johnson"
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestVaultSearchImprovement:
     """Tests for improved vault search behavior.

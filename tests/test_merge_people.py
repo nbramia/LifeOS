@@ -9,14 +9,14 @@ Tests cover:
 """
 import pytest
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from datetime import datetime, timezone
 
 # Import test subject after mocking path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+pytestmark = pytest.mark.unit
 
 
 class TestMergedIdsTracking:
@@ -283,7 +283,7 @@ class TestMergePeople:
             mock_conn.return_value.execute.return_value = mock_cursor
 
             from scripts.merge_people import merge_people
-            result = merge_people("primary-id", "secondary-id", dry_run=True)
+            merge_people("primary-id", "secondary-id", dry_run=True)
 
             # In dry run, store methods should not be called to persist
             mock_person_store.update.assert_not_called()

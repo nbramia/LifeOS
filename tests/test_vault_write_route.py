@@ -9,7 +9,6 @@ directly; the worker enforces non-empty results separately
 """
 from __future__ import annotations
 
-import importlib
 import tempfile
 from pathlib import Path
 
@@ -17,26 +16,39 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def app_and_vault(monkeypatch):
     """Spin up a minimal FastAPI app with vault.router mounted on a tmp vault.
 
-    settings is module-scoped so we reload it after pointing LIFEOS_VAULT_PATH
-    at the tmp dir; otherwise the route picks up the user's real vault.
+    #682: monkeypatch the shared `settings` singleton's .vault_path attribute
+    directly, rather than pointing LIFEOS_VAULT_PATH at the tmp dir and
+    importlib.reload()-ing config.settings. A reload rebinds
+    `config.settings.settings` to a brand-new object — every module that
+    already did `from config.settings import settings` earlier in the
+    process (api.services.agent_worker.worker, for one) keeps its old
+    reference, so a *later* test that also does a fresh
+    `from config.settings import settings` and monkeypatches THAT object is
+    silently patching a different object than the one worker.py reads,
+    while a module-level `settings.vault_path` read (e.g.
+    tests/test_directory_resolver.py) sees whatever the reload left behind.
+    Patching the attribute in place keeps identity intact for every
+    consumer and monkeypatch reverts it automatically — no reload needed at
+    all, and the route (api/routes/vault.py) already does a normal
+    `from config.settings import settings` so it picks up the patched value
+    with no importlib.reload(vault) required either.
     """
+    from config.settings import settings
     tmpdir = tempfile.mkdtemp(prefix="lifeos-vault-test-")
-    monkeypatch.setenv("LIFEOS_VAULT_PATH", tmpdir)
-    import config.settings
-    importlib.reload(config.settings)
+    monkeypatch.setattr(settings, "vault_path", Path(tmpdir))
     from api.routes import vault
-    importlib.reload(vault)
     app = FastAPI()
     app.include_router(vault.router)
     yield TestClient(app), Path(tmpdir)
     import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 def test_create_writes_file_with_parents(app_and_vault):
     c, vault = app_and_vault

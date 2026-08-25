@@ -2,6 +2,8 @@
 import pytest
 from scripts.sync_contacts_csv import normalize_phone
 
+pytestmark = pytest.mark.unit
+
 
 class TestNormalizePhone:
     """Tests for phone number normalization."""
