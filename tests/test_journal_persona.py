@@ -11,23 +11,27 @@ without one:
   other specialized bot — mirrors test_persona_api.py / test_doctor_bot.py);
 - the persona file itself states the behavior the issue specifies (mirrors
   test_doctor_bot.py's needle-based check on doctor.md);
-- the create-then-append mechanism the persona is instructed to use actually
-  produces a well-formed day file when driven against the real
-  `/api/vault/write` route (same fixture pattern as test_vault_write_route.py);
+- that capture lands where the persona says it lands, driven through the real
+  capture path (#674 moved capture out of the persona's prompt and into
+  `api/services/journal_capture.py`, because the tool it used to be told to
+  call — `lifeos_vault_write` — is MCP-only and absent from the native agentic
+  loop, so nothing was ever written; the mechanism's full behavior, including
+  end-to-end captures through `/chat` and the ring-ingest endpoint, lives in
+  tests/test_journal_capture.py);
 - the reserved-path guard (tested directly in test_vault_write_route.py) is
   what makes "never targets Personal/Journal/" an enforced fact rather than a
   prompt suggestion.
 """
 from __future__ import annotations
 
-import importlib
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from api.routes import vault as vault_route
 
 pytestmark = pytest.mark.unit
 
@@ -101,10 +105,23 @@ class TestPersonaContent:
         assert "type: log" in text
         assert "date:" in text
 
-    def test_states_create_then_append_mechanism(self):
+    def test_does_not_instruct_a_tool_the_agentic_loop_lacks(self):
+        """#674: the persona used to tell the model to append the bullet via
+        `lifeos_vault_write` — MCP-only, absent from the native loop's
+        TOOL_DEFINITIONS. The model could not call it, wrote the bullet as
+        prose, and every fragment was lost. Capture is code now
+        (api/services/journal_capture.py); the persona must not claim
+        otherwise."""
         text = _PERSONA_PATH.read_text()
-        assert 'mode="create"' in text
-        assert 'mode="append"' in text
+        assert "lifeos_vault_write" not in text
+        assert 'mode="create"' not in text
+        assert 'mode="append"' not in text
+
+    def test_states_capture_is_automatic_and_not_the_models_job(self):
+        text = _PERSONA_PATH.read_text()
+        low = text.lower()
+        assert "do not try to write the log yourself" in low
+        assert "before your turn starts" in low
 
     def test_states_extraction_tools_and_all_three_cases(self):
         text = _PERSONA_PATH.read_text()
@@ -126,70 +143,64 @@ class TestPersonaContent:
 
 
 # ---------------------------------------------------------------------------
-# The create-then-append mechanism, exercised against the real vault_write
-# route (same fixture pattern as test_vault_write_route.py).
+# Where capture actually lands, driven through the real capture path (#674).
+# Mechanism detail lives in tests/test_journal_capture.py; this file only
+# holds the persona-level invariants to its word.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def app_and_vault(monkeypatch):
-    tmpdir = tempfile.mkdtemp(prefix="lifeos-journal-test-")
-    monkeypatch.setenv("LIFEOS_VAULT_PATH", tmpdir)
-    import config.settings
-    importlib.reload(config.settings)
-    from api.routes import vault
-    importlib.reload(vault)
-    app = FastAPI()
-    app.include_router(vault.router)
-    yield TestClient(app), Path(tmpdir)
-    import shutil
-    shutil.rmtree(tmpdir, ignore_errors=True)
+def vault(tmp_path, monkeypatch) -> Path:
+    """A throwaway vault. Asserts the redirect actually took — a capture test
+    that silently ran against the operator's real vault would be far worse
+    than a failing one.
+
+    Patches `vault_path` on the settings object each module actually holds,
+    not just the current `config.settings.settings`: tests/test_vault_write_route.py
+    reloads `config.settings`, after which a module that did
+    `from config.settings import settings` at import time keeps the ORIGINAL
+    instance — the one still pointing at the operator's real vault.
+    """
+    import api.services.journal_capture as journal_capture_mod
+    import config.settings as settings_mod
+    from api.routes import vault as vault_route_mod
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    seen = {}
+    for obj in (settings_mod.settings, journal_capture_mod.settings, vault_route_mod.settings):
+        seen[id(obj)] = obj
+    for obj in seen.values():
+        monkeypatch.setattr(obj, "vault_path", root)
+    assert journal_capture_mod.settings.vault_path == root
+    return root
 
 
-def _day_file_header(date: str) -> str:
-    return f"---\ntype: log\ndate: {date}\n---\n"
+class TestCaptureTarget:
+    def test_fragment_lands_in_the_day_log_the_persona_names(self, vault):
+        from datetime import datetime
+        from api.services.journal_capture import capture_fragment
 
-
-class TestCaptureMechanism:
-    def test_first_fragment_of_day_creates_file_with_frontmatter(self, app_and_vault):
-        c, vault = app_and_vault
-        path = "Personal/Log/2026-08-23.md"
-        content = _day_file_header("2026-08-23") + "- 09:14 · idea about the deploy gate #eng\n"
-        r = c.post("/api/vault/write", json={"path": path, "content": content, "mode": "create"})
-        assert r.status_code == 200, r.text
-        assert r.json()["created"] is True
-
+        capture_fragment("idea about the deploy gate #eng", now=datetime(2026, 8, 23, 9, 14))
         written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
         assert written.startswith("---\ntype: log\ndate: 2026-08-23\n---\n")
         assert "- 09:14 · idea about the deploy gate #eng" in written
 
-    def test_second_fragment_falls_back_to_append_after_create_conflicts(self, app_and_vault):
-        c, vault = app_and_vault
-        path = "Personal/Log/2026-08-23.md"
-        first = _day_file_header("2026-08-23") + "- 09:14 · idea about the deploy gate #eng\n"
-        c.post("/api/vault/write", json={"path": path, "content": first, "mode": "create"})
+    def test_capture_never_lands_in_reserved_journal_dir(self, vault):
+        from datetime import datetime
+        from api.services.journal_capture import capture_fragment
 
-        # Second fragment: create conflicts (file exists) -> fall back to append.
-        second_bullet = '- 14:37 · that book title — "Seeing Like a State"\n'
-        create_attempt = c.post("/api/vault/write", json={"path": path, "content": second_bullet, "mode": "create"})
-        assert create_attempt.status_code == 409
+        capture_fragment("should never land in the generated journal", now=datetime(2026, 8, 23, 9, 14))
+        assert not (vault / "Personal" / "Journal").exists()
 
-        append = c.post("/api/vault/write", json={"path": path, "content": second_bullet, "mode": "append"})
-        assert append.status_code == 200, append.text
-
-        written = (vault / "Personal" / "Log" / "2026-08-23.md").read_text()
-        # Frontmatter written exactly once, both bullets present, in order.
-        assert written.count("type: log") == 1
-        lines = [line for line in written.splitlines() if line.startswith("- ")]
-        assert lines == [
-            "- 09:14 · idea about the deploy gate #eng",
-            '- 14:37 · that book title — "Seeing Like a State"',
-        ]
-
-    def test_capture_never_lands_in_reserved_journal_dir(self, app_and_vault):
-        c, vault = app_and_vault
+    def test_vault_write_route_still_reserves_personal_journal(self, vault):
+        # The prompt-level "never write here" is backed by a route-level guard;
+        # #674 must not have weakened it.
+        app = FastAPI()
+        app.include_router(vault_route.router)
+        c = TestClient(app)
         r = c.post("/api/vault/write", json={
             "path": "Personal/Journal/2026-08-23.md",
-            "content": _day_file_header("2026-08-23") + "- 09:14 · should never land here\n",
+            "content": "should never land here",
             "mode": "create",
         })
         assert r.status_code == 400

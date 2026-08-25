@@ -345,7 +345,12 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
             forwarded to the orchestrator so its replies are domain-primed.
 
     Returns:
-        {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None}
+        {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None,
+         "journal_capture": {"path": str, "created": bool}|None}
+
+        `journal_capture` is populated only on the journal persona's turns
+        (#674) and only once the fragment is on disk — it is the caller's proof
+        of capture, not something to infer from the turn completing.
     """
     port = settings.port
     body: dict = {"question": question}
@@ -362,6 +367,7 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
     sources = []
     statuses = []
     perf_trace = None
+    journal_capture = None
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
@@ -396,6 +402,14 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
                     sources = event.get("sources", [])
                 elif etype == "perf_trace":
                     perf_trace = event
+                elif etype == "journal_capture":
+                    # #674: proof the fragment reached disk, not an inference
+                    # from the turn completing. Relayed verbatim so callers
+                    # (api/routes/journal_ingest.py) can require it.
+                    journal_capture = {
+                        "path": event.get("path"),
+                        "created": bool(event.get("created")),
+                    }
                 elif etype == "error":
                     error_msg = event.get("message", "Unknown error")
                     logger.error(f"Chat pipeline error: {error_msg}")
@@ -410,6 +424,7 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
         "sources": sources,
         "statuses": statuses,
         "perf_trace": perf_trace,
+        "journal_capture": journal_capture,
     }
 
 

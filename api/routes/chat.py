@@ -34,6 +34,12 @@ from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import get_turn_registry, TRUNCATION_MARKER, truncation_routing
+from api.services.journal_capture import (
+    JOURNAL_PERSONA_ID,
+    CaptureResult,
+    JournalCaptureError,
+    capture_fragment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +594,30 @@ async def ask_stream(request: AskStreamRequest):
         _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
     personal_context = settings.personal_context(_effective_pid or "")
 
+    # #674: the journal persona's capture is deterministic, done here in code,
+    # not left to the model. It used to be prompt-only — the persona was told to
+    # call `lifeos_vault_write`, a tool the native agentic loop does not have, so
+    # every fragment was lost while the reply read like a successful capture.
+    #
+    # Done BEFORE the SSE stream opens (like the persona resolution above) so a
+    # capture failure is a clean HTTP 500 rather than a mid-stream error: no
+    # caller can report success for a fragment that wasn't written, and the ring
+    # ingest's idempotency key stays unburned so a retry can still land. Covers
+    # every journal surface at once — the Telegram bot and the ingest endpoint
+    # both arrive here through `chat_via_api`'s raw-`persona` path, `/chat` and
+    # voice through `persona_id`.
+    journal_capture: Optional[CaptureResult] = None
+    if _effective_pid == JOURNAL_PERSONA_ID:
+        try:
+            journal_capture = capture_fragment(request.question)
+        except JournalCaptureError:
+            # Deliberately not `str(e)` — the detail is surfaced to the user
+            # (Telegram renders it verbatim) and must never quote the fragment.
+            raise HTTPException(
+                status_code=500,
+                detail="journal capture failed: the fragment was not written",
+            )
+
     # #611: the turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving
     # (#616 lifted the voice-only exception; see ChatTurn.reader() in
@@ -674,6 +704,22 @@ async def ask_stream(request: AskStreamRequest):
 
             # Send conversation ID to client
             await turn.emit(f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n")
+
+            # #674: tell the caller the fragment is on disk. This is the only
+            # thing that makes "logged" an honest status downstream — the ring
+            # ingest endpoint requires this event before it reports success or
+            # burns the delivery's idempotency key, rather than inferring
+            # capture from "the pipeline returned without raising", which is
+            # exactly the inference that hid this bug. Additive event type;
+            # clients that don't know it ignore it.
+            if journal_capture is not None:
+                await turn.emit(
+                    "data: " + json.dumps({
+                        "type": "journal_capture",
+                        "path": journal_capture.path,
+                        "created": journal_capture.created,
+                    }) + "\n\n"
+                )
 
             # Save user message
             store.add_message(conversation_id, "user", request.question)
