@@ -1,7 +1,7 @@
 # Python Conventions
 
 > **Status:** Complete
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-08-25
 > **Audience:** All developers and AI agents
 
 Coding conventions extracted from the LifeOS codebase. Match these patterns when writing new code.
@@ -130,6 +130,37 @@ def get_by_id(self, entity_id: str) -> Optional[PersonEntity]:
     finally:
         conn.close()
 ```
+
+## SQLite Connection Closing
+
+`with sqlite3.connect(...)` is a *transaction* context manager — it commits
+or rolls back on exit, but does not close the connection. Left alone,
+CPython's refcounting closes it once `conn` goes out of scope, which is why
+this has been safe in practice (see issue #678's fd measurements), but that
+is an implementation detail, not a guarantee: the same bare pattern leaked a
+file descriptor per batch in a tight loop and exhausted `ulimit -n` (#647).
+
+Prefer `contextlib.closing`, matching `api/services/imessage.py`:
+
+```python
+from contextlib import closing
+
+# Read-only: closing() alone ends the connection deterministically.
+with closing(sqlite3.connect(self.storage_path)) as conn:
+    conn.row_factory = sqlite3.Row
+    ...
+
+# Writes: pair it with the connection's own commit/rollback context too --
+# closing() alone silently drops the commit.
+with closing(sqlite3.connect(self.storage_path)) as conn, conn:
+    conn.execute("UPDATE ...")
+```
+
+This is the house style for new and touched code. `api/services/`'s other
+SQLite-backed stores (`agent_viz_summary.py`, `agent_viz_label_override.py`,
+`job_queue.py`, `hermes_persona_thread_store.py`, `perf_trace.py`,
+`gsheet_sync.py`, `usage_store.py`) still use the bare form; sweeping them is
+a separate follow-up, not a blocker for adopting this pattern elsewhere.
 
 ## Error Handling
 
