@@ -2,10 +2,7 @@
 Tests for RelationshipSummary module.
 """
 import pytest
-import tempfile
-import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from api.services.relationship_summary import (
@@ -13,8 +10,9 @@ from api.services.relationship_summary import (
     RelationshipSummary,
     get_relationship_summary,
     format_relationship_context,
-    RECENT_ACTIVITY_DAYS,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestChannelActivity:

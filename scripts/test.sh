@@ -82,6 +82,13 @@ check_server() {
 }
 
 # Run unit tests (fast, no external deps)
+#
+# #682: this negative filter and the pre-push hook's `-m "unit and not slow"`
+# are meant to select the same set, and after the #682 marker triage they
+# collect the identical set (verified via --collect-only on both filters) —
+# see scripts/pre-push and tests/conftest.py's pytest_collection_modifyitems
+# for how a pre-existing name-substring auto-marker used to break that
+# agreement and why it was removed rather than special-cased.
 run_unit_tests() {
     log_step "Running unit tests..."
     python -m pytest tests/ -v \
@@ -103,7 +110,12 @@ run_integration_tests() {
         sleep 3
     fi
 
-    python -m pytest tests/test_e2e_flow.py -v \
+    # #682: was hardcoded to tests/test_e2e_flow.py only, so every other
+    # `integration`-marked test (including the direct-DB data-integrity
+    # suites) had no scope that ever ran them. Sweep the whole tree instead —
+    # this is the only place `integration`-marked tests run on this box.
+    python -m pytest tests/ -v \
+        --ignore=tests/archive \
         -m "integration" \
         --tb=short
 }

@@ -11,6 +11,8 @@ from api.services.whatsapp_import import (
     _parse_datetime,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestParseWhatsAppExport:
     """Tests for parse_whatsapp_export function."""

@@ -329,6 +329,7 @@ def test_worker_unit_has_no_api_restart_cascade():
     assert any(d.startswith("After=") and "lifeos-api" in d for d in directives)
 
 
+@pytest.mark.unit
 def test_classify_change_picks_worker_vs_api(tmp_path: Path):
     """classify-change prints 'worker' for an agent_worker diff, 'api' otherwise."""
     if not SERVER_SH.exists():

@@ -19,8 +19,10 @@ from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
 
 
-# All classes in this file require database access
-pytestmark = pytest.mark.usefixtures("require_db")
+# All classes in this file require database access to real production data
+# (#682: `require_db` only skips a *locked* db, not an empty one, so this
+# also needs `integration` to actually leave the unit/push gate).
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("require_db")]
 
 
 class TestR1CleanDatabase:

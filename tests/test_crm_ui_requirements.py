@@ -18,6 +18,7 @@ from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
 
 
+@pytest.mark.unit
 class TestPeopleListSorting:
     """Tests for people list sorting functionality."""
 
@@ -90,6 +91,7 @@ class TestPeopleListSorting:
         assert strengths == sorted(strengths, reverse=True)
 
 
+@pytest.mark.unit
 class TestZeroInteractionFilter:
     """Tests for filtering out zero-interaction people."""
 
@@ -143,6 +145,7 @@ class TestZeroInteractionFilter:
         assert unfiltered_total >= filtered_total
 
 
+@pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestStatsMatchDatabase:
     """Tests that PersonEntity stats match the interaction database.
@@ -214,6 +217,7 @@ class TestStatsMatchDatabase:
                 assert person.meeting_count == calendar_count
 
 
+@pytest.mark.unit
 class TestReviewQueue:
     """Tests for review queue functionality."""
 

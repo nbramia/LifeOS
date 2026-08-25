@@ -18,6 +18,7 @@ from api.services.meeting_prep import (
 from api.services.calendar import CalendarEvent
 
 
+@pytest.mark.unit
 class TestHelperFunctions:
     """Test helper functions in meeting_prep module."""
 
@@ -82,6 +83,7 @@ class TestHelperFunctions:
         assert alex_count == 1
 
 
+@pytest.mark.unit
 class TestFindPeopleNotes:
     """Test _find_people_notes function."""
 
@@ -118,6 +120,7 @@ class TestFindPeopleNotes:
         assert len(notes) == 0
 
 
+@pytest.mark.unit
 class TestFindPastMeetings:
     """Test _find_past_meetings function."""
 
@@ -196,8 +199,15 @@ class TestGetMeetingPrep:
             }
         ]
 
+    @pytest.mark.integration
     def test_returns_meeting_prep_response(self, mock_calendar_events, mock_search_results):
-        """Should return MeetingPrepResponse with meetings."""
+        """Should return MeetingPrepResponse with meetings.
+
+        #682: only get_calendar_service/get_hybrid_search are patched — which
+        accounts get iterated comes from get_configured_accounts(), which
+        reads real OAuth token config. On a clean checkout with no configured
+        Google accounts this returns 0 meetings, not 2.
+        """
         from api.services.google_auth import GoogleAccount
 
         def mock_get_service(account):
@@ -220,8 +230,13 @@ class TestGetMeetingPrep:
         assert result.count == 2
         assert len(result.meetings) == 2
 
+    @pytest.mark.integration
     def test_meeting_has_required_fields(self, mock_calendar_events, mock_search_results):
-        """Should include all required fields in meeting prep."""
+        """Should include all required fields in meeting prep.
+
+        #682: relies on result.meetings[0], which requires at least one
+        configured Google account (get_configured_accounts()) to be non-empty.
+        """
         from api.services.google_auth import GoogleAccount
 
         def mock_get_service(account):
@@ -246,6 +261,7 @@ class TestGetMeetingPrep:
         assert meeting.html_link is not None
         assert isinstance(meeting.related_notes, list)
 
+    @pytest.mark.unit
     def test_filters_all_day_events_by_default(self, mock_search_results):
         """Should exclude all-day events by default."""
         from api.services.google_auth import GoogleAccount
@@ -276,8 +292,16 @@ class TestGetMeetingPrep:
 
         assert result.count == 0
 
+    @pytest.mark.unit
     def test_includes_all_day_events_when_requested(self, mock_search_results):
-        """Should include all-day events when include_all_day=True."""
+        """Should include all-day events when include_all_day=True.
+
+        Only exercises the PERSONAL account, which get_configured_accounts()
+        always includes unconditionally (unlike WORK/WORK2, gated on a
+        credentials file) — so this passes on a clean checkout. Verified by
+        running: 17 passed / 3 failed on this file, and this test is in the
+        17 (#682).
+        """
         from api.services.google_auth import GoogleAccount
 
         all_day_event = CalendarEvent(
@@ -306,13 +330,19 @@ class TestGetMeetingPrep:
 
         assert result.count == 1
 
+    @pytest.mark.unit
     def test_invalid_date_raises_error(self):
         """Should raise ValueError for invalid date format."""
         with pytest.raises(ValueError, match="Invalid date format"):
             get_meeting_prep("invalid-date")
 
+    @pytest.mark.integration
     def test_fetches_from_both_calendars(self, mock_search_results):
-        """Should fetch from both work and personal calendars."""
+        """Should fetch from both work and personal calendars.
+
+        #682: asserts get_calendar_service was called twice, which requires
+        both accounts to be present in get_configured_accounts().
+        """
         def mock_get_service(account):
             mock = MagicMock()
             mock.get_events_in_range.return_value = []
@@ -329,8 +359,10 @@ class TestGetMeetingPrep:
         assert mock_get_cal.call_count == 2
 
 
-# API endpoint tests (slow - requires app initialization)
-pytestmark_api = pytest.mark.slow
+# API endpoint tests (slow - requires app initialization). Each method below
+# carries its own @pytest.mark.slow — `pytestmark` (not `pytestmark_api`,
+# which pytest never recognizes) would apply it uniformly, but per-method is
+# already equivalent here since every method in the class has it (#682).
 
 
 class TestMeetingPrepEndpoint:
@@ -423,7 +455,7 @@ class TestMeetingPrepEndpoint:
 
         client = TestClient(app)
 
-        with patch('api.routes.calendar.get_meeting_prep', return_value=mock_meeting_prep) as mock_fn:
+        with patch('api.routes.calendar.get_meeting_prep', return_value=mock_meeting_prep):
             response = client.get("/api/calendar/meeting-prep?include_all_day=true")
             assert response.status_code == 200
 

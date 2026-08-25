@@ -11,6 +11,8 @@ from api.services.relationship_metrics import (
     FREQUENCY_TARGET,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestRecencyScore:
     """Tests for recency score calculation."""

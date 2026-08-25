@@ -13,6 +13,8 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+pytestmark = pytest.mark.unit
+
 
 class TestSlackSyncExitCodes:
     """scripts/sync_slack.py must fail loudly when the integration is disabled."""

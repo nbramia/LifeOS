@@ -23,6 +23,8 @@ from api.services.imessage import (
     resolve_entity_id_confidence,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestAppleTimestampConversion:
     """Tests for Apple timestamp conversion functions."""

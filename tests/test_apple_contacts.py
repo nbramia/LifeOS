@@ -1,13 +1,14 @@
 """Tests for Apple Contacts integration service."""
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
 
 from api.services.apple_contacts import (
     AppleContact,
     create_contact_source_entity,
     SOURCE_CONTACTS,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestAppleContact:

@@ -8,6 +8,9 @@ interaction creation — operates on parsed dicts and is tested here.
 import sqlite3
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from api.services.source_entity import SourceEntity
 from api.services.whatsapp import (
     SOURCE_WHATSAPP,
     extract_phone_from_jid,
@@ -18,7 +21,8 @@ from api.services.whatsapp import (
     process_whatsapp_messages,
     resolve_lid_phone,
 )
-from api.services.source_entity import SourceEntity
+
+pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------

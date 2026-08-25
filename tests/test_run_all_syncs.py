@@ -2,6 +2,10 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 # Minimal SYNC_SOURCES for tests — only defines metadata (depends_on, frequency, phase).
 # The actual sync logic is mocked via run_sync.
 TEST_SYNC_SOURCES = {

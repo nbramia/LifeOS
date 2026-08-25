@@ -18,6 +18,8 @@ from api.services.interaction_store import (
     create_vault_interaction,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestInteraction:
     """Tests for Interaction dataclass."""

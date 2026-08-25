@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 # ---------------------------------------------------------------------------
 # 1. Encode-time GPU → CPU fallback

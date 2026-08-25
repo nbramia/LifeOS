@@ -886,7 +886,6 @@ def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
     assert "Tools called" not in msg
 
 
-@pytest.mark.unit
 class _FakeManagedDriver:
     def __init__(self, fail: bool = False):
         self.fail = fail
@@ -903,6 +902,7 @@ class _FakeManagedExecutor:
         self.driver = _FakeManagedDriver(fail=fail)
 
 
+@pytest.mark.unit
 def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
     """#198: rolling back a session with a live remote Managed Agents session
     must kill the remote session — otherwise it keeps running on Anthropic's
@@ -935,6 +935,7 @@ def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
     assert "orphan_remote_session_killed" in kinds
 
 
+@pytest.mark.unit
 def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
     """#198: a kill failure (remote 404, network error) must not block the
     local rollback — the session still finalizes FAILED."""
@@ -960,6 +961,7 @@ def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
     assert w.session_store.get("t1").status == STATUS_FAILED
 
 
+@pytest.mark.unit
 def test_resume_pending_does_not_telegram_for_spawned_children(tmp_path: Path):
     """Live bug: after a worker restart, the startup-recovery path saw a
     spawned child stuck in RUNNING, rolled it back, and pinged the

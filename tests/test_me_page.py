@@ -9,7 +9,12 @@ from datetime import datetime, timezone, timedelta
 
 from api.routes.crm import MY_PERSON_ID
 
+# Marked per-class below rather than at module level: every class here is
+# mock-based (unit) except test_my_person_id_is_valid_uuid, which needs a
+# real configured settings.my_person_id (#682) and is marked individually.
 
+
+@pytest.mark.unit
 class TestMeStatsEndpoint:
     """Tests for GET /api/crm/me/stats endpoint."""
 
@@ -73,6 +78,7 @@ class TestMeStatsEndpoint:
         assert result.total_messages == 0
 
 
+@pytest.mark.unit
 class TestMeInteractionsEndpoint:
     """Tests for GET /api/crm/me/interactions endpoint (aggregated data)."""
 
@@ -170,7 +176,7 @@ class TestMeInteractionsEndpoint:
 
         with patch('api.routes.crm.get_person_entity_store', return_value=person_store):
             with patch('api.routes.crm.get_interaction_store', return_value=interaction_store):
-                result = await get_me_interactions(days_back=365)
+                await get_me_interactions(days_back=365)
 
         # Verify get_all_in_range was called with exclude_person_ids
         interaction_store.get_all_in_range.assert_called_once()
@@ -222,12 +228,15 @@ class TestMeInteractionsEndpoint:
 class TestMyPersonIdConstant:
     """Tests for MY_PERSON_ID constant."""
 
+    @pytest.mark.integration
     def test_my_person_id_is_valid_uuid(self):
-        """MY_PERSON_ID should be a valid UUID string."""
+        """MY_PERSON_ID should be a valid UUID string. Needs a real configured
+        settings.my_person_id — empty (not a UUID) in a clean checkout."""
         import uuid
         # Should not raise
         uuid.UUID(MY_PERSON_ID)
 
+    @pytest.mark.unit
     def test_my_person_id_from_settings(self):
         """MY_PERSON_ID should come from settings (not hardcoded)."""
         from config.settings import settings

@@ -1,11 +1,15 @@
 """
 Tests for phone number utilities.
 """
+import pytest
+
 from api.services.phone_utils import (
     normalize_phone,
     format_phone_display,
     is_valid_phone,
 )
+
+pytestmark = pytest.mark.unit
 
 
 class TestNormalizePhone:
