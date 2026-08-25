@@ -598,6 +598,92 @@ async def test_spawn_succeeds_from_a_hermes_turns_caller_session_id(proxy_client
     assert result["ok"] is True, result
 
 
+# ---------------------------------------------------------------------------
+# Caller-session bot ownership (#684 adversarial review) — a Hermes turn's
+# caller_session_id, and every lifeos_agent_spawn descendant of it, must
+# carry the SAME bot ownership a native-spawned session gets, so the
+# worker's status/blocked notices for that lineage route to the right
+# Telegram bot and that bot's threaded-reply resume (scoped to its own
+# `bot`) can find them. Before this, a Hermes-rooted session's `bot` was
+# always None regardless of persona_id, so every descendant silently fell
+# back to the PRIMARY bot's channel.
+# ---------------------------------------------------------------------------
+
+async def test_caller_session_bot_matches_persona_id(proxy_client, agent_session_store, tmp_path, monkeypatch):
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("DOCTOR PERSONA BODY")
+    reg = _registry(tmp_path, [
+        {"name": "doctor", "token_env": "TG_DOC", "persona_file": str(persona_file), "orchestrates": True},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_DOC", "tok")
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "persona_id": "doctor"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    session = agent_session_store.get_by_session_id(caller_session_id)
+    assert session is not None
+    assert session.bot == "doctor"
+
+
+async def test_caller_session_bot_is_none_for_primary(proxy_client, agent_session_store):
+    """No persona_id → defaults to primary — `bot` stays `None`, matching
+    the convention every primary-rooted session already uses (never the
+    literal string "primary")."""
+    resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+
+    session = agent_session_store.get_by_session_id(caller_session_id)
+    assert session is not None
+    assert session.bot is None
+
+
+async def test_spawned_child_inherits_bot_from_hermes_caller(proxy_client, agent_session_store, tmp_path, monkeypatch):
+    """The Codex-flagged regression: a doctor-persona Hermes turn's
+    caller_session_id, used to `lifeos_agent_spawn` a worker, must produce a
+    child session tagged `bot="doctor"` — not `None` (which would route the
+    worker's own status/blocked notices to the primary bot's channel and
+    make the doctor listener's threaded-reply resume, scoped to `bot=
+    "doctor"`, unable to find them)."""
+    from api.services.agent_worker import inter_agent
+    from api.services.agent_worker.transcript_store import TranscriptStore
+
+    persona_file = tmp_path / "doctor.md"
+    persona_file.write_text("DOCTOR PERSONA BODY")
+    reg = _registry(tmp_path, [
+        {"name": "doctor", "token_env": "TG_DOC", "persona_file": str(persona_file), "orchestrates": True},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_DOC", "tok")
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "hi", "persona_id": "doctor", "conversation_id": "conv-bot-684"},
+    )
+    assert resp.status_code == 200
+    caller_session_id = json.loads(_received["body"])["lifeos_context"]["turn"]["caller_session_id"]
+    assert agent_session_store.get_by_session_id(caller_session_id).bot == "doctor"
+
+    ctx = inter_agent.InterAgentContext(
+        session_store=agent_session_store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        caller_session_id=caller_session_id,
+        caps=inter_agent.Caps(),
+    )
+    result = inter_agent.dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "investigate the sync timer", "model": "claude_code",
+    })
+    assert result["ok"] is True, result
+
+    child = agent_session_store.get_by_session_id(result["child_session_id"])
+    assert child is not None
+    assert child.bot == "doctor"
+
+
 async def test_spawn_model_claude_blocked_from_a_hermes_root(proxy_client, agent_session_store, tmp_path):
     """The spend guard (#640, extending #578/ADR-018): a Hermes-rooted
     session is not API-billed, so it may not open the model="claude" side

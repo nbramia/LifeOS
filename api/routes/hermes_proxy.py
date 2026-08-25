@@ -95,18 +95,28 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=TIMEOUT)
 
 
-def _resolve_caller_session_id(conversation_id: Optional[str]) -> str:
+def _resolve_caller_session_id(conversation_id: Optional[str], persona_id: str) -> str:
     """Hermes's `lifeos_agent_*` identity for this turn (#640).
 
     `SessionStore` is imported locally (not at module top) so tests can
     patch `api.services.agent_worker.session_store.SessionStore` in place —
     the same isolation pattern `api/routes/conversations.py` uses for the
     same class.
+
+    `persona_id` (#684 review) is forwarded as the root session's `bot`
+    ownership tag (`None` for `"primary"`, matching the convention every
+    Telegram-spawned session already uses) — see
+    `resolve_hermes_caller_session_id`'s docstring for why this matters: a
+    `lifeos_agent_spawn` descendant of this session inherits it, which is
+    what lets a doctor-persona Hermes conversation's spawned workers route
+    their status/blocked notices back to the doctor bot instead of silently
+    falling back to the primary one.
     """
     from api.services.agent_worker.hermes_session import resolve_hermes_caller_session_id
     from api.services.agent_worker.session_store import SessionStore
 
-    return resolve_hermes_caller_session_id(SessionStore(), conversation_id)
+    bot = None if persona_id in (None, "primary") else persona_id
+    return resolve_hermes_caller_session_id(SessionStore(), conversation_id, bot=bot)
 
 
 def _resolve_lifeos_context(
@@ -173,7 +183,7 @@ def _resolve_lifeos_context(
     # request. Additive at schema_version 1 (no version bump): a consumer
     # that doesn't know this key ignores it exactly as it would any other
     # unrecognized field.
-    turn["caller_session_id"] = _resolve_caller_session_id(conversation_id)
+    turn["caller_session_id"] = _resolve_caller_session_id(conversation_id, persona_id)
 
     return {
         "schema_version": 1,

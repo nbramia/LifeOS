@@ -305,32 +305,141 @@ class TestDoctorListener:
         assert listener._owns_agent_sessions is False
 
     @pytest.mark.asyncio
-    async def test_doctor_message_spawns_session_not_chat(self):
+    async def test_doctor_fresh_message_routes_through_chat_pipeline(self, monkeypatch):
+        """#684: doctor's direct-CC spawn entry (`_handle_orchestration_message`)
+        is retired — a fresh message now flows through the same chat pipeline
+        as any other bot, resolving its persona via `persona_id` so it reaches
+        Hermes (which supervises its own workers via `lifeos_agent_spawn`,
+        config/personas/doctor.hermes.md) exactly like fitness/therapist/
+        finance/journal."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
         listener = self._listener("doctor", "999", persona="DOCTOR CONTRACT", orchestrates=True)
         update = {"message": {"text": "search is broken", "chat": {"id": 999}, "message_id": 1}}
 
-        spawn = MagicMock(return_value={"ok": True, "session_id": "sess_x", "task_id": "t"})
-        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
-             patch("api.services.agent_worker.session_store.SessionStore"), \
-             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
              patch("api.services.telegram.TypingIndicator", _DummyTyping), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "On it.", "conversation_id": "c1"}
             await listener._handle_update(update)
 
-        # Doctor drives a Claude Code session, never the chat pipeline.
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("persona_id") == "doctor"
+        assert mock_chat.call_args.kwargs.get("backend") == "hermes"
+        assert not hasattr(listener, "_handle_orchestration_message")
+
+    @pytest.mark.asyncio
+    async def test_doctor_native_fallback_uses_persona_id_gated_spawn(self, monkeypatch):
+        """With Hermes unavailable, doctor's fallback turn still goes to the
+        native pipeline via `persona_id="doctor"` (not a raw preamble) — that
+        is what makes `POST /api/ask/stream`'s own persona_id-gated
+        orchestrating-persona spawn (api/routes/chat.py) fire, tagging the
+        spawned session `bot="doctor"` for Telegram-thread parity, instead of
+        an ordinary inline chat reply."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        listener = self._listener("doctor", "999", persona="DOCTOR CONTRACT", orchestrates=True)
+        update = {"message": {"text": "search is broken", "chat": {"id": 999}, "message_id": 1}}
+
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "🩺 On it", "conversation_id": "c1"}
+            await listener._handle_update(update)
+
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("persona_id") == "doctor"
+        assert mock_chat.call_args.kwargs.get("backend") == "lifeos"
+
+    # ------------------------------------------------------------------
+    # #453 guard, re-pinned for #684 (Codex adversarial review): the native
+    # fallback path still reaches chat.py's persona_id-gated orchestration
+    # spawn, which fires unconditionally for ANY message once persona_id
+    # names an orchestrating bot — so a bare affirmative reaching the
+    # NATIVE fallback (unlike the Hermes path, where spawning is the
+    # model's own deliberate tool call) must still be intercepted before it
+    # looks like a fresh "report". These replace the three tests removed
+    # earlier in this file that exercised the retired
+    # `_handle_orchestration_message` directly; the property they guarded
+    # is the same, only the call path changed (`_native_turn` /
+    # `_maybe_consume_bare_affirmative` in api/services/telegram.py).
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_doctor_native_fallback_bare_yes_routes_to_open_gate(self, tmp_path, monkeypatch):
+        """A bare 'Yes' on the native fallback path, with an open
+        goal_approval gate, resolves that gate — it must never reach
+        chat_via_api (which would trigger chat.py's unconditional spawn)."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        store = self._seed_goal_question(tmp_path, message_id=5000)
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        update = {"message": {"text": "Yes", "chat": {"id": 999}, "message_id": 1}}
+
+        sent: list[str] = []
+
+        def _capture_ids(text, chat_id=None, bot=None):
+            sent.append(text)
+            return [8001]
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store),              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock),              patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids),              patch("api.services.telegram.send_message_async", new_callable=AsyncMock),              patch("api.services.telegram.TypingIndicator", _DummyTyping),              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            await listener._handle_update(update)
+
         mock_chat.assert_not_called()
-        spawn.assert_called_once()
-        kwargs = spawn.call_args.kwargs
-        assert kwargs["bot"] == "doctor"
-        assert kwargs["working_dir"].endswith("/LifeOS")
-        # The persona is the orchestration prompt prefix; the report is appended.
-        prompt = spawn.call_args.args[1]
-        assert "DOCTOR CONTRACT" in prompt
-        assert "search is broken" in prompt
+        assert any("Goal locked" in s for s in sent)
+        answered = store.list_answered_unprocessed_questions()
+        assert [q["answer"] for q in answered] == ["Yes"]
+
+    @pytest.mark.asyncio
+    async def test_doctor_native_fallback_bare_approved_no_gate_consumed(self, tmp_path, monkeypatch):
+        """A bare 'approved' on the native fallback path with NOTHING
+        awaiting approval is consumed with a "nothing waiting" notice — it
+        must never spawn a session whose entire "report" is the word
+        approved."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        from api.services.agent_worker.session_store import SessionStore
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        update = {"message": {"text": "approved", "chat": {"id": 999}, "message_id": 2}}
+
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None):
+            sent.append(text)
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store),              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock),              patch("api.services.telegram.send_message_async", side_effect=_capture),              patch("api.services.telegram.TypingIndicator", _DummyTyping),              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            await listener._handle_update(update)
+
+        mock_chat.assert_not_called()
+        assert any("nothing here waiting" in s for s in sent)
+
+    @pytest.mark.asyncio
+    async def test_doctor_native_fallback_real_report_still_dispatches(self, monkeypatch):
+        """A real report that merely STARTS with an affirmative word exceeds
+        the bare-affirmative bound (25 chars) and proceeds to the chat
+        pipeline normally, exactly as before #684."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
+        update = {"message": {
+            "text": "yes the calendar tool is broken again",
+            "chat": {"id": 999}, "message_id": 3,
+        }}
+
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock),              patch("api.services.telegram.send_message_async", new_callable=AsyncMock),              patch("api.services.telegram.TypingIndicator", _DummyTyping),              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "🩺 On it", "conversation_id": "c1"}
+            await listener._handle_update(update)
+
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("persona_id") == "doctor"
+        assert mock_chat.call_args.kwargs.get("backend") == "lifeos"
 
     @pytest.mark.asyncio
     async def test_doctor_threaded_reply_runs_resume_hook(self):
+        """Threaded-reply resume still short-circuits before the chat
+        pipeline is ever reached — unaffected by #684's retirement of the
+        direct-CC spawn entry for FRESH messages."""
         listener = self._listener("doctor", "999", persona="P", orchestrates=True)
         update = {"message": {
             "text": "yes",
@@ -340,12 +449,12 @@ class TestDoctorListener:
         }}
         with patch.object(listener, "_maybe_handle_claude_code_reply",
                           new_callable=AsyncMock, return_value=True) as mock_resume, \
-             patch.object(listener, "_handle_orchestration_message", new_callable=AsyncMock) as mock_spawn, \
-             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock):
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             await listener._handle_update(update)
-        # The reply resumed the session; it did NOT spawn a fresh one.
+        # The reply resumed the session; the chat pipeline was never reached.
         mock_resume.assert_awaited_once()
-        mock_spawn.assert_not_called()
+        mock_chat.assert_not_called()
 
     def _seed_goal_question(self, tmp_path, message_id=5000):
         """A BLOCKED doctor session with an open goal_approval question
@@ -448,112 +557,38 @@ class TestDoctorListener:
         answered = store.list_answered_unprocessed_questions()
         assert len(answered) == 1
 
-    def _seed_goal_gate(self, tmp_path, message_id=5000):
-        from api.services.agent_worker.session_store import STATUS_BLOCKED, SessionStore
-
-        store = SessionStore(db_path=tmp_path / "sessions.db")
-        s = store.create(
-            task_id="t-gate", routing="claude_code", origin="operator",
-            bot="doctor", status=STATUS_BLOCKED,
-        )
-        store.create_pending_question(
-            session_id=s.session_id, task_id="t-gate",
-            question="goal + instructions", sent_message_id=message_id,
-            sent_message_ids=[message_id], kind="goal_approval", bot="doctor",
-        )
-        return store, s
-
-    @pytest.mark.asyncio
-    async def test_bare_affirmative_routes_to_open_goal_gate_not_spawn(self, tmp_path):
-        """#453: a plain (non-threaded) "yes" while a goal gate is open must
-        answer THAT gate — not spawn a fresh context-free session (the
-        yes/approved orphan factory of 2026-07-09)."""
-        from unittest.mock import MagicMock
-
-        store, s = self._seed_goal_gate(tmp_path)
-        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
-        sent: list[str] = []
-
-        async def _capture(text, chat_id=None, bot=None):
-            sent.append(text)
-
-        def _capture_ids(text, chat_id=None, bot=None):
-            sent.append(text)
-            return [8001]
-
-        spawn = MagicMock()
-        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
-             patch("api.services.agent_worker.session_store.SessionStore",
-                   return_value=store), \
-             patch("api.services.telegram.send_message_capture_ids",
-                   side_effect=_capture_ids), \
-             patch("api.services.telegram.send_message_async", side_effect=_capture):
-            await listener._handle_orchestration_message("Yes", "999")
-
-        spawn.assert_not_called()
-        assert any("Goal locked" in t for t in sent)
-        answered = store.list_answered_unprocessed_questions()
-        assert [q["answer"] for q in answered] == ["Yes"]
+    # #684 removed `_handle_orchestration_message`, the direct-CC entry for a
+    # FRESH message — including its bare-affirmative-routes-to-open-goal-gate
+    # special case (#453's "yes/approved orphan factory" guard). That guard
+    # existed only because every non-threaded message unconditionally spawned
+    # a session; on the new chat-pipeline path (Hermes, or the persona_id-
+    # gated native fallback) spawning is the model's own tool call, not an
+    # automatic per-message action, so the failure mode the guard protected
+    # against can't recur the same way. The three tests that exercised that
+    # method directly (`test_bare_affirmative_routes_to_open_goal_gate_not_spawn`,
+    # `test_bare_affirmative_with_no_gate_is_consumed_not_spawned`,
+    # `test_report_starting_with_yes_still_spawns`) were removed with it.
+    # `_maybe_handle_claude_code_reply`'s own goal_approval handling (a
+    # THREADED reply to the goal message, exercised above and in
+    # test_session_thread_replies.py) is unaffected and still covers the
+    # in-thread approval flow this retirement doesn't touch.
 
     @pytest.mark.asyncio
-    async def test_bare_affirmative_with_no_gate_is_consumed_not_spawned(self, tmp_path):
-        """#453: "yes" with nothing awaiting approval must not spawn a session
-        whose entire "report" is the word yes — it gets a clear pointer back."""
-        from unittest.mock import MagicMock
-        from api.services.agent_worker.session_store import SessionStore
-
-        store = SessionStore(db_path=tmp_path / "sessions.db")
-        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
-        sent: list[str] = []
-
-        async def _capture(text, chat_id=None, bot=None):
-            sent.append(text)
-
-        spawn = MagicMock()
-        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
-             patch("api.services.agent_worker.session_store.SessionStore",
-                   return_value=store), \
-             patch("api.services.telegram.send_message_async", side_effect=_capture):
-            await listener._handle_orchestration_message("approved", "999")
-
-        spawn.assert_not_called()
-        assert any("nothing here waiting" in t for t in sent)
-
-    @pytest.mark.asyncio
-    async def test_report_starting_with_yes_still_spawns(self, tmp_path):
-        """A real report that merely STARTS with an affirmative word ("yes the
-        calendar tool is broken again") exceeds the bare-affirmative bound and
-        spawns a session as before."""
-        from unittest.mock import MagicMock
-
-        store, s = self._seed_goal_gate(tmp_path)
-        listener = self._listener("doctor", "999", persona="P", orchestrates=True)
-
-        spawn = MagicMock(return_value={"ok": True, "session_id": "sess-n", "task_id": "t-n"})
-        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
-             patch("api.services.agent_worker.session_store.SessionStore",
-                   return_value=store), \
-             patch("api.services.telegram.send_message_capture_ids",
-                   side_effect=lambda t, c=None, bot=None: [1]), \
-             patch("api.services.telegram.send_message_async", new_callable=AsyncMock):
-            await listener._handle_orchestration_message(
-                "yes the calendar tool is broken again", "999")
-
-        spawn.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_pure_chat_bot_never_spawns(self):
+    async def test_pure_chat_bot_never_spawns_directly(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
         listener = self._listener("fitness", "999", persona="P", orchestrates=False)
         update = {"message": {"text": "bench 135x8", "chat": {"id": 999}, "message_id": 3}}
-        with patch.object(listener, "_handle_orchestration_message", new_callable=AsyncMock) as mock_spawn, \
+        spawn = MagicMock()
+        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
              patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
              patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
              patch("api.services.telegram.TypingIndicator", _DummyTyping), \
              patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
             mock_chat.return_value = {"answer": "Logged", "conversation_id": "c1"}
             await listener._handle_update(update)
-        mock_spawn.assert_not_called()
+        spawn.assert_not_called()
         mock_chat.assert_awaited_once()  # pure chat, as before
+        assert mock_chat.call_args.kwargs.get("persona_id") == "fitness"
 
 
 # ---------------------------------------------------------------------------

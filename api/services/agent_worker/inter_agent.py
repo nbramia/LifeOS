@@ -360,6 +360,15 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         root_session_id=root,
         spawn_depth=new_depth,
         claude_code_model=claude_code_model,
+        # #684 review: inherit the caller's bot ownership (e.g. "doctor" for
+        # a Hermes doctor-persona conversation, via hermes_session.py) so the
+        # worker's own status/blocked/completion notices for this child
+        # route to the same Telegram bot the caller answers on, and that
+        # bot's threaded-reply resume (scoped to its own `bot`) can find
+        # them. `caller.bot` is already `None` for a primary-rooted lineage
+        # and for every pre-existing (pre-#684) Hermes/CLI root, so this is
+        # additive — a lineage that never had bot ownership still doesn't.
+        bot=caller.bot,
     )
     # The prompt becomes the child's task description (used by the executor's
     # _seed_conversation) so the system prompt + inter-agent guidance run as

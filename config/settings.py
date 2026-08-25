@@ -33,7 +33,16 @@ class TelegramBotConfig:
     capitalized ``name``. ``orchestrates`` marks a bot that drives Claude Code
     sessions (e.g. the doctor self-repair bot) instead of being pure chat — such
     a bot owns its own agent-session reply threads rather than redirecting coding
-    tasks to the primary bot.
+    tasks to the primary bot. ``backend`` (#684) selects which pipeline answers
+    this bot's turns: ``"hermes"`` (the default for every registry entry, i.e.
+    every specialized bot) targets the Hermes proxy (``/api/hermes/ask/stream``),
+    the same backend ``/chat`` prefers when it's available; ``"lifeos"``
+    targets the native pipeline directly. The primary bot always resolves to
+    ``"lifeos"`` regardless of this field (see ``Settings.telegram_primary_bot``)
+    — it has no registry entry to set it from. A ``"hermes"`` bot falls back to
+    ``"lifeos"`` for a given turn, with a one-time in-channel disclosure,
+    whenever Hermes is unconfigured or unreachable (``chat_via_api``'s
+    ``HermesUnavailable``) — see ``TelegramBotListener._run_chat_turn``.
     """
     name: str
     token: str
@@ -41,6 +50,7 @@ class TelegramBotConfig:
     persona: str = ""
     label: str = ""
     orchestrates: bool = False
+    backend: str = "hermes"
     # Parsed from the persona file's optional YAML frontmatter (see _parse_persona).
     # `voice` rules are consumed on voice turns (the chat route appends them to the
     # system prompt). `model` is RESERVED — parsed and stored here but not yet read
@@ -1102,6 +1112,9 @@ class Settings(BaseSettings):
             persona=persona,
             voice=voice,
             model=model,
+            # Always "lifeos" (#684) — the primary bot never targets Hermes,
+            # regardless of the dataclass default meant for specialized bots.
+            backend="lifeos",
         )
 
     @property
@@ -1113,7 +1126,10 @@ class Settings(BaseSettings):
         tokens simply runs the primary bot. Persona text is loaded from the
         entry's ``persona_file``. ``chat_id_env`` is optional and defaults to the
         primary ``TELEGRAM_CHAT_ID`` (in Telegram DMs the chat id is your user
-        id, identical across bots).
+        id, identical across bots). ``backend`` (#684) is optional and defaults
+        to ``"hermes"``; an entry may set it to ``"lifeos"`` to opt a specific
+        bot out of Hermes permanently. An unrecognized value falls back to
+        ``"hermes"`` with a warning, same pattern as an invalid bot name.
         """
         if not _TELEGRAM_BOTS_FILE.exists():
             return []
@@ -1158,11 +1174,19 @@ class Settings(BaseSettings):
                 except OSError as e:
                     logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
             label = (entry.get("label") or "").strip()
+            backend = (entry.get("backend") or "hermes").strip().lower()
+            if backend not in ("hermes", "lifeos"):
+                logger.warning(
+                    f"Telegram bot '{name}': invalid backend {backend!r}, "
+                    "defaulting to 'hermes'"
+                )
+                backend = "hermes"
             seen.add(name)
             bots.append(TelegramBotConfig(
                 name=name, token=token, chat_id=chat_id, persona=persona, label=label,
                 orchestrates=bool(entry.get("orchestrates", False)),
                 voice=voice, model=model, persona_file=persona_file or "",
+                backend=backend,
             ))
         return bots
 
