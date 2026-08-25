@@ -644,7 +644,9 @@ def test_force_remote_builds_client_from_settings(monkeypatch):
 
     from api.services.llm_client import LocalLLMClient
     assert isinstance(client, LocalLLMClient)
-    assert client.base_url == "https://api.fireworks.ai/inference/v1"
+    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # path is always {base}/v1/chat/completions, never .../v1/v1/....
+    assert client.base_url == "https://api.fireworks.ai/inference"
     assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert client._api_key == "fw_test_key"
     assert client.timeout == 42
