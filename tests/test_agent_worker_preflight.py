@@ -596,3 +596,143 @@ def test_subscription_routes_are_unaffected_by_the_gate():
         result = pf.run_preflight("do the thing", tags=["agent", tag],
                                   caller=_stub_caller(routing="claude"))
         assert result.routing == route, tag
+
+
+# ---------------------------------------------------------------------------
+# #704 — `_default_llm_caller` client-selection fallback order
+# ---------------------------------------------------------------------------
+
+class _FakeLLMResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
+@pytest.mark.unit
+def test_default_llm_caller_uses_anthropic_when_key_set_no_probe(monkeypatch):
+    """Order 1: an Anthropic key selects AnthropicLLMClient with
+    agent_preflight_model, exactly as before #704 — and never touches
+    LocalLLMClient.is_available (no reachability probe on this branch)."""
+    from config.settings import settings
+    from api.services.llm_client import AnthropicLLMClient, LocalLLMClient
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-anthropic-key", raising=False)
+    monkeypatch.setattr(settings, "agent_preflight_model", "claude-haiku-4-5", raising=False)
+
+    captured = {}
+
+    def fake_init(self, api_key=None, model=None):
+        captured["model"] = model
+        captured["api_key"] = api_key
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return _FakeLLMResponse("anthropic reply")
+
+    monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
+    monkeypatch.setattr(AnthropicLLMClient, "create", fake_create)
+
+    def _forbidden_probe(self):
+        raise AssertionError("Anthropic branch must not probe the local llama-server")
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", _forbidden_probe)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "anthropic reply"
+    assert captured["model"] == "claude-haiku-4-5"
+    assert captured["messages"] == [{"role": "user", "content": "some prompt"}]
+    assert captured["max_tokens"] == 1024
+    assert captured["temperature"] == 0.0
+
+
+@pytest.mark.unit
+def test_default_llm_caller_falls_back_to_local_when_reachable(monkeypatch):
+    """Order 2: no Anthropic key, local llama-server reachable → runs on it."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    captured = {}
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: True)
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["base_url"] = self.base_url
+        captured["model"] = self.model
+        return _FakeLLMResponse("local reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "local reply"
+    assert captured["model"] == "local"
+    assert captured["base_url"] == LocalLLMClient().base_url
+
+
+@pytest.mark.unit
+def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypatch):
+    """Order 3: no Anthropic key, local unreachable, #699 remote provider
+    configured + enabled → runs on the remote OpenAI-compatible provider."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", True, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v4-flash-0731", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 42, raising=False)
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["base_url"] = self.base_url
+        captured["model"] = self.model
+        captured["timeout"] = self.timeout
+        captured["auth"] = self._auth_headers()
+        return _FakeLLMResponse("remote reply")
+
+    monkeypatch.setattr(LocalLLMClient, "create", fake_create)
+
+    result = pf._default_llm_caller("some prompt")
+
+    assert result == "remote reply"
+    assert captured["base_url"] == "https://remote.example/v1"
+    assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert captured["timeout"] == 42
+    assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}
+
+
+@pytest.mark.unit
+def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
+    """Order 4: no key, no reachable local server, no remote provider ⇒
+    raise. `run_preflight`'s existing except-clause degrades this to
+    sane=False/routing=ask, unchanged by #704."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    with pytest.raises(RuntimeError):
+        pf._default_llm_caller("some prompt")
+
+    # And the run_preflight integration point: the raise degrades to the
+    # existing safe path rather than propagating.
+    result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
+    assert result.sane is False
+    assert result.routing == pf.ROUTE_ASK
