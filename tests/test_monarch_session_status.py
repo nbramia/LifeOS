@@ -67,3 +67,83 @@ class TestGetSessionStatus:
         backdate = time.time() - (SESSION_EXPIRY_DAYS + 5) * 86400
         os.utime(temp_session, (backdate, backdate))
         assert get_session_status()["status"] == "expired"
+
+
+class TestIsMonarchConfigured:
+    """Pins the exact "not configured" condition for issue #687: the
+    nightly sync must skip cleanly ONLY when there is truly no way to
+    authenticate (no cached session AND no credentials). Anything else
+    (a session that exists but might be stale, or credentials present but
+    wrong) has to keep reaching the real client so a genuine outage still
+    fails loud -- conflating the two would hide a real Monarch outage on
+    the maintainer's own box, the exact regression #646 fixed elsewhere.
+    """
+
+    def test_no_session_no_credentials_is_not_configured(self, temp_session, monkeypatch):
+        from api.services.monarch import is_monarch_configured, settings
+        monkeypatch.setattr(settings, "monarch_email", "")
+        monkeypatch.setattr(settings, "monarch_password", "")
+        assert is_monarch_configured() is False
+
+    def test_cached_session_alone_is_configured(self, temp_session, monkeypatch):
+        """A cached session is sufficient even with no credentials in .env --
+        the documented flow lets credentials be scrubbed after first login."""
+        from api.services.monarch import is_monarch_configured, settings
+        monkeypatch.setattr(settings, "monarch_email", "")
+        monkeypatch.setattr(settings, "monarch_password", "")
+        temp_session.write_bytes(b"")
+        assert is_monarch_configured() is True
+
+    def test_credentials_alone_is_configured(self, temp_session, monkeypatch):
+        """No cached session yet, but MONARCH_EMAIL/PASSWORD are set (e.g.
+        first run before the initial login) still counts as configured."""
+        from api.services.monarch import is_monarch_configured, settings
+        monkeypatch.setattr(settings, "monarch_email", "user@example.com")
+        monkeypatch.setattr(settings, "monarch_password", "hunter2")
+        assert is_monarch_configured() is True
+
+    def test_partial_credentials_is_not_configured(self, temp_session, monkeypatch):
+        """Only one of email/password set (e.g. mid-edit .env) must not
+        count as configured -- matches _get_client()'s `and` check."""
+        from api.services.monarch import is_monarch_configured, settings
+        monkeypatch.setattr(settings, "monarch_email", "user@example.com")
+        monkeypatch.setattr(settings, "monarch_password", "")
+        assert is_monarch_configured() is False
+
+
+class TestWriteMonthlyReportVaultDir:
+    """Pins that write_monthly_report() honors LIFEOS_MONARCH_VAULT_DIR
+    (issue #687 #4) -- both the unset-default (must match the previously
+    hardcoded path exactly) and an explicit override."""
+
+    @pytest.mark.asyncio
+    async def test_default_vault_dir_matches_hardcoded_path(self, tmp_path, monkeypatch):
+        from api.services.monarch import MonarchClient, settings
+
+        monkeypatch.setattr(settings, "vault_path", tmp_path)
+        monkeypatch.setattr(settings, "monarch_vault_dir", "Personal/Finance/Monarch")
+
+        client = MonarchClient()
+        async def _fake_generate(year, month):
+            return "content"
+
+        monkeypatch.setattr(client, "generate_monthly_report", _fake_generate)
+
+        result = await client.write_monthly_report(2026, 1, dry_run=True)
+        assert result["file"] == str(tmp_path / "Personal" / "Finance" / "Monarch" / "2026-01.md")
+
+    @pytest.mark.asyncio
+    async def test_env_override_changes_vault_dir(self, tmp_path, monkeypatch):
+        from api.services.monarch import MonarchClient, settings
+
+        monkeypatch.setattr(settings, "vault_path", tmp_path)
+        monkeypatch.setattr(settings, "monarch_vault_dir", "Personal/Money/Monarch")
+
+        client = MonarchClient()
+        async def _fake_generate(year, month):
+            return "content"
+
+        monkeypatch.setattr(client, "generate_monthly_report", _fake_generate)
+
+        result = await client.write_monthly_report(2026, 1, dry_run=True)
+        assert result["file"] == str(tmp_path / "Personal" / "Money" / "Monarch" / "2026-01.md")

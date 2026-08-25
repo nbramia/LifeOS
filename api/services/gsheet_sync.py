@@ -7,7 +7,6 @@ Supports both a rolling document with all entries and appending to daily notes.
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 import yaml
 from dataclasses import dataclass
@@ -86,6 +85,11 @@ class GSheetSyncService:
         self.vault_path = vault_path or settings.vault_path
         self.db_path = db_path or get_gsheet_sync_db_path()
         self.configs: list[SheetConfig] = []
+        # Distinguishes "no config" (skip -- issue #687) from "config present
+        # but failed to parse/load" (a real error -- a hand-edited YAML with
+        # broken indentation must not be reported as "not configured" while
+        # the file sits right there. Adversarial review of #687.)
+        self.config_load_error: Optional[str] = None
         self._load_config()
         self._init_db()
 
@@ -117,6 +121,7 @@ class GSheetSyncService:
 
         except Exception as e:
             logger.error(f"Failed to load GSheet sync config: {e}")
+            self.config_load_error = str(e)
 
     def _init_db(self):
         """Initialize SQLite database for tracking synced rows."""
@@ -608,7 +613,30 @@ class GSheetSyncService:
         }
 
         if not self.configs:
+            if self.config_load_error:
+                # The config file EXISTS but failed to parse/load (e.g. a
+                # hand-edited gsheet_sync.yaml with broken indentation) --
+                # this is a real error, not "not configured", and must not
+                # be reported as a quiet skip while the broken file sits
+                # right there. Same principle #687 applies to Monarch:
+                # absence of config and presence of errors must not be
+                # conflated. Adversarial review of #687.
+                logger.error(
+                    f"GSheet sync config exists but failed to load: {self.config_load_error}"
+                )
+                stats["status"] = "error"
+                stats["reason"] = f"gsheet_config_parse_error: {self.config_load_error}"
+                return stats
+
+            # No config file (or an empty/disabled one) — covers the
+            # gsheet-journal case: without a Google Form -> Sheet ->
+            # gsheet_sync.yaml pipeline set up, there's nothing to sync.
+            # Flagging this distinctly lets the caller emit SYNC_SKIPPED
+            # instead of a zero-count "success" that's indistinguishable
+            # from a real (if quiet) run — issue #687.
             logger.info("No sheets configured for GSheet sync")
+            stats["status"] = "skipped"
+            stats["reason"] = "gsheet_sync_not_configured"
             return stats
 
         for config in self.configs:

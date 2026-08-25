@@ -787,12 +787,30 @@ SYNC_TIMEOUTS = {
 }
 
 
+# Personal Google account sources — unlike work/work2 (explicit opt-in
+# booleans below) there's no separate on/off toggle for personal, since it's
+# the default account most installs set up first. "Configured" for personal
+# means its OAuth credentials file exists — same signal
+# get_configured_accounts() uses for work/work2 in api/services/google_auth.py.
+# Kept as a plain path check here (not imported from google_auth) to avoid
+# pulling google-auth-oauthlib into this module for a one-line check.
+PERSONAL_GOOGLE_SOURCES = {"gmail_personal", "calendar_personal"}
+
+
+def _personal_google_credentials_exist() -> bool:
+    return (Path(__file__).parent.parent / "config" / "credentials-personal.json").exists()
+
+
 def get_disabled_work_sources() -> set[str]:
     """
-    Return set of sources that should be skipped because work integrations are disabled.
+    Return set of sources that should be skipped because they aren't configured.
 
     Work integrations are disabled by default for safety - work data will only be
-    synced if explicitly enabled via environment variables.
+    synced if explicitly enabled via environment variables. Personal Google has
+    no such toggle, but is gated the same way once its credentials are absent —
+    absence used to reach sync_gmail_calendar_interactions.py unguarded and
+    raise FileNotFoundError, recorded as SyncStatus.FAILED every night on any
+    install that never set up personal Gmail/Calendar — issue #687.
     """
     disabled = set()
 
@@ -816,6 +834,9 @@ def get_disabled_work_sources() -> set[str]:
     if not settings.sync_slack:
         disabled.add("slack")
         disabled.add("link_slack")
+
+    if not _personal_google_credentials_exist():
+        disabled.update(PERSONAL_GOOGLE_SOURCES)
 
     return disabled
 
@@ -1795,10 +1816,11 @@ def run_all_syncs(
     skipped_sources = []  # Exited early because they aren't configured
     start_time = datetime.now()
 
-    # Check for disabled work integrations
+    # Check for disabled/unconfigured sources (work integrations + personal
+    # Google without credentials)
     disabled_sources = get_disabled_work_sources()
     if disabled_sources:
-        logger.info(f"Work integration sources disabled: {', '.join(sorted(disabled_sources))}")
+        logger.info(f"Disabled/unconfigured sources: {', '.join(sorted(disabled_sources))}")
         logger.info("Enable via LIFEOS_SYNC_SLACK=true, etc. in .env")
 
     logger.info(f"Sync triggered: {trigger}")
@@ -1875,10 +1897,15 @@ def run_all_syncs(
                 logger.warning(f"Unknown source: {source}, skipping")
                 continue
 
-            # Skip sources disabled by work integration settings
+            # Skip sources disabled by work integration settings (or, for
+            # personal Google, missing OAuth credentials — issue #687)
             if source in disabled_sources:
-                logger.info(f"Skipping {source}: work integration disabled")
-                results[source] = {"skipped": True, "reason": "work_integration_disabled"}
+                if source in PERSONAL_GOOGLE_SOURCES:
+                    logger.info(f"Skipping {source}: personal Google account not configured")
+                    results[source] = {"skipped": True, "reason": "google_account_not_configured"}
+                else:
+                    logger.info(f"Skipping {source}: work integration disabled")
+                    results[source] = {"skipped": True, "reason": "work_integration_disabled"}
                 continue
 
             # Skip monthly sources unless it's the 1st of the month (or forced)

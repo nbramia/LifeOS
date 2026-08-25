@@ -3,9 +3,8 @@ Tests for Google Sheets sync service.
 """
 import pytest
 import tempfile
-import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from datetime import datetime
 
 # Mark all tests as unit tests
@@ -388,6 +387,91 @@ sheets:
                     service = GSheetSyncService(vault_path=vault_path)
 
             assert len(service.configs) == 0
+
+    def test_sync_all_reports_skipped_when_missing_config(self):
+        """sync_all() must flow "no config" through the structured
+        status/reason contract, not just a zero-count dict indistinguishable
+        from a real (if quiet) success -- issue #687. This is the
+        gsheet-journal case: no config/gsheet_sync.yaml means the Google
+        Form -> Sheet -> vault pipeline was never set up.
+        """
+        from api.services.gsheet_sync import GSheetSyncService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir) / "vault"
+            vault_path.mkdir()
+
+            with patch("api.services.gsheet_sync.CONFIG_PATH", Path(tmpdir) / "nonexistent.yaml"):
+                with patch("api.services.gsheet_sync.get_gsheet_sync_db_path", return_value=str(Path(tmpdir) / "test.db")):
+                    service = GSheetSyncService(vault_path=vault_path)
+                    stats = service.sync_all()
+
+            assert stats["status"] == "skipped"
+            assert stats["reason"] == "gsheet_sync_not_configured"
+            # The zero-count keys stay intact -- callers that only look at
+            # "synced"/"failed" (never "status") still see today's shape.
+            assert stats["synced"] == 0
+            assert stats["failed"] == 0
+
+    def test_sync_all_reports_error_when_config_malformed(self):
+        """A config file that EXISTS but fails to parse (e.g. hand-edited
+        YAML with broken indentation) must be reported as a real error, not
+        a quiet "not configured" skip -- adversarial review of #687 caught
+        that the pre-existing `except Exception` swallow in _load_config()
+        left self.configs empty either way, which the naive "not self.configs
+        -> skipped" branch couldn't tell apart from a genuinely absent file.
+        Absence of config and presence of errors must not be conflated --
+        the same principle #687 applies to Monarch.
+        """
+        from api.services.gsheet_sync import GSheetSyncService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            vault_path = Path(tmpdir) / "vault"
+            vault_path.mkdir()
+
+            # Invalid YAML (unbalanced flow mapping) -- yaml.safe_load raises.
+            config_path.write_text("sheets: [ { sheet_id: 'test123' \n")
+
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                with patch("api.services.gsheet_sync.get_gsheet_sync_db_path", return_value=str(Path(tmpdir) / "test.db")):
+                    service = GSheetSyncService(vault_path=vault_path)
+                    assert service.config_load_error is not None
+                    stats = service.sync_all()
+
+            assert stats["status"] == "error"
+            assert stats["reason"].startswith("gsheet_config_parse_error:")
+            assert stats["status"] != "skipped"
+
+    def test_sync_all_no_status_key_when_configured(self):
+        """A configured install (sheets present) must see no change: no
+        "status"/"reason" key appears on the normal path, so existing
+        callers that don't check for it are unaffected."""
+        from api.services.gsheet_sync import GSheetSyncService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            vault_path = Path(tmpdir) / "vault"
+            vault_path.mkdir()
+
+            config_content = """
+sheets:
+  - sheet_id: "test123"
+    name: "Test Sheet"
+"""
+            config_path.write_text(config_content)
+
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                with patch("api.services.gsheet_sync.get_gsheet_sync_db_path", return_value=str(Path(tmpdir) / "test.db")):
+                    service = GSheetSyncService(vault_path=vault_path)
+                    # _sync_sheet would hit the real Google Sheets API, so
+                    # stub it out -- only sync_all()'s empty-configs branch
+                    # (or lack thereof) is under test here.
+                    service._sync_sheet = lambda config: {"new_rows": 0, "skipped_rows": 0}
+                    stats = service.sync_all()
+
+            assert "status" not in stats
+            assert "reason" not in stats
 
 
 class TestDailyNoteAppend:

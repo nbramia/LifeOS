@@ -130,3 +130,27 @@ def test_orchestrator_model_default_is_alias_not_snapshot():
 
     default = Settings.model_fields["anthropic_model"].default
     assert not re.search(r"-20\d{6}$", default)
+
+
+def test_monarch_vault_dir_default_matches_hardcoded_path():
+    """LIFEOS_MONARCH_VAULT_DIR must default to exactly the path that was
+    previously hardcoded (Personal/Finance/Monarch) -- issue #687's
+    behavior-neutrality constraint requires an install that never sets this
+    var to write to the same place it always has.
+
+    Asserts the FIELD default, not a live instance, so a host-level override
+    can't turn this into a false failure.
+    """
+    from config.settings import Settings
+
+    assert Settings.model_fields["monarch_vault_dir"].default == "Personal/Finance/Monarch"
+
+
+def test_monarch_vault_dir_from_env(monkeypatch):
+    """LIFEOS_MONARCH_VAULT_DIR should be configurable via env var, same
+    convention as LIFEOS_AGENT_OUTPUT_DIR (issue #687)."""
+    monkeypatch.setenv("LIFEOS_MONARCH_VAULT_DIR", "Personal/Money/Monarch")
+    from config.settings import Settings
+
+    s = Settings()
+    assert s.monarch_vault_dir == "Personal/Money/Monarch"
