@@ -1541,8 +1541,14 @@ def get_telegram_listeners() -> list[TelegramBotListener]:
     global _telegram_listeners
     if _telegram_listeners is None:
         listeners: list[TelegramBotListener] = []
-        if settings.telegram_enabled:
+        if settings.telegram_enabled and settings.telegram_primary_listener_enabled:
             listeners.append(TelegramBotListener(settings.telegram_primary_bot))
+        elif settings.telegram_enabled:
+            logger.info(
+                "Primary Telegram listener disabled "
+                "(TELEGRAM_PRIMARY_LISTENER_ENABLED=false); send-only mode. "
+                "The scheduler still delivers; another process owns getUpdates."
+            )
         for bot in settings.telegram_bots:
             listeners.append(TelegramBotListener(bot))
         _telegram_listeners = listeners

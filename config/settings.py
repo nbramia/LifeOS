@@ -1152,6 +1152,23 @@ class Settings(BaseSettings):
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
     @property
+    def telegram_primary_listener_enabled(self) -> bool:
+        """Whether to POLL the primary bot, as opposed to only sending as it.
+
+        Sending (sendMessage) and receiving (getUpdates) are separable, but
+        Telegram allows only ONE getUpdates consumer per bot token. When the
+        primary token belongs to a bot another process already polls — e.g. a
+        Hermes gateway that owns the Telegram surface — LifeOS must send as that
+        bot without polling it, or the two clients 409 each other.
+
+        Set TELEGRAM_PRIMARY_LISTENER_ENABLED=false in that case. The scheduler
+        still starts and still delivers; only the inbound listener is skipped.
+        """
+        import os
+        raw = os.getenv("TELEGRAM_PRIMARY_LISTENER_ENABLED", "true").strip().lower()
+        return raw not in ("false", "0", "no", "off")
+
+    @property
     def telegram_primary_bot(self) -> "TelegramBotConfig":
         """The default Telegram bot, driven by TELEGRAM_BOT_TOKEN/CHAT_ID.
 
