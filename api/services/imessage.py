@@ -488,7 +488,7 @@ class IMessageStore:
         """
         total_updated = 0
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn, conn:
             for phone, entity_id in phone_to_entity.items():
                 cursor = conn.execute(
                     """
@@ -516,7 +516,7 @@ class IMessageStore:
         """
         total_updated = 0
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn, conn:
             for handle, entity_id in handle_to_entity.items():
                 # Match case-insensitively on handle
                 cursor = conn.execute(
@@ -565,7 +565,7 @@ class IMessageStore:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(query, params)
 
@@ -615,7 +615,7 @@ class IMessageStore:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(query, params)
 
@@ -671,7 +671,7 @@ class IMessageStore:
         sql += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(sql, params)
 
@@ -755,7 +755,7 @@ class IMessageStore:
         sql += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(sql, params)
 
@@ -822,7 +822,7 @@ class IMessageStore:
 
     def get_statistics(self) -> dict:
         """Get statistics about the exported messages."""
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             stats = {}
 
             # Total messages
@@ -884,7 +884,7 @@ class IMessageStore:
         Returns:
             List of dicts with contact info and message counts
         """
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 """
@@ -956,7 +956,7 @@ def join_imessages_to_entities() -> dict:
     entity_store = get_person_entity_store()
 
     # Get unique phone numbers from messages
-    with sqlite3.connect(store.storage_path) as conn:
+    with closing(sqlite3.connect(store.storage_path)) as conn:
         cursor = conn.execute(
             """
             SELECT DISTINCT handle_normalized
