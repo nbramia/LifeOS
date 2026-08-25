@@ -738,3 +738,137 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
     result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
     assert result.sane is False
     assert result.routing == pf.ROUTE_ASK
+
+
+# ---------------------------------------------------------------------------
+# #707 — LIFEOS_AGENT_DEFAULT_ROUTE: route "ask for lack of cues" outcomes
+# instead of blocking, on installs with exactly one executor.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_default_route_unset_is_byte_identical_to_today():
+    """Empty setting (the default) must not touch the no-cues ask path."""
+    reply = _golden_reply(routing="ask", routing_reason="no tag and no title cue")
+    result = pf.run_preflight(title="research dolphins", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_ASK
+    assert result.routing_reason == "no tag and no title cue"
+
+
+@pytest.mark.unit
+def test_default_route_applies_when_no_cues(monkeypatch):
+    """Set + no-cues ask -> routes without blocking, and routing_reason
+    names the setting."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(routing="ask", routing_reason="no tag and no title cue")
+    result = pf.run_preflight(title="research dolphins", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert "LIFEOS_AGENT_DEFAULT_ROUTE=local" in result.routing_reason
+    assert result.model == pf.MODEL_LOCAL
+
+
+@pytest.mark.unit
+def test_default_route_applies_to_llm_omitted_routing(monkeypatch):
+    """The deterministic no-cues path (invalid/missing `routing` from the
+    model) is also routed by the default — same "nothing to route on"
+    outcome as the LLM's own explicit `ask`."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(routing="not-a-real-route")
+    result = pf.run_preflight(title="x", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+
+
+@pytest.mark.unit
+def test_default_route_does_not_apply_on_ambiguity(monkeypatch):
+    """Set + ambiguity -> still ask."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="ask", routing_reason="no tag and no title cue",
+        ambiguity={"question": "Which John — John Doe or John Smith?"},
+    )
+    result = pf.run_preflight(title="reply to John", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_ASK
+    assert result.ambiguity is not None
+
+
+@pytest.mark.unit
+def test_default_route_does_not_apply_on_sanity_failure(monkeypatch):
+    """Set + sane=False -> still ask."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(routing="ask", sane=False, sane_reason="destructive: 'rm -rf /'")
+    result = pf.run_preflight(title="rm -rf /", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_ASK
+    assert result.sane is False
+
+
+@pytest.mark.unit
+def test_default_route_does_not_apply_on_empty_title(monkeypatch):
+    """Set + empty title (sanity short-circuit) -> still ask, no LLM call."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def fail(prompt):
+        raise AssertionError("LLM should not have been called for empty title")
+
+    result = pf.run_preflight(title="   ", tags=["agent"], caller=fail)
+    assert result.routing == pf.ROUTE_ASK
+    assert result.sane is False
+
+
+@pytest.mark.unit
+def test_default_route_does_not_apply_on_llm_error(monkeypatch):
+    """Set + preflight LLM call failed -> still ask."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+
+    def boom(prompt):
+        raise RuntimeError("no client available")
+
+    result = pf.run_preflight(title="do the thing", tags=["agent"], caller=boom)
+    assert result.routing == pf.ROUTE_ASK
+    assert result.sane is False
+
+
+@pytest.mark.unit
+def test_default_route_does_not_apply_to_unconfirmed_cloud_inference(monkeypatch):
+    """Set + a #584 cloud-inference downgrade (a cue nobody confirmed, not a
+    *lack* of cues) -> still ask. This is the case the plain
+    `routing == ask and sane and ambiguity is None` gate would wrongly
+    catch without the original-routing check."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight("draft an email", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.routing == pf.ROUTE_ASK
+    assert "not explicitly requested" in result.routing_reason
+
+
+@pytest.mark.unit
+def test_default_route_invalid_value_logs_error_and_falls_back_to_ask(monkeypatch, caplog):
+    """AC: an invalid value surfaces a clear error rather than silently
+    asking (or crashing the worker loop) — falls back to `ask` with a
+    logged ERROR."""
+    import logging
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "bogus-route")
+    reply = _golden_reply(routing="ask", routing_reason="no tag and no title cue")
+    with caplog.at_level(logging.ERROR, logger="api.services.agent_worker.preflight"):
+        result = pf.run_preflight(title="research dolphins", tags=["agent"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_ASK
+    assert any("LIFEOS_AGENT_DEFAULT_ROUTE" in rec.message for rec in caplog.records)
+    assert any(rec.levelno == logging.ERROR for rec in caplog.records)
+
+
+@pytest.mark.unit
+def test_default_route_tags_still_win(monkeypatch):
+    """Tag overrides beat the default route — precedence: tags > explicit
+    LLM route > default route > ask."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "claude")
+    reply = _golden_reply(routing="ask", routing_reason="no tag and no title cue")
+    result = pf.run_preflight(title="research dolphins", tags=["agent", "local"], caller=_stub(reply))
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.routing_reason == "#local tag present"

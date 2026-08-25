@@ -549,6 +549,23 @@ class Settings(BaseSettings):
         alias="LIFEOS_AGENT_DEFAULT_MAX_TOKENS",
         description="Default per-task token budget (input + output combined)."
     )
+    agent_default_route: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_DEFAULT_ROUTE",
+        description="Route preflight dispatches to instead of `ask` when a task "
+                    "has no routing cues at all (#707) — for a single-executor "
+                    "install (e.g. local-only, no Claude Code/Codex/Managed "
+                    "Agents) there's nothing useful to ask about. Empty (default) "
+                    "keeps today's behavior: no cues -> ask the operator. Only "
+                    "applies when preflight would otherwise land on `ask` purely "
+                    "for lack of cues; ambiguity, sanity failures, and preflight "
+                    "LLM errors always still ask. Tag overrides (#local, #cloud, "
+                    "etc.) always win over this. Value is validated in "
+                    "agent_worker/preflight.py against the known routing "
+                    "destinations (local/claude/claude_code/codex/ask); an "
+                    "invalid value logs an error and falls back to `ask` rather "
+                    "than silently misrouting."
+    )
     agent_daily_cap_dollars: float = Field(
         default=100.0,
         alias="LIFEOS_AGENT_DAILY_CAP_DOLLARS",
