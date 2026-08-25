@@ -150,6 +150,13 @@ class ExecutorOutcome:
     # remote session. Worker uses this to append a footer to the completion
     # summary so the operator knows which connectors are broken.
     init_failed_mcps: list[str] = field(default_factory=list)
+    # #699 — non-empty only when this session actually ran on the flag-gated
+    # remote fallback provider (the model id it ran on). Empty for the
+    # ordinary local llama-server path, including every install with the
+    # flag off or the remote provider unconfigured. worker.py uses this to
+    # report what actually served the session (the #658 principle: report
+    # observed, not configured) instead of just the static "local" label.
+    served_by: str = ""
 
 
 # Static portion of the system prompt — never changes between sessions. Kept
@@ -312,6 +319,57 @@ def _user_message_for(task: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _default_llm_client(model_name: str) -> tuple[object, str, bool]:
+    """Choose the LLM client + model attribution for a production
+    (no explicit `llm_client` injected) local executor. Returns
+    `(client, model_name, is_remote)`.
+
+    Default: bare `LocalLLMClient()` against the local llama-server,
+    `model_name` unchanged (the caller's default, "local"), `is_remote`
+    False — byte-identical to the executor's pre-#699 construction
+    whenever the flag is off or the remote provider (#654) isn't fully
+    configured. That's the operator's standing behavior-neutrality
+    requirement, so both conditions are checked before this function does
+    anything else network-shaped.
+
+    When `settings.agent_remote_executor` is on AND the remote OpenAI-
+    compatible provider is configured, this does exactly one cheap
+    reachability check against the local llama-server —
+    `LocalLLMClient.is_available()`, a single short-timeout GET /health —
+    at session-construction time. Deliberately not a background prober:
+    llama-server either answers right now or it doesn't, and checking
+    once, right when we're about to use it, is cheap and honest. This is
+    also the #688 lesson applied in reverse — that issue was "configured"
+    silently standing in for "reachable"; the mirror-image mistake here
+    would be treating "remote is configured" as license to skip actually
+    checking whether local is still up, so the check happens regardless
+    of how confident the config looks.
+
+    - Local reachable   → local wins. Explicit `#agent local` routing on a
+      host with a live llama-server is unaffected — remote is a fallback,
+      not a replacement.
+    - Local unreachable → build a `LocalLLMClient` pointed at the remote
+      provider instead (with `is_remote=True` and the remote model id for
+      attribution), so the session actually runs instead of dying with a
+      connection error on every call.
+    """
+    from api.services.llm_client import LocalLLMClient
+    from config.settings import settings as _settings
+
+    if _settings.agent_remote_executor and _settings.remote_llm_configured:
+        local_client = LocalLLMClient()
+        if not local_client.is_available():
+            remote_client = LocalLLMClient(
+                base_url=_settings.remote_llm_base_url,
+                model=_settings.remote_llm_model,
+                api_key=_settings.remote_llm_api_key,
+                timeout=_settings.remote_llm_timeout,
+            )
+            return remote_client, _settings.remote_llm_model, True
+        return local_client, model_name, False
+    return LocalLLMClient(), model_name, False
+
+
 class LocalExecutor:
     """Drives one turn or one yielded resumption per call to `execute`."""
 
@@ -322,6 +380,7 @@ class LocalExecutor:
         tool_registry: ToolRegistry | None = None,
         llm_client=None,
         model_name: str = "local",
+        is_remote: bool = False,
     ):
         self.session_store = session_store
         self.transcript_store = transcript_store
@@ -330,10 +389,16 @@ class LocalExecutor:
             tool_registry = ToolRegistry()
         self.tools = tool_registry
         if llm_client is None:
-            from api.services.llm_client import LocalLLMClient
-            llm_client = LocalLLMClient()
+            llm_client, model_name, is_remote = _default_llm_client(model_name)
         self.llm = llm_client
         self.model_name = model_name
+        # (#699) True iff this executor is running on the flag-gated remote
+        # fallback provider rather than the local llama-server. Drives both
+        # spend pricing (_record_spend) and the served_by attribution on
+        # ExecutorOutcome. Only ever True via `_default_llm_client`'s own
+        # selection, or a test that injects it explicitly alongside a fake
+        # `llm_client` — never a side effect of settings alone.
+        self.is_remote = is_remote
 
     # ------------------------------------------------------------------
     # Entry points
@@ -497,7 +562,7 @@ class LocalExecutor:
                 refreshed = self.session_store.get(session.task_id)
                 kind = "yielded_for_children" if refreshed.yield_waiting_for else "yielded_for_user"
                 self.transcript_store.append(sid, kind, {})
-                return ExecutorOutcome(status=STATUS_YIELDED)
+                return ExecutorOutcome(status=STATUS_YIELDED, served_by=self._served_by())
 
             if yielded_seconds is not None:
                 return self._finalize_sleeping(session, yielded_seconds)
@@ -590,13 +655,35 @@ class LocalExecutor:
         rate (that's the right call for a *budget* estimate, wrong here) --
         it's recorded as $0 and the session is flagged `unpriced` instead
         (#669).
+
+        (#699) The remote fallback provider's model id (e.g. a Fireworks
+        path) is never in pricing.PRICING -- that table is Anthropic-only
+        plus the free "local" sentinel. Its rate, when known, comes from
+        `settings.remote_llm_{input,output}_price_per_mtok` instead (set
+        by #654), mirroring the `force_remote` branch in
+        `agent_loop.py`'s `_track_usage` exactly. Unset rates still record
+        as real, unpriced spend -- never fallback-priced, same #669
+        convention as the unknown-model branch below.
         """
         usage = getattr(response, "usage", None)
         if not usage:
             return
         tokens_in = getattr(usage, "input_tokens", 0)
         tokens_out = getattr(usage, "output_tokens", 0)
-        if is_known_model(self.model_name):
+        if self.is_remote:
+            from config.settings import settings as _settings
+            input_price = _settings.remote_llm_input_price_per_mtok
+            output_price = _settings.remote_llm_output_price_per_mtok
+            if input_price is None or output_price is None:
+                dollars = 0.0
+                unpriced = True
+            else:
+                dollars = (
+                    (tokens_in / 1_000_000) * input_price
+                    + (tokens_out / 1_000_000) * output_price
+                )
+                unpriced = False
+        elif is_known_model(self.model_name):
             dollars = cost_for(self.model_name, tokens_in, tokens_out)
             unpriced = False
         else:
@@ -630,6 +717,15 @@ class LocalExecutor:
                 {"root": root_session_id, "reason": reason},
             )
 
+    def _served_by(self) -> str:
+        """(#699) Model id that actually ran this session, when that
+        differs from what the routing name ("local") implies -- i.e. this
+        executor is on the flag-gated remote fallback. Empty for the
+        ordinary local llama-server path, so a caller (worker.py) only
+        needs to add anything to its messaging when there's something
+        worth reporting (#658: report observed, not configured)."""
+        return self.model_name if self.is_remote else ""
+
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_COMPLETED)
         # Persist the body, not just the length. The final text is also sent
@@ -639,19 +735,24 @@ class LocalExecutor:
             session.session_id, "completed",
             {"final_chars": len(final_text or ""), "final_text": final_text or ""},
         )
-        return ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text or "")
+        return ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text=final_text or "", served_by=self._served_by(),
+        )
 
     def _finalize_failed(self, session, reason: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_FAILED)
         self.transcript_store.append(session.session_id, "failed", {"reason": reason})
-        return ExecutorOutcome(status=STATUS_FAILED, reason=reason)
+        return ExecutorOutcome(status=STATUS_FAILED, reason=reason, served_by=self._served_by())
 
     def _finalize_budget_exceeded(self, session, kind: str) -> ExecutorOutcome:
         self.session_store.update_status(session.task_id, STATUS_BUDGET_EXCEEDED)
         self.transcript_store.append(
             session.session_id, "budget_exceeded", {"kind": kind}
         )
-        return ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({kind})")
+        return ExecutorOutcome(
+            status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({kind})",
+            served_by=self._served_by(),
+        )
 
     def _finalize_sleeping(self, session, seconds: int) -> ExecutorOutcome:
         wake_at = int(time.time()) + int(seconds)
@@ -660,4 +761,4 @@ class LocalExecutor:
         self.transcript_store.append(
             session.session_id, "sleep", {"seconds": int(seconds), "wake_at": wake_at}
         )
-        return ExecutorOutcome(status=STATUS_YIELDED, wake_at=wake_at)
+        return ExecutorOutcome(status=STATUS_YIELDED, wake_at=wake_at, served_by=self._served_by())

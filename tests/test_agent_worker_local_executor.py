@@ -14,6 +14,7 @@ import pytest
 from api.services.agent_worker.local_executor import (
     _SYSTEM_PROMPT_STATIC,
     LocalExecutor,
+    _default_llm_client,
     _system_prompt,
 )
 from api.services.agent_worker.pricing import cost_for, is_known_model
@@ -417,6 +418,202 @@ def test_executor_records_unknown_model_as_unpriced_not_fallback_rate(tmp_path: 
     assert refreshed.total_output_tokens == 500
     assert refreshed.total_dollars == pytest.approx(0.0)
     assert refreshed.unpriced is True
+
+
+# ---------------------------------------------------------------------------
+# #699 — remote fallback executor construction, spend, and served_by
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_default_llm_client_flag_off_stays_local_without_probing(monkeypatch):
+    """Pins behavior-neutrality: flag off is byte-identical to pre-#699,
+    including making zero network calls to check anything — the remote
+    branch is never even entered."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "remote-model", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "key", raising=False)
+
+    probed = []
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: probed.append(1) or True)
+
+    client, model_name, is_remote = _default_llm_client("local")
+
+    assert is_remote is False
+    assert model_name == "local"
+    assert isinstance(client, LocalLLMClient)
+    assert client.base_url == LocalLLMClient().base_url
+    assert probed == [], "flag off must not probe the local server at all"
+
+
+@pytest.mark.unit
+def test_default_llm_client_flag_on_but_remote_not_configured_stays_local(monkeypatch):
+    """Second half of behavior-neutrality: flag on with an incompletely
+    configured remote provider (missing api key here) is also a no-op —
+    same as flag off."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", True, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "remote-model", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)  # unconfigured
+
+    probed = []
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: probed.append(1) or True)
+
+    client, model_name, is_remote = _default_llm_client("local")
+
+    assert is_remote is False
+    assert model_name == "local"
+    assert probed == []
+
+
+@pytest.mark.unit
+def test_default_llm_client_flag_on_remote_configured_local_alive_stays_local(monkeypatch):
+    """Fallback, not replacement: an explicit local route on a host with a
+    live llama-server keeps using it even with the flag on and a fully
+    configured remote provider."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", True, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "remote-model", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "key", raising=False)
+
+    probed = []
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: probed.append(1) or True)
+
+    client, model_name, is_remote = _default_llm_client("local")
+
+    assert is_remote is False
+    assert model_name == "local"
+    assert client.base_url == LocalLLMClient().base_url
+    assert probed == [1], "must check reachability exactly once, not zero times"
+
+
+@pytest.mark.unit
+def test_default_llm_client_flag_on_remote_configured_local_down_selects_remote(monkeypatch):
+    """The end-to-end AC: flag on + remote configured + no reachable local
+    llama-server ⇒ construct a LocalLLMClient pointed at the remote
+    provider's base_url/model/api_key from settings."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", True, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v4-flash-0731", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test_key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 42, raising=False)
+
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    client, model_name, is_remote = _default_llm_client("local")
+
+    assert is_remote is True
+    assert model_name == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert isinstance(client, LocalLLMClient)
+    assert client.base_url == "https://remote.example/v1"
+    assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert client.timeout == 42
+    assert client._auth_headers() == {"Authorization": "Bearer fw_test_key"}
+
+
+@pytest.mark.unit
+def test_executor_construction_flag_off_builds_bare_local_client(tmp_path: Path, monkeypatch):
+    """Same guarantee as the module-level test above, but through the
+    LocalExecutor constructor itself — pins the actual call site worker.py
+    uses (no llm_client injected)."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", False, raising=False)
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+    )
+    assert executor.is_remote is False
+    assert executor.model_name == "local"
+    assert isinstance(executor.llm, LocalLLMClient)
+    assert executor.llm.base_url == LocalLLMClient().base_url
+
+
+@pytest.mark.unit
+def test_executor_records_remote_spend_priced_with_configured_rates(tmp_path: Path, fake_session, monkeypatch):
+    """Mirrors agent_loop.py's force_remote _track_usage branch (#654):
+    when remote rates are configured, a remote-served session prices real
+    dollars from them, not from pricing.PRICING (the remote model id isn't
+    in that table at all)."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "remote_llm_input_price_per_mtok", 0.5, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_output_price_per_mtok", 1.5, raising=False)
+
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(1_000_000, 1_000_000)),
+    ])
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+        llm_client=llm,
+        model_name="accounts/fireworks/models/deepseek-v4-flash-0731",
+        is_remote=True,
+    )
+    outcome = executor.execute(session, {"id": "t1", "description": "x"})
+    refreshed = store.get("t1")
+    assert refreshed.total_dollars == pytest.approx(0.5 + 1.5)
+    assert refreshed.unpriced is False
+    assert outcome.served_by == "accounts/fireworks/models/deepseek-v4-flash-0731"
+
+
+@pytest.mark.unit
+def test_executor_records_remote_spend_unpriced_without_configured_rates(tmp_path: Path, fake_session, monkeypatch):
+    """No configured rate ⇒ real unpriced spend, never fallback-priced —
+    same #669 convention as the unknown-model case, applied to the remote
+    branch."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "remote_llm_input_price_per_mtok", None, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_output_price_per_mtok", None, raising=False)
+
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(1000, 500)),
+    ])
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+        llm_client=llm,
+        model_name="accounts/fireworks/models/deepseek-v4-flash-0731",
+        is_remote=True,
+    )
+    executor.execute(session, {"id": "t1", "description": "x"})
+    refreshed = store.get("t1")
+    assert refreshed.total_input_tokens == 1000
+    assert refreshed.total_output_tokens == 500
+    assert refreshed.total_dollars == pytest.approx(0.0)
+    assert refreshed.unpriced is True
+
+
+@pytest.mark.unit
+def test_executor_outcome_served_by_empty_for_ordinary_local_session(tmp_path: Path, fake_session):
+    """served_by must stay empty (no message-text change downstream) for
+    every session not on the remote fallback — including the default
+    is_remote=False path exercised by every existing test above."""
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(10, 5)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(session, {"id": "t1", "description": "x"})
+    assert outcome.served_by == ""
 
 
 @pytest.mark.unit

@@ -1409,6 +1409,29 @@ def test_completion_label_says_local_for_local_routing(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_completion_label_reports_remote_fallback_model_when_served_by_set(tmp_path: Path):
+    """(#699) When the local route actually ran on the flag-gated remote
+    fallback, the completion message must name the model that actually
+    served the session, not just the static "local" route label — #658's
+    report-observed-not-configured principle applied to this new path."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "task", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_COMPLETED, final_text="done",
+        served_by="accounts/fireworks/models/deepseek-v4-flash-0731",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sent
+    assert "Local agent worker" in sent[0]
+    assert "accounts/fireworks/models/deepseek-v4-flash-0731" in sent[0]
+
+
+@pytest.mark.unit
 def test_completion_inline_summary_kept_when_under_cap(tmp_path: Path):
     """A short final_text is delivered inline (not replaced by a preview), and
     every completion now also lands a note in the vault — so the message carries

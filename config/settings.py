@@ -475,6 +475,32 @@ class Settings(BaseSettings):
         unpriced (see remote_llm_input_price_per_mtok)."""
         return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
 
+    # #699 — lets the agent worker's `local` route fall back to the remote
+    # OpenAI-compatible provider above when the local llama-server isn't
+    # reachable. Exists for a real deployment with NO other #agent executor
+    # (no Claude Code, no Codex, no local llama-server, no Anthropic key) —
+    # without this, #agent tasks there have nowhere to run. Default False +
+    # empty remote config (default) is byte-identical to pre-#699 behavior
+    # everywhere, including the maintainer's own install, which has every
+    # other executor and no remote config. This is a fallback, not a new
+    # route: an explicit `#agent local` on a host with a live llama-server
+    # is unaffected — see agent_worker/local_executor.py's selection logic.
+    # It is also never a rung an escalation ladder can climb to on its own:
+    # NON_API_RUNGS in agent_loop.py only ever names "local" (the on-box
+    # llama-server route via `_select_client(force_local=True)`), which
+    # doesn't consult this flag at all — that selection logic lives solely
+    # in agent_worker/local_executor.py, a different code path from the
+    # chat orchestrator's escalation ladder.
+    agent_remote_executor: bool = Field(
+        default=False, alias="LIFEOS_AGENT_REMOTE_EXECUTOR",
+        description="Opt-in: when the remote provider above is configured "
+                    "(remote_llm_configured) and the local llama-server is "
+                    "unreachable at session start, the agent worker's local "
+                    "route runs the session on the remote provider instead "
+                    "of failing. Off by default; also a no-op unless the "
+                    "remote provider is fully configured."
+    )
+
     # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
     mcp_http_port: int = Field(
         default=8765,
