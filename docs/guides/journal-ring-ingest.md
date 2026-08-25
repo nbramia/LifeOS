@@ -37,6 +37,15 @@ separate implementation of capture — same log file
 same ask-when-unsure behavior described in
 [`config/personas/journal.md`](../../config/personas/journal.md).
 
+The write itself is deterministic and done in code
+([`api/services/journal_capture.py`](../../api/services/journal_capture.py)),
+before the model's turn starts — the fragment survives whether or not the
+model does anything useful, and the pipeline reports back that it landed. This
+endpoint requires that confirmation before it answers `status: "logged"` or
+records the delivery as processed. Prior to #674 it inferred capture from "the
+pipeline returned without raising", which reported success for fragments that
+were never written and burned their dedupe keys.
+
 One documented difference from a Telegram message: the bullet's `HH:MM`
 timestamp is whatever the persona resolves as "now, local time" at
 processing time — same as a typed message, which also carries no separate
@@ -101,7 +110,8 @@ or, for a delivery already seen:
 | `401` | Missing or wrong bearer token. Nothing written. |
 | `422` | Missing/empty `text`, `device_id`, or `timestamp`, or a `timestamp` that isn't valid ISO 8601. Nothing written. |
 | `400` | Body isn't valid JSON. Nothing written. |
-| `502` | The chat pipeline itself failed (e.g. the LLM backend is down). Nothing written; not recorded as processed, so an identical retry is *not* treated as a duplicate. |
+| `502` | The chat pipeline failed (e.g. the LLM backend is down), or it returned without confirming the fragment reached disk. Nothing captured; not recorded as processed, so an identical retry is *not* treated as a duplicate. |
+| `500` | The capture write itself failed. Same as `502` for retry purposes: nothing recorded as processed. |
 | `503` | The endpoint is disabled (`LIFEOS_JOURNAL_INGEST_TOKEN` unset) or the `journal` persona isn't configured. |
 
 Auth is checked **before** the body is parsed, so an unauthenticated request
@@ -118,9 +128,9 @@ since a retry resends those three values unchanged. Either way, only the
 derived key (a hash, or the device's own id) is persisted — never the
 fragment text — in `data/journal_ingest.db`.
 
-A delivery is marked processed only **after** the capture pipeline succeeds,
-so a failed attempt (`502`) can be retried rather than being silently
-swallowed as a duplicate forever.
+A delivery is marked processed only **after** the pipeline confirms the
+fragment is on disk — not merely after it returns — so a failed attempt can be
+retried rather than being silently swallowed as a duplicate forever.
 
 ## Verify with `curl`
 
@@ -135,7 +145,8 @@ Check `Personal/Log/<today>.md` in the vault for the new bullet.
 
 ## Related Documents
 
-- [`config/personas/journal.md`](../../config/personas/journal.md) — The capture behavior this endpoint routes into (#659); authoritative on log shape and task/schedule extraction.
+- [`config/personas/journal.md`](../../config/personas/journal.md) — The persona this endpoint routes into (#659); authoritative on task/schedule extraction. Log shape is `api/services/journal_capture.py`'s since #674.
 - [Configuration](configuration.md#journal-ring-ingest) — `LIFEOS_JOURNAL_INGEST_TOKEN` reference.
 - [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py) — Implementation; `_adapt_payload()` is the one function to change once a real device's webhook is observed.
+- [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from (#674).
 - [Apple Health Import](apple-health.md) — The precedent this mirrors: a dedicated bearer-token ingest endpoint for an external capture device.

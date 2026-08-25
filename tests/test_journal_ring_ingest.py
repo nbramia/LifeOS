@@ -9,6 +9,13 @@ adapter, idempotency, clean failure) and that it calls into the pipeline the
 same way the journal Telegram bot does, not the persona's LLM behavior
 itself (which #659's own tests already note isn't unit-testable without a
 model). Never touches the real vault or a real chat pipeline.
+
+The mock returns `journal_capture` because since #674 the pipeline reports
+back that the fragment reached disk, and this endpoint refuses to call a
+delivery `logged` (or burn its dedupe key) without that confirmation — a
+mocked pipeline asserting only that it was *called* is precisely what let
+#674 ship. The tests that exercise a real capture, file content and all, are
+in tests/test_journal_capture.py.
 """
 import pytest
 from fastapi import FastAPI
@@ -19,6 +26,18 @@ import api.services.journal_ingest_store as journal_ingest_store
 from api.services.journal_ingest_store import JournalIngestStore
 
 pytestmark = pytest.mark.unit
+
+
+def _captured_result(conversation_id="conv-1"):
+    """What the chat pipeline returns for a journal turn since #674: a reply
+    AND proof the fragment is on disk."""
+    return {
+        "answer": "Logged.",
+        "conversation_id": conversation_id,
+        "claude_intent": False,
+        "task": None,
+        "journal_capture": {"path": "Personal/Log/2026-08-23.md", "created": True},
+    }
 
 
 def _payload(**overrides):
@@ -49,7 +68,7 @@ def env(tmp_path, monkeypatch):
 
     async def fake_chat_via_api(question, conversation_id=None, persona=None):
         calls.append({"question": question, "conversation_id": conversation_id, "persona": persona})
-        return {"answer": "Logged.", "conversation_id": "conv-1", "claude_intent": False, "task": None}
+        return _captured_result()
 
     monkeypatch.setattr("api.services.telegram.chat_via_api", fake_chat_via_api)
 
@@ -203,7 +222,7 @@ class TestIdempotency:
 
         async def fake_chat_via_api(question, conversation_id=None, persona=None):
             calls.append(question)
-            return {"answer": "Logged.", "conversation_id": "conv-2"}
+            return _captured_result(conversation_id="conv-2")
 
         monkeypatch.setattr("api.services.telegram.chat_via_api", fake_chat_via_api)
         resp = client.post("/api/journal/ingest", json=payload, headers=_auth())

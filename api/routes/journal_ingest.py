@@ -8,7 +8,10 @@ NOT reimplement capture: `_ingest_fragment` below calls the exact same chat
 pipeline entry point (`api.services.telegram.chat_via_api`, with the journal
 persona's preamble) that the journal Telegram bot uses for a typed fragment,
 so a spoken fragment gets identical treatment — same log file, same task/
-schedule thresholds, same ask-when-unsure behavior.
+schedule thresholds, same ask-when-unsure behavior. Since #674 that pipeline
+writes the fragment to `Personal/Log/YYYY-MM-DD.md` deterministically, in code,
+and reports back that it did; this endpoint requires that confirmation before
+it calls a delivery captured.
 
 Our own contract (see docs/guides/journal-ring-ingest.md) — the exact shape a
 real Pebble Index webhook sends is unknown until the device ships in March
@@ -172,6 +175,18 @@ async def journal_ring_ingest(request: Request):
         # reach the logs.
         logger.error(f"Journal ring ingest: pipeline error for device {fields.device_id}")
         raise HTTPException(status_code=502, detail="capture pipeline error")
+
+    # #674: "the pipeline returned without raising" is NOT "the fragment was
+    # written" — that inference is what let a silently-failed capture report
+    # `status: "logged"` and burn the delivery's dedupe key, permanently
+    # suppressing a genuine retry. Require the pipeline's explicit capture
+    # confirmation instead, and mark the key processed only after it.
+    if not result.get("journal_capture"):
+        logger.error(
+            f"Journal ring ingest: capture unconfirmed for device {fields.device_id}, "
+            "not marking processed so a retry can still land"
+        )
+        raise HTTPException(status_code=502, detail="capture not confirmed; fragment not written")
 
     _conversations[fields.device_id] = result["conversation_id"]
     store.mark_processed(dedupe_key)
