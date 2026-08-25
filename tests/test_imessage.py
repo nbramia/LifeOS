@@ -18,6 +18,7 @@ from api.services.imessage import (
     apple_timestamp_to_datetime,
     datetime_to_apple_timestamp,
     extract_text_from_attributed_body,
+    join_imessages_to_entities,
     resolve_entity_id,
     resolve_entity_id_confidence,
 )
@@ -642,3 +643,137 @@ class TestExportConnectionLifecycle:
             copied_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
 
         assert copied_count == SOURCE_MESSAGE_COUNT
+
+
+class TestQueryPathConnectionsClose:
+    """Regression tests for #678: the 9 query-path connections now use
+    `contextlib.closing`, matching the export-path fix in #647.
+
+    Counting live fds (as TestExportConnectionLifecycle does) can't tell a
+    real fix from a no-op here: CPython's refcounting already closes a
+    connection the instant its local variable goes out of scope, so a bare
+    `with sqlite3.connect(...) as conn:` and a `closing(...)` one look
+    identical by fd count. Instead these tests spy on `sqlite3.connect` to
+    capture the actual connection object each method opens, then assert
+    operating on it raises "closed database" — which only `closing()`
+    guarantees deterministically at the end of the `with` block.
+    """
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = IMessageStore(f.name)
+            yield store
+            for suffix in ("", "-wal", "-shm"):
+                Path(f.name + suffix).unlink(missing_ok=True)
+
+    @pytest.fixture
+    def captured_connections(self, monkeypatch):
+        """Spy on sqlite3.connect as used by imessage.py; return the connections it opens."""
+        captured = []
+        real_connect = sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            captured.append(conn)
+            return conn
+
+        monkeypatch.setattr("api.services.imessage.sqlite3.connect", spy_connect)
+        return captured
+
+    def _assert_closed(self, conn: sqlite3.Connection) -> None:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            conn.execute("SELECT 1")
+
+    def test_update_entity_mappings_closes_and_commits(self, temp_store, captured_connections):
+        with closing(sqlite3.connect(temp_store.storage_path)) as conn, conn:
+            conn.execute(
+                "INSERT INTO messages (rowid, text, timestamp, is_from_me, handle,"
+                " handle_normalized, service) VALUES"
+                " (1, 'hi', '2024-01-01T00:00:00', 0, '+15550001111', '+15550001111', 'iMessage')"
+            )
+        captured_connections.clear()  # drop the setup connection above
+
+        updated = temp_store.update_entity_mappings({"+15550001111": "entity-1"})
+
+        assert updated == 1
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+        # A closing() swap drops the commit unless paired with `, conn`; confirm
+        # the write actually landed, not just that the connection closed.
+        with closing(sqlite3.connect(temp_store.storage_path)) as conn:
+            row = conn.execute("SELECT person_entity_id FROM messages WHERE rowid = 1").fetchone()
+        assert row[0] == "entity-1"
+
+    def test_update_entity_mappings_by_handle_closes_and_commits(self, temp_store, captured_connections):
+        with closing(sqlite3.connect(temp_store.storage_path)) as conn, conn:
+            conn.execute(
+                "INSERT INTO messages (rowid, text, timestamp, is_from_me, handle,"
+                " handle_normalized, service) VALUES"
+                " (1, 'hi', '2024-01-01T00:00:00', 0, 'friend@example.com', NULL, 'iMessage')"
+            )
+        captured_connections.clear()  # drop the setup connection above
+
+        updated = temp_store.update_entity_mappings_by_handle({"friend@example.com": "entity-2"})
+
+        assert updated == 1
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+        with closing(sqlite3.connect(temp_store.storage_path)) as conn:
+            row = conn.execute("SELECT person_entity_id FROM messages WHERE rowid = 1").fetchone()
+        assert row[0] == "entity-2"
+
+    def test_get_messages_for_phone_closes(self, temp_store, captured_connections):
+        temp_store.get_messages_for_phone("+15550001111")
+
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+    def test_get_messages_for_entity_closes(self, temp_store, captured_connections):
+        temp_store.get_messages_for_entity("entity-1")
+
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+    def test_search_messages_closes(self, temp_store, captured_connections):
+        temp_store.search_messages("hello")
+
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+    def test_query_messages_closes(self, temp_store, captured_connections):
+        temp_store.query_messages()
+
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+    def test_get_statistics_closes(self, temp_store, captured_connections):
+        temp_store.get_statistics()
+
+        # get_statistics() also calls _get_last_synced_rowid(), which opens
+        # its own connection (line 252) — expect both, both closed.
+        assert len(captured_connections) == 2
+        for conn in captured_connections:
+            self._assert_closed(conn)
+
+    def test_get_recent_conversations_closes(self, temp_store, captured_connections):
+        temp_store.get_recent_conversations()
+
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
+
+    def test_join_imessages_to_entities_closes(self, temp_store, captured_connections, monkeypatch):
+        monkeypatch.setattr("api.services.imessage.get_imessage_store", lambda *a, **kw: temp_store)
+        monkeypatch.setattr(
+            "api.services.person_entity.get_person_entity_store",
+            lambda *a, **kw: SimpleNamespace(get_by_phone=lambda p: None, get_by_email=lambda e: None),
+        )
+
+        stats = join_imessages_to_entities()
+
+        assert stats["unique_phones"] == 0
+        assert stats["unique_emails"] == 0
+        assert len(captured_connections) == 1
+        self._assert_closed(captured_connections[0])
