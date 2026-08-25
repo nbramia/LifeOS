@@ -253,7 +253,7 @@ file; the next run re-fetches and re-evaluates the whole window.
 | `apple_data_import.py` | Import Apple data exports into LifeOS | Linux server |
 | `apple_data_agent.sh` | Orchestrate export + rsync + import | Mac Mini (cron) |
 
-WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `wacli` (steipete/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records.
+WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `wacli` (openclaw/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records. A non-zero `wacli sync` exit (including a "Client outdated (405)" protocol rejection, distinct from an auth failure) marks the export `status: "error"` rather than silently exporting stale data as `ok` — see issue #677.
 
 ### Phase 2: Entity Processing
 

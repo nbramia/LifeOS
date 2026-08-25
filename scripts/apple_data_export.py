@@ -688,18 +688,154 @@ def export_photos_faces(dry_run: bool = False) -> dict:
     }
 
 
+
+# Markers used by _diagnose_wacli_failure to classify a failed `wacli sync`.
+_WACLI_CLIENT_OUTDATED_MARKERS = ("outdated", "405")
+_WACLI_AUTH_FAILURE_MARKERS = (
+    "unauthorized",
+    "401",
+    "not authenticated",
+    "not logged in",
+    "please pair",
+    "please scan",
+    "session expired",
+    "logged out",
+)
+
+
+def _diagnose_wacli_failure(output: str) -> dict:
+    """Classify a failed `wacli sync` from its combined stdout/stderr.
+
+    Issue #677: WhatsApp sync was dead for 3+ months because a silent
+    Homebrew tap rename (steipete/tap -> openclaw/tap) froze wacli at 0.5.0
+    while WhatsApp's protocol moved on, producing "Client outdated (405)".
+    `wacli doctor` kept reporting AUTHENTICATED true throughout — the
+    session genuinely was valid — so every investigation re-paired the
+    client, which just produces a fresh, equally-rejected session. This
+    tells the two failure modes apart so the diagnosis it feeds into this
+    source's manifest entry (via the "reason"/"diagnosis" fields) names the
+    real cause and the real remedy instead of sending the operator to
+    re-pair.
+
+    The path this actually escapes by: a status of "error" here marks this
+    source as errored in manifest.json; on the Linux side
+    `_manifest_source_errored` reads that and makes `import_whatsapp`
+    return `status: "error"` too; apple_data_import.py's main() collects
+    that into `errored_sources` and calls `sys.exit(1)`; run_all_syncs.py
+    (around line 1109) sees the subprocess's non-zero return code and
+    records the failure (health_message/markdown_message/classify_message,
+    the nightly summary status, any alert) from that exit code. The
+    CRITICAL log check_manifest() also emits IS captured into the sync log
+    file, so a human reading it does see the diagnosis (#646) — it just
+    doesn't drive record_failure or anything downstream of it. Only the
+    exit code does.
+    """
+    lowered = (output or "").lower()
+    if all(marker in lowered for marker in _WACLI_CLIENT_OUTDATED_MARKERS):
+        return {
+            "diagnosis": "client_version",
+            "reason": (
+                "wacli client rejected by WhatsApp: Client outdated (405). "
+                "This is a client-version problem, NOT authentication — "
+                "`wacli doctor` will keep reporting AUTHENTICATED true "
+                "because the session is still valid, and re-pairing will "
+                "not fix it. Run `brew upgrade wacli`; if `brew outdated` "
+                "reports nothing, check for a tap rename first with "
+                "`brew info wacli`."
+            ),
+        }
+    if any(marker in lowered for marker in _WACLI_AUTH_FAILURE_MARKERS):
+        return {
+            "diagnosis": "auth",
+            "reason": "wacli reports an authentication failure — re-pair with `wacli auth`.",
+        }
+    return {
+        "diagnosis": "unknown",
+        "reason": f"wacli sync failed: {(output or '').strip()[:200]}",
+    }
+
+
+def _get_wacli_version() -> str | None:
+    """Best-effort `wacli --version` lookup for the export manifest.
+
+    Recorded on every export (issue #677) so a frozen client is visible
+    from the Linux side without shelling into the Mac — a version that
+    hasn't moved in months is the frozen-client signal even before a sync
+    actually fails outright. Mirrors _get_agent_sha's best-effort shape:
+    any failure here just means the field is null in the manifest, never a
+    broken export.
+    """
+    try:
+        result = subprocess.run(
+            ["wacli", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    version = (result.stdout or result.stderr or "").strip()
+    return version or None
+
+
+def _newest_message_timestamp(messages: list[dict]) -> str | None:
+    """Return the ISO timestamp of the newest message, or None if empty.
+
+    wacli stores `ts` as either an ISO string or unix epoch seconds — the
+    same ambiguity api.services.whatsapp.parse_message_timestamp handles on
+    the import side. Reimplemented locally (rather than importing that
+    module) to keep this macOS-only export script free of the CRM/DB
+    dependencies api.services.whatsapp pulls in at import time.
+    """
+    newest: datetime | None = None
+    for msg in messages:
+        ts = msg.get("ts")
+        if ts is None:
+            continue
+        try:
+            if isinstance(ts, str):
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            else:
+                parsed = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, TypeError, OSError):
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if newest is None or parsed > newest:
+            newest = parsed
+    return newest.isoformat() if newest else None
+
+
 def export_whatsapp(dry_run: bool = False) -> dict:
     """Export WhatsApp data via wacli for import on Linux.
 
-    Routes through the wacli CLI (steipete/tap/wacli) which is macOS-only
-    and reads the WhatsApp Desktop app's local SQLite database. The Mac Mini
-    is the canonical source — Linux can't run wacli, so this export bridges
-    them via a JSON file the Linux importer can consume.
+    Routes through the wacli CLI (openclaw/tap, formerly steipete/tap) which
+    is macOS-only and reads the WhatsApp Desktop app's local SQLite
+    database. The Mac Mini is the canonical source — Linux can't run wacli,
+    so this export bridges them via a JSON file the Linux importer can
+    consume.
+
+    Periodic "is wacli current?" check (issue #677 AC): deliberately NOT
+    implemented as a separate network call to GitHub/Homebrew. `brew
+    outdated` already claims to do this and is exactly what silently broke
+    (a tap rename made it go quiet); a second freshness poll would rot the
+    same way. Instead this relies on two things that are always-on: (1)
+    _get_wacli_version() records the installed version on every export, so
+    a version frozen for months is visible as a passive signal even before
+    anything fails outright, and (2) _diagnose_wacli_failure() below turns
+    the first real protocol rejection into an immediate, correctly-labeled
+    error rather than a silent "ok" — so staleness surfaces on the next
+    nightly sync after it actually starts mattering, not months later.
     """
-    import subprocess
+    wacli_version = _get_wacli_version()
 
     # Step 1: Have wacli refresh its local database from WhatsApp Desktop.
-    # Best effort — if this fails we still export whatever's already on disk.
+    # A non-zero exit (or a timeout) must not be treated as "continue with
+    # whatever's on disk and call it ok" — that is exactly how a 405 Client
+    # outdated failure exported as status "ok" for 3+ months (issue #677).
+    sync_diagnosis: dict | None = None
     try:
         result = subprocess.run(
             ["wacli", "sync", "--once"],
@@ -710,19 +846,26 @@ def export_whatsapp(dry_run: bool = False) -> dict:
         if result.returncode == 0:
             logger.info("wacli sync completed")
         else:
-            logger.warning(f"wacli sync returned non-zero: {result.stderr.strip()[:200]}")
+            sync_diagnosis = _diagnose_wacli_failure(f"{result.stdout}\n{result.stderr}")
+            logger.error(
+                f"wacli sync failed ({sync_diagnosis['diagnosis']}): {sync_diagnosis['reason']}"
+            )
     except FileNotFoundError:
-        logger.error("wacli not found. Install with: brew install steipete/tap/wacli")
-        return {"status": "error", "reason": "wacli not installed"}
+        logger.error("wacli not found. Install with: brew install openclaw/tap/wacli")
+        return {"status": "error", "reason": "wacli not installed", "wacli_version": wacli_version}
     except subprocess.TimeoutExpired:
-        logger.warning("wacli sync timed out after 3 minutes — continuing with existing data")
+        sync_diagnosis = {
+            "diagnosis": "timeout",
+            "reason": "wacli sync timed out after 3 minutes — exported data may be stale",
+        }
+        logger.warning(sync_diagnosis["reason"])
 
     # Step 2: Verify wacli databases exist
     wacli_db = Path.home() / ".wacli" / "wacli.db"
     session_db = Path.home() / ".wacli" / "session.db"
     if not wacli_db.exists():
         logger.error(f"wacli database not found at {wacli_db}")
-        return {"status": "error", "reason": "wacli.db not found"}
+        return {"status": "error", "reason": "wacli.db not found", "wacli_version": wacli_version}
 
     # Step 3: Pull the contact list via the wacli command (richer than raw rows)
     try:
@@ -734,7 +877,7 @@ def export_whatsapp(dry_run: bool = False) -> dict:
         )
     except subprocess.TimeoutExpired:
         logger.error("wacli contacts search timed out")
-        return {"status": "error", "reason": "wacli contacts timeout"}
+        return {"status": "error", "reason": "wacli contacts timeout", "wacli_version": wacli_version}
 
     contacts: list[dict] = []
     if result.returncode == 0 and result.stdout.strip():
@@ -750,11 +893,16 @@ def export_whatsapp(dry_run: bool = False) -> dict:
         logger.warning(f"wacli contacts search failed: {result.stderr.strip()[:200]}")
 
     if dry_run:
-        return {
-            "status": "dry_run",
+        dry_result = {
+            "status": "error" if sync_diagnosis else "dry_run",
             "contacts": len(contacts),
             "wacli_db_mb": round(wacli_db.stat().st_size / (1024 * 1024), 1),
+            "wacli_version": wacli_version,
         }
+        if sync_diagnosis:
+            dry_result["reason"] = sync_diagnosis["reason"]
+            dry_result["diagnosis"] = sync_diagnosis["diagnosis"]
+        return dry_result
 
     # Step 4: Dump messages, group_participants, lid contacts from wacli.db
     conn = sqlite3.connect(f"file:{wacli_db}?mode=ro", uri=True)
@@ -813,14 +961,20 @@ def export_whatsapp(dry_run: bool = False) -> dict:
         f"Exported WhatsApp: {len(contacts)} contacts, {len(messages)} messages, "
         f"{len(group_participants)} group memberships, {len(lid_phones)} LID phones to {out_path}"
     )
-    return {
-        "status": "ok",
+    result_dict = {
+        "status": "error" if sync_diagnosis else "ok",
         "contacts": len(contacts),
         "messages": len(messages),
         "group_participants": len(group_participants),
         "lid_phones": len(lid_phones),
         "path": str(out_path),
+        "wacli_version": wacli_version,
+        "newest_message_at": _newest_message_timestamp(messages),
     }
+    if sync_diagnosis:
+        result_dict["reason"] = sync_diagnosis["reason"]
+        result_dict["diagnosis"] = sync_diagnosis["diagnosis"]
+    return result_dict
 
 
 def _finalize_result(result: dict) -> dict:

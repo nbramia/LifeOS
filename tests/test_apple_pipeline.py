@@ -1065,6 +1065,256 @@ class TestAgentShaImport:
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp export (issue #677) — a failed `wacli sync` must not export as
+# status "ok", a 405 "Client outdated" must be diagnosed as client-version
+# (not auth), and a genuine auth failure must still be diagnosed as auth.
+# ---------------------------------------------------------------------------
+
+class TestWacliFailureDiagnosis:
+    """_diagnose_wacli_failure classifies a failed `wacli sync` from its
+    combined stdout/stderr. Real sample output from issue #677 (synthetic
+    protocol/version numbers only, no personal data)."""
+
+    # Captured 2026-08-24 on a wacli client frozen at 0.5.0 by a silent
+    # Homebrew tap rename (steipete/tap -> openclaw/tap) — see issue #677.
+    SYNC_405_OUTPUT = (
+        "[Client/Socket ERROR] Error reading from websocket: failed to get "
+        "reader: failed to read frame header: EOF\n"
+        "[Client ERROR] Client outdated (405) connect failure "
+        "(client version: 2.3000.1037076227)\n\n"
+        "Idle for 30s, exiting.\n"
+        "Messages stored: 0"
+    )
+
+    # Synthetic — wacli doesn't publish a canonical auth-failure message;
+    # this exercises the auth-marker branch without inventing 405 text.
+    SYNC_AUTH_OUTPUT = (
+        "[Client ERROR] Unauthorized (401): session not authenticated. "
+        "Run `wacli auth` to pair a device.\n"
+        "Idle for 5s, exiting.\n"
+        "Messages stored: 0"
+    )
+
+    def _diagnose(self):
+        from scripts.apple_data_export import _diagnose_wacli_failure
+        return _diagnose_wacli_failure
+
+    def test_405_client_outdated_is_client_version_not_auth(self):
+        diagnose = self._diagnose()
+        result = diagnose(self.SYNC_405_OUTPUT)
+
+        assert result["diagnosis"] == "client_version"
+        assert "auth" not in result["diagnosis"]
+        assert "brew upgrade wacli" in result["reason"]
+        assert "NOT authentication" in result["reason"]
+
+    def test_genuine_auth_failure_is_still_auth(self):
+        """The 405 fix must not overcorrect into misdiagnosing a real auth
+        failure as a client-version problem."""
+        diagnose = self._diagnose()
+        result = diagnose(self.SYNC_AUTH_OUTPUT)
+
+        assert result["diagnosis"] == "auth"
+        assert "wacli auth" in result["reason"]
+
+    def test_unrecognized_failure_is_unknown_not_silently_ok(self):
+        diagnose = self._diagnose()
+        result = diagnose("[Client ERROR] connection refused")
+
+        assert result["diagnosis"] == "unknown"
+        assert "connection refused" in result["reason"]
+
+    def test_empty_output_handled(self):
+        diagnose = self._diagnose()
+        result = diagnose("")
+        assert result["diagnosis"] == "unknown"
+
+
+class TestWacliVersionLookup:
+    """_get_wacli_version is best-effort, like _get_agent_sha: any failure
+    just means the manifest field is null, never a broken export."""
+
+    def _get_version(self):
+        from scripts.apple_data_export import _get_wacli_version
+        return _get_wacli_version
+
+    def test_returns_stripped_version(self):
+        get_version = self._get_version()
+        fake_result = MagicMock(returncode=0, stdout="0.17.1\n", stderr="")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert get_version() == "0.17.1"
+
+    def test_none_on_nonzero_exit(self):
+        get_version = self._get_version()
+        fake_result = MagicMock(returncode=1, stdout="", stderr="unknown flag")
+        with patch("scripts.apple_data_export.subprocess.run", return_value=fake_result):
+            assert get_version() is None
+
+    def test_none_when_wacli_missing(self):
+        get_version = self._get_version()
+        with patch("scripts.apple_data_export.subprocess.run", side_effect=FileNotFoundError()):
+            assert get_version() is None
+
+
+class TestNewestMessageTimestamp:
+    """_newest_message_timestamp handles wacli's mixed ISO-string/epoch-
+    second `ts` formats, same ambiguity as the import-side parser."""
+
+    def _newest(self):
+        from scripts.apple_data_export import _newest_message_timestamp
+        return _newest_message_timestamp
+
+    def test_picks_latest_iso_timestamp(self):
+        newest = self._newest()
+        result = newest([
+            {"ts": "2026-08-20T10:00:00+00:00"},
+            {"ts": "2026-08-24T09:30:00+00:00"},
+            {"ts": "2026-08-22T00:00:00+00:00"},
+        ])
+        assert result == "2026-08-24T09:30:00+00:00"
+
+    def test_picks_latest_epoch_timestamp(self):
+        newest = self._newest()
+        earlier = int(datetime(2026, 8, 20, tzinfo=timezone.utc).timestamp())
+        later = int(datetime(2026, 8, 24, tzinfo=timezone.utc).timestamp())
+        result = newest([{"ts": earlier}, {"ts": later}])
+        assert result == datetime(2026, 8, 24, tzinfo=timezone.utc).isoformat()
+
+    def test_empty_list_returns_none(self):
+        newest = self._newest()
+        assert newest([]) is None
+
+    def test_unparseable_timestamps_skipped(self):
+        newest = self._newest()
+        result = newest([{"ts": "not-a-date"}, {"ts": "2026-08-24T00:00:00+00:00"}])
+        assert result == "2026-08-24T00:00:00+00:00"
+
+
+class TestExportWhatsapp:
+    """export_whatsapp's end-to-end status/diagnosis behavior."""
+
+    def _build_wacli_db(self, path: Path, messages: list[tuple]):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE messages (
+                msg_id TEXT, chat_jid TEXT, chat_name TEXT, sender_jid TEXT,
+                sender_name TEXT, ts TEXT, from_me INTEGER, text TEXT,
+                display_text TEXT, media_type TEXT
+            );
+            CREATE TABLE group_participants (group_jid TEXT, user_jid TEXT);
+            CREATE TABLE contacts (jid TEXT, push_name TEXT);
+        """)
+        for m in messages:
+            conn.execute(
+                "INSERT INTO messages (msg_id, chat_jid, chat_name, sender_jid, "
+                "sender_name, ts, from_me, text, display_text, media_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                m,
+            )
+        conn.commit()
+        conn.close()
+
+    def _msg(self, msg_id: str, ts: str):
+        return (msg_id, "15555550100@s.whatsapp.net", "Test Chat",
+                "15555550100@s.whatsapp.net", "Tester", ts, 0, "hi", "hi", None)
+
+    def _run_export(
+        self,
+        tmp_path: Path,
+        sync_returncode: int,
+        sync_output: str = "",
+        messages: list[tuple] | None = None,
+        dry_run: bool = False,
+        wacli_version: str = "0.17.1",
+    ):
+        from scripts.apple_data_export import export_whatsapp
+
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        wacli_db = tmp_path / ".wacli" / "wacli.db"
+        self._build_wacli_db(wacli_db, messages or [])
+
+        sync_result = MagicMock(returncode=sync_returncode, stdout=sync_output, stderr="")
+        version_result = MagicMock(returncode=0, stdout=wacli_version, stderr="")
+        contacts_result = MagicMock(returncode=0, stdout='{"data": []}', stderr="")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["wacli", "sync"]:
+                return sync_result
+            if cmd[:2] == ["wacli", "--version"]:
+                return version_result
+            if "--json" in cmd:
+                return contacts_result
+            raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir), \
+             patch("scripts.apple_data_export.subprocess.run", side_effect=fake_run):
+            return export_whatsapp(dry_run=dry_run)
+
+    def test_successful_sync_is_ok(self, tmp_path):
+        result = self._run_export(tmp_path, sync_returncode=0)
+        assert result["status"] == "ok"
+        assert "reason" not in result
+
+    def test_nonzero_sync_exit_marks_error_not_ok(self, tmp_path):
+        """Issue #677's core bug: a failing `wacli sync` used to export as
+        status "ok" and package whatever stale data was already on disk."""
+        result = self._run_export(
+            tmp_path, sync_returncode=1, sync_output="[Client ERROR] connection refused",
+        )
+        assert result["status"] == "error"
+        assert result["diagnosis"] == "unknown"
+        # The export still runs to completion — stale data is better than
+        # none, but the run must not look like a clean success.
+        assert result["path"]
+
+    def test_405_client_outdated_is_error_with_client_version_diagnosis(self, tmp_path):
+        result = self._run_export(
+            tmp_path,
+            sync_returncode=1,
+            sync_output=TestWacliFailureDiagnosis.SYNC_405_OUTPUT,
+        )
+        assert result["status"] == "error"
+        assert result["diagnosis"] == "client_version"
+        assert "brew upgrade wacli" in result["reason"]
+
+    def test_auth_failure_is_error_with_auth_diagnosis(self, tmp_path):
+        result = self._run_export(
+            tmp_path,
+            sync_returncode=1,
+            sync_output=TestWacliFailureDiagnosis.SYNC_AUTH_OUTPUT,
+        )
+        assert result["status"] == "error"
+        assert result["diagnosis"] == "auth"
+
+    def test_manifest_records_wacli_version_and_newest_message_timestamp(self, tmp_path):
+        result = self._run_export(
+            tmp_path,
+            sync_returncode=0,
+            wacli_version="0.17.1",
+            messages=[
+                self._msg("m1", "2026-08-20T10:00:00+00:00"),
+                self._msg("m2", "2026-08-24T09:30:00+00:00"),
+            ],
+        )
+        assert result["wacli_version"] == "0.17.1"
+        assert result["newest_message_at"] == "2026-08-24T09:30:00+00:00"
+
+    def test_dry_run_still_surfaces_sync_error(self, tmp_path):
+        result = self._run_export(
+            tmp_path,
+            sync_returncode=1,
+            sync_output=TestWacliFailureDiagnosis.SYNC_405_OUTPUT,
+            dry_run=True,
+        )
+        assert result["status"] == "error"
+        assert result["diagnosis"] == "client_version"
+        assert result["wacli_version"] == "0.17.1"
+
+
+# ---------------------------------------------------------------------------
 # Phone import — phone number extraction and person resolution
 # ---------------------------------------------------------------------------
 
