@@ -11,6 +11,7 @@ import logging
 import re
 import sqlite3
 import uuid as uuid_mod
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -217,7 +218,7 @@ class IMessageStore:
         """Create the local database schema if it doesn't exist."""
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn, conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS messages (
@@ -248,23 +249,34 @@ class IMessageStore:
 
     def _get_last_synced_rowid(self) -> int:
         """Get the last synced ROWID for incremental sync."""
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn:
             cursor = conn.execute(
                 "SELECT value FROM sync_state WHERE key = 'last_rowid'"
             )
             row = cursor.fetchone()
             return int(row[0]) if row else 0
 
-    def _set_last_synced_rowid(self, rowid: int) -> None:
-        """Update the last synced ROWID."""
-        with sqlite3.connect(self.storage_path) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sync_state (key, value)
-                VALUES ('last_rowid', ?)
-                """,
-                (str(rowid),),
-            )
+    def _set_last_synced_rowid(
+        self, rowid: int, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        """Update the last synced ROWID.
+
+        Args:
+            rowid: New high-water mark.
+            conn: Optional caller-owned connection to reuse. When omitted a
+                connection is opened and closed for this call.
+        """
+        sql = """
+            INSERT OR REPLACE INTO sync_state (key, value)
+            VALUES ('last_rowid', ?)
+        """
+        if conn is not None:
+            with conn:
+                conn.execute(sql, (str(rowid),))
+            return
+
+        with closing(sqlite3.connect(self.storage_path)) as own_conn, own_conn:
+            own_conn.execute(sql, (str(rowid),))
 
     def export_from_source(
         self,
@@ -320,78 +332,69 @@ class IMessageStore:
         if limit:
             query += f" LIMIT {limit}"
 
-        try:
-            with sqlite3.connect(f"file:{self.SOURCE_DB_PATH}?mode=ro", uri=True) as source_conn:
-                source_conn.row_factory = sqlite3.Row
-                cursor = source_conn.execute(query, (last_rowid,))
+        # One destination connection for the whole export. Reconnecting per
+        # batch leaks a file descriptor each time and dies at the default
+        # macOS `ulimit -n` of 256 partway through a full export (#647).
+        with closing(sqlite3.connect(self.storage_path)) as dest_conn:
+            batch = []
+            max_rowid = last_rowid
 
-                batch = []
-                max_rowid = last_rowid
+            for row in self._iter_source_rows(query, last_rowid):
+                rowid = row["ROWID"]
+                text = row["text"]
+                attributed_body = row["attributedBody"]
+                apple_ts = row["date"]
+                is_from_me = bool(row["is_from_me"])
+                handle = row["handle"] or ""
+                service = row["service"] or "Unknown"
 
-                for row in cursor:
-                    rowid = row["ROWID"]
-                    text = row["text"]
-                    attributed_body = row["attributedBody"]
-                    apple_ts = row["date"]
-                    is_from_me = bool(row["is_from_me"])
-                    handle = row["handle"] or ""
-                    service = row["service"] or "Unknown"
+                # Try text field first, then attributedBody
+                final_text = text
+                if not final_text and attributed_body:
+                    final_text = extract_text_from_attributed_body(attributed_body)
 
-                    # Try text field first, then attributedBody
-                    final_text = text
-                    if not final_text and attributed_body:
-                        final_text = extract_text_from_attributed_body(attributed_body)
-
-                    # Skip messages with no extractable text (attachments, etc.)
-                    if not final_text:
-                        stats["messages_skipped"] += 1
-                        max_rowid = max(max_rowid, rowid)
-                        continue
-
-                    # Convert timestamp
-                    timestamp = apple_timestamp_to_datetime(apple_ts)
-                    if not timestamp:
-                        stats["messages_skipped"] += 1
-                        max_rowid = max(max_rowid, rowid)
-                        continue
-
-                    # Normalize phone number
-                    handle_normalized = normalize_phone(handle) if handle else None
-
-                    batch.append((
-                        rowid,
-                        final_text,
-                        timestamp.isoformat(),
-                        1 if is_from_me else 0,
-                        handle,
-                        handle_normalized,
-                        service,
-                    ))
-
+                # Skip messages with no extractable text (attachments, etc.)
+                if not final_text:
+                    stats["messages_skipped"] += 1
                     max_rowid = max(max_rowid, rowid)
-                    stats["messages_exported"] += 1
+                    continue
 
-                    # Batch insert
-                    if len(batch) >= 1000:
-                        self._insert_batch(batch)
-                        batch = []
+                # Convert timestamp
+                timestamp = apple_timestamp_to_datetime(apple_ts)
+                if not timestamp:
+                    stats["messages_skipped"] += 1
+                    max_rowid = max(max_rowid, rowid)
+                    continue
 
-                # Insert remaining
-                if batch:
-                    self._insert_batch(batch)
+                # Normalize phone number
+                handle_normalized = normalize_phone(handle) if handle else None
 
-                # Update sync state
-                if max_rowid > last_rowid:
-                    self._set_last_synced_rowid(max_rowid)
-                    stats["new_last_rowid"] = max_rowid
+                batch.append((
+                    rowid,
+                    final_text,
+                    timestamp.isoformat(),
+                    1 if is_from_me else 0,
+                    handle,
+                    handle_normalized,
+                    service,
+                ))
 
-        except sqlite3.OperationalError as e:
-            if "unable to open database" in str(e).lower():
-                raise PermissionError(
-                    "Cannot access iMessage database. "
-                    "Grant Full Disk Access to Terminal/IDE in System Preferences."
-                ) from e
-            raise
+                max_rowid = max(max_rowid, rowid)
+                stats["messages_exported"] += 1
+
+                # Batch insert
+                if len(batch) >= 1000:
+                    self._insert_batch(batch, dest_conn)
+                    batch = []
+
+            # Insert remaining
+            if batch:
+                self._insert_batch(batch, dest_conn)
+
+            # Update sync state
+            if max_rowid > last_rowid:
+                self._set_last_synced_rowid(max_rowid, dest_conn)
+                stats["new_last_rowid"] = max_rowid
 
         logger.info(
             f"iMessage export complete: {stats['messages_exported']} messages, "
@@ -400,21 +403,75 @@ class IMessageStore:
 
         return stats
 
-    def _insert_batch(self, batch: list) -> None:
-        """Insert a batch of messages."""
-        with sqlite3.connect(self.storage_path) as conn:
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO messages
-                (rowid, text, timestamp, is_from_me, handle, handle_normalized, service)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                batch,
-            )
+    def _iter_source_rows(self, query: str, last_rowid: int):
+        """Yield rows from the macOS Messages database.
+
+        The source connection and its error handling live entirely inside this
+        generator. A generator's ``except`` clause is only active while the
+        generator itself is running, so a sqlite3.OperationalError raised by
+        the consumer's loop body — i.e. while writing to the *destination*
+        database — can never be misreported as a Full Disk Access problem on
+        the source (#647).
+        """
+        try:
+            with closing(
+                sqlite3.connect(f"file:{self.SOURCE_DB_PATH}?mode=ro", uri=True)
+            ) as source_conn:
+                source_conn.row_factory = sqlite3.Row
+                yield from source_conn.execute(query, (last_rowid,))
+        except sqlite3.OperationalError as e:
+            if "unable to open database" in str(e).lower():
+                raise PermissionError(
+                    f"Cannot read the iMessage database at {self.SOURCE_DB_PATH} "
+                    f"({e}). Grant Full Disk Access to Terminal/IDE in "
+                    "System Preferences."
+                ) from e
+            raise
+
+    def _insert_batch(
+        self, batch: list, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        """Insert a batch of messages.
+
+        Args:
+            batch: Rows to insert.
+            conn: Optional caller-owned connection to reuse. Exports pass the
+                connection they hold open for the whole run; opening one per
+                batch exhausts the process file-descriptor limit on a full
+                export (see issue #647).
+        """
+        sql = """
+            INSERT OR REPLACE INTO messages
+            (rowid, text, timestamp, is_from_me, handle, handle_normalized, service)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        if conn is not None:
+            with conn:
+                conn.executemany(sql, batch)
+            return
+
+        with closing(sqlite3.connect(self.storage_path)) as own_conn, own_conn:
+            own_conn.executemany(sql, batch)
+
+    def checkpoint(self) -> None:
+        """Fold the write-ahead log back into the main database file.
+
+        The store runs in WAL mode, so recent writes live in a ``-wal`` sidecar
+        until a checkpoint. Anything that copies ``storage_path`` as a single
+        file — the Apple export does — silently ships a stale database unless
+        the WAL has been folded in first (#647).
+
+        SQLite checkpoints automatically when the last connection closes, but
+        that is skipped whenever any other connection is still open, which
+        fails silently. Callers that are about to copy the file should ask for
+        a checkpoint explicitly rather than rely on that.
+        """
+        with closing(sqlite3.connect(self.storage_path)) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _clear_data(self) -> None:
         """Clear all exported data (for full resync)."""
-        with sqlite3.connect(self.storage_path) as conn:
+        with closing(sqlite3.connect(self.storage_path)) as conn, conn:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM sync_state")
         logger.info("Cleared iMessage export data for full resync")

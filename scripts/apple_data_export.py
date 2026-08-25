@@ -403,8 +403,8 @@ def export_imessage(dry_run: bool = False) -> dict:
     except FileNotFoundError:
         logger.warning("Apple Messages database not found — skipping iMessage export")
         return {"status": "skipped", "reason": "Messages.db not found"}
-    except PermissionError:
-        logger.warning("Cannot access Messages.db — grant Full Disk Access to Terminal")
+    except PermissionError as e:
+        logger.warning(f"Cannot access Messages.db — grant Full Disk Access to Terminal: {e}")
         return {"status": "skipped", "reason": "Full Disk Access required"}
 
     if not imessage_db.exists():
@@ -414,6 +414,10 @@ def export_imessage(dry_run: bool = False) -> dict:
     if dry_run:
         size_mb = imessage_db.stat().st_size / (1024 * 1024)
         return {"status": "dry_run", "size_mb": round(size_mb, 1)}
+
+    # Fold the WAL into the main file first — copy2 takes only imessage.db, so
+    # anything still sitting in imessage.db-wal would be dropped from the copy.
+    store.checkpoint()
 
     # Copy the database file (it's already in portable SQLite format)
     out_path = EXPORT_DIR / "imessage.db"
