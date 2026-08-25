@@ -65,10 +65,34 @@ PRICING: dict[str, dict[str, float]] = {
     # $1.00/$5.00 per Mtok (Haiku 4.5's actual published rate). Was
     # incorrectly 0.8e-6/4.0e-6 (Haiku 3.5's retired rate) until #656.
     "claude-haiku-4-5":  {"input":  1.0e-6, "output":  5.0e-6},
+    # Retired tiers, still served on Bedrock/Vertex and still named by
+    # historical usage rows -- absent until #669, which meant a row
+    # referencing one of these resolved to fallback_rates() and *understated*
+    # the Opus pair (fallback is $10/$50; these are the pricier $15/$75).
+    # $15/$75 per Mtok, per https://platform.claude.com/docs/en/about-claude/pricing
+    # (verified 2026-08-24).
+    "claude-opus-4-1":   {"input": 15.0e-6, "output": 75.0e-6},
+    "claude-opus-4":     {"input": 15.0e-6, "output": 75.0e-6},
+    # $0.80/$4.00 per Mtok -- Haiku 3.5's actual (retired) rate, same figure
+    # claude-haiku-4-5 was incorrectly assigned until #656.
+    "claude-haiku-3-5":  {"input":  0.8e-6, "output":  4.0e-6},
 
     # Local backend (llama-server) — compute is free.
     "local":             {"input": 0.0,     "output": 0.0},
 }
+
+# Ids Anthropic has retired from the first-party API (still served on Bedrock /
+# Vertex, still named by historical usage rows). They stay in PRICING so those
+# rows price correctly, but they are excluded from fallback_rates(): the ceiling
+# for an *unrecognized* model must be the priciest tier still being served, not
+# a retired one. Without this, adding Opus 4/4.1 ($15/$75 — pricier than any
+# current tier) silently raised every unknown-model estimate by 50% (#669).
+RETIRED_MODELS: frozenset[str] = frozenset({
+    "claude-opus-4-1",
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-haiku-3-5",
+})
 
 # Matches a trailing dated-snapshot suffix on an Anthropic model id, e.g.
 # "claude-sonnet-4-5-20250929" -> "claude-sonnet-4-5". Real usage rows
@@ -104,14 +128,18 @@ def is_known_model(model: str) -> bool:
 
 
 def fallback_rates() -> dict[str, float]:
-    """Rates for an unrecognized model id: the priciest tier in PRICING.
+    """Rates for an unrecognized model id: the priciest *currently-served* tier.
 
     Computed from the table rather than naming a specific model id, so this
     doesn't itself go stale the next time a new top-tier model ships (as
     happened across Opus 4.6/4.7/4.8 before #655).
     """
     return max(
-        (rates for name, rates in PRICING.items() if name != "local"),
+        (
+            rates
+            for name, rates in PRICING.items()
+            if name != "local" and name not in RETIRED_MODELS
+        ),
         key=lambda rates: rates["output"],
     )
 

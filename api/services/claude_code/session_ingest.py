@@ -149,6 +149,11 @@ class SessionMeta:
     total_cache_creation_tokens: int = 0
     total_cache_read_tokens: int = 0
     total_dollars: float = 0.0
+    # True once any assistant turn in this session priced against an
+    # unrecognized model (pricing.is_known_model() == False) -- see
+    # `_cost_from_usage` (#669). Sticky for the session: distinguishes a
+    # genuine $0.00 from "some turns couldn't be priced".
+    unpriced: bool = False
     tool_call_count: int = 0
     error_count: int = 0
     last_event_kind: str = ""
@@ -384,7 +389,7 @@ def _truncate(s: str, cap: int = _PAYLOAD_PREVIEW_MAX) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _cost_from_usage(usage: dict[str, Any], model: str) -> float:
+def _cost_from_usage(usage: dict[str, Any], model: str) -> tuple[float, bool]:
     """Apply pricing.py to a single message's `usage` block.
 
     Sums all four Anthropic token buckets — uncached input, output,
@@ -393,20 +398,32 @@ def _cost_from_usage(usage: dict[str, Any], model: str) -> float:
     cache-aware pricing in `pricing.cost_for`. This keeps API spend
     numbers apples-to-apples across LifeOS agent and Claude Code
     sources.
+
+    Returns `(cost, unpriced)`. This is a **record** path -- it prices
+    whatever real historical model id Claude Code reports, which makes it
+    the call site most likely to meet a genuinely new model id first. An
+    unrecognized model is **not** billed at cost_for's conservative
+    fallback rate (right for a budget estimate, wrong for a real spend
+    record): it costs $0.00 and `unpriced=True` is returned instead (#669).
     """
-    from api.services.agent_worker.pricing import cost_for
+    from api.services.agent_worker.pricing import cost_for, is_known_model
 
     in_tok = int(usage.get(_USAGE_INPUT, 0) or 0)
     out_tok = int(usage.get(_USAGE_OUTPUT, 0) or 0)
     cache_creation = int(usage.get(_USAGE_CACHE_CREATION, 0) or 0)
     cache_read = int(usage.get(_USAGE_CACHE_READ, 0) or 0)
     use_model = model or "claude-sonnet-5"  # safer default than the Opus fallback
-    return cost_for(
-        use_model,
-        in_tok,
-        out_tok,
-        cache_creation_tokens=cache_creation,
-        cache_read_tokens=cache_read,
+    if not is_known_model(use_model):
+        return 0.0, True
+    return (
+        cost_for(
+            use_model,
+            in_tok,
+            out_tok,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
+        ),
+        False,
     )
 
 
@@ -451,6 +468,7 @@ def parse_session(
     total_cache_creation = 0
     total_cache_read = 0
     total_dollars = 0.0
+    unpriced = False
     tool_call_count = 0
     error_count = 0
     last_kind = ""
@@ -498,7 +516,9 @@ def parse_session(
             total_out += int(usage.get(_USAGE_OUTPUT, 0) or 0)
             total_cache_creation += int(usage.get(_USAGE_CACHE_CREATION, 0) or 0)
             total_cache_read += int(usage.get(_USAGE_CACHE_READ, 0) or 0)
-            total_dollars += _cost_from_usage(usage, ev_model or model)
+            turn_cost, turn_unpriced = _cost_from_usage(usage, ev_model or model)
+            total_dollars += turn_cost
+            unpriced = unpriced or turn_unpriced
             for tu in payload.get("tool_uses") or []:
                 tool_call_count += 1
                 if tu.get("id"):
@@ -548,6 +568,7 @@ def parse_session(
     meta.total_cache_creation_tokens = total_cache_creation
     meta.total_cache_read_tokens = total_cache_read
     meta.total_dollars = total_dollars
+    meta.unpriced = unpriced
     meta.tool_call_count = tool_call_count
     meta.error_count = error_count
     meta.last_event_kind = last_kind
@@ -745,6 +766,7 @@ def to_session_dict(meta: SessionMeta) -> dict[str, Any]:
         "total_cache_creation_tokens": meta.total_cache_creation_tokens,
         "total_cache_read_tokens": meta.total_cache_read_tokens,
         "total_dollars": round(meta.total_dollars, 6),
+        "unpriced": meta.unpriced,
         "total_active_seconds": 0.0,
         "expected_output": None,
         "label": meta.label,

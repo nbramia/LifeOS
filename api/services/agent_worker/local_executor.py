@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from api.services.agent_worker.delegation import INTER_AGENT_BLOCK
-from api.services.agent_worker.pricing import cost_for
+from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
@@ -583,13 +583,28 @@ class LocalExecutor:
         )
 
     def _record_spend(self, session, response) -> None:
+        """Record real spend for one turn.
+
+        This is a **record** path, not an estimate: an unrecognized model
+        must not be silently billed at cost_for's conservative fallback
+        rate (that's the right call for a *budget* estimate, wrong here) --
+        it's recorded as $0 and the session is flagged `unpriced` instead
+        (#669).
+        """
         usage = getattr(response, "usage", None)
         if not usage:
             return
         tokens_in = getattr(usage, "input_tokens", 0)
         tokens_out = getattr(usage, "output_tokens", 0)
-        dollars = cost_for(self.model_name, tokens_in, tokens_out)
-        self.session_store.record_spend(session.task_id, tokens_in, tokens_out, dollars)
+        if is_known_model(self.model_name):
+            dollars = cost_for(self.model_name, tokens_in, tokens_out)
+            unpriced = False
+        else:
+            dollars = 0.0
+            unpriced = True
+        self.session_store.record_spend(
+            session.task_id, tokens_in, tokens_out, dollars, unpriced=unpriced
+        )
 
     # ------------------------------------------------------------------
     # Finalizers

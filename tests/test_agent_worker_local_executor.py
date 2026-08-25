@@ -369,6 +369,54 @@ def test_executor_records_local_spend_is_zero_dollars(tmp_path: Path, fake_sessi
     assert refreshed.total_output_tokens == 567
     # Local model is $0/token — total_dollars stays 0 even with many tokens.
     assert refreshed.total_dollars == pytest.approx(0.0)
+    # "local" is a genuinely free known model, not an unrecognized one.
+    assert refreshed.unpriced is False
+
+
+@pytest.mark.unit
+def test_executor_records_known_model_priced_and_not_unpriced(tmp_path: Path, fake_session):
+    """A recognized model prices real dollars and leaves `unpriced` False —
+    the record path must not regress known-model behavior (#669)."""
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(1000, 500)),
+    ])
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+        llm_client=llm,
+        model_name="claude-haiku-4-5",
+    )
+    executor.execute(session, {"id": "t1", "description": "x"})
+    refreshed = store.get("t1")
+    assert refreshed.total_dollars == pytest.approx(cost_for("claude-haiku-4-5", 1000, 500))
+    assert refreshed.unpriced is False
+
+
+@pytest.mark.unit
+def test_executor_records_unknown_model_as_unpriced_not_fallback_rate(tmp_path: Path, fake_session):
+    """This is a **record** path (#669): an unrecognized model must not be
+    silently billed at cost_for's conservative fallback (priciest) rate —
+    it must record $0.00 and flag the session `unpriced` instead."""
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(text="done.", usage=_FakeUsage(1000, 500)),
+    ])
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+        llm_client=llm,
+        model_name="typoed-model",
+    )
+    assert is_known_model("typoed-model") is False
+    executor.execute(session, {"id": "t1", "description": "x"})
+    refreshed = store.get("t1")
+    assert refreshed.total_input_tokens == 1000
+    assert refreshed.total_output_tokens == 500
+    assert refreshed.total_dollars == pytest.approx(0.0)
+    assert refreshed.unpriced is True
 
 
 @pytest.mark.unit
@@ -485,13 +533,32 @@ def test_pricing_unknown_model_falls_through_to_priciest_rate():
 def test_pricing_fallback_does_not_hardcode_a_specific_model_id():
     """The unknown-model fallback must track whichever tier is priciest,
     not a specific superseded id (#655) — so it can't itself go stale the
-    next time a new top-tier model ships."""
-    from api.services.agent_worker.pricing import PRICING, fallback_rates
+    next time a new top-tier model ships.
 
-    priciest_output_rate = max(
-        rates["output"] for name, rates in PRICING.items() if name != "local"
+    #669 narrowed the set it maxes over to models Anthropic still serves
+    (see RETIRED_MODELS); the original guard — computed, never a hardcoded
+    id — is unchanged, and a newly-added top tier is still picked up
+    automatically, which is what this test exists to protect.
+    """
+    from api.services.agent_worker.pricing import (
+        PRICING, RETIRED_MODELS, fallback_rates,
     )
-    assert fallback_rates()["output"] == pytest.approx(priciest_output_rate)
+
+    priciest_served_rate = max(
+        rates["output"]
+        for name, rates in PRICING.items()
+        if name != "local" and name not in RETIRED_MODELS
+    )
+    assert fallback_rates()["output"] == pytest.approx(priciest_served_rate)
+
+    # Still dynamic: a hypothetical new top tier would take over the ceiling
+    # without any code change.
+    hypothetical = {"input": 99.0e-6, "output": 999.0e-6}
+    PRICING["zz-hypothetical-top-tier"] = hypothetical
+    try:
+        assert fallback_rates() == hypothetical
+    finally:
+        del PRICING["zz-hypothetical-top-tier"]
 
 
 @pytest.mark.unit
@@ -559,6 +626,46 @@ def test_pricing_cache_buckets_default_to_zero():
         "claude-haiku-4-5", 1000, 500, cache_creation_tokens=0, cache_read_tokens=0,
     )
     assert cost == pytest.approx(expected_two_arg)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("model,input_rate,output_rate", [
+    ("claude-opus-4-1", 15.0e-6, 75.0e-6),
+    ("claude-opus-4", 15.0e-6, 75.0e-6),
+    ("claude-haiku-3-5", 0.8e-6, 4.0e-6),
+])
+def test_retired_model_pricing_added_by_669(model, input_rate, output_rate):
+    """Before #669, these retired-but-still-served ids had no PRICING entry
+    and silently fell through to fallback_rates() (the $10/$50 tier) —
+    which *understated* the Opus pair's real $15/$75 rate."""
+    assert is_known_model(model) is True
+    # 1M input + 1M output tokens, so the dollar total is the per-Mtok pair.
+    assert cost_for(model, 1_000_000, 1_000_000) == pytest.approx(
+        (input_rate + output_rate) * 1_000_000
+    )
+
+
+@pytest.mark.unit
+def test_retired_models_do_not_raise_the_unknown_model_ceiling():
+    """Retired ids are priced for historical rows but must never win
+    fallback_rates(). Opus 4/4.1 are $15/$75 — pricier than any tier
+    Anthropic still serves — so including them would silently inflate every
+    unknown-model *estimate* by 50% (found while implementing #669)."""
+    from api.services.agent_worker.pricing import (
+        PRICING, RETIRED_MODELS, fallback_rates,
+    )
+
+    assert "claude-opus-4-1" in RETIRED_MODELS
+    # The ceiling is the priciest still-served tier, not the priciest row.
+    assert fallback_rates() == PRICING["claude-fable-5"]
+    priciest_row = max(
+        (r for n, r in PRICING.items() if n != "local"),
+        key=lambda r: r["output"],
+    )
+    assert priciest_row["output"] > fallback_rates()["output"]
+    # ...and every retired id still prices from its own real rate.
+    for name in RETIRED_MODELS:
+        assert PRICING[name] != fallback_rates() or name == "claude-fable-5"
 
 
 # ---------------------------------------------------------------------------

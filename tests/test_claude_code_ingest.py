@@ -269,6 +269,87 @@ def test_parse_session_sums_tokens_and_cost(tmp_path: Path):
     #      = 0.00015 + 0.000375 + 0.00015 = 0.000675
     # Total: 0.002775
     assert meta.total_dollars == pytest.approx(0.002775, rel=1e-3)
+    assert meta.unpriced is False
+
+
+@pytest.mark.unit
+def test_parse_session_unknown_model_marks_unpriced_not_fallback_rate(tmp_path: Path):
+    """This ingest path costs whatever model string Claude Code reports, so
+    it's the call site most likely to meet a genuinely new/unrecognized
+    model id first. A **record** path must not invent a number for it —
+    it should cost $0.00 and flag the session `unpriced` (#669), unlike a
+    budget-estimate path which is allowed to fall back to the priciest
+    known tier."""
+    proj = tmp_path / "-home-syn-Code-B"
+    path = proj / "s-unknown.jsonl"
+    _write_jsonl(path, [
+        _assistant_event(
+            model="claude-opus-99-typo",
+            usage={"input_tokens": 100, "output_tokens": 50,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        ),
+    ])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    assert meta.total_input_tokens == 100
+    assert meta.total_output_tokens == 50
+    assert meta.total_dollars == pytest.approx(0.0)
+    assert meta.unpriced is True
+
+    d = cc.to_session_dict(meta)
+    assert d["unpriced"] is True
+    assert d["total_dollars"] == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+def test_parse_session_mixed_known_and_unknown_models_flags_unpriced(tmp_path: Path):
+    """One unpriced turn is enough to flag the whole session, even when a
+    later turn in the same session prices a known model — the reader needs
+    to know the total is a lower bound, not just the last event."""
+    proj = tmp_path / "-home-syn-Code-C"
+    path = proj / "s-mixed.jsonl"
+    _write_jsonl(path, [
+        _assistant_event(
+            model="claude-opus-99-typo",
+            usage={"input_tokens": 100, "output_tokens": 50,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        ),
+        _assistant_event(
+            model="claude-sonnet-4-6",
+            usage={"input_tokens": 100, "output_tokens": 50,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        ),
+    ])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    # First turn priced $0.00 (unknown); second turn priced for real.
+    assert meta.total_dollars == pytest.approx(100 * 3.0e-6 + 50 * 15.0e-6)
+    assert meta.unpriced is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("model,input_rate,output_rate", [
+    ("claude-opus-4-1", 15.0e-6, 75.0e-6),
+    ("claude-opus-4", 15.0e-6, 75.0e-6),
+    ("claude-haiku-3-5", 0.8e-6, 4.0e-6),
+])
+def test_retired_models_price_correctly_not_fallback(tmp_path: Path, model, input_rate, output_rate):
+    """The three retired-but-still-served models added in #669 must price
+    at their real (higher) rate, not silently understate via the $10/$50
+    fallback (which is cheaper than the Opus pair's real $15/$75)."""
+    proj = tmp_path / "-home-syn-Code-D"
+    path = proj / f"s-{model}.jsonl"
+    _write_jsonl(path, [
+        _assistant_event(
+            model=model,
+            usage={"input_tokens": 1000, "output_tokens": 1000,
+                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        ),
+    ])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    assert meta.total_dollars == pytest.approx(1000 * input_rate + 1000 * output_rate)
+    assert meta.unpriced is False
 
 
 # ---------------------------------------------------------------------------

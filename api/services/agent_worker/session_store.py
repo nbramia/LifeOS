@@ -105,6 +105,14 @@ class Session:
     # worker routes [NOTIFY]/[CLARIFY]/completion notices back to that bot, not
     # the primary. See api/services/telegram.py and config/telegram_bots.json.
     bot: str | None = None
+    # True once any `record_spend` call for this session priced a turn from
+    # an unrecognized model (pricing.is_known_model() == False). Sticky for
+    # the life of the session -- unlike total_dollars, which only ever
+    # accrues real priced spend, this flag exists so a reader can tell
+    # "$0.00 total" apart from "some turns couldn't be priced" (#669, same
+    # motivation as usage_store's per-row `unpriced` column from #613/#661,
+    # adapted here to an accumulating total rather than one row per turn).
+    unpriced: bool = False
 
 
 _SCHEMA = """
@@ -132,7 +140,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     origin                    TEXT,  -- NULL/"agent" = #agent task; "operator" = root-spawned (#235)
     claude_code_session_id    TEXT,  -- Claude Code (or Codex) CLI session UUID for routing="claude_code"/"codex"
     claude_code_model         TEXT,  -- Claude tier for routing="claude_code" (haiku/sonnet/opus); NULL = CLI default (opus)
-    bot                       TEXT   -- Telegram bot that owns this session's notices; NULL = primary (#348)
+    bot                       TEXT,  -- Telegram bot that owns this session's notices; NULL = primary (#348)
+    unpriced                  INTEGER NOT NULL DEFAULT 0  -- sticky: any record_spend call priced an unknown model (#669)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -350,6 +359,13 @@ class SessionStore:
             # Old rows stay NULL → the CLI default ("opus").
             if "claude_code_model" not in sess_cols:
                 conn.execute("ALTER TABLE sessions ADD COLUMN claude_code_model TEXT")
+            # Idempotent migration for the sticky `unpriced` flag (#669). Old
+            # rows default to 0 (not retroactively flagged) -- a pre-existing
+            # row's cost is what it is; we don't reclassify history.
+            if "unpriced" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN unpriced INTEGER NOT NULL DEFAULT 0"
+                )
             # Migrate legacy routing tag: 'code' was the pre-rename name for
             # what is now 'claude_code'. Idempotent — only flips rows that
             # still carry the old value.
@@ -562,12 +578,22 @@ class SessionStore:
         dollars: float,
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
+        unpriced: bool = False,
     ) -> None:
         """Add to a session's cumulative token + dollar counters.
 
         Cache buckets default to zero so the local executor (which only
         sees plain input/output) doesn't need to update; managed sessions
         always pass all four buckets.
+
+        `unpriced` (#669) marks that `dollars` for this call came from an
+        unrecognized model rather than a real rate -- a **record** caller
+        (the local executor, Claude Code ingest) should pass `dollars=0.0`
+        and `unpriced=True` in that case rather than inventing a number. An
+        **estimate** caller (the managed-executor budget-kill check) should
+        keep passing a fallback-rate `dollars` and leave `unpriced` False --
+        that conservative estimate is intentional, not a bug. Sticky: once
+        True for a session, later priced calls don't clear it.
         """
         with self._connect() as conn:
             conn.execute(
@@ -578,6 +604,7 @@ class SessionStore:
                     total_cache_creation_tokens = total_cache_creation_tokens + ?,
                     total_cache_read_tokens     = total_cache_read_tokens     + ?,
                     total_dollars               = total_dollars               + ?,
+                    unpriced                    = unpriced OR ?,
                     last_activity_at            = ?
                 WHERE task_id = ?
                 """,
@@ -587,6 +614,7 @@ class SessionStore:
                     cache_creation_tokens,
                     cache_read_tokens,
                     dollars,
+                    int(unpriced),
                     _now(),
                     task_id,
                 ),
@@ -1395,4 +1423,5 @@ class SessionStore:
                 row["claude_code_model"] if "claude_code_model" in row.keys() else None
             ),
             bot=(row["bot"] if "bot" in row.keys() else None),
+            unpriced=(bool(row["unpriced"]) if "unpriced" in row.keys() else False),
         )
