@@ -1,12 +1,12 @@
 # Doctor Bot — Self-Repair Surface
 
 **Status:** Complete
-**Last Updated:** 2026-08-18
+**Last Updated:** 2026-08-25
 **Audience:** Operator
 
 The **doctor** bot's only job is fixing LifeOS itself. You message it when you notice LifeOS misbehaving or missing something; it converses with you to define the **goal**, locks that goal, then — on your approval — orchestrates the work end to end and reports back. It is a **goal-first orchestrator**: it supervises the implementation (subagents do the coding via `/implement`) rather than hand-coding inline, and every change lands through a reviewed, tested PR — never a direct push to `main`.
 
-Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orchestrates**: each message drives a real Claude Code session, and that session's progress, questions, and completion all come back to you.
+Unlike the `fitness` and `therapist` bots (pure chat surfaces), the doctor **orchestrates**: it supervises a real Claude Code session, and that session's progress, questions, and completion all come back to you. Since #684, a message to the Telegram bot answers through **Hermes** by default, which drives that supervision conversationally (via `lifeos_agent_spawn`) rather than spawning a session directly the moment you send a message — see the transport note under Setup below. The clarify → goal → execute → confirm contract below is the same either way.
 
 ## Surfaces
 
@@ -39,6 +39,8 @@ This is the operator's-eye summary; the exact contract the session runs lives in
    - **`gh`** authenticated (`gh auth login`) so it can file issues and open/merge PRs.
    - The **agent worker** running (`lifeos-agent-worker`) — it runs the doctor's Claude Code sessions.
 4. **Restart** to pick up the new bot: `./scripts/server.sh restart`.
+
+**Transport (#684).** By default the doctor Telegram bot's turns answer through the Hermes text backend (`LIFEOS_HERMES_BACKEND_URL`) — see [client-surfaces.md](../specs/technical/client-surfaces.md#telegram-bot-backends-684). If Hermes is unset or unreachable for a turn, the bot falls back to the native pipeline (a genuine Claude Code spawn, same as before #684) and says so in-channel, once. Neither path needs anything extra from you here — this only matters if you're debugging why a repair session is or isn't conversational.
 
 ## Autonomy and safety
 

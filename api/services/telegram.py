@@ -331,18 +331,56 @@ async def send_message_async(text: str, chat_id: str = None, bot: str = None) ->
 
 
 # ---------------------------------------------------------------------------
-# Internal chat client (consumes SSE from /api/ask/stream)
+# Internal chat client (consumes SSE from /api/ask/stream or the Hermes proxy)
 # ---------------------------------------------------------------------------
 
-async def chat_via_api(question: str, conversation_id: str = None, persona: str = None) -> dict:
+class HermesUnavailable(RuntimeError):
+    """Raised by chat_via_api() for a ``backend="hermes"`` call that couldn't
+    reach ``/api/hermes/ask/stream`` — a 503 (Hermes unconfigured) or a 502
+    (configured but unreachable), the two statuses `api/routes/_proxy.py`'s
+    router returns BEFORE any turn-visible side effect (e.g. #685's journal
+    capture, via `pre_send`) can have run — see that router's docstring on
+    hook ordering. Callers (the Telegram listener, #684) catch this and retry
+    the same turn on backend="lifeos", disclosing the degradation once rather
+    than failing the turn or silently degrading. Never raised once a side
+    effect could already have landed: a journal turn that fails *after*
+    capture succeeds surfaces as an in-stream `error` event instead (folded
+    into `answer` below), specifically so a caller here never retries a turn
+    whose fragment is already on disk.
     """
-    Run a question through the full LifeOS chat pipeline (non-streaming).
 
-    POSTs to the local /api/ask/stream endpoint and collects SSE events.
+
+async def chat_via_api(
+    question: str,
+    conversation_id: str = None,
+    persona: str = None,
+    persona_id: str = None,
+    backend: str = "lifeos",
+) -> dict:
+    """
+    Run a question through the LifeOS chat pipeline (non-streaming).
+
+    POSTs to the local /api/ask/stream endpoint (backend="lifeos", the
+    default) or the Hermes proxy at /api/hermes/ask/stream (backend="hermes",
+    #684) and collects SSE events — both speak the identical event
+    vocabulary, except the Hermes path never emits `claude_intent` and only
+    ever emits `journal_capture` on a journal-persona turn (same as native).
 
     Args:
         persona: Optional per-bot system-prompt preamble (e.g. the fitness bot),
             forwarded to the orchestrator so its replies are domain-primed.
+            This is the primary bot's shape only (#684) — every other caller
+            uses `persona_id` instead, since server-side persona resolution
+            keyed by id is what makes the Hermes envelope, journal-capture
+            gate, and orchestrating-persona spawn all resolve correctly.
+            Mutually exclusive with `persona_id` (the target endpoint 400s if
+            both are sent).
+        persona_id: Registered persona id (Telegram bot name) to resolve
+            server-side, on either backend.
+        backend: "lifeos" (default, byte-identical to before #684) targets
+            the native pipeline; "hermes" targets the Hermes proxy and raises
+            `HermesUnavailable` on a 502/503 response so the caller can retry
+            on "lifeos" for this turn.
 
     Returns:
         {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None,
@@ -358,6 +396,10 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
         body["conversation_id"] = conversation_id
     if persona:
         body["persona"] = persona
+    if persona_id:
+        body["persona_id"] = persona_id
+
+    path = "/api/hermes/ask/stream" if backend == "hermes" else "/api/ask/stream"
 
     full_text = ""
     conv_id = conversation_id
@@ -372,11 +414,15 @@ async def chat_via_api(question: str, conversation_id: str = None, persona: str 
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
-            f"http://localhost:{port}/api/ask/stream",
+            f"http://localhost:{port}{path}",
             json=body,
         ) as resp:
             if resp.status_code != 200:
                 error_body = await resp.aread()
+                if backend == "hermes" and resp.status_code in (502, 503):
+                    raise HermesUnavailable(
+                        f"Hermes backend returned HTTP {resp.status_code}: {error_body[:500]}"
+                    )
                 raise RuntimeError(f"Chat pipeline returned HTTP {resp.status_code}: {error_body[:500]}")
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
@@ -534,6 +580,11 @@ class TelegramBotListener:
         self._last_result: dict | None = None  # Last chat result for /inspect
         self._last_update_id = self._load_last_update_id()
         self._processed_ids: deque[int] = deque(maxlen=self._DEDUP_WINDOW)
+        # #684: whether this bot has already disclosed, in-channel, that it's
+        # answering via the native pipeline because Hermes is unconfigured or
+        # unreachable. Set once per listener lifetime so the disclosure is a
+        # single notice, not per-message spam — see _disclose_hermes_fallback.
+        self._hermes_fallback_notified = False
 
     def _load_last_update_id(self) -> int:
         """Load persisted update_id from disk, or 0 if unavailable."""
@@ -720,104 +771,138 @@ class TelegramBotListener:
             chat_id=chat_id,
         )
 
-    async def _handle_orchestration_message(self, text: str, chat_id: str):
-        """Spawn a Claude Code session for an orchestration bot (e.g. doctor).
+    async def _run_chat_turn(self, text: str, chat_id: str, conv_id: Optional[str]) -> Optional[dict]:
+        """Run one chat turn for this bot, routing to its configured backend.
 
-        The bot's persona is the orchestration contract; the user's message is
-        the problem report. The session is tagged with this bot's name so the
-        worker routes every [NOTIFY]/[CLARIFY]/completion notice back to this
-        bot, and a threaded reply (handled by the resume hook) continues it.
-        Working dir is the canonical LifeOS checkout, not whatever worktree the
-        operator happens to be in.
+        The primary bot is untouched by #684: it always calls the native
+        pipeline with its raw persona preamble, exactly as before. Every
+        specialized bot (fitness/therapist/doctor/finance/journal) resolves
+        its persona server-side via `persona_id` instead of a raw preamble —
+        that's what lets the Hermes envelope, the journal-capture gate, and
+        the persona_id-gated orchestrating-persona spawn (`api/routes/chat.py`)
+        all key off the right persona, on either backend (see chat_via_api()'s
+        docstring).
+
+        A `backend="hermes"` bot whose Hermes call raises `HermesUnavailable`
+        (unconfigured, or configured but unreachable — never once a
+        turn-visible side effect could have already happened, see that
+        exception's docstring) falls back to `_native_turn()` for this turn
+        and discloses the degradation once per listener lifetime (#684) —
+        never silently.
+
+        Returns `None` when the turn was already fully handled without ever
+        reaching a chat backend (see `_native_turn()`'s #453 guard) — the
+        caller must not send another reply for it.
         """
-        import os
-        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
-        from api.services.agent_worker.session_store import SessionStore
+        if self._is_primary:
+            return await chat_via_api(text, conversation_id=conv_id, persona=self._persona)
+        if self._bot.backend != "hermes":
+            return await self._native_turn(text, chat_id, conv_id)
+        if not settings.hermes_backend_url:
+            logger.info(
+                f"bot '{self._bot.name}': Hermes not configured, answering via the native pipeline"
+            )
+            await self._disclose_hermes_fallback(chat_id)
+            return await self._native_turn(text, chat_id, conv_id)
+        try:
+            return await chat_via_api(
+                text, conversation_id=conv_id, persona_id=self._bot.name, backend="hermes",
+            )
+        except HermesUnavailable as exc:
+            logger.warning(
+                f"bot '{self._bot.name}': Hermes unreachable ({exc}), "
+                "falling back to the native pipeline for this turn"
+            )
+            await self._disclose_hermes_fallback(chat_id)
+            return await self._native_turn(text, chat_id, conv_id)
 
-        # A short bare affirmative ("yes", "approved", "go ahead") is never a
-        # problem report — it's almost certainly a mis-threaded approval of a
-        # pending goal (#453: each such plain message used to spawn a fresh
-        # context-free session). Route it to the most recent open goal gate on
-        # this bot instead; only genuinely unmatched text falls through to a
-        # spawn. The length bound keeps real reports that merely START with
-        # "yes ..." ("yes the calendar tool is broken again") spawning normally.
-        stripped = text.strip()
-        if len(stripped) <= 25:
-            from api.services.agent_worker.worker import _is_affirmative
-            if _is_affirmative(stripped):
-                try:
-                    gate = SessionStore().get_latest_open_question(
-                        bot=self._bot.name, kind="goal_approval",
-                    )
-                except Exception as exc:
-                    logger.warning(f"goal-gate lookup failed: {exc}")
-                    gate = None
-                if gate and await self._maybe_handle_claude_code_reply(
-                    int(gate["sent_message_id"]), stripped, chat_id,
-                ):
-                    return
-                if not gate:
-                    await send_message_async(
-                        f'I got "{stripped}" but there\'s nothing here waiting '
-                        "for an approval — no session was started. If you meant "
-                        "to answer an earlier message, use Telegram's Reply on "
-                        "it; otherwise describe the problem you want me to fix.",
-                        chat_id=chat_id,
-                    )
-                    return
+    async def _native_turn(self, text: str, chat_id: str, conv_id: Optional[str]) -> Optional[dict]:
+        """Dispatch this specialized bot's turn to the native pipeline via
+        `persona_id` (configured backend="lifeos", Hermes unconfigured, or a
+        mid-conversation Hermes fallback — every native dispatch for a
+        specialized bot goes through here).
 
-        working_dir = os.path.expanduser(os.path.join(str(settings.code_dir), "LifeOS"))
-        prompt = (
-            f"{self._persona}\n\n"
-            f"---\n\n"
-            f"The user just sent this report via the {self._bot.name} bot:\n\n{text}"
+        #453 guard, re-pinned for #684 (adversarial review): the native
+        pipeline's persona_id-gated orchestrating-persona spawn
+        (`api/routes/chat.py`) fires unconditionally for ANY message once
+        `persona_id` names an orchestrating bot — including a bare "yes" or
+        "approved" reply that's actually a mis-threaded approval of a pending
+        goal, not a fresh problem report (the exact "yes/approved orphan
+        factory" #453 fixed). `_handle_orchestration_message` used to guard
+        this before #684 retired it; that guard was safe to drop only for the
+        Hermes path, where spawning is the model's own deliberate tool call,
+        never an unconditional per-message action — it is NOT safe to drop
+        here, since a native turn for an orchestrating bot still reaches that
+        same unconditional spawn gate. So the guard is re-applied at the one
+        remaining place it's structurally needed.
+        """
+        if self._bot.orchestrates and await self._maybe_consume_bare_affirmative(text, chat_id):
+            return None
+        return await chat_via_api(
+            text, conversation_id=conv_id, persona_id=self._bot.name, backend="lifeos",
         )
-        # Send the ack with id capture so it can be registered as a reply
-        # anchor once the spawn returns a session id — replying to "On it"
-        # then routes into the session like any other thread message (#458).
-        from api.services.agent_worker.worker import _with_reply_footer
-        ack_ids = []
+
+    async def _maybe_consume_bare_affirmative(self, text: str, chat_id: str) -> bool:
+        """Route a short bare affirmative ("yes", "approved", "go ahead") to
+        the most recent open goal-approval gate on this bot, instead of
+        letting it reach the native persona_id-gated spawn as a fresh "report"
+        (see `_native_turn`'s #453 guard above).
+
+        Mirrors the bare-affirmative branch `_handle_orchestration_message`
+        used to run before #684 retired that method. Returns True when the
+        message was fully handled here (routed to an open gate, or acked with
+        a "nothing waiting" notice) — the caller must not dispatch it to a
+        chat backend. Returns False for a genuine report (too long, not
+        affirmative, or a gate was found but couldn't be resumed — e.g. a
+        race with it being answered elsewhere), which proceeds normally.
+        """
+        stripped = text.strip()
+        if len(stripped) > 25:
+            return False
+        from api.services.agent_worker.worker import _is_affirmative
+        if not _is_affirmative(stripped):
+            return False
+        from api.services.agent_worker.session_store import SessionStore
         try:
-            ack_ids = send_message_capture_ids(
-                _with_reply_footer("🩺 On it — taking a look now. I'll follow up here as I go."),
-                chat_id,
-            ) or []
-        except Exception as exc:
-            logger.warning(f"orchestration ack send failed: {exc}")
-        if not ack_ids:
-            await send_message_async(
-                "🩺 On it — taking a look now. I'll follow up here as I go.",
-                chat_id=chat_id,
-            )
-        store = SessionStore()
-        try:
-            result = await asyncio.to_thread(
-                spawn_claude_code_session,
-                store,
-                prompt,
-                working_dir=working_dir,
-                plan_mode=False,
-                chat_id=chat_id,
-                bot=self._bot.name,
+            gate = SessionStore().get_latest_open_question(
+                bot=self._bot.name, kind="goal_approval",
             )
         except Exception as exc:
-            logger.warning(f"orchestration spawn failed: {exc}")
+            logger.warning(f"goal-gate lookup failed: {exc}")
+            gate = None
+        if gate and await self._maybe_handle_claude_code_reply(
+            int(gate["sent_message_id"]), stripped, chat_id,
+        ):
+            return True
+        if not gate:
             await send_message_async(
-                f"Couldn't start the session: {str(exc)[:200]}", chat_id=chat_id,
+                f'I got "{stripped}" but there\'s nothing here waiting '
+                "for an approval — no session was started. If you meant "
+                "to answer an earlier message, use Telegram's Reply on "
+                "it; otherwise describe the problem you want me to fix.",
+                chat_id=chat_id,
             )
+            return True
+        return False
+
+    async def _disclose_hermes_fallback(self, chat_id: str) -> None:
+        """One-time, per-listener-lifetime in-channel notice that this bot is
+        answering via the native LifeOS pipeline instead of Hermes (#684) —
+        covers both "Hermes was never configured" and "a turn's connection to
+        it failed." Never silent degradation, but never per-message spam
+        either — every occurrence is still logged by the caller above.
+        """
+        if self._hermes_fallback_notified:
             return
-        if ack_ids and result.get("ok") and result.get("session_id"):
-            try:
-                store.add_reply_anchors(
-                    result["session_id"], result.get("task_id") or "",
-                    ack_ids, bot=self._bot.name,
-                )
-            except Exception as exc:
-                logger.warning(f"on-it anchor registration failed: {exc}")
-        if not result.get("ok"):
+        self._hermes_fallback_notified = True
+        try:
             await send_message_async(
-                f"Couldn't start the session: {result.get('error')}", chat_id=chat_id,
+                "⚠️ Hermes isn't reachable right now — answering via the "
+                "native LifeOS pipeline until it's back.",
+                chat_id=chat_id,
             )
+        except Exception as exc:
+            logger.warning(f"hermes-fallback notice failed to send: {exc}")
 
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
@@ -887,13 +972,17 @@ class TelegramBotListener:
         # an implicit follow-up — so unrelated questions never get
         # silently swallowed into a finished agent or /claude thread.
 
-        # Orchestration bots (e.g. doctor) drive a Claude Code session instead
-        # of the chat pipeline. A threaded reply to one of its messages is
-        # already handled above (resume hook); a fresh message starts a new
-        # repair session whose clarify/implement gates round-trip on this bot.
-        if self._bot.orchestrates:
-            await self._handle_orchestration_message(text, chat_id)
-            return
+        # Orchestrating bots (e.g. doctor) used to drive a headless Claude Code
+        # session directly from a fresh message (`_handle_orchestration_message`,
+        # retired by #684). A fresh message now flows through the same chat
+        # pipeline as every other bot below: on the Hermes backend, the doctor
+        # persona supervises its own workers via `lifeos_agent_spawn`
+        # (config/personas/doctor.hermes.md, hermes#62/#642); on a native
+        # fallback, `_run_chat_turn`'s persona_id path still triggers a real
+        # Claude Code spawn via the persona_id-gated orchestration block in
+        # `api/routes/chat.py`, tagged `bot="doctor"` for Telegram parity. A
+        # threaded reply to either kind of spawned session is already handled
+        # above (the resume hook) before this point is ever reached.
 
         # Threaded-reply context: when the user replies to one of the bot's own
         # messages (e.g. correcting a "Logged: …" line, or asking about a bullet
@@ -912,7 +1001,13 @@ class TelegramBotListener:
         try:
             async with TypingIndicator(chat_id):
                 conv_id = self._conversations.get(chat_id)
-                result = await chat_via_api(effective_text, conversation_id=conv_id, persona=self._persona)
+                result = await self._run_chat_turn(effective_text, chat_id, conv_id)
+                if result is None:
+                    # #684/#453: a native-fallback bare affirmative was fully
+                    # handled inside _native_turn (routed to an open goal
+                    # gate, or acked with a "nothing waiting" notice) without
+                    # ever reaching a chat backend — nothing more to send.
+                    return
                 self._conversations[chat_id] = result["conversation_id"]
                 self._last_result = result
 
@@ -921,6 +1016,16 @@ class TelegramBotListener:
             # handoffs spawn background sessions whose follow-ups route to the
             # primary bot, so only the primary honors them. A specialized bot
             # redirects instead of falling through to a possibly-empty answer.
+            # #684: the Hermes backend never emits `claude_intent` (Hermes has
+            # no engine-handoff concept of its own — chat_via_api()'s parsing
+            # loop simply never sets it True), so this whole block is a no-op
+            # for a hermes-backed turn and `result["answer"]` below is used
+            # unconditionally — a bare `.get()` already tolerates that with no
+            # special-casing needed. The accepted, deliberate side effect: the
+            # "code task → main bot" redirect only ever fires on a native-
+            # pipeline turn (the primary bot, or a specialized bot's fallback
+            # turn) — a hermes-backed specialized bot no longer redirects an
+            # inferred code task, since Hermes never tells us it saw one.
             if result.get("claude_intent"):
                 task = result.get("task", text)
                 engine = result.get("engine", "claude_code")

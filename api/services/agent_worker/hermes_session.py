@@ -81,7 +81,7 @@ def _hermes_budget() -> dict:
 
 
 def resolve_hermes_caller_session_id(
-    session_store: SessionStore, conversation_id: str | None,
+    session_store: SessionStore, conversation_id: str | None, bot: str | None = None,
 ) -> str:
     """Return the `caller_session_id` Hermes should use for this turn,
     creating the backing session row on first use.
@@ -90,6 +90,22 @@ def resolve_hermes_caller_session_id(
     turns, resolve to the same session. `conversation_id` of `None` (turn 1
     of a brand-new conversation — see module docstring) always mints a
     fresh, one-off session instead.
+
+    `bot` (#684 review) tags this root session with the persona it was
+    resolved for — the same `bot` a Telegram-spawned session carries (e.g.
+    ``"doctor"``; ``None``/``"primary"`` for the default persona). Without
+    this, every `lifeos_agent_spawn` descendant of a Hermes turn inherited no
+    bot ownership at all: the worker's own status/blocked notices for such a
+    child fall back to the PRIMARY bot (`worker.py`'s `bot = session.bot`,
+    `None` → primary), and a specialized listener's threaded-reply resume —
+    scoped to its own bot (`_owns_agent_sessions`) — can never find the
+    anchor. Passed through from the persona the Hermes proxy already resolved
+    for this turn (`hermes_proxy.py`'s `_resolve_lifeos_context`), so a
+    doctor-persona Hermes conversation's spawned workers route back to the
+    doctor bot exactly like a native-spawned session does. Only applied when
+    creating the row for the first time — an existing conversation's root
+    session keeps whatever bot it was created with, since persona is stable
+    for a conversation's lifetime in practice.
     """
     if not conversation_id:
         session_id = new_session_id()
@@ -109,6 +125,7 @@ def resolve_hermes_caller_session_id(
             budget=_hermes_budget(),
             expected_output="text",
             origin="hermes",
+            bot=bot,
         )
     except sqlite3.IntegrityError:
         # Lost a create race against a concurrent request for the same

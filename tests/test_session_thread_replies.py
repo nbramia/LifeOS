@@ -367,41 +367,19 @@ class TestStatusAnchorReplies:
         assert any(t.endswith(REPLYABLE_FOOTER) for t in sent)
 
 
-class TestOnItAnchor:
-    @pytest.mark.asyncio
-    async def test_on_it_ack_registers_against_spawned_session(self, tmp_path):
-        """Replying to the doctor's "On it" reaches the session it spawned:
-        the ack is sent with id capture and registered as a status anchor once
-        the spawn returns a session id."""
-        from unittest.mock import MagicMock
-        from api.services.telegram import TelegramBotListener
-        from config.settings import TelegramBotConfig
-
-        listener = TelegramBotListener(TelegramBotConfig(
-            name="doctor", token="TOK", chat_id="999", persona="P", orchestrates=True,
-        ))
-        store = SessionStore(db_path=tmp_path / "sessions.db")
-        sent: list[str] = []
-
-        def _capture_ids(text, chat_id=None, bot=None):
-            sent.append(text)
-            return [4242]
-
-        spawn = MagicMock(return_value={
-            "ok": True, "session_id": "sess-onit", "task_id": "t-onit",
-        })
-        with patch("api.services.agent_worker.claude_code_spawn.spawn_claude_code_session", spawn), \
-             patch("api.services.agent_worker.session_store.SessionStore",
-                   return_value=store), \
-             patch("api.services.telegram.send_message_capture_ids",
-                   side_effect=_capture_ids):
-            await listener._handle_orchestration_message("search is broken", "999")
-
-        assert sent and sent[0].endswith(REPLYABLE_FOOTER)
-        assert "On it" in sent[0]
-        q = store.get_open_question_by_message_id(4242, bot="doctor")
-        assert q is not None and q["kind"] == "status_anchor"
-        assert q["session_id"] == "sess-onit"
+# #684 retired `_handle_orchestration_message` (the direct-CC entry doctor
+# used for a FRESH message, including its "On it" ack + reply-anchor
+# registration) in favor of routing fresh messages through the same chat
+# pipeline every other bot uses. The worker-side anchor machinery this test
+# exercised (`send_message_capture_ids` + `add_reply_anchors`) is unaffected
+# and still fully covered elsewhere in this file (e.g.
+# TestReplyAnchorStore, TestFooterAndAnchors) — it's exercised there via a
+# session the worker itself sends status/completion messages for, which is
+# how a Hermes- or native-fallback-spawned doctor session still gets
+# anchored replies once the WORKER (not this retired ack) sends its first
+# operator-facing message. `test_blocked_session_note_rides_the_goal_answer`
+# below is the closest surviving end-to-end case: a spawned doctor session's
+# anchored status message resolves a threaded reply back into it.
 
 
 class TestNoteRidesGateAnswer:
