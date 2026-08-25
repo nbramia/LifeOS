@@ -868,6 +868,17 @@ class Settings(BaseSettings):
                     "elapsed time), so they are bounded by count with "
                     "oldest-first eviction instead of by age."
     )
+    contact_person_min_messages: int = Field(
+        default=5,
+        alias="LIFEOS_CONTACT_PERSON_MIN_MESSAGES",
+        description="Minimum iMessage count on a contact's phone or email "
+                    "handle before scripts/create_contact_persons.py will "
+                    "create a PersonEntity for an otherwise person-less "
+                    "Apple Contacts record (#700). The contact-record "
+                    "requirement already filters the address book down to "
+                    "real people; this just avoids one-off wrong-number "
+                    "artifacts."
+    )
 
     # ==========================================================================
     # WORK INTEGRATION TOGGLES

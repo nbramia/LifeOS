@@ -690,6 +690,7 @@ SYNC_ORDER = [
     "link_slack",               # Link Slack users to people by email
     "imessage",                 # Create interactions from iMessage data (links its own unlinked messages internally)
     "link_imessage",            # Retroactive: backfill phone-based links against latest CRM data (runs after imessage — see depends_on)
+    "create_contact_persons",   # Create people for contacts with iMessage evidence but no person yet (#700)
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
@@ -745,6 +746,7 @@ SYNC_SCRIPTS = {
     # Phase 2: Entity Processing
     "link_slack": ("scripts/link_slack_entities.py", ["--execute"]),
     "link_imessage": ("scripts/link_imessage_entities.py", ["--execute"]),
+    "create_contact_persons": ("scripts/create_contact_persons.py", ["--execute"]),
     "link_source_entities": ("scripts/link_source_entities.py", ["--execute"]),
     "photos": ("scripts/sync_photos.py", ["--execute"]),
 
