@@ -319,16 +319,25 @@ export function initVoice() {
       else stopAllAudio();
     });
   }
+
+  // Text|Voice mode pill (#684) — replaces the old mic/keyboard icon toggle;
+  // mirrors backend.js's explicit-set pattern (each button picks its own
+  // mode) rather than a single toggle button.
+  if (elements.modeTextBtn) elements.modeTextBtn.addEventListener('click', () => setVoiceMode(false));
+  if (elements.modeVoiceBtn) elements.modeVoiceBtn.addEventListener('click', () => setVoiceMode(true));
 }
 
-export function toggleVoiceMode() {
-  config.voiceMode = !isVoiceMode();
-  storeVoiceMode(config.voiceMode);
+export function setVoiceMode(on) {
+  if (on === isVoiceMode()) return;
+  config.voiceMode = on;
+  storeVoiceMode(on);
   applyVoiceMode();
 }
 
 function applyVoiceMode() {
   document.body.classList.toggle('voice-mode', isVoiceMode());
+  if (elements.modeTextBtn) elements.modeTextBtn.classList.toggle('active', !isVoiceMode());
+  if (elements.modeVoiceBtn) elements.modeVoiceBtn.classList.toggle('active', isVoiceMode());
 }
 
 function setTalkActive(on) {

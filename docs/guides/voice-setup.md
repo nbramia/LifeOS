@@ -70,7 +70,7 @@ Restart the API after editing `.env`:
 In voice mode the text composer is replaced by the dock:
 
 - **Tap-to-talk** — the shutter button starts/stops recording; a cancel (`✕`) aborts an in-flight turn.
-- **Keyboard button** (`⌨️`) — swaps back to the text composer (Voice ↔ Text). The mode persists per browser.
+- **Text/Voice pill** — a two-way pill selector at the top of `/chat` (next to the backend selector) swaps between the text composer and the voice dock. The mode persists per browser.
 - Three dock toggles (state saved per browser):
   - **Mute** — suppress spoken playback (the reply still returns as text).
   - **2×** — play spoken replies at double speed.
@@ -110,7 +110,7 @@ On the **Hermes** backend an orchestrating persona's spoken turn never spawns an
 | "Mic blocked — this page is not on HTTPS" | Not on HTTPS. If `TAILNET_HTTPS_URL` is set, the message carries an **Open over HTTPS** link to this same page on that origin — tap it. Otherwise reopen `/chat` on your tailnet HTTPS URL, not `http://` or a LAN IP, and confirm `lifeos-tailscale.service` is active. |
 | "Mic unavailable — …" (no microphone API / no MediaRecorder / no supported audio format) | Not an HTTPS problem: the browser itself lacks a recording capability. Use a current Chrome, Safari, or Firefox; in-app webviews and stripped-down browsers often omit these. |
 | Dock present but turns error immediately | whisper-relay isn't running on `LIFEOS_VOICE_GATEWAY_URL` (default `:9788`). Start the gateway; check `curl http://127.0.0.1:9788` locally. |
-| Voice dock never appears | Voice is opt-in per browser. Toggle to Voice with the mic control, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
+| Voice dock never appears | Voice is opt-in per browser. Tap **Voice** on the Text/Voice pill, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
 | `Hermes` toggle missing | Expected unless `LIFEOS_HERMES_BACKEND_URL` is set. |
 
