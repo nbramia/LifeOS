@@ -1,7 +1,7 @@
 # Launchd Setup — Superseded
 
 **Status:** Superseded
-**Last Updated:** 2026-05-27
+**Last Updated:** 2026-08-25
 **Audience:** Operators
 
 > **This guide is superseded by [ADR-007: Linux Migration](../adr/007-linux-migration.md).**
@@ -9,6 +9,13 @@
 > LifeOS no longer ships a macOS-as-primary-server deployment. The Linux migration (ADR-007) moved the API server, ChromaDB, embedding pipeline, sync, agent worker, and LLM orchestration to a Linux workstation under **systemd** (`./scripts/setup-systemd.sh`).
 >
 > The original content of this guide (`com.lifeos.api`, `com.lifeos.crm-sync`, `com.lifeos.chromadb` launchd plists and the ChromaDB cron watchdog) is preserved in git history if you need it for a legacy Mac Mini deployment.
+
+**If you're setting up LifeOS to run *on* a Mac** (not just for Apple Data
+Agent export), see [Installation § Running LifeOS on macOS as the
+Host](installation.md#running-lifeos-on-macos-as-the-host) for what's
+packaged today (`com.lifeos.api`, `com.lifeos.crm-sync`) versus what's
+Linux-only (crash-restart watchdogs, autodeploy, agent worker, MCP-HTTP) and
+a cron/launchd snippet for nightly sync.
 
 ## If you have a Mac in the system today
 

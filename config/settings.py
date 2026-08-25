@@ -1047,6 +1047,13 @@ class Settings(BaseSettings):
         alias="MONARCH_PASSWORD",
         description="Monarch Money account password"
     )
+    monarch_vault_dir: str = Field(
+        default="Personal/Finance/Monarch",
+        alias="LIFEOS_MONARCH_VAULT_DIR",
+        description="Vault-relative directory where the Monarch Money monthly "
+                    "summary (YYYY-MM.md) lands. Path is joined under "
+                    "LIFEOS_VAULT_PATH, same convention as LIFEOS_AGENT_OUTPUT_DIR."
+    )
 
     # Backup directory
     backup_path: str = Field(

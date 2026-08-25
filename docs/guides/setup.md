@@ -1,7 +1,7 @@
 # LifeOS New Instance Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-08-09
+> **Last Updated:** 2026-08-25
 > **Audience:** New users
 
 Read this top-to-bottom. Execute each step, verify the check, then proceed.
@@ -135,7 +135,7 @@ cp .env.example .env
 - **Monarch Money** — Financial data (account balances, transactions, budgets)
 - **Telegram bot** — Chat interface and push notifications
 - **Slack** — Workspace message sync
-- **WhatsApp** — Chat history sync via `wacli` on a paired Mac Mini (the LifeOS
+- **WhatsApp** — Chat history sync via `wacli` on a paired Apple Data Agent Mac (the LifeOS
   host runs on Linux; wacli is macOS-only). Data is exported into
   `data/apple-imports/whatsapp.json` and rsynced alongside contacts/iMessage.
 - **MCP for Claude Code** — Use LifeOS as a tool from Claude Code/Desktop
@@ -331,7 +331,7 @@ systemctl status lifeos-api lifeos-chromadb
 > **Note:** launchd is macOS-only and superseded by systemd on Linux — see
 > [ADR-007: Linux Migration](../adr/007-linux-migration.md). Use this only on a macOS host.
 
-`setup-launchd.sh` is interactive and takes no arguments — it prompts for the vault path:
+`setup-launchd.sh` accepts an optional `[vault_path] [--yes]` and is interactive when you omit them — it prompts for the vault path:
 
 ```bash
 ./scripts/setup-launchd.sh
@@ -435,11 +435,12 @@ For a **second work account**, repeat with `--account work2`:
 
 ### WhatsApp
 
-WhatsApp sync runs on the Mac Mini side of the Apple Data Agent pipeline —
-the Linux LifeOS host does not touch wacli directly. These steps must be run
-on the Mac Mini that rsyncs `data/apple-imports/` to the Linux server.
+WhatsApp sync runs on the Apple Data Agent side of the pipeline — the Linux
+LifeOS host does not touch wacli directly. These steps must be run on
+whichever Mac plays the Apple Data Agent role (any spare Mac with FDA
+granted works), which rsyncs `data/apple-imports/` to the Linux server.
 
-On the Mac Mini:
+On the Apple Data Agent Mac:
 
 1. Install: `brew install openclaw/tap/wacli` (formerly `steipete/tap/wacli` —
    the tap was renamed; a stale local tap silently disables `brew outdated`,

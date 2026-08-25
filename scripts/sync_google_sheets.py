@@ -38,7 +38,23 @@ def sync_google_sheets(dry_run: bool = True) -> dict:
 
     try:
         results = sync_gsheets()
-        logger.info(f"\n=== Google Sheets Sync Results ===")
+
+        if results.get("status") == "skipped":
+            # No config/gsheet_sync.yaml (or an empty/disabled one) — e.g.
+            # the gsheet-journal Form -> Sheet pipeline was never set up.
+            # Declare the skip so the parent records SKIPPED instead of a
+            # zero-count "success" — same pattern as Photos/Apple Contacts/
+            # Monarch — issue #687.
+            logger.info(f"GSheet sync skipped: {results.get('reason', 'not configured')}")
+            print(
+                "SYNC_SKIPPED: No Google Sheets configured — copy "
+                "config/gsheet_sync.example.yaml to config/gsheet_sync.yaml "
+                "to enable",
+                flush=True,
+            )
+            return results
+
+        logger.info("\n=== Google Sheets Sync Results ===")
         logger.info(f"  Sheets synced: {results.get('synced', 0)}")
         logger.info(f"  Rows processed: {results.get('rows', 0)}")
         return results

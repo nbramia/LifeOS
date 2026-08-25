@@ -427,6 +427,7 @@ Since #592, `restoreBackendConversation()` renders the stored conversation on a 
 
 ### Operational
 - [Voice Setup](../../guides/voice-setup.md) — Operator-facing voice mode setup, including the Hermes/Agent backend contract this doc specifies
+- [Installation](../../guides/installation.md) — Config-only second-user setup checklist that references this doc's Hermes default/fallback contract
 
 ### Code References
 - [Chat route](../../api/routes/chat.py) — SSE emission and handoff handler

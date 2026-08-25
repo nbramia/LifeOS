@@ -77,6 +77,20 @@ def _is_source_disabled(source: str) -> bool:
     if source in ("slack", "link_slack") and not getattr(settings, "sync_slack", False):
         return True
 
+    # Personal Google has no on/off toggle (it's the default account), so
+    # "disabled" means its OAuth credentials file is absent — same signal
+    # run_all_syncs.get_disabled_work_sources() uses to skip the source
+    # before ever invoking the script. Without this, an unconfigured
+    # install would show gmail_personal/calendar_personal as permanently
+    # "never run" in the health summary instead of quietly excluded, since
+    # no sync_runs row is ever written for a source that's pre-skipped —
+    # issue #687.
+    if source in ("gmail_personal", "calendar_personal"):
+        from pathlib import Path
+        credentials_path = Path(__file__).parent.parent.parent / "config" / "credentials-personal.json"
+        if not credentials_path.exists():
+            return True
+
     return False
 
 # =============================================================================

@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-08-19
+**Last Updated:** 2026-08-25
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
@@ -127,6 +127,7 @@ On the **Hermes** backend an orchestrating persona's spoken turn never spawns an
 ### Operational
 - [Configuration](configuration.md) — Environment variable reference
 - [Personas](personas.md) — The persona layer shared by web chat and voice, including per-persona `voice` formatting rules
+- [Installation](installation.md) — Config-only second-user setup checklist that references the Agent/Hermes backend variables documented here
 
 ### Project Context
 - [README](../../README.md) — Architecture overview, including the whisper-relay voice gateway in the service topology
