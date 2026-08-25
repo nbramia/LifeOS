@@ -3,6 +3,7 @@
 **Status:** Complete
 **Last Updated:** 2026-06-22
 **Decision:** Accepted
+**Amended by:** [ADR-021](021-voice-turn-persistence-tee.md)
 
 ## Context
 
