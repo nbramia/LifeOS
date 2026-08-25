@@ -57,6 +57,7 @@ from api.services.sync_health import (
     get_typical_yield,
     get_yield_history,
     get_consecutive_zero_yield_runs,
+    get_repeated_yield_streak,
     get_recent_errors,
     check_sync_health,
     reap_orphan_sync_runs,
@@ -423,6 +424,32 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             src_details = ", ".join(f"{s}: {c}" for s, c in interactions_by_src.items() if c > 0)
             lines.append(f"- Interactions: {interactions_created}" + (f" ({src_details})" if src_details else ""))
 
+    # Repeated-identical-yield sources (#646) — excluded from "New Records"
+    # above because a constant non-zero count across consecutive runs is
+    # evidence of re-importing unchanged upstream data, not real new
+    # records. Called out here so the run isn't just silently under-counted.
+    repeated_yield_sources = result.get("repeated_yield_sources", [])
+    if repeated_yield_sources:
+        lines.append("")
+        lines.append(f"**Possible stale re-import ({len(repeated_yield_sources)}, not counted as new):**")
+        for src in repeated_yield_sources:
+            info = result.get("results", {}).get(src, {}).get("repeated_yield", {})
+            value = info.get("repeated_value")
+            runs = info.get("consecutive_runs")
+            if value is not None and runs is not None:
+                lines.append(f"- {src}: {value:.0f} records, {runs} runs in a row")
+            else:
+                lines.append(f"- {src}")
+
+    # Apple Data Agent SHA drift (#646) — a silently-broken self-update on
+    # the Mac Mini export agent, surfaced here instead of a log line no
+    # batched report reads.
+    apple_agent_sha_drift = result.get("apple_agent_sha_drift")
+    if apple_agent_sha_drift:
+        lines.append("")
+        lines.append("**Apple Data Agent SHA drift:**")
+        lines.append(f"- {apple_agent_sha_drift}")
+
     lines.append("")
     lines.append("---")
 
@@ -448,7 +475,15 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
 
     # Build message
     collapsed_sources = result.get("duration_collapsed_sources", [])
-    status_emoji = "✅" if result["failed"] == 0 and not collapsed_sources and not result.get("investments_stale") else "⚠️"
+    status_emoji = (
+        "✅"
+        if result["failed"] == 0
+        and not collapsed_sources
+        and not result.get("investments_stale")
+        and not result.get("repeated_yield_sources")
+        and not result.get("apple_agent_sha_drift")
+        else "⚠️"
+    )
     lines = [
         f"{status_emoji} *LifeOS Sync Complete*",
         f"Trigger: {trigger}",
@@ -525,6 +560,32 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append("")
         lines.append("⚠️ *Investments snapshot stale:*")
         lines.append(f"  {investments_stale}")
+
+    # Apple Data Agent SHA drift (#646) — surface here so a silently-broken
+    # Mac Mini self-update reaches the operator (the bare log line does not
+    # feed any batched report).
+    apple_agent_sha_drift = result.get("apple_agent_sha_drift")
+    if apple_agent_sha_drift:
+        lines.append("")
+        lines.append("⚠️ *Apple Data Agent SHA drift:*")
+        lines.append(f"  {apple_agent_sha_drift}")
+
+    # Repeated-identical-yield sources (#646) — a constant non-zero count
+    # across consecutive runs is evidence of re-importing unchanged upstream
+    # data, not real new records. Called out explicitly since these counts
+    # are excluded from "New People"/"New Interactions" above.
+    repeated_yield_sources = result.get("repeated_yield_sources", [])
+    if repeated_yield_sources:
+        lines.append("")
+        lines.append(f"*Possible stale re-import ({len(repeated_yield_sources)}, not counted as new):*")
+        for src in repeated_yield_sources:
+            info = result.get("results", {}).get(src, {}).get("repeated_yield", {})
+            value = info.get("repeated_value")
+            runs = info.get("consecutive_runs")
+            if value is not None and runs is not None:
+                lines.append(f"  • {src}: {value:.0f} records, {runs} runs in a row")
+            else:
+                lines.append(f"  • {src}")
 
     try:
         success = send_message("\n".join(lines))
@@ -867,6 +928,40 @@ def _detect_never_yielded(source: str, stats: dict) -> dict | None:
         "runs": history["runs"],
         "avg_duration_seconds": history["avg_duration_seconds"],
     }
+
+
+# Repeated-yield detection (issue #646): a dead export agent that leaves the
+# same stale upstream file in place every night is invisible to yield
+# collapse (yield collapse only fires on *zero* output) — the re-import
+# re-processes byte-identical data and reports an identical non-zero count,
+# night after night. Nathan's post-incident analysis found exactly this: a
+# 10-night streak of "1294 created" / "3302 created" while five Apple
+# sources were frozen, read by the nightly summary as thousands of healthy
+# new records.
+REPEATED_YIELD_MIN_CONSECUTIVE = 3
+
+
+def _detect_repeated_yield(source: str, stats: dict) -> dict | None:
+    """Return info if this run produced the exact same non-zero yield as
+    each of the last few runs — evidence of re-importing an unchanged
+    upstream file and reporting it as new, rather than genuine repetition.
+
+    Never raises — a sync_health DB hiccup must not fail the sync itself.
+    """
+    this_yield = _run_yield(stats)
+    if this_yield <= 0:
+        return None
+    try:
+        # +1 for the run in flight: it isn't recorded yet, so the stored
+        # history is one short of the true streak (mirrors _detect_yield_collapse).
+        streak = get_repeated_yield_streak(source, this_yield) + 1
+    except Exception as e:
+        logger.warning(f"Repeated-yield check failed for {source}: {e}")
+        return None
+
+    if streak < REPEATED_YIELD_MIN_CONSECUTIVE:
+        return None
+    return {"repeated_value": this_yield, "consecutive_runs": streak}
 
 
 # A chronic never-yielded source (link_slack, repoint_stale_ids, google_sheets,
@@ -1310,6 +1405,18 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                             record_sync_error(source, msg, error_type="never_yielded")
                             stats["never_yielded_warned"] = True
 
+                    repeated_yield = _detect_repeated_yield(source, stats)
+                    if repeated_yield:
+                        stats["repeated_yield"] = repeated_yield
+                        msg = (
+                            f"{source} produced the same "
+                            f"{repeated_yield['repeated_value']:.0f} records for "
+                            f"{repeated_yield['consecutive_runs']} runs in a row — "
+                            f"possible re-import of unchanged upstream data reported as new"
+                        )
+                        logger.error(msg)
+                        record_sync_error(source, msg, error_type="repeated_yield")
+
                 if skipped_reason:
                     stats["skipped"] = True
                     stats["skipped_reason"] = skipped_reason
@@ -1684,6 +1791,7 @@ def run_all_syncs(
     duration_collapsed = []  # Sources that "succeeded" suspiciously fast
     yield_collapsed = []  # Normally produce records, produced none this run
     never_yielded_sources = []  # Never produced anything across many runs
+    repeated_yield_sources = []  # Same non-zero count for several runs in a row
     skipped_sources = []  # Exited early because they aren't configured
     start_time = datetime.now()
 
@@ -1856,6 +1964,8 @@ def run_all_syncs(
                     yield_collapsed.append(source)
                 if stats.get("never_yielded_warned"):
                     never_yielded_sources.append(source)
+                if stats.get("repeated_yield"):
+                    repeated_yield_sources.append(source)
 
             # Restart LLM after last embedding phase completes (if we stopped it)
             if source in EMBEDDING_SOURCES and _llm_stopped_for_sync:
@@ -1891,6 +2001,11 @@ def run_all_syncs(
         logger.error(f"Yield collapse (produced nothing, normally do): {', '.join(yield_collapsed)}")
     if never_yielded_sources:
         logger.warning(f"Never produced records: {', '.join(never_yielded_sources)}")
+    if repeated_yield_sources:
+        logger.error(
+            f"Repeated identical yield (possible stale re-import reported as new): "
+            f"{', '.join(repeated_yield_sources)}"
+        )
     logger.info("=" * 60)
 
     # Apply backup retention only now, and only if nothing failed. Tonight's
@@ -1936,6 +2051,23 @@ def run_all_syncs(
     except Exception as e:
         logger.warning(f"Investments freshness check failed: {e}")
 
+    # Apple Data Agent SHA-drift warning (issue #646): the Mac Mini export
+    # agent's self-update (#509) can silently stop working, leaving it
+    # running stale code indefinitely with no per-run signal — apple_import's
+    # own CRITICAL log line never reaches this summary (it's a subprocess;
+    # only its SYNC_STATS line is parsed). Checked directly against
+    # manifest.json here, independent of the subprocess, the same way
+    # investments freshness is checked above. Non-fatal — a warning, not a
+    # run failure — and silent when not set up (missing manifest/agent_sha).
+    apple_agent_sha_drift = None
+    try:
+        from scripts.apple_data_import import check_manifest as _check_apple_manifest
+        _apple_manifest = _check_apple_manifest()
+        if _apple_manifest:
+            apple_agent_sha_drift = _apple_manifest.get("_agent_sha_drift_message")
+    except Exception as e:
+        logger.warning(f"Apple agent SHA-drift check failed: {e}")
+
     # Calculate duration
     end_time = datetime.now()
     duration_seconds = (end_time - start_time).total_seconds()
@@ -1950,6 +2082,14 @@ def run_all_syncs(
 
     for source, stats in results.items():
         if stats.get("skipped") or stats.get("dry_run"):
+            continue
+        # Issue #646: a source flagged repeated_yield reported the exact same
+        # non-zero count it reported on the last several runs — the
+        # signature of re-importing an unchanged upstream file, not real new
+        # records. Excluded here so the "New Records" summary doesn't repeat
+        # the same phantom total night after night; repeated_yield_sources
+        # (added to `result` below) is where this run's numbers actually go.
+        if stats.get("repeated_yield"):
             continue
         pc = stats.get("people_created", 0)
         pu = stats.get("people_updated", 0)
@@ -1985,7 +2125,9 @@ def run_all_syncs(
         "interactions_by_source": interactions_by_source,
         "dep_skipped_sources": sorted(dep_skipped),
         "duration_collapsed_sources": duration_collapsed,
+        "repeated_yield_sources": repeated_yield_sources,
         "investments_stale": investments_stale,
+        "apple_agent_sha_drift": apple_agent_sha_drift,
     }
 
     # Exit maintenance mode now that sync is complete

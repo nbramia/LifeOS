@@ -59,6 +59,7 @@ def _run_sync_with_patches(subprocess_side_effect):
         patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
         patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
         patch("scripts.run_all_syncs._detect_never_yielded", return_value=None),
+        patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
     ):
         success, stats = run_sync(_SOURCE, dry_run=False)
 
@@ -307,6 +308,7 @@ class TestRetryLoop:
             patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_never_yielded", return_value=None),
+            patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
         ):
             success, stats = run_sync(_SOURCE, dry_run=False)
 
@@ -362,6 +364,7 @@ class TestOrchestrationExceptionSafety:
             patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_yield_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_never_yielded", return_value=None),
+            patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
         ):
             # Must not raise — a locked DB is not the subprocess's fault.
             success, stats = run_sync(_SOURCE, dry_run=False)
@@ -481,6 +484,7 @@ class TestCampaignStatsNotLostOnRetry:
             patch("scripts.run_all_syncs._detect_duration_collapse", return_value=None),
             patch("scripts.run_all_syncs._detect_yield_collapse") as yield_collapse_mock,
             patch("scripts.run_all_syncs._detect_never_yielded", return_value=None),
+            patch("scripts.run_all_syncs._detect_repeated_yield", return_value=None),
         ):
             yield_collapse_mock.return_value = None
             success, stats = run_sync(_SOURCE, dry_run=False)

@@ -75,11 +75,27 @@ def check_manifest() -> dict | None:
 
     Logs warnings/errors based on data age:
     - >48h: WARNING (picked up by nightly health batch)
-    - >7d:  CRITICAL-level log (triggers immediate alert if server is running)
+    - >7d:  CRITICAL-level log, AND sets manifest["_staleness_critical_message"]
 
     Also walks manifest["results"] and logs CRITICAL for any source the Mac
     Mini export marked with status == "error". The caller (main) uses the
     returned manifest to decide exit status.
+
+    Issue #646: a CRITICAL log line alone never drives alerting. It does
+    land in the sync log file — a human reading it directly sees it fine —
+    but this script runs as a subprocess under run_all_syncs.py, and only
+    that subprocess's exit code (plus the ``SYNC_STATS:{json}`` line for
+    stats) feeds ``record_failure``/the run status/the nightly summary.
+    Logging alone never touches any of those. A 10-day dead export agent
+    produced exactly this CRITICAL every night — visible in the log, had
+    anyone gone looking — while the run was still recorded as a clean
+    success. So in addition to logging, staleness and agent-SHA drift are
+    recorded as keys directly on the returned manifest dict —
+    ``_staleness_critical_message`` (checked by main() below to force a
+    nonzero exit) and ``_agent_sha_drift_message`` (checked by run_all_syncs
+    directly, since drift is a warning, not a run failure). The leading
+    underscore marks these as synthetic, not part of the Mac-side export
+    schema.
     """
     manifest_path = IMPORT_DIR / "manifest.json"
     if not manifest_path.exists():
@@ -101,10 +117,12 @@ def check_manifest() -> dict | None:
             age_hours = age.total_seconds() / 3600
 
             if age_hours > STALENESS_CRITICAL_HOURS:
-                logger.critical(
+                message = (
                     f"Apple import data is {age.days} days old (exported {exported_at_str}). "
                     f"Check Mac Mini cron and rsync pipeline."
                 )
+                logger.critical(message)
+                manifest["_staleness_critical_message"] = message
             elif age_hours > STALENESS_WARNING_HOURS:
                 logger.warning(
                     f"Apple import data is {age_hours:.0f}h old (exported {exported_at_str}). "
@@ -115,9 +133,18 @@ def check_manifest() -> dict | None:
         except (ValueError, TypeError) as e:
             logger.warning(f"Cannot parse manifest exported_at: {e}")
 
-    # Walk per-source results and log CRITICAL for any export-side errors.
-    # The CRITICAL log level is the existing alerting path — it routes through
-    # email/Telegram when the server is running.
+    # Walk per-source results and log CRITICAL for any export-side errors,
+    # for visibility when this script is run directly (or when someone
+    # reads the sync log file). That log line alone does NOT drive
+    # record_failure, the run status, or the nightly summary — only the
+    # subprocess exit code does, and logging by itself never touches it.
+    # main() below is what actually makes this count, by folding any
+    # manifest-reported error into this run's results dict so the existing
+    # status=="error" -> sys.exit(1) path picks it up. (Issue #646:
+    # believing the CRITICAL log level *was* "the existing alerting path"
+    # — this comment used to say exactly that — is what let a stale export
+    # look healthy for ten days, even though the CRITICAL was right there
+    # in the log the whole time.)
     results = manifest.get("results") or {}
     if isinstance(results, dict):
         for source_name, source_result in results.items():
@@ -137,11 +164,13 @@ def check_manifest() -> dict | None:
     if agent_sha:
         local_sha = _get_local_main_sha()
         if local_sha and agent_sha != local_sha:
-            logger.warning(
+            message = (
                 f"Apple Data Agent exported from {agent_sha[:7]}, which differs from "
                 f"this host's main ({local_sha[:7]}) — its self-update may have failed. "
                 f"Check the agent log on the Mac Mini."
             )
+            logger.warning(message)
+            manifest["_agent_sha_drift_message"] = message
 
     return manifest
 
@@ -863,24 +892,58 @@ def main():
             logger.error(f"Failed to import {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
 
-    # Also surface per-source errors recorded in the manifest for sources we
-    # didn't attempt this run (e.g. --source contacts will skip whatsapp, but
-    # if the manifest says whatsapp errored on the Mac side we still want to
-    # propagate that). Only sources the caller selected are merged so that
-    # --source contacts doesn't spuriously fail on an unrelated phone error.
+    # Also surface per-source errors recorded in the manifest. Only sources
+    # the caller selected are considered so that --source contacts doesn't
+    # spuriously fail on an unrelated phone error.
+    #
+    # Two cases:
+    #   - Not attempted this run (e.g. --source contacts skips whatsapp, but
+    #     the manifest says whatsapp errored on the Mac side) — add it.
+    #   - Attempted and returned non-error. import_contacts/import_whatsapp
+    #     are manifest-aware internally (see _manifest_source_errored) and
+    #     already report "error" themselves when the manifest says so, so
+    #     this is a no-op for them. imessage/phone/photos/health are NOT
+    #     manifest-aware: if last export's file is still on disk, the local
+    #     import happily reprocesses it and reports "ok", silently masking
+    #     a Mac-side export failure (issue #646 — the same "logged but not
+    #     structured" gap as staleness, just for this specific walk in
+    #     check_manifest() above instead of the staleness guard). Override
+    #     status back to "error" here rather than teaching every import_*
+    #     function to check the manifest individually.
     if manifest:
         manifest_results = manifest.get("results") or {}
         for name in sources:
-            if name in results:
-                continue
             manifest_entry = manifest_results.get(name) if isinstance(manifest_results, dict) else None
-            if isinstance(manifest_entry, dict) and manifest_entry.get("status") == "error":
-                results[name] = {
-                    "status": "error",
-                    "reason": manifest_entry.get("reason")
-                    or manifest_entry.get("error")
-                    or "Mac export reported error",
-                }
+            if not isinstance(manifest_entry, dict) or manifest_entry.get("status") != "error":
+                continue
+            existing = results.get(name)
+            if isinstance(existing, dict) and existing.get("status") == "error":
+                continue  # already flagged (e.g. import_contacts's own manifest check)
+            reason = (
+                manifest_entry.get("reason")
+                or manifest_entry.get("error")
+                or "Mac export reported error"
+            )
+            if isinstance(existing, dict):
+                existing["status"] = "error"
+                existing["reason"] = reason
+            else:
+                results[name] = {"status": "error", "reason": reason}
+
+    # Issue #646: staleness past STALENESS_CRITICAL_HOURS must fail the run,
+    # not just log a CRITICAL that doesn't drive record_failure/alerting —
+    # only the exit code does. A synthetic "manifest_staleness" entry reuses
+    # the exact per-source error path below (results[...]["status"] ==
+    # "error" -> nonzero exit -> run_all_syncs.py marks apple_import FAILED
+    # -> reaches the Telegram/markdown summary) — the one mechanism already
+    # proven to reach alerting, instead of adding another log line that
+    # would land in the file the same way the staleness CRITICAL already
+    # does, without changing whether anyone is actually told.
+    if manifest and manifest.get("_staleness_critical_message"):
+        results["manifest_staleness"] = {
+            "status": "error",
+            "reason": manifest["_staleness_critical_message"],
+        }
 
     print(json.dumps({"results": results}, indent=2))
 

@@ -679,3 +679,81 @@ class TestTypicalDuration:
                 self._insert_run("gmail", "success", 5000.0, base - timedelta(days=i))
 
             assert get_typical_duration_seconds("gmail", n=5) == 100.0
+
+
+class TestRepeatedYieldStreak:
+    """Tests for get_repeated_yield_streak (issue #646).
+
+    A dead export agent that leaves a stale upstream file in place makes a
+    re-import report the same non-zero count night after night — invisible
+    to yield-collapse (which only fires on zero) and to never-yielded
+    (which only fires when nothing was EVER produced). This is the detector
+    for "reports the same thing every time," the signature defect #2 in the
+    linked issue: ten consecutive nights of an identical "1294 created."
+    """
+
+    def _insert_run(self, source, status, created, started_at):
+        conn = get_sync_health_db()
+        conn.execute(
+            """
+            INSERT INTO sync_runs (source, status, started_at, completed_at, records_created)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source, status, started_at.isoformat(), started_at.isoformat(), created),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_streak_of_identical_value(self, temp_db):
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            for i in range(5):
+                self._insert_run("apple_import", "success", 1294, base - timedelta(days=i))
+
+            assert get_repeated_yield_streak("apple_import", 1294) == 5
+
+    def test_streak_stops_at_first_different_value(self, temp_db):
+        """A genuinely varying night (real new data) breaks the streak."""
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            # 3 most-recent identical runs, then a different value further back
+            for i in range(3):
+                self._insert_run("apple_import", "success", 1294, base - timedelta(days=i))
+            self._insert_run("apple_import", "success", 800, base - timedelta(days=3))
+            self._insert_run("apple_import", "success", 1294, base - timedelta(days=4))
+
+            assert get_repeated_yield_streak("apple_import", 1294) == 3
+
+    def test_no_matching_value_returns_zero(self, temp_db):
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            self._insert_run("apple_import", "success", 500, base)
+
+            assert get_repeated_yield_streak("apple_import", 1294) == 0
+
+    def test_no_history_returns_zero(self, temp_db):
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert get_repeated_yield_streak("apple_import", 1294) == 0
+
+    def test_failed_runs_excluded(self, temp_db):
+        """Only successful runs count toward the streak."""
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            self._insert_run("apple_import", "success", 1294, base - timedelta(days=0))
+            self._insert_run("apple_import", "failed", 1294, base - timedelta(days=1))
+            self._insert_run("apple_import", "success", 1294, base - timedelta(days=2))
+
+            # The failed row breaks the streak (it's excluded from the query
+            # entirely, so it doesn't even count as a "different value" —
+            # the two surrounding successes are adjacent in the result set).
+            assert get_repeated_yield_streak("apple_import", 1294) == 2

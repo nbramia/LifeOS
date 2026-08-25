@@ -733,6 +733,43 @@ def get_consecutive_zero_yield_runs(source: str, limit: int = 50) -> int:
     return streak
 
 
+def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int:
+    """How many of the most recent successful runs, in a row, produced
+    exactly ``value`` records.
+
+    Complements :func:`get_consecutive_zero_yield_runs`, which only catches
+    a source going silent (yield drops to zero). A source re-importing the
+    same byte-identical stale upstream file every night can instead report
+    the *same non-zero* count forever — e.g. issue #646, where a dead Mac
+    Mini export agent left ten nights reporting an identical "1294 created"
+    while nothing had actually changed. A long streak of an identical
+    non-zero count is the signature of that: real nightly variation almost
+    never lands on the exact same number twice in a row.
+    """
+    conn = get_sync_health_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT records_created, records_updated, interactions_created,
+                   records_processed
+            FROM sync_runs
+            WHERE source = ? AND status = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (source, SyncStatus.SUCCESS.value, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    streak = 0
+    for row in rows:
+        if _row_yield(row) != value:
+            break
+        streak += 1
+    return streak
+
+
 def get_yield_history(source: str) -> dict:
     """Lifetime yield stats for ``source``: run count and best run ever.
 
