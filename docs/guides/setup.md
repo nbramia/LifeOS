@@ -441,7 +441,9 @@ on the Mac Mini that rsyncs `data/apple-imports/` to the Linux server.
 
 On the Mac Mini:
 
-1. Install: `brew install steipete/tap/wacli`
+1. Install: `brew install openclaw/tap/wacli` (formerly `steipete/tap/wacli` —
+   the tap was renamed; a stale local tap silently disables `brew outdated`,
+   see issue #677)
 2. Authenticate: `wacli auth` (scan the QR code with WhatsApp → Linked Devices)
 3. Verify: `wacli chats list --limit 5`
 4. Confirm the exporter picks up WhatsApp:
