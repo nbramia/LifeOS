@@ -2,7 +2,7 @@
 
 > **Status:** Draft
 > **Owner:** Core
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-08-25
 
 ## Overview
 
@@ -10,7 +10,7 @@ LifeOS is single-user, self-hosted on Linux (or macOS). The threat model is fund
 
 ## Guiding Principles
 
-- **All data stays local.** No cloud storage, no telemetry, no analytics. Data leaves the machine only when using `LIFEOS_LLM_BACKEND=anthropic`; the local backend (default) keeps all data on-machine.
+- **All data stays local by choice, not by default.** `LIFEOS_LLM_BACKEND` defaults to `anthropic`, which sends query text and tool results to the Claude API (see "What Leaves the Machine" below). Setting it to `local` keeps everything on-machine, but that's an opt-in, not the out-of-the-box behavior.
 - **The LLM receives only query payloads.** The LLM call sends the user's question and relevant search results, never bulk data exports or full database dumps.
 - **External service credentials are stored locally.** OAuth tokens, API keys, and session cookies never leave the machine.
 - **Logs never contain personal data content.** Log entity IDs and counts, not message bodies, email content, or contact details.
@@ -90,7 +90,7 @@ logger.info(f"Search result: {result.content[:200]}")
 ## OS Security Integration
 
 - **Linux**: systemd service isolation. The API server and sync jobs run as user-level systemd services. No special permission wrappers needed.
-- **macOS (Apple Data Agent only)**: FDA/TCC permissions are managed on the Mac Mini for Apple data export. See [ADR-005](../../adr/005-external-venv-macos-tcc.md) for TCC background.
+- **macOS (Apple Data Agent only)**: FDA/TCC permissions are managed on the Apple Data Agent Mac for Apple data export. See [ADR-005](../../adr/005-external-venv-macos-tcc.md) for TCC background.
 - **Full-disk encryption**: LUKS (Linux) or FileVault (macOS) assumed to be enabled. LifeOS does not implement its own encryption at rest.
 
 ## Related Documents

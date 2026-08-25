@@ -1,7 +1,7 @@
 # Installation Guide
 
 > **Status:** Complete
-> **Last Updated:** 2026-07-09
+> **Last Updated:** 2026-08-25
 > **Audience:** New users
 
 > **Quick start**: If you have Claude Code, run it in the project root and point it at
@@ -49,6 +49,45 @@ The minimal path is Steps 1–8 below. The full-setup integrations are covered i
 - **Linux** (primary) or **macOS** (required only for Apple Data Agent: iMessage, Contacts, Photos)
 - **Python 3.11+**
 - **Anthropic API key** — required for the default LLM backend (`LIFEOS_LLM_BACKEND=anthropic`), which handles orchestration and synthesis. Only optional if you run the fully-local path instead (`LIFEOS_LLM_BACKEND=local` + llama-server + a high-VRAM GPU — see [Local LLM (optional)](#local-llm-optional)).
+
+---
+
+## Running LifeOS on macOS as the Host
+
+The minimal setup (Steps 1–7 below) works identically on macOS and Linux —
+Anthropic API key, vault, ChromaDB, working `/chat`. Past that point, most of
+the packaged "keep itself healthy unattended" automation is Linux-only:
+**17 systemd units** ship for Linux (sync, three crash-restart watchdogs,
+autodeploy, agent worker, MCP-HTTP, local LLM) versus **3 launchd templates**
+for macOS (`com.lifeos.api`, `com.lifeos.crm-sync`, and an unused
+`com.lifeos.chromadb` — ChromaDB uses a cron watchdog instead, see Step 3).
+See [launchd-setup.md](launchd-setup.md) for why macOS-as-primary-server was
+superseded by the Linux migration and what's preserved from it.
+
+**Nightly sync does have a packaged macOS path.** `./scripts/setup-launchd.sh`
+(Phase 8 of [setup.md](setup.md)) installs `com.lifeos.crm-sync`, a launchd
+agent that runs `scripts/run_sync_wrapper.sh --execute --trigger=scheduled`
+at 3 AM — a wrapper that adds preflight checks, `LIFEOS_HEADLESS=true`, and a
+6-hour runtime watchdog around the bare sync script. It does not restart
+itself on failure (`KeepAlive: false` — a crashed run just waits for the
+next scheduled tick). If you'd rather skip launchd entirely, a plain cron
+entry calling `run_all_syncs.py` directly is simpler but **not equivalent**
+— it skips the wrapper's preflight checks, headless-mode env var, and
+watchdog, so a hang just runs until cron's own environment kills it (if
+ever):
+
+```bash
+# Add to crontab (crontab -e) -- runs the full nightly sync at 3:00 AM
+# Replace /path/to/LifeOS with wherever you cloned the repo.
+0 3 * * * cd /path/to/LifeOS && ~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --execute --trigger scheduled >> logs/sync.log 2>&1
+```
+
+**What you're living without, either way:** if a sync run hangs or crashes,
+nothing restarts it until the next scheduled tick (no `lifeos-watchdog`
+equivalent); pushing to `main` doesn't auto-redeploy the running server (no
+`lifeos-autodeploy`); and the agent worker and MCP-HTTP bridge aren't
+packaged for launchd at all. None of that blocks chat, search, or manual
+sync runs — it's the unattended-operations layer, and it's Linux-only today.
 
 ---
 
@@ -203,6 +242,16 @@ llama-server; a few are pre-configured:
 | `Qwen/Qwen3-32B-GGUF` | ~20 GB (Q4_K_M) | Strong general-purpose option |
 | `ggml-org/gpt-oss-120b-GGUF` | ~59 GB (MXFP4) | Highest quality, but starves embeddings (sync stops the LLM automatically) |
 
+**On a 16 GB machine (e.g. a base Mac mini), the default local model has zero
+headroom** — 16 GB of VRAM/unified memory for a ~16 GB model leaves nothing
+for the OS, the embedding model, or the server process itself. Don't try to
+force the local path on a small machine. Anthropic-API-only
+(`LIFEOS_LLM_BACKEND=anthropic`, the default — see [Step 4](#step-4-configure-environment))
+is the intended mode for small machines and is fully functional: it's what
+the entire Minimal Setup tier above already runs on. Treat "Local LLM" as
+something you opt into on hardware that has the VRAM for it, not a
+requirement.
+
 ### Switching models
 
 ```bash
@@ -251,8 +300,62 @@ sudo systemd-run --scope -p MemoryMax=16G --user bash
 
 See [Troubleshooting](troubleshooting.md) for detailed solutions.
 
+## Setting up for a second user (config-only)
+
+A common deployment: someone other than the maintainer clones LifeOS onto
+their own machine (e.g. a family member's Mac mini), talks to it through an
+external Hermes front door instead of `/chat` directly, and never touches
+the repo's own source files. This checklist is that path.
+
+1. **Minimal tier, as above.** Vault path + Anthropic key + ChromaDB gets you
+   a working `/chat` (Steps 1–7). Every person-specific value lives in files
+   git doesn't track: `.env` (copied from `.env.example`) and, if you use
+   them, `config/*.json` / `config/*.yaml` files copied from their
+   `.example`/`.example.yaml` templates (e.g.
+   `config/people_dictionary.example.json`,
+   `config/family_members.example.json` — full list in
+   [Configuration § Configuration Files](configuration.md#configuration-files)). You should never need
+   to edit a tracked file in the repo itself to configure an instance.
+2. **Connect an external Hermes.** Add `LIFEOS_HERMES_BACKEND_URL` (and
+   `LIFEOS_HERMES_BACKEND_TOKEN` if Hermes requires one) directly to your
+   `.env` — both are deliberately absent from `.env.example` since they're
+   opt-in. Once set, `/chat` shows a **LifeOS | Agent | Hermes** backend
+   selector and defaults new sessions to Hermes automatically. **The
+   fallback to plain LifeOS only fires when the URL is unset** — `GET
+   /api/hermes/status` reports "available" purely from whether
+   `LIFEOS_HERMES_BACKEND_URL` is configured, not from actually reaching
+   Hermes, so a configured-but-down Hermes still gets selected and every
+   turn on it fails until you fix Hermes or unset the URL (which reverts
+   `/chat` to plain LifeOS). See
+   [client-surfaces.md](../specs/technical/client-surfaces.md) for the exact
+   contract and [voice-setup.md § Optional Agent and Hermes text
+   backends](voice-setup.md#optional-agent-and-hermes-text-backends) for the
+   full variable reference. **Standing up the Hermes adapter service itself
+   is Hermes-repo setup — out of scope here.** LifeOS only proxies to a URL
+   you already have running.
+3. **Skip the local LLM.** API-only mode (`LIFEOS_LLM_BACKEND=anthropic`,
+   the default) is the intended small-machine path — see the 16 GB caveat in
+   [Local LLM (optional)](#local-llm-optional) above. Leave
+   `LIFEOS_LLM_MODEL*` unset entirely.
+4. **Leave everything else unconfigured.** Google OAuth (beyond whatever
+   account you actually want indexed), Slack, Monarch Money, a dedicated
+   Telegram bot, the Apple Data Agent — any of these you don't set up simply
+   stay unset. The nightly sync already treats several sources this way
+   (Apple-only sources report `skipped` rather than failing on a Linux/no-Mac
+   host — see [data-and-sync.md](../specs/technical/data-and-sync.md)), and
+   Monarch Money and the personal Google account join that clean-skip
+   pattern once #687 lands: an unconfigured source reports
+   "skipped (not configured)," not a failure, and the rest of the sync
+   still succeeds.
+5. **macOS as the host.** If this second machine is a Mac, see
+   [Running LifeOS on macOS as the Host](#running-lifeos-on-macos-as-the-host)
+   above for what's packaged (nightly sync) versus what you'll want to
+   hand-roll (crash-restart watchdogs, autodeploy).
+
 ## Related Documents
 
 - [Configuration](configuration.md) -- Environment variables and config files
 - [First Run](first-run.md) -- Post-installation first use guide
+- [Launchd Setup](launchd-setup.md) -- macOS service automation: what's packaged (`com.lifeos.api`, `com.lifeos.crm-sync`), what's superseded, and why
+- [Client Surfaces](../specs/technical/client-surfaces.md) -- The Agent/Hermes backend contract and fallback behavior referenced above
 - [ADR-005: External Venv](../adr/005-external-venv-macos-tcc.md) -- Why the venv is outside the project

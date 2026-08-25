@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-08-21
+> **Last Updated:** 2026-08-25
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -412,6 +412,7 @@ Since #592, `restoreBackendConversation()` renders the stored conversation on a 
 
 ### Operational
 - [Voice Setup](../../guides/voice-setup.md) — Operator-facing voice mode setup, including the Hermes/Agent backend contract this doc specifies
+- [Installation](../../guides/installation.md) — Config-only second-user setup checklist that references this doc's Hermes default/fallback contract
 
 ### Code References
 - [Chat route](../../api/routes/chat.py) — SSE emission and handoff handler

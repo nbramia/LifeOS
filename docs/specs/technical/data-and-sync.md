@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-08-13
+> **Last Updated:** 2026-08-25
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -28,11 +28,11 @@ How LifeOS ingests and stores data from multiple sources.
 |--------|-------------|----------------|
 | Gmail | Google API | From/To/CC, subjects, timestamps, threads |
 | Calendar | Google API | Attendees, organizer, titles, times |
-| Apple Contacts | Apple Data Agent (Mac Mini export via rsync) | Names, emails, phone numbers, companies |
-| Apple Photos | Apple Data Agent (Mac Mini export via rsync) | Face recognition, co-appearances, timestamps |
-| Phone Calls | Apple Data Agent (Mac Mini export via rsync) | Numbers, names, duration, direction |
+| Apple Contacts | Apple Data Agent (export via rsync) | Names, emails, phone numbers, companies |
+| Apple Photos | Apple Data Agent (export via rsync) | Face recognition, co-appearances, timestamps |
+| Phone Calls | Apple Data Agent (export via rsync) | Numbers, names, duration, direction |
 | WhatsApp | wacli CLI | JIDs, names, phone numbers |
-| iMessage | Apple Data Agent (Mac Mini export via rsync) | Phone/email, message content, timestamps |
+| iMessage | Apple Data Agent (export via rsync) | Phone/email, message content, timestamps |
 | Slack | Slack API (OAuth) | User profiles, DMs, channels |
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
@@ -62,9 +62,9 @@ How LifeOS ingests and stores data from multiple sources.
 All data syncing is consolidated into a single daily sync with proper phase ordering (`SYNC_ORDER` in `scripts/run_all_syncs.py`). This ensures downstream processes always have access to fresh upstream data.
 
 ```
-02:50          Apple Data Agent export (Mac Mini → Linux server via rsync)
+02:50          Apple Data Agent export (any spare Mac -> Linux server via rsync)
                └─ Exports contacts, phone calls, iMessage, photos, WhatsApp
-               └─ scripts/apple_data_agent.sh → scripts/apple_data_export.py (Mac Mini)
+               └─ scripts/apple_data_agent.sh → scripts/apple_data_export.py (Apple Data Agent Mac)
                └─ scripts/apple_data_import.py (Linux server)
 02:30          Pre-sync health check (API server)
 03:00          Unified sync starts (via run_all_syncs.py)
@@ -76,7 +76,7 @@ All data syncing is consolidated into a single daily sync with proper phase orde
                └─ LinkedIn (connections CSV export)
                └─ Contacts (Apple Contacts; macOS-only — reports `skipped` on Linux)
                └─ Apple import (contacts, phone, iMessage, photos, WhatsApp from
-                 the Mac Mini export; Linux only)
+                 the Apple Data Agent export; Linux only)
                └─ Slack (users + DM and member-channel messages)
 
                === PHASE 2: Entity Processing ===
@@ -150,7 +150,7 @@ The 7-phase structure ensures correct data flow:
 6. **Post-Sync Cleanup** auto-hides obvious non-human entities after all other syncs
 7. **Consistency Verification** checks cross-store consistency after everything else has run
 
-**Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from the Mac Mini via the Apple Data Agent (`scripts/apple_data_agent.sh`) at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on the Mac Mini (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
+**Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from an Apple Data Agent (any spare Mac with FDA granted) via `scripts/apple_data_agent.sh` at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on that Mac (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
 
 ### Process Summary
 
@@ -223,7 +223,7 @@ All sync scripts in `scripts/` follow the pattern:
 | `sync_gmail_calendar_interactions.py` | Sync emails (sent+received+CC) and calendar | Gmail/Calendar API |
 | `sync_linkedin.py` | Sync LinkedIn connections | CSV export |
 | `sync_apple_contacts.py` | Sync Apple Contacts (macOS-only — `skipped` on Linux) | Apple Data Agent export |
-| `apple_data_import.py` | Import Apple ecosystem data (contacts, phone, iMessage, photos, WhatsApp) from the Mac Mini export | Apple Data Agent export (Linux only) |
+| `apple_data_import.py` | Import Apple ecosystem data (contacts, phone, iMessage, photos, WhatsApp) from the Apple Data Agent export | Apple Data Agent export (Linux only) |
 | `sync_phone_calls.py` | Sync phone calls (not in nightly `SYNC_ORDER` — runs via the separate FDA cron on macOS) | Apple Data Agent export |
 | `sync_slack.py` | Sync Slack users, DMs, and member channels | Slack API |
 
@@ -249,11 +249,11 @@ file; the next run re-fetches and re-evaluates the whole window.
 
 | Script | Purpose | Runs On |
 |--------|---------|---------|
-| `apple_data_export.py` | Export Apple data (contacts, phone, iMessage, photos, WhatsApp) | Mac Mini |
+| `apple_data_export.py` | Export Apple data (contacts, phone, iMessage, photos, WhatsApp) | Apple Data Agent Mac |
 | `apple_data_import.py` | Import Apple data exports into LifeOS | Linux server |
-| `apple_data_agent.sh` | Orchestrate export + rsync + import | Mac Mini (cron) |
+| `apple_data_agent.sh` | Orchestrate export + rsync + import | Apple Data Agent Mac (cron) |
 
-WhatsApp data flows through the same Mac Mini → Linux pipeline. The Mac runs `wacli` (openclaw/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records. A non-zero `wacli sync` exit (including a "Client outdated (405)" protocol rejection, distinct from an auth failure) marks the export `status: "error"` rather than silently exporting stale data as `ok` — see issue #677.
+WhatsApp data flows through the same Apple Data Agent → Linux pipeline. The Mac runs `wacli` (openclaw/tap/wacli) which reads the WhatsApp Desktop app's local SQLite database; `apple_data_export.export_whatsapp` dumps contacts, messages, group memberships and the LID-to-phone map to `whatsapp.json`; `apple_data_import.import_whatsapp` calls into `api/services/whatsapp.py` to create SourceEntity and Interaction records. A non-zero `wacli sync` exit (including a "Client outdated (405)" protocol rejection, distinct from an auth failure) marks the export `status: "error"` rather than silently exporting stale data as `ok` — see issue #677.
 
 ### Phase 2: Entity Processing
 
@@ -349,13 +349,13 @@ All scheduled times use **America/New_York** (Eastern Time).
 
 ### WhatsApp Sync
 
-**Data Source:** `~/.wacli/wacli.db` on the Mac Mini (wacli CLI tool database).
+**Data Source:** `~/.wacli/wacli.db` on the Apple Data Agent Mac (wacli CLI tool database).
 LifeOS runs on Linux; wacli is macOS-only, so WhatsApp data rides through the
 Apple Data Agent pipeline alongside contacts, iMessage, phone calls, and
 photos.
 
 **Sync Process:**
-1. Mac Mini cron runs `scripts/apple_data_export.py --execute`, which invokes
+1. Apple Data Agent Mac cron runs `scripts/apple_data_export.py --execute`, which invokes
    `wacli sync --once` to refresh the local database, then dumps messages,
    group participants, LID contacts, and the whatsmeow LID→phone map to
    `data/apple-imports/whatsapp.json`. If `wacli` is missing or fails the
@@ -453,10 +453,10 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 2. `calendar_personal` / `calendar_work` / `calendar_work2` - Calendar sync
 3. `linkedin` - LinkedIn connections
 4. `contacts` - Apple Contacts (macOS-only — `skipped` on Linux)
-5. `apple_import` - Import Apple ecosystem data + WhatsApp from the Mac Mini export (Linux only)
+5. `apple_import` - Import Apple ecosystem data + WhatsApp from the Apple Data Agent export (Linux only)
 6. `slack` - Slack users, DMs, and member channels
 
-**Note:** `phone` is defined as a source but is not in nightly `SYNC_ORDER` — it runs via the separate FDA cron on macOS (`scripts/run_sync_with_fda.sh`). Apple data (contacts, phone, iMessage, photos, WhatsApp) is exported from the Mac Mini via the Apple Data Agent at 2:50 AM (before the main pipeline) and imported on the Linux server by `apple_import`.
+**Note:** `phone` is defined as a source but is not in nightly `SYNC_ORDER` — it runs via the separate FDA cron on macOS (`scripts/run_sync_with_fda.sh`). Apple data (contacts, phone, iMessage, photos, WhatsApp) is exported from an Apple Data Agent (any spare Mac) at 2:50 AM (before the main pipeline) and imported on the Linux server by `apple_import`.
 
 **Phase 2: Entity Processing**
 7. `link_slack` - Link Slack entities by email
@@ -621,6 +621,7 @@ The scraping system uses Claude in Chrome MCP for browser automation. It require
 - [Data Model](../product/data-model.md) -- Two-tier data model (SourceEntity / PersonEntity)
 - [Entity Resolution](../product/entity-resolution.md) -- How source entities are linked to canonical records
 - [Search & Indexing](search-indexing.md) -- Hybrid search pipeline
+- [Installation](../../guides/installation.md) -- Config-only second-user setup checklist, which points here for the unconfigured-source clean-skip pattern
 - [ADR-002: ChromaDB](../../adr/002-chromadb-vector-store.md) -- Why ChromaDB was chosen
 - [ADR-003: Two-Tier Data Model](../../adr/003-two-tier-data-model.md) -- Why SourceEntity and PersonEntity are separate
 - [ADR-012: Embedding Pipeline](../../adr/012-embedding-pipeline.md) -- Embedding model, GPU/CPU fallback, pre-flight RAM gate around phase 4
