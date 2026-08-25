@@ -242,8 +242,12 @@ class TestSyncHealthSummary:
     def test_get_sync_summary_with_issues(self, temp_db):
         """Test summary when some sources have issues."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
-            # One fresh success
-            run_id = record_sync_start("gmail_personal")
+            # One fresh success — use vault_reindex (never conditionally
+            # disabled, unlike gmail_personal since #687: a dev checkout
+            # with no config/credentials-personal.json now correctly
+            # reports that source as disabled, so it can no longer stand
+            # in for "a source that's always healthy" here).
+            run_id = record_sync_start("vault_reindex")
             record_sync_complete(run_id, SyncStatus.SUCCESS)
 
             # One failure — use imessage (never platform-disabled in the disabled list)
@@ -348,6 +352,55 @@ class TestSyncSourceConfiguration:
                 f"Script not found for {source}: {config['script']}"
 
 
+class TestPersonalGoogleDisabledCheck:
+    """Direct tests of _is_source_disabled()'s personal-Google handling
+    (issue #687). Without this, an unconfigured install would show
+    gmail_personal/calendar_personal as permanently "never run" in the
+    health summary instead of quietly excluded, since run_all_syncs
+    pre-skips the source and never writes a sync_runs row for it.
+
+    sync_health.py locates the repo root via __file__ (three parents up
+    from api/services/sync_health.py), not cwd, so these point __file__ at
+    a fake tree rather than chdir-ing.
+    """
+
+    def _fake_module_file(self, fake_root):
+        return str(fake_root / "api" / "services" / "sync_health.py")
+
+    def test_disabled_when_credentials_file_absent(self, tmp_path, monkeypatch):
+        import api.services.sync_health as mod
+
+        (tmp_path / "config").mkdir()
+        monkeypatch.setattr(mod, "__file__", self._fake_module_file(tmp_path))
+
+        assert mod._is_source_disabled("gmail_personal") is True
+        assert mod._is_source_disabled("calendar_personal") is True
+
+    def test_not_disabled_when_credentials_file_present(self, tmp_path, monkeypatch):
+        """Behavior-neutrality: a configured install (credentials file
+        present, today's status quo) must see no change."""
+        import api.services.sync_health as mod
+
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "credentials-personal.json").write_text("{}")
+        monkeypatch.setattr(mod, "__file__", self._fake_module_file(tmp_path))
+
+        assert mod._is_source_disabled("gmail_personal") is False
+        assert mod._is_source_disabled("calendar_personal") is False
+
+    def test_unrelated_source_unaffected(self, tmp_path, monkeypatch):
+        """The new check must only ever apply to the two personal-Google
+        sources, never leak into an unrelated source's disabled-ness."""
+        import api.services.sync_health as mod
+
+        (tmp_path / "config").mkdir()  # credentials-personal.json absent
+        monkeypatch.setattr(mod, "__file__", self._fake_module_file(tmp_path))
+
+        # imessage has no Google-account dependency at all, so it must stay
+        # unaffected by the personal-credentials check either way.
+        assert mod._is_source_disabled("imessage") is False
+
+
 class TestSyncHealthIntegration:
     """Integration tests for sync health system."""
 
@@ -408,11 +461,15 @@ class TestOrphanReaper:
         """Rows in status=running older than max_age_hours are marked failed."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             conn = get_sync_health_db()
-            # 10h ago — should be reaped at default 8h cutoff
+            # 10h ago — should be reaped at default 8h cutoff. vault_reindex
+            # (not gmail_personal) since #687: a dev checkout with no
+            # config/credentials-personal.json now correctly reports that
+            # source as disabled, and get_sync_health() deliberately doesn't
+            # surface last_status for a disabled source.
             old = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
             conn.execute(
                 "INSERT INTO sync_runs (source, status, started_at) VALUES (?, ?, ?)",
-                ("gmail_personal", "running", old),
+                ("vault_reindex", "running", old),
             )
             conn.commit()
             conn.close()
@@ -420,7 +477,7 @@ class TestOrphanReaper:
             reaped = reap_orphan_sync_runs()
             assert reaped == 1
 
-            health = get_sync_health("gmail_personal")
+            health = get_sync_health("vault_reindex")
             assert health.last_status == SyncStatus.FAILED
 
     def test_leaves_fresh_running_rows_alone(self, temp_db):

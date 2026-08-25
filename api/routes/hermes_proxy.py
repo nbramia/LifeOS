@@ -61,11 +61,12 @@ from pydantic import BaseModel, ValidationError
 from config.settings import settings  # noqa: F401
 
 from api.routes._proxy import TIMEOUT, make_backend_router
-from api.routes.chat import AskStreamRequest
+from api.routes.chat import AskStreamRequest, journal_capture_gate, resolve_effective_persona_id
 from api.services.agent_system_prompt import build_turn_context
 from api.services.chat_turns import TRUNCATION_MARKER, get_turn_registry, truncation_routing
 from api.services.conversation_store import get_store
 from api.services.hermes_persona_thread_store import get_persona_thread_store
+from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.model_readout import record_hermes_chat_turn_model
 from api.services.usage_store import get_usage_store
 
@@ -255,6 +256,71 @@ def _build_envelope(raw_body: bytes) -> bytes:
         apply_voice_rules=apply_voice_rules,
     )
     return json.dumps(data).encode("utf-8")
+
+
+def _journal_capture_prelude(raw_body: bytes) -> list:
+    """`pre_send` hook (#685): mirrors `ask_stream`'s native journal-capture
+    gate (api/routes/chat.py) on this proxy's relay path, via the shared
+    `journal_capture_gate` + `resolve_effective_persona_id` helpers — the
+    same one-source-of-truth argument `_resolve_lifeos_context()` already
+    makes for persona resolution. Before #685, a journal-persona turn sent
+    through this proxy (which `/chat` reaches by default whenever Hermes is
+    available) was relayed to Hermes and never captured at all — #674's gap,
+    resurrected on a surface nobody had checked.
+
+    Deliberately does NOT reuse `_build_envelope`'s own `parsed.persona_id or
+    "primary"` shorthand (adversarial-review follow-up): that ignores a raw
+    `persona` preamble entirely, which is exactly the shape `chat_via_api()`
+    and the ring ingest send (issue #684 is what points those callers at
+    this proxy) — approximating persona resolution that way would silently
+    stop capturing a raw-preamble journal turn the moment #684 lands, the
+    same bug class a third time. `resolve_effective_persona_id()` reverse-
+    maps a raw `persona` the same way `ask_stream()` does, and rejects the
+    same malformed shapes (`persona_id` and `persona` both set; an
+    unrecognized/empty `persona_id`) with the same `HTTPException(400)` —
+    raised here, before the backend is contacted, exactly like
+    `journal_capture_gate`'s own `HTTPException(500)` below.
+
+    `make_backend_router`'s `pre_send` contract runs this before the backend
+    is contacted, so either exception means Hermes is never sent the turn —
+    no false success, and the ring ingest's idempotency key
+    (api/routes/journal_ingest.py) stays unburned exactly as it does on the
+    native path.
+
+    Reparses `raw_body` independently rather than sharing `_build_envelope`'s
+    parse — the same "each hook is self-contained" pattern `_make_persister`
+    already uses for this identical raw body. A body that fails to parse or
+    fails Pydantic validation here returns no frames rather than raising:
+    `_build_envelope` (this router's `transform_body`) is what turns THAT
+    kind of malformed body into a 400, and it runs on the same raw body
+    regardless of hook order — only the persona-shape checks above need to
+    live here too, since `_build_envelope` doesn't perform them.
+    """
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    try:
+        parsed = AskStreamRequest.model_validate(data)
+    except ValidationError:
+        return []
+
+    effective_pid = resolve_effective_persona_id(parsed.persona_id, parsed.persona)
+    result = journal_capture_gate(effective_pid, parsed.question)
+    if result is None:
+        return []
+    # Same event shape the native path emits (api/routes/chat.py) — the ring
+    # ingest and chat_via_api() require this exact event as proof of
+    # capture, on either path alike.
+    return [
+        "data: " + json.dumps({
+            "type": "journal_capture",
+            "path": result.path,
+            "created": result.created,
+        }) + "\n\n"
+    ]
 
 
 class _HermesTurnPersister:
@@ -544,6 +610,7 @@ router = make_backend_router(
     client_factory=lambda: _client(),
     transform_body=_build_envelope,
     make_observer=_make_persister,
+    pre_send=_journal_capture_prelude,
 )
 
 
@@ -718,6 +785,29 @@ async def resolve_persona_from_text(request: Request):
     if persona_id is None:
         # Rule 3.
         return {"persona_id": None, "text": parsed.text, "lifeos_context": None}
+
+    if persona_id == JOURNAL_PERSONA_ID:
+        # #685 adversarial-review follow-up: this endpoint resolves a
+        # persona WITHOUT running a turn — Hermes's own Telegram front door
+        # calls it to build an envelope BEFORE deciding what, if anything,
+        # it does with the message — so there is no ask/stream turn here for
+        # the journal-capture gate to hook (that gate lives on the relay
+        # above, keyed off a persona id that's actually about to drive a
+        # turn). Silently resolving `journal` here would either double-
+        # capture once Hermes relays the real turn through that proxy, or
+        # capture text that never becomes a turn at all (a reply Hermes
+        # never sends, a tag with no follow-up). Until this surface has its
+        # own capture/proof protocol, refuse it visibly rather than let
+        # Hermes reply "Logged." with nothing on disk — the #674/#685
+        # signature a third time, this time silent since nothing here would
+        # even try to write. Applies identically whether `journal` came from
+        # an explicit `@journal` tag (rule 1) or thread inheritance (rule
+        # 2) — deliberately checked after both, once persona_id is settled,
+        # rather than duplicated in each branch above.
+        raise HTTPException(
+            status_code=400,
+            detail="journal capture isn't available via the Hermes Telegram bot; use the journal bot",
+        )
 
     modality = "voice" if (parsed.modality or "").strip().lower() == "voice" else "text"
     # A resolved persona — tag or inherited — is always the "chose a

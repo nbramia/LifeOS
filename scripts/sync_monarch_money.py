@@ -2,7 +2,8 @@
 """
 Sync Monarch Money financial data to the Obsidian vault.
 
-Generates a monthly Markdown summary at Personal/Finance/Monarch/YYYY-MM.md.
+Generates a monthly Markdown summary at LIFEOS_MONARCH_VAULT_DIR/YYYY-MM.md
+(defaults to Personal/Finance/Monarch/YYYY-MM.md).
 Designed to run on the 1st of each month for the previous month's data.
 
 Usage:
@@ -36,7 +37,8 @@ async def sync_monarch(dry_run: bool = True, month: str | None = None) -> dict:
     Returns:
         Stats dict
     """
-    from api.services.monarch import get_monarch_client
+    from api.services.monarch import get_monarch_client, is_monarch_configured
+    from config.settings import settings
 
     # Determine target month
     if month:
@@ -53,15 +55,36 @@ async def sync_monarch(dry_run: bool = True, month: str | None = None) -> dict:
 
     if dry_run:
         logger.info(f"DRY RUN — would sync Monarch Money data for {period}")
-        logger.info(f"  Output: Personal/Finance/Monarch/{period}.md")
+        logger.info(f"  Output: {settings.monarch_vault_dir}/{period}.md")
         return {"status": "dry_run", "period": period}
+
+    if not is_monarch_configured():
+        # Declare the skip so the parent records SKIPPED instead of a
+        # FAILED that repeats every night on any install that never set up
+        # Monarch — same pattern as Photos/Apple Contacts (#495/#497).
+        # A configured-but-broken session (bad password, network, expired
+        # session with no fallback credentials) does NOT hit this branch —
+        # is_monarch_configured() only reports "no way to authenticate at
+        # all", so a real outage still reaches get_monarch_client() below
+        # and fails loud, exactly as before — issue #687.
+        logger.warning(
+            "Monarch Money not configured (no cached session and "
+            "MONARCH_EMAIL/MONARCH_PASSWORD unset) — skipping"
+        )
+        print(
+            "SYNC_SKIPPED: Monarch Money not configured — set MONARCH_EMAIL "
+            "and MONARCH_PASSWORD in .env or run the interactive login "
+            "(see AGENTS.md / docs/guides/operations.md)",
+            flush=True,
+        )
+        return {"status": "skipped", "reason": "monarch_not_configured", "period": period}
 
     logger.info(f"Starting Monarch Money sync for {period}...")
 
     client = get_monarch_client()
     result = await client.write_monthly_report(year, mon, dry_run=False)
 
-    logger.info(f"\n=== Monarch Money Sync Results ===")
+    logger.info("\n=== Monarch Money Sync Results ===")
     logger.info(f"  Period: {period}")
     logger.info(f"  File: {result.get('file', 'N/A')}")
     logger.info(f"  Size: {result.get('size', 0)} chars")
@@ -90,9 +113,14 @@ def main():
         if run_id is not None:
             try:
                 from api.services.sync_health import record_sync_complete, SyncStatus
+                status = (
+                    SyncStatus.SKIPPED
+                    if result.get("status") == "skipped"
+                    else SyncStatus.SUCCESS
+                )
                 record_sync_complete(
                     run_id,
-                    status=SyncStatus.SUCCESS,
+                    status=status,
                     records_processed=1,
                     records_created=1 if result.get("status") == "success" else 0,
                 )

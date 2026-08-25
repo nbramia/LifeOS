@@ -339,8 +339,11 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 |---|---|---|---|
 | `MONARCH_EMAIL` | str | — | Monarch Money login email. |
 | `MONARCH_PASSWORD` | str | — | Monarch Money password. |
+| `LIFEOS_MONARCH_VAULT_DIR` | path | `Personal/Finance/Monarch` | Vault-relative folder where the monthly Monarch summary (`YYYY-MM.md`) lands. |
 
 Auth tokens are cached at `data/monarch_session.pickle` after first login. Re-authenticate when the token expires (401/525) per the steps in the root [AGENTS.md § Monarch Money](../../AGENTS.md#monarch-money-financial-data).
+
+Both `MONARCH_EMAIL`/`MONARCH_PASSWORD` unset AND no cached session at `data/monarch_session.pickle` means Monarch isn't configured — the nightly sync records it as skipped rather than failed. Any other failure (bad session, wrong password, network) still fails the run.
 
 ## Configuration Files
 

@@ -30,6 +30,20 @@ SESSION_EXPIRY_DAYS = 30
 SESSION_WARNING_DAYS = 25  # Surface in health endpoints before things break.
 
 
+def is_monarch_configured() -> bool:
+    """Return True if Monarch Money has any way to authenticate.
+
+    "Configured" mirrors exactly what ``MonarchClient._get_client()`` tries,
+    in order: a cached session (``SESSION_PATH``) or, failing that, both
+    ``MONARCH_EMAIL``/``MONARCH_PASSWORD`` set. A fresh install with neither
+    is not configured — the nightly sync should skip quietly rather than
+    fail. Anything else (a stale/invalid session, a wrong password, a
+    network outage) still reaches ``_get_client()`` and raises for real,
+    which must keep surfacing as a failure — issue #687.
+    """
+    return SESSION_PATH.exists() or bool(settings.monarch_email and settings.monarch_password)
+
+
 def get_session_age_days() -> Optional[float]:
     """Return the cached Monarch session's age in days, or None if not present.
 
@@ -477,7 +491,7 @@ class MonarchClient:
         content = await self.generate_monthly_report(year, month)
         period = f"{year}-{month:02d}"
 
-        vault_path = settings.vault_path / "Personal" / "Finance" / "Monarch"
+        vault_path = settings.vault_path / settings.monarch_vault_dir
         file_path = vault_path / f"{period}.md"
 
         if dry_run:

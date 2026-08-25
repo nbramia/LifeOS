@@ -12,15 +12,18 @@ import base64
 import json
 import logging
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
+from fastapi.testclient import TestClient
 
 from api.routes import hermes_proxy as hp
 from api.services.conversation_store import ConversationStore
+from api.services.journal_capture import log_path_for
 from api.services.usage_store import UsageStore
 
 pytestmark = pytest.mark.unit
@@ -2253,3 +2256,473 @@ async def test_register_persona_message_requires_auth(resolve_client):
         json={"chat_id": "chat-1", "message_id": "bot-msg-1", "persona_id": "primary"},
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Journal capture gate on the proxy relay path (#685). Before this, a
+# journal-persona turn sent through `/api/hermes/ask/stream` — which `/chat`
+# reaches by default whenever Hermes is available — was relayed to Hermes and
+# never captured at all: #674's exact signature (a reply that reads like a
+# successful capture and no file) resurrected on a surface nobody had
+# checked. Mirrors tests/test_journal_capture.py's coverage of the native
+# path: assertions land on the actual file on disk, not on a mock having
+# been called — the gap that let #674 ship broken in the first place.
+# ---------------------------------------------------------------------------
+
+# Obviously synthetic fragment — nothing here resembles a real note.
+_JOURNAL_FRAGMENT = "the deploy gate should fail closed #eng"
+
+
+def _bullets(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("- ")]
+
+
+@pytest.fixture
+def journal_vault(tmp_path, monkeypatch) -> Path:
+    """A throwaway vault for the proxy's journal-capture gate. Same
+    redirect-and-assert pattern as tests/test_journal_capture.py's `vault`
+    fixture, extended to this module's own `hp.settings` reference (the gate
+    is reached through hermes_proxy.py, not just chat.py/journal_capture.py)
+    since `config.settings` can be reloaded elsewhere in the suite, leaving a
+    module that imported `settings` at import time holding a stale instance."""
+    import api.services.journal_capture as journal_capture_mod
+    import config.settings as settings_mod
+
+    root = tmp_path / "vault"
+    root.mkdir()
+    seen = {}
+    for obj in (settings_mod.settings, journal_capture_mod.settings, hp.settings):
+        seen[id(obj)] = obj
+    for obj in seen.values():
+        monkeypatch.setattr(obj, "vault_path", root)
+    assert journal_capture_mod.settings.vault_path == root
+    return root
+
+
+@pytest.fixture
+def journal_persona_registered(tmp_path, monkeypatch) -> str:
+    """Register a `journal` bot against the real persona file, the same way
+    tests/test_journal_capture.py's `journal_persona` fixture does, so
+    `persona_id="journal"` resolves on this proxy's envelope path too.
+    Returns the resolved raw preamble — the shape `chat_via_api()` and the
+    ring ingest actually send (`persona=...`, no `persona_id`), needed by
+    the raw-preamble capture test below (#685 finding 1)."""
+    reg = _registry(tmp_path, [
+        {"name": "journal", "token_env": "TG_JOURNAL_TEST", "persona_file": "config/personas/journal.md"},
+    ])
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+    monkeypatch.setenv("TG_JOURNAL_TEST", "tok")
+    preamble = hp.settings.resolve_persona("journal")
+    assert preamble, "journal persona did not resolve"
+    return preamble
+
+
+def _sse_events(resp) -> list[dict]:
+    return [
+        json.loads(chunk[len("data: "):])
+        for chunk in resp.text.split("\n\n")
+        if chunk.startswith("data: ")
+    ]
+
+
+async def test_journal_persona_writes_fragment_before_hermes_relay(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+    )
+    assert resp.status_code == 200
+
+    log = journal_vault / log_path_for(date.today())
+    assert log.exists(), "the fragment never reached disk"
+    written = log.read_text()
+    assert written.startswith(f"---\ntype: log\ndate: {date.today().isoformat()}\n---\n")
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+    # The turn was still relayed to Hermes — a captured fragment doesn't
+    # short-circuit the proxy, it just has to land first (the failure-path
+    # test below proves that ordering structurally: on a capture failure,
+    # Hermes is never contacted at all).
+    assert json.loads(_received["body"])["question"] == _JOURNAL_FRAGMENT
+
+
+async def test_journal_capture_sse_event_matches_native_shape(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+
+    # Same event shape ask_stream() emits natively (api/routes/chat.py) —
+    # chat_via_api() and the ring ingest (api/routes/journal_ingest.py)
+    # require this exact event as proof of capture on either path alike.
+    capture_events = [e for e in events if e.get("type") == "journal_capture"]
+    assert capture_events == [{
+        "type": "journal_capture",
+        "path": log_path_for(date.today()),
+        "created": True,
+    }]
+    # It's the first frame the browser sees — ahead of anything Hermes
+    # itself streamed for this turn.
+    assert events[0]["type"] == "journal_capture"
+
+
+async def test_second_fragment_of_the_day_appends_and_created_is_false(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    first = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+    )
+    assert [e for e in _sse_events(first) if e.get("type") == "journal_capture"][0]["created"] is True
+
+    second = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "a second synthetic fragment", "persona_id": "journal"},
+    )
+    assert [e for e in _sse_events(second) if e.get("type") == "journal_capture"][0]["created"] is False
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert written.count("type: log") == 1
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [
+        _JOURNAL_FRAGMENT, "a second synthetic fragment",
+    ]
+
+
+async def test_capture_failure_fails_the_request_and_never_reaches_hermes(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    # Same "day dir exists as a file" trick tests/test_journal_capture.py's
+    # equivalent native-path test (test_capture_failure_is_a_clean_error_and_
+    # no_stream) uses to force a real write failure out of capture_fragment().
+    (journal_vault / "Personal").mkdir()
+    (journal_vault / "Personal" / "Log").write_text("not a directory")
+
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+    )
+    assert resp.status_code == 500
+    # No false success, and the reply a user sees must not quote what they
+    # said.
+    assert _JOURNAL_FRAGMENT not in resp.text
+    # Hermes was never contacted — no false success is even possible, and
+    # whatever idempotency key a caller (e.g. the ring ingest) tracks for
+    # this delivery stays unburned since the whole request failed before any
+    # relay began.
+    assert _received == {}
+
+
+async def test_non_journal_persona_proxy_behavior_unchanged(proxy_client, journal_vault):
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "what did I do last week?"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"".join(_UPSTREAM_SSE_CHUNKS)
+    assert not any(e.get("type") == "journal_capture" for e in _sse_events(resp))
+    assert not (journal_vault / "Personal").exists()
+    assert json.loads(_received["body"])["question"] == "what did I do last week?"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review follow-up (#685, finding 1): the journal-capture gate's
+# effective-persona resolution must match ask_stream()'s native semantics —
+# reverse-mapping a raw `persona` preamble (the exact shape chat_via_api()
+# and the ring ingest send, api/routes/journal_ingest.py:172), and rejecting
+# the same malformed persona_id/persona shapes with the same 400 — not
+# approximate them as `persona_id or "primary"` alone.
+# ---------------------------------------------------------------------------
+
+async def test_raw_persona_preamble_journal_turn_still_captures(
+    proxy_client, journal_vault, journal_persona_registered,
+):
+    """The shape chat_via_api()/the ring ingest actually send: a raw
+    `persona` preamble, no `persona_id` at all. #684 is what's expected to
+    point those callers at this proxy — if the prelude only ever looked at
+    `persona_id`, this turn would silently stop being captured the moment
+    that happens, #674's bug a third time."""
+    journal_preamble = journal_persona_registered
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": _JOURNAL_FRAGMENT, "persona": journal_preamble},
+    )
+    assert resp.status_code == 200
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+    assert [e for e in _sse_events(resp) if e.get("type") == "journal_capture"] == [{
+        "type": "journal_capture",
+        "path": log_path_for(date.today()),
+        "created": True,
+    }]
+
+
+async def test_empty_persona_id_gets_native_400_on_proxy(proxy_client, journal_vault):
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream", json={"question": "hi", "persona_id": ""},
+    )
+    assert resp.status_code == 400
+    assert _received == {}  # rejected before the upstream backend was ever called
+
+
+async def test_persona_and_persona_id_conflict_gets_native_400_on_proxy(proxy_client, journal_vault):
+    resp = await proxy_client.post(
+        "/api/hermes/ask/stream",
+        json={"question": "hi", "persona": "X", "persona_id": "primary"},
+    )
+    assert resp.status_code == 400
+    assert _received == {}
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review follow-up (#685, finding 2): once capture has already
+# succeeded, its proof must reach the caller regardless of what Hermes then
+# does — chat_via_api() (api/services/telegram.py) and the ring ingest
+# (api/routes/journal_ingest.py) both treat a non-200 response as "nothing
+# happened" and never look at its body for a `journal_capture` event.
+# ---------------------------------------------------------------------------
+
+async def test_journal_capture_proof_survives_hermes_connect_failure(
+    journal_vault, journal_persona_registered, monkeypatch,
+):
+    class _Refusing:
+        def build_request(self, *a, **k):
+            return object()
+
+        async def send(self, *a, **k):
+            raise httpx.ConnectError("refused")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", _Refusing)
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post(
+            "/api/hermes/ask/stream",
+            json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+        )
+
+    # NOT a 502 — a caller that error-branches on status code alone (both
+    # real callers do) must still be able to see the capture proof.
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert events[0] == {
+        "type": "journal_capture",
+        "path": log_path_for(date.today()),
+        "created": True,
+    }
+    error_events = [e for e in events if e.get("type") == "error"]
+    assert len(error_events) == 1
+    # Same {"type": "error", "message": ...} shape api/routes/chat.py's
+    # native path already emits, which chat_via_api() already knows to fold
+    # into its answer rather than choke on.
+    assert "unreachable" in error_events[0]["message"]
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+
+async def test_journal_capture_proof_survives_hermes_non_200(
+    journal_vault, journal_persona_registered, monkeypatch,
+):
+    # Reuses the module's existing `_stub_500` app (already used by
+    # test_non_200_upstream_is_passed_through above) rather than a second
+    # near-identical stub.
+    monkeypatch.setattr(
+        hp, "_client",
+        lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=_stub_500), base_url="http://a"),
+    )
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://a")
+    monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
+    app = FastAPI()
+    app.include_router(hp.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
+        resp = await c.post(
+            "/api/hermes/ask/stream",
+            json={"question": _JOURNAL_FRAGMENT, "persona_id": "journal"},
+        )
+
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert events[0]["type"] == "journal_capture"
+    error_events = [e for e in events if e.get("type") == "error"]
+    assert len(error_events) == 1
+    assert "500" in error_events[0]["message"]
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+
+@pytest.fixture
+def journal_ingest_via_proxy(tmp_path, monkeypatch, journal_vault, journal_persona_registered):
+    """`POST /api/journal/ingest` wired to a `chat_via_api`-shaped bridge that
+    posts through the Hermes PROXY instead of native `/api/ask/stream` — the
+    wiring #684 is expected to give `chat_via_api()` itself once it points
+    the journal bot at Hermes. Exercises the REAL, unmocked ring-ingest
+    dedupe logic (api/routes/journal_ingest.py) on top of the guaranteed-
+    prelude-delivery fix (#685 finding 2): a capture that succeeds while
+    Hermes then fails must still get the delivery's idempotency key burned,
+    or a genuine retry re-invokes `capture_fragment()` a second time for the
+    same delivery — the double-append the adversarial review flagged.
+
+    Hermes is unreachable for every call in this fixture — the point being
+    proven is that capture (and the ring ingest's success/dedupe
+    bookkeeping) never depended on Hermes working in the first place.
+    """
+    import api.routes.journal_ingest as journal_ingest
+    import api.services.journal_ingest_store as journal_ingest_store
+    from api.services.journal_ingest_store import JournalIngestStore
+
+    store = JournalIngestStore(db_path=str(tmp_path / "journal_ingest.db"))
+    monkeypatch.setattr(journal_ingest_store, "_store_instance", store)
+    journal_ingest._conversations.clear()
+    monkeypatch.setattr(journal_ingest.settings, "journal_ingest_token", "secret-token")
+
+    class _Refusing:
+        def build_request(self, *a, **k):
+            return object()
+
+        async def send(self, *a, **k):
+            raise httpx.ConnectError("refused")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(hp, "_client", _Refusing)
+    monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
+
+    proxy_app = FastAPI()
+    proxy_app.include_router(hp.router)
+    proxy_transport = httpx.ASGITransport(app=proxy_app)
+
+    async def chat_via_proxy(question, conversation_id=None, persona=None):
+        # Mirrors api.services.telegram.chat_via_api()'s SSE-parsing loop
+        # verbatim, posting through the Hermes proxy instead of native
+        # /api/ask/stream — see the fixture docstring.
+        body = {"question": question}
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        if persona:
+            body["persona"] = persona
+        full_text = ""
+        conv_id = conversation_id
+        journal_capture = None
+        async with httpx.AsyncClient(transport=proxy_transport, base_url="http://proxy") as c:
+            async with c.stream("POST", "/api/hermes/ask/stream", json=body) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    raise RuntimeError(f"Chat pipeline returned HTTP {resp.status_code}: {error_body[:500]}")
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        event = json.loads(line[len("data: "):])
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event.get("type")
+                    if etype == "content":
+                        full_text += event.get("content", "")
+                    elif etype == "conversation_id":
+                        conv_id = event.get("conversation_id", conv_id)
+                    elif etype == "journal_capture":
+                        journal_capture = {"path": event.get("path"), "created": bool(event.get("created"))}
+                    elif etype == "error":
+                        msg = event.get("message", "Unknown error")
+                        full_text += f"\n\nError: {msg}" if full_text else f"Error: {msg}"
+        return {"answer": full_text, "conversation_id": conv_id, "journal_capture": journal_capture}
+
+    monkeypatch.setattr("api.services.telegram.chat_via_api", chat_via_proxy)
+
+    ingest_app = FastAPI()
+    ingest_app.include_router(journal_ingest.router)
+    return TestClient(ingest_app), store
+
+
+def _journal_ingest_payload(**overrides):
+    payload = {
+        "text": _JOURNAL_FRAGMENT,
+        "device_id": "ring-test-1",
+        "timestamp": "2026-08-23T14:37:00Z",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _journal_ingest_auth():
+    return {"Authorization": "Bearer secret-token"}
+
+
+def test_capture_proof_survives_hermes_failure_and_retry_does_not_double_append(
+    journal_ingest_via_proxy, journal_vault,
+):
+    client, store = journal_ingest_via_proxy
+
+    first = client.post(
+        "/api/journal/ingest", json=_journal_ingest_payload(), headers=_journal_ingest_auth(),
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "logged"
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+    # A genuine retry of the SAME delivery — Hermes is STILL unreachable,
+    # but the dedupe key was already burned on the first attempt (its
+    # capture proof reached the ring ingest despite Hermes failing), so this
+    # must short-circuit as a duplicate rather than append a second bullet.
+    second = client.post(
+        "/api/journal/ingest", json=_journal_ingest_payload(), headers=_journal_ingest_auth(),
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "duplicate"
+
+    written = (journal_vault / log_path_for(date.today())).read_text()
+    assert [b.split(" · ")[1] for b in _bullets(written)] == [_JOURNAL_FRAGMENT]
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review follow-up (#685, finding 3): `/resolve-persona` resolves
+# a persona WITHOUT running a turn, so there is no ask/stream turn here for
+# the journal-capture gate to hook — `journal` must be refused visibly
+# instead of silently resolving into a phantom "Logged." reply with nothing
+# on disk, whether it arrived via an explicit tag (rule 1) or thread
+# inheritance (rule 2).
+# ---------------------------------------------------------------------------
+
+async def test_resolve_persona_rejects_tagged_journal(resolve_client, journal_persona_registered):
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={"text": "@journal had a thought"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 400
+    assert "journal" in resp.json()["detail"].lower()
+
+
+async def test_resolve_persona_rejects_inherited_journal(
+    resolve_client, journal_persona_registered,
+):
+    first = await resolve_client.post(
+        "/api/hermes/register-persona-message",
+        json={"chat_id": "chat-1", "message_id": "bot-msg-1", "persona_id": "journal"},
+        headers=_auth(),
+    )
+    assert first.status_code == 200
+
+    resp = await resolve_client.post(
+        "/api/hermes/resolve-persona",
+        json={
+            "text": "one more thing", "chat_id": "chat-1",
+            "message_id": "msg-2", "reply_to_message_id": "bot-msg-1",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 400
+    assert "journal" in resp.json()["detail"].lower()
