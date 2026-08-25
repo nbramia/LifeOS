@@ -541,6 +541,74 @@ async def _handle_agent_slash(stripped: str, conversation_id, store):
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
+def resolve_effective_persona_id(persona_id: Optional[str], persona: Optional[str]) -> Optional[str]:
+    """The exact persona-shape validation and effective-id derivation
+    `ask_stream()` performs for its `_effective_pid` — shared with the
+    Hermes proxy's journal-capture gate (`api/routes/hermes_proxy.py`,
+    #685 adversarial-review follow-up) so a raw-`persona` preamble turn
+    (`chat_via_api()`'s and the ring ingest's shape, not just a
+    `persona_id`-selected one) resolves identically on both surfaces —
+    approximating it as `persona_id or "primary"` alone, as the proxy's
+    envelope-building code does, silently misses a raw-preamble journal
+    turn entirely.
+
+    Raises `HTTPException(400)` for the same two malformed shapes
+    `ask_stream()`'s own persona resolution rejects: `persona_id` and
+    `persona` both given, or a `persona_id` that doesn't resolve to any
+    registered persona (including `""`, which resolves to nothing).
+    Returns `persona_id` once validated; otherwise, when only `persona` (a
+    raw preamble) was given, the registered bot name whose preamble matches
+    it verbatim — `None` if neither field is given or no bot matches.
+    """
+    if persona_id is not None:
+        if persona is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either persona_id or persona, not both",
+            )
+        if settings.resolve_persona(persona_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown persona_id: {persona_id!r}",
+            )
+        return persona_id
+    if persona:
+        return next((b.name for b in settings.telegram_bots if b.persona == persona), None)
+    return None
+
+
+def journal_capture_gate(persona_id: Optional[str], text: str) -> Optional[CaptureResult]:
+    """#674's deterministic journal capture, as a single gate shared by every
+    surface that can drive a journal-persona turn — the native path below and
+    the Hermes proxy relay (`api/routes/hermes_proxy.py`, #685) — so a third
+    surface can't recreate the gap this closes: the journal persona used to be
+    told to call `lifeos_vault_write` itself, a tool that doesn't exist in
+    either agentic loop, so every fragment was silently lost while the reply
+    still read like a successful capture.
+
+    No-op (returns `None`) for any persona other than `journal`. Must be
+    called BEFORE the caller's SSE stream opens / before the turn is handed
+    to a downstream backend — a capture failure is then a clean HTTP 500
+    instead of a mid-stream error: no caller can report success for a
+    fragment that was never written, and a delivery's idempotency key (the
+    ring ingest, `api/routes/journal_ingest.py`) stays unburned so a retry
+    can still land.
+
+    Raises `HTTPException(500)` on a write failure. Deliberately not
+    `str(e)` in the detail — it is surfaced to the user (Telegram renders it
+    verbatim) and must never quote the fragment.
+    """
+    if persona_id != JOURNAL_PERSONA_ID:
+        return None
+    try:
+        return capture_fragment(text)
+    except JournalCaptureError:
+        raise HTTPException(
+            status_code=500,
+            detail="journal capture failed: the fragment was not written",
+        )
+
+
 @router.post("/ask/stream")
 async def ask_stream(request: AskStreamRequest):
     """
@@ -588,35 +656,22 @@ async def ask_stream(request: AskStreamRequest):
     # Personal-context block: the therapist persona pre-resolves the user's people
     # from config so it can target sessions/messages without a lookup round. Works
     # on the persona_id path and the raw-`persona` (Telegram) path via a reverse
-    # lookup of the preamble back to a bot name.
-    _effective_pid = request.persona_id
-    if _effective_pid is None and request.persona:
-        _effective_pid = next((b.name for b in settings.telegram_bots if b.persona == request.persona), None)
+    # lookup of the preamble back to a bot name. By the time this runs, the block
+    # above has already validated persona_id/persona's shape, so
+    # resolve_effective_persona_id() below can't actually raise here — it's
+    # reused rather than re-inlined so the Hermes proxy's journal-capture gate
+    # (#685) shares the exact same derivation instead of approximating it.
+    _effective_pid = resolve_effective_persona_id(request.persona_id, request.persona)
     personal_context = settings.personal_context(_effective_pid or "")
 
-    # #674: the journal persona's capture is deterministic, done here in code,
-    # not left to the model. It used to be prompt-only — the persona was told to
-    # call `lifeos_vault_write`, a tool the native agentic loop does not have, so
-    # every fragment was lost while the reply read like a successful capture.
-    #
-    # Done BEFORE the SSE stream opens (like the persona resolution above) so a
-    # capture failure is a clean HTTP 500 rather than a mid-stream error: no
-    # caller can report success for a fragment that wasn't written, and the ring
-    # ingest's idempotency key stays unburned so a retry can still land. Covers
-    # every journal surface at once — the Telegram bot and the ingest endpoint
-    # both arrive here through `chat_via_api`'s raw-`persona` path, `/chat` and
-    # voice through `persona_id`.
-    journal_capture: Optional[CaptureResult] = None
-    if _effective_pid == JOURNAL_PERSONA_ID:
-        try:
-            journal_capture = capture_fragment(request.question)
-        except JournalCaptureError:
-            # Deliberately not `str(e)` — the detail is surfaced to the user
-            # (Telegram renders it verbatim) and must never quote the fragment.
-            raise HTTPException(
-                status_code=500,
-                detail="journal capture failed: the fragment was not written",
-            )
+    # #674 (shared with the Hermes proxy via `journal_capture_gate`, #685):
+    # deterministic journal capture, done here in code, not left to the
+    # model. Done BEFORE the SSE stream opens (like the persona resolution
+    # above) — see the helper's docstring for why. Covers every journal
+    # surface at once — the Telegram bot and the ingest endpoint both arrive
+    # here through `chat_via_api`'s raw-`persona` path, `/chat` and voice
+    # through `persona_id`.
+    journal_capture = journal_capture_gate(_effective_pid, request.question)
 
     # #611: the turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving

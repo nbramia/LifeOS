@@ -80,6 +80,7 @@ def make_backend_router(
     *, prefix, tag, backend_label, url_attr, token_attr, client_factory,
     transform_body: Optional[Callable[[bytes], bytes]] = None,
     make_observer: Optional[Callable[[bytes], Optional[object]]] = None,
+    pre_send: Optional[Callable[[bytes], list]] = None,
 ):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
 
@@ -143,6 +144,45 @@ def make_backend_router(
     it — and why an observer that returns `None` for a given request (a
     `make_observer` configured but declining to observe this one) falls
     through to the plain, still-client-tied `relay()` for that request.
+
+    `pre_send` (#685) runs a side-effecting precondition — the journal
+    persona's deterministic capture is the motivating case — before the
+    backend is contacted at all. Called once per request with the same raw,
+    pre-transform body the other two hooks receive, AFTER `transform_body`/
+    `make_observer` but BEFORE the upstream request is built: it may raise
+    `HTTPException` (e.g. a capture write failure) and that happens before a
+    single byte reaches the backend, exactly like `transform_body`'s own
+    HTTPException case above — no false success is possible, and whatever
+    "this delivery already happened" bookkeeping the caller does downstream
+    (e.g. an idempotency key) stays unclaimed. On success it returns a list
+    of frames (of whatever type `emit()`/`yield` already accept elsewhere in
+    this module — an SSE `data: ...` string, in practice) to hand the
+    browser BEFORE any backend byte. An empty list — the default for every
+    request this hook doesn't apply to — changes nothing; its absence (every
+    other backend) leaves this router exactly as it was before this
+    parameter existed.
+
+    A non-empty return ALSO changes how this request's backend call itself
+    is handled (#685 adversarial-review follow-up): a caller like
+    `chat_via_api()` (api/services/telegram.py) or the ring ingest
+    (api/routes/journal_ingest.py) treats a non-200 response as "nothing
+    happened" and never inspects its body, so if the backend call could
+    still turn into an HTTP-level 502 or a passed-through non-200 status,
+    proof that already reached disk (or wherever `pre_send`'s side effect
+    landed) would be silently discarded along with it. So once there ARE
+    prelude frames, `client_factory()`/the upstream call is made only AFTER
+    they're already queued for the browser, the response is unconditionally
+    a 200 SSE stream, and a connect failure or a non-200 upstream response
+    becomes an in-stream `{"type": "error", "message": ...}` event — the
+    same shape `api/routes/chat.py`'s native path already emits and
+    `chat_via_api()` already folds into its answer — rather than an
+    exception or a forwarded status code. This is why the plain path below
+    builds the upstream request unconditionally before deciding how to
+    relay it: that ordering is only wrong when there's a precondition's
+    proof to protect, i.e. only when `pre_send` is set AND actually returned
+    something for this request. Every other request (no `pre_send`, or one
+    that returns `[]` for this particular request — e.g. every non-journal
+    Hermes turn) takes the plain path, completely unchanged.
     """
     router = APIRouter(prefix=prefix, tags=[tag])
 
@@ -170,13 +210,96 @@ def make_backend_router(
         # otherwise stream straight through unbuffered (Agent), unchanged from
         # before #590. transform_body may raise HTTPException (e.g. a bad
         # persona) — that happens before client_factory(), so nothing is sent.
-        # make_observer (#592) shares this same raw body rather than a second
-        # request.body() read.
-        raw_body = await request.body() if (transform_body or make_observer) else None
+        # make_observer (#592) and pre_send (#685) share this same raw body
+        # rather than a second/third request.body() read.
+        raw_body = await request.body() if (transform_body or make_observer or pre_send) else None
         body = transform_body(raw_body) if transform_body else request.stream()
         observer = make_observer(raw_body) if make_observer else None
+        # pre_send may itself raise HTTPException (e.g. a journal capture
+        # write failure) — like transform_body's, that happens before
+        # client_factory() below, so the backend is never contacted.
+        prelude_frames = pre_send(raw_body) if pre_send else []
 
         client = client_factory()
+
+        if prelude_frames:
+            # #685 adversarial-review follow-up — see make_backend_router's
+            # docstring on `pre_send` for the full reasoning. Short version:
+            # a precondition's proof (journal capture) has already succeeded
+            # by the time there are frames here, and that proof must reach
+            # the caller no matter what the backend then does, so the
+            # backend call is made INSIDE the turn (after the frames are
+            # already queued) and its failure becomes an in-stream event
+            # rather than an HTTP-level 502/passed-through status.
+            #
+            # Reuses the same turn-registry/detached-pump machinery (#611)
+            # the observer branch below uses, so a journal turn survives a
+            # client disconnect and is cancellable the same way any other
+            # turn is.
+            client_turn_id = _sniff_client_turn_id(raw_body)
+            if client_turn_id:
+                get_turn_registry().cancel_by_client_turn_id(client_turn_id)
+            turn = get_turn_registry().create(
+                conversation_id=None,
+                modality=_sniff_modality(raw_body),
+                client_turn_id=client_turn_id,
+            )
+            if hasattr(observer, "bind_turn"):
+                observer.bind_turn(turn)
+
+            async def _pump_guaranteed():
+                try:
+                    for frame in prelude_frames:
+                        await turn.emit(frame)
+                    try:
+                        upstream_req = client.build_request(
+                            "POST", url, headers=headers, content=body,
+                        )
+                        upstream = await client.send(upstream_req, stream=True)
+                    except (httpx.RequestError, httpx.InvalidURL) as exc:
+                        logger.warning(
+                            "%s backend request failed after a precondition "
+                            "already succeeded: %s", backend_label, exc,
+                        )
+                        await turn.emit(
+                            "data: " + json.dumps({
+                                "type": "error",
+                                "message": f"{backend_label} backend unreachable: {exc}",
+                            }) + "\n\n"
+                        )
+                        return
+                    if upstream.status_code >= 400:
+                        logger.warning(
+                            "%s backend returned HTTP %s after a precondition "
+                            "already succeeded", backend_label, upstream.status_code,
+                        )
+                        await turn.emit(
+                            "data: " + json.dumps({
+                                "type": "error",
+                                "message": f"{backend_label} backend returned HTTP {upstream.status_code}",
+                            }) + "\n\n"
+                        )
+                        await upstream.aclose()
+                        return
+                    try:
+                        async for chunk in upstream.aiter_raw():
+                            if observer is not None:
+                                observer.observe(chunk)
+                            await turn.emit(chunk)
+                    finally:
+                        await upstream.aclose()
+                finally:
+                    if observer is not None:
+                        observer.finalize()
+                    await client.aclose()
+                    get_turn_registry().pop(turn)
+                    await turn.close()
+
+            turn.task = asyncio.create_task(_pump_guaranteed())
+            return StreamingResponse(
+                turn.reader(), status_code=200, media_type="text/event-stream",
+            )
+
         try:
             upstream_req = client.build_request(
                 "POST", url, headers=headers, content=body,
