@@ -1190,7 +1190,24 @@ class Settings(BaseSettings):
 
     @property
     def telegram_bots(self) -> list["TelegramBotConfig"]:
-        """Specialized Telegram bots beyond the primary, from the registry file.
+        """Specialized Telegram bots that can actually run — token env set.
+
+        Thin wrapper over :meth:`_load_registry_bots`; see it for the registry
+        format. Callers that start Telegram listeners want this one, since a
+        listener without a token is meaningless.
+        """
+        return self._load_registry_bots(require_token=True)
+
+    def _load_registry_bots(self, require_token: bool = True) -> list["TelegramBotConfig"]:
+        """Specialized bots from the registry file.
+
+        ``require_token=True`` (the default, used by Telegram listeners) drops
+        entries whose token env var is unset. ``require_token=False`` keeps
+        them, for surfaces that do not use Telegram at all — the web /chat UI
+        and voice list personas via :meth:`list_http_personas`, and requiring a
+        Telegram bot token to see a persona there was a coupling bug: it forced
+        creating a bot you never intend to message just to use a persona in the
+        browser.
 
         Each registry entry names an env var holding the bot's token; entries
         whose token is unset are skipped (logged) so a fresh clone with no extra
@@ -1230,7 +1247,7 @@ class Settings(BaseSettings):
                 logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
                 continue
             token = (env.get(entry.get("token_env", "")) or "").strip()
-            if not token:
+            if not token and require_token:
                 logger.info(
                     f"Telegram bot '{name}' skipped: env var "
                     f"{entry.get('token_env')!r} is unset"
@@ -1264,9 +1281,10 @@ class Settings(BaseSettings):
     def list_http_personas(self) -> list["PersonaInfo"]:
         """Chat personas visible to HTTP clients (web, voice/whisper-relay).
 
-        Returns the primary persona plus every configured specialized bot from
-        the registry whose token env is set (``telegram_bots`` already drops the
-        unset ones). No secrets are exposed. The primary persona and any
+        Returns the primary persona plus every specialized persona in the
+        registry, whether or not it has a Telegram bot token. These surfaces do
+        not use Telegram, so a token is irrelevant to them; gating on one meant
+        a persona was invisible in the browser until you created a bot for it. No secrets are exposed. The primary persona and any
         orchestrating bot (``orchestrates: true``, e.g. the doctor self-repair
         bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
         bots advertise none. Adding a registry entry + its token env var surfaces
@@ -1283,7 +1301,7 @@ class Settings(BaseSettings):
             capabilities=list(ORCHESTRATOR_PERSONA_CAPABILITIES),
             orchestrates=self.persona_orchestrates("primary"),
         )]
-        for bot in self.telegram_bots:
+        for bot in self._load_registry_bots(require_token=False):
             personas.append(PersonaInfo(
                 id=bot.name,
                 label=bot.label or bot.name.capitalize(),
