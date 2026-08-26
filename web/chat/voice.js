@@ -73,7 +73,12 @@ let clipInFlight = false;
 let thinkingEl = null;
 let ttsAudio = null;
 
-let dockSettings = { mute: false, auto: false, fast: false, listen: false };
+// Dock defaults for a first-time visitor (no stored settings yet). 2x playback,
+// auto-continue, and wake-word listening are on so voice mode is conversational
+// out of the box: speak, hear the reply at 2x, and be heard again without
+// touching anything. Mute stays off for the same reason. A stored choice always
+// wins over these — loadDockSettings() overwrites the whole object.
+let dockSettings = { mute: false, auto: true, fast: true, listen: true };
 
 class EmptyRecordingError extends Error {
   constructor() {

@@ -204,37 +204,61 @@ def _is_recording(page: Page):
 
 
 class TestListeningToggleBasics:
-    """Renders unchecked by default and persists like its siblings."""
+    """Renders checked by default and persists like its siblings."""
 
-    def test_default_is_off(self, page: Page, chat_base_url):
+    def test_default_is_on(self, page: Page, chat_base_url):
+        """Listening ships on, alongside Auto and 2x, so voice mode is
+        conversational without touching the dock. Mute is the one dock
+        toggle that stays off by default."""
         _open_voice_chat(page, chat_base_url)
-        expect(page.locator("#voiceListen")).not_to_be_checked()
+        expect(page.locator("#voiceListen")).to_be_checked()
+        expect(page.locator("#voiceAuto")).to_be_checked()
+        expect(page.locator("#voiceFast")).to_be_checked()
+        expect(page.locator("#voiceMute")).not_to_be_checked()
 
-    def test_checking_persists_across_reload(self, page: Page, chat_base_url):
+    def test_unchecking_persists_across_reload(self, page: Page, chat_base_url):
+        """A stored choice beats the default in both directions — opting out
+        of Listening has to survive a reload, or the default would silently
+        re-enable the mic hold on every visit."""
         _open_voice_chat(page, chat_base_url)
-        page.locator("#voiceListen").check()
+        page.locator("#voiceListen").uncheck()
 
         stored = page.evaluate(
             "JSON.parse(window.localStorage.getItem('lifeos:chat:dock_settings') || '{}')"
         )
-        assert stored.get("listen") is True
+        assert stored.get("listen") is False
 
         page.reload()
         page.wait_for_selector("#voiceListen")
 
-        expect(page.locator("#voiceListen")).to_be_checked()
+        expect(page.locator("#voiceListen")).not_to_be_checked()
 
 
 class TestListeningMicLifecycle:
     """Only meaningful in voice mode; releases the mic entirely on
     toggle-off or on leaving voice mode."""
 
-    def test_enabling_in_voice_mode_requests_mic(self, page: Page, chat_base_url):
+    def test_entering_voice_mode_requests_mic_with_the_default_on(
+            self, page: Page, chat_base_url):
+        """Listening is on by default, so the mic hold is acquired by entering
+        voice mode itself — no dock click required."""
         _open_voice_chat(page, chat_base_url)
-        assert page.evaluate("window.__gumCalls") == 0
+        page.wait_for_function("window.__gumCalls === 1")
+
+        assert page.evaluate("window.__lastGumConstraints") == {"audio": True}
+
+    def test_re_enabling_after_opting_out_requests_mic_again(
+            self, page: Page, chat_base_url):
+        """The enable transition still acquires a fresh hold after a user has
+        turned Listening off — the path a non-default user takes."""
+        _open_voice_chat(page, chat_base_url)
+        page.wait_for_function("window.__gumCalls === 1")
+
+        page.locator("#voiceListen").uncheck()
+        page.wait_for_function("window.__stopCalls > 0")
 
         page.locator("#voiceListen").check()
-        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("window.__gumCalls === 2")
 
         assert page.evaluate("window.__lastGumConstraints") == {"audio": True}
 
@@ -350,7 +374,12 @@ class TestListeningSuspension:
         assert page.evaluate("window.__recorderStartCalls") == 1
 
     def test_suspended_while_tts_is_playing_and_resumes_after(self, page: Page, chat_base_url):
+        """Isolates the TTS self-trigger guard. Auto is switched off here on
+        purpose: with Auto on (the default) auto-continue starts recording the
+        instant playback ends, which legitimately keeps wake detection
+        suspended — that interaction is pinned separately below."""
         _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()
         page.locator("#voiceListen").check()
         page.wait_for_function("window.__gumCalls === 1")
 
@@ -372,4 +401,31 @@ class TestListeningSuspension:
         triggered_after = _check_wake(page, "Hermes")
 
         assert triggered_after is True, "Listening did not resume after TTS playback ended"
+        assert page.evaluate("window.__recorderStartCalls") == 1
+
+    def test_auto_continue_takes_over_after_tts_instead_of_the_wake_word(
+            self, page: Page, chat_base_url):
+        """With both defaults on, the two features don't fight: when a reply
+        finishes, Auto is already recording the next utterance, so a wake match
+        is correctly suppressed rather than restarting or duplicating it. The
+        wake word is for re-entering an idle conversation, not for continuing
+        an active one."""
+        _open_voice_chat(page, chat_base_url)
+        expect(page.locator("#voiceAuto")).to_be_checked()
+        expect(page.locator("#voiceListen")).to_be_checked()
+        page.wait_for_function("window.__gumCalls === 1")
+
+        clip_url = page.evaluate("window.__makeWav(500)")
+        page.evaluate("(u) => { window.__turnClipUrl = u; }", clip_url)
+        page.evaluate("() => { window.lifeChatVoice.submitTurn({ transcript: 'hi' }); }")
+        page.wait_for_function("window.__audioPlayingCount > 0")
+        page.wait_for_function("window.__audioPlayingCount === 0", timeout=5000)
+
+        # Auto-continue owns the mic now.
+        page.wait_for_function("window.__recorderStartCalls === 1", timeout=5000)
+        assert _is_recording(page) is True
+
+        triggered = _check_wake(page, "Hermes")
+
+        assert triggered is False, "a wake match fired while auto-continue was already recording"
         assert page.evaluate("window.__recorderStartCalls") == 1

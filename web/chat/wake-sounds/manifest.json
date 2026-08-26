@@ -1,0 +1,18 @@
+{
+  "sounds": [
+    "jarvis-mk2__acknowledge_2.mp3",
+    "jarvis-mk2__acknowledge_4.mp3",
+    "jarvis-mk2__input_3.mp3",
+    "jarvis-mk2__input_8.mp3",
+    "jarvis-mk2__session_start_1.mp3",
+    "eve-walle__ack1.wav",
+    "eve-walle__start3.wav",
+    "eve-walle__done1.wav",
+    "d2_deckard_cain__GoodDay.wav",
+    "d2_deckard_cain__Hello.wav",
+    "d2_deckard_cain__Yes.wav",
+    "diablo-drops__gem.wav",
+    "diablo-drops__portalcast.wav",
+    "diablo-drops__ring.wav"
+  ]
+}
