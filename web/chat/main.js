@@ -22,6 +22,7 @@ import { loadPersonas, onPersonaChange, personaOrchestrates, personaSupportsHand
 import {
   initVoice, submitTurn, checkForWakeWord,
   checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+  isCancelUtterance,
 } from './voice.js';
 import { initBackend } from './backend.js';
 import { initModel, onModelChange } from './model.js';
@@ -103,4 +104,5 @@ Object.assign(window, {
 window.lifeChatVoice = {
   submitTurn, checkForWakeWord,
   checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+  isCancelUtterance,
 };
