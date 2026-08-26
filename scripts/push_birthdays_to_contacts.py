@@ -42,6 +42,30 @@ def get_apple_contacts_with_email():
         )
         return {}
 
+    # Fail fast when Contacts access has not been granted. A fetch with
+    # authorization status notDetermined makes macOS try to raise a consent
+    # prompt; under launchd/cron there is no GUI session to show it, so the
+    # call BLOCKS INDEFINITELY rather than erroring. Observed on a Mac mini as
+    # a 60-minute sync timeout every night, which also dependency-skipped
+    # downstream sources — all from a source that had 12 birthdays to push.
+    #
+    # Only skip when nobody could answer a prompt. Interactively (a human at a
+    # TTY) fall through and let macOS ask, since that is how the grant gets
+    # created in the first place — skipping there would make the permission
+    # effectively ungrantable.
+    status = Contacts.CNContactStore.authorizationStatusForEntityType_(0)
+    CN_AUTHORIZED = 3
+    if status != CN_AUTHORIZED and not sys.stdin.isatty():
+        state = {0: "notDetermined", 1: "restricted", 2: "denied"}.get(status, str(status))
+        print(
+            "SYNC_SKIPPED: Apple Contacts access not granted "
+            f"(authorization status: {state}). Grant Contacts access to the "
+            "Python binary in System Settings -> Privacy & Security -> "
+            "Contacts, or run this script once from a terminal to be prompted.",
+            flush=True,
+        )
+        return {}
+
     store = Contacts.CNContactStore.alloc().init()
 
     keys_to_fetch = [
