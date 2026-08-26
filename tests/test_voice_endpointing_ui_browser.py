@@ -358,9 +358,11 @@ class TestCancelledDuringCheck:
         page.locator("#voiceTalkBtn").click(force=True)
         page.wait_for_function("window.__recorderStopCalls === 1")
 
-        # Auto is on, so the manual stop's own empty-recording path (the
-        # fake stream is silent) re-triggers Auto-continue, starting a
-        # brand-new recording that reuses the same mic stream.
+        # A manual stop stays stopped, even with Auto on (#721) -- so start
+        # the next recording the way a user would, by tapping again. This is
+        # the case the token guard exists for: a *different* recording is now
+        # live than the one the in-flight check transcribed.
+        _start_recording(page)
         page.wait_for_function("window.__recorderStartCalls === 2")
         page.wait_for_function("window.__gumCalls === 1")  # never a second getUserMedia call
 
