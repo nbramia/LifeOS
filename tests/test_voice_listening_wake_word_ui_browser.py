@@ -281,16 +281,40 @@ class TestListeningToggleBasics:
 
 class TestListeningMicLifecycle:
     """Only meaningful in voice mode; releases the mic entirely on
-    toggle-off or on leaving voice mode."""
+    toggle-off or on leaving voice mode.
+
+    #740 note: the constraints assertions below check `__lastGumConstraints`
+    -- the object actually passed to `navigator.mediaDevices.getUserMedia()`
+    -- rather than reading the resulting track's `getConstraints()`/
+    `getSettings()`. Verified empirically (real Chromium, not a guess): a
+    track from `AudioContext.createMediaStreamDestination()` -- what the fake
+    `getUserMedia()` stub above returns, since headless Chromium has no real
+    microphone to hand back a genuine device track -- reports
+    `getConstraints() === {}` and a `getSettings()` with only generic
+    WebAudio fields (channelCount/deviceId/latency/sampleRate/sampleSize),
+    none of echoCancellation/noiseSuppression/autoGainControl, regardless of
+    what was requested. A synthetic stream never had real device constraints
+    applied to it in the first place, so asserting on it would test nothing;
+    the call-site object is the only place this suite can meaningfully
+    observe what was requested."""
 
     def test_entering_voice_mode_requests_mic_with_the_default_on(
             self, page: Page, chat_base_url):
         """Listening is on by default, so the mic hold is acquired by entering
-        voice mode itself — no dock click required."""
+        voice mode itself — no dock click required. #740: the wake stream is
+        requested with echoCancellation/noiseSuppression/autoGainControl all
+        explicitly off — unlike the plain `{ audio: true }` the recording
+        path still uses (see WAKE_STREAM_CONSTRAINTS in voice.js)."""
         _open_voice_chat(page, chat_base_url)
         page.wait_for_function("window.__gumCalls === 1")
 
-        assert page.evaluate("window.__lastGumConstraints") == {"audio": True}
+        assert page.evaluate("window.__lastGumConstraints") == {
+            "audio": {
+                "echoCancellation": False,
+                "noiseSuppression": False,
+                "autoGainControl": False,
+            }
+        }
 
     def test_re_enabling_after_opting_out_requests_mic_again(
             self, page: Page, chat_base_url):
@@ -305,7 +329,13 @@ class TestListeningMicLifecycle:
         page.locator("#voiceListen").check()
         page.wait_for_function("window.__gumCalls === 2")
 
-        assert page.evaluate("window.__lastGumConstraints") == {"audio": True}
+        assert page.evaluate("window.__lastGumConstraints") == {
+            "audio": {
+                "echoCancellation": False,
+                "noiseSuppression": False,
+                "autoGainControl": False,
+            }
+        }
 
     def test_leaving_voice_mode_stops_the_tracks(self, page: Page, chat_base_url):
         _open_voice_chat(page, chat_base_url)
@@ -517,6 +547,47 @@ class TestListeningSuspension:
 
         # And detection genuinely works again, not just the graph being
         # nominally "running" -- a real wake match still triggers recording.
+        triggered = _check_wake(page, "Hermes")
+        assert triggered is True
+        assert page.evaluate("window.__recorderStartCalls") == 1
+
+    def test_wake_track_itself_disables_during_playback_and_reenables_after(
+            self, page: Page, chat_base_url):
+        """#740: #734 believed listenAudioCtx.suspend() (above) fully
+        deactivated the wake tap during playback, but suspend() only stops
+        the graph's *processing* -- the underlying MediaStreamTrack keeps
+        capturing regardless, which is the actual mechanism behind the
+        popping that persisted after #734 shipped (confirmed on real
+        hardware: it correlates exactly with the Listening toggle).
+        isListenTrackEnabled() checks the wake stream's own track.enabled
+        state directly -- independent of, and in addition to, the context
+        suspend/resume this suite already covers -- and __gumCalls/
+        __stopCalls confirm disabling the track never touches the mic
+        permission: no second getUserMedia, no track stop, so no re-prompt
+        across the cycle."""
+        _open_voice_chat(page, chat_base_url)
+        page.locator("#voiceAuto").uncheck()  # isolate from auto-continue, as above
+        page.locator("#voiceListen").check()
+        page.wait_for_function("window.__gumCalls === 1")
+        page.wait_for_function("() => window.lifeChatVoice.isListenTrackEnabled() === true")
+
+        clip_url = page.evaluate("window.__makeWav(500)")
+        page.evaluate("(u) => { window.__turnClipUrl = u; }", clip_url)
+        page.evaluate("() => { window.lifeChatVoice.submitTurn({ transcript: 'hi' }); }")
+        page.wait_for_function("window.__audioPlayingCount > 0")
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTrackEnabled() === false")
+        assert page.evaluate("window.__gumCalls") == 1
+        assert page.evaluate("window.__stopCalls") == 0
+
+        page.wait_for_function("window.__audioPlayingCount === 0", timeout=5000)
+
+        page.wait_for_function("() => window.lifeChatVoice.isListenTrackEnabled() === true")
+        assert page.evaluate("window.__gumCalls") == 1
+        assert page.evaluate("window.__stopCalls") == 0
+
+        # Wake detection genuinely works again after the track re-enables --
+        # not just the flag flipping back.
         triggered = _check_wake(page, "Hermes")
         assert triggered is True
         assert page.evaluate("window.__recorderStartCalls") == 1

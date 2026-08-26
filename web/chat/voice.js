@@ -103,6 +103,14 @@ function setClipInFlight(value) {
 // processing without touching the mic stream or the node wiring, so a wake
 // match still works the instant recording ends, with zero extra
 // getUserMedia calls.
+//
+// #740: suspend()/resume() above are NOT enough on their own -- they stop
+// the graph's *processing*, but the underlying MediaStreamTrack keeps
+// capturing regardless, so the same shouldSuspend condition below also
+// drives setListenTracksEnabled(), which disables/re-enables the wake
+// stream's own tracks in lockstep. See that function's comment and the
+// taps-inventory block above ensureAudioContext() for why an open capture
+// is a second, independent hazard from main-thread contention.
 function updateListenSuspension() {
   if (!listenAudioCtx) return;
   const shouldSuspend = clipInFlight || isRecording;
@@ -111,6 +119,7 @@ function updateListenSuspension() {
   } else if (!shouldSuspend && listenAudioCtx.state === 'suspended') {
     listenAudioCtx.resume().catch(() => {});
   }
+  setListenTracksEnabled(!shouldSuspend);
 }
 
 // Every write to `isRecording` goes through here (#724), for the same
@@ -491,6 +500,9 @@ async function acquireMicStream() {
   for (const delay of backoffMs) {
     if (delay) await new Promise((r) => setTimeout(r, delay));
     try {
+      // Deliberately plain `{ audio: true }`, unlike WAKE_STREAM_CONSTRAINTS
+      // (Listening section, below) -- see that constant's comment for the
+      // reasoning (#740).
       return await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
       lastErr = err;
@@ -615,6 +627,32 @@ function beginRecording(stream) {
 // and running regardless, same contention, different trigger.
 // `updateListenSuspension()` (by `setClipInFlight()`/`setIsRecording()`)
 // generalizes the fix to both conditions at once.
+//
+// A second, independent hazard (#740): main-thread contention is not the
+// only way an unneeded tap degrades playback. `AudioContext.suspend()`
+// stops the graph's *processing*, but it does NOT stop the underlying
+// `MediaStreamTrack` -- the microphone capture itself stays live regardless
+// of whether anything reads it. #734's fix above was necessary but not
+// sufficient: it shipped believing `listenAudioCtx.suspend()` fully
+// deactivated the wake tap during playback, and on real hardware it did
+// not -- popping persisted, correlating exactly with the Listening toggle,
+// because the capture was never actually stopped. An open capture, on its
+// own, degrades output independently of CPU: `getUserMedia({ audio: true })`
+// (the un-narrowed constraints, before #740) enables echoCancellation --
+// which has to reference the current output signal to cancel it, hooking
+// the output path for as long as the capture stays open -- and a live
+// capture can also force a play-and-record audio session on some platforms,
+// which can resample or otherwise degrade output. Both last exactly as long
+// as the track is capturing, not as long as the graph is processing.
+// **The correct invariant is that the mic must not merely be un-read during
+// playback, it must be un-captured**: `track.enabled = false` on top of
+// `AudioContext.suspend()`, not instead of it (the suspend/resume is still
+// correct and worth keeping for its own reason -- CPU). See
+// `setListenTracksEnabled()` and `WAKE_STREAM_CONSTRAINTS` in the Listening
+// section below for the fix, and `isListenTrackEnabled()` for the browser
+// test seam that distinguishes "capturing" from "processing" the way
+// `isListenTapRunning()` already distinguishes "processing" from
+// "detecting".
 //
 // Anyone adding a fourth tap (or re-enabling one of these outside its
 // documented window) must account for the aggregate main-thread cost across
@@ -1243,6 +1281,31 @@ function playWakeChime() {
   }).catch(() => {});  // belt-and-suspenders -- loadWakeChimeManifest() already never throws
 }
 
+// #740 -- getUserMedia constraints for the wake stream specifically (see
+// startListening() below), deliberately different from the plain
+// `{ audio: true }` acquireMicStream() (the talk-button/recording path)
+// still uses. Bare `audio: true` accepts the browser's defaults, which
+// enable echoCancellation, noiseSuppression, and autoGainControl.
+// Echo cancellation in particular has to reference the current output
+// signal to cancel it, so an AEC-enabled capture hooks the output path for
+// as long as it stays open -- and with Listening shipping on by default,
+// that's the entire time voice mode is open, including through every TTS
+// playback. The wake detector is a simple energy VAD plus a whisper
+// round-trip on the captured burst; it gets no benefit from any of the
+// three, and detection is already suspended during playback
+// (updateListenSuspension() below), so the assistant's own voice leaking
+// into an un-cancelled capture is harmless -- nothing reads it while a clip
+// plays. The *recording* stream (acquireMicStream()) deliberately keeps the
+// browser defaults: AEC/NS/AGC genuinely help transcription quality of the
+// user's own speech, and unlike the wake stream, the recording stream is
+// only open for user-directed capture -- not held open, armed, through
+// playback -- so it isn't implicated by this bug (see #740: popping
+// correlates exactly with the Listening toggle, not with whether a prior
+// recording's stream is still cached).
+const WAKE_STREAM_CONSTRAINTS = {
+  audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+};
+
 let listenStream = null;
 let listenAudioCtx = null;
 let listenSource = null;
@@ -1252,6 +1315,38 @@ let listenSpeechMs = 0;
 let listenSilenceMs = 0;
 let listenInBurst = false;
 let listenChecking = false;  // an STT round-trip for an already-captured burst is in flight
+
+// #740 -- disables/re-enables the wake stream's own MediaStreamTracks,
+// called by updateListenSuspension() above in lockstep with
+// listenAudioCtx.suspend()/resume(). AudioContext.suspend() only stops
+// *processing* what the track produces; the browser keeps the underlying
+// capture itself live regardless, which is exactly the mechanism #734
+// missed -- an open capture forces a play-and-record audio session (and,
+// were WAKE_STREAM_CONSTRAINTS not already off, would keep an AEC pipeline
+// hooked to the output) for as long as any track feeding it stays live, not
+// just while something reads its output. Per spec, `track.enabled = false`
+// stops the track from producing anything (silence instead) without
+// touching the permission grant, so toggling it back never re-prompts and
+// never requires a fresh getUserMedia call -- same no-extra-acquisition
+// guarantee the context suspend/resume already provides. No-op when
+// Listening isn't running (listenStream null).
+function setListenTracksEnabled(enabled) {
+  if (!listenStream) return;
+  for (const t of listenStream.getAudioTracks()) t.enabled = enabled;
+}
+
+// Test seam (#740): whether the wake stream's own tracks are currently
+// capturing, as opposed to isListenTapRunning() below (whether the
+// AudioContext graph is processing). The two are set in lockstep by
+// updateListenSuspension() but are independent browser-level states -- this
+// lets a browser test assert the capture itself stops, not just the
+// context, closing the exact gap #734 missed.
+export function isListenTrackEnabled() {
+  if (!listenStream) return null;
+  const tracks = listenStream.getAudioTracks();
+  if (tracks.length === 0) return null;
+  return tracks.every((t) => t.enabled === true);
+}
 
 // The shared guards: recording, a turn in flight, or TTS playing
 // (clipInFlight -- the self-trigger guard, independent of the mute toggle,
@@ -1283,7 +1378,13 @@ async function startListening() {
   if (micBlockReason()) return;  // same preconditions as the talk button; fail silent here
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // #740 -- the wake stream is requested WITHOUT the browser's default
+    // audio-processing chain (echoCancellation/noiseSuppression/
+    // autoGainControl all explicitly off), unlike acquireMicStream() below
+    // (the talk-button/recording path), which deliberately keeps the
+    // defaults. See WAKE_STREAM_CONSTRAINTS for the reasoning -- this is a
+    // considered split, not an oversight.
+    stream = await navigator.mediaDevices.getUserMedia(WAKE_STREAM_CONSTRAINTS);
   } catch (e) {
     return;  // denied/unavailable -- Listening just doesn't run
   }
