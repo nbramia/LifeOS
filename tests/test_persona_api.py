@@ -60,7 +60,13 @@ class TestListHttpPersonas:
         assert fitness.capabilities == []  # specialized bots are pure chat
         assert fitness.orchestrates is False
 
-    def test_unset_token_bot_omitted(self, tmp_path, monkeypatch):
+    def test_unset_token_bot_still_listed_for_http(self, tmp_path, monkeypatch):
+        """A persona with no Telegram token is still usable in /chat and voice.
+
+        Those surfaces never speak Telegram, so a bot token is irrelevant to
+        them. Telegram listeners still require one — asserted below — because a
+        listener without a token cannot poll.
+        """
         reg = _registry(tmp_path, [
             {"name": "fitness", "token_env": "TG_FIT"},
             {"name": "therapist", "token_env": "TG_THER"},
@@ -68,6 +74,42 @@ class TestListHttpPersonas:
         monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
         monkeypatch.setenv("TG_FIT", "tok")
         monkeypatch.delenv("TG_THER", raising=False)
+        from config.settings import settings
+
+        # HTTP surfaces: both personas available.
+        assert [p.id for p in settings.list_http_personas()] == [
+            "primary", "fitness", "therapist",
+        ]
+        # Telegram listeners: only the one that can actually run.
+        assert [b.name for b in settings.telegram_bots] == ["fitness"]
+
+    def test_local_override_replaces_template(self, tmp_path, monkeypatch):
+        """An untracked local registry wins over the tracked template.
+
+        The template is repo-wide; the local file is this install's selection.
+        It REPLACES rather than merges, so dropping an entry there actually
+        drops it — otherwise you could never disable a persona the template
+        ships.
+        """
+        template = _registry(tmp_path, [
+            {"name": "fitness", "token_env": "TG_FIT"},
+            {"name": "therapist", "token_env": "TG_THER"},
+        ])
+        local = tmp_path / "telegram_bots.local.json"
+        local.write_text(json.dumps([{"name": "journal", "token_env": "TG_JOURNAL"}]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", template)
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_LOCAL_FILE", local)
+        from config.settings import settings
+
+        ids = [p.id for p in settings.list_http_personas()]
+        assert ids == ["primary", "journal"]
+        assert "fitness" not in ids and "therapist" not in ids
+
+    def test_template_used_when_no_local_override(self, tmp_path, monkeypatch):
+        template = _registry(tmp_path, [{"name": "fitness", "token_env": "TG_FIT"}])
+        missing = tmp_path / "does-not-exist.local.json"
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", template)
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_LOCAL_FILE", missing)
         from config.settings import settings
 
         assert [p.id for p in settings.list_http_personas()] == ["primary", "fitness"]

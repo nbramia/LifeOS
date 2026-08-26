@@ -697,3 +697,17 @@ def reset_ml_singletons_at_session_end():
         reset_ml_singletons()
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _no_local_telegram_bots_override(tmp_path_factory, monkeypatch):
+    """Keep a real config/telegram_bots.local.json out of the test run.
+
+    The registry loader prefers the untracked local override over the tracked
+    template. Tests monkeypatch ``_TELEGRAM_BOTS_FILE`` (the template), so on a
+    machine that actually has a local override the loader would read that
+    instead of the fixture and the tests would depend on developer state.
+    Point the local path at somewhere that cannot exist.
+    """
+    missing = tmp_path_factory.mktemp("no-local-bots") / "telegram_bots.local.json"
+    monkeypatch.setattr("config.settings._TELEGRAM_BOTS_LOCAL_FILE", missing, raising=False)
