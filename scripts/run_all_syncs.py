@@ -704,12 +704,21 @@ SYNC_ORDER = [
     # refresh here to catch anything missed (photos, edge cases, timestamps)
     "person_stats_full",        # Full refresh of all PersonEntity counts + timestamps
     "relationship_discovery",   # Discover relationships, populate edge weights
-    "strengths",                # Calculate relationship strength scores
     "push_birthdays",           # Push LifeOS birthdays to Apple Contacts
 
     # === Phase 4: Vector Store Indexing ===
     # Index content with fresh people data available for entity resolution
     "vault_reindex",            # Full reindex with LLM summaries (no timeout)
+    # `strengths` runs AFTER vault_reindex, not with the other Phase 3
+    # relationship work, because vault_reindex *creates people* from vault
+    # mentions. Ranked before it, those people are never scored: they get a
+    # NULL relationship_strength and NULL dunbar_circle until the following
+    # night. Observed on a real install as 243 circle-less people, all of them
+    # created by that night's own vault_reindex (7354 people in the store vs
+    # 7084 seen by strengths). sync_strengths.py's own docstring already says
+    # it "should run after all other syncs"; this makes the ordering match.
+    # It stays ahead of crm_vectorstore so indexed people carry fresh scores.
+    "strengths",                # Calculate relationship strength scores
     "crm_vectorstore",          # Index CRM people for semantic search
 
     # === Phase 5: Content Sync ===
