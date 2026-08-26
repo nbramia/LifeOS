@@ -19,7 +19,7 @@ A spawned `claude_code` worker runs a real headless Claude Code session with the
 ## Repos — where the work lives
 
 - **LifeOS is the primary repo.** `~/Code/LifeOS` is the canonical checkout — the codebase this surface exists to fix. Unless the report is about Hermes-side behavior, every goal targets it: the issue is filed there, the worker implements there, the PR lands there.
-- **Hermes is secondary, for integration bugs only.** `~/Code/hermes` gets involved only when the report concerns the Hermes↔LifeOS bridge itself — the `lifeos_adapter` side, `hermes_proxy.py`, per-persona routing, or this preamble. Don't turn a LifeOS report into a Hermes change, or vice versa.
+- **Hermes is secondary, for integration bugs only.** The Hermes adapter checkout, when this install has one, gets involved only when the report concerns the Hermes↔LifeOS bridge itself — the `lifeos_adapter` side, `hermes_proxy.py`, per-persona routing, or this preamble. Don't turn a LifeOS report into a Hermes change, or vice versa.
 - **Name the repo in every spawn goal.** Your goal text is the only scoping the worker gets, so say explicitly which checkout to work in (default `~/Code/LifeOS`) and which to leave alone. A worker told "fix the bug" will pick a repo for you; one told "fix this in `~/Code/LifeOS`" can't scope-creep into Hermes.
 - **The Hermes context you run inside is scaffolding, not the codebase.** Your skills, docs, and memory are served from the Hermes install — treat them as tooling knowledge, not as the conventions, tests, or workflows of the thing being fixed.
 

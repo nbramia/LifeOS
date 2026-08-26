@@ -978,3 +978,72 @@ def test_finance_registered_in_bot_registry():
     assert finance["persona_file"] == "config/personas/finance.md"
     assert finance["label"] == "Finance", "finance displays as 'Finance' in the chat UI"
     assert not finance.get("orchestrates"), "finance is pure-chat, not an orchestrator"
+
+
+# ---------------------------------------------------------------------------
+# doctor.hermes.md — repo-scoping section stays generic (#744 revision)
+# ---------------------------------------------------------------------------
+
+_DOCTOR_HERMES_FILE = Path(__file__).parent.parent / "config" / "personas" / "doctor.hermes.md"
+
+
+@pytest.mark.unit
+def test_doctor_hermes_repo_section_has_no_hardcoded_hermes_checkout():
+    """The 'Repos' section must scope work to the LifeOS repo without assuming
+    a private ~/Code/hermes checkout exists on every install — that path is
+    operator-specific and not something a fresh open-source clone has."""
+    text = _DOCTOR_HERMES_FILE.read_text()
+    assert "~/Code/hermes" not in text, "hardcoded private-repo path leaked into a committed persona file"
+    assert "~/Code/LifeOS" in text, "LifeOS checkout guidance is still explicit"
+    assert "Hermes adapter checkout" in text, "role-based phrasing for the Hermes repo is present"
+    import re
+    assert not re.search(r"/home/[a-z]", text), "no absolute home path in the committed file"
+
+
+@pytest.mark.unit
+def test_doctor_hermes_still_scopes_every_spawn_goal_to_a_repo():
+    """The surrounding guidance (name the repo in every spawn goal, LifeOS is
+    primary) is untouched by the wording fix."""
+    text = _DOCTOR_HERMES_FILE.read_text()
+    assert "Name the repo in every spawn goal" in text
+    assert "LifeOS is the primary repo" in text
+
+
+# ---------------------------------------------------------------------------
+# primary.md — hands LifeOS-repair requests to doctor (#746)
+# ---------------------------------------------------------------------------
+
+_PRIMARY_FILE = Path(__file__).parent.parent / "config" / "personas" / "primary.md"
+
+
+@pytest.mark.unit
+def test_primary_persona_hands_repo_changes_to_doctor():
+    """Primary must plainly name doctor as the destination for a request to
+    *change* LifeOS, without gaining doctor's own safety invariants inline
+    (those stay in doctor.md/doctor.hermes.md — no duplicated prose)."""
+    text = _PRIMARY_FILE.read_text()
+    assert "doctor" in text.lower(), "primary names doctor as the handoff destination"
+    assert "change" in text.lower() and "understand" in text.lower(), \
+        "the rule distinguishes changing LifeOS from understanding it"
+    # Don't duplicate doctor's own invariant prose verbatim into primary.
+    assert "Never bill the API on the user's behalf" not in text
+    assert "goal-first orchestrator" not in text
+
+
+@pytest.mark.unit
+def test_primary_persona_still_parses_and_resolves():
+    from config.settings import _parse_persona
+    body, voice, model = _parse_persona(_PRIMARY_FILE.read_text(), "primary")
+    assert body.strip()
+    assert "Out of scope" in body or "out of scope" in body.lower()
+    assert isinstance(voice, tuple) and voice
+
+
+@pytest.mark.unit
+def test_no_primary_hermes_variant_file_created():
+    """#746 deliberately defers extracting shared orchestration-invariant prose
+    into a common block until a second orchestrator exists — no primary.hermes.md
+    or similar sibling should appear as a side effect of this change."""
+    personas_dir = _PRIMARY_FILE.parent
+    variants = sorted(p.name for p in personas_dir.glob("primary.*.md"))
+    assert variants == [], f"unexpected primary surface-variant file(s): {variants}"
