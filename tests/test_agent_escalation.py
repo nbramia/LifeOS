@@ -467,6 +467,36 @@ def test_remote_not_in_non_api_rungs():
     assert "remote" not in NON_API_RUNGS
 
 
+def test_local_escalation_rung_ignores_the_699_remote_executor_flag(monkeypatch):
+    """(#699) The agent worker's flag-gated remote fallback lives entirely
+    in agent_worker/local_executor.py — a different code path from the chat
+    orchestrator's escalation ladder in this module. Proves it structurally:
+    even with LIFEOS_AGENT_REMOTE_EXECUTOR on, the remote provider fully
+    configured, AND the local llama-server simulated unreachable, the
+    ladder's "local" rung (chat.py sets force_local=True for it) still
+    builds a plain local-llama-server client — automatic escalation has no
+    path to the remote executor, on top of NON_API_RUNGS already keeping
+    "remote" off the ladder entirely (test_remote_not_in_non_api_rungs)."""
+    from config.settings import settings
+    from api.services.llm_client import LocalLLMClient
+
+    monkeypatch.setattr(settings, "agent_remote_executor", True, raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://remote.example/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "remote-model", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "key", raising=False)
+    monkeypatch.setattr(settings, "llm_backend", "anthropic", raising=False)
+    # Even if the local server were down, _select_client's force_local branch
+    # never calls is_available() at all — but simulate it anyway so the test
+    # fails loudly if a future change makes that branch consult reachability.
+    monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: False)
+
+    client = _select_client("local", force_local=True)
+
+    assert isinstance(client, LocalLLMClient)
+    assert client.base_url == LocalLLMClient().base_url
+    assert client.base_url != "https://remote.example/v1"
+
+
 # ---------------------------------------------------------------------------
 # engine handoff directives (#305 part b)
 # ---------------------------------------------------------------------------

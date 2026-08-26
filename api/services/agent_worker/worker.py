@@ -252,13 +252,23 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     return text[: m.end()], text[m.end():]
 
 
-def _worker_label(routing: str | None) -> str:
+def _worker_label(routing: str | None, served_by: str = "") -> str:
     """Telegram-message prefix that names the route — operator wants to
     know at a glance whether a result came from local Gemma or cloud
     Claude. Defaults to the generic "Agent worker" when the routing
-    isn't known yet (e.g., startup recovery messages)."""
+    isn't known yet (e.g., startup recovery messages).
+
+    (#699) `served_by` is the model id that actually ran the session when
+    it differs from what the routing name implies — currently only the
+    flag-gated remote fallback on the "local" route. Empty (the default,
+    and every session not on that fallback) leaves the label unchanged —
+    report observed, not configured (#658), only when there's something
+    to report."""
     if routing == ROUTE_LOCAL:
-        return "Local agent worker"
+        label = "Local agent worker"
+        if served_by:
+            label += f" (remote fallback: {served_by})"
+        return label
     if routing == ROUTE_CLAUDE:
         return "Cloud agent worker"
     return "Agent worker"
@@ -2330,7 +2340,8 @@ class Worker:
                 )
                 self._notify_terminal(
                     session,
-                    f"⚠️ {_worker_label(session.routing)}: task '{title}' returned "
+                    f"⚠️ {_worker_label(session.routing, served_by=getattr(outcome, 'served_by', ''))}: "
+                    f"task '{title}' returned "
                     f"empty result with no side-effect tool use — marking failed. "
                     f"What the agent did:\n\n{recovered}\n\n"
                     f"Transcript: `data/agent_transcripts/{sid}.jsonl`",
@@ -2429,7 +2440,7 @@ class Worker:
         active_s = int(refreshed.total_active_seconds or 0)
         expected = refreshed.expected_output or "text"
         title = task.get("description", session.task_id)
-        label = _worker_label(refreshed.routing or session.routing)
+        label = _worker_label(refreshed.routing or session.routing, served_by=getattr(outcome, "served_by", ""))
         # Four-bucket token breakdown so the operator can see what drove cost.
         # For local sessions cache buckets are always zero and collapse out of
         # the rendered string.
