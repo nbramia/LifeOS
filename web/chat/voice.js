@@ -73,7 +73,7 @@ let clipInFlight = false;
 let thinkingEl = null;
 let ttsAudio = null;
 
-let dockSettings = { mute: false, auto: false, fast: false };
+let dockSettings = { mute: false, auto: false, fast: false, listen: false };
 
 class EmptyRecordingError extends Error {
   constructor() {
@@ -91,7 +91,7 @@ function loadDockSettings() {
     const raw = window.localStorage.getItem(DOCK_SETTINGS_KEY);
     if (raw) {
       const p = JSON.parse(raw);
-      dockSettings = { mute: !!p.mute, auto: !!p.auto, fast: !!p.fast };
+      dockSettings = { mute: !!p.mute, auto: !!p.auto, fast: !!p.fast, listen: !!p.listen };
     }
   } catch (e) {
     /* storage blocked */
@@ -110,6 +110,7 @@ function persistDockSettings() {
 function shouldPlayAudio() { return !dockSettings.mute; }
 function getAutoContinue() { return dockSettings.auto; }
 function getPlaybackRate() { return dockSettings.fast ? FAST_PLAYBACK_RATE : 1; }
+function isListeningEnabled() { return !!dockSettings.listen; }
 
 function applyPlaybackRate(audio) {
   audio.playbackRate = getPlaybackRate();
@@ -289,6 +290,11 @@ function formatMicError(err) {
 }
 
 export function initVoice() {
+  // Loaded before the first applyVoiceMode() call below (#710): that call
+  // syncs the Listening mic hold to dockSettings.listen, so the setting has
+  // to be in memory before voice mode is first applied, not after.
+  loadDockSettings();
+
   const explicit = resolveExplicitVoiceMode();
   config.voiceMode = explicit === true;  // text until the server default resolves
   applyVoiceMode();
@@ -303,10 +309,10 @@ export function initVoice() {
     });
   }
 
-  loadDockSettings();
   wireDockToggle(elements.voiceMute, 'mute', () => { if (dockSettings.mute) stopAllAudio(); });
   wireDockToggle(elements.voiceFast, 'fast', syncActivePlaybackRates);
   wireDockToggle(elements.voiceAuto, 'auto');
+  wireDockToggle(elements.voiceListen, 'listen', onListenToggleChange);
 
   const talk = elements.voiceTalkBtn;
   if (talk) {
@@ -338,6 +344,11 @@ function applyVoiceMode() {
   document.body.classList.toggle('voice-mode', isVoiceMode());
   if (elements.modeTextBtn) elements.modeTextBtn.classList.toggle('active', !isVoiceMode());
   if (elements.modeVoiceBtn) elements.modeVoiceBtn.classList.toggle('active', isVoiceMode());
+  // Listening (#710) is only meaningful in voice mode -- leaving voice mode
+  // releases its mic hold entirely; entering it (with the toggle already on)
+  // re-acquires it. startListening()/stopListening() are both idempotent.
+  if (isVoiceMode() && isListeningEnabled()) startListening();
+  else stopListening();
 }
 
 function setTalkActive(on) {
@@ -829,6 +840,271 @@ async function maybeAutoContinue() {
   } catch (e) {
     /* mic re-acquire may need a tap on some platforms */
   }
+}
+
+// --- Listening: wake-word ("Hermes") detection (#710) ---
+//
+// A fourth dock toggle, default off, persisted like its siblings (dockSettings
+// above). While on and in voice mode, this holds its *own* mic stream --
+// deliberately never the `micStream` the talk button acquires and reuses
+// across taps (requestMicInGesture() above) -- and runs a lightweight
+// energy-based VAD in JS. No third-party wake-word engine, no Web Speech API
+// (that ships audio to Google -- a hard no for an all-local project). When a
+// speech burst ends, the short clip is POSTed to a bare STT endpoint and the
+// transcript is fuzzy-matched against "Hermes". A match calls
+// beginRecordingFromTap() -- the same function the talk button itself calls
+// -- so a wake trigger is indistinguishable from a tap.
+//
+// `${endpoints.voice}/transcribe` is forwarded by the existing generic
+// `/api/voice/*` reverse proxy (api/routes/voice.py) with no LifeOS-side
+// route change. It does NOT exist in whisper-relay as of this writing --
+// see docs/guides/voice-setup.md. Until the gateway adds it, every wake
+// check 404s (transcribeClip() below treats that as "no match" and returns
+// quietly) and Listening never actually triggers; the toggle, mic hold, and
+// VAD all still work standalone and are ready the moment the route ships.
+const WAKE_VAD_RMS_THRESHOLD = 0.02;  // energy floor to call a frame "speech" -- above SILENCE_RMS_THRESHOLD's ambient-noise cutoff
+const WAKE_SILENCE_MS = 600;          // trailing silence that ends a speech burst
+const WAKE_MIN_SPEECH_MS = 250;       // shorter bursts are clicks/pops, not a word -- skipped without an STT round-trip
+const WAKE_MAX_BURST_MS = 4000;       // safety cap so sustained background noise can't buffer forever
+const WAKE_PROCESSOR_BUFFER = 4096;   // same block size beginWebAudioRecording() uses
+const WAKE_WORD = 'hermes';
+const WAKE_MAX_EDIT_DISTANCE = 1;     // tolerates "Hermès"/"Hermie's"/"hermez"-ish whisper-isms
+
+let listenStream = null;
+let listenAudioCtx = null;
+let listenSource = null;
+let listenProcessor = null;
+let listenBuffer = [];       // Float32Array chunks accumulated since the current burst started
+let listenSpeechMs = 0;
+let listenSilenceMs = 0;
+let listenInBurst = false;
+let listenChecking = false;  // an STT round-trip for an already-captured burst is in flight
+
+// The shared guards: recording, a turn in flight, or TTS playing
+// (clipInFlight -- the self-trigger guard, independent of the mute toggle,
+// so the assistant saying "Hermes" can never wake it) all suspend Listening.
+// `isStarting` covers the brief async gap while a recording is being
+// acquired (a tap, or auto mode's own post-TTS re-record) -- without it, a
+// wake burst could start accumulating in the instant between a turn ending
+// and auto-continue's beginRecordingFromTap() actually flipping isRecording.
+function baseWakeGuardsOk() {
+  return isListeningEnabled() && isVoiceMode() && !isRecording && !isStarting
+    && !voiceBusy && !state.isLoading && !clipInFlight;
+}
+
+// Also excludes "a wake check is already in flight" -- used to gate whether
+// new audio frames accumulate into a burst at all, so overlapping wake
+// checks never fire. (Not used by the actual trigger below -- see there.)
+function canDetectWake() {
+  return baseWakeGuardsOk() && !listenChecking;
+}
+
+function onListenToggleChange() {
+  if (!isVoiceMode()) return;  // held for the next time voice mode is entered
+  if (isListeningEnabled()) startListening();
+  else stopListening();
+}
+
+async function startListening() {
+  if (listenStream || !isListeningEnabled() || !isVoiceMode()) return;
+  if (micBlockReason()) return;  // same preconditions as the talk button; fail silent here
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    return;  // denied/unavailable -- Listening just doesn't run
+  }
+  // A concurrent toggle-off (or leaving voice mode) while the await above was
+  // pending already released everything this function would set up.
+  if (!isListeningEnabled() || !isVoiceMode()) {
+    for (const t of stream.getTracks()) t.stop();
+    return;
+  }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    for (const t of stream.getTracks()) t.stop();
+    return;
+  }
+  listenStream = stream;
+  listenAudioCtx = new Ctx();
+  listenSource = listenAudioCtx.createMediaStreamSource(listenStream);
+  listenProcessor = listenAudioCtx.createScriptProcessor(WAKE_PROCESSOR_BUFFER, 1, 1);
+  listenBuffer = [];
+  listenSpeechMs = 0;
+  listenSilenceMs = 0;
+  listenInBurst = false;
+  listenProcessor.onaudioprocess = handleListenFrame;
+  listenSource.connect(listenProcessor);
+  // A ScriptProcessorNode only fires onaudioprocess while connected into the
+  // graph's output; it never writes to that output buffer, so nothing here
+  // is actually audible.
+  listenProcessor.connect(listenAudioCtx.destination);
+}
+
+// Releases the mic entirely -- called on toggle-off and on leaving voice
+// mode (applyVoiceMode()). Idempotent: safe to call when nothing is held.
+function stopListening() {
+  try {
+    if (listenProcessor) {
+      listenProcessor.onaudioprocess = null;
+      listenProcessor.disconnect();
+    }
+    if (listenSource) listenSource.disconnect();
+  } catch (_) { /* ignore */ }
+  listenProcessor = null;
+  listenSource = null;
+  if (listenAudioCtx) {
+    listenAudioCtx.close().catch(() => {});
+    listenAudioCtx = null;
+  }
+  if (listenStream) {
+    for (const t of listenStream.getTracks()) t.stop();
+    listenStream = null;
+  }
+  listenBuffer = [];
+  listenInBurst = false;
+  listenSpeechMs = 0;
+  listenSilenceMs = 0;
+  listenChecking = false;
+}
+
+function handleListenFrame(e) {
+  if (!canDetectWake()) {
+    // Suspended -- drop whatever's accumulated so a burst never stitches
+    // together audio from before and after a suspend/resume boundary (e.g.
+    // speech right before the talk button was tapped, then more after).
+    listenBuffer = [];
+    listenInBurst = false;
+    listenSpeechMs = 0;
+    listenSilenceMs = 0;
+    return;
+  }
+  const samples = new Float32Array(e.inputBuffer.getChannelData(0));
+  const frameMs = (samples.length / e.inputBuffer.sampleRate) * 1000;
+  const { rms } = pcmLevels(samples);
+
+  if (rms >= WAKE_VAD_RMS_THRESHOLD) {
+    listenInBurst = true;
+    listenSpeechMs += frameMs;
+    listenSilenceMs = 0;
+    listenBuffer.push(samples);
+  } else if (listenInBurst) {
+    listenSilenceMs += frameMs;
+    listenBuffer.push(samples);  // a little trailing silence rides along in the clip
+    if (listenSilenceMs >= WAKE_SILENCE_MS) {
+      finishBurst(e.inputBuffer.sampleRate);
+      return;
+    }
+  } else {
+    return;  // ambient silence -- nothing buffered yet
+  }
+
+  if (listenSpeechMs + listenSilenceMs >= WAKE_MAX_BURST_MS) finishBurst(e.inputBuffer.sampleRate);
+}
+
+function finishBurst(sampleRate) {
+  const speechMs = listenSpeechMs;
+  const chunks = listenBuffer;
+  listenBuffer = [];
+  listenInBurst = false;
+  listenSpeechMs = 0;
+  listenSilenceMs = 0;
+  if (speechMs < WAKE_MIN_SPEECH_MS) return;  // too short to be a word
+
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const flat = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) { flat.set(c, off); off += c.length; }
+  checkForWakeWord(flat, sampleRate);
+}
+
+// Whisper-isms tolerated: accent marks ("Hermès"), trailing punctuation
+// ("Hermes,"), and Whisper occasionally splitting the word around a stray
+// space ("her mes"). Normalize by stripping diacritics/punctuation and
+// lowercasing, then accept either an individual word or the whole
+// (space-collapsed) transcript within edit distance 1 of "hermes" -- covers
+// "Hermes" / "Hermès" / "Hermes," / "her mes" / "Hermie's" (-> "hermies",
+// distance 1) without accepting unrelated short words.
+function normalizeForWakeMatch(text) {
+  return (text || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // Hermès -> Hermes
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')                        // drop punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i += 1) {
+    const cur = [i];
+    for (let j = 1; j <= n; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+function isCloseToWakeWord(token) {
+  return !!token && levenshtein(token, WAKE_WORD) <= WAKE_MAX_EDIT_DISTANCE;
+}
+
+function matchesWakeWord(transcript) {
+  const norm = normalizeForWakeMatch(transcript);
+  if (!norm) return false;
+  if (norm.split(' ').some(isCloseToWakeWord)) return true;
+  return isCloseToWakeWord(norm.replace(/\s+/g, ''));  // "her mes" -> "hermes"
+}
+
+async function transcribeClip(blob) {
+  const form = new FormData();
+  form.append('audio', blob, 'wake.wav');
+  const res = await fetch(`${endpoints.voice}/transcribe`, { method: 'POST', body: form });
+  if (!res.ok) return '';  // includes 404 -- the relay route doesn't exist yet
+  const data = await res.json().catch(() => ({}));
+  return (data.transcript || '').toString();
+}
+
+// Exported so the headless test harness can drive the post-capture pipeline
+// without real audio hardware -- getUserMedia energy analysis doesn't run
+// headless, the same reason submitTurn() is exported below. Feeds synthetic
+// PCM straight into the same STT-call/match/trigger logic a real captured
+// burst reaches via finishBurst() above; nothing here is a parallel/fake
+// implementation of that logic.
+export async function checkForWakeWord(samples, sampleRate) {
+  listenChecking = true;
+  try {
+    const blob = encodeWav(samples, sampleRate);
+    let transcript;
+    try {
+      transcript = await transcribeClip(blob);
+    } catch (e) {
+      return false;  // relay unreachable/erroring -- miss this burst, not fatal
+    }
+    if (!matchesWakeWord(transcript)) return false;
+    return await triggerWakeRecording();
+  } finally {
+    listenChecking = false;
+  }
+}
+
+// The exact code path a talk-button tap uses to start recording. Re-checks
+// the guards immediately before firing (not just at burst-capture time) --
+// this is what actually prevents a double-trigger with auto mode's own
+// post-TTS re-record: if auto-continue's beginRecordingFromTap() already won
+// the race by the time this wake match's STT round-trip resolves,
+// isRecording/isStarting are already true and this quietly no-ops.
+async function triggerWakeRecording() {
+  if (!baseWakeGuardsOk()) return false;
+  unlockTtsAudio();
+  await beginRecordingFromTap();
+  return true;
 }
 
 // --- thinking placeholder in the thread ---

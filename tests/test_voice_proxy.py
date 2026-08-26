@@ -50,6 +50,14 @@ async def _stub_audio(turn_id: str, clip_id: str):
     )
 
 
+@stub_gateway.post("/api/voice/transcribe")
+async def _stub_transcribe(request: Request):
+    form = await request.form()
+    audio = form.get("audio")
+    body = await audio.read() if audio is not None else b""
+    return {"transcript": "hermes" if body else ""}
+
+
 @pytest.fixture
 def proxy_client(monkeypatch):
     """An httpx client hitting the proxy app, whose upstream is the stub gateway."""
@@ -109,6 +117,18 @@ async def test_audio_clip_forwards_bytes_and_headers(proxy_client):
     # non-hop-by-hop upstream headers pass through
     assert resp.headers.get("cache-control") == "private, max-age=3600"
     assert resp.headers.get("x-clip") == "status-0"
+
+
+async def test_transcribe_forwards_through_the_generic_proxy(proxy_client):
+    """No LifeOS-side route for this exists (#710) -- the catch-all `{path:path}`
+    handler already forwards any gateway path, including one whisper-relay
+    doesn't implement yet. Proven here against a stub that does, pinning that
+    the day the real route ships, LifeOS needs no code change to use it."""
+    files = {"audio": ("wake.wav", b"\x00\x01fakepcm", "audio/wav")}
+    resp = await proxy_client.post("/api/voice/transcribe", files=files)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"transcript": "hermes"}
 
 
 async def test_gateway_unreachable_returns_502(monkeypatch):

@@ -71,10 +71,15 @@ In voice mode the text composer is replaced by the dock:
 
 - **Tap-to-talk** — the shutter button starts/stops recording; a cancel (`✕`) aborts an in-flight turn.
 - **Text/Voice pill** — a two-way pill selector at the top of `/chat` (next to the backend selector) swaps between the text composer and the voice dock. The mode persists per browser.
-- Three dock toggles (state saved per browser):
+- Four dock toggles (state saved per browser):
   - **Mute** — suppress spoken playback (the reply still returns as text).
   - **2×** — play spoken replies at double speed.
   - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap.
+  - **Listening** — wake-word mode, default off (#710). While on, the page holds its own mic stream and runs a local energy-based VAD (no third-party wake-word engine, no Web Speech API — that ships audio to Google). When it hears a speech burst end, it POSTs the short clip to `${voice gateway}/api/voice/transcribe` and fuzzy-matches the transcript against "Hermes" (tolerating whisper-isms like "Hermès" or "her mes" — see `matchesWakeWord()` in `web/chat/voice.js`); a match starts recording exactly as a talk-button tap would. Detection is suspended while recording, while a turn is in flight, and while a spoken reply is playing (so the assistant can never wake itself), and resumes after. Leaving voice mode or unchecking Listening releases its mic entirely. **Requires a `/api/voice/transcribe` route on the voice gateway that does not exist yet as of this writing** — see the note below.
+
+### Listening's dependency: a bare-STT gateway route (not yet shipped)
+
+whisper-relay's `POST /api/voice/turn` and `/turn/stream` always run the full STT→LLM→TTS pipeline. Listening needs a **transcribe-only** route with no LLM call, no TTS, no conversation/turn persistence — it must be safe to call every second or two without creating any artifacts. LifeOS's `/api/voice/*` proxy already forwards any path generically (`api/routes/voice.py`), so once the gateway adds `POST /api/voice/transcribe` (multipart `audio` file in, `{"transcript": "..."}` out — the same audio normalization + `STTAdapter.transcribe()` step `turns.py` already uses internally, minus everything after it), Listening picks it up with no LifeOS-side change. Until then, every wake check 404s and Listening's toggle/mic-hold/VAD still work but never actually trigger.
 
 Each spoken response bubble is also **tap-to-replay** — tap it to hear the reply again. (Replay is a per-response affordance, not a dock toggle.) Empty or silent recordings are **skipped automatically** by silence detection — there is no manual "skip silent" control.
 
@@ -113,6 +118,7 @@ On the **Hermes** backend an orchestrating persona's spoken turn never spawns an
 | Voice dock never appears | Voice is opt-in per browser. Tap **Voice** on the Text/Voice pill, or set `LIFEOS_CHAT_DEFAULT_VOICE=true` and restart the API. |
 | `Agent` toggle missing | Expected unless `LIFEOS_AGENT_BACKEND_URL` is set. |
 | `Hermes` toggle missing | Expected unless `LIFEOS_HERMES_BACKEND_URL` is set. |
+| `Listening` never triggers recording | Expected until the gateway ships `POST /api/voice/transcribe` — see above. |
 
 ---
 
