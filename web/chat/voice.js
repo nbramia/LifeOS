@@ -576,7 +576,15 @@ function stopRecorder() {
 async function handleSkippedEmptyRecording() {
   setTalkActive(false);
   setStatus('', 'Ready');
-  if (getAutoContinue()) await maybeAutoContinue();
+  // No auto-continue here (#721). stopRecordingAndSend() -- this function's
+  // only caller -- is itself only reached from onTalkClick's stop branch, so
+  // every empty/silent recording this handles is a manual tap-to-stop, not a
+  // completed turn. Auto-continue has to key off "a turn was submitted and
+  // its reply finished playing" (submitTurn()'s own maybeAutoContinue() call
+  // below, after `await playbackChain`) -- re-arming here as well used to
+  // treat a deliberate stop (typically a quick tap that catches too little
+  // or no audio) as if a reply had just played, instantly restarting
+  // recording with no way to stop without leaving Auto mode entirely.
 }
 
 async function beginRecordingFromTap() {
