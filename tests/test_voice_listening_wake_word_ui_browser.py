@@ -97,6 +97,16 @@ window.fetch = function (url, opts) {
       status: 200, headers: { 'Content-Type': 'text/event-stream' },
     }));
   }
+  if (urlStr.indexOf('/api/chat/config') !== -1) {
+    // Auto ships on by default and several tests here open a real
+    // (fake-stream) recording -- the idle timeout (#723) runs off a genuine
+    // onaudioprocess tap ticking on real wall-clock time, unrelated to
+    // anything this test drives directly. An hour keeps it from ever
+    // firing mid-test on a slow/loaded run.
+    return Promise.resolve(new Response(JSON.stringify({ voice_idle_timeout_ms: 3600000 }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }));
+  }
   return Promise.resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
 };
 

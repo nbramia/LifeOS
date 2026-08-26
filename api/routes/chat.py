@@ -281,6 +281,11 @@ async def chat_config():
     `web/chat/voice.js`. `voice_endpoint_semantic` is reserved for a future
     optional completeness classifier and is currently unwired on the client
     (see `config/settings.py`'s `voice_endpoint_semantic` docstring).
+
+    `voice_idle_timeout_ms` (#723) is a disjoint timing knob for the opposite
+    situation those two govern: no speech at all yet in the recording. After
+    this much silence with nothing spoken, the client stops and discards the
+    recording rather than leaving the mic open indefinitely.
     """
     return {
         "default_voice": bool(settings.chat_default_voice),
@@ -290,6 +295,7 @@ async def chat_config():
         "voice_endpoint_silence_ms": settings.voice_endpoint_silence_ms,
         "voice_endpoint_hard_cap_ms": settings.voice_endpoint_hard_cap_ms,
         "voice_endpoint_semantic": bool(settings.voice_endpoint_semantic),
+        "voice_idle_timeout_ms": settings.voice_idle_timeout_ms,
     }
 
 
