@@ -2177,6 +2177,7 @@ class Worker:
             "ambiguity": pre.ambiguity.question if pre.ambiguity else None,
             "sane": pre.sane,
             "sane_reason": pre.sane_reason,
+            "sane_fatal": pre.sane_fatal,
             "budget": {
                 "wall_seconds": pre.budget.wall_seconds,
                 "max_tokens": pre.budget.max_tokens,
@@ -2199,16 +2200,35 @@ class Worker:
         )
         session = self.session_store.get(task_id)  # refresh
 
-        # Sanity gate.
-        if not pre.sane:
+        # Sanity gate (#747). Only a *fatal* sane=False fails the task
+        # closed — an empty title, a preflight-call error, or a title the
+        # code itself matched as a deterministically destructive shape (see
+        # `preflight._DESTRUCTIVE_TITLE_RE`). Everything else is the
+        # classifier's own inferred "this isn't executable" opinion, which
+        # has been observed ignoring the prompt's "mundane tasks are sane"
+        # rule — treating that single cheap-model judgement as authoritative
+        # would silently cancel real work, so it's parked below instead,
+        # same as an ambiguous task: a wrong inference costs one question,
+        # not the task.
+        if not pre.sane and pre.sane_fatal:
             self._mark_failed(
                 session, task,
                 f"preflight flagged task as unsafe to run: {pre.sane_reason}",
             )
             return
 
-        # Ambiguity / ask-routing → block on user input (Issue F closes this loop).
+        # Ambiguity / ask-routing / non-fatal sanity objection → block on
+        # user input (Issue F closes this loop). Each contributes its own
+        # sentence so the operator can tell a sanity objection apart from a
+        # genuine ambiguity or an engine-choice question at a glance, rather
+        # than seeing one generic "blocked" string.
         question_parts: list[str] = []
+        if not pre.sane:
+            question_parts.append(
+                f"Preflight flagged this task as possibly not executable: "
+                f"{pre.sane_reason} Reply to confirm it should run as-is, "
+                f"or edit/retag the task in the vault."
+            )
         if pre.ambiguity:
             question_parts.append(pre.ambiguity.question)
         if pre.routing == ROUTE_ASK:

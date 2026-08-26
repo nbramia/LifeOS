@@ -75,6 +75,142 @@ def test_preflight_sanity_failure_passed_through():
     assert "destructive" in result.sane_reason
 
 
+# ---------------------------------------------------------------------------
+# #747 — a sanity rejection must park, not cancel, unless the code itself can
+# confirm the title is empty, deterministically destructive, or preflight
+# itself failed. `sane_fatal` is the signal the worker uses to distinguish.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_sane_false_on_mundane_title_is_not_fatal():
+    """Repro of the live #747 bug: the model rejects a routine UI task as
+    'not executable'. The title itself is ordinary — the classifier's own
+    inferred opinion must not be treated as fatal."""
+    reply = _golden_reply(
+        sane=False,
+        sane_reason="This is a product specification or feature request, not a task an agent can execute.",
+    )
+    result = pf.run_preflight(
+        title="Display the user's transcribed message immediately after sending",
+        tags=["agent"], caller=_stub(reply),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+
+
+@pytest.mark.unit
+def test_sane_false_destructive_title_is_fatal():
+    """The model's own sane=false on an actually-destructive title is
+    corroborated by the deterministic check — stays fatal."""
+    reply = _golden_reply(sane=False, sane_reason="destructive: 'rm -rf /'")
+    result = pf.run_preflight(title="rm -rf /", tags=["agent"], caller=_stub(reply))
+    assert result.sane is False
+    assert result.sane_fatal is True
+
+
+@pytest.mark.unit
+def test_destructive_title_is_fatal_even_if_model_claims_sane():
+    """The destructive-shape guard must not be weakened by (or dependent on)
+    model compliance: even a model that wrongly says sane=true on an
+    obviously destructive title gets overridden by the deterministic check."""
+    reply = _golden_reply(sane=True, sane_reason="")
+    result = pf.run_preflight(title="delete all my data", tags=["agent"], caller=_stub(reply))
+    assert result.sane is False
+    assert result.sane_fatal is True
+
+
+@pytest.mark.unit
+def test_empty_title_sanity_failure_is_fatal():
+    def fail(prompt):
+        raise AssertionError("LLM should not have been called for empty title")
+
+    result = pf.run_preflight(title="   ", tags=["agent"], caller=fail)
+    assert result.sane is False
+    assert result.sane_fatal is True
+
+
+@pytest.mark.unit
+def test_preflight_llm_error_sanity_failure_is_fatal():
+    def boom(prompt):
+        raise RuntimeError("haiku is down")
+
+    result = pf.run_preflight(title="x", tags=["agent"], caller=boom)
+    assert result.sane is False
+    assert result.sane_fatal is True
+
+
+@pytest.mark.unit
+def test_preflight_unparseable_reply_sanity_failure_is_fatal():
+    result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
+    assert result.sane is False
+    assert result.sane_fatal is True
+
+
+# ---------------------------------------------------------------------------
+# #748 — a routing/method-of-execution question smuggled into `ambiguity`
+# must not block; routing (including the default route) owns that decision.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_routing_flavored_ambiguity_is_suppressed():
+    """Repro of the live #748 bug: the model raises 'should this go to a
+    local agent or is it a design task for a human engineer' as ambiguity.
+    That's a routing question, not a blocking ambiguity."""
+    reply = _golden_reply(
+        routing="ask",
+        routing_reason="No explicit model cue or capability inference.",
+        ambiguity={
+            "question": (
+                "Should this task be routed to a local agent for code "
+                "implementation, or is it a design/specification task for "
+                "a human engineer?"
+            ),
+        },
+    )
+    result = pf.run_preflight(
+        title="Turn the inactive record button white when not recording",
+        tags=["agent"], caller=_stub(reply),
+    )
+    assert result.ambiguity is None
+
+
+@pytest.mark.unit
+def test_genuine_missing_referent_ambiguity_still_blocks():
+    """A real missing-referent ambiguity must not be swallowed by the
+    routing-flavored matcher."""
+    reply = _golden_reply(
+        ambiguity={"question": "Which John — John Doe or John Smith?"},
+    )
+    result = pf.run_preflight(title="reply to John", tags=["agent"], caller=_stub(reply))
+    assert result.ambiguity is not None
+    assert "John" in result.ambiguity.question
+
+
+@pytest.mark.unit
+def test_default_route_applies_when_ambiguity_is_routing_flavored(monkeypatch):
+    """#707's default route must not be defeated by a spurious routing-
+    flavored ambiguity — this was the concrete way #748 broke #707."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    reply = _golden_reply(
+        routing="ask",
+        routing_reason="No explicit model cue or capability inference.",
+        ambiguity={
+            "question": (
+                "Should this task be routed to a local agent for code "
+                "implementation, or is it a design/specification task for "
+                "a human engineer?"
+            ),
+        },
+    )
+    result = pf.run_preflight(
+        title="Turn the inactive record button white when not recording",
+        tags=["agent"], caller=_stub(reply),
+    )
+    assert result.ambiguity is None
+    assert result.routing == pf.ROUTE_LOCAL
+
+
 @pytest.mark.unit
 def test_preflight_handles_json_in_code_fence():
     """Some models like to wrap output in ```json fences."""

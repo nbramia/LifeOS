@@ -292,6 +292,8 @@ def test_routing_ask_lands_in_blocked_with_model_question(tmp_path: Path):
 
 @pytest.mark.unit
 def test_insane_task_lands_in_failed(tmp_path: Path):
+    """A deterministically destructive title (matched by the code, not the
+    model's prose) still fails closed — #747 must not weaken this guard."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["agent", "local"]},
     ])
@@ -303,6 +305,86 @@ def test_insane_task_lands_in_failed(tmp_path: Path):
     assert executor.calls == []
     assert FAILED_TAG in api.tasks["t1"]["tags"]
     assert w.session_store.get("t1").status == STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_mundane_sane_false_task_lands_in_blocked_not_cancelled(tmp_path: Path):
+    """#747: a preflight sanity rejection of an ordinary, non-destructive
+    title must park the task (blocked, still actionable) rather than
+    cancel it — the model's own 'not executable' opinion is not fatal."""
+    api = FakeApi(tasks=[
+        {"id": "t1",
+         "description": "Display the transcribed message immediately after sending",
+         "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
+    preflight = _golden_preflight(
+        routing="local", sane=False,
+        sane_reason="This is a product specification or feature request, not a task an agent can execute.",
+    )
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    # Never ran, but critically NOT cancelled — parked and still actionable.
+    assert executor.calls == []
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert api.tasks["t1"]["status"] != "cancelled"
+    assert w.session_store.get("t1").status == STATUS_BLOCKED
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("not executable" in s and "flagged" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_sane_false_and_ambiguous_blocked_messages_are_distinguishable(tmp_path: Path):
+    """#747 + #748 interaction: a parked sanity objection and a genuine
+    ambiguity must produce distinguishable operator-facing text, not one
+    generic 'blocked' string."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="should not run"))
+    preflight = _golden_preflight(
+        routing="local", sane=False, sane_reason="looks like a spec, not a task",
+        ambiguity={"question": "Which John — John Doe or John Smith?"},
+    )
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    combined = " ".join(sent)
+    assert "looks like a spec" in combined
+    assert "Which John" in combined
+    # The two objections are textually distinct, not collapsed into one line.
+    assert "looks like a spec" not in "Which John — John Doe or John Smith?"
+
+
+@pytest.mark.unit
+def test_routing_flavored_ambiguity_does_not_block(tmp_path: Path):
+    """#748: a method-of-execution question smuggled into `ambiguity` must
+    not block the task — routing decides."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "Turn the record button white when idle",
+         "status": "todo", "tags": ["agent", "local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ran"))
+    preflight = _golden_preflight(
+        routing="local",
+        ambiguity={
+            "question": (
+                "Should this task be routed to a local agent for code "
+                "implementation, or is it a design/specification task for "
+                "a human engineer?"
+            ),
+        },
+    )
+    w = _make_worker(tmp_path, api, preflight_caller=preflight, local_executor=executor)
+    w.tick()
+
+    assert executor.calls != []
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
 
 
 @pytest.mark.unit
