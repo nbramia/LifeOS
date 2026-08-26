@@ -157,6 +157,16 @@ class ExecutorOutcome:
     # report what actually served the session (the #658 principle: report
     # observed, not configured) instead of just the static "local" label.
     served_by: str = ""
+    # #760 — claude_code/codex-only: how many [NOTIFY]s the executor sent
+    # during this run (always 0 for codex, which has no notify convention).
+    # Consumed by completion_signal.has_positive_completion_signal to decide
+    # whether a nominal STATUS_COMPLETED outcome is an earned completion or
+    # an interrupted mid-work session.
+    notifications_sent: int = 0
+    # #760 — claude_code/codex-only: best-effort description of how the CLI
+    # subprocess ended (returncode / signal / timed_out / whether a genuine
+    # terminal stream event was seen), for the terminal transcript event.
+    exit_meta: dict = field(default_factory=dict)
 
 
 # Static portion of the system prompt — never changes between sessions. Kept

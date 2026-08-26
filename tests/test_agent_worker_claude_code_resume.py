@@ -129,8 +129,10 @@ def test_clarification_block_sends_specific_prompt(tmp_path: Path, monkeypatch):
 
 
 def test_completed_outcome_registers_followup_for_reply(tmp_path: Path, monkeypatch):
+    # notifications_sent=1 earns the completion (#760) — this test is about
+    # followup-anchor registration, not the earned-completion gate itself.
     stub = _StubClaudeCodeExecutor(execute_outcome=ExecutorOutcome(
-        status=STATUS_COMPLETED, final_text="Here is the result.",
+        status=STATUS_COMPLETED, final_text="Here is the result.", notifications_sent=1,
     ))
     w = _make_worker(tmp_path, stub, monkeypatch)
     session = _seed_fresh_code_session(w.session_store)

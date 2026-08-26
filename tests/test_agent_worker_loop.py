@@ -1905,7 +1905,9 @@ def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
     class _Executor:
         def execute(self, session, task):
             calls.append((session.task_id, task.get("description")))
-            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="all done")
+            # notifications_sent=1 earns the completion (#760) — this test is
+            # about off-tick dispatch, not the earned-completion gate itself.
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="all done", notifications_sent=1)
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "do the thing", "status": "todo", "tags": ["agent"]},
@@ -1949,11 +1951,15 @@ def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
 
     class _Executor:
         def execute(self, session, task):
+            # notifications_sent=1 earns the completion (#760) — this test is
+            # about pool concurrency, not the earned-completion gate itself.
             if task.get("description") == "slow task":
                 start_evt.set()
                 assert release_evt.wait(timeout=5), "test deadlocked waiting for release"
-                return ExecutorOutcome(status=STATUS_COMPLETED, final_text="slow done")
-            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="fast done")
+                return ExecutorOutcome(
+                    status=STATUS_COMPLETED, final_text="slow done", notifications_sent=1)
+            return ExecutorOutcome(
+                status=STATUS_COMPLETED, final_text="fast done", notifications_sent=1)
 
     api = FakeApi(tasks=[
         {"id": "t-slow", "description": "slow task", "status": "todo", "tags": ["agent"]},

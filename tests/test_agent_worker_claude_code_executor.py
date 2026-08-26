@@ -203,6 +203,56 @@ def test_init_event_captures_and_persists_cli_session_id(tmp_path: Path):
     assert "claude_code_completed" in kinds
 
 
+def test_completed_outcome_and_event_carry_exit_meta(tmp_path: Path):
+    """#760: the terminal transcript event (and the ExecutorOutcome the
+    worker's earned-completion gate reads) both carry how the subprocess
+    ended — returncode, timed_out, and stream_terminal_event_seen (True only
+    when a `result` event was actually parsed, the real signal that
+    distinguishes a genuine finish from "stdout just closed")."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-exit"},
+        {"type": "result", "session_id": "cli-sess-exit", "total_cost_usd": 0.01, "result": "All set."},
+    ]
+    executor, store, transcripts = _build_executor(tmp_path, spawn_fn=_spawn_with(events, returncode=0))
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "Print a haiku"})
+
+    assert outcome.notifications_sent == 0
+    assert outcome.exit_meta == {
+        "returncode": 0, "timed_out": False, "stream_terminal_event_seen": True,
+    }
+    completed = [
+        e for e in _read_transcript(transcripts, session.session_id)
+        if e["kind"] == "claude_code_completed"
+    ]
+    assert completed[0]["payload"]["exit_meta"] == outcome.exit_meta
+
+
+def test_returncode_zero_without_result_event_flags_exit_meta(tmp_path: Path):
+    """A subprocess that exits 0 without ever emitting a `result` event (the
+    field case's likely shape — hit --max-turns or died mid-turn but still
+    returned 0) still lands on the returncode==0 fallback in `_run`, but
+    `stream_terminal_event_seen` is False — the diagnostic signal #760 added
+    so this no longer has to be reconstructed from prose logs."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-noterm"},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Now update the cancel test to drop the release:"}]},
+        },
+        # No `result` event — stdout just ends here.
+    ]
+    executor, store, transcripts = _build_executor(tmp_path, spawn_fn=_spawn_with(events, returncode=0))
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "Fix the flaky test"})
+
+    assert outcome.status == STATUS_COMPLETED  # returncode==0 fallback still fires
+    assert outcome.exit_meta["stream_terminal_event_seen"] is False
+    assert outcome.notifications_sent == 0
+
+
 def test_notify_invokes_callback_and_records_transcript(tmp_path: Path):
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},

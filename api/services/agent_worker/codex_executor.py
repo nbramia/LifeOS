@@ -414,6 +414,7 @@ class CodexExecutor:
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
         if proc.returncode == 0 or state.terminal:
+            exit_meta = self._exit_metadata(proc, timed_out, state)
             self.session_store.update_status(session.task_id, STATUS_COMPLETED)
             self.transcript_store.append(sid, "codex_completed", {
                 "cost_usd": state.cost_usd,
@@ -425,10 +426,17 @@ class CodexExecutor:
                 # streams to the operator (#429), so this is its only path out
                 # (parity with claude_code_completed, #349).
                 "final_text": state.final_text,
+                # #760: how the subprocess ended, parity with claude_code_completed.
+                "exit_meta": exit_meta,
             })
             return ExecutorOutcome(
                 status=STATUS_COMPLETED,
                 final_text=state.final_text,
+                # Codex has no [NOTIFY] convention — always 0. The earned-
+                # completion gate in worker.py falls through to the
+                # PR-mention / summary-shape checks for this route.
+                notifications_sent=0,
+                exit_meta=exit_meta,
             )
 
         stderr_tail = ""
@@ -445,6 +453,22 @@ class CodexExecutor:
             status=STATUS_FAILED,
             reason=f"codex exited with code {proc.returncode}",
         )
+
+    @staticmethod
+    def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
+        """Best-effort description of how the subprocess ended (#760).
+        Mirrors ClaudeCodeExecutor._exit_metadata; ``stream_terminal_event_seen``
+        is True only when a `session.completed`/`exec.completed` event was
+        actually parsed, not merely inferred from a clean returncode."""
+        rc = proc.returncode
+        meta: dict = {
+            "returncode": rc,
+            "timed_out": timed_out.is_set(),
+            "stream_terminal_event_seen": state.terminal,
+        }
+        if rc is not None and rc < 0:
+            meta["signal"] = -rc
+        return meta
 
     @staticmethod
     def _cleanup_tempfile(path: str) -> None:

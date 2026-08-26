@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
+from api.services.agent_worker.completion_signal import has_positive_completion_signal
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
     ROUTE_CLAUDE,
@@ -350,6 +351,10 @@ BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 # agent if tagged `#agent`. The list API only accepts a single status per
 # request, so we fan out and dedupe.
 AGENT_PICKUP_STATUSES = ("todo", "urgent")
+
+# #760: best-effort WIP-branch discovery for an interrupted CLI session — a
+# regex over past tool_use transcript events, never a live `git` call.
+_WIP_BRANCH_RE = re.compile(r"git\s+(?:switch\s+-c|checkout\s+-b)\s+([A-Za-z0-9._/-]+)")
 
 
 class _SynchronousPool:
@@ -1399,6 +1404,136 @@ class Worker:
             self._swap_tag(task_id, RUNNING_TAG, FAILED_TAG)
             self._set_task_status(task_id, "cancelled")
 
+    def _discover_wip_branch(self, session_id: str) -> str | None:
+        """Best-effort scan of this session's OWN past transcript for a WIP
+        branch the CLI created via ``git switch -c <branch>`` / ``git
+        checkout -b <branch>`` (#760). Returns the LAST such branch name
+        found (a later branch supersedes an earlier one across resumes), or
+        None if none was ever recorded. Read-only — this never runs git
+        itself, only greps tool_use events the executor already wrote.
+        """
+        branch = None
+        try:
+            for ev in self.transcript_store.read(session_id):
+                if ev.get("kind") not in ("claude_code_tool_use", "codex_tool_use"):
+                    continue
+                payload = ev.get("payload") or {}
+                # claude_code_tool_use: {"name": "Bash", "input": {"command": ...}}
+                # codex_tool_use: {"type": ..., "preview": "..."}
+                command = ""
+                if "input" in payload:
+                    command = (payload.get("input") or {}).get("command", "") or ""
+                elif "preview" in payload:
+                    command = payload.get("preview", "") or ""
+                if not command:
+                    continue
+                match = _WIP_BRANCH_RE.search(command)
+                if match:
+                    branch = match.group(1)
+        except Exception as exc:
+            logger.warning("wip-branch discovery failed for %s: %s", session_id, exc)
+        return branch
+
+    def _handle_cli_interrupted(self, session: Session, outcome, *, bot: str | None = None) -> None:
+        """A claude_code/codex session's subprocess reached a nominal
+        STATUS_COMPLETED without an earned completion signal (#760,
+        ``completion_signal.has_positive_completion_signal``) — treat it as
+        interrupted mid-work rather than done.
+
+        Resumable case (a CLI session id was persisted): park it exactly
+        like the executor's own BLOCKED outcomes above — register a
+        pending_question of ``kind='followup'`` so a threaded reply
+        round-trips through ``_resume_as_followup``, which for
+        claude_code/codex routing just re-enqueues the reply and flips the
+        session to CLAIMED so the next dispatch drains it through
+        ``resume()`` on the persisted CLI session id. The vault tag is left
+        at ``#agent-running`` (mirrors the CLARIFY/GOAL/PLAN block path,
+        which also doesn't swap it) — only the session row moves to BLOCKED
+        so ``/agents`` reflects it.
+
+        Fallback (no CLI session id persisted — ``init`` never fired, so
+        there is nothing to resume against, or Telegram delivery failed and
+        left no reply anchor): fail with the interrupted context preserved
+        in the message, same disposition as an undeliverable block prompt.
+        """
+        sid = session.session_id
+        task_id = session.task_id
+        final_text = (outcome.final_text or "").strip()
+        wip_branch = self._discover_wip_branch(sid)
+
+        self.transcript_store.append(sid, "cli_session_interrupted", {
+            "final_text": final_text,
+            "final_chars": len(final_text),
+            "notifications_sent": outcome.notifications_sent,
+            "exit_meta": outcome.exit_meta,
+            "wip_branch": wip_branch,
+        })
+
+        current = self.session_store.get_by_session_id(sid)
+        resumable = bool(current is not None and current.claude_code_session_id)
+
+        parts = [
+            "⚠️ Session interrupted mid-work — reply to resume." if resumable
+            else "⚠️ Session interrupted mid-work."
+        ]
+        if wip_branch:
+            parts.append(f"WIP branch preserved: `{wip_branch}`.")
+        if final_text:
+            preview = final_text if len(final_text) <= 500 else final_text[:500] + "…"
+            parts.append(f"Last activity:\n\n{preview}")
+        if not resumable:
+            parts.append(
+                "No CLI session id was persisted for this run, so it can't "
+                "be resumed automatically — marked failed instead; "
+                "re-trigger it to retry."
+            )
+        message = "\n\n".join(parts)
+
+        def _send(text):
+            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
+
+        def _send_with_id(text):
+            return (
+                self._telegram_send_with_id(text, bot=bot) if bot
+                else self._telegram_send_with_id(text)
+            )
+
+        if resumable:
+            self.session_store.update_status(task_id, STATUS_BLOCKED)
+            sent_ids: list = []
+            try:
+                sent_ids = _send_with_id(_with_reply_footer(message)) or []
+            except Exception as exc:
+                logger.warning("interrupted-session notice send failed: %s", exc)
+            if sent_ids:
+                self.session_store.create_pending_question(
+                    session_id=sid,
+                    task_id=task_id,
+                    question=message[:200],
+                    sent_message_id=sent_ids[0],
+                    sent_message_ids=sent_ids,
+                    kind="followup",
+                    bot=bot,
+                )
+                self.transcript_store.append(sid, "cli_interrupted_prompt_registered", {
+                    "message_ids": sent_ids, "wip_branch": wip_branch,
+                })
+                self._mirror_to_conversation(sid, message)
+                return
+            # Delivery failed after retries would just repeat the same
+            # failure — no anchor means the operator can't reply to resume,
+            # so a BLOCKED row would sit silent forever. Escalate to
+            # failed-with-preserved-context (documented fallback, #760).
+            self.transcript_store.append(sid, "cli_interrupted_prompt_undelivered", {})
+
+        self.session_store.update_status(task_id, STATUS_FAILED)
+        try:
+            _send(_with_reply_footer(message, replyable=False))
+        except Exception as exc:
+            logger.warning("interrupted-session (unresumable) notice send failed: %s", exc)
+        self._mirror_to_conversation(sid, message)
+        self._reconcile_vault_terminal(session, STATUS_FAILED)
+
     # ------------------------------------------------------------------
     # Claim + dispatch
     # ------------------------------------------------------------------
@@ -1790,6 +1925,19 @@ class Worker:
             return
 
         if outcome.status == STATUS_COMPLETED:
+            # #760: a subprocess exiting cleanly (or emitting a degenerate
+            # terminal event) doesn't mean the agent actually finished — it
+            # can hit --max-turns or die mid-turn and still land here with a
+            # mid-thought final_text and zero notifications. Require an
+            # earned signal before treating this as real completion. Spawned
+            # children are exempt (parity with the empty-result guard in
+            # _handle_outcome): their outcome is consumed by the parent, not
+            # surfaced to the operator directly.
+            if not session.parent_session_id and not has_positive_completion_signal(
+                outcome.final_text, outcome.notifications_sent,
+            ):
+                self._handle_cli_interrupted(session, outcome, bot=bot)
+                return
             # Send the final assistant text (if any) to Telegram with id
             # capture so a threaded reply can resume the session via
             # _resume_as_followup. [NOTIFY] bodies that already streamed
@@ -2071,6 +2219,15 @@ class Worker:
                 return
 
         if outcome.status == STATUS_COMPLETED:
+            # #760: parity with the claude_code gate — a clean exit doesn't
+            # mean the agent finished. Codex has no [NOTIFY] convention, so
+            # this always falls through to the PR-mention / summary-shape
+            # checks. Spawned children are exempt, same rationale as claude_code.
+            if not session.parent_session_id and not has_positive_completion_signal(
+                outcome.final_text, outcome.notifications_sent,
+            ):
+                self._handle_cli_interrupted(session, outcome, bot=None)
+                return
             # Spawned children (have a parent) stay silent to the operator —
             # the parent relays their findings in its own completion message
             # (#429, the #349 gate the codex path never got). The child's
