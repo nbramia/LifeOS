@@ -19,7 +19,10 @@ import {
 } from './conversations.js';
 import { sendMessage, askQuestion, stopTurn } from './ask-stream.js';
 import { loadPersonas, onPersonaChange, personaOrchestrates, personaSupportsHandoff } from './persona.js';
-import { initVoice, submitTurn, checkForWakeWord } from './voice.js';
+import {
+  initVoice, submitTurn, checkForWakeWord,
+  checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+} from './voice.js';
 import { initBackend } from './backend.js';
 import { initModel, onModelChange } from './model.js';
 
@@ -97,4 +100,7 @@ Object.assign(window, {
 });
 
 // Voice helpers for the headless test harness (mic/audio can't run headless).
-window.lifeChatVoice = { submitTurn, checkForWakeWord };
+window.lifeChatVoice = {
+  submitTurn, checkForWakeWord,
+  checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+};

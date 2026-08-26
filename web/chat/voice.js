@@ -299,6 +299,7 @@ export function initVoice() {
   // syncs the Listening mic hold to dockSettings.listen, so the setting has
   // to be in memory before voice mode is first applied, not after.
   loadDockSettings();
+  loadEndpointingConfig();  // #718 -- fire-and-forget; defaults apply until it resolves
 
   const explicit = resolveExplicitVoiceMode();
   config.voiceMode = explicit === true;  // text until the server default resolves
@@ -449,6 +450,7 @@ function beginRecording(stream) {
   isRecording = true;
   setStatus('', 'Recording…');
   setTalkActive(true);
+  maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
 }
 
 function ensureAudioContext() {
@@ -473,6 +475,7 @@ function beginWebAudioRecording(stream) {
   isRecording = true;
   setStatus('', 'Recording…');
   setTalkActive(true);
+  maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
 }
 
 function releaseCapture() {
@@ -610,13 +613,18 @@ async function beginRecordingFromTap() {
 
 async function stopRecordingAndSend() {
   if (isStarting || !isRecording) return;
+  // Set (and tear down endpointing) synchronously, before the MIN_RECORD_MS
+  // await below, so a concurrent second call -- #718's hard cap and a
+  // candidate's "complete" verdict can each reach this function -- sees
+  // `!isRecording` and returns immediately instead of double-stopping.
+  isRecording = false;
+  stopEndpointing();
 
   const elapsed = Date.now() - recordStartedAt;
   if (elapsed < MIN_RECORD_MS) {
     await new Promise((r) => setTimeout(r, MIN_RECORD_MS - elapsed));
   }
 
-  isRecording = false;
   setTalkActive(false);
 
   try {
@@ -1191,6 +1199,265 @@ async function triggerWakeRecording() {
   if (!baseWakeGuardsOk()) return false;  // state may have changed during chime playback
   await beginRecordingFromTap();
   return true;
+}
+
+// --- Smart turn endpointing: pause + semantic completeness (#718) ---
+//
+// Auto-continue (above) already reopens the mic after each reply; this layers
+// on *when to stop* a recording that started that way (or from a manual tap
+// -- endpointing applies to any recording while Auto is on, not only an
+// auto-triggered one). It runs its own small WebAudio graph on the SAME
+// stream beginRecordingFromTap() already acquired -- never a second
+// getUserMedia call -- computing the same energy-VAD RMS check
+// handleListenFrame() above uses for wake detection.
+//
+// Pipeline: after SILENCE_MS of trailing silence *following speech*, the
+// recording-so-far is a *candidate* endpoint, not a final decision --
+// POSTed to the same bare-STT route (`/api/voice/transcribe`) Listening's
+// wake check already uses (no conversation/turn artifacts either way), then
+// run through isTranscriptComplete() below. Complete -> finalize through the
+// SAME path a manual stop uses (stopRecordingAndSend(), never a parallel
+// submit implementation). Incomplete -> keep recording; speech resuming
+// re-arms the candidate timer. Silence that keeps growing past HARD_CAP_MS
+// finalizes regardless of any candidate verdict, so an ambiguous or
+// unreachable check can never hang the mic open forever.
+//
+// Guards are re-checked after every await, the same pattern
+// triggerWakeRecording() uses after its chime -- a manual stop tap, a cancel,
+// or Auto/voice mode changing while a candidate round-trip is in flight must
+// never let a stale "complete" verdict resurrect or double-submit a turn the
+// user already ended a different way.
+const ENDPOINT_DEFAULT_SILENCE_MS = 1600;
+const ENDPOINT_DEFAULT_HARD_CAP_MS = 3000;
+
+// Trailing words/phrases that read as "still talking" even after a pause --
+// conjunctions/connectives that normally lead into more speech, plus common
+// spoken-filler hedges. Checked against the transcript's last word (or last
+// two, for "i mean") with trailing punctuation stripped. Deliberately
+// conservative: a false "incomplete" verdict just keeps recording a beat
+// longer, bounded by the hard cap either way; a false "complete" verdict
+// sends a fragment as the actual turn.
+const ENDPOINT_TRAILING_FILLER_WORDS = [
+  'and', 'but', 'so', 'because', 'or', 'if', 'then', 'um', 'uh', 'like',
+];
+const ENDPOINT_TRAILING_FILLER_PHRASES = ['i mean'];
+const ENDPOINT_TERMINAL_PUNCTUATION_RE = /[.?!]["')\]]*$/;
+
+// Pure heuristic -- exported (window.lifeChatVoice below) so it's testable on
+// its own, with no page/recording/network round-trip involved. Terminal
+// punctuation (. ? !) at the end -> complete. A trailing conjunction/filler
+// word, or no terminal punctuation at all, -> incomplete. Whisper frequently
+// omits end-of-utterance punctuation on short clips, so "no punctuation"
+// alone is a weak signal -- but a false negative here only costs one more
+// candidate check (or, worst case, the hard cap), never a hang, so the
+// heuristic leans toward "keep listening" over "guess complete."
+export function isTranscriptComplete(transcript) {
+  const text = (transcript || '').trim();
+  if (!text) return false;
+  const endsWithPunctuation = ENDPOINT_TERMINAL_PUNCTUATION_RE.test(text);
+  const words = text
+    .toLowerCase()
+    .replace(/[.?!,;:'"()[\]]+$/g, '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const lastWord = words[words.length - 1] || '';
+  const lastTwoWords = words.slice(-2).join(' ');
+  const endsWithFiller =
+    ENDPOINT_TRAILING_FILLER_WORDS.includes(lastWord)
+    || ENDPOINT_TRAILING_FILLER_PHRASES.includes(lastTwoWords);
+  if (endsWithFiller) return false;
+  return endsWithPunctuation;
+}
+
+// LIFEOS_VOICE_ENDPOINT_SILENCE_MS / _HARD_CAP_MS, read from GET
+// /api/chat/config (settings.py) the same way LIFEOS_CHAT_DEFAULT_VOICE
+// reaches fetchDefaultVoiceMode() above. Both start at the designed defaults
+// and only move if/when the (already-cached, shared) config fetch resolves
+// with a valid override, so a slow or unreachable config never blocks
+// endpointing -- it just runs on the built-in timings meanwhile. There is no
+// server-side use of these values; the settings only exist to make this
+// client-side timing operator-tunable without an env-var-free config file.
+let endpointSilenceMsSetting = ENDPOINT_DEFAULT_SILENCE_MS;
+let endpointHardCapMsSetting = ENDPOINT_DEFAULT_HARD_CAP_MS;
+
+function loadEndpointingConfig() {
+  fetchChatConfig().then((data) => {
+    const silence = Number(data.voice_endpoint_silence_ms);
+    const hardCap = Number(data.voice_endpoint_hard_cap_ms);
+    if (Number.isFinite(silence) && silence > 0) endpointSilenceMsSetting = silence;
+    if (Number.isFinite(hardCap) && hardCap > 0) endpointHardCapMsSetting = hardCap;
+  });
+}
+
+let endpointCtx = null;
+let endpointSource = null;
+let endpointProcessor = null;
+let endpointSampleRate = 0;
+let endpointFrames = [];            // Float32Array frames captured since the current recording started
+let endpointHasSpeech = false;      // at least one speech frame seen this recording
+let endpointSilenceMs = 0;          // trailing silence since the last speech frame
+let endpointCandidateFired = false; // a candidate check already ran for the current silence run
+let endpointChecking = false;       // a candidate transcribe/completeness round-trip is in flight
+// Bumped every time a NEW recording's endpointing tap is (re)installed
+// (maybeStartEndpointing()). `endpointingActive()`'s `isRecording` check
+// alone isn't enough to catch a stale candidate: Auto-continue can start a
+// brand-new recording (isRecording flips true again) in the gap between a
+// cancelled/finalized recording and a still-in-flight candidate check for
+// THAT earlier recording resolving. checkEndpointCandidate() below captures
+// this token at the start and compares it after every await, so a stale
+// verdict can never finalize a DIFFERENT (newer) recording than the one it
+// was transcribing.
+let endpointRecordingToken = 0;
+
+// Only meaningful while Auto-continue AND voice mode AND an actual recording
+// are all true -- Auto off, leaving voice mode, or the recording already
+// having ended all mean today's manual-stop-only behavior, unchanged.
+function endpointingActive() {
+  return getAutoContinue() && isVoiceMode() && isRecording;
+}
+
+function resetEndpointState() {
+  endpointFrames = [];
+  endpointHasSpeech = false;
+  endpointSilenceMs = 0;
+  endpointCandidateFired = false;
+  endpointChecking = false;
+}
+
+// A no-op when Auto is off or voice mode isn't active, so a non-auto
+// recording never pays for this graph at all.
+function maybeStartEndpointing(stream) {
+  if (!getAutoContinue() || !isVoiceMode()) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  resetEndpointState();
+  endpointRecordingToken += 1;
+  try {
+    endpointCtx = new Ctx();
+    endpointSource = endpointCtx.createMediaStreamSource(stream);
+    endpointProcessor = endpointCtx.createScriptProcessor(WAKE_PROCESSOR_BUFFER, 1, 1);
+    endpointSampleRate = endpointCtx.sampleRate;
+    endpointProcessor.onaudioprocess = handleEndpointFrame;
+    endpointSource.connect(endpointProcessor);
+    endpointProcessor.connect(endpointCtx.destination);
+  } catch (e) {
+    stopEndpointing();  // don't leave a half-wired graph behind
+  }
+}
+
+function stopEndpointing() {
+  try {
+    if (endpointProcessor) {
+      endpointProcessor.onaudioprocess = null;
+      endpointProcessor.disconnect();
+    }
+    if (endpointSource) endpointSource.disconnect();
+  } catch (_) { /* ignore */ }
+  endpointProcessor = null;
+  endpointSource = null;
+  if (endpointCtx) {
+    endpointCtx.close().catch(() => {});
+    endpointCtx = null;
+  }
+  resetEndpointState();
+}
+
+function flattenEndpointFrames() {
+  let total = 0;
+  for (const c of endpointFrames) total += c.length;
+  const flat = new Float32Array(total);
+  let off = 0;
+  for (const c of endpointFrames) { flat.set(c, off); off += c.length; }
+  return flat;
+}
+
+function handleEndpointFrame(e) {
+  if (!endpointingActive()) return;
+  const samples = new Float32Array(e.inputBuffer.getChannelData(0));
+  const frameMs = (samples.length / e.inputBuffer.sampleRate) * 1000;
+  // Always keep the "audio so far" mirror current, even while a candidate
+  // check is in flight below -- otherwise speech spoken during that
+  // round-trip would be missing from the NEXT candidate's transcript.
+  endpointFrames.push(samples);
+  if (endpointChecking) return;  // a check already owns the decision right now
+
+  const { rms } = pcmLevels(samples);
+  if (rms >= WAKE_VAD_RMS_THRESHOLD) {
+    endpointHasSpeech = true;
+    endpointSilenceMs = 0;
+    endpointCandidateFired = false;  // speech resumed -- re-arm the candidate timer
+    return;
+  }
+  if (!endpointHasSpeech) return;  // ambient silence before any speech -- not timed yet
+
+  endpointSilenceMs += frameMs;
+
+  if (endpointSilenceMs >= endpointHardCapMsSetting) {
+    finalizeEndpointing();
+    return;
+  }
+  if (!endpointCandidateFired && endpointSilenceMs >= endpointSilenceMsSetting) {
+    endpointCandidateFired = true;
+    checkEndpointCandidate(flattenEndpointFrames(), endpointSampleRate);
+  }
+}
+
+// Finalizes through the SAME path a manual stop uses -- stopRecordingAndSend()
+// -- never a parallel submit implementation. Called both by the hard cap
+// above and by a candidate check's own "complete" verdict below. Safe to call
+// more than once (the hard cap firing right around when a candidate resolves,
+// say): stopRecordingAndSend() itself guards on `!isRecording`, so whichever
+// call gets there first wins and the other is a no-op. Exported so the
+// headless test harness can exercise the hard-cap path directly -- it's the
+// exact function real continuous silence crossing HARD_CAP_MS calls, with no
+// way to wait out that much real silence through the live audio graph in a
+// browser test (see checkEndpointCandidate's doc comment for the same
+// reasoning re: candidate checks).
+export function finalizeEndpointing() {
+  if (!isRecording) return;
+  stopRecordingAndSend().catch((err) => {
+    setStatus('error', 'Error');
+    addMessage('⚠️ ' + (err?.message || 'Recording failed'), 'assistant');
+    setTalkActive(false);
+  });
+}
+
+// The candidate-endpoint pipeline. Exported (samples/sampleRate params, like
+// checkForWakeWord above) so the headless test harness can drive it directly
+// -- the live onaudioprocess VAD above can't run headless either. This is the
+// exact function handleEndpointFrame() itself calls once real silence
+// crosses SILENCE_MS; nothing here is a parallel/fake implementation of that
+// logic. Returns the completeness verdict (or null when the check never
+// reached one -- suspended, superseded, or the relay call failed) so tests
+// can assert on it directly.
+//
+// `token` pins this check to the recording it started transcribing for
+// (see endpointRecordingToken above) -- `isRecording` alone can't tell a
+// cancelled recording apart from a brand-new one Auto-continue has since
+// started, so both guard checks below compare the token too.
+export async function checkEndpointCandidate(samples, sampleRate) {
+  if (endpointChecking) return null;
+  endpointChecking = true;
+  const token = endpointRecordingToken;
+  try {
+    if (!endpointingActive() || token !== endpointRecordingToken) return null;
+    const blob = encodeWav(samples, sampleRate);
+    let transcript;
+    try {
+      transcript = await transcribeClip(blob);
+    } catch (e) {
+      return null;  // relay unreachable/erroring -- miss this candidate, the hard cap still protects us
+    }
+    // Recording ended (or Auto/voice mode changed, or a NEW recording has
+    // since started) while we awaited -- a stale verdict must never act.
+    if (!endpointingActive() || token !== endpointRecordingToken) return null;
+    const complete = isTranscriptComplete(transcript);
+    if (complete) finalizeEndpointing();
+    return complete;
+  } finally {
+    endpointChecking = false;
+  }
 }
 
 // --- thinking placeholder in the thread ---
