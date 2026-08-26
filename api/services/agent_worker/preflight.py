@@ -124,6 +124,13 @@ class PreflightResult:
     # `ambiguity` itself is cleared to None in the same step, since a
     # demoted ambiguity must not block. None when nothing was demoted.
     demoted_ambiguity: str | None = None
+    # Set when an LLM-chosen route (local / claude_code / codex) was demoted
+    # to `settings.agent_default_route` because the title didn't corroborate
+    # it (#757) — holds the route the model/parse actually produced, so the
+    # worker can log it as context the same way `demoted_ambiguity` is
+    # logged. `routing` itself is overwritten with the default route in the
+    # same step. None when nothing was demoted. See `_apply_route_corroboration`.
+    demoted_routing: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -482,6 +489,52 @@ _TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
     r"(?i)\b(claude|opus|sonnet|haiku|cloud|anthropic|api)\b"
 )
 
+# Title phrases that corroborate an LLM-chosen `local` route — lifted
+# verbatim from the prompt's own rule-3 cue list (`_PREFLIGHT_INSTRUCTIONS`:
+# "with local agent", "using gemma"). Used by `_apply_route_corroboration`
+# (#757) the same way `_TITLE_NAMES_A_CLOUD_ENGINE` is used for cloud: a
+# route the model claims is explicit only counts when the title itself
+# backs it up.
+_TITLE_NAMES_LOCAL_ENGINE = re.compile(
+    r"(?i)\b(with\s+local\s+agent|using\s+gemma)\b"
+)
+
+# Title phrases that corroborate an LLM-chosen `claude_code` / `codex`
+# route. Preflight's own schema never asks the model to emit these two
+# routes directly (routing is restricted to "local" | "claude" | "ask" —
+# see `_PREFLIGHT_INSTRUCTIONS`); they normally only arrive via the
+# `#claude`/`#codex` tags in `_apply_tag_overrides`. `KNOWN_ROUTES` accepts
+# them from the model anyway (parse_preflight_response has no per-route
+# schema enforcement), so a noncompliant model can emit one — the same
+# failure mode #757 exists to catch for `local` — and this gives that case
+# a corroboration check too rather than leaving it unguarded.
+_TITLE_NAMES_CLAUDE_CODE_ENGINE = re.compile(r"(?i)\bclaude\s+code\b")
+_TITLE_NAMES_CODEX_ENGINE = re.compile(r"(?i)\bcodex\b")
+
+# Per-route corroboration pattern consulted by `_apply_route_corroboration`.
+# `ROUTE_CLAUDE` is deliberately absent — `_apply_tag_overrides`'s #584
+# downgrade already performs this same title-corroboration check for cloud
+# and must be left to run it alone (see that function's docstring).
+# `ROUTE_ASK` is absent too: nothing to corroborate, and `_apply_default_route`
+# already owns substituting it.
+_ROUTE_TITLE_CORROBORATION: dict[str, re.Pattern[str]] = {
+    ROUTE_LOCAL: _TITLE_NAMES_LOCAL_ENGINE,
+    ROUTE_CLAUDE_CODE: _TITLE_NAMES_CLAUDE_CODE_ENGINE,
+    ROUTE_CODEX: _TITLE_NAMES_CODEX_ENGINE,
+}
+
+# Tags that constitute the operator's own, direct routing corroboration —
+# mirrors the tag names `_apply_tag_overrides` recognizes. Presence of any
+# of these means `_apply_route_corroboration` must not second-guess the
+# result with a title-cue check: a tag IS the operator naming the engine.
+_ROUTE_OVERRIDE_TAG_NAMES = frozenset(
+    {"local", "claude", "codex", "cloud", "cloud-haiku", "cloud-sonnet"}
+)
+
+
+def _has_route_override_tag(tags: list[str]) -> bool:
+    return any(_normalize_tag(t) in _ROUTE_OVERRIDE_TAG_NAMES for t in (tags or []))
+
 
 def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
     """Apply tag-based routing/model overrides (#139 §2 precedence).
@@ -566,6 +619,128 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
             result.model = MODEL_LOCAL
         # ROUTE_ASK leaves model=None — the worker will set it after the
         # operator answers.
+    return result
+
+
+def _apply_route_corroboration(
+    result: PreflightResult, original_routing: str, title: str, tags_list: list[str]
+) -> PreflightResult:
+    """(#757) Demote an uncorroborated LLM-chosen `local`/`claude_code`/`codex`
+    route to `settings.agent_default_route` when the title doesn't back it up.
+
+    **The bug this closes.** `_apply_default_route`'s route substitution only
+    fires when `result.routing == ROUTE_ASK` — any other value the model
+    returned short-circuits past it untouched, on the theory that a routing
+    the model was confident enough to name outright should stand. #757 is
+    the case where that confidence was fabricated: a noncompliant model
+    invented `routing="local"` with a reason that matched none of the
+    prompt's rule-3 cues and no tag was present, and because "local" isn't
+    `ask`, the operator's `LIFEOS_AGENT_DEFAULT_ROUTE=claude_code` never got
+    a look — the session ran locally with full Bash reach into the checkout.
+    This closes that gap the same way #584 already closes it for cloud: a
+    model-claimed route counts only when the *title* corroborates it, not
+    merely when the model sets `routing_explicit=true` (which #584's own
+    comment already calls "the guess it probably is"). `routing_explicit`
+    without a title match doesn't count; `routing_explicit=False` never
+    counts, regardless of what the title says.
+
+    **Scope — why `ROUTE_CLAUDE` is excluded.** `_apply_tag_overrides`'s
+    #584 downgrade already runs this exact corroboration check for cloud
+    (same "explicit AND title names the engine" shape, over
+    `_TITLE_NAMES_A_CLOUD_ENGINE`) — but on a miss, it demotes to `ROUTE_ASK`
+    and asks the operator, not to the configured default. That's
+    deliberate and this function must not weaken it: an uncorroborated
+    cloud route is a real cost decision (per-token API spend), so it stays
+    a confirmation question even when a default route is configured for
+    everything else — `_apply_default_route`'s own `original_routing`
+    check (below) is what keeps that `ask` from being silently rescued into
+    the default. Re-running a *second*, differently-shaped corroboration
+    check over `ROUTE_CLAUDE` here would risk landing a different verdict
+    than #584's and double-guessing a flow that already does its own job
+    correctly. `ROUTE_ASK` is excluded too — there's nothing to corroborate,
+    and `_apply_default_route` already owns substituting it.
+
+    **Why this runs on `original_routing`, but *after* `_apply_tag_overrides`
+    executes.** The corroboration question is "did the *model* justify this
+    on its own", so it must be asked about the routing value from *before*
+    any tag ran — `original_routing`, captured in `_finish` right after
+    parsing, exactly as `_apply_default_route` already does for its own
+    gate. A tag is direct operator corroboration and must never be
+    second-guessed by a title-cue check it was never subject to. Comparing
+    `result.routing` to `original_routing` for equality would almost work
+    as a "was there a tag" signal, but not quite — a `#local` tag landing on
+    a model that also independently guessed `"local"` leaves them equal
+    without a tag being absent — so this checks `tags_list` directly via
+    `_has_route_override_tag` instead and no-ops whenever a recognized
+    routing tag is present, full stop.
+
+    Chronologically it still has to run *after* `_apply_tag_overrides`
+    finishes, not interleaved with it or before it: if this function wrote
+    a demoted route of `ROUTE_CLAUDE` (i.e. the operator configured
+    `LIFEOS_AGENT_DEFAULT_ROUTE=claude`) before `_apply_tag_overrides` ran,
+    that write would walk straight into #584's own downgrade-to-`ask` gate
+    inside `_apply_tag_overrides` and get bounced right back to `ask` —
+    undoing the very substitution the operator's default-route setting
+    asked for. Running after `_apply_tag_overrides` means that gate has
+    already had its say on the model's *original* cloud-or-not verdict and
+    won't re-examine a value it never produced. It also runs before
+    `_apply_default_route`: that function's ambiguity demotion (#751) and
+    ask-substitution are unaffected either way (they only touch `ask`
+    outcomes, which this function never produces), so the relative order
+    between the two doesn't matter for correctness — but sitting this one
+    directly after `_apply_tag_overrides`, next to the #584 gate it mirrors,
+    keeps the two corroboration checks readable side by side.
+
+    No-op (returns `result` unchanged) whenever: no default route is
+    configured, the configured value is invalid (`_apply_default_route`,
+    called right after this, owns that validation and its loud ERROR log —
+    duplicating it here would double-log), a recognized routing tag is
+    present, `original_routing` isn't one of `local`/`claude_code`/`codex`,
+    or the route is corroborated. So an unset `LIFEOS_AGENT_DEFAULT_ROUTE`
+    is byte-identical to pre-#757 behavior.
+    """
+    if not settings.agent_default_route or settings.agent_default_route not in KNOWN_ROUTES:
+        return result
+    if _has_route_override_tag(tags_list):
+        return result  # a tag is the operator's own corroboration — never second-guessed
+
+    corroboration_re = _ROUTE_TITLE_CORROBORATION.get(original_routing)
+    if corroboration_re is None:
+        return result  # ask (nothing to corroborate) or claude (#584 owns it)
+
+    if result.routing_explicit and corroboration_re.search(title or ""):
+        return result  # corroborated by the title — the route stands
+
+    default_route = settings.agent_default_route
+    logger.info(
+        "preflight route demoted to default (LIFEOS_AGENT_DEFAULT_ROUTE=%s "
+        "configured, uncorroborated %s route not backed by title %r; "
+        "model's routing_reason was %r)",
+        default_route, original_routing, title, result.routing_reason,
+    )
+    result.demoted_routing = original_routing
+    result.routing = default_route
+    result.routing_reason = (
+        f"uncorroborated {original_routing} route demoted to "
+        f"LIFEOS_AGENT_DEFAULT_ROUTE={default_route}"
+    )
+    # The route it came from is no longer applicable, and this substitution
+    # is the operator's standing config, not something the model or a tag
+    # named — leave routing_explicit False (mirrors #584's own downgrade,
+    # which resets it the same way).
+    result.routing_explicit = False
+    if default_route == ROUTE_CLAUDE:
+        result.model = MODEL_SONNET
+    elif default_route == ROUTE_LOCAL:
+        result.model = MODEL_LOCAL
+    elif default_route in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+        # Mirrors the `#claude`/`#codex` tag overrides above: the CLI picks
+        # its own model. `result.model` may already hold a stale value from
+        # `original_routing`'s own tail assignment just above (e.g. "local"
+        # if the model's own guess was ROUTE_LOCAL) — clear it rather than
+        # leave a model/routing mismatch behind.
+        result.model = ""
+    # ROUTE_ASK: harmless no-op combination — leave model as-is.
     return result
 
 
@@ -753,8 +928,9 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
 
 def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
     """Shared post-processing pipeline for every `run_preflight` return path:
-    sanity gate (#747) > tag overrides > default route (#707, now also
-    demoting ambiguity per #751) > preset class > cost gates.
+    sanity gate (#747) > tag overrides > route corroboration (#757) > default
+    route (#707, now also demoting ambiguity per #751) > preset class > cost
+    gates.
 
     Precedence, and why each sits where it does:
 
@@ -768,33 +944,63 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
          this: a default route answers "who resolves an open question", not
          "should this task run at all".
       2. **Tags** (`_apply_tag_overrides`) — the operator retagging a task
-         is the most direct, most recent signal available; always wins.
-      3. **Explicit LLM route** — preserved by tag overrides leaving a
-         non-`ask` classifier routing alone, and by `_apply_default_route`
-         only substituting when routing is still `ask` *and* was already
-         `ask` before tag overrides ran (see `original_routing` below) — so
-         a routing the model was confident enough to name outright is never
-         overridden by the default route.
+         is the most direct, most recent signal available; always wins,
+         over both the model's routing and (since #757) route corroboration.
+      3. **Corroborated LLM route** — a routing the model returned (not
+         `ask`) stands only when the *title* backs it up (`_apply_route_
+         corroboration`, #757). This is the piece that used to be an
+         unconditional "explicit LLM route always wins": before #757, any
+         non-`ask` value from the model — including one it invented with no
+         cue at all — skipped `_apply_default_route`'s substitution
+         entirely, because that function only fires on `ask`. A model that
+         hallucinated `routing="local"` with a fabricated-sounding reason
+         (the field case this issue exists for) therefore silently beat a
+         configured `LIFEOS_AGENT_DEFAULT_ROUTE`. `_apply_route_
+         corroboration` closes that: for `local`/`claude_code`/`codex`, an
+         LLM route now needs `routing_explicit=True` *and* a matching
+         rule-3-style title cue to survive; otherwise it's demoted to the
+         configured default and logged (`demoted_routing`), mirroring how
+         #751 demotes `ambiguity`. `ROUTE_CLAUDE` is excluded from this
+         step on purpose — see point 3a.
+      3a. **Cloud is `_apply_tag_overrides`'s job, not #757's.** An
+         uncorroborated cloud route already gets its own, older
+         corroboration check inside `_apply_tag_overrides` (#584) — same
+         "explicit AND title names the engine" shape, but it demotes a miss
+         to `ROUTE_ASK` (a confirmation question) rather than to the
+         default route, because API spend is a real cost decision that
+         must stay a question even on an install with a default route
+         configured for everything else. `_apply_route_corroboration`
+         running *after* `_apply_tag_overrides` (not before, not
+         interleaved) is what keeps the two independent: if it ran first
+         and wrote a demoted route of `claude` (an operator could configure
+         `LIFEOS_AGENT_DEFAULT_ROUTE=claude`), that write would walk
+         straight back into #584's downgrade gate and get bounced to `ask`,
+         undoing the demotion the default-route setting asked for.
       4. **Default route** (`_apply_default_route`, #707) — substitutes
          `ask` for the configured route only when nothing above produced a
          real answer. As of #751, this step *also* demotes a non-null
          `ambiguity` to advisory (logged, not blocking) whenever the setting
          is configured and valid — independent of whether step 4's route
-         substitution itself fires, since an explicit route (step 3) can
-         still carry a stale ambiguity the model should not have set.
+         substitution itself fires, since a corroborated route (step 3) can
+         still carry a stale ambiguity the model should not have set. This
+         step's own `original_routing` exclusion (only substitutes when the
+         *pre-tag* routing was already `ask`) is what keeps #584's
+         downgraded-to-`ask` cloud case from being rescued here too — see 3a.
       5. **Ask** — the fallback when nothing above resolved routing, or the
          #584 unconfirmed-cloud downgrade parked it there.
 
     Centralized (rather than each return path chaining the calls itself) so
     `original_routing` is captured exactly once, right after the
     parse/short-circuit result is built and before `_apply_tag_overrides`
-    (the only thing that mutates `result.routing` ahead of the default-route
-    hook) gets a chance to change it. See `_apply_default_route` for why that
-    pre-tag-override value matters.
+    (the only thing that mutates `result.routing` ahead of the route-
+    corroboration and default-route hooks) gets a chance to change it. See
+    `_apply_route_corroboration` and `_apply_default_route` for why that
+    pre-tag-override value matters to each.
     """
     result = _apply_sanity_gate(result, title)
     original_routing = result.routing
     result = _apply_tag_overrides(result, tags_list, title)
+    result = _apply_route_corroboration(result, original_routing, title, tags_list)
     result = _apply_default_route(result, original_routing)
     result = _apply_preset_class(result, tags_list)
     result = _apply_cost_gates(result)
