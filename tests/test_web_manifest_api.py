@@ -1,4 +1,5 @@
-"""Tests that the web app manifest and its icons are served correctly (#727).
+"""Tests that the web app manifest and its icons are served correctly (#727,
+extended by #731 for the designed icon set + maskable variant).
 
 A Home Screen shortcut on iOS only opens standalone when the manifest is
 reachable at the URL the HTML pages actually link, with a content type
@@ -7,8 +8,11 @@ StaticFiles would make for a bare .webmanifest extension under /static),
 and with `display: standalone` plus a `start_url` that resolves to a real
 route rather than the /static prefix.
 """
+import io
+
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 pytestmark = pytest.mark.unit
 
@@ -62,6 +66,7 @@ class TestIconServing:
         "/static/icons/icon-192.png",
         "/static/icons/icon-512.png",
         "/static/icons/apple-touch-icon.png",
+        "/static/icons/icon-maskable-512.png",
     ])
     def test_icon_returns_200_with_png_content_type(self, client, path):
         response = client.get(path)
@@ -77,6 +82,33 @@ class TestIconServing:
             resp = client.get(icon["src"])
             assert resp.status_code == 200
             assert resp.headers["content-type"] == icon["type"]
+
+    def test_manifest_declares_a_maskable_icon(self, client):
+        # Android adaptive icons crop to a circle/squircle/rounded-square mask
+        # of the launcher's choosing -- without a "maskable" entry, Android
+        # instead applies that mask to the plain "any" icon, which has no
+        # padding for it and gets clipped (#731).
+        manifest = client.get("/manifest.webmanifest").json()
+        maskable = [icon for icon in manifest["icons"] if icon.get("purpose") == "maskable"]
+        assert maskable, "manifest must declare at least one purpose=maskable icon"
+        for icon in maskable:
+            resp = client.get(icon["src"])
+            assert resp.status_code == 200
+            assert resp.headers["content-type"] == "image/png"
+
+    def test_apple_touch_icon_is_fully_opaque(self, client):
+        # iOS composites this icon on its own opaque rounded rect with no
+        # transparency of its own -- any alpha channel (even a
+        # near-invisible anti-aliased edge left over from SVG rasterization)
+        # would show through as a border artifact rather than being masked
+        # cleanly (#731).
+        response = client.get("/static/icons/apple-touch-icon.png")
+        img = Image.open(io.BytesIO(response.content))
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            alpha = img.convert("RGBA").split()[3]
+            assert alpha.getextrema() == (255, 255), "apple-touch-icon must have no transparent/translucent pixels"
+        else:
+            assert img.mode in ("RGB", "L"), f"unexpected opaque-icon mode: {img.mode}"
 
 
 class TestServedPagesLinkManifestAndDeclareStandalone:

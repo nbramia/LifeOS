@@ -185,6 +185,45 @@ function resolveExplicitVoiceMode() {
   return null;
 }
 
+// An explicit "begin recording immediately" deep link (#731 -- the iPhone
+// Action Button, via Shortcuts, opening this page). Distinct from
+// ?mode=voice on purpose: that param alone only arms wake-listening (a
+// live mic that waits for a spoken wake burst), never an actual recording
+// -- see resolveExplicitVoiceMode() above. This one skips straight to a
+// recording, since an Action Button press already *is* the user's intent
+// to speak. It never fires from ?mode=voice alone, isn't persisted to
+// storage (unlike the voice-mode preference), and only ever fires once per
+// page load: a Shortcut always opens the same fixed URL, so the param has
+// to be present on this navigation to have any effect -- an ordinary
+// reload of a URL that never carried it stays inert. Requires voice mode
+// to already be active (pass ?mode=voice alongside it), and fails closed
+// through the same guard + messaging as a manual tap on the talk button.
+function maybeAutoStartRecording() {
+  let record = null;
+  try {
+    record = new URLSearchParams(window.location.search).get('record');
+  } catch (e) {
+    return;  // no URLSearchParams / blocked
+  }
+  if (record !== '1' || !isVoiceMode()) return;
+  // Deferred to a microtask: initVoice() (this function's caller) runs
+  // synchronously inside main.js's initChat(), which unconditionally calls
+  // setStatus('', 'Ready') on the very next line after initVoice() returns.
+  // Calling reportMicBlocked() (below) synchronously here would have its
+  // setStatus('error', ...) call instantly clobbered by that reset. A
+  // microtask runs after the current synchronous call stack -- including
+  // that reset -- finishes, so this always executes after it instead.
+  Promise.resolve().then(() => {
+    unlockTtsAudio();  // same as a manual tap -- best-effort without a real gesture
+    const blocked = micBlockReason();
+    if (blocked) {
+      reportMicBlocked(blocked);
+      return;
+    }
+    beginRecordingFromTap();
+  });
+}
+
 // GET /chat/config, once per page load. Both the default-mode resolution and the
 // insecure-context escape hatch read this, and either may run first, so the
 // promise is cached rather than re-fetched. Always resolves — an unreachable
@@ -304,6 +343,7 @@ export function initVoice() {
   const explicit = resolveExplicitVoiceMode();
   config.voiceMode = explicit === true;  // text until the server default resolves
   applyVoiceMode();
+  maybeAutoStartRecording();  // #731 -- only ever fires alongside ?mode=voice&record=1
   if (explicit === null) {
     // No URL param / stored preference — honor the server default. Async, but
     // local + sub-frame, so any text→voice flip is imperceptible.
