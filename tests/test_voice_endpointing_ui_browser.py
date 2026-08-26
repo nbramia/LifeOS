@@ -46,6 +46,15 @@ make the word list testable on its own (see its doc comment in
 No `requires_server` marker (serves `web/` itself from an ephemeral port, the
 same pattern as tests/test_voice_mic_block_ui_browser.py), so this runs at
 pre-push (`browser and not requires_server`).
+
+The `/api/chat/config` stub below pins `voice_idle_timeout_ms` to an hour --
+every test here that opens a real (fake-stream) recording does so with Auto
+on by default, and the idle timer runs off a genuine onaudioprocess tap on
+real wall-clock time, not off anything a test seam controls. Without this,
+a slow/loaded run can cross the shipped 10s default mid-test and discard a
+recording out from under an unrelated assertion. TestIdleTimeout and
+TestIdleTimeoutThenWake are unaffected either way -- they call
+`finalizeIdleTimeout()` directly, which doesn't consult this setting.
 """
 import http.server
 import threading
@@ -110,6 +119,7 @@ window.__transcribeResponse = 'turn off the lights.';
 window.__deferTranscribe = false;
 window.__pendingTranscribeResolvers = [];
 window.__turnStreamCalls = 0;
+window.__idleTimeoutOverrideMs = null;  // set by _open_voice_chat_short_idle_timeout() below
 
 function __transcribeResponseBody() {
   return new Response(JSON.stringify({ transcript: window.__transcribeResponse }), {
@@ -133,6 +143,21 @@ window.fetch = function (url, opts) {
     var sse = 'data: ' + JSON.stringify({ type: 'done', data: { response_text: 'ok' } }) + '\\n\\n';
     return Promise.resolve(new Response(sse, {
       status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    }));
+  }
+  if (urlStr.indexOf('/api/chat/config') !== -1) {
+    // A real recording started here is subject to the live idle timeout
+    // (#723) the instant Auto is on -- the default -- via a genuine
+    // onaudioprocess tap on this (silent) fake stream, ticking on real wall
+    // clock time regardless of what any test seam calls. An hour keeps that
+    // background timer from ever firing mid-test for every test EXCEPT the
+    // one that deliberately opts into a short window via
+    // window.__idleTimeoutOverrideMs (_open_voice_chat_short_idle_timeout()
+    // below) to prove the live accrual/threshold path itself, not just
+    // finalizeIdleTimeout() called directly.
+    var idleMs = window.__idleTimeoutOverrideMs || 3600000;
+    return Promise.resolve(new Response(JSON.stringify({ voice_idle_timeout_ms: idleMs }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
     }));
   }
   return Promise.resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
@@ -171,6 +196,22 @@ navigator.mediaDevices.getUserMedia = function (constraints) {
 
 def _open_voice_chat(page: Page, base_url):
     page.add_init_script(_INSTRUMENT_SCRIPT)
+    page.goto(f"{base_url}/chat?mode=voice")
+    page.wait_for_selector("#voiceListen")
+
+
+# Overrides window.__idleTimeoutOverrideMs (set after _INSTRUMENT_SCRIPT so
+# it wins) so /api/chat/config reports a short voice_idle_timeout_ms instead
+# of the suite-wide one-hour default above. Used by exactly one test
+# (test_idle_timeout_fires_from_real_silence_not_just_the_seam below) that
+# proves the LIVE trigger -- handleEndpointFrame() accruing endpointIdleMs on
+# real onaudioprocess callbacks against the silent fake stream and calling
+# finalizeIdleTimeout() itself once it crosses the threshold -- rather than
+# a test calling finalizeIdleTimeout() directly the way every other test in
+# this class does.
+def _open_voice_chat_short_idle_timeout(page: Page, base_url, ms):
+    page.add_init_script(_INSTRUMENT_SCRIPT)
+    page.add_init_script("window.__idleTimeoutOverrideMs = %d;" % ms)
     page.goto(f"{base_url}/chat?mode=voice")
     page.wait_for_selector("#voiceListen")
 
@@ -492,10 +533,46 @@ class TestIdleTimeout:
     LIFEOS_VOICE_IDLE_TIMEOUT_MS of silence, distinct from the
     trailing-silence-after-speech timers TestHardCapFinalize above exercises.
     `finalizeIdleTimeout()` is the exact function real continuous no-speech
-    silence crossing that timeout calls -- exercised directly, the same seam
-    pattern TestHardCapFinalize uses for finalizeEndpointing(), since a
-    browser test can't wait out several real seconds of silence through the
-    live audio graph either."""
+    silence crossing that timeout calls -- exercised directly (in every test
+    below except the first), the same seam pattern TestHardCapFinalize uses
+    for finalizeEndpointing(), since a browser test can't wait out the
+    shipped 10s default's worth of real silence through the live audio graph
+    without configuring a shorter one for itself.
+
+    The first test below is the exception: it configures a short timeout via
+    `/api/chat/config` and proves the LIVE trigger -- handleEndpointFrame()
+    (the real onaudioprocess handler this suite's fetch stub above exists to
+    keep off everyone else's back) actually accruing silence and firing
+    finalizeIdleTimeout() on its own -- not just that discard-teardown
+    function behaving correctly when called directly."""
+
+    def test_idle_timeout_fires_from_real_silence_not_just_the_seam(
+            self, page: Page, chat_base_url):
+        """Every other test in this class calls `finalizeIdleTimeout()`
+        directly -- proving the discard teardown, not the trigger that's
+        supposed to call it. This test proves the trigger itself:
+        `handleEndpointFrame()`, installed as the real `onaudioprocess`
+        handler on this (silent) fake stream exactly as it would be on a
+        real mic, accrues `endpointIdleMs` on genuine `onaudioprocess`
+        callbacks and calls `finalizeIdleTimeout()` itself once that crosses
+        `LIFEOS_VOICE_IDLE_TIMEOUT_MS` -- with no test code calling
+        `finalizeIdleTimeout()` at all. A short (300ms) configured timeout
+        keeps this bounded: at the live graph's 4096-sample buffer size
+        (`WAKE_PROCESSOR_BUFFER`), one `onaudioprocess` callback is roughly
+        85-95ms at a typical 44.1/48kHz context sample rate, so a handful of
+        real callbacks cross 300ms well within the wait below. (This is the
+        exact mechanism #723's harness bug rode on elsewhere in this suite
+        -- see the `/api/chat/config` stub's doc comment above -- just
+        deliberately triggered here instead of suppressed.)"""
+        _open_voice_chat_short_idle_timeout(page, chat_base_url, 300)
+        _start_recording(page)
+
+        page.wait_for_function("window.__recorderStopCalls === 1", timeout=5000)
+
+        assert _is_recording(page) is False
+        assert page.evaluate("window.__turnStreamCalls") == 0, (
+            "the live idle timeout submitted a turn instead of discarding it"
+        )
 
     def test_idle_timeout_discards_no_submit_no_rearm_toggles_unchanged(
             self, page: Page, chat_base_url):
