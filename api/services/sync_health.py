@@ -187,6 +187,13 @@ SYNC_SOURCES = {
         "phase": 2,
         "depends_on": ["imessage"],
     },
+    "create_contact_persons": {
+        "description": "Create people for contacts with iMessage interaction evidence (#700)",
+        "script": "scripts/create_contact_persons.py",
+        "frequency": "daily",
+        "phase": 2,
+        "depends_on": ["imessage", "apple_import", "contacts"],
+    },
     "link_source_entities": {
         "description": "Retroactively link unlinked source entities to people",
         "script": "scripts/link_source_entities.py",
