@@ -73,7 +73,12 @@ let clipInFlight = false;
 let thinkingEl = null;
 let ttsAudio = null;
 
-let dockSettings = { mute: false, auto: false, fast: false, listen: false };
+// Dock defaults for a first-time visitor (no stored settings yet). 2x playback,
+// auto-continue, and wake-word listening are on so voice mode is conversational
+// out of the box: speak, hear the reply at 2x, and be heard again without
+// touching anything. Mute stays off for the same reason. A stored choice always
+// wins over these — loadDockSettings() overwrites the whole object.
+let dockSettings = { mute: false, auto: true, fast: true, listen: true };
 
 class EmptyRecordingError extends Error {
   constructor() {
@@ -870,6 +875,68 @@ const WAKE_PROCESSOR_BUFFER = 4096;   // same block size beginWebAudioRecording(
 const WAKE_WORD = 'hermes';
 const WAKE_MAX_EDIT_DISTANCE = 1;     // tolerates "Hermès"/"Hermie's"/"hermez"-ish whisper-isms
 
+// --- wake chime: a "heard you" sound on a confirmed wake match (#726) ---
+//
+// A bundled set of short confirmation sounds lives at
+// `web/chat/wake-sounds/*`, described by `web/chat/wake-sounds/manifest.json`
+// (`{"sounds": [...]}`) -- see docs/guides/voice-setup.md for the set and
+// its attribution. Everything below is defensive against that directory or
+// manifest being absent, empty, or malformed regardless -- a from-source
+// build missing the assets, a stripped-down install, or any other reason
+// the fetch below 404s or the JSON doesn't parse as expected -- in which
+// case the manifest resolves empty and playWakeChime() resolves immediately
+// with no sound played, i.e. today's behavior with no chime at all.
+const WAKE_CHIME_DIR = '/static/chat/wake-sounds/';
+const WAKE_CHIME_MANIFEST_URL = `${WAKE_CHIME_DIR}manifest.json`;
+const WAKE_CHIME_TIMEOUT_MS = 1500;  // caps a long/stalled clip -- must never hang the wake
+
+// Fetched (at most) once per page load, then cached -- both the resolved
+// list and the fact that a fetch was already attempted, so a malformed
+// manifest or a network hiccup doesn't retry forever but also doesn't wedge
+// future calls behind a promise that already settled empty.
+let wakeChimeManifestPromise = null;
+
+function loadWakeChimeManifest() {
+  if (!wakeChimeManifestPromise) {
+    wakeChimeManifestPromise = fetch(WAKE_CHIME_MANIFEST_URL)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => (Array.isArray(data?.sounds)
+        ? data.sounds.filter((s) => typeof s === 'string' && s)
+        : []))
+      .catch(() => []);  // 404 / network error / malformed JSON -- no chime, never throws
+  }
+  return wakeChimeManifestPromise;
+}
+
+// Plays one randomly-chosen chime and resolves once it's done -- on `ended`,
+// on a safety timeout (a long or stalled clip must never hang the wake), or
+// immediately if there's nothing to play. Never rejects: a missing/broken
+// sound file degrades to "no chime", not a wake failure.
+function playWakeChime() {
+  return loadWakeChimeManifest().then((sounds) => {
+    if (!sounds.length) return;
+    const name = sounds[Math.floor(Math.random() * sounds.length)];
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const timer = setTimeout(finish, WAKE_CHIME_TIMEOUT_MS);
+      const settleAndClear = () => { clearTimeout(timer); finish(); };
+      try {
+        const audio = new Audio(WAKE_CHIME_DIR + encodeURIComponent(name));
+        audio.addEventListener('ended', settleAndClear);
+        audio.addEventListener('error', settleAndClear);
+        audio.play().catch(settleAndClear);
+      } catch (e) {
+        settleAndClear();
+      }
+    });
+  }).catch(() => {});  // belt-and-suspenders -- loadWakeChimeManifest() already never throws
+}
+
 let listenStream = null;
 let listenAudioCtx = null;
 let listenSource = null;
@@ -1100,9 +1167,20 @@ export async function checkForWakeWord(samples, sampleRate) {
 // post-TTS re-record: if auto-continue's beginRecordingFromTap() already won
 // the race by the time this wake match's STT round-trip resolves,
 // isRecording/isStarting are already true and this quietly no-ops.
+//
+// A wake-confirmation chime (#726) plays here, before recording starts --
+// never after, so it's never captured as part of the user's turn. While it
+// plays, `listenChecking` is still true (checkForWakeWord() below only
+// clears it in its `finally`, which runs after this whole async function
+// settles), so handleListenFrame() keeps dropping frames the entire time --
+// the chime can't be mistaken for speech or re-trigger detection. Guards are
+// re-checked below because playback is async: recording, a manual talk-tap,
+// or leaving Listening/voice mode could all happen while the chime plays.
 async function triggerWakeRecording() {
   if (!baseWakeGuardsOk()) return false;
   unlockTtsAudio();
+  await playWakeChime();
+  if (!baseWakeGuardsOk()) return false;  // state may have changed during chime playback
   await beginRecordingFromTap();
   return true;
 }

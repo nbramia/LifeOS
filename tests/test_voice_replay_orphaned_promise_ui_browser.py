@@ -176,11 +176,25 @@ window.fetch = function (url, opts) {
 ANDROID_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
 
 
+# These suites measure playback and replay behavior, not dock configuration.
+# The shipped dock defaults (2x/Auto/Listening on) would otherwise inject an
+# auto-continue turn and a wake-word mic hold into every scenario and shift the
+# counts they assert, so each page starts from an explicit, quiet baseline:
+# every toggle off. Dock-default behavior itself is covered in
+# tests/test_voice_listening_wake_word_ui_browser.py.
+_DOCK_BASELINE = (
+    "try { window.localStorage.setItem('lifeos:chat:dock_settings', "
+    "JSON.stringify({ mute: false, auto: false, fast: false, listen: false })); } "
+    "catch (e) {}"
+)
+
+
 def _open_voice_chat(page: Page, base_url, *, android=False):
     if android:
         page.add_init_script(
             "Object.defineProperty(navigator, 'userAgent', { value: %r });" % ANDROID_UA
         )
+    page.add_init_script(_DOCK_BASELINE)
     page.add_init_script(_INSTRUMENT_SCRIPT)
     page.add_init_script(_FETCH_MOCK)
     page.goto(f"{base_url}/chat?mode=voice")
