@@ -2175,6 +2175,10 @@ class Worker:
             "routing_reason": pre.routing_reason,
             "expected_output": pre.expected_output,
             "ambiguity": pre.ambiguity.question if pre.ambiguity else None,
+            # (#751) A default route demotes ambiguity to advisory rather than
+            # discarding it — logged here as context for whoever reads the
+            # transcript, not as a blocking question to the operator.
+            "demoted_ambiguity": pre.demoted_ambiguity,
             "sane": pre.sane,
             "sane_reason": pre.sane_reason,
             "sane_fatal": pre.sane_fatal,

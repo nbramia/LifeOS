@@ -160,6 +160,7 @@ class PreflightResult:
     ambiguity: PreflightAmbiguity | None
     sane: bool
     sane_reason: str
+    demoted_ambiguity: str | None   # #751: ambiguity text demoted to advisory, if any
     raw: dict                       # the parsed JSON for debugging
 ```
 
@@ -171,7 +172,9 @@ Routing precedence (per the prompt instructions):
 4. Title contains capability-implying phrase ("search my gmail", "google drive", "send a slack message", etc.) → claude (those tools require cloud connectors)
 5. Otherwise → `LIFEOS_AGENT_DEFAULT_ROUTE` if set, else ask (worker pauses the task and asks via Telegram)
 
-`LIFEOS_AGENT_DEFAULT_ROUTE` (empty by default) applies only when preflight would otherwise land on `ask` purely for lack of routing cues — not when ambiguity or a sanity failure is the reason, and not when the classifier inferred a cloud route that the API-consent downgrade below sends to `ask`. It exists for a single-executor install (e.g. local-only, no Claude Code/Codex/Managed Agents) where a multi-engine clarification question has nothing useful to offer. Tag overrides (`#local`, `#cloud`, etc.) always take precedence over it. An invalid value logs an error and falls back to `ask` rather than crashing the worker loop.
+`LIFEOS_AGENT_DEFAULT_ROUTE` (empty by default) applies only when preflight would otherwise land on `ask` purely for lack of routing cues — not when a sanity failure is the reason, and not when the classifier inferred a cloud route that the API-consent downgrade below sends to `ask`. It exists for a single-executor install (e.g. local-only, no Claude Code/Codex/Managed Agents) where a multi-engine clarification question has nothing useful to offer. Tag overrides (`#local`, `#cloud`, etc.) always take precedence over it. An invalid value logs an error and falls back to `ask` rather than crashing the worker loop.
+
+**Ambiguity demotion (#751).** When `LIFEOS_AGENT_DEFAULT_ROUTE` is set to a valid route, a non-null `ambiguity` no longer blocks the task, regardless of what routing was ultimately picked (default-route substitution, an explicit LLM route, or a tag override). Configuring a default route is the operator saying "run untagged tasks without asking me"; a cheap classifier's hedging shouldn't override that standing instruction — especially since string-matching the hedge's prose (the #748 fix) proved to be whack-a-mole once the model started rephrasing around the pattern. The question is preserved on `demoted_ambiguity` and logged to the session transcript as advisory context rather than discarded, and the executing agent can still ask a specific question mid-run via `lifeos_agent_user_ask` if it genuinely needs to. This is orthogonal to sanity: a non-fatal `sane=false` still parks the task even with a default route configured (#747 is about whether the task should run at all, which a default route has no bearing on), and the #584 unconfirmed-cloud downgrade still blocks (never auto-spend on inferred cloud routing). With no default route configured, ambiguity blocks exactly as before.
 
 Hardening: response is parsed defensively (handles `` ```json `` fences, partial schemas, missing keys, exceptions). On any parse failure the result defaults to `sane=false` so the worker parks the task rather than running with garbage.
 
