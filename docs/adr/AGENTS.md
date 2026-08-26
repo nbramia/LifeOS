@@ -17,11 +17,12 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `013-fitness-store.md` — Self-data fitness store, separate from the person-centric CRM model
 - `014-apple-health-collection.md` — Apple Health via an iOS Shortcut (a Mac has no HealthKit store)
 - `015-healthbridge-app.md` — HealthBridge iOS app as the recommended collector (amends 014)
-- `016-voice-gateway-reverse-proxy.md` — Voice gateway reverse-proxied through LifeOS
+- `016-voice-gateway-reverse-proxy.md` — Voice gateway reverse-proxied through LifeOS **(Amended by 021)**
 - `017-retire-ollama-llama-server-routing.md` — Ollama retired; query routing moved onto the shared llama-server runtime (supersedes 006)
 - `018-api-spend-requires-consent.md` — LifeOS never picks an API-billed engine on its own (amends 008)
 - `019-turn-owned-by-server.md` — a chat turn's lifetime is owned by the server, not the SSE connection watching it **(Amended by 020)**
 - `020-voice-cancel-gate-lifted.md` — the voice-only detachment exception in 019 is removed now that whisper-relay cancels explicitly (amends 019)
+- `021-voice-turn-persistence-tee.md` — `POST turn/stream` tees a Hermes-backend voice turn into the conversation store, the one exception to 016's "no voice logic" (amends 016)
 
 ## Key Principles
 
